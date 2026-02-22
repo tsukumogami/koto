@@ -40,8 +40,8 @@ rationale: |
 |-------|--------------|------|
 | ~~[#4: feat(engine): implement walking skeleton with init, transition, and next](https://github.com/tsukumogami/koto/issues/4)~~ | ~~None~~ | ~~testable~~ |
 | ~~_Establishes the Go module, core types (`State`, `Machine`, `Engine`), `Init`/`Load`/`Transition` methods, atomic persistence, and a minimal CLI with `init`/`transition`/`next` subcommands. Uses a hardcoded `Machine` -- real template parsing comes later._~~ | | |
-| [#5: feat(engine): add rewind, cancel, and query methods](https://github.com/tsukumogami/koto/issues/5) | [#4](https://github.com/tsukumogami/koto/issues/4) | testable |
-| _Builds on the engine from #4 to add `Rewind` (with history preservation), `Cancel` (state file deletion), and copy-safe query methods. Completes the full Engine API surface._ | | |
+| ~~[#5: feat(engine): add rewind, cancel, and query methods](https://github.com/tsukumogami/koto/issues/5)~~ | ~~[#4](https://github.com/tsukumogami/koto/issues/4)~~ | ~~testable~~ |
+| ~~_Builds on the engine from #4 to add `Rewind` (with history preservation), `Cancel` (state file deletion), and copy-safe query methods. Completes the full Engine API surface._~~ | | |
 | [#6: feat(engine): add version conflict detection and TransitionError JSON serialization](https://github.com/tsukumogami/koto/issues/6) | [#4](https://github.com/tsukumogami/koto/issues/4) | testable |
 | _Hardens the error layer: every engine failure returns a structured `TransitionError` with a machine-parseable code. Adds version conflict detection (optimistic concurrency) and template hash mismatch checking._ | | |
 | [#7: feat(template): implement template parsing and interpolation](https://github.com/tsukumogami/koto/issues/7) | [#4](https://github.com/tsukumogami/koto/issues/4) | testable |
@@ -89,8 +89,8 @@ graph TD
     classDef needsDesign fill:#e1bee7
     classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
 
-    class I4 done
-    class I5,I6,I7,I8 ready
+    class I4,I5 done
+    class I6,I7,I8 ready
     class I9,I10 blocked
 ```
 

@@ -3,7 +3,7 @@
   "design_doc": "docs/designs/DESIGN-koto-engine.md",
   "branch": "docs/koto-engine",
   "pr_number": 2,
-  "integrity_hash": "sha256:374ba4697e8a796278e5f19eb3f751318d8de99ccbf06d6b0da2e2eed80514ec",
+  "integrity_hash": "sha256:aea77e276a400cfbed8d6bf3b3e35206c140024a04dff002e6ae493916926e5a",
   "issues": [
     {
       "number": 4,
@@ -74,7 +74,7 @@
     {
       "number": 5,
       "title": "feat(engine): add rewind, cancel, and query methods",
-      "status": "scrutinized",
+      "status": "pushed",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
       "issue_type": "code",
@@ -94,6 +94,26 @@
         "tests_added": 11,
         "key_decisions": "Rewind uses rewind_failed error code for all failure modes with distinct messages. Cancel delegates directly to os.Remove. Added TestSnapshot_ReturnsCopy for full copy-safety verification.",
         "requirements_map": []
+      },
+      "reviewer_results": {
+        "issue": 5,
+        "reviewers": [
+          {
+            "focus": "pragmatic",
+            "blocking_count": 0,
+            "advisory_count": 1
+          },
+          {
+            "focus": "architect",
+            "blocking_count": 0,
+            "advisory_count": 0
+          },
+          {
+            "focus": "maintainer",
+            "blocking_count": 0,
+            "advisory_count": 4
+          }
+        ]
       },
       "testable_scenarios": [
         "scenario-10",
