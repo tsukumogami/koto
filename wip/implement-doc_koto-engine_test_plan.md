@@ -196,7 +196,7 @@ Total scenarios: 25
 **Commands**:
 - `koto transition invalid-target --state <path>`
 **Expected**: stdout JSON matches `{"error": {"code": "invalid_transition", "message": "...", "current_state": "...", "target_state": "invalid-target", "valid_transitions": [...]}}`. Fields with zero values are omitted (omitempty). All six error codes (`terminal_state`, `invalid_transition`, `unknown_state`, `template_mismatch`, `version_conflict`, `rewind_failed`) serialize correctly.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -208,7 +208,7 @@ Total scenarios: 25
 - (Externally modify the state file to increment `version` field)
 - `koto transition <target> --state <path>`
 **Expected**: Exit code 1. Error JSON with `code: "version_conflict"`. The engine detects that the on-disk version changed between its load and write operations.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -220,7 +220,7 @@ Total scenarios: 25
 - (Modify the template file content after init)
 - `koto next --state <path>` or `koto transition <target> --state <path>`
 **Expected**: Exit code 1. Error JSON with `code: "template_mismatch"`. No override flag exists to bypass this check.
-**Status**: pending
+**Status**: passed
 
 ---
 
