@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 problem: |
   koto templates must serve two audiences: humans who write and maintain workflow
   definitions, and the engine that executes them deterministically. A single format
@@ -25,7 +25,7 @@ rationale: |
 
 ## Status
 
-**Proposed**
+**Accepted**
 
 ## Context and Problem Statement
 
