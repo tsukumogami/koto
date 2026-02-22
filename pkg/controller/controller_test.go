@@ -245,3 +245,100 @@ func TestNext_WithTemplate_InterpolatesVariables(t *testing.T) {
 		t.Errorf("Directive = %q, should not contain unresolved placeholder {{TASK}}", d.Directive)
 	}
 }
+
+const testTemplateWithEvidence = `---
+name: test-machine
+---
+
+## start
+
+Do the {{TASK}} work. Result: {{RESULT}}
+
+**Transitions**: [done]
+
+## done
+
+Work is complete.
+`
+
+func TestNext_WithTemplate_MergesEvidenceIntoContext(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeTestTemplate(t, dir, testTemplateWithEvidence)
+
+	tmpl, err := template.Parse(tmplPath)
+	if err != nil {
+		t.Fatalf("template.Parse() error: %v", err)
+	}
+
+	statePath := filepath.Join(dir, "koto-test.state.json")
+	eng, err := engine.Init(statePath, tmpl.Machine, engine.InitMeta{
+		Name:         "test",
+		TemplateHash: tmpl.Hash,
+		Variables:    map[string]string{"TASK": "important"},
+	})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// The template has {{RESULT}} placeholder but there's no variable
+	// for it. Without evidence, it remains unresolved.
+	ctrl, err := New(eng, tmpl)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	d, err := ctrl.Next()
+	if err != nil {
+		t.Fatalf("Next() error: %v", err)
+	}
+
+	if !strings.Contains(d.Directive, "{{RESULT}}") {
+		t.Errorf("Directive = %q, want it to contain unresolved {{RESULT}}", d.Directive)
+	}
+
+	// Now rewind and add evidence via a self-transition trick:
+	// We need to use a machine that allows staying in start. Instead,
+	// let's create a fresh engine that has evidence pre-loaded.
+	// Actually, we can write a v2 state file with evidence directly.
+	stateData := `{
+		"schema_version": 2,
+		"workflow": {"name": "test", "template_hash": "` + tmpl.Hash + `", "template_path": "", "created_at": "2024-01-01T00:00:00Z"},
+		"version": 1,
+		"current_state": "start",
+		"variables": {"TASK": "important"},
+		"evidence": {"RESULT": "pass"},
+		"history": []
+	}`
+	statePath2 := filepath.Join(dir, "koto-test2.state.json")
+	if err := os.WriteFile(statePath2, []byte(stateData), 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	eng2, err := engine.Load(statePath2, tmpl.Machine)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	ctrl2, err := New(eng2, tmpl)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	d2, err := ctrl2.Next()
+	if err != nil {
+		t.Fatalf("Next() error: %v", err)
+	}
+
+	// The evidence value should be interpolated.
+	if !strings.Contains(d2.Directive, "pass") {
+		t.Errorf("Directive = %q, want it to contain %q (evidence value)", d2.Directive, "pass")
+	}
+	if strings.Contains(d2.Directive, "{{RESULT}}") {
+		t.Errorf("Directive = %q, should not contain unresolved {{RESULT}}", d2.Directive)
+	}
+
+	// Variables should also still be interpolated.
+	if !strings.Contains(d2.Directive, "important") {
+		t.Errorf("Directive = %q, want it to contain %q (variable value)", d2.Directive, "important")
+	}
+}

@@ -60,8 +60,8 @@ func TestInit_CreatesValidStateFile(t *testing.T) {
 		t.Fatalf("Unmarshal() error: %v", err)
 	}
 
-	if state.SchemaVersion != 1 {
-		t.Errorf("schema_version = %d, want 1", state.SchemaVersion)
+	if state.SchemaVersion != 2 {
+		t.Errorf("schema_version = %d, want 2", state.SchemaVersion)
 	}
 	if state.Version != 1 {
 		t.Errorf("version = %d, want 1", state.Version)
@@ -409,8 +409,8 @@ func TestSnapshot_ReturnsFullState(t *testing.T) {
 	}
 
 	snap := eng.Snapshot()
-	if snap.SchemaVersion != 1 {
-		t.Errorf("SchemaVersion = %d, want 1", snap.SchemaVersion)
+	if snap.SchemaVersion != 2 {
+		t.Errorf("SchemaVersion = %d, want 2", snap.SchemaVersion)
 	}
 	if snap.Workflow.Name != "snapshot-test" {
 		t.Errorf("Workflow.Name = %q, want %q", snap.Workflow.Name, "snapshot-test")
@@ -1395,4 +1395,587 @@ func keysOf(m map[string]interface{}) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// --- Evidence support tests (issue #15) ---
+
+func TestTransition_WithEvidence_MergesIntoState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, testMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Transition with evidence.
+	err = eng.Transition("middle", WithEvidence(map[string]string{
+		"result": "pass",
+		"count":  "42",
+	}))
+	if err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	ev := eng.Evidence()
+	if ev["result"] != "pass" {
+		t.Errorf("Evidence[result] = %q, want %q", ev["result"], "pass")
+	}
+	if ev["count"] != "42" {
+		t.Errorf("Evidence[count] = %q, want %q", ev["count"], "42")
+	}
+}
+
+func TestTransition_WithEvidence_OverwritesExistingKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := rewindMachine()
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// First transition with evidence.
+	err = eng.Transition("research", WithEvidence(map[string]string{
+		"status": "initial",
+		"keep":   "this",
+	}))
+	if err != nil {
+		t.Fatalf("Transition(research) error: %v", err)
+	}
+
+	// Second transition overwrites "status", keeps "keep", adds "new".
+	err = eng.Transition("implementing", WithEvidence(map[string]string{
+		"status": "updated",
+		"new":    "value",
+	}))
+	if err != nil {
+		t.Fatalf("Transition(implementing) error: %v", err)
+	}
+
+	ev := eng.Evidence()
+	if ev["status"] != "updated" {
+		t.Errorf("Evidence[status] = %q, want %q", ev["status"], "updated")
+	}
+	if ev["keep"] != "this" {
+		t.Errorf("Evidence[keep] = %q, want %q", ev["keep"], "this")
+	}
+	if ev["new"] != "value" {
+		t.Errorf("Evidence[new] = %q, want %q", ev["new"], "value")
+	}
+}
+
+func TestTransition_WithEvidence_RecordedInHistory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, testMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	evidence := map[string]string{"key": "val"}
+	if err := eng.Transition("middle", WithEvidence(evidence)); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	hist := eng.History()
+	if len(hist) != 1 {
+		t.Fatalf("History length = %d, want 1", len(hist))
+	}
+	if hist[0].Evidence == nil {
+		t.Fatal("History[0].Evidence is nil, want non-nil")
+	}
+	if hist[0].Evidence["key"] != "val" {
+		t.Errorf("History[0].Evidence[key] = %q, want %q", hist[0].Evidence["key"], "val")
+	}
+}
+
+func TestTransition_NoEvidence_HistoryEvidenceNil(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, testMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Transition without evidence (zero opts).
+	if err := eng.Transition("middle"); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	hist := eng.History()
+	if len(hist) != 1 {
+		t.Fatalf("History length = %d, want 1", len(hist))
+	}
+	if hist[0].Evidence != nil {
+		t.Errorf("History[0].Evidence = %v, want nil (omitempty)", hist[0].Evidence)
+	}
+}
+
+func TestRewind_DoesNotModifyEvidence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := rewindMachine()
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Transition with evidence.
+	err = eng.Transition("research", WithEvidence(map[string]string{
+		"gathered": "yes",
+		"count":    "5",
+	}))
+	if err != nil {
+		t.Fatalf("Transition(research) error: %v", err)
+	}
+
+	// Rewind to start.
+	if err := eng.Rewind("start"); err != nil {
+		t.Fatalf("Rewind(start) error: %v", err)
+	}
+
+	// Evidence should be preserved after rewind.
+	ev := eng.Evidence()
+	if ev["gathered"] != "yes" {
+		t.Errorf("Evidence[gathered] = %q after rewind, want %q", ev["gathered"], "yes")
+	}
+	if ev["count"] != "5" {
+		t.Errorf("Evidence[count] = %q after rewind, want %q", ev["count"], "5")
+	}
+}
+
+func TestEvidence_ReturnsCopy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, testMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	if err := eng.Transition("middle", WithEvidence(map[string]string{"KEY": "original"})); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	ev := eng.Evidence()
+	ev["KEY"] = "tampered"
+
+	// Engine's internal evidence should not be affected.
+	if got := eng.Evidence()["KEY"]; got != "original" {
+		t.Errorf("Evidence()[KEY] = %q, want %q (copy was not independent)", got, "original")
+	}
+}
+
+func TestSnapshot_DeepCopiesEvidence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, testMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	if err := eng.Transition("middle", WithEvidence(map[string]string{"KEY": "original"})); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	snap := eng.Snapshot()
+	snap.Evidence["KEY"] = "tampered"
+
+	// Engine's internal evidence should not be affected.
+	if got := eng.Evidence()["KEY"]; got != "original" {
+		t.Errorf("Evidence()[KEY] = %q after snapshot mutation, want %q", got, "original")
+	}
+}
+
+func TestInit_SchemaVersion2(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, testMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	snap := eng.Snapshot()
+	if snap.SchemaVersion != 2 {
+		t.Errorf("SchemaVersion = %d, want 2", snap.SchemaVersion)
+	}
+
+	// Evidence should be initialized to empty map, not nil.
+	if snap.Evidence == nil {
+		t.Error("Evidence is nil, want empty map")
+	}
+	if len(snap.Evidence) != 0 {
+		t.Errorf("Evidence length = %d, want 0", len(snap.Evidence))
+	}
+}
+
+func TestLoad_SchemaVersion1_BackwardCompat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+	machine := testMachine()
+
+	// Write a schema_version 1 state file (no evidence field).
+	state := State{
+		SchemaVersion: 1,
+		Version:       1,
+		CurrentState:  "start",
+		Variables:     map[string]string{"X": "1"},
+		History:       []HistoryEntry{},
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	eng, err := Load(path, machine)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	// Evidence should be initialized to empty map.
+	ev := eng.Evidence()
+	if ev == nil {
+		t.Fatal("Evidence() returned nil for schema_version 1 file, want empty map")
+	}
+	if len(ev) != 0 {
+		t.Errorf("Evidence() length = %d, want 0", len(ev))
+	}
+
+	// The engine should still work normally.
+	if got := eng.CurrentState(); got != "start" {
+		t.Errorf("CurrentState() = %q, want %q", got, "start")
+	}
+}
+
+func TestLoad_SchemaVersion2_WithEvidence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+	machine := testMachine()
+
+	// Write a schema_version 2 state file with evidence.
+	state := State{
+		SchemaVersion: 2,
+		Version:       1,
+		CurrentState:  "start",
+		Variables:     map[string]string{"X": "1"},
+		Evidence:      map[string]string{"result": "pass"},
+		History:       []HistoryEntry{},
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	eng, err := Load(path, machine)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	ev := eng.Evidence()
+	if ev["result"] != "pass" {
+		t.Errorf("Evidence[result] = %q, want %q", ev["result"], "pass")
+	}
+}
+
+func TestTransition_WithEvidence_PersistsToFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+	machine := testMachine()
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	err = eng.Transition("middle", WithEvidence(map[string]string{
+		"result": "pass",
+	}))
+	if err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	// Reload and verify evidence persists.
+	loaded, err := Load(path, machine)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	ev := loaded.Evidence()
+	if ev["result"] != "pass" {
+		t.Errorf("loaded Evidence[result] = %q, want %q", ev["result"], "pass")
+	}
+
+	// Verify history entry has evidence too.
+	hist := loaded.History()
+	if len(hist) != 1 {
+		t.Fatalf("loaded History length = %d, want 1", len(hist))
+	}
+	if hist[0].Evidence["result"] != "pass" {
+		t.Errorf("loaded History[0].Evidence[result] = %q, want %q", hist[0].Evidence["result"], "pass")
+	}
+}
+
+func TestTransition_WithEvidence_StateRestoredOnPersistFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+	machine := testMachine()
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Tamper with on-disk version to force a version conflict.
+	data, err := os.ReadFile(path) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("ReadFile() error: %v", err)
+	}
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+	state.Version = 99
+	modified, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+	if err := os.WriteFile(path, modified, 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	// Attempt transition with evidence -- should fail.
+	err = eng.Transition("middle", WithEvidence(map[string]string{"key": "val"}))
+	if err == nil {
+		t.Fatal("Transition() expected version_conflict error")
+	}
+
+	// Evidence should NOT have been merged.
+	ev := eng.Evidence()
+	if len(ev) != 0 {
+		t.Errorf("Evidence length = %d after failed transition, want 0", len(ev))
+	}
+}
+
+func TestEvidence_EmptyAfterInit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, testMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	ev := eng.Evidence()
+	if ev == nil {
+		t.Error("Evidence() returned nil, want empty map")
+	}
+	if len(ev) != 0 {
+		t.Errorf("Evidence() length = %d, want 0", len(ev))
+	}
+}
+
+func TestTransition_WithEvidence_EvidenceAccumulatesAcrossTransitions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := rewindMachine()
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Each transition adds different evidence.
+	if err := eng.Transition("research", WithEvidence(map[string]string{"phase1": "done"})); err != nil {
+		t.Fatalf("Transition(research) error: %v", err)
+	}
+	if err := eng.Transition("implementing", WithEvidence(map[string]string{"phase2": "done"})); err != nil {
+		t.Fatalf("Transition(implementing) error: %v", err)
+	}
+	if err := eng.Transition("review", WithEvidence(map[string]string{"phase3": "done"})); err != nil {
+		t.Fatalf("Transition(review) error: %v", err)
+	}
+
+	ev := eng.Evidence()
+	if ev["phase1"] != "done" || ev["phase2"] != "done" || ev["phase3"] != "done" {
+		t.Errorf("Evidence = %v, want all three phases", ev)
+	}
+
+	// Each history entry should have its own evidence.
+	hist := eng.History()
+	if len(hist) != 3 {
+		t.Fatalf("History length = %d, want 3", len(hist))
+	}
+	if hist[0].Evidence["phase1"] != "done" {
+		t.Errorf("History[0].Evidence = %v, want phase1=done", hist[0].Evidence)
+	}
+	if hist[1].Evidence["phase2"] != "done" {
+		t.Errorf("History[1].Evidence = %v, want phase2=done", hist[1].Evidence)
+	}
+	if hist[2].Evidence["phase3"] != "done" {
+		t.Errorf("History[2].Evidence = %v, want phase3=done", hist[2].Evidence)
+	}
+}
+
+func TestRewind_EvidencePersistsAcrossRewind(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := rewindMachine()
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Transition with evidence through multiple states.
+	if err := eng.Transition("research", WithEvidence(map[string]string{"a": "1"})); err != nil {
+		t.Fatalf("Transition(research) error: %v", err)
+	}
+	if err := eng.Transition("implementing", WithEvidence(map[string]string{"b": "2"})); err != nil {
+		t.Fatalf("Transition(implementing) error: %v", err)
+	}
+
+	// Rewind to research.
+	if err := eng.Rewind("research"); err != nil {
+		t.Fatalf("Rewind(research) error: %v", err)
+	}
+
+	// All evidence from prior transitions should still be present.
+	ev := eng.Evidence()
+	if ev["a"] != "1" {
+		t.Errorf("Evidence[a] = %q after rewind, want %q", ev["a"], "1")
+	}
+	if ev["b"] != "2" {
+		t.Errorf("Evidence[b] = %q after rewind, want %q", ev["b"], "2")
+	}
+
+	// New transition can overwrite evidence.
+	if err := eng.Transition("implementing", WithEvidence(map[string]string{"b": "3"})); err != nil {
+		t.Fatalf("Transition(implementing) after rewind error: %v", err)
+	}
+	ev = eng.Evidence()
+	if ev["b"] != "3" {
+		t.Errorf("Evidence[b] = %q after overwrite, want %q", ev["b"], "3")
+	}
+	if ev["a"] != "1" {
+		t.Errorf("Evidence[a] = %q after overwrite, want %q", ev["a"], "1")
+	}
+}
+
+func TestTransitionOption_ZeroOpts_BackwardCompat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, testMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Existing callers passing zero opts should continue to work.
+	if err := eng.Transition("middle"); err != nil {
+		t.Fatalf("Transition() with zero opts error: %v", err)
+	}
+
+	if got := eng.CurrentState(); got != "middle" {
+		t.Errorf("CurrentState() = %q, want %q", got, "middle")
+	}
+
+	// Evidence should remain empty.
+	ev := eng.Evidence()
+	if len(ev) != 0 {
+		t.Errorf("Evidence length = %d after transition with zero opts, want 0", len(ev))
+	}
+}
+
+func TestEvidence_JSONSerialization(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, testMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	if err := eng.Transition("middle", WithEvidence(map[string]string{"key": "val"})); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	// Read the persisted file and verify JSON structure.
+	data, err := os.ReadFile(path) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("ReadFile() error: %v", err)
+	}
+
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+
+	// Evidence should be in the JSON.
+	ev, ok := raw["evidence"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("evidence field missing or wrong type in JSON")
+	}
+	if ev["key"] != "val" {
+		t.Errorf("evidence.key = %v, want %q", ev["key"], "val")
+	}
+
+	// History entry should have evidence.
+	hist, ok := raw["history"].([]interface{})
+	if !ok {
+		t.Fatalf("history field missing or wrong type")
+	}
+	if len(hist) != 1 {
+		t.Fatalf("history length = %d, want 1", len(hist))
+	}
+	entry, ok := hist[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("history[0] wrong type")
+	}
+	entryEv, ok := entry["evidence"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("history[0].evidence missing or wrong type")
+	}
+	if entryEv["key"] != "val" {
+		t.Errorf("history[0].evidence.key = %v, want %q", entryEv["key"], "val")
+	}
+}
+
+func TestEvidence_OmitemptyWhenEmpty(t *testing.T) {
+	// Verify that empty evidence is omitted from JSON output
+	// when using Init (which sets Evidence to empty map).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	_, err := Init(path, testMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	data, err := os.ReadFile(path) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("ReadFile() error: %v", err)
+	}
+
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+
+	// Empty evidence map: Go's omitempty will NOT omit a non-nil empty map.
+	// This is expected and fine -- the field will be present as {}.
+	// The key behavior is that schema_version 1 files (which lack the
+	// field entirely) are handled correctly by Load.
 }

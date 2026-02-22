@@ -72,7 +72,13 @@ func (c *Controller) Next() (*Directive, error) {
 	directive := "Execute the " + current + " phase of the workflow."
 	if c.tmpl != nil {
 		if section, ok := c.tmpl.Sections[current]; ok {
-			directive = template.Interpolate(section, c.eng.Variables())
+			// Build interpolation context: variable defaults, init-time
+			// vars, then evidence (last wins on key collision).
+			ctx := c.eng.Variables()
+			for k, v := range c.eng.Evidence() {
+				ctx[k] = v
+			}
+			directive = template.Interpolate(section, ctx)
 		}
 	}
 

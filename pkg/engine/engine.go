@@ -24,6 +24,25 @@ type InitMeta struct {
 	Variables    map[string]string
 }
 
+// transitionConfig holds configuration for a single transition,
+// populated by TransitionOption functions.
+type transitionConfig struct {
+	evidence map[string]string
+}
+
+// TransitionOption is a functional option for Engine.Transition.
+type TransitionOption func(*transitionConfig)
+
+// WithEvidence returns a TransitionOption that attaches evidence
+// key-value pairs to a transition. Evidence is merged into
+// State.Evidence on success (new keys added, existing keys
+// overwritten) and recorded in the HistoryEntry.
+func WithEvidence(evidence map[string]string) TransitionOption {
+	return func(cfg *transitionConfig) {
+		cfg.evidence = evidence
+	}
+}
+
 // Init creates a new workflow state file and returns an engine for it.
 // The state file is written atomically to the given path.
 func Init(statePath string, machine *Machine, meta InitMeta) (*Engine, error) {
@@ -40,7 +59,7 @@ func Init(statePath string, machine *Machine, meta InitMeta) (*Engine, error) {
 	}
 
 	state := State{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Workflow: WorkflowMeta{
 			Name:         meta.Name,
 			TemplateHash: meta.TemplateHash,
@@ -50,6 +69,7 @@ func Init(statePath string, machine *Machine, meta InitMeta) (*Engine, error) {
 		Version:      1,
 		CurrentState: machine.InitialState,
 		Variables:    vars,
+		Evidence:     map[string]string{},
 		History:      []HistoryEntry{},
 	}
 
@@ -78,6 +98,14 @@ func Load(statePath string, machine *Machine) (*Engine, error) {
 		return nil, fmt.Errorf("parse state file: %w", err)
 	}
 
+	// Accept schema_version 1 (backward compat) and 2.
+	// Version 1 files lack the Evidence field; initialize it.
+	if state.SchemaVersion == 1 {
+		if state.Evidence == nil {
+			state.Evidence = map[string]string{}
+		}
+	}
+
 	if _, ok := machine.States[state.CurrentState]; !ok {
 		return nil, &TransitionError{
 			Code:         ErrUnknownState,
@@ -96,7 +124,16 @@ func Load(statePath string, machine *Machine) (*Engine, error) {
 // Transition advances to the target state. It validates the transition
 // is allowed, updates state, and persists atomically. If persistence
 // fails, the in-memory state is restored to its pre-transition value.
-func (e *Engine) Transition(target string) error {
+//
+// Optional TransitionOption values can be passed to attach evidence
+// or other metadata to the transition. Existing callers passing zero
+// options continue to compile and work unchanged.
+func (e *Engine) Transition(target string, opts ...TransitionOption) error {
+	var cfg transitionConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	current := e.state.CurrentState
 	ms, ok := e.machine.States[current]
 	if !ok {
@@ -128,14 +165,33 @@ func (e *Engine) Transition(target string) error {
 
 	prev := deepCopyState(e.state)
 
-	e.state.CurrentState = target
-	e.state.Version++
-	e.state.History = append(e.state.History, HistoryEntry{
+	// Build the history entry, recording any evidence supplied.
+	entry := HistoryEntry{
 		From:      current,
 		To:        target,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Type:      "transition",
-	})
+	}
+	if len(cfg.evidence) > 0 {
+		entry.Evidence = make(map[string]string, len(cfg.evidence))
+		for k, v := range cfg.evidence {
+			entry.Evidence[k] = v
+		}
+	}
+
+	// Merge evidence into state (new keys added, existing overwritten).
+	if len(cfg.evidence) > 0 {
+		if e.state.Evidence == nil {
+			e.state.Evidence = make(map[string]string)
+		}
+		for k, v := range cfg.evidence {
+			e.state.Evidence[k] = v
+		}
+	}
+
+	e.state.CurrentState = target
+	e.state.Version++
+	e.state.History = append(e.state.History, entry)
 
 	if err := e.persist(); err != nil {
 		e.state = prev
@@ -227,6 +283,15 @@ func (e *Engine) Variables() map[string]string {
 	return out
 }
 
+// Evidence returns a copy of the accumulated evidence map.
+func (e *Engine) Evidence() map[string]string {
+	out := make(map[string]string, len(e.state.Evidence))
+	for k, v := range e.state.Evidence {
+		out[k] = v
+	}
+	return out
+}
+
 // History returns the transition history.
 func (e *Engine) History() []HistoryEntry {
 	out := make([]HistoryEntry, len(e.state.History))
@@ -235,9 +300,12 @@ func (e *Engine) History() []HistoryEntry {
 }
 
 // Snapshot returns a copy of the full state for serialization to JSON.
+// The returned State shares no references with the engine's internal
+// state: Variables, Evidence, and History are all deep copied.
 func (e *Engine) Snapshot() State {
 	s := e.state
 	s.Variables = e.Variables()
+	s.Evidence = e.Evidence()
 	s.History = e.History()
 	return s
 }
@@ -399,6 +467,13 @@ func deepCopyState(s State) State {
 		cp.Variables = make(map[string]string, len(s.Variables))
 		for k, v := range s.Variables {
 			cp.Variables[k] = v
+		}
+	}
+
+	if s.Evidence != nil {
+		cp.Evidence = make(map[string]string, len(s.Evidence))
+		for k, v := range s.Evidence {
+			cp.Evidence[k] = v
 		}
 	}
 

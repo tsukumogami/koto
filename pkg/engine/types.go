@@ -12,6 +12,7 @@ type State struct {
 	Version       int               `json:"version"`
 	CurrentState  string            `json:"current_state"`
 	Variables     map[string]string `json:"variables"`
+	Evidence      map[string]string `json:"evidence,omitempty"`
 	History       []HistoryEntry    `json:"history"`
 }
 
@@ -25,10 +26,11 @@ type WorkflowMeta struct {
 
 // HistoryEntry records a single state change.
 type HistoryEntry struct {
-	From      string `json:"from"`
-	To        string `json:"to"`
-	Timestamp string `json:"timestamp"`
-	Type      string `json:"type"` // "transition" or "rewind"
+	From      string            `json:"from"`
+	To        string            `json:"to"`
+	Timestamp string            `json:"timestamp"`
+	Type      string            `json:"type"` // "transition" or "rewind"
+	Evidence  map[string]string `json:"evidence,omitempty"`
 }
 
 // Machine is the in-memory representation of a state machine definition.
