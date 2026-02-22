@@ -1,0 +1,51 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - ineffassign
+    - unused
+    - misspell
+    - gosec
+    - bodyclose
+    - dupl
+
+  settings:
+    misspell:
+      locale: US
+
+    gosec:
+      excludes:
+        # Errors unhandled in cleanup (defer Close, etc.)
+        - G104
+
+    dupl:
+      threshold: 250
+
+    errcheck:
+      exclude-functions:
+        - (*os.File).Close
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+        - os.Remove
+        - os.RemoveAll
+        - fmt.Fprintf
+
+    staticcheck:
+      checks:
+        - "all"
+        - "-ST*"
+        - "-QF*"
+
+run:
+  relative-path-mode: cfg
+  timeout: 5m
+
+issues:
+  exclusions:
+    presets:
+      - comments
+      - std-error-handling

@@ -1,13 +1,33 @@
 name: validate
 
 on:
-  pull_request:
-    branches: [main]
   push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
     branches: [main]
 
 jobs:
-  validate:
+  check-artifacts:
+    name: Check Artifacts
+    if: ${{ github.event.pull_request.draft != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for work artifacts
+        run: |
+          failed=0
+          for dir in wip; do
+            if [ -d "$dir" ] && [ "$(ls -A "$dir" 2>/dev/null)" ]; then
+              echo "::error::$dir/ contains intermediate work artifacts that should not be merged into main. Delete this folder before merging, or convert the PR to a draft while work is in progress."
+              ls -la "$dir/"
+              failed=1
+            fi
+          done
+          exit $failed
+
+  unit-tests:
+    name: Unit Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,6 +36,49 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - run: go vet ./...
-      - run: go test ./...
-      - run: go build ./...
+      - run: go mod download
+
+      - name: Run tests
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            go test -short -race -coverprofile=coverage.out ./...
+          else
+            go test -short ./...
+          fi
+
+      - name: Check for test artifacts
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Tests left artifacts in the source tree."
+            git status --porcelain
+            exit 1
+          fi
+
+  lint-tests:
+    name: Lint Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: go mod download
+
+      - name: Run lint tests
+        run: go test -v -run 'Test(GolangCILint|GoFmt|GoModTidy|GoVet|Govulncheck)' .
+
+  validate:
+    name: validate
+    needs: [check-artifacts, unit-tests, lint-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          if [ "${{ needs.check-artifacts.result }}" = "failure" ] || \
+             [ "${{ needs.unit-tests.result }}" = "failure" ] || \
+             [ "${{ needs.lint-tests.result }}" = "failure" ]; then
+            exit 1
+          fi
