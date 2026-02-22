@@ -191,7 +191,10 @@ func cmdNext(args []string) error {
 		return err
 	}
 
-	ctrl := controller.New(eng)
+	ctrl, err := controller.New(eng, "")
+	if err != nil {
+		return err
+	}
 	d, err := ctrl.Next()
 	if err != nil {
 		return err

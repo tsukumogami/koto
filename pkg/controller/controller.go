@@ -4,6 +4,8 @@
 package controller
 
 import (
+	"fmt"
+
 	"github.com/tsukumogami/koto/pkg/engine"
 )
 
@@ -20,12 +22,26 @@ type Directive struct {
 	Message   string `json:"message,omitempty"`   // completion message (done only)
 }
 
-// New creates a controller wrapping the given engine.
+// New creates a controller wrapping the given engine. The templateHash
+// parameter is the SHA-256 hash of the current template file on disk.
+// If it does not match the hash stored in the engine's state file,
+// New returns a template_mismatch error.
 //
-// In this skeleton, template hash verification is skipped. Full hash
-// verification will be added in issue #6.
-func New(eng *engine.Engine) *Controller {
-	return &Controller{eng: eng}
+// Pass an empty string to skip hash verification (useful when the
+// template package is not yet available).
+func New(eng *engine.Engine, templateHash string) (*Controller, error) {
+	if templateHash != "" {
+		storedHash := eng.Snapshot().Workflow.TemplateHash
+		if storedHash != templateHash {
+			return nil, &engine.TransitionError{
+				Code: engine.ErrTemplateMismatch,
+				Message: fmt.Sprintf(
+					"template hash mismatch: state file has %q but template on disk is %q",
+					storedHash, templateHash),
+			}
+		}
+	}
+	return &Controller{eng: eng}, nil
 }
 
 // Next returns the directive for the current state.
@@ -39,7 +55,7 @@ func (c *Controller) Next() (*Directive, error) {
 	ms, ok := machine.States[current]
 	if !ok {
 		return nil, &engine.TransitionError{
-			Code:         "unknown_state",
+			Code:         engine.ErrUnknownState,
 			Message:      "current state not found in machine definition: " + current,
 			CurrentState: current,
 		}

@@ -29,7 +29,7 @@ type InitMeta struct {
 func Init(statePath string, machine *Machine, meta InitMeta) (*Engine, error) {
 	if _, ok := machine.States[machine.InitialState]; !ok {
 		return nil, &TransitionError{
-			Code:    "unknown_state",
+			Code:    ErrUnknownState,
 			Message: fmt.Sprintf("initial state %q not found in machine definition", machine.InitialState),
 		}
 	}
@@ -80,7 +80,7 @@ func Load(statePath string, machine *Machine) (*Engine, error) {
 
 	if _, ok := machine.States[state.CurrentState]; !ok {
 		return nil, &TransitionError{
-			Code:         "unknown_state",
+			Code:         ErrUnknownState,
 			Message:      fmt.Sprintf("current state %q not found in machine definition", state.CurrentState),
 			CurrentState: state.CurrentState,
 		}
@@ -100,7 +100,7 @@ func (e *Engine) Transition(target string) error {
 	ms, ok := e.machine.States[current]
 	if !ok {
 		return &TransitionError{
-			Code:         "unknown_state",
+			Code:         ErrUnknownState,
 			Message:      fmt.Sprintf("current state %q not found in machine definition", current),
 			CurrentState: current,
 		}
@@ -108,7 +108,7 @@ func (e *Engine) Transition(target string) error {
 
 	if ms.Terminal {
 		return &TransitionError{
-			Code:         "terminal_state",
+			Code:         ErrTerminalState,
 			Message:      fmt.Sprintf("cannot transition from terminal state %q", current),
 			CurrentState: current,
 			TargetState:  target,
@@ -117,7 +117,7 @@ func (e *Engine) Transition(target string) error {
 
 	if !contains(ms.Transitions, target) {
 		return &TransitionError{
-			Code:             "invalid_transition",
+			Code:             ErrInvalidTransition,
 			Message:          fmt.Sprintf("cannot transition from %q to %q: not in allowed transitions %v", current, target, ms.Transitions),
 			CurrentState:     current,
 			TargetState:      target,
@@ -145,7 +145,7 @@ func (e *Engine) Rewind(target string) error {
 	ms, ok := e.machine.States[target]
 	if !ok {
 		return &TransitionError{
-			Code:         "rewind_failed",
+			Code:         ErrRewindFailed,
 			Message:      fmt.Sprintf("cannot rewind to %q: state not found in machine definition", target),
 			CurrentState: e.state.CurrentState,
 			TargetState:  target,
@@ -154,7 +154,7 @@ func (e *Engine) Rewind(target string) error {
 
 	if ms.Terminal {
 		return &TransitionError{
-			Code:         "rewind_failed",
+			Code:         ErrRewindFailed,
 			Message:      fmt.Sprintf("cannot rewind to %q: target is a terminal state", target),
 			CurrentState: e.state.CurrentState,
 			TargetState:  target,
@@ -173,7 +173,7 @@ func (e *Engine) Rewind(target string) error {
 		}
 		if !found {
 			return &TransitionError{
-				Code:         "rewind_failed",
+				Code:         ErrRewindFailed,
 				Message:      fmt.Sprintf("cannot rewind to %q: state has never been visited", target),
 				CurrentState: e.state.CurrentState,
 				TargetState:  target,
@@ -253,14 +253,57 @@ func (e *Engine) Machine() *Machine {
 	}
 }
 
-// persist writes the current state to disk atomically.
+// persist writes the current state to disk atomically. Before writing,
+// it re-reads the on-disk version to detect concurrent modifications.
+// If the on-disk version differs from the expected version, persist
+// returns a version_conflict error.
 func (e *Engine) persist() error {
 	data, err := json.MarshalIndent(e.state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}
 	data = append(data, '\n')
+
+	// Check for version conflict before writing. The expected version
+	// is the version we had before the current mutation incremented it.
+	// For Init (version=1, no prior file), we skip the check.
+	expectedVersion := e.state.Version - 1
+	if expectedVersion > 0 {
+		if err := e.checkVersionConflict(expectedVersion); err != nil {
+			return err
+		}
+	}
+
 	return atomicWrite(e.path, data)
+}
+
+// checkVersionConflict re-reads the state file's version field and
+// returns a version_conflict error if it differs from expected.
+func (e *Engine) checkVersionConflict(expectedVersion int) error {
+	diskData, err := os.ReadFile(e.path) //nolint:gosec // G304: engine re-reads its own state file path
+	if err != nil {
+		// If the file doesn't exist (e.g., first write after Init), no conflict.
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("re-read state file for version check: %w", err)
+	}
+
+	var diskState struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(diskData, &diskState); err != nil {
+		return fmt.Errorf("parse state file for version check: %w", err)
+	}
+
+	if diskState.Version != expectedVersion {
+		return &TransitionError{
+			Code:    ErrVersionConflict,
+			Message: fmt.Sprintf("version conflict: expected version %d but found %d on disk", expectedVersion, diskState.Version),
+		}
+	}
+
+	return nil
 }
 
 // atomicWrite writes data to path using write-to-temp-then-rename.

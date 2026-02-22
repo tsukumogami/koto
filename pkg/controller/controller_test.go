@@ -31,7 +31,10 @@ func TestNext_NonTerminalState(t *testing.T) {
 		t.Fatalf("Init() error: %v", err)
 	}
 
-	ctrl := New(eng)
+	ctrl, err := New(eng, "")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
 	d, err := ctrl.Next()
 	if err != nil {
 		t.Fatalf("Next() error: %v", err)
@@ -65,7 +68,10 @@ func TestNext_TerminalState(t *testing.T) {
 		t.Fatalf("Transition() error: %v", err)
 	}
 
-	ctrl := New(eng)
+	ctrl, err := New(eng, "")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
 	d, err := ctrl.Next()
 	if err != nil {
 		t.Fatalf("Next() error: %v", err)
@@ -82,5 +88,76 @@ func TestNext_TerminalState(t *testing.T) {
 	}
 	if d.Directive != "" {
 		t.Errorf("Directive = %q, want empty for done action", d.Directive)
+	}
+}
+
+func TestNew_TemplateHashMatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := engine.Init(path, testMachine(), engine.InitMeta{
+		Name:         "test",
+		TemplateHash: "sha256:abc123",
+	})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Same hash should succeed.
+	ctrl, err := New(eng, "sha256:abc123")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	if ctrl == nil {
+		t.Fatal("New() returned nil controller")
+	}
+}
+
+func TestNew_TemplateHashMismatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := engine.Init(path, testMachine(), engine.InitMeta{
+		Name:         "test",
+		TemplateHash: "sha256:abc123",
+	})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Different hash should fail with template_mismatch.
+	_, err = New(eng, "sha256:different")
+	if err == nil {
+		t.Fatal("New() expected error for template hash mismatch")
+	}
+
+	te, ok := err.(*engine.TransitionError)
+	if !ok {
+		t.Fatalf("expected *engine.TransitionError, got %T", err)
+	}
+	if te.Code != engine.ErrTemplateMismatch {
+		t.Errorf("error code = %q, want %q", te.Code, engine.ErrTemplateMismatch)
+	}
+}
+
+func TestNew_EmptyHashSkipsVerification(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := engine.Init(path, testMachine(), engine.InitMeta{
+		Name:         "test",
+		TemplateHash: "sha256:abc123",
+	})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Empty hash should skip verification.
+	ctrl, err := New(eng, "")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	if ctrl == nil {
+		t.Fatal("New() returned nil controller")
 	}
 }

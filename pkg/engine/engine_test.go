@@ -102,8 +102,8 @@ func TestInit_InvalidInitialState(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *TransitionError, got %T", err)
 	}
-	if te.Code != "unknown_state" {
-		t.Errorf("error code = %q, want %q", te.Code, "unknown_state")
+	if te.Code != ErrUnknownState {
+		t.Errorf("error code = %q, want %q", te.Code, ErrUnknownState)
 	}
 }
 
@@ -165,8 +165,8 @@ func TestLoad_InvalidCurrentState(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *TransitionError, got %T", err)
 	}
-	if te.Code != "unknown_state" {
-		t.Errorf("error code = %q, want %q", te.Code, "unknown_state")
+	if te.Code != ErrUnknownState {
+		t.Errorf("error code = %q, want %q", te.Code, ErrUnknownState)
 	}
 }
 
@@ -232,8 +232,8 @@ func TestTransition_FromTerminalState(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *TransitionError, got %T", err)
 	}
-	if te.Code != "terminal_state" {
-		t.Errorf("error code = %q, want %q", te.Code, "terminal_state")
+	if te.Code != ErrTerminalState {
+		t.Errorf("error code = %q, want %q", te.Code, ErrTerminalState)
 	}
 	if te.CurrentState != "done" {
 		t.Errorf("current_state = %q, want %q", te.CurrentState, "done")
@@ -258,8 +258,8 @@ func TestTransition_InvalidTarget(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *TransitionError, got %T", err)
 	}
-	if te.Code != "invalid_transition" {
-		t.Errorf("error code = %q, want %q", te.Code, "invalid_transition")
+	if te.Code != ErrInvalidTransition {
+		t.Errorf("error code = %q, want %q", te.Code, ErrInvalidTransition)
 	}
 	if te.CurrentState != "start" {
 		t.Errorf("current_state = %q, want %q", te.CurrentState, "start")
@@ -662,8 +662,8 @@ func TestRewind_ToNeverVisitedState(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *TransitionError, got %T", err)
 	}
-	if te.Code != "rewind_failed" {
-		t.Errorf("error code = %q, want %q", te.Code, "rewind_failed")
+	if te.Code != ErrRewindFailed {
+		t.Errorf("error code = %q, want %q", te.Code, ErrRewindFailed)
 	}
 }
 
@@ -698,8 +698,8 @@ func TestRewind_ToTerminalState(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *TransitionError, got %T", err)
 	}
-	if te.Code != "rewind_failed" {
-		t.Errorf("error code = %q, want %q", te.Code, "rewind_failed")
+	if te.Code != ErrRewindFailed {
+		t.Errorf("error code = %q, want %q", te.Code, ErrRewindFailed)
 	}
 }
 
@@ -721,8 +721,8 @@ func TestRewind_ToUnknownState(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *TransitionError, got %T", err)
 	}
-	if te.Code != "rewind_failed" {
-		t.Errorf("error code = %q, want %q", te.Code, "rewind_failed")
+	if te.Code != ErrRewindFailed {
+		t.Errorf("error code = %q, want %q", te.Code, ErrRewindFailed)
 	}
 }
 
@@ -884,4 +884,377 @@ func TestRewind_HistoryPreserved(t *testing.T) {
 			t.Errorf("History[%d].Type = %q, want %q", i, hist[i].Type, want.typ)
 		}
 	}
+}
+
+func TestTransitionError_JSONShape(t *testing.T) {
+	// Full error with all fields populated.
+	te := &TransitionError{
+		Code:             ErrInvalidTransition,
+		Message:          "cannot transition from 'research' to 'submitting': not in allowed transitions [validation_jury]",
+		CurrentState:     "research",
+		TargetState:      "submitting",
+		ValidTransitions: []string{"validation_jury"},
+	}
+
+	data, err := json.Marshal(te)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+
+	if m["code"] != "invalid_transition" {
+		t.Errorf("code = %v, want %q", m["code"], "invalid_transition")
+	}
+	if m["message"] != te.Message {
+		t.Errorf("message = %v, want %q", m["message"], te.Message)
+	}
+	if m["current_state"] != "research" {
+		t.Errorf("current_state = %v, want %q", m["current_state"], "research")
+	}
+	if m["target_state"] != "submitting" {
+		t.Errorf("target_state = %v, want %q", m["target_state"], "submitting")
+	}
+	transitions, ok := m["valid_transitions"].([]interface{})
+	if !ok || len(transitions) != 1 || transitions[0] != "validation_jury" {
+		t.Errorf("valid_transitions = %v, want [validation_jury]", m["valid_transitions"])
+	}
+}
+
+func TestTransitionError_JSONOmitempty(t *testing.T) {
+	// Error with only code and message -- optional fields should be omitted.
+	te := &TransitionError{
+		Code:    ErrVersionConflict,
+		Message: "version conflict detected",
+	}
+
+	data, err := json.Marshal(te)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+
+	// Only code and message should be present.
+	if len(m) != 2 {
+		t.Errorf("JSON has %d keys, want 2 (code, message); got keys: %v", len(m), keysOf(m))
+	}
+	if _, exists := m["current_state"]; exists {
+		t.Error("current_state should be omitted when empty")
+	}
+	if _, exists := m["target_state"]; exists {
+		t.Error("target_state should be omitted when empty")
+	}
+	if _, exists := m["valid_transitions"]; exists {
+		t.Error("valid_transitions should be omitted when empty")
+	}
+}
+
+func TestTransitionError_AllCodes(t *testing.T) {
+	// Verify all six error codes are defined and serialize correctly.
+	codes := []string{
+		ErrTerminalState,
+		ErrInvalidTransition,
+		ErrUnknownState,
+		ErrTemplateMismatch,
+		ErrVersionConflict,
+		ErrRewindFailed,
+	}
+
+	expected := []string{
+		"terminal_state",
+		"invalid_transition",
+		"unknown_state",
+		"template_mismatch",
+		"version_conflict",
+		"rewind_failed",
+	}
+
+	for i, code := range codes {
+		if code != expected[i] {
+			t.Errorf("error code constant %d = %q, want %q", i, code, expected[i])
+		}
+
+		te := &TransitionError{Code: code, Message: "test"}
+		data, err := json.Marshal(te)
+		if err != nil {
+			t.Fatalf("Marshal(%q) error: %v", code, err)
+		}
+
+		var m map[string]interface{}
+		if err := json.Unmarshal(data, &m); err != nil {
+			t.Fatalf("Unmarshal(%q) error: %v", code, err)
+		}
+		if m["code"] != expected[i] {
+			t.Errorf("serialized code = %v, want %q", m["code"], expected[i])
+		}
+	}
+}
+
+func TestTransitionError_ErrorInterface(t *testing.T) {
+	te := &TransitionError{
+		Code:    ErrInvalidTransition,
+		Message: "the error message",
+	}
+
+	// Verify Error() returns the Message field.
+	var err error = te
+	if err.Error() != "the error message" {
+		t.Errorf("Error() = %q, want %q", err.Error(), "the error message")
+	}
+}
+
+func TestVersionConflict_ConcurrentWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+	machine := testMachine()
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Simulate a concurrent write by directly modifying the state file
+	// on disk to increment its version.
+	data, err := os.ReadFile(path) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("ReadFile() error: %v", err)
+	}
+
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+
+	// Bump the version on disk to simulate another writer.
+	state.Version = 99
+	modified, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+	if err := os.WriteFile(path, modified, 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	// Now the engine thinks version is 1, but disk has 99.
+	// A transition should detect the conflict.
+	err = eng.Transition("middle")
+	if err == nil {
+		t.Fatal("Transition() expected version_conflict error")
+	}
+
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T: %v", err, err)
+	}
+	if te.Code != ErrVersionConflict {
+		t.Errorf("error code = %q, want %q", te.Code, ErrVersionConflict)
+	}
+}
+
+func TestVersionConflict_RewindDetects(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+	machine := rewindMachine()
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Advance to have a rewind target.
+	if err := eng.Transition("research"); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	// Tamper with on-disk version.
+	data, err := os.ReadFile(path) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("ReadFile() error: %v", err)
+	}
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+	state.Version = 50
+	modified, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+	if err := os.WriteFile(path, modified, 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	// Rewind should also detect the conflict.
+	err = eng.Rewind("start")
+	if err == nil {
+		t.Fatal("Rewind() expected version_conflict error")
+	}
+
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T: %v", err, err)
+	}
+	if te.Code != ErrVersionConflict {
+		t.Errorf("error code = %q, want %q", te.Code, ErrVersionConflict)
+	}
+}
+
+func TestVersionConflict_NoConflictOnNormalFlow(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+	machine := testMachine()
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Normal transition should succeed without version conflict.
+	if err := eng.Transition("middle"); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	// Second transition should also succeed.
+	if err := eng.Transition("done"); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	snap := eng.Snapshot()
+	if snap.Version != 3 {
+		t.Errorf("Version = %d, want 3", snap.Version)
+	}
+}
+
+func TestErrorCodes_TriggeredByCorrectConditions(t *testing.T) {
+	dir := t.TempDir()
+
+	tests := []struct {
+		name     string
+		wantCode string
+		setup    func(t *testing.T) error
+	}{
+		{
+			name:     "terminal_state from Transition",
+			wantCode: ErrTerminalState,
+			setup: func(t *testing.T) error {
+				path := filepath.Join(dir, "terminal.state.json")
+				eng, err := Init(path, testMachine(), InitMeta{Name: "terminal"})
+				if err != nil {
+					t.Fatalf("Init() error: %v", err)
+				}
+				if err := eng.Transition("middle"); err != nil {
+					t.Fatalf("Transition(middle) error: %v", err)
+				}
+				if err := eng.Transition("done"); err != nil {
+					t.Fatalf("Transition(done) error: %v", err)
+				}
+				return eng.Transition("anywhere")
+			},
+		},
+		{
+			name:     "invalid_transition from Transition",
+			wantCode: ErrInvalidTransition,
+			setup: func(t *testing.T) error {
+				path := filepath.Join(dir, "invalid.state.json")
+				eng, err := Init(path, testMachine(), InitMeta{Name: "invalid"})
+				if err != nil {
+					t.Fatalf("Init() error: %v", err)
+				}
+				return eng.Transition("done") // start can only go to middle
+			},
+		},
+		{
+			name:     "unknown_state from Init",
+			wantCode: ErrUnknownState,
+			setup: func(t *testing.T) error {
+				path := filepath.Join(dir, "unknown.state.json")
+				m := &Machine{
+					Name:         "bad",
+					InitialState: "nonexistent",
+					States:       map[string]*MachineState{},
+				}
+				_, err := Init(path, m, InitMeta{Name: "unknown"})
+				return err
+			},
+		},
+		{
+			name:     "unknown_state from Load",
+			wantCode: ErrUnknownState,
+			setup: func(t *testing.T) error {
+				path := filepath.Join(dir, "load-unknown.state.json")
+				state := State{
+					SchemaVersion: 1,
+					Version:       1,
+					CurrentState:  "nonexistent",
+					Variables:     map[string]string{},
+					History:       []HistoryEntry{},
+				}
+				data, _ := json.Marshal(state)
+				if err := os.WriteFile(path, data, 0o600); err != nil {
+					t.Fatalf("WriteFile() error: %v", err)
+				}
+				_, err := Load(path, testMachine())
+				return err
+			},
+		},
+		{
+			name:     "rewind_failed for never-visited state",
+			wantCode: ErrRewindFailed,
+			setup: func(t *testing.T) error {
+				path := filepath.Join(dir, "rewind-nv.state.json")
+				eng, err := Init(path, rewindMachine(), InitMeta{Name: "rewind-nv"})
+				if err != nil {
+					t.Fatalf("Init() error: %v", err)
+				}
+				if err := eng.Transition("research"); err != nil {
+					t.Fatalf("Transition() error: %v", err)
+				}
+				return eng.Rewind("implementing")
+			},
+		},
+		{
+			name:     "rewind_failed for terminal target",
+			wantCode: ErrRewindFailed,
+			setup: func(t *testing.T) error {
+				path := filepath.Join(dir, "rewind-term.state.json")
+				eng, err := Init(path, rewindMachine(), InitMeta{Name: "rewind-term"})
+				if err != nil {
+					t.Fatalf("Init() error: %v", err)
+				}
+				return eng.Rewind("done")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.setup(t)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			te, ok := err.(*TransitionError)
+			if !ok {
+				t.Fatalf("expected *TransitionError, got %T: %v", err, err)
+			}
+			if te.Code != tt.wantCode {
+				t.Errorf("error code = %q, want %q", te.Code, tt.wantCode)
+			}
+		})
+	}
+}
+
+// keysOf returns the keys of a map for diagnostic output.
+func keysOf(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
