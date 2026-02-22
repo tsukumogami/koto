@@ -68,7 +68,7 @@ func Parse(path string) (*Template, error) {
 	hash := "sha256:" + hex.EncodeToString(sum[:])
 
 	// Split front-matter from body.
-	header, body, err := splitFrontMatter(content)
+	header, body, err := SplitFrontMatter(content)
 	if err != nil {
 		return nil, err
 	}
@@ -183,10 +183,10 @@ func Interpolate(text string, ctx map[string]string) string {
 	return b.String()
 }
 
-// splitFrontMatter separates the YAML front-matter from the markdown body.
+// SplitFrontMatter separates the YAML front-matter from the markdown body.
 // The front-matter is delimited by "---" lines. Returns the header content
 // (between the delimiters) and the body (after the closing delimiter).
-func splitFrontMatter(content string) (header, body string, err error) {
+func SplitFrontMatter(content string) (header, body string, err error) {
 	// Trim leading whitespace/newlines.
 	trimmed := strings.TrimLeft(content, " \t\r\n")
 

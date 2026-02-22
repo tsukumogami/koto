@@ -62,7 +62,7 @@ type sourceGateDecl struct {
 // and produces a CompiledTemplate. It returns warnings for non-fatal issues
 // and an error if compilation fails.
 func Compile(source []byte) (*template.CompiledTemplate, []Warning, error) {
-	header, body, err := splitFrontMatter(string(source))
+	header, body, err := template.SplitFrontMatter(string(source))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -175,43 +175,6 @@ func Hash(ct *template.CompiledTemplate) (string, []byte, error) {
 	sum := sha256.Sum256(data)
 	hash := "sha256:" + hex.EncodeToString(sum[:])
 	return hash, data, nil
-}
-
-// splitFrontMatter separates YAML frontmatter from the markdown body.
-// The frontmatter is delimited by "---" lines.
-func splitFrontMatter(content string) (header, body string, err error) {
-	trimmed := strings.TrimLeft(content, " \t\r\n")
-
-	if !strings.HasPrefix(trimmed, "---") {
-		return "", "", fmt.Errorf("template missing opening front-matter delimiter (---)")
-	}
-
-	afterOpen := strings.Index(trimmed, "\n")
-	if afterOpen < 0 {
-		return "", "", fmt.Errorf("template has only an opening front-matter delimiter")
-	}
-
-	rest := trimmed[afterOpen+1:]
-
-	closeIdx := strings.Index(rest, "\n---")
-	if closeIdx < 0 {
-		if strings.HasPrefix(rest, "---") {
-			return "", rest[3:], nil
-		}
-		return "", "", fmt.Errorf("template missing closing front-matter delimiter (---)")
-	}
-
-	header = rest[:closeIdx]
-
-	afterClose := rest[closeIdx+4:] // skip "\n---"
-	nlIdx := strings.Index(afterClose, "\n")
-	if nlIdx >= 0 {
-		body = afterClose[nlIdx+1:]
-	} else {
-		body = ""
-	}
-
-	return header, body, nil
 }
 
 // parseBody splits the markdown body into per-state directive text using
