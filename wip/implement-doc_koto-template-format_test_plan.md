@@ -4,6 +4,29 @@ Generated from: docs/designs/DESIGN-koto-template-format.md
 Issues covered: 5
 Total scenarios: 20
 
+## Scenario Checklist
+
+- [x] scenario-1
+- [x] scenario-2
+- [x] scenario-3
+- [x] scenario-4
+- [x] scenario-5
+- [x] scenario-6
+- [x] scenario-7
+- [x] scenario-8
+- [ ] scenario-9
+- [ ] scenario-10
+- [ ] scenario-11
+- [ ] scenario-12
+- [ ] scenario-13
+- [ ] scenario-14
+- [ ] scenario-15
+- [ ] scenario-16
+- [ ] scenario-17
+- [ ] scenario-18
+- [ ] scenario-19
+- [ ] scenario-20
+
 ---
 
 ## Scenario 1: ParseJSON accepts valid compiled template
