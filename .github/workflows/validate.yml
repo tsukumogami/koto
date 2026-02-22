@@ -46,6 +46,14 @@ jobs:
             go test -short ./...
           fi
 
+      - name: Upload coverage to Codecov
+        if: github.event_name == 'push'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.out
+          fail_ci_if_error: true
+
       - name: Check for test artifacts
         run: |
           if [ -n "$(git status --porcelain)" ]; then
