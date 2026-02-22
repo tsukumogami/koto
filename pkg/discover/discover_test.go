@@ -5,25 +5,28 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/tsukumogami/koto/pkg/engine"
 )
 
 // writeStateFile creates a minimal koto state file in dir with the given
-// workflow name and current state.
+// workflow name and current state. It uses engine.State to ensure the JSON
+// shape stays in sync with the engine package.
 func writeStateFile(t *testing.T, dir, name, currentState string) string {
 	t.Helper()
 
-	state := map[string]interface{}{
-		"schema_version": 1,
-		"workflow": map[string]string{
-			"name":          name,
-			"template_hash": "sha256:abc123",
-			"template_path": "/tmp/template.md",
-			"created_at":    "2026-02-22T12:00:00Z",
+	state := engine.State{
+		SchemaVersion: 1,
+		Workflow: engine.WorkflowMeta{
+			Name:         name,
+			TemplateHash: "sha256:abc123",
+			TemplatePath: "/tmp/template.md",
+			CreatedAt:    "2026-02-22T12:00:00Z",
 		},
-		"version":       1,
-		"current_state": currentState,
-		"variables":     map[string]string{},
-		"history":       []interface{}{},
+		Version:      1,
+		CurrentState: currentState,
+		Variables:    map[string]string{},
+		History:      []engine.HistoryEntry{},
 	}
 
 	data, err := json.MarshalIndent(state, "", "  ")
@@ -292,5 +295,64 @@ func TestWorkflow_JSONTags(t *testing.T) {
 	}
 	if len(m) != len(expectedKeys) {
 		t.Errorf("JSON has %d keys, want %d", len(m), len(expectedKeys))
+	}
+}
+
+// TestFind_EngineRoundTrip marshals an engine.State struct to a temp file and
+// verifies that discover.Find reads back the same values. This catches schema
+// drift between the stateHeader fields in discover.go and the JSON tags on
+// engine.State / engine.WorkflowMeta in pkg/engine/types.go.
+func TestFind_EngineRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+
+	original := engine.State{
+		SchemaVersion: 1,
+		Workflow: engine.WorkflowMeta{
+			Name:         "roundtrip-wf",
+			TemplateHash: "sha256:deadbeef",
+			TemplatePath: "/workflows/roundtrip.md",
+			CreatedAt:    "2026-02-22T09:30:00Z",
+		},
+		Version:      3,
+		CurrentState: "verifying",
+		Variables:    map[string]string{"KEY": "value"},
+		History: []engine.HistoryEntry{
+			{From: "start", To: "verifying", Timestamp: "2026-02-22T09:31:00Z", Type: "transition"},
+		},
+	}
+
+	data, err := json.MarshalIndent(original, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal engine.State: %v", err)
+	}
+
+	path := filepath.Join(dir, "koto-roundtrip-wf.state.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write state file: %v", err)
+	}
+
+	workflows, err := Find(dir)
+	if err != nil {
+		t.Fatalf("Find() error: %v", err)
+	}
+	if len(workflows) != 1 {
+		t.Fatalf("Find() returned %d workflows, want 1", len(workflows))
+	}
+
+	w := workflows[0]
+	if w.Name != original.Workflow.Name {
+		t.Errorf("Name = %q, want %q", w.Name, original.Workflow.Name)
+	}
+	if w.CurrentState != original.CurrentState {
+		t.Errorf("CurrentState = %q, want %q", w.CurrentState, original.CurrentState)
+	}
+	if w.TemplatePath != original.Workflow.TemplatePath {
+		t.Errorf("TemplatePath = %q, want %q", w.TemplatePath, original.Workflow.TemplatePath)
+	}
+	if w.CreatedAt != original.Workflow.CreatedAt {
+		t.Errorf("CreatedAt = %q, want %q", w.CreatedAt, original.Workflow.CreatedAt)
+	}
+	if w.Path != path {
+		t.Errorf("Path = %q, want %q", w.Path, path)
 	}
 }

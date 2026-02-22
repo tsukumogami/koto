@@ -26,6 +26,10 @@ type Workflow struct {
 // stateHeader is a minimal struct for unmarshaling only the fields
 // needed from a koto state file. It avoids reading history, variables,
 // or other heavyweight fields.
+//
+// The JSON field names here must match the tags on engine.State and
+// engine.WorkflowMeta in pkg/engine/types.go. A cross-package round-trip
+// test in discover_test.go guards against schema drift.
 type stateHeader struct {
 	Workflow     workflowHeader `json:"workflow"`
 	CurrentState string         `json:"current_state"`
