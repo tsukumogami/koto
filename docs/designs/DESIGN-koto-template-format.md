@@ -1,34 +1,25 @@
 ---
 status: Proposed
 problem: |
-  koto has a working template parser but the format is undocumented and incomplete.
-  Evidence gates have no syntax. The header parser silently ignores unknown keys.
-  State section boundaries can collide with markdown headings in directive text.
-  There's no template search path, no validation contract, and no way to declare
-  variable types or requirements. Downstream designs (quick-task template, agent
-  integration) can't build on an unspecified format.
+  koto templates need to serve two audiences: the engine (which needs deterministic,
+  unambiguous state machine definitions) and humans (who need to author and understand
+  workflow definitions naturally). The v1 design attempted a single format for both,
+  creating cascading complexity: heading collision, declared-state matching, dual
+  transition sources, format wars. These are symptoms of conflating two concerns.
 decision: |
-  Formalize the template format as TOML front matter plus markdown state sections.
-  TOML replaces the current YAML-like header because koto already needs structured
-  data (nested gate declarations, typed variables) that the hand-rolled parser can't
-  handle, and Go has a zero-CGo TOML library (BurntSushi/toml) that's been stable
-  for a decade. Evidence gates are declared per-state in the TOML header with three
-  types: field_not_empty, field_equals, and command. Template search follows a
-  three-tier path: explicit path, project-local .koto/templates/, user-global
-  ~/.config/koto/templates/. State sections use ## headings with a parsing rule
-  that only headings matching declared state names are treated as boundaries. An
-  explicit initial_state field identifies the starting state (no reliance on TOML
-  table ordering).
+  Separate the template into a canonical JSON format (what the engine reads) and a
+  markdown authoring format (what humans write). JSON is deterministic, schema-
+  validatable, and uses Go's stdlib. Markdown renders on GitHub and naturally embeds
+  rich directive content. A deterministic compiler converts markdown to JSON. An
+  optional LLM-assisted linter helps humans fix authoring errors before compilation,
+  but sits outside the parse path. The engine only ever reads JSON.
 rationale: |
-  TOML handles the nested structures evidence gates require (per-state gate
-  declarations with type-specific fields) without external dependencies that
-  would compromise koto's zero-dependency goal for the core engine. The heading
-  collision problem is solved by declared-state matching rather than escape
-  sequences, keeping templates readable. A three-tier search path gives users
-  progressive complexity: start with explicit paths, graduate to project templates,
-  optionally share global templates. Evidence gates use declarative types rather
-  than embedded scripts because the common checks (field presence, value match,
-  command exit code) cover the primary use cases without portability concerns.
+  The dual-format approach eliminates the heading collision problem entirely (JSON
+  has no headings), removes the YAML-vs-TOML debate (JSON for machines, markdown for
+  humans), and lets each format do what it's good at. The compilation step is
+  deterministic -- same input always produces same output. LLM assistance is confined
+  to the authoring tooling layer, never in the engine's parse path. JSON Schema
+  provides editor support and validation without custom tooling.
 ---
 
 # DESIGN: koto Template Format Specification
@@ -39,592 +30,181 @@ rationale: |
 
 ## Context and Problem Statement
 
-koto templates are markdown files that define workflow state machines. The engine (implemented in PR #2) parses these templates into `Machine` instances, extracts state directives, and uses them to guide AI agents through multi-step workflows. The current parser works but the format has several gaps that block downstream work.
+koto templates define workflow state machines that guide AI agents through multi-step tasks. A template contains two types of content:
 
-**Undocumented format**: The template structure exists only in code comments and test fixtures. Template authors have no specification to work from, and the parser's behavior on edge cases is undefined.
+**Structure**: States, transitions, evidence gates, variables, and metadata. This is the state machine definition -- it must be parsed deterministically with zero ambiguity. The engine depends on this being correct.
 
-**No evidence gates**: The engine design reserves space for evidence-gated transitions (requiring proof before advancing) but the template format has no syntax for declaring gates. This is the primary extension koto needs to move from "enforces ordering" to "enforces proof of work."
+**Content**: Directive text for each state -- the instructions an AI agent reads when it enters a state. This is rich markdown with tables, code blocks, headings, and examples. It needs to be authored by humans and rendered readably.
 
-**Header format limitations**: The current parser handles flat `key: value` pairs and one level of indentation (`variables:` block). Evidence gate declarations need nested structures (per-state, per-transition gate definitions with type-specific fields). The hand-rolled YAML parser can't express this without becoming a full YAML parser.
+The v1 design tried to serve both needs with a single file format (TOML/YAML frontmatter + markdown body). This created a cascade of problems:
 
-**Heading collision**: The parser treats every `## heading` as a state boundary. If a directive tells an agent to "write a section with `## Analysis`" and `Analysis` happens to be a state name, the parser would split the directive at the wrong point.
+- **Heading collision**: `## headings` in directive content conflicted with `## headings` marking state boundaries, requiring "declared-state matching" rules
+- **Dual transition sources**: Transitions declared in the header AND `**Transitions**:` lines in the body, with precedence rules for conflicts
+- **Format debates**: TOML vs YAML vs extended markdown -- each had trade-offs because no single format serves both deterministic parsing and human authoring well
+- **Parsing fragility**: Code blocks containing state-name headings, whitespace sensitivity, case sensitivity rules -- all artifacts of using a content format for structure
 
-**No search path**: Templates are specified by absolute path at `koto init` time. There's no way to reference a template by name (e.g., `koto init --template quick-task`) or maintain project-local or user-global template libraries.
+These problems share a root cause: **conflating the machine-readable format with the human authoring format**. They don't need to be the same.
 
-**No validation contract**: The parser validates structural correctness (transition targets exist, delimiters present) but doesn't validate variable declarations, state name formats, or the bidirectional consistency between header declarations and body sections.
+### The Insight
+
+Systems like Terraform (HCL/JSON), Protocol Buffers (.proto/binary), and Markdoc (markdown/AST) separate the human authoring format from the machine-readable format, with a deterministic compilation step between them. This separation lets each format do what it's good at:
+
+- The **canonical format** is optimized for machines: deterministic, schema-validatable, unambiguous
+- The **authoring format** is optimized for humans: readable, writable, renderable
+- The **compiler** bridges them deterministically: same input always produces same output
+- **Validation tooling** (including optional LLM assistance) helps humans write correct input before compilation
 
 ### Scope
 
 **In scope:**
-- Header format specification (TOML vs YAML, required/optional fields, evidence gate syntax)
-- State section parsing rules (boundary identification, heading collision resolution)
-- Variable and evidence interpolation contract
-- Template search path and resolution order
-- Bidirectional validation rules
-- Validation timing (init vs operation vs explicit validate)
-- At least one valid and two invalid template examples
+- Canonical (machine-readable) format specification
+- Markdown authoring format specification
+- Deterministic compilation from markdown to canonical format
+- Evidence gate declaration syntax (both formats)
+- Variable declaration syntax (both formats)
+- Template search path and resolution
+- Validation contract (parse-time, compile-time, explicit)
+- LLM-assisted validation architecture (where it fits, what it can/cannot do)
 
 **Out of scope:**
 - Evidence gate evaluation logic (how the engine checks gates at transition time)
-- Template registry, sharing, or community distribution
-- Template versioning migration between schema versions
-- Built-in template content (that's the quick-task template design, #313)
+- LLM integration implementation details (model selection, prompting strategy)
+- Template registry or community distribution
+- Built-in template content (that's the quick-task template design, #13)
 
 ## Decision Drivers
 
-- **Zero external dependencies for core engine**: The engine, controller, and discover packages use only the Go standard library. The template package can add a dependency if the benefit is clear, since it's a leaf package that nothing else imports (except the CLI).
-- **Backward compatibility**: Existing templates must continue to work, or the migration path must be trivial.
-- **Readability**: Templates are authored by humans and read by both humans and AI agents. The format should be natural to write and easy to understand.
-- **Nested structure support**: Evidence gates require per-state, per-transition declarations with type-specific fields. The header format must handle 2-3 levels of nesting cleanly.
-- **Declared-state-first parsing**: State sections should be identified by matching declared state names, not by arbitrary markdown heading patterns.
-- **Progressive complexity**: Simple templates (no gates, no search path) should be minimal. Advanced features add syntax only when used.
+- **Deterministic machine format**: The engine must parse templates with zero ambiguity. No heading collision, no precedence rules, no whitespace sensitivity.
+- **Human-friendly authoring**: Templates should be natural to write and render well on GitHub. Rich directive content (markdown) is a first-class need.
+- **Deterministic compilation**: Converting from human format to machine format must produce identical output for identical input. No LLMs in the parse path.
+- **LLM assistance at the validation layer only**: LLMs can help fix authoring errors, but the compiler itself is deterministic. This keeps the system predictable.
+- **Zero dependencies for core engine**: The engine reads the canonical format using only Go's standard library. Dependencies (if any) are confined to the compiler/tooling layer.
+- **Progressive complexity**: Simple templates should be simple to author. Evidence gates, search paths, and LLM validation are opt-in features.
+- **Schema-based tooling**: The canonical format should support JSON Schema for editor autocomplete, linting, and validation.
 
 ## Implementation Context
 
 ### Current Template Format
 
-The parser in `pkg/template/template.go` handles:
+The parser in `pkg/template/template.go` uses a YAML-like frontmatter (`---` delimiters) with markdown body sections. It handles flat `key: value` pairs and one level of nesting (`variables:` block). States are identified by `## heading` markers. The parser produces a `Template` struct containing a `Machine`, section content, variables, and a SHA-256 hash.
 
-```
----
-name: workflow-name
-version: "1.0"
-description: A workflow description
-variables:
-  KEY: default-value
----
-
-## state-name
-
-Directive text for the agent.
-
-**Transitions**: [next-state-a, next-state-b]
-```
-
-Key behaviors: first `##` heading becomes the initial state. States without a `**Transitions**:` line are terminal. SHA-256 hash covers the full file. The header parser uses `strings.SplitN(line, ":", 2)` -- not a YAML library.
+Key limitation: the parser treats ALL `## headings` as state boundaries, creating the heading collision problem. The hand-rolled YAML parser can't handle nested structures (evidence gates).
 
 ### Industry Patterns
 
-Research into AI agent orchestration tools reveals consistent patterns:
+Research into dual-format systems reveals:
 
-**Format convergence**: Claude Code skills, Gemini CLI configuration, and GitHub Actions all use structured headers (YAML/TOML) with human-readable bodies. The separation of machine-parseable configuration from human/agent-readable content is the standard approach.
+- **Terraform**: HCL and JSON are both first-class. Either can be authored. Same internal representation. Bidirectional conversion.
+- **Markdoc (Stripe)**: Markdown compiles to a serializable AST. The AST is the canonical format -- cacheable, validatable, transformable.
+- **OpenAPI / Kubernetes**: YAML authoring validated against JSON Schema. Schema drives editor tooling.
+- **CUE**: Validation rules embedded in the data definition. Gradual validation (partial specs are valid).
+- **LLM-assisted validation**: Research shows LLMs useful for suggestions but core validation must be deterministic. Output validation rules address non-determinism.
 
-**Evidence patterns**: Three gate types cover the spectrum: command gates (shell exit code), field checks (declarative conditions on state data), and prompt gates (LLM evaluation). koto's Phase 1 should cover the first two; prompt gates require an LLM integration that's out of scope.
-
-**Search paths**: Most tools follow a project-local > user-global > built-in precedence order. Claude Code uses `.claude/` in the project, `~/.claude/` globally. Go tools use `$XDG_CONFIG_HOME` or `~/.config/`.
-
-**State storage**: Beads (`.beads/`) and TaskMaster (`.taskmaster/`) validate project-directory state with ephemeral lifecycle. koto's `wip/` pattern fits this model.
+No tool in the AI agent workflow space uses a compiled template approach. koto would be the first to separate authoring format from execution format for workflow state machines.
 
 ## Considered Options
 
-### Decision 1: Header Format
+### Decision 1: Architecture
 
-The template header needs to express nested structures for evidence gates. A gate declaration looks something like: "for state X, before transitioning, require that field Y is not empty and command Z exits 0." This is inherently 2-3 levels deep. The current hand-rolled parser handles one level of nesting (the `variables:` block) and would need significant extension.
+Should koto use a single format or separate the authoring and execution formats?
 
-#### Chosen: TOML front matter
+#### Chosen: Dual-format with deterministic compilation
 
-Replace the YAML-like `---` delimiters with TOML `+++` delimiters. Use BurntSushi/toml (BSD license, zero dependencies, stable since 2013) for parsing. TOML's native table and array-of-tables syntax handles the nested gate declarations naturally:
+Two formats connected by a deterministic compiler:
 
-```toml
-+++
-name = "quick-task"
-version = "1.0"
-description = "A linear task workflow"
-initial_state = "assess"
+- **Canonical format** (JSON): What the engine reads. Deterministic, schema-validatable, zero-ambiguity. Stored as `.koto.json` files.
+- **Authoring format** (Markdown): What humans write. YAML frontmatter for structure, markdown body for directives. Stored as `.md` files. Renders on GitHub.
+- **Compiler**: `koto template compile template.md` produces `template.koto.json`. Same input always produces same output. No LLMs involved.
+- **Decompiler**: `koto template decompile template.koto.json` produces a readable markdown file. Enables round-tripping.
+- **Linter**: `koto template lint template.md` validates the authoring format and suggests fixes. Optionally uses LLMs for ambiguity resolution.
 
-[variables]
-TASK = {description = "What to build", required = true}
-
-[states.assess.gates.task_defined]
-type = "field_not_empty"
-field = "TASK"
-
-[states.implement.gates.tests_pass]
-type = "command"
-command = "go test ./..."
-+++
-```
-
-This adds one dependency to `pkg/template/` (which is a leaf package -- nothing imports it except the CLI). The engine, controller, and discover packages remain dependency-free.
+The engine only reads `.koto.json` files. The `koto init` command accepts either format: if given a `.md` file, it compiles it first, then initializes from the JSON.
 
 #### Alternatives Considered
 
-**JSON front matter**: JSON is in Go's standard library (zero external dependencies) and handles arbitrary nesting. Rejected because JSON is significantly noisier than TOML for configuration: it requires quoting all keys, doesn't support comments, and lacks bare string values. A state machine definition in JSON would be harder to read and write than the TOML equivalent. The zero-dependency benefit is real but doesn't outweigh the readability cost for a format that humans author by hand.
+**Single YAML format (go-yaml v3)**: YAML frontmatter with block scalars for directives. Simpler (no compilation step), but the heading collision problem returns if directives contain markdown with headings. YAML block scalars are awkward for long markdown content. Editor support is good (JSON Schema works for YAML too) but the format still conflates structure and content.
 
-**Full YAML parser (go-yaml/yaml)**: More familiar syntax, widely used. The upstream strategic design document used YAML-style syntax in its template examples, reflecting the hand-rolled parser that existed at the time. However, YAML's implicit typing creates surprises in template headers -- go-yaml v3 uses YAML 1.2 which improves on YAML 1.1's worst behaviors (bare `yes` becoming boolean), but the multiple-representation problem persists (flow vs block, single vs double quotes). TOML is less familiar than YAML to most developers, but koto's primary audience is Go developers who encounter TOML regularly in Go tooling. The dependency size comparison (go-yaml ~15K lines vs BurntSushi/toml ~3K lines) further favors TOML.
+**Single JSON format**: JSON for everything, including directives as string fields. Maximally deterministic, but JSON with embedded markdown (`\n` escapes, no syntax highlighting inside strings) is painful to write. No GitHub rendering. Humans would need tooling assistance for everything.
 
-**Extend hand-rolled parser**: Add nested block handling to the current `parseHeader` function. Rejected because the parser would need to handle indentation-based nesting for gate declarations, essentially becoming a partial YAML parser without the benefit of a tested library. The maintenance cost grows with each new feature.
+**Markdown-only with conventions**: Pure markdown with structural conventions (specific heading levels, blockquotes for metadata). Renders beautifully on GitHub but has no schema validation ecosystem, no editor support, and the parser depends on exact formatting conventions. Fragile.
 
-**Keep YAML-like with `---` delimiters, use go-yaml**: Parse the existing format with a real YAML library. Rejected because it doesn't solve the implicit typing problem and adds a larger dependency than BurntSushi/toml for a less suitable format.
+**Directory-based format**: JSON manifest + separate `.md` files per state (`states/assess.md`). Clean separation but one template becomes a directory, complicating distribution, search paths, and template management.
 
-### Decision 2: State Section Boundaries
+### Decision 2: Canonical Format
 
-The parser must identify where one state's directive ends and another begins. The current approach treats every `## heading` as a state boundary, which fails when directive text contains markdown headings.
+What format should the engine read?
 
-#### Chosen: Declared-state matching
+#### Chosen: JSON
 
-Only `## headings` whose text matches a state name declared in the TOML header are treated as state boundaries. All other `##` headings are regular markdown content within the current state's directive.
+The engine reads JSON files using Go's `encoding/json` (standard library, zero dependencies). JSON is:
 
-States must be declared in the TOML header. The header is the source of truth for which states exist; the body sections provide content for those states. This means the parser reads the header first, builds the set of declared state names, then scans the body looking only for headings that match.
+- Deterministic to parse (no implicit typing, no multiple representations)
+- Schema-validatable (JSON Schema for editor support and CI validation)
+- Already used by koto for state files (consistent ecosystem)
+- Well-supported by every language and tool
 
-```toml
-+++
-name = "example"
-version = "1.0"
-initial_state = "assess"
-
-[states]
-assess = {transitions = ["plan"]}
-plan = {transitions = ["implement"]}
-implement = {transitions = ["done"]}
-done = {terminal = true}
-+++
-
-## assess
-
-Analyze the problem. Write your findings under:
-
-## Analysis
-
-This heading is NOT a state boundary because "Analysis" is not in [states].
-
-**Transitions**: [plan]
-```
+The canonical format uses the `.koto.json` extension to distinguish from plain JSON files.
 
 #### Alternatives Considered
 
-**Escape syntax**: Use `\## heading` or `<!-- koto-escape -->` to mark headings that aren't state boundaries. Rejected because it requires template authors to know which headings collide and to maintain escape markers as directives evolve. It's error-prone and ugly.
+**YAML**: More readable than JSON for humans, but the engine reads the canonical format -- readability for machines doesn't matter. YAML adds a dependency (go-yaml) to the engine's parse path, violating the zero-dependency goal.
 
-**Different heading level**: Use `# heading` (H1) for state boundaries instead of `## heading` (H2). Rejected because H1 is conventionally used for the document title, and this would conflict with templates that want a readable document structure.
+**TOML**: Good for configuration but awkward for the list-of-states pattern. Adds a dependency to the engine. Not widely used for data interchange.
 
-**Fenced sections**: Use code-fence-like markers (`:::state-name` / `:::`) instead of headings. Rejected because it makes templates less readable as standalone markdown documents. One of koto's strengths is that templates are valid, readable markdown.
+**Custom binary format**: Maximum parsing speed, but templates are read once at init time. The performance benefit doesn't justify the tooling cost.
 
-### Decision 3: Template Search Path
+### Decision 3: Authoring Format
 
-When a user runs `koto init --template quick-task`, the CLI needs to find the template file. The current implementation requires an explicit file path. A search path enables named template references and library organization.
+What format do humans write?
 
-#### Chosen: Three-tier search with explicit path override
+#### Chosen: YAML frontmatter + Markdown body
 
-Template resolution follows this order:
-
-1. **Explicit path**: If `--template` is a file path (contains `/` or `.`), use it directly.
-2. **Project-local**: Look for `.koto/templates/<name>.md` relative to the git root (or CWD if not in a git repo).
-3. **User-global**: Look for `~/.config/koto/templates/<name>.md` (respects `$XDG_CONFIG_HOME`).
-
-No built-in templates are embedded via `go:embed` in the initial release. Built-in templates would create a versioning problem (template content tied to binary version) and mask whether the user has a local override. Templates are distributed as files, installed by copying.
-
-#### Alternatives Considered
-
-**Embedded built-ins via go:embed**: Ship default templates inside the binary. Rejected for the initial release because it couples template content to binary release cycles and makes template customization unclear (is the user running the built-in or a local override?). Can be added later if demand exists.
-
-**Single search directory**: Only project-local, no global. Rejected because users working across multiple projects would need to copy templates into each project. A global directory enables shared templates.
-
-**Registry with remote fetch**: `koto init --template github.com/user/templates/quick-task`. Rejected as over-engineering for the initial release. File copying covers the use case without network dependencies.
-
-### Decision 4: Evidence Gate Declarations
-
-Evidence gates block transitions until conditions are met. The engine design reserves the extension point (`MachineState` struct); this decision specifies how template authors declare gates.
-
-#### Chosen: Per-state gate declarations in TOML header
-
-Gates are declared under `[states.<name>.gates.<gate-name>]` in the TOML header. Each gate has a `type` field and type-specific parameters. Three gate types for Phase 1:
-
-**field_not_empty**: Checks that a named field exists and is non-empty in the evidence map.
-
-```toml
-[states.plan.gates.task_defined]
-type = "field_not_empty"
-field = "TASK"
-```
-
-**field_equals**: Checks that a named field equals a specific value.
-
-```toml
-[states.finalize.gates.tests_passed]
-type = "field_equals"
-field = "CI_STATUS"
-value = "passed"
-```
-
-**command**: Runs a shell command and checks the exit code.
-
-```toml
-[states.implement.gates.lint_clean]
-type = "command"
-command = "go vet ./..."
-```
-
-Gates on a state are evaluated when attempting to leave that state (before the transition commits). If any gate fails, the transition is rejected with a `gate_failed` error that includes which gate failed and why. In other words, gates are exit conditions: "you must satisfy these conditions before leaving this state."
-
-Gate names are scoped to the state they're declared on. They appear in error messages and history entries for debuggability.
-
-#### Alternatives Considered
-
-**Inline gate syntax in markdown sections**: Declare gates within the state section body using a special syntax like `**Gate**: field_not_empty(TASK)`. Rejected because mixing machine-parseable gate declarations with human-readable directive text makes both harder to read. Separation of concerns: the header is for machine configuration, the body is for human/agent content.
-
-**Transition-level gates instead of state-level**: Attach gates to specific transitions rather than states. For example, "only the assess->plan transition requires TASK to be defined, but assess->escalate doesn't." Rejected for Phase 1 because it adds significant complexity (gates indexed by `from,to` pairs) and the common case is "this state requires these conditions before you can leave it." Transition-level gates can be added later if needed.
-
-### Decision 5: Variable and Evidence Interpolation
-
-Templates use `{{KEY}}` placeholders in directive text. The question is how variables (set at init time) and evidence (accumulated during execution) interact in the interpolation context.
-
-#### Chosen: Merged context with evidence-wins precedence
-
-When the controller interpolates a directive, it builds the context by merging:
-1. Template variable defaults (lowest priority)
-2. Init-time variable values (from `--var` flags)
-3. Evidence values accumulated during execution (highest priority)
-
-If a key exists in both variables and evidence, the evidence value wins. This enables patterns like: define a default `TASK` variable at init, then let evidence from a later state refine it.
-
-Unresolved placeholders remain as-is (not an error). This is the existing behavior and allows templates to include placeholders that are resolved at different points in the workflow.
-
-#### Alternatives Considered
-
-**Separate namespaces**: Use `{{var.TASK}}` for variables and `{{evidence.CI_STATUS}}` for evidence. This has a real benefit: disambiguation. If a template variable and an evidence field share the same key, the merged context silently picks the evidence value. A template author who defines a `STATUS` variable with a default and later accumulates evidence with the same key sees the default overridden without warning. However, this is the intended behavior -- evidence represents current ground truth and should take precedence over stale defaults. The disambiguation benefit doesn't justify the verbosity cost for every placeholder reference in every template. Naming conventions (variables in SCREAMING_CASE, evidence in lower_case) can reduce collision risk without syntax overhead.
-
-**Go's `text/template` package**: The standard library's template engine handles `{{.Key}}` natively with zero dependencies, supports conditionals and loops, and is well-tested. Rejected because `text/template` allows arbitrary logic in templates (conditionals, range loops, function calls), which would introduce security concerns (template authors could invoke arbitrary Go functions) and template debugging complexity. koto's single-pass literal replacement is deliberately simpler: it does one thing (substitute values) with no evaluation, no control flow, and no side effects.
-
-**Error on unresolved placeholders**: Fail if any `{{KEY}}` can't be resolved. Rejected because some placeholders are intentionally left for later states to fill (evidence not yet collected), and templates may include example syntax in directives that looks like placeholders.
-
-### Decision 6: Validation Contract
-
-Templates need validation at multiple points: when parsed, when a workflow is initialized, and on explicit `koto validate` invocation. The question is what gets checked and when.
-
-#### Chosen: Parse-time structural validation plus explicit semantic validation
-
-**At parse time** (every template load):
-- TOML header is syntactically valid
-- Required fields present (name, version)
-- All states in `[states]` have corresponding `## heading` sections in the body
-- All `## heading` sections in the body that match declared state names have content
-- All transition targets reference declared states
-- Gate declarations have valid types and required type-specific fields
-- No duplicate state names
-
-**At `koto validate` time** (explicit invocation):
-- All parse-time checks
-- Variable declarations are consistent (no variable referenced in a gate but not declared)
-- Reachability analysis: all states are reachable from the initial state
-- Terminal states have no transitions declared
-- Warning (not error) for states with no outgoing transitions that aren't marked terminal
-
-**Not validated** (by design):
-- State name format (any non-empty string is valid)
-- Variable naming conventions
-- Directive content quality
-
-#### Alternatives Considered
-
-**Validate everything at parse time**: Run reachability analysis and cross-reference checks on every parse. Rejected because these checks add latency to every `koto next` and `koto transition` call, and parse-time is the hot path. Structural validity (the template won't crash the parser) matters on every load; semantic validity (the template is well-designed) is a development-time check.
-
-**No explicit validation command**: Rely on parse-time checks only. Rejected because template authors need a way to check their work during development without running a full workflow. `koto validate` is the development-time quality gate.
-
-## Decision Outcome
-
-### Summary
-
-The koto template format uses TOML front matter (delimited by `+++`) for machine-readable configuration and markdown body sections for state directives. The TOML header declares the complete state machine: state names, transitions, evidence gates, and variable definitions. The markdown body provides directive content for each state, matched by `## heading` text against the declared state names.
-
-Evidence gates are declared per-state in the TOML header using three types: `field_not_empty` (a named field exists and is non-empty), `field_equals` (a named field matches a specific value), and `command` (a shell command exits 0). Gates are evaluated before a transition commits. Template variables and evidence values merge into a single interpolation context with evidence taking precedence over variables.
-
-Template resolution follows a three-tier search path: explicit file path, project-local `.koto/templates/`, user-global `~/.config/koto/templates/`. The `pkg/template/` package adds a dependency on BurntSushi/toml for header parsing while the rest of the engine remains dependency-free. Validation splits between parse-time structural checks (every load) and explicit semantic checks (`koto validate`).
-
-### Rationale
-
-The decisions reinforce a separation between structure (TOML header) and content (markdown body). The header is the machine-parseable source of truth: it declares which states exist, what transitions are allowed, and what evidence is required. The body provides the human/agent-readable directives. This split means the parser reads the header first and uses it to interpret the body, resolving the heading collision problem without escape syntax.
-
-TOML fits naturally because koto's configuration is inherently tabular: each state is a table with fields (transitions, gates). TOML tables map directly to this structure. The single-dependency cost is confined to the template package and buys correct parsing of nested structures, quoted strings, and typed values.
-
-The three-tier search path gives users a progression: start with explicit paths (zero setup), move to project-local templates (team sharing), optionally add global templates (personal library). No built-in templates avoids coupling template content to binary versions.
-
-### Trade-offs Accepted
-
-- **One dependency in pkg/template/**: BurntSushi/toml is well-maintained, BSD-licensed, and ~3K lines. The engine, controller, and discover packages remain dependency-free. Acceptable because the template package is a leaf with no downstream importers.
-- **Breaking change from YAML-like to TOML**: Existing templates need migration (change `---` to `+++`, convert YAML-like syntax to TOML). Acceptable because the koto user base is currently zero (no public release yet) and the migration is mechanical.
-- **No prompt/LLM gates**: Only deterministic gate types (field checks, commands) in Phase 1. Acceptable because deterministic gates cover the primary use cases (CI status, file existence, field values) and LLM evaluation requires a separate design for model selection, cost, and reliability.
-- **No built-in templates**: Users must obtain template files separately. Acceptable for the initial release; `go:embed` can be added later if demand exists.
-
-## Solution Architecture
-
-### Template File Structure
-
-A complete template file has two parts:
-
-```
-+++
-<TOML configuration>
-+++
-
-<Markdown state sections>
-```
-
-### TOML Header Schema
-
-```toml
-+++
-# Required fields
-name = "workflow-name"        # kebab-case, used in state file naming
-version = "1.0"               # semver string (metadata only; hash is the integrity mechanism)
-initial_state = "assess"      # must match a key in [states]
-
-# Optional fields
-description = "What this workflow does"
-
-# Variable declarations
-[variables]
-TASK = {description = "What to build", required = true}
-REVIEWER = {description = "Who reviews", required = false, default = "team"}
-
-# State declarations
-[states.assess]
-transitions = ["plan", "escalate"]
-
-[states.assess.gates.task_defined]
-type = "field_not_empty"
-field = "TASK"
-
-[states.plan]
-transitions = ["implement"]
-
-[states.implement]
-transitions = ["done"]
-
-[states.implement.gates.tests_pass]
-type = "command"
-command = "go test ./..."
-
-[states.implement.gates.lint_clean]
-type = "command"
-command = "go vet ./..."
-
-[states.escalate]
-terminal = true
-
-[states.done]
-terminal = true
-+++
-```
-
-**Required fields:**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | string | Template identifier, used in state file naming |
-| `version` | string | Template version, metadata only (the SHA-256 hash is the integrity mechanism) |
-| `initial_state` | string | Name of the starting state, must match a key in `[states]` |
-
-**Optional fields:**
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `description` | string | `""` | Human-readable description |
-
-**Variable declarations** (`[variables]`):
-
-Each variable is a table with optional fields:
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `description` | string | `""` | What this variable is for |
-| `required` | bool | `false` | Must be provided at init time |
-| `default` | string | `""` | Default value if not provided |
-
-Simple variables with no metadata can use shorthand: `TASK = "default-value"` (equivalent to `TASK = {default = "default-value", required = false}`). An empty string shorthand (`TASK = ""`) is equivalent to `{default = "", required = false}`. A variable with `required = true` and no `default` field has an effective default of `""` but must be explicitly provided at init time.
-
-**State declarations** (`[states.<name>]`):
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `transitions` | string array | `[]` | Allowed target states |
-| `terminal` | bool | `false` | Whether this is an end state |
-
-A state with no `transitions` and `terminal = false` produces a validation warning (unreachable dead end).
-
-**Gate declarations** (`[states.<name>.gates.<gate-name>]`):
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `type` | string | yes | Gate type: `field_not_empty`, `field_equals`, `command` |
-| `field` | string | for field types | Evidence field name to check |
-| `value` | string | for `field_equals` | Expected field value |
-| `command` | string | for `command` | Shell command to run (no interpolation, literal string) |
-
-**Gate evaluation semantics**: All gates on a state are evaluated with AND logic -- every gate must pass for the transition to proceed. OR composition (any gate passes) is not supported in Phase 1. If needed, the `command` gate type can implement OR logic within a single shell command.
-
-**Command gate execution**: Commands run via `sh -c "<command>"` (not a login shell) with the working directory set to the project root (git root or CWD, matching the directory where `koto init` was run -- not the state file directory, since commands like `go test ./...` expect to run from the project root). Environment variables are inherited from the koto process. There is no timeout in Phase 1; a hanging command blocks the transition indefinitely. This is acceptable for interactive use but must be addressed before any unsupervised agent scenario -- a timeout mechanism is a pre-requisite for unattended operation. Only the exit code is checked (0 = pass, non-zero = fail). stdout and stderr are not captured or stored.
-
-**Command gate interpolation**: Template variable placeholders (`{{KEY}}`) are NOT expanded in command gate strings. Command strings are treated as literals. This prevents injection attacks where a variable value like `foo; rm -rf /` could be spliced into a shell command. If a command needs access to a variable value, it can read it from the koto state file via `koto query`.
-
-### Go Struct Definitions
-
-The TOML header unmarshals into these Go structs:
-
-```go
-// TemplateConfig is the top-level TOML structure.
-type TemplateConfig struct {
-    Name         string                       `toml:"name"`
-    Version      string                       `toml:"version"`
-    InitialState string                       `toml:"initial_state"`
-    Description  string                       `toml:"description,omitempty"`
-    Variables    map[string]VariableDecl       `toml:"variables,omitempty"`
-    States       map[string]StateDecl          `toml:"states"`
-}
-
-// VariableDecl defines a template variable.
-// Implements toml.Unmarshaler to support shorthand: TASK = "value"
-// unmarshals as VariableDecl{Default: "value"}.
-// The custom unmarshaler type-switches: if the TOML value is a string,
-// it creates {Default: s}; if it's a table, it does normal unmarshal.
-type VariableDecl struct {
-    Description string `toml:"description,omitempty"`
-    Required    bool   `toml:"required,omitempty"`
-    Default     string `toml:"default,omitempty"`
-}
-
-// StateDecl defines a state in the state machine.
-type StateDecl struct {
-    Transitions []string             `toml:"transitions,omitempty"`
-    Terminal    bool                  `toml:"terminal,omitempty"`
-    Gates       map[string]GateDecl   `toml:"gates,omitempty"`
-}
-
-// GateDecl defines an evidence gate.
-type GateDecl struct {
-    Type    string `toml:"type"`              // "field_not_empty", "field_equals", "command"
-    Field   string `toml:"field,omitempty"`   // for field_not_empty, field_equals
-    Value   string `toml:"value,omitempty"`   // for field_equals
-    Command string `toml:"command,omitempty"` // for command
-}
-```
-
-### Markdown Body Sections
-
-Each declared state must have a corresponding `## heading` in the markdown body. The heading text must exactly match the state name from the TOML header.
+The authoring format uses standard YAML frontmatter (`---` delimiters) for the state machine structure and markdown body for directive content:
 
 ```markdown
-## assess
+---
+name: quick-task
+version: "1.0"
+description: A focused task workflow
+initial_state: assess
 
-Evaluate the problem and determine the approach.
+variables:
+  TASK:
+    description: What to build
+    required: true
+  REPO:
+    description: Repository path
+    default: "."
 
-Consider these factors:
-- Complexity of the change
-- Files affected
-- Test coverage needed
-
-## plan
-
-Create an implementation plan for {{TASK}}.
-
-### Recommended Structure
-
-Use this heading structure for the plan:
-
-## Overview
-
-This `## Overview` heading is NOT a state boundary because "Overview"
-is not in [states]. It's part of the plan directive.
-```
-
-**State name rules**: State names are case-sensitive. Matching between `## heading` text and declared state names uses exact string comparison after trimming leading/trailing whitespace from the heading text. State names should use kebab-case (`assess-task`, not `Assess Task`) and must not contain characters that would be ambiguous in TOML keys or markdown headings. Recommended pattern: `[a-z][a-z0-9_-]*`.
-
-**Parsing rules:**
-
-1. Read the TOML header first. Build the set of declared state names. The initial state is the value of `initial_state` (must match a key in `[states]`).
-2. Scan the markdown body line by line.
-3. A line starting with `## ` followed by text that, after whitespace trimming, exactly matches a declared state name starts a new state section.
-4. All other lines (including `##` headings that don't match declared states) are content within the current section.
-5. A `**Transitions**:` line within a recognized state section is consumed by the parser and excluded from the section content. A `**Transitions**:` line that appears before the first recognized state heading, or within body content that's part of a non-state heading, is left as-is (treated as regular content). The markdown transitions line is optional -- transitions declared in the TOML header take precedence.
-6. Duplicate state headings: if the body contains `## assess` twice and `assess` is a declared state, the second occurrence reopens the section. Content from both occurrences is concatenated. (This is unlikely in practice but the behavior should be deterministic.)
-
-**Known limitation**: The parser does line-by-line string matching and does not track fenced code blocks. A `## state-name` line inside a fenced code block (``` or ~~~) will be incorrectly treated as a state boundary. Template authors should avoid using declared state names as headings inside code blocks. This limitation will be addressed in a future release.
-
-**Transition declaration precedence**: If a state has transitions in both the TOML header and a `**Transitions**:` line in the body, the TOML header wins. If both are present and disagree (different lists), a parser warning is emitted noting the discrepancy and stating which value is used. The `**Transitions**:` line is supported for backward compatibility and for templates that want inline readability.
-
-### Template Search Path
-
-When `--template` value doesn't contain `/` or `.`:
-
-1. `.koto/templates/<name>.md` (relative to git root, or CWD)
-2. `~/.config/koto/templates/<name>.md` (or `$XDG_CONFIG_HOME/koto/templates/<name>.md`)
-
-First match wins. If no match, error with the paths searched.
-
-When `--template` contains `/` or `.`, treat it as a file path (absolute or relative).
-
-### Interpolation Contract
-
-The controller builds the interpolation context as a `map[string]string`:
-
-```
-context = merge(template.Variables defaults, init-time --var values, evidence values)
-```
-
-Later entries override earlier ones. The `Interpolate` function does single-pass replacement of `{{KEY}}` placeholders. Unresolved placeholders remain as-is.
-
-Evidence values are set via `koto transition <target> --evidence key=value`. They accumulate in the state file across transitions and are available in all subsequent directives. This requires extending the `engine.State` struct with an `Evidence map[string]string` field (separate from `Variables`). Variables are immutable after init; evidence accumulates during execution. The state file schema version increments to accommodate this field.
-
-### Validation Rules
-
-**Parse-time (structural):**
-
-| Check | Error |
-|-------|-------|
-| TOML syntax invalid | TOML parse error with line number |
-| Missing `name` field | `"template missing required field: name"` |
-| Missing `version` field | `"template missing required field: version"` |
-| Missing `initial_state` field | `"template missing required field: initial_state"` |
-| `initial_state` not in `[states]` | `"initial_state %q is not a declared state"` |
-| State in header has no body section | `"state %q declared in header but has no section in body"` |
-| Body section matches no declared state | (ignored -- it's regular markdown content) |
-| Transition target not in declared states | `"state %q references undefined transition target %q"` |
-| Gate has unknown type | `"state %q gate %q: unknown type %q"` |
-| Gate missing required field | `"state %q gate %q: missing required field %q"` |
-| Empty transitions list with terminal = false | warning, not error |
-
-**Explicit validation (`koto validate --template`):**
-
-| Check | Severity |
-|-------|----------|
-| All parse-time checks | error |
-| All states reachable from initial state | warning |
-| Required variables have no default and must be provided at init | info |
-| Gate references field not in variables | warning |
-
-### Example: Valid Template
-
-```toml
-+++
-name = "quick-task"
-version = "1.0"
-description = "A simple linear task workflow"
-initial_state = "assess"
-
-[variables]
-TASK = {description = "What to build", required = true}
-
-[states.assess]
-transitions = ["plan"]
-
-[states.plan]
-transitions = ["implement"]
-
-[states.implement]
-transitions = ["done"]
-
-[states.implement.gates.tests_pass]
-type = "command"
-command = "go test ./..."
-
-[states.done]
-terminal = true
-+++
+states:
+  assess:
+    transitions: [plan, escalate]
+    gates:
+      task_defined:
+        type: field_not_empty
+        field: TASK
+  plan:
+    transitions: [implement]
+  implement:
+    transitions: [done]
+    gates:
+      tests_pass:
+        type: command
+        command: go test ./...
+  escalate:
+    terminal: true
+  done:
+    terminal: true
+---
 
 ## assess
 
-Analyze the task: {{TASK}}.
+Analyze the task: {{TASK}}
 
-Determine the scope, identify affected files, and assess complexity.
+Review the codebase in {{REPO}} and determine:
+- What files need to change
+- How complex the change is
+- Whether tests exist for the affected code
 
 ## plan
 
@@ -638,159 +218,514 @@ Execute the plan. Write code and tests.
 
 ## done
 
-Work is complete. The task has been implemented and tested.
+Work is complete.
+
+## escalate
+
+Task could not be completed in this workflow.
 ```
 
-### Example: Invalid Template (missing state section)
+The YAML frontmatter contains the complete state machine definition. The markdown body contains directive content, matched to states by `## heading` text. GitHub renders this as a nice document with the frontmatter hidden.
 
-```toml
-+++
-name = "broken"
-version = "1.0"
-initial_state = "start"
+**Why YAML for the frontmatter**: YAML is the industry standard for frontmatter. GitHub renders it. Editors support it. go-yaml is a dependency of the compiler/tooling layer (not the engine). The implicit typing concern (bare `yes` becoming boolean) is real but narrow -- template authors already quote version strings (`"1.0"`), and the compiler validates types.
 
-[states.start]
-transitions = ["middle"]
+**Heading collision is reduced, not eliminated**: In the authoring format, `## headings` matching state names are state boundaries. Other headings are directive content. The compiler resolves this deterministically and produces unambiguous JSON. If the authoring format is ambiguous, the linter catches it. The engine never sees the ambiguity -- it reads JSON.
 
-[states.middle]
-transitions = ["end"]
+#### Alternatives Considered
 
-[states.end]
-terminal = true
-+++
+**Pure YAML**: All content in YAML, directives as block scalars. No heading collision, but long markdown in YAML block scalars is awkward (indentation-sensitive, no syntax highlighting, hard to edit).
 
-## start
+**Pure markdown with conventions**: No frontmatter, everything encoded in markdown structure. Renders perfectly but has no schema validation, no editor support, and fragile parsing.
 
-Begin the work.
+**TOML frontmatter**: Works well for nested config but `+++` delimiters aren't standard. GitHub doesn't render TOML frontmatter. Less familiar than YAML to most developers.
 
-## end
+### Decision 4: Evidence Gate Declarations
 
-Done.
+How do template authors declare evidence requirements?
+
+#### Chosen: Per-state gate declarations
+
+Gates are declared under each state in both formats. Three gate types for Phase 1:
+
+**field_not_empty**: A named field exists and is non-empty in the evidence map.
+
+**field_equals**: A named field equals a specific value.
+
+**command**: A shell command exits 0. Commands are literal strings -- no `{{VARIABLE}}` interpolation (prevents injection). Commands run via `sh -c` from the project root directory.
+
+Gates on a state are exit conditions: all must pass (AND logic) before leaving that state. OR composition is not supported in Phase 1.
+
+#### Alternatives Considered
+
+**Transition-level gates**: Attach gates to specific transitions rather than states. Deferred for Phase 1 -- the common case is "satisfy these conditions before leaving this state." Transition-level gates can be added later.
+
+**Inline gate syntax in markdown**: Declare gates in the body using special syntax. Rejected because it mixes machine configuration with content -- exactly the problem the dual-format approach solves.
+
+### Decision 5: Template Search Path
+
+How does koto find templates?
+
+#### Chosen: Three-tier search with explicit override
+
+Template resolution:
+
+1. **Explicit path**: If `--template` is a file path (contains `/` or `.`), use it directly. Accepts both `.md` and `.koto.json`.
+2. **Project-local**: `.koto/templates/<name>.koto.json` or `.koto/templates/<name>.md` (relative to git root or CWD).
+3. **User-global**: `~/.config/koto/templates/<name>.koto.json` or `~/.config/koto/templates/<name>.md`.
+
+If a `.md` file is found but no `.koto.json`, the compiler runs automatically. First match wins.
+
+### Decision 6: LLM-Assisted Validation
+
+Where do LLMs fit in the template workflow?
+
+#### Chosen: Optional linter, outside the parse path
+
+LLMs are confined to the `koto template lint` command. They are never invoked during `koto init`, `koto next`, `koto transition`, or any engine operation.
+
+The linter workflow:
+
+1. **Deterministic checks first**: Parse YAML frontmatter, validate against schema, check state references, verify heading matches. These are fast, free, and deterministic.
+2. **LLM checks second (optional)**: If deterministic checks pass, optionally invoke an LLM to review:
+   - Directive quality (are instructions clear enough for an agent?)
+   - Gate completeness (should this state have gates?)
+   - Variable usage (are all declared variables used in directives?)
+3. **LLM fixes (optional)**: If deterministic checks fail, optionally invoke an LLM to suggest fixes:
+   - "State 'assess' has no matching ## heading in body. Did you mean ## Assess?"
+   - "Variable TASK is declared but never referenced in any directive."
+4. **All fixes are suggestions**: The linter outputs suggestions. The human applies them. The compiler only processes the result after the human is done editing.
+
+The LLM is a tool for humans, not a component of the system. koto works without it.
+
+#### Alternatives Considered
+
+**LLM in the compilation path**: Use LLMs to handle ambiguous markdown-to-JSON conversion. Rejected because it makes compilation non-deterministic. Same input could produce different output depending on model, temperature, or prompt changes.
+
+**No LLM support**: Ignore LLMs entirely. The deterministic tooling is sufficient. The LLM linter is optional and can be added later without changing the architecture. This is a reasonable simplification for Phase 1.
+
+## Decision Outcome
+
+### Summary
+
+koto uses a dual-format template system: a canonical JSON format for the engine and a markdown authoring format for humans. A deterministic compiler converts markdown to JSON. The engine only reads JSON -- no ambiguity, no heading collision, no format debates.
+
+The canonical JSON format uses Go's standard library (`encoding/json`) with zero external dependencies. It contains the complete state machine definition (states, transitions, gates, variables) and directive content for each state.
+
+The markdown authoring format uses standard YAML frontmatter (`---` delimiters) for structure and markdown body for directives. GitHub renders it. go-yaml parses the frontmatter in the compiler/tooling layer only.
+
+An optional LLM-assisted linter helps humans fix authoring errors but sits entirely outside the parse and compilation path. koto works without it.
+
+### Rationale
+
+The dual-format approach eliminates the heading collision problem (JSON has no headings), removes the YAML-vs-TOML debate (JSON for machines, YAML frontmatter for humans), and lets each format excel at what it's designed for. The compilation step is deterministic -- there's no ambiguity about what the engine will read.
+
+The cost is a compilation step and two file representations. This is acceptable because:
+- Templates are authored infrequently (write once, run many times)
+- The compiler is fast (YAML parse + JSON serialize)
+- `koto init` can compile on the fly (no manual step required)
+- Round-tripping (decompile) means either format can be the source of truth
+
+### Trade-offs Accepted
+
+- **Two formats**: Templates have a `.md` source and a `.koto.json` canonical form. This adds conceptual overhead for template authors. Mitigated by `koto init` accepting either format transparently.
+- **go-yaml dependency in compiler**: The compiler (not the engine) depends on go-yaml for parsing YAML frontmatter. The engine remains dependency-free. Acceptable because the dependency is confined to tooling.
+- **Directive duplication**: Directives exist in both the markdown body (human-readable) and the JSON file (as string fields). The compiler ensures consistency. If the JSON is generated from markdown, there's one source of truth.
+- **No LLM gates**: Only deterministic gate types (field checks, commands) in Phase 1. LLM-based evaluation (prompt gates) deferred to a separate design.
+
+## Solution Architecture
+
+### Canonical Format (JSON)
+
+A `.koto.json` file contains the complete template:
+
+```json
+{
+  "schema_version": 1,
+  "name": "quick-task",
+  "version": "1.0",
+  "description": "A focused task workflow",
+  "initial_state": "assess",
+  "variables": {
+    "TASK": {
+      "description": "What to build",
+      "required": true,
+      "default": ""
+    },
+    "REPO": {
+      "description": "Repository path",
+      "required": false,
+      "default": "."
+    }
+  },
+  "states": {
+    "assess": {
+      "directive": "Analyze the task: {{TASK}}\n\nReview the codebase in {{REPO}} and determine:\n- What files need to change\n- How complex the change is\n- Whether tests exist for the affected code",
+      "transitions": ["plan", "escalate"],
+      "gates": {
+        "task_defined": {
+          "type": "field_not_empty",
+          "field": "TASK"
+        }
+      }
+    },
+    "plan": {
+      "directive": "Create an implementation plan for {{TASK}}.\n\nBreak the work into steps. Identify tests to write.",
+      "transitions": ["implement"]
+    },
+    "implement": {
+      "directive": "Execute the plan. Write code and tests.",
+      "transitions": ["done"],
+      "gates": {
+        "tests_pass": {
+          "type": "command",
+          "command": "go test ./..."
+        }
+      }
+    },
+    "escalate": {
+      "directive": "Task could not be completed in this workflow.",
+      "terminal": true
+    },
+    "done": {
+      "directive": "Work is complete.",
+      "terminal": true
+    }
+  }
+}
 ```
 
-**Error**: `state "middle" declared in header but has no section in body`
+**Schema version**: Enables forward-compatible evolution. The engine rejects unknown schema versions.
 
-### Example: Invalid Template (undefined transition target)
+**Go types:**
 
-```toml
-+++
-name = "broken"
-version = "1.0"
-initial_state = "start"
+```go
+// CanonicalTemplate is the JSON-serializable template format.
+type CanonicalTemplate struct {
+    SchemaVersion int                        `json:"schema_version"`
+    Name          string                     `json:"name"`
+    Version       string                     `json:"version"`
+    Description   string                     `json:"description,omitempty"`
+    InitialState  string                     `json:"initial_state"`
+    Variables     map[string]VariableDecl     `json:"variables,omitempty"`
+    States        map[string]StateDecl        `json:"states"`
+}
 
-[states.start]
-transitions = ["nonexistent"]
-+++
+type VariableDecl struct {
+    Description string `json:"description,omitempty"`
+    Required    bool   `json:"required,omitempty"`
+    Default     string `json:"default,omitempty"`
+}
 
-## start
+type StateDecl struct {
+    Directive   string               `json:"directive"`
+    Transitions []string             `json:"transitions,omitempty"`
+    Terminal    bool                 `json:"terminal,omitempty"`
+    Gates       map[string]GateDecl  `json:"gates,omitempty"`
+}
 
-Begin the work.
+type GateDecl struct {
+    Type    string `json:"type"`
+    Field   string `json:"field,omitempty"`
+    Value   string `json:"value,omitempty"`
+    Command string `json:"command,omitempty"`
+}
 ```
 
-**Error**: `state "start" references undefined transition target "nonexistent"`
+**Validation rules (parse-time):**
+
+| Check | Error |
+|-------|-------|
+| Invalid JSON | JSON parse error |
+| Unknown `schema_version` | `"unsupported schema version: %d"` |
+| Missing `name` | `"missing required field: name"` |
+| Missing `version` | `"missing required field: version"` |
+| Missing `initial_state` | `"missing required field: initial_state"` |
+| `initial_state` not in states | `"initial_state %q is not a declared state"` |
+| No states declared | `"template has no states"` |
+| Transition target not in states | `"state %q references undefined transition target %q"` |
+| Gate has unknown type | `"state %q gate %q: unknown type %q"` |
+| Gate missing required field | `"state %q gate %q: missing required field %q"` |
+| State has empty directive | `"state %q has empty directive"` |
+
+### Authoring Format (Markdown)
+
+A `.md` file with YAML frontmatter:
+
+```markdown
+---
+name: quick-task
+version: "1.0"
+description: A focused task workflow
+initial_state: assess
+
+variables:
+  TASK:
+    description: What to build
+    required: true
+  REPO:
+    description: Repository path
+    default: "."
+
+states:
+  assess:
+    transitions: [plan, escalate]
+    gates:
+      task_defined:
+        type: field_not_empty
+        field: TASK
+  plan:
+    transitions: [implement]
+  implement:
+    transitions: [done]
+    gates:
+      tests_pass:
+        type: command
+        command: go test ./...
+  escalate:
+    terminal: true
+  done:
+    terminal: true
+---
+
+## assess
+
+Analyze the task: {{TASK}}
+
+Review the codebase in {{REPO}} and determine:
+- What files need to change
+- How complex the change is
+- Whether tests exist for the affected code
+
+## plan
+
+Create an implementation plan for {{TASK}}.
+
+Break the work into steps. Identify tests to write.
+
+## implement
+
+Execute the plan. Write code and tests.
+
+## done
+
+Work is complete.
+
+## escalate
+
+Task could not be completed in this workflow.
+```
+
+The YAML frontmatter contains the complete state machine definition (identical data to the JSON canonical format). The markdown body provides directive content, matched by `## heading` to state names.
+
+**Compilation rules:**
+
+1. Parse YAML frontmatter using go-yaml v3.
+2. Build the set of declared state names from `states:`.
+3. Scan markdown body for `## headings` matching declared state names. Content between headings becomes the directive.
+4. For each declared state, the directive comes from the markdown body. If a state has no matching heading, compilation fails.
+5. The heading collision problem still exists in the authoring format but is contained: the compiler resolves it deterministically, and the engine never sees it.
+6. Serialize to JSON. Compute SHA-256 hash of the JSON output.
+
+**What the compiler does NOT do:**
+- Parse `**Transitions**:` lines from the body. Transitions come exclusively from the YAML frontmatter. No dual sources.
+- Treat non-matching headings as errors. `## Analysis` within a state directive is content, not a state boundary.
+- Invoke LLMs. Compilation is deterministic.
+
+### Evidence Gates
+
+**Gate types (Phase 1):**
+
+| Type | Required Fields | Description |
+|------|----------------|-------------|
+| `field_not_empty` | `field` | Evidence field exists and is non-empty |
+| `field_equals` | `field`, `value` | Evidence field equals expected value |
+| `command` | `command` | Shell command exits 0 |
+
+**Gate semantics:**
+- Gates are exit conditions: all gates on a state must pass before leaving (AND logic).
+- Gates are evaluated when `koto transition` is called, between validation and commit.
+- Command gates run via `sh -c "<command>"` from the project root. No `{{VARIABLE}}` interpolation in command strings (prevents injection). No timeout in Phase 1.
+- Evidence is supplied via `koto transition <target> --evidence key=value` and accumulates in the state file across transitions.
+
+**Engine extension:**
+- Add `Evidence map[string]string` to `engine.State` (separate from `Variables`).
+- Extend `Engine.Transition` signature: `Transition(target string, opts ...TransitionOption) error` with `WithEvidence(map[string]string)` option for backward compatibility.
+- Bump `schema_version` to 2. `Load` accepts v1 (empty Evidence map) and v2.
+
+### Interpolation
+
+The controller builds the interpolation context:
+
+```
+context = merge(variable defaults, init-time --var values, evidence values)
+```
+
+Evidence wins over variables (higher precedence). Single-pass `{{KEY}}` replacement. Unresolved placeholders remain as-is.
+
+Command gate strings are NOT interpolated. This is a security boundary -- verified by explicit tests.
+
+### Template Search Path
+
+When `--template` doesn't contain `/` or `.`:
+
+1. `.koto/templates/<name>.koto.json` then `.koto/templates/<name>.md` (project-local)
+2. `~/.config/koto/templates/<name>.koto.json` then `~/.config/koto/templates/<name>.md` (user-global, respects `$XDG_CONFIG_HOME`)
+
+JSON is preferred over markdown when both exist (skip compilation). First match wins.
+
+### Tooling Commands
+
+```
+koto template compile <input.md> [-o output.koto.json]
+koto template decompile <input.koto.json> [-o output.md]
+koto template validate <file>                # structural + semantic checks
+koto template lint <file.md>                 # validate + optional LLM suggestions
+koto template new <name>                     # scaffold a new template
+```
+
+`koto init --template <file>` accepts either format. If given `.md`, it compiles in memory (no persistent `.koto.json` needed unless the user wants one).
+
+### LLM Linter Architecture
+
+The linter is optional and separate from compilation:
+
+```
+Human writes template.md
+        |
+        v
+[Deterministic validation]  ← schema checks, state references, type validation
+        |
+    pass / fail
+       / \
+      /   \
+     v     v
+  [OK]  [LLM suggests fixes]  ← "Did you mean ## assess instead of ## Assess?"
+           |
+           v
+   Human reviews + applies fixes
+           |
+           v
+   [Re-validate]
+           |
+           v
+   [Compile to JSON]  ← deterministic, no LLM
+```
+
+The LLM never touches the compilation path. It's a development-time assistant that helps humans write valid templates. koto works without it.
 
 ## Implementation Approach
 
-### Phase 1: TOML Header Parser
+### Phase 1: Canonical JSON Format
 
-Replace `parseHeader` with TOML parsing using BurntSushi/toml:
-- Define Go structs matching the TOML schema
-- Parse `+++` delimited front matter
-- Build `engine.Machine` from parsed states
-- Extract variable declarations and gate definitions
-- Update `splitFrontMatter` to handle both `---` (legacy) and `+++` (TOML) delimiters. The `---` support will be removed in the next release after the format change ships. Since koto has no public release yet, the transition period is one release cycle at most.
+Define the JSON schema and implement parsing in `pkg/template/`:
+- `CanonicalTemplate` struct with JSON tags
+- `ParseJSON(path string) (*Template, error)` -- reads and validates `.koto.json`
+- Build `engine.Machine` from parsed canonical template
+- JSON Schema file for editor support
+- Unit tests for every validation rule
 
-### Phase 2: Declared-State Section Parsing
+No external dependencies. Uses `encoding/json` from stdlib.
 
-Update `parseSections` to use the declared state set:
-- Read state names from parsed TOML header
-- Only treat `## heading` as boundary if heading matches declared state
-- Handle `**Transitions**:` as optional (TOML transitions take precedence)
+### Phase 2: Markdown Compiler
+
+Implement the compiler as a separate package (`pkg/template/compile/` or `cmd/koto/`):
+- Parse YAML frontmatter (go-yaml v3 dependency here, not in engine)
+- Extract directive content from markdown body
+- Produce `CanonicalTemplate` struct
+- `koto template compile` CLI command
+- Unit tests for compilation edge cases (heading collision, missing sections)
 
 ### Phase 3: Template Search Path
 
-Add search path resolution to the CLI layer:
-- `resolveTemplatePath` function in `cmd/koto/main.go`
+Add search path resolution to the CLI:
+- `resolveTemplatePath` in `cmd/koto/`
 - Git root detection for project-local search
 - XDG config directory for user-global search
-- No changes to `pkg/template/` (it always receives a resolved path)
+- Prefer `.koto.json` over `.md` when both exist
 
-### Phase 4: Evidence Gate Types
+### Phase 4: Evidence Gates
 
-Add gate types to the template struct and extend the engine API:
-- Gate declaration structs in `pkg/template/`
-- Validation of gate declarations at parse time
-- Gate evaluation integration in `pkg/engine/` (extend `MachineState`)
-- `gate_failed` error code in `TransitionError`
-- Extend `Engine.Transition` to accept evidence: `Transition(target string, opts ...TransitionOption) error` using functional options (`WithEvidence(map[string]string)`). This is backward-compatible -- existing callers pass no options.
-- Add `Evidence map[string]string` field to `engine.State`. Bump `schema_version` to 2. `Load` accepts both v1 (empty Evidence map) and v2. `Init` always writes v2.
-- Add explicit test: a command gate containing `{{TASK}}` must NOT expand (verifies the no-interpolation security boundary).
+Extend the engine for evidence:
+- `Evidence map[string]string` in `engine.State`
+- `Transition(target string, opts ...TransitionOption) error`
+- Gate evaluation between validation and commit
+- `gate_failed` error code
+- Command gate execution (`sh -c`, project root CWD, no interpolation)
 
-**Note**: Phase 1 parses gate declarations from the TOML header but does not carry them to `engine.MachineState`. The parsed `GateDecl` data is retained in the `Template` struct for Phase 4 to consume. This is intentional -- it allows templates with gates to be parsed and validated structurally even before the engine supports gate evaluation.
+### Phase 5: Backward Compatibility
 
-### Phase 5: Validation Command
+Support the legacy format during transition:
+- Detect `---` frontmatter with flat `key: value` syntax (legacy)
+- Convert to canonical format in memory
+- Emit deprecation warning
+- Remove after one release cycle (user base is currently zero)
 
-Enhance `koto validate` with a `--template` flag for template-only validation (no state file needed). The current `koto validate` checks template hash integrity against a running workflow's state file -- a different mode. With `--template`, validation runs the semantic checks below against a template file directly:
-- Reachability analysis (BFS from initial state)
-- Cross-reference checks (gates referencing variables)
-- Rich error output with line numbers where possible
+### Phase 6: Validation and Linter
+
+Implement `koto template validate` and `koto template lint`:
+- Structural validation (parse-time checks)
+- Semantic validation (reachability, cross-references)
+- Optional LLM integration for lint suggestions
 
 ## Security Considerations
 
 ### Download Verification
 
-Not applicable. The template format design doesn't involve downloading anything. Templates are local files read from disk.
+Not applicable. Templates are local files. No downloads at runtime.
 
 ### Execution Isolation
 
-**Command gates execute shell commands**: The `command` gate type runs arbitrary commands via the user's shell. This is a deliberate feature (the template author defines what commands to run) but carries the same risks as any shell execution:
-- Commands run with the user's permissions
-- Templates from untrusted sources could run malicious commands
-- Command output is not sandboxed
+**Command gates execute shell commands**: `sh -c "<command>"` with user permissions from the project root. This is deliberate (template authors define what to run). Commands are literal strings -- no variable interpolation prevents injection.
 
-Mitigation: command gates only execute when a transition is attempted, not when a template is parsed or validated. The `koto validate` command does NOT execute command gates -- it only checks that the declaration is syntactically valid. Users should review template files before running `koto init`, the same way they'd review a Makefile or shell script.
+**No timeout in Phase 1**: A hanging command blocks the transition indefinitely. This must be addressed before unattended agent scenarios. Acceptable for interactive use.
+
+Mitigation: command gates execute only during transitions, not during parse or validate. `koto template validate` does NOT execute commands. Review templates before use (same trust model as Makefiles).
 
 ### Supply Chain Risks
 
-**Template files as code**: Templates with command gates are effectively executable. A modified template in a shared repository could introduce malicious commands. Mitigation: koto's existing template hash verification detects any modification after `koto init`. The SHA-256 hash covers the entire file including gate declarations.
+**Template files with command gates are executable**: A malicious template could run arbitrary commands. Mitigation: SHA-256 hash stored at init time, verified on every operation. Template modification after init is detected.
 
-**TOML parser dependency**: Adding BurntSushi/toml introduces a supply chain dependency. Mitigation: the library is BSD-licensed, has been stable since 2013 with minimal churn, has 4.5K+ stars, and is maintained by a well-known Go community member. The dependency is confined to `pkg/template/`.
+**go-yaml dependency**: Confined to the compiler/tooling layer. The engine reads JSON using stdlib only. A go-yaml vulnerability affects template authoring, not workflow execution.
+
+**JSON canonical format**: Go's `encoding/json` is part of the standard library. No supply chain risk from the engine's parser.
 
 ### User Data Exposure
 
-**Evidence values in state files**: Evidence accumulated during execution is stored in the state file. If evidence includes sensitive data (test output, API responses), it persists on disk and in git history if the state file is committed. Mitigation: this is the existing behavior for variables; evidence follows the same pattern. State files in `wip/` are cleaned before merge.
+**Evidence in state files**: Evidence accumulated during execution is stored in the state file (JSON on disk). Same risk as the existing variables. State files in `wip/` are cleaned before merge.
 
-**Command gate output**: Command gates check exit codes only; stdout/stderr is not captured or stored. No command output leaks into the state file.
+**Command gate output**: Exit codes only. stdout/stderr not captured or stored.
 
 ### Mitigations
 
 | Risk | Mitigation | Residual Risk |
 |------|------------|---------------|
-| Malicious command gates in templates | Template hash verification after init; user reviews templates before use | User runs untrusted template without review |
-| TOML parser vulnerability | Well-maintained, widely-used library; confined to template package | Zero-day in parser |
-| Sensitive data in evidence | State files cleaned before merge; same pattern as variables | Exposure on feature branches |
-| Template modification after init | SHA-256 hash on every operation; no bypass flag | Hash collision (negligible) |
+| Malicious command gates | SHA-256 hash verification; review before use | Untrusted template used without review |
+| go-yaml vulnerability | Confined to compiler, not engine | Zero-day in compiler path |
+| Evidence contains sensitive data | Cleaned before merge; same as variables | Exposure on feature branches |
+| Template modification after init | Hash check on every operation | Hash collision (negligible) |
+| Command injection via variables | No interpolation in command strings; explicit test | Future contributor bypasses this |
 
 ## Consequences
 
 ### Positive
 
-- Templates become self-documenting: the TOML header is the complete state machine definition, readable without running the parser
-- Evidence gates enable the core value proposition: enforcing proof of work, not just ordering
-- The heading collision problem is solved cleanly without escape syntax or format changes to directive content
-- Template search path enables project-local template libraries without requiring explicit paths
-- The `pkg/template/` dependency boundary means the TOML parser doesn't affect the engine's zero-dependency guarantee
+- Heading collision eliminated: JSON has no headings. The engine never sees markdown ambiguity.
+- Format debates resolved: JSON for machines (deterministic), YAML+markdown for humans (readable). Each format does what it's designed for.
+- Zero engine dependencies: `encoding/json` is stdlib. go-yaml is confined to the compiler.
+- Schema-based tooling: JSON Schema enables editor autocomplete, CI validation, and third-party tool support.
+- LLM assistance without LLM dependency: The linter is optional. koto works without it. LLMs help humans, not the system.
+- Clean extension point: new gate types, new fields, and schema evolution all work through JSON schema versioning.
 
 ### Negative
 
-- One external dependency (BurntSushi/toml) in `pkg/template/`
-- Breaking change from `---` to `+++` delimiters (no existing users, so the cost is effectively zero)
-- Command gates introduce shell execution, expanding the security surface
-- Duplicate transition declaration (TOML header and `**Transitions**:` line) could confuse template authors
+- Two formats to understand: template authors need to know that `.md` compiles to `.koto.json`. Conceptual overhead.
+- Compilation step: an extra command or implicit step at `koto init`. Mitigated by transparent compilation when given `.md`.
+- JSON directives are ugly: the canonical format embeds markdown as JSON strings (`\n` everywhere). Humans shouldn't need to read the JSON, but debugging may require it.
+- go-yaml dependency in compiler: adds ~15K lines of dependency to the tooling layer. Acceptable for a well-maintained, widely-used library.
 
 ### Mitigations
 
-- The TOML dependency is well-maintained, BSD-licensed, and confined to a single package
-- A transition period supporting both `---` and `+++` delimiters eases migration
-- Command gate security follows the same trust model as Makefiles and CI scripts -- review before use
-- Parser warnings on redundant transition declarations guide authors toward the canonical form
+- `koto init` accepts both formats transparently -- most users never see the JSON
+- `koto template decompile` enables round-tripping if someone needs to recover the markdown
+- JSON Schema provides structure that makes the canonical format navigable even with escaped markdown
+- The compiler is a small, focused component (~200 lines) that's easy to understand and maintain

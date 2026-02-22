@@ -1,25 +1,24 @@
-# Exploration Summary: koto Template Format
+# Exploration Summary: koto Template Format (v2)
 
 ## Problem (Phase 1)
-koto has a working template parser but the format is undocumented, limited, and makes assumptions that will break as templates grow more complex. Evidence gates have no syntax. The header parser silently ignores unknown keys. State section boundaries collide with normal markdown. There's no template search path, no validation contract, and no way to declare variable types or requirements. The format needs to be formalized before other designs (quick-task template, agent integration) can build on it.
+
+The previous design attempt tried to find a single format serving both deterministic machine parsing and human authoring. This created cascading complexity: heading collision, declared-state matching, dual transition sources, TOML-vs-YAML debates. These are symptoms of conflating two separate concerns. The real problem has two parts: (1) koto needs a machine-readable, fully structured, deterministic canonical format for state machines, and (2) humans need a way to author, edit, and understand template definitions that is natural to write and renders well in tools like GitHub. These don't need to be the same format.
 
 ## Decision Drivers (Phase 1)
-- Zero external dependencies (current constraint, manual parsing)
-- Backward compatibility with existing templates
-- Evidence gates must be declarable per-transition
-- Template search path needed for built-in and user templates
-- YAML vs TOML header format is an open question
-- Heading collision (`## state-name` in directive text) must be resolved
-- Variables vs evidence interpolation namespace needs rules
+- The canonical (machine) format must be deterministic to parse with zero ambiguity
+- The human authoring format must be readable, writable, and render well on GitHub
+- Conversion from human format to canonical format must be deterministic
+- LLMs may assist at the validation layer (fixing input) but NOT in the parsing path
+- Zero external dependencies for the core engine (parsing the canonical format)
+- The human format should support rich directive content (markdown with tables, code blocks, headings)
+- Backward compatibility with existing templates is a nice-to-have, not a hard requirement
+- Progressive complexity: simple templates should be simple to author
 
 ## Research Findings (Phase 2)
-- YAML frontmatter + Markdown body is the industry standard (Claude Code skills, Gemini CLI, GitHub Actions)
-- Three evidence gate types: command (exit code), field check (declarative), prompt (LLM evaluation)
-- Project-directory state storage with ephemeral lifecycle validated by Beads and TaskMaster
-- Evidence from one state should feed into interpolation context for later states
-- Typed variable inputs (type, description, required) improve usability over bare key-value
-- No tool combines state machine enforcement with file-based simplicity -- koto's gap is real
+- Previous research still valid: YAML frontmatter + markdown is the industry standard for single-format tools
+- New research: investigating dual-format patterns (Terraform HCL/JSON, Protocol Buffers, CUE, MDX)
+- Key question: does any tool in the AI agent space use a compiled template approach?
 
 ## Current Status
-**Phase:** 4 - Review complete, feedback incorporated
+**Phase:** 1 - Problem reframed, Phase 2 research in progress
 **Last Updated:** 2026-02-22

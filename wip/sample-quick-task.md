@@ -1,44 +1,44 @@
-+++
-name = "quick-task"
-version = "1.0"
-description = "A focused task workflow for small, well-defined changes"
-initial_state = "assess"
+---
+name: quick-task
+version: "1.0"
+description: A focused task workflow for small, well-defined changes
+initial_state: assess
 
-[variables]
-TASK = {description = "What to build or fix", required = true}
-REPO = {description = "Repository path", default = "."}
+variables:
+  TASK:
+    description: What to build or fix
+    required: true
+  REPO:
+    description: Repository path
+    default: "."
 
-[states.assess]
-transitions = ["plan", "escalate"]
-
-[states.assess.gates.task_defined]
-type = "field_not_empty"
-field = "TASK"
-
-[states.plan]
-transitions = ["implement"]
-
-[states.implement]
-transitions = ["verify"]
-
-[states.implement.gates.tests_pass]
-type = "command"
-command = "go test ./..."
-
-[states.verify]
-transitions = ["done", "implement"]
-
-[states.verify.gates.ci_green]
-type = "field_equals"
-field = "CI_STATUS"
-value = "passed"
-
-[states.escalate]
-terminal = true
-
-[states.done]
-terminal = true
-+++
+states:
+  assess:
+    transitions: [plan, escalate]
+    gates:
+      task_defined:
+        type: field_not_empty
+        field: TASK
+  plan:
+    transitions: [implement]
+  implement:
+    transitions: [verify]
+    gates:
+      tests_pass:
+        type: command
+        command: go test ./...
+  verify:
+    transitions: [done, implement]
+    gates:
+      ci_green:
+        type: field_equals
+        field: CI_STATUS
+        value: passed
+  escalate:
+    terminal: true
+  done:
+    terminal: true
+---
 
 ## assess
 
@@ -61,8 +61,6 @@ If the task is too large or unclear, transition to **escalate** with a note abou
 | Ambiguous requirements | Transition to **escalate** |
 | Needs design discussion | Transition to **escalate** |
 
-**Transitions**: [plan, escalate]
-
 ## plan
 
 Create an implementation plan for: {{TASK}}
@@ -76,8 +74,6 @@ Based on the assessment, write a concrete plan covering:
 
 Keep the plan focused -- this is a quick task, not a full design doc.
 
-**Transitions**: [implement]
-
 ## implement
 
 Execute the plan. Write code and tests for: {{TASK}}
@@ -90,8 +86,6 @@ Follow these guidelines:
 
 When you believe implementation is complete, run the full test suite before transitioning.
 
-**Transitions**: [verify]
-
 ## verify
 
 Verify the implementation is complete and CI is green.
@@ -103,8 +97,6 @@ Check:
 - [ ] No unrelated changes included
 
 If CI fails or something is wrong, transition back to **implement** to fix it.
-
-**Transitions**: [done, implement]
 
 ## escalate
 
