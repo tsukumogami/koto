@@ -48,11 +48,11 @@ type MachineState struct {
 }
 
 // GateDecl represents a gate declaration on a machine state. Gates are
-// preconditions that must be satisfied before entering the state.
+// exit conditions that must be satisfied before leaving the state.
 type GateDecl struct {
-	Type    string
-	Field   string
-	Value   string
-	Command string
-	Timeout int // seconds, 0 = default (30s)
+	Type    string `json:"type"`
+	Field   string `json:"field,omitempty"`
+	Value   string `json:"value,omitempty"`
+	Command string `json:"command,omitempty"`
+	Timeout int    `json:"timeout,omitempty"` // seconds, 0 = default (30s)
 }

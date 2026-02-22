@@ -31,20 +31,10 @@ type VariableDecl struct {
 // StateDecl defines a single state in the compiled template, including
 // the directive text, allowed transitions, terminal flag, and gates.
 type StateDecl struct {
-	Directive   string              `json:"directive"`
-	Transitions []string            `json:"transitions,omitempty"`
-	Terminal    bool                `json:"terminal,omitempty"`
-	Gates       map[string]GateDecl `json:"gates,omitempty"`
-}
-
-// GateDecl defines a precondition gate on a state. The Type field
-// determines which other fields are required.
-type GateDecl struct {
-	Type    string `json:"type"`
-	Field   string `json:"field,omitempty"`
-	Value   string `json:"value,omitempty"`
-	Command string `json:"command,omitempty"`
-	Timeout int    `json:"timeout,omitempty"` // seconds, 0 = default (30s)
+	Directive   string                     `json:"directive"`
+	Transitions []string                   `json:"transitions,omitempty"`
+	Terminal    bool                       `json:"terminal,omitempty"`
+	Gates       map[string]engine.GateDecl `json:"gates,omitempty"`
 }
 
 // ParseJSON parses a compiled template from JSON bytes and validates
@@ -121,13 +111,8 @@ func (ct *CompiledTemplate) BuildMachine() *engine.Machine {
 		if len(sd.Gates) > 0 {
 			gates = make(map[string]*engine.GateDecl, len(sd.Gates))
 			for gn, gd := range sd.Gates {
-				gates[gn] = &engine.GateDecl{
-					Type:    gd.Type,
-					Field:   gd.Field,
-					Value:   gd.Value,
-					Command: gd.Command,
-					Timeout: gd.Timeout,
-				}
+				g := gd // copy the value to avoid aliasing the loop variable
+				gates[gn] = &g
 			}
 		}
 
