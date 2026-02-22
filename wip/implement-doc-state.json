@@ -3,12 +3,12 @@
   "design_doc": "docs/designs/DESIGN-koto-template-format.md",
   "branch": "docs/koto-template-format",
   "pr_number": 12,
-  "integrity_hash": "sha256:09b52dbe34fd53ada960c9a9fe0c5f235090ece30d8061b83d4a1f616e0f1221",
+  "integrity_hash": "sha256:2e54adaa74b41309f5ac2344afd42a3bdab8fa6d5ddfe674a972b21b8b5188f6",
   "issues": [
     {
       "number": 13,
       "title": "feat(template): define compiled template format with JSON parsing",
-      "status": "scrutinized",
+      "status": "pushed",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
       "issue_type": "code",
@@ -18,6 +18,39 @@
       ],
       "agent_type": "",
       "summary": null,
+      "reviewer_results": {
+        "issue": 13,
+        "reviews": [
+          {
+            "focus": "pragmatic",
+            "blocking_count": 0,
+            "advisory_count": 2,
+            "detail_file": "wip/research/implement-doc_review_pragmatic_issue13.md"
+          },
+          {
+            "focus": "architect",
+            "blocking_count": 1,
+            "advisory_count": 2,
+            "detail_file": "wip/research/implement-doc_review_architect_issue13.md",
+            "resolved": true,
+            "resolution": "Unified GateDecl type with JSON tags in engine package, removed template duplicate"
+          },
+          {
+            "focus": "maintainer",
+            "blocking_count": 1,
+            "advisory_count": 2,
+            "detail_file": "wip/research/implement-doc_review_maintainer_issue13.md",
+            "resolved": true,
+            "resolution": "Fixed godoc comment: gates are exit conditions, not entry preconditions"
+          }
+        ],
+        "qa": {
+          "scenarios_tested": 8,
+          "scenarios_passed": 8,
+          "scenarios_failed": 0,
+          "detail_file": "wip/research/implement-doc_validation_issue13.md"
+        }
+      },
       "testable_scenarios": [
         "scenario-1",
         "scenario-2",
