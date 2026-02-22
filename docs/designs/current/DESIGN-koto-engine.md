@@ -1,5 +1,5 @@
 ---
-status: Planned
+status: Current
 problem: |
   AI coding agents running multi-step workflows lack reliable execution control.
   They skip prescribed steps, lose progress across session boundaries, and can't
