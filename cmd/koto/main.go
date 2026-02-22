@@ -53,20 +53,23 @@ func cmdInit(args []string) error {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--name":
-			if i+1 < len(args) {
-				i++
-				name = args[i]
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--name requires a value")
 			}
+			i++
+			name = args[i]
 		case "--template":
-			if i+1 < len(args) {
-				i++
-				templatePath = args[i]
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--template requires a value")
 			}
+			i++
+			templatePath = args[i]
 		case "--state-dir":
-			if i+1 < len(args) {
-				i++
-				stateDir = args[i]
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state-dir requires a value")
 			}
+			i++
+			stateDir = args[i]
 		}
 	}
 
@@ -127,10 +130,11 @@ func cmdTransition(args []string) error {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--state":
-			if i+1 < len(args) {
-				i++
-				statePath = args[i]
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state requires a value")
 			}
+			i++
+			statePath = args[i]
 		default:
 			if target == "" && !isFlag(args[i]) {
 				target = args[i]
@@ -167,7 +171,10 @@ func cmdNext(args []string) error {
 	var statePath string
 
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--state" && i+1 < len(args) {
+		if args[i] == "--state" {
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state requires a value")
+			}
 			i++
 			statePath = args[i]
 		}

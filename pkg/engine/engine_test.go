@@ -438,6 +438,42 @@ func TestInit_EmptyVariables(t *testing.T) {
 	}
 }
 
+func TestMachine_ReturnsCopy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, testMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	m := eng.Machine()
+
+	// Mutate the returned machine's state map
+	m.States["done"].Terminal = false
+
+	// Engine's internal machine should not be affected
+	internal := eng.Machine()
+	if !internal.States["done"].Terminal {
+		t.Error("Machine().States[done].Terminal = false, want true (copy was not independent)")
+	}
+
+	// Mutate the returned machine's transitions slice
+	m.States["start"].Transitions[0] = "tampered"
+	internal2 := eng.Machine()
+	if internal2.States["start"].Transitions[0] != "middle" {
+		t.Errorf("Machine().States[start].Transitions[0] = %q, want %q (copy was not independent)",
+			internal2.States["start"].Transitions[0], "middle")
+	}
+
+	// Add a new state to the returned machine
+	m.States["injected"] = &MachineState{Terminal: true}
+	internal3 := eng.Machine()
+	if _, exists := internal3.States["injected"]; exists {
+		t.Error("Machine().States contains injected state, copy was not independent")
+	}
+}
+
 func TestTransition_PersistsToFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "koto-test.state.json")

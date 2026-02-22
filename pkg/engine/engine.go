@@ -171,9 +171,23 @@ func (e *Engine) Path() string {
 	return e.path
 }
 
-// Machine returns the machine definition associated with this engine.
+// Machine returns a deep copy of the machine definition associated with
+// this engine. The copy prevents callers from mutating internal state.
 func (e *Engine) Machine() *Machine {
-	return e.machine
+	states := make(map[string]*MachineState, len(e.machine.States))
+	for name, ms := range e.machine.States {
+		transitions := make([]string, len(ms.Transitions))
+		copy(transitions, ms.Transitions)
+		states[name] = &MachineState{
+			Transitions: transitions,
+			Terminal:    ms.Terminal,
+		}
+	}
+	return &Machine{
+		Name:         e.machine.Name,
+		InitialState: e.machine.InitialState,
+		States:       states,
+	}
 }
 
 // persist writes the current state to disk atomically.
