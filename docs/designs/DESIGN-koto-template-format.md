@@ -35,8 +35,8 @@ rationale: |
 |-------|--------------|------|
 | ~~[#13: feat(template): define compiled template format with JSON parsing](https://github.com/tsukumogami/koto/issues/13)~~ | ~~None~~ | ~~testable~~ |
 | ~~_Defines `CompiledTemplate`, `VariableDecl`, `StateDecl`, and `GateDecl` Go types with JSON tags, implements `ParseJSON()` with all 13 validation rules, adds `Gates` to `MachineState`, and builds `engine.Machine` from compiled JSON. This is the foundation that both the compiler and gate evaluation build on._~~ | | |
-| [#14: feat(template): implement source format compiler](https://github.com/tsukumogami/koto/issues/14) | [#13](https://github.com/tsukumogami/koto/issues/13) | testable |
-| _Creates `pkg/template/compile/` with go-yaml v3 to parse YAML frontmatter and extract markdown directives by matching `## headings` against declared states. Produces deterministic JSON with sorted keys and SHA-256 hash. Emits heading collision warnings._ | | |
+| ~~[#14: feat(template): implement source format compiler](https://github.com/tsukumogami/koto/issues/14)~~ | ~~[#13](https://github.com/tsukumogami/koto/issues/13)~~ | ~~testable~~ |
+| ~~_Creates `pkg/template/compile/` with go-yaml v3 to parse YAML frontmatter and extract markdown directives by matching `## headings` against declared states. Produces deterministic JSON with sorted keys and SHA-256 hash. Emits heading collision warnings._~~ | | |
 | [#15: feat(engine): add evidence support with transition options](https://github.com/tsukumogami/koto/issues/15) | None | testable |
 | _Adds `Evidence map[string]string` to engine state, introduces the `TransitionOption` functional pattern with `WithEvidence()`, bumps `schema_version` to 2 with backward-compatible load, and updates the controller to merge evidence into the interpolation context. Evidence persists across rewind._ | | |
 | [#16: feat(engine): implement field-based gate evaluation](https://github.com/tsukumogami/koto/issues/16) | [#13](https://github.com/tsukumogami/koto/issues/13), [#15](https://github.com/tsukumogami/koto/issues/15) | testable |
@@ -80,9 +80,9 @@ graph TD
     classDef needsDesign fill:#e1bee7
     classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
 
-    class I13 done
+    class I13,I14 done
     class I15 ready
-    class I14,I16,I17 blocked
+    class I16,I17 blocked
     class I18 needsDesign
 ```
 
