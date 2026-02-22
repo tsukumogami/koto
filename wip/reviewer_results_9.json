@@ -1,0 +1,28 @@
+{
+  "issue": 9,
+  "reviewers": [
+    {
+      "focus": "pragmatic",
+      "blocking_count": 0,
+      "advisory_count": 5,
+      "detail_file": "wip/research/implement-doc_review_pragmatic_issue9.md"
+    },
+    {
+      "focus": "architect",
+      "blocking_count": 1,
+      "advisory_count": 1,
+      "detail_file": "wip/research/implement-doc_review_architect_issue9.md",
+      "blocking_resolved": true,
+      "resolution_commit": "see latest commit"
+    },
+    {
+      "focus": "maintainer",
+      "blocking_count": 4,
+      "advisory_count": 5,
+      "detail_file": "wip/research/implement-doc_review_maintainer_issue9.md",
+      "blocking_resolved": true,
+      "resolution_commit": "see latest commit",
+      "note": "cmdStatus text output is intentional per design doc (human-facing commands output plain text). Treated as design-justified, not a defect."
+    }
+  ]
+}

@@ -267,7 +267,7 @@ Total scenarios: 25
 - `koto transition <terminal-state> --state <path>`
 - `koto next --state <path>` (verify done directive)
 **Expected**: Complete lifecycle works end-to-end through the CLI. JSON output is valid at every step. Variables are interpolated in directives. State file version increments on each mutation. History records all transitions.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -281,7 +281,7 @@ Total scenarios: 25
 - `koto next --state <path-to-workflow-a>`
 - `koto workflows --state-dir <dir>`
 **Expected**: `koto next` without `--state` fails with a clear error listing available state files when multiple exist. `koto next --state <specific-path>` succeeds. `koto workflows` lists both active workflows as JSON array. When only one state file exists, commands auto-select it without `--state`.
-**Status**: pending
+**Status**: passed
 
 ---
 
