@@ -3,8 +3,11 @@ package engine
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // testMachine returns a simple three-state machine for testing:
@@ -2763,5 +2766,262 @@ func TestGate_StateNotMutatedOnFailure(t *testing.T) {
 	// Evidence should NOT have been merged since gate failed before commit.
 	if len(snap.Evidence) != 0 {
 		t.Errorf("Evidence = %v after gate failure, want empty", snap.Evidence)
+	}
+}
+
+// commandGateMachine returns a machine with a command gate on "start".
+func commandGateMachine(command string, timeout int) *Machine {
+	return &Machine{
+		Name:         "test",
+		InitialState: "start",
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"done"},
+				Gates: map[string]*GateDecl{
+					"check": {
+						Type:    "command",
+						Command: command,
+						Timeout: timeout,
+					},
+				},
+			},
+			"done": {Terminal: true},
+		},
+	}
+}
+
+func TestGate_Command_ExitZero_Passes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, commandGateMachine("exit 0", 0), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	err = eng.Transition("done")
+	if err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	if got := eng.CurrentState(); got != "done" {
+		t.Errorf("CurrentState() = %q, want %q", got, "done")
+	}
+}
+
+func TestGate_Command_NonZeroExit_Fails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, commandGateMachine("exit 1", 0), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	err = eng.Transition("done")
+	if err == nil {
+		t.Fatal("Transition() expected gate_failed error for exit 1")
+	}
+
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T", err)
+	}
+	if te.Code != ErrGateFailed {
+		t.Errorf("error code = %q, want %q", te.Code, ErrGateFailed)
+	}
+	if !strings.Contains(te.Message, "check") {
+		t.Errorf("error message should contain gate name, got %q", te.Message)
+	}
+	if !strings.Contains(te.Message, "command") {
+		t.Errorf("error message should indicate command gate, got %q", te.Message)
+	}
+
+	// State should not have changed.
+	if got := eng.CurrentState(); got != "start" {
+		t.Errorf("CurrentState() = %q, want %q", got, "start")
+	}
+}
+
+func TestGate_Command_Timeout(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, commandGateMachine("sleep 60", 1), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	start := time.Now()
+	err = eng.Transition("done")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Transition() expected gate_failed error for timeout")
+	}
+
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T", err)
+	}
+	if te.Code != ErrGateFailed {
+		t.Errorf("error code = %q, want %q", te.Code, ErrGateFailed)
+	}
+	if !strings.Contains(te.Message, "timed out") {
+		t.Errorf("error message should indicate timeout, got %q", te.Message)
+	}
+
+	// Should complete roughly within the 1-second timeout, not wait for 60s.
+	if elapsed > 5*time.Second {
+		t.Errorf("command took %v, expected ~1s timeout", elapsed)
+	}
+}
+
+func TestGate_Command_NoInterpolation(t *testing.T) {
+	// Security test: {{VARIABLE}} placeholders in command strings must NOT
+	// be expanded. The command is passed to sh -c exactly as written.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	// The command writes its argument to a file so we can inspect what
+	// sh -c actually received. If interpolation happened, {{TASK}} would
+	// be replaced with something else (or empty string).
+	outFile := filepath.Join(dir, "output.txt")
+	command := "printf '{{TASK}}' > " + outFile
+
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "start",
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"done"},
+				Gates: map[string]*GateDecl{
+					"check": {
+						Type:    "command",
+						Command: command,
+					},
+				},
+			},
+			"done": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{
+		Name:      "test",
+		Variables: map[string]string{"TASK": "should-not-appear"},
+	})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	err = eng.Transition("done")
+	if err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	// Read the output file and verify the literal {{TASK}} was written.
+	data, err := os.ReadFile(outFile) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("ReadFile() error: %v", err)
+	}
+	if string(data) != "{{TASK}}" {
+		t.Errorf("command output = %q, want literal %q (interpolation happened!)", string(data), "{{TASK}}")
+	}
+}
+
+func TestGate_Command_DefaultTimeout(t *testing.T) {
+	// Verify that when Timeout is 0, the function uses 30s default.
+	// We can't easily test the exact 30s value without waiting, so
+	// we test indirectly: a fast command with timeout=0 should pass
+	// (proving a non-zero timeout was applied, not an instant timeout).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, commandGateMachine("exit 0", 0), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	err = eng.Transition("done")
+	if err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	if got := eng.CurrentState(); got != "done" {
+		t.Errorf("CurrentState() = %q, want %q", got, "done")
+	}
+}
+
+func TestGate_Command_CWD(t *testing.T) {
+	// Command should execute from git repo root. We verify by running
+	// a command that succeeds if CWD is a valid directory (which it
+	// always will be whether we get git root or process CWD).
+	// We also verify it matches what git rev-parse returns (if in a repo).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	cwdFile := filepath.Join(dir, "cwd.txt")
+	command := "pwd > " + cwdFile
+
+	eng, err := Init(path, commandGateMachine(command, 5), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	err = eng.Transition("done")
+	if err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	data, err := os.ReadFile(cwdFile) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("ReadFile() error: %v", err)
+	}
+	actualCWD := strings.TrimSpace(string(data))
+
+	// If we're in a git repo, the CWD should match git rev-parse output.
+	gitRoot, gitErr := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if gitErr == nil {
+		expectedCWD := strings.TrimSpace(string(gitRoot))
+		if actualCWD != expectedCWD {
+			t.Errorf("command CWD = %q, want git root %q", actualCWD, expectedCWD)
+		}
+	}
+	// If not in a git repo, just verify CWD is non-empty (valid directory).
+	if actualCWD == "" {
+		t.Error("command CWD is empty")
+	}
+}
+
+func TestGate_Command_StdoutNotCaptured(t *testing.T) {
+	// Command produces output, but the gate result should only depend
+	// on the exit code. This test verifies the command succeeds despite
+	// producing stdout/stderr, and that the output doesn't appear in
+	// any error or state.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	command := "echo 'this is stdout'; echo 'this is stderr' >&2; exit 0"
+
+	eng, err := Init(path, commandGateMachine(command, 5), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	err = eng.Transition("done")
+	if err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	if got := eng.CurrentState(); got != "done" {
+		t.Errorf("CurrentState() = %q, want %q", got, "done")
+	}
+
+	// Verify no stdout/stderr leaked into state or evidence.
+	snap := eng.Snapshot()
+	for k, v := range snap.Evidence {
+		if strings.Contains(v, "stdout") || strings.Contains(v, "stderr") {
+			t.Errorf("evidence key %q contains command output: %q", k, v)
+		}
 	}
 }

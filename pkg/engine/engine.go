@@ -1,10 +1,15 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -578,6 +583,11 @@ func evaluateGates(gates map[string]*GateDecl, evidence map[string]string, curre
 				}
 			}
 
+		case "command":
+			if err := evaluateCommandGate(gate, name, current, target); err != nil {
+				return err
+			}
+
 		default:
 			return &TransitionError{
 				Code:         ErrGateFailed,
@@ -588,6 +598,65 @@ func evaluateGates(gates map[string]*GateDecl, evidence map[string]string, curre
 		}
 	}
 	return nil
+}
+
+// evaluateCommandGate runs a command gate via sh -c and checks the exit code.
+// Exit code 0 means the gate passes; any other exit code (or timeout) fails it.
+// The command string is passed to sh -c exactly as-is with no interpolation.
+// CWD is the git repo root if available, otherwise the process CWD.
+func evaluateCommandGate(gate *GateDecl, name, current, target string) error {
+	timeout := time.Duration(gate.Timeout) * time.Second
+	if gate.Timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", gate.Command) //nolint:gosec // G204: command gate runs user-defined commands by design
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+
+	// Determine CWD: prefer git repo root, fall back to process CWD.
+	cmd.Dir = gitRepoRoot()
+
+	err := cmd.Run()
+	if err != nil {
+		// Check if the context deadline was exceeded (timeout).
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			// Kill the entire process group to clean up child processes.
+			if cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+			return &TransitionError{
+				Code:         ErrGateFailed,
+				Message:      fmt.Sprintf("gate %q failed: command timed out after %s", name, timeout),
+				CurrentState: current,
+				TargetState:  target,
+			}
+		}
+
+		return &TransitionError{
+			Code:         ErrGateFailed,
+			Message:      fmt.Sprintf("gate %q failed: command gate returned non-zero exit status", name),
+			CurrentState: current,
+			TargetState:  target,
+		}
+	}
+
+	return nil
+}
+
+// gitRepoRoot returns the git repository root directory, or the process
+// CWD if git is not available or the current directory is not in a git repo.
+func gitRepoRoot() string {
+	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output() //nolint:gosec // G204: fixed git command
+	if err != nil {
+		dir, _ := os.Getwd()
+		return dir
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func contains(ss []string, s string) bool {
