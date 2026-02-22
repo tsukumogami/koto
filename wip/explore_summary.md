@@ -1,24 +1,34 @@
-# Exploration Summary: koto Template Format (v2)
+# Exploration Summary: koto Template Format (v3)
 
 ## Problem (Phase 1)
 
-The previous design attempt tried to find a single format serving both deterministic machine parsing and human authoring. This created cascading complexity: heading collision, declared-state matching, dual transition sources, TOML-vs-YAML debates. These are symptoms of conflating two separate concerns. The real problem has two parts: (1) koto needs a machine-readable, fully structured, deterministic canonical format for state machines, and (2) humans need a way to author, edit, and understand template definitions that is natural to write and renders well in tools like GitHub. These don't need to be the same format.
+koto needs a programming language for state machines. The source format (what humans write and store) and the execution format (what the engine reads) don't need to be the same -- like source code and compiled binaries. The v1 design conflated these, creating heading collision, format debates, and parsing fragility. The v2 design separated them but wasn't clear about which format is the primary artifact. v3 establishes the source format as the artifact of record -- what gets stored, versioned, and shared -- with one-way deterministic compilation to JSON for the engine.
 
 ## Decision Drivers (Phase 1)
-- The canonical (machine) format must be deterministic to parse with zero ambiguity
-- The human authoring format must be readable, writable, and render well on GitHub
-- Conversion from human format to canonical format must be deterministic
-- LLMs may assist at the validation layer (fixing input) but NOT in the parsing path
-- Zero external dependencies for the core engine (parsing the canonical format)
-- The human format should support rich directive content (markdown with tables, code blocks, headings)
-- Backward compatibility with existing templates is a nice-to-have, not a hard requirement
+- The source format is the primary artifact (stored, versioned, shared)
+- Compilation from source to JSON must be deterministic
+- The source format must be readable, writable, and render on GitHub
+- LLMs may assist at the validation layer but NOT in the compilation path
+- Zero external dependencies for the core engine (reads compiled JSON)
 - Progressive complexity: simple templates should be simple to author
 
 ## Research Findings (Phase 2)
-- Previous research still valid: YAML frontmatter + markdown is the industry standard for single-format tools
-- New research: investigating dual-format patterns (Terraform HCL/JSON, Protocol Buffers, CUE, MDX)
-- Key question: does any tool in the AI agent space use a compiled template approach?
+- Source/compiled separation is well-established: programming languages, Terraform, Protocol Buffers
+- YAML frontmatter + markdown is the industry standard for human-authored structured documents
+- No markdown schema exists -- structure validation requires a structured format (YAML/JSON)
+- No AI agent workflow tool uses compiled templates; koto would be first
+
+## Decision (Phase 5)
+
+**Problem:**
+koto templates must serve two audiences: humans who write and maintain workflow definitions, and the engine that executes them deterministically. The v1 design tried a single format for both, creating heading collision, dual transition sources, and parsing fragility. These problems stem from conflating the source format with the execution format.
+
+**Decision:**
+Template source files (.md with YAML frontmatter) are the primary artifact -- stored, versioned, and shared. A deterministic compiler produces JSON for the engine to read at runtime. Compilation is one-way, like a programming language compiler. The engine reads compiled JSON using only Go's stdlib (zero dependencies). An optional LLM-assisted linter helps authors write valid source but sits outside the compile path. Evidence gates (field_not_empty, field_equals, command with 30s default timeout) are declared per state, evaluated on exit. Evidence persists across rewind.
+
+**Rationale:**
+The source/compiled separation eliminates heading collision (JSON has no headings) and format debates (each format does what it's designed for). The "programming language" model is familiar to every developer. YAML frontmatter is the industry standard for structured metadata in markdown documents. JSON as the compiled target uses Go's stdlib, keeping the engine dependency-free. The compilation step is invisible in practice -- koto init compiles in memory.
 
 ## Current Status
-**Phase:** 1 - Problem reframed, Phase 2 research in progress
+**Phase:** 5 - Decision documented, ready for architecture detail
 **Last Updated:** 2026-02-22

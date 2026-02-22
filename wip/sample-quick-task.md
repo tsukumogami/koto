@@ -27,6 +27,7 @@ states:
       tests_pass:
         type: command
         command: go test ./...
+        timeout: 120
   verify:
     transitions: [done, implement]
     gates:

@@ -1,25 +1,25 @@
 ---
 status: Proposed
 problem: |
-  koto templates need to serve two audiences: the engine (which needs deterministic,
-  unambiguous state machine definitions) and humans (who need to author and understand
-  workflow definitions naturally). The v1 design attempted a single format for both,
-  creating cascading complexity: heading collision, declared-state matching, dual
-  transition sources, format wars. These are symptoms of conflating two concerns.
+  koto templates must serve two audiences: humans who write and maintain workflow
+  definitions, and the engine that executes them deterministically. A single format
+  for both creates heading collision, dual transition sources, and parsing fragility.
+  These stem from conflating the source format with the execution format.
 decision: |
-  Separate the template into a canonical JSON format (what the engine reads) and a
-  markdown authoring format (what humans write). JSON is deterministic, schema-
-  validatable, and uses Go's stdlib. Markdown renders on GitHub and naturally embeds
-  rich directive content. A deterministic compiler converts markdown to JSON. An
-  optional LLM-assisted linter helps humans fix authoring errors before compilation,
-  but sits outside the parse path. The engine only ever reads JSON.
+  Template source files (.md with YAML frontmatter) are the primary artifact -- what
+  gets stored, versioned, and shared. A deterministic compiler produces JSON for the
+  engine to read at runtime. Compilation is one-way, like a programming language
+  compiler. The engine reads compiled JSON using Go's stdlib (zero dependencies). An
+  optional LLM-assisted linter helps authors write valid source but sits outside the
+  compile path. Evidence gates (field_not_empty, field_equals, command with 30s default
+  timeout) are declared per state, evaluated on exit. Evidence persists across rewind.
 rationale: |
-  The dual-format approach eliminates the heading collision problem entirely (JSON
-  has no headings), removes the YAML-vs-TOML debate (JSON for machines, markdown for
-  humans), and lets each format do what it's good at. The compilation step is
-  deterministic -- same input always produces same output. LLM assistance is confined
-  to the authoring tooling layer, never in the engine's parse path. JSON Schema
-  provides editor support and validation without custom tooling.
+  The source/compiled separation eliminates heading collision (JSON has no headings)
+  and format debates (each format does what it's designed for). The "programming
+  language" model is familiar to every developer. YAML frontmatter is the industry
+  standard for structured metadata in markdown. JSON as the compiled target uses Go's
+  stdlib, keeping the engine dependency-free. The compilation step is invisible in
+  practice -- koto init compiles in memory.
 ---
 
 # DESIGN: koto Template Format Specification
@@ -43,25 +43,29 @@ The v1 design tried to serve both needs with a single file format (TOML/YAML fro
 - **Format debates**: TOML vs YAML vs extended markdown -- each had trade-offs because no single format serves both deterministic parsing and human authoring well
 - **Parsing fragility**: Code blocks containing state-name headings, whitespace sensitivity, case sensitivity rules -- all artifacts of using a content format for structure
 
-These problems share a root cause: **conflating the machine-readable format with the human authoring format**. They don't need to be the same.
+These problems share a root cause: **conflating the source format with the execution format**. They don't need to be the same.
 
 ### The Insight
 
-Systems like Terraform (HCL/JSON), Protocol Buffers (.proto/binary), and Markdoc (markdown/AST) separate the human authoring format from the machine-readable format, with a deterministic compilation step between them. This separation lets each format do what it's good at:
+The relationship between templates and the engine is the same as the relationship between source code and a runtime. Programmers write source code in a language designed for humans. Compilers produce machine code designed for CPUs. We store source code, not machine code. Compilation is one-way and deterministic.
 
-- The **canonical format** is optimized for machines: deterministic, schema-validatable, unambiguous
-- The **authoring format** is optimized for humans: readable, writable, renderable
-- The **compiler** bridges them deterministically: same input always produces same output
-- **Validation tooling** (including optional LLM assistance) helps humans write correct input before compilation
+koto templates work the same way:
+
+- The **source format** is the primary artifact -- what humans write, store, version, and share. It's the "programming language" for koto state machines.
+- The **compiled format** is what the engine reads at runtime -- deterministic, schema-validatable, unambiguous. It's ephemeral, like a compiled binary.
+- The **compiler** converts source to compiled format deterministically: same input always produces same output.
+- **Validation tooling** (including optional LLM assistance) helps humans write correct source, like a linter for a programming language.
+
+There is no decompiler. If you want to edit a template, you edit the source. The compiled form is derived, not authored.
 
 ### Scope
 
 **In scope:**
-- Canonical (machine-readable) format specification
-- Markdown authoring format specification
-- Deterministic compilation from markdown to canonical format
-- Evidence gate declaration syntax (both formats)
-- Variable declaration syntax (both formats)
+- Source format specification (the "programming language" for templates)
+- Compiled format specification (what the engine reads)
+- Deterministic compiler from source to compiled format
+- Evidence gate declaration syntax
+- Variable declaration syntax
 - Template search path and resolution
 - Validation contract (parse-time, compile-time, explicit)
 - LLM-assisted validation architecture (where it fits, what it can/cannot do)
@@ -74,13 +78,13 @@ Systems like Terraform (HCL/JSON), Protocol Buffers (.proto/binary), and Markdoc
 
 ## Decision Drivers
 
-- **Deterministic machine format**: The engine must parse templates with zero ambiguity. No heading collision, no precedence rules, no whitespace sensitivity.
-- **Human-friendly authoring**: Templates should be natural to write and render well on GitHub. Rich directive content (markdown) is a first-class need.
-- **Deterministic compilation**: Converting from human format to machine format must produce identical output for identical input. No LLMs in the parse path.
-- **LLM assistance at the validation layer only**: LLMs can help fix authoring errors, but the compiler itself is deterministic. This keeps the system predictable.
-- **Zero dependencies for core engine**: The engine reads the canonical format using only Go's standard library. Dependencies (if any) are confined to the compiler/tooling layer.
+- **Source format as primary artifact**: The template source is what gets stored, versioned, and shared. It needs to be well-designed as a language for defining state machines.
+- **Deterministic compilation**: Converting source to compiled format must produce identical output for identical input. No LLMs in the compile path.
+- **Human-friendly authoring**: The source format should be natural to write and render well on GitHub. Rich directive content (markdown) is a first-class need.
+- **Zero dependencies for core engine**: The engine reads the compiled format using only Go's standard library. Dependencies (if any) are confined to the compiler/tooling layer.
+- **LLM assistance at the validation layer only**: LLMs can help fix source errors, but the compiler is deterministic. Like a linter for a programming language.
 - **Progressive complexity**: Simple templates should be simple to author. Evidence gates, search paths, and LLM validation are opt-in features.
-- **Schema-based tooling**: The canonical format should support JSON Schema for editor autocomplete, linting, and validation.
+- **Schema-based tooling**: The compiled format supports JSON Schema for validation. The source format supports YAML schema for editor autocomplete.
 
 ## Implementation Context
 
@@ -92,33 +96,33 @@ Key limitation: the parser treats ALL `## headings` as state boundaries, creatin
 
 ### Industry Patterns
 
-Research into dual-format systems reveals:
+The source/compiled separation pattern is well-established:
 
-- **Terraform**: HCL and JSON are both first-class. Either can be authored. Same internal representation. Bidirectional conversion.
-- **Markdoc (Stripe)**: Markdown compiles to a serializable AST. The AST is the canonical format -- cacheable, validatable, transformable.
-- **OpenAPI / Kubernetes**: YAML authoring validated against JSON Schema. Schema drives editor tooling.
+- **Programming languages (C, Go, Rust)**: Source code stored and versioned; compiled binary is derived and ephemeral. Compilation is one-way. No decompiler in the standard workflow.
+- **Terraform**: HCL (source) and JSON (machine). Either can be authored, but HCL is the standard source format.
+- **Protocol Buffers**: `.proto` (source) compiles to binary wire format. Source is stored. Binary is derived.
+- **Markdoc (Stripe)**: Markdown (source) compiles to serializable AST. The AST is cacheable and validatable.
+- **OpenAPI / Kubernetes**: YAML source validated against JSON Schema. Schema drives editor tooling.
 - **CUE**: Validation rules embedded in the data definition. Gradual validation (partial specs are valid).
-- **LLM-assisted validation**: Research shows LLMs useful for suggestions but core validation must be deterministic. Output validation rules address non-determinism.
 
-No tool in the AI agent workflow space uses a compiled template approach. koto would be the first to separate authoring format from execution format for workflow state machines.
+No tool in the AI agent workflow space uses a compiled template approach. koto would be the first to separate source format from execution format for workflow state machines.
 
 ## Considered Options
 
 ### Decision 1: Architecture
 
-Should koto use a single format or separate the authoring and execution formats?
+Should koto use a single format or separate source from compiled output?
 
-#### Chosen: Dual-format with deterministic compilation
+#### Chosen: Source format with deterministic compilation
 
-Two formats connected by a deterministic compiler:
+The template source (`.md` files) is the primary artifact -- stored, versioned, and shared. The engine reads compiled JSON, produced by a deterministic compiler. Compilation is one-way.
 
-- **Canonical format** (JSON): What the engine reads. Deterministic, schema-validatable, zero-ambiguity. Stored as `.koto.json` files.
-- **Authoring format** (Markdown): What humans write. YAML frontmatter for structure, markdown body for directives. Stored as `.md` files. Renders on GitHub.
-- **Compiler**: `koto template compile template.md` produces `template.koto.json`. Same input always produces same output. No LLMs involved.
-- **Decompiler**: `koto template decompile template.koto.json` produces a readable markdown file. Enables round-tripping.
-- **Linter**: `koto template lint template.md` validates the authoring format and suggests fixes. Optionally uses LLMs for ambiguity resolution.
+- **Source format** (Markdown): What humans write and store. YAML frontmatter for structure, markdown body for directives. Renders on GitHub. This is the "programming language" for koto state machines.
+- **Compiled format** (JSON): What the engine reads at runtime. Deterministic, schema-validatable, zero-ambiguity. Derived from source, not authored directly.
+- **Compiler**: `koto template compile template.md` produces JSON. Same input always produces same output. No LLMs involved. `koto init` compiles in memory -- no persistent JSON file needed.
+- **Linter**: `koto template lint template.md` validates source and suggests fixes. Optionally uses LLMs for ambiguity resolution.
 
-The engine only reads `.koto.json` files. The `koto init` command accepts either format: if given a `.md` file, it compiles it first, then initializes from the JSON.
+There is no decompiler. The source format is the artifact of record. To edit a template, edit the source.
 
 #### Alternatives Considered
 
@@ -126,40 +130,40 @@ The engine only reads `.koto.json` files. The `koto init` command accepts either
 
 **Single JSON format**: JSON for everything, including directives as string fields. Maximally deterministic, but JSON with embedded markdown (`\n` escapes, no syntax highlighting inside strings) is painful to write. No GitHub rendering. Humans would need tooling assistance for everything.
 
-**Markdown-only with conventions**: Pure markdown with structural conventions (specific heading levels, blockquotes for metadata). Renders beautifully on GitHub but has no schema validation ecosystem, no editor support, and the parser depends on exact formatting conventions. Fragile.
+**Markdown-only with conventions**: Pure markdown with structural conventions (specific heading levels, blockquotes for metadata). Renders beautifully on GitHub but has no schema validation ecosystem, no editor support, and the parser depends on exact formatting conventions. No equivalent of JSON Schema for markdown means no deterministic validation.
 
 **Directory-based format**: JSON manifest + separate `.md` files per state (`states/assess.md`). Clean separation but one template becomes a directory, complicating distribution, search paths, and template management.
 
-### Decision 2: Canonical Format
+### Decision 2: Compiled Format
 
-What format should the engine read?
+What format should the compiler produce and the engine read?
 
 #### Chosen: JSON
 
-The engine reads JSON files using Go's `encoding/json` (standard library, zero dependencies). JSON is:
+The compiler produces JSON. The engine reads JSON using Go's `encoding/json` (standard library, zero dependencies). JSON is:
 
 - Deterministic to parse (no implicit typing, no multiple representations)
-- Schema-validatable (JSON Schema for editor support and CI validation)
+- Schema-validatable (JSON Schema for CI validation and debugging)
 - Already used by koto for state files (consistent ecosystem)
 - Well-supported by every language and tool
 
-The canonical format uses the `.koto.json` extension to distinguish from plain JSON files.
+The compiled format is ephemeral -- `koto init` compiles source in memory and never writes a JSON file to disk unless explicitly requested via `koto template compile`. This is the same as running `go run` vs `go build`: the compiled artifact exists in memory unless you ask for it.
 
 #### Alternatives Considered
 
-**YAML**: More readable than JSON for humans, but the engine reads the canonical format -- readability for machines doesn't matter. YAML adds a dependency (go-yaml) to the engine's parse path, violating the zero-dependency goal.
+**YAML**: More readable than JSON for humans, but humans don't read the compiled output -- they read the source. YAML adds a dependency (go-yaml) to the engine's parse path, violating the zero-dependency goal.
 
 **TOML**: Good for configuration but awkward for the list-of-states pattern. Adds a dependency to the engine. Not widely used for data interchange.
 
 **Custom binary format**: Maximum parsing speed, but templates are read once at init time. The performance benefit doesn't justify the tooling cost.
 
-### Decision 3: Authoring Format
+### Decision 3: Source Format
 
-What format do humans write?
+What does the "programming language" for koto state machines look like?
 
 #### Chosen: YAML frontmatter + Markdown body
 
-The authoring format uses standard YAML frontmatter (`---` delimiters) for the state machine structure and markdown body for directive content:
+The source format uses standard YAML frontmatter (`---` delimiters) for state machine structure and markdown body for directive content:
 
 ```markdown
 ---
@@ -191,6 +195,7 @@ states:
       tests_pass:
         type: command
         command: go test ./...
+        timeout: 120
   escalate:
     terminal: true
   done:
@@ -225,17 +230,17 @@ Work is complete.
 Task could not be completed in this workflow.
 ```
 
-The YAML frontmatter contains the complete state machine definition. The markdown body contains directive content, matched to states by `## heading` text. GitHub renders this as a nice document with the frontmatter hidden.
+The YAML frontmatter contains the complete state machine structure. The markdown body provides directive content for each state, matched by `## heading` text. GitHub renders this as a readable document with the frontmatter collapsed.
 
-**Why YAML for the frontmatter**: YAML is the industry standard for frontmatter. GitHub renders it. Editors support it. go-yaml is a dependency of the compiler/tooling layer (not the engine). The implicit typing concern (bare `yes` becoming boolean) is real but narrow -- template authors already quote version strings (`"1.0"`), and the compiler validates types.
+**Why YAML for structure**: YAML is the industry standard for frontmatter. GitHub renders it. Editors support it with autocompletion. go-yaml is a dependency of the compiler (not the engine). The implicit typing concern (bare `yes` becoming boolean) is real but narrow -- template authors already quote version strings (`"1.0"`), and the compiler validates types.
 
-**Heading collision is reduced, not eliminated**: In the authoring format, `## headings` matching state names are state boundaries. Other headings are directive content. The compiler resolves this deterministically and produces unambiguous JSON. If the authoring format is ambiguous, the linter catches it. The engine never sees the ambiguity -- it reads JSON.
+**Heading collision is contained**: In the source format, `## headings` matching declared state names are state boundaries. Other headings within a state's section are directive content. The compiler resolves this deterministically using the declared state list from the YAML frontmatter. If the source is ambiguous, the linter catches it before compilation.
 
 #### Alternatives Considered
 
-**Pure YAML**: All content in YAML, directives as block scalars. No heading collision, but long markdown in YAML block scalars is awkward (indentation-sensitive, no syntax highlighting, hard to edit).
+**Pure YAML**: All content in YAML, directives as block scalars. No heading collision, but long markdown in YAML block scalars is awkward (indentation-sensitive, no syntax highlighting, hard to edit). A poor "programming language" for content-heavy definitions.
 
-**Pure markdown with conventions**: No frontmatter, everything encoded in markdown structure. Renders perfectly but has no schema validation, no editor support, and fragile parsing.
+**Pure markdown with conventions**: No frontmatter, everything encoded in markdown structure. Renders perfectly but has no schema validation, no editor support, and fragile parsing. No equivalent to JSON Schema for markdown means no deterministic validation of structure.
 
 **TOML frontmatter**: Works well for nested config but `+++` delimiters aren't standard. GitHub doesn't render TOML frontmatter. Less familiar than YAML to most developers.
 
@@ -245,7 +250,7 @@ How do template authors declare evidence requirements?
 
 #### Chosen: Per-state gate declarations
 
-Gates are declared under each state in both formats. Three gate types for Phase 1:
+Gates are declared under each state in the source format (and carried through to the compiled format). Three gate types for Phase 1:
 
 **field_not_empty**: A named field exists and is non-empty in the evidence map.
 
@@ -269,11 +274,11 @@ How does koto find templates?
 
 Template resolution:
 
-1. **Explicit path**: If `--template` is a file path (contains `/` or `.`), use it directly. Accepts both `.md` and `.koto.json`.
-2. **Project-local**: `.koto/templates/<name>.koto.json` or `.koto/templates/<name>.md` (relative to git root or CWD).
-3. **User-global**: `~/.config/koto/templates/<name>.koto.json` or `~/.config/koto/templates/<name>.md`.
+1. **Explicit path**: If `--template` is a file path (contains `/` or `.`), use it directly. Accepts `.md` source files and `.koto.json` pre-compiled files.
+2. **Project-local**: `.koto/templates/<name>.md` (relative to git root or CWD).
+3. **User-global**: `~/.config/koto/templates/<name>.md` (respects `$XDG_CONFIG_HOME`).
 
-If a `.md` file is found but no `.koto.json`, the compiler runs automatically. First match wins.
+Source files are the expected format. `koto init` compiles them in memory. First match wins.
 
 ### Decision 6: LLM-Assisted Validation
 
@@ -307,40 +312,36 @@ The LLM is a tool for humans, not a component of the system. koto works without 
 
 ### Summary
 
-koto uses a dual-format template system: a canonical JSON format for the engine and a markdown authoring format for humans. A deterministic compiler converts markdown to JSON. The engine only reads JSON -- no ambiguity, no heading collision, no format debates.
+koto templates use a source-and-compiled architecture. Template source files (`.md`) are the primary artifact -- what humans write, store, and share. A deterministic compiler produces JSON for the engine to read at runtime. Compilation is one-way.
 
-The canonical JSON format uses Go's standard library (`encoding/json`) with zero external dependencies. It contains the complete state machine definition (states, transitions, gates, variables) and directive content for each state.
+The source format uses YAML frontmatter for state machine structure and markdown body for directive content. It's the "programming language" for koto workflows -- designed for humans to read, write, and version.
 
-The markdown authoring format uses standard YAML frontmatter (`---` delimiters) for structure and markdown body for directives. GitHub renders it. go-yaml parses the frontmatter in the compiler/tooling layer only.
+The compiled JSON format uses Go's standard library (`encoding/json`) with zero external dependencies. It's ephemeral -- produced in memory by `koto init` and never persisted unless explicitly requested.
 
-An optional LLM-assisted linter helps humans fix authoring errors but sits entirely outside the parse and compilation path. koto works without it.
+An optional LLM-assisted linter helps humans write valid source, like a linter for a programming language. It sits outside the compile path. koto works without it.
 
 ### Rationale
 
-The dual-format approach eliminates the heading collision problem (JSON has no headings), removes the YAML-vs-TOML debate (JSON for machines, YAML frontmatter for humans), and lets each format excel at what it's designed for. The compilation step is deterministic -- there's no ambiguity about what the engine will read.
+The source/compiled separation eliminates the heading collision problem (JSON has no headings), removes format debates (each format does what it's designed for), and lets the engine parse with zero ambiguity. The compilation step is deterministic -- same source always produces the same compiled output.
 
-The cost is a compilation step and two file representations. This is acceptable because:
-- Templates are authored infrequently (write once, run many times)
-- The compiler is fast (YAML parse + JSON serialize)
-- `koto init` can compile on the fly (no manual step required)
-- Round-tripping (decompile) means either format can be the source of truth
+This maps to a well-understood model: source code and compilation. The cost is a compilation step, but it's invisible in practice because `koto init` compiles in memory. Template authors only ever interact with the source format, just as programmers only interact with source code.
 
 ### Trade-offs Accepted
 
-- **Two formats**: Templates have a `.md` source and a `.koto.json` canonical form. This adds conceptual overhead for template authors. Mitigated by `koto init` accepting either format transparently.
+- **Compilation step**: Source must be compiled before the engine can use it. Mitigated: `koto init` compiles in memory transparently. Authors never see JSON unless they ask for it.
 - **go-yaml dependency in compiler**: The compiler (not the engine) depends on go-yaml for parsing YAML frontmatter. The engine remains dependency-free. Acceptable because the dependency is confined to tooling.
-- **Directive duplication**: Directives exist in both the markdown body (human-readable) and the JSON file (as string fields). The compiler ensures consistency. If the JSON is generated from markdown, there's one source of truth.
+- **JSON directives are unreadable**: The compiled format embeds markdown as JSON strings with escape sequences. Acceptable because humans don't read the compiled format -- they read the source.
 - **No LLM gates**: Only deterministic gate types (field checks, commands) in Phase 1. LLM-based evaluation (prompt gates) deferred to a separate design.
 
 ## Solution Architecture
 
-### Canonical Format (JSON)
+### Compiled Format (JSON)
 
-A `.koto.json` file contains the complete template:
+The compiler produces a JSON representation of the template. This is what the engine reads at runtime:
 
 ```json
 {
-  "schema_version": 1,
+  "format_version": 1,
   "name": "quick-task",
   "version": "1.0",
   "description": "A focused task workflow",
@@ -378,7 +379,8 @@ A `.koto.json` file contains the complete template:
       "gates": {
         "tests_pass": {
           "type": "command",
-          "command": "go test ./..."
+          "command": "go test ./...",
+          "timeout": 120
         }
       }
     },
@@ -394,14 +396,14 @@ A `.koto.json` file contains the complete template:
 }
 ```
 
-**Schema version**: Enables forward-compatible evolution. The engine rejects unknown schema versions.
+**Format version**: The compiled template uses `format_version` (not `schema_version`) to avoid confusion with the state file's `schema_version`. These are independent versioning tracks. The engine rejects unknown format versions.
 
 **Go types:**
 
 ```go
-// CanonicalTemplate is the JSON-serializable template format.
-type CanonicalTemplate struct {
-    SchemaVersion int                        `json:"schema_version"`
+// CompiledTemplate is the JSON-serializable compiled template format.
+type CompiledTemplate struct {
+    FormatVersion int                        `json:"format_version"`
     Name          string                     `json:"name"`
     Version       string                     `json:"version"`
     Description   string                     `json:"description,omitempty"`
@@ -428,6 +430,7 @@ type GateDecl struct {
     Field   string `json:"field,omitempty"`
     Value   string `json:"value,omitempty"`
     Command string `json:"command,omitempty"`
+    Timeout int    `json:"timeout,omitempty"` // seconds, 0 = default (30s)
 }
 ```
 
@@ -436,7 +439,7 @@ type GateDecl struct {
 | Check | Error |
 |-------|-------|
 | Invalid JSON | JSON parse error |
-| Unknown `schema_version` | `"unsupported schema version: %d"` |
+| Unknown `format_version` | `"unsupported format version: %d"` |
 | Missing `name` | `"missing required field: name"` |
 | Missing `version` | `"missing required field: version"` |
 | Missing `initial_state` | `"missing required field: initial_state"` |
@@ -445,11 +448,12 @@ type GateDecl struct {
 | Transition target not in states | `"state %q references undefined transition target %q"` |
 | Gate has unknown type | `"state %q gate %q: unknown type %q"` |
 | Gate missing required field | `"state %q gate %q: missing required field %q"` |
+| Command gate has empty command | `"state %q gate %q: command must not be empty"` |
 | State has empty directive | `"state %q has empty directive"` |
 
-### Authoring Format (Markdown)
+### Source Format (Markdown)
 
-A `.md` file with YAML frontmatter:
+The source format is the "programming language" for koto state machines. A `.md` file with YAML frontmatter:
 
 ```markdown
 ---
@@ -481,6 +485,7 @@ states:
       tests_pass:
         type: command
         command: go test ./...
+        timeout: 120
   escalate:
     terminal: true
   done:
@@ -515,21 +520,23 @@ Work is complete.
 Task could not be completed in this workflow.
 ```
 
-The YAML frontmatter contains the complete state machine definition (identical data to the JSON canonical format). The markdown body provides directive content, matched by `## heading` to state names.
+The YAML frontmatter declares the state machine structure: states, transitions, gates, and variables. The markdown body provides directive content for each state, matched by `## heading` to state names declared in the frontmatter. This is the file that gets stored in version control and shared.
 
 **Compilation rules:**
 
 1. Parse YAML frontmatter using go-yaml v3.
 2. Build the set of declared state names from `states:`.
-3. Scan markdown body for `## headings` matching declared state names. Content between headings becomes the directive.
+3. Scan markdown body for `## headings` matching declared state names (case-sensitive). Content between state headings becomes the directive.
 4. For each declared state, the directive comes from the markdown body. If a state has no matching heading, compilation fails.
-5. The heading collision problem still exists in the authoring format but is contained: the compiler resolves it deterministically, and the engine never sees it.
-6. Serialize to JSON. Compute SHA-256 hash of the JSON output.
+5. Headings that don't match a declared state name are treated as directive content, not state boundaries. The declared state list from the frontmatter is the authority.
+6. Serialize to JSON with sorted keys (deterministic output). Compute SHA-256 hash of the compiled JSON. This hash is what the engine stores at init time and verifies on every operation. Hashing the compiled output (not the source) means source-only changes that don't affect behavior (YAML reformatting, comment-like content outside state sections) don't invalidate running workflows.
+
+**Compiler warnings:** The compiler emits a warning (not an error) when a `## heading` inside a state's directive section matches the name of another declared state. This catches accidental content reassignment -- for example, adding `## plan` inside the `assess` directive when `plan` is also a state. The warning is: `"state %q directive contains ## heading matching state %q; is this intentional?"`. The compiler still produces valid output (the heading is treated as directive content, not a state boundary, because content is assigned by the first `## heading` match for each declared state).
 
 **What the compiler does NOT do:**
 - Parse `**Transitions**:` lines from the body. Transitions come exclusively from the YAML frontmatter. No dual sources.
-- Treat non-matching headings as errors. `## Analysis` within a state directive is content, not a state boundary.
-- Invoke LLMs. Compilation is deterministic.
+- Treat non-matching headings as errors. `### Decision Criteria` within a state directive is content, not a state boundary.
+- Invoke LLMs. Compilation is deterministic. Same source always produces the same compiled output.
 
 ### Evidence Gates
 
@@ -539,18 +546,26 @@ The YAML frontmatter contains the complete state machine definition (identical d
 |------|----------------|-------------|
 | `field_not_empty` | `field` | Evidence field exists and is non-empty |
 | `field_equals` | `field`, `value` | Evidence field equals expected value |
-| `command` | `command` | Shell command exits 0 |
+| `command` | `command` (optional: `timeout`) | Shell command exits 0 (default 30s timeout) |
 
 **Gate semantics:**
 - Gates are exit conditions: all gates on a state must pass before leaving (AND logic).
 - Gates are evaluated when `koto transition` is called, between validation and commit.
-- Command gates run via `sh -c "<command>"` from the project root. No `{{VARIABLE}}` interpolation in command strings (prevents injection). No timeout in Phase 1.
+- Command gates run via `sh -c "<command>"` from the project root (git repository root, or CWD if not in a git repo). No `{{VARIABLE}}` interpolation in command strings (prevents injection). Default timeout: 30 seconds. Configurable per gate via optional `timeout` field (integer seconds).
 - Evidence is supplied via `koto transition <target> --evidence key=value` and accumulates in the state file across transitions.
+
+**Gate evaluation scope:** Gates check the **evidence map only**, not the merged variables+evidence context. Variables are for directive interpolation. Evidence is for gate evaluation. These are separate concerns with separate namespaces.
+
+**Type mapping to engine:** The compiled template's `StateDecl.Gates` maps to a new `Gates` field on `engine.MachineState`. The template parser builds the `Machine` with gates populated. The engine evaluates gates during `Transition()` between validation (step 4) and commit (step 5), as specified in the engine design's extension point.
 
 **Engine extension:**
 - Add `Evidence map[string]string` to `engine.State` (separate from `Variables`).
 - Extend `Engine.Transition` signature: `Transition(target string, opts ...TransitionOption) error` with `WithEvidence(map[string]string)` option for backward compatibility.
-- Bump `schema_version` to 2. `Load` accepts v1 (empty Evidence map) and v2.
+- Bump the state file's `schema_version` to 2. `Load` accepts v1 (empty Evidence map) and v2. (Note: this is the state file schema version, not the compiled template's `format_version` -- they are independent versioning tracks.)
+
+**Evidence and rewind:** Evidence persists across rewind. Rewind changes the current state but doesn't modify the evidence map. If an agent rewinds from `verify` to `implement`, evidence values from prior transitions remain. The agent can overwrite values by supplying new evidence on subsequent transitions. This is the simplest correct model -- evidence is append/overwrite, never deleted. History entries record which evidence was supplied per transition for auditability.
+
+**CLI surface:** `koto transition <target> --evidence key=value [--evidence key2=value2]`. The `--evidence` flag is repeatable. Key-value pairs are parsed as `key=value` (first `=` splits key from value). Evidence is passed through to `WithEvidence()`. The `koto next` command displays accumulated evidence alongside the directive.
 
 ### Interpolation
 
@@ -560,7 +575,9 @@ The controller builds the interpolation context:
 context = merge(variable defaults, init-time --var values, evidence values)
 ```
 
-Evidence wins over variables (higher precedence). Single-pass `{{KEY}}` replacement. Unresolved placeholders remain as-is.
+**Namespace collision rule:** Evidence keys must not shadow declared variable names. If `--evidence TASK=value` is supplied and `TASK` is a declared variable, the transition is rejected with error `"evidence key %q shadows declared variable"`. This prevents evidence from rewriting agent instructions via variable interpolation. Undeclared variable names are available for evidence use.
+
+Single-pass `{{KEY}}` replacement. Unresolved placeholders remain as-is.
 
 Command gate strings are NOT interpolated. This is a security boundary -- verified by explicit tests.
 
@@ -568,29 +585,28 @@ Command gate strings are NOT interpolated. This is a security boundary -- verifi
 
 When `--template` doesn't contain `/` or `.`:
 
-1. `.koto/templates/<name>.koto.json` then `.koto/templates/<name>.md` (project-local)
-2. `~/.config/koto/templates/<name>.koto.json` then `~/.config/koto/templates/<name>.md` (user-global, respects `$XDG_CONFIG_HOME`)
+1. `.koto/templates/<name>.md` (project-local)
+2. `~/.config/koto/templates/<name>.md` (user-global, respects `$XDG_CONFIG_HOME`)
 
-JSON is preferred over markdown when both exist (skip compilation). First match wins.
+Source files (`.md`) are the expected format in the search path. `koto init` compiles them in memory. First match wins. Pre-compiled `.koto.json` files are also accepted at explicit paths for specialized use cases (CI caching, programmatic generation).
 
 ### Tooling Commands
 
 ```
-koto template compile <input.md> [-o output.koto.json]
-koto template decompile <input.koto.json> [-o output.md]
-koto template validate <file>                # structural + semantic checks
-koto template lint <file.md>                 # validate + optional LLM suggestions
-koto template new <name>                     # scaffold a new template
+koto template compile <input.md> [-o output.koto.json]   # explicit compilation (optional)
+koto template validate <file.md>                          # structural + semantic checks
+koto template lint <file.md>                              # validate + optional LLM suggestions
+koto template new <name>                                  # scaffold a new template
 ```
 
-`koto init --template <file>` accepts either format. If given `.md`, it compiles in memory (no persistent `.koto.json` needed unless the user wants one).
+`koto init --template <file>` compiles source in memory. No persistent JSON file is created. `koto template compile` exists for debugging and CI caching, not as a required step in the normal workflow.
 
 ### LLM Linter Architecture
 
-The linter is optional and separate from compilation:
+The linter is optional and separate from compilation -- like a code linter for a programming language:
 
 ```
-Human writes template.md
+Author writes template.md (source)
         |
         v
 [Deterministic validation]  ← schema checks, state references, type validation
@@ -602,7 +618,7 @@ Human writes template.md
   [OK]  [LLM suggests fixes]  ← "Did you mean ## assess instead of ## Assess?"
            |
            v
-   Human reviews + applies fixes
+   Author reviews + applies fixes
            |
            v
    [Re-validate]
@@ -611,28 +627,28 @@ Human writes template.md
    [Compile to JSON]  ← deterministic, no LLM
 ```
 
-The LLM never touches the compilation path. It's a development-time assistant that helps humans write valid templates. koto works without it.
+The LLM never touches the compilation path. It's a development-time assistant that helps authors write valid source. koto works without it.
 
 ## Implementation Approach
 
-### Phase 1: Canonical JSON Format
+### Phase 1: Compiled Format and Engine Integration
 
 Define the JSON schema and implement parsing in `pkg/template/`:
-- `CanonicalTemplate` struct with JSON tags
-- `ParseJSON(path string) (*Template, error)` -- reads and validates `.koto.json`
-- Build `engine.Machine` from parsed canonical template
-- JSON Schema file for editor support
+- `CompiledTemplate` struct with JSON tags
+- `ParseJSON([]byte) (*Template, error)` -- validates compiled JSON
+- Build `engine.Machine` from parsed compiled template
+- JSON Schema file for validation and debugging
 - Unit tests for every validation rule
 
 No external dependencies. Uses `encoding/json` from stdlib.
 
-### Phase 2: Markdown Compiler
+### Phase 2: Source Format Compiler
 
-Implement the compiler as a separate package (`pkg/template/compile/` or `cmd/koto/`):
+Implement the compiler as a separate package (`pkg/template/compile/`):
 - Parse YAML frontmatter (go-yaml v3 dependency here, not in engine)
-- Extract directive content from markdown body
-- Produce `CanonicalTemplate` struct
-- `koto template compile` CLI command
+- Extract directive content from markdown body using declared state list
+- Produce `CompiledTemplate` struct
+- `koto template compile` CLI command (for debugging and CI)
 - Unit tests for compilation edge cases (heading collision, missing sections)
 
 ### Phase 3: Template Search Path
@@ -641,7 +657,7 @@ Add search path resolution to the CLI:
 - `resolveTemplatePath` in `cmd/koto/`
 - Git root detection for project-local search
 - XDG config directory for user-global search
-- Prefer `.koto.json` over `.md` when both exist
+- Source files (`.md`) are the expected format
 
 ### Phase 4: Evidence Gates
 
@@ -656,14 +672,14 @@ Extend the engine for evidence:
 
 Support the legacy format during transition:
 - Detect `---` frontmatter with flat `key: value` syntax (legacy)
-- Convert to canonical format in memory
+- Compile to `CompiledTemplate` in memory
 - Emit deprecation warning
 - Remove after one release cycle (user base is currently zero)
 
 ### Phase 6: Validation and Linter
 
 Implement `koto template validate` and `koto template lint`:
-- Structural validation (parse-time checks)
+- Structural validation (parse-time checks against source)
 - Semantic validation (reachability, cross-references)
 - Optional LLM integration for lint suggestions
 
@@ -675,9 +691,9 @@ Not applicable. Templates are local files. No downloads at runtime.
 
 ### Execution Isolation
 
-**Command gates execute shell commands**: `sh -c "<command>"` with user permissions from the project root. This is deliberate (template authors define what to run). Commands are literal strings -- no variable interpolation prevents injection.
+**Command gates execute shell commands**: `sh -c "<command>"` with user permissions from the project root (git root, or CWD if not in a git repo). Commands inherit the user's full shell environment. This is deliberate (template authors define what to run, same trust model as Makefiles). Commands are literal strings -- no variable interpolation prevents injection.
 
-**No timeout in Phase 1**: A hanging command blocks the transition indefinitely. This must be addressed before unattended agent scenarios. Acceptable for interactive use.
+**Command gate timeout**: Default 30-second timeout prevents indefinite blocking. Configurable per gate. A timed-out command fails the gate (transition is rejected).
 
 Mitigation: command gates execute only during transitions, not during parse or validate. `koto template validate` does NOT execute commands. Review templates before use (same trust model as Makefiles).
 
@@ -685,9 +701,9 @@ Mitigation: command gates execute only during transitions, not during parse or v
 
 **Template files with command gates are executable**: A malicious template could run arbitrary commands. Mitigation: SHA-256 hash stored at init time, verified on every operation. Template modification after init is detected.
 
-**go-yaml dependency**: Confined to the compiler/tooling layer. The engine reads JSON using stdlib only. A go-yaml vulnerability affects template authoring, not workflow execution.
+**go-yaml dependency**: Confined to the compiler, not the engine. The engine reads compiled JSON using stdlib only. A go-yaml vulnerability affects the compilation tooling, not workflow execution.
 
-**JSON canonical format**: Go's `encoding/json` is part of the standard library. No supply chain risk from the engine's parser.
+**Compiled JSON format**: Go's `encoding/json` is part of the standard library. No supply chain risk from the engine's parser.
 
 ### User Data Exposure
 
@@ -704,28 +720,28 @@ Mitigation: command gates execute only during transitions, not during parse or v
 | Evidence contains sensitive data | Cleaned before merge; same as variables | Exposure on feature branches |
 | Template modification after init | Hash check on every operation | Hash collision (negligible) |
 | Command injection via variables | No interpolation in command strings; explicit test | Future contributor bypasses this |
+| Evidence overwrites agent instructions | Evidence keys cannot shadow declared variable names | Undeclared variable names remain open |
 
 ## Consequences
 
 ### Positive
 
-- Heading collision eliminated: JSON has no headings. The engine never sees markdown ambiguity.
-- Format debates resolved: JSON for machines (deterministic), YAML+markdown for humans (readable). Each format does what it's designed for.
+- Heading collision eliminated: the compiled format has no headings. The engine never sees markdown ambiguity.
+- Format debates resolved: the source format is designed for humans, the compiled format for the engine. Each does what it's designed for.
 - Zero engine dependencies: `encoding/json` is stdlib. go-yaml is confined to the compiler.
-- Schema-based tooling: JSON Schema enables editor autocomplete, CI validation, and third-party tool support.
-- LLM assistance without LLM dependency: The linter is optional. koto works without it. LLMs help humans, not the system.
-- Clean extension point: new gate types, new fields, and schema evolution all work through JSON schema versioning.
+- Source format renders on GitHub: YAML frontmatter + markdown body is a standard GitHub renders well.
+- LLM assistance without LLM dependency: the linter is optional. koto works without it. LLMs help authors, not the system.
+- Clean extension point: new gate types, new fields, and schema evolution all work through schema versioning.
+- Clear mental model: source code and compilation is a pattern every developer already knows.
 
 ### Negative
 
-- Two formats to understand: template authors need to know that `.md` compiles to `.koto.json`. Conceptual overhead.
-- Compilation step: an extra command or implicit step at `koto init`. Mitigated by transparent compilation when given `.md`.
-- JSON directives are ugly: the canonical format embeds markdown as JSON strings (`\n` everywhere). Humans shouldn't need to read the JSON, but debugging may require it.
-- go-yaml dependency in compiler: adds ~15K lines of dependency to the tooling layer. Acceptable for a well-maintained, widely-used library.
+- Compilation step: source must be compiled before the engine can use it. Invisible in practice (`koto init` compiles in memory), but adds internal complexity.
+- JSON directives are unreadable: the compiled format embeds markdown as JSON strings with escape sequences. This complicates debugging, though `koto template compile` can produce formatted JSON for inspection.
+- go-yaml dependency in compiler: adds a dependency to the tooling layer. Acceptable for a well-maintained, widely-used library.
 
 ### Mitigations
 
-- `koto init` accepts both formats transparently -- most users never see the JSON
-- `koto template decompile` enables round-tripping if someone needs to recover the markdown
-- JSON Schema provides structure that makes the canonical format navigable even with escaped markdown
+- `koto init` compiles transparently -- authors never see JSON in normal use
+- `koto template compile -o` produces formatted JSON for debugging when needed
 - The compiler is a small, focused component (~200 lines) that's easy to understand and maintain
