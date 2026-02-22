@@ -22,7 +22,7 @@ func TestMain(m *testing.M) {
 	defer os.RemoveAll(tmp)
 
 	kotoBinary = filepath.Join(tmp, "koto")
-	cmd := exec.Command("go", "build", "-o", kotoBinary, ".")
+	cmd := exec.Command("go", "build", "-o", kotoBinary, ".") //nolint:gosec // test-only: path is from os.MkdirTemp
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "build koto binary: %v\n", err)
