@@ -287,15 +287,33 @@ func TestIntegration_RewindAndReadvance(t *testing.T) {
 	// verify history has the rewind entry
 	stdout = mustRunKoto(t, "query", "--state", statePath)
 	queryResult := parseJSON(t, stdout)
-	history := queryResult["history"].([]interface{})
-	lastEntry := history[len(history)-1].(map[string]interface{})
-	if typ := lastEntry["type"].(string); typ != "rewind" {
+	history, ok := queryResult["history"].([]interface{})
+	if !ok {
+		t.Fatalf("history is not an array: %T", queryResult["history"])
+	}
+	lastEntry, ok := history[len(history)-1].(map[string]interface{})
+	if !ok {
+		t.Fatalf("last history entry is not an object: %T", history[len(history)-1])
+	}
+	typ, ok := lastEntry["type"].(string)
+	if !ok {
+		t.Fatalf("history entry 'type' is not a string: %T", lastEntry["type"])
+	}
+	if typ != "rewind" {
 		t.Errorf("last history type = %q, want %q", typ, "rewind")
 	}
-	if from := lastEntry["from"].(string); from != "implement" {
+	from, ok := lastEntry["from"].(string)
+	if !ok {
+		t.Fatalf("history entry 'from' is not a string: %T", lastEntry["from"])
+	}
+	if from != "implement" {
 		t.Errorf("rewind from = %q, want %q", from, "implement")
 	}
-	if to := lastEntry["to"].(string); to != "plan" {
+	to, ok := lastEntry["to"].(string)
+	if !ok {
+		t.Fatalf("history entry 'to' is not a string: %T", lastEntry["to"])
+	}
+	if to != "plan" {
 		t.Errorf("rewind to = %q, want %q", to, "plan")
 	}
 
@@ -310,7 +328,10 @@ func TestIntegration_RewindAndReadvance(t *testing.T) {
 	}
 	// history: assess->plan, plan->implement, implement->plan (rewind),
 	// plan->implement, implement->done = 5 entries
-	history = queryResult["history"].([]interface{})
+	history, ok = queryResult["history"].([]interface{})
+	if !ok {
+		t.Fatalf("history is not an array: %T", queryResult["history"])
+	}
 	if len(history) != 5 {
 		t.Errorf("history len = %d, want 5", len(history))
 	}
@@ -375,8 +396,14 @@ func TestIntegration_MultiWorkflow(t *testing.T) {
 	}
 	// Verify the error output is valid JSON and mentions the problem.
 	m := parseJSON(t, stdout)
-	errObj := m["error"].(map[string]interface{})
-	msg := errObj["message"].(string)
+	errObj, ok := m["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("'error' is not an object: %T", m["error"])
+	}
+	msg, ok := errObj["message"].(string)
+	if !ok {
+		t.Fatalf("'message' is not a string: %T", errObj["message"])
+	}
 	if msg == "" {
 		t.Error("error message should not be empty")
 	}
@@ -545,106 +572,5 @@ func TestIntegration_TemplateMismatch(t *testing.T) {
 	code = errorCode(t, stdout)
 	if code != "template_mismatch" {
 		t.Errorf("transition error code = %q, want %q", code, "template_mismatch")
-	}
-}
-
-// TestIntegration_VersionConflict tests that concurrent modification of
-// the state file's version field triggers a version_conflict error.
-//
-// The engine detects version conflicts by re-reading the state file during
-// persist and comparing against the expected version. This check catches
-// changes that happen between Load (start of CLI invocation) and persist
-// (end of CLI invocation).
-//
-// Two concurrent transitions on the same state file can trigger this: both
-// read version N, both try to write version N+1, one writes first, the
-// other re-reads and finds N+1 instead of the expected N.
-func TestIntegration_VersionConflict(t *testing.T) {
-	if testing.Short() {
-		t.Skip("short mode: skipping integration test")
-	}
-
-	// Use a template with two valid transitions from the same state so
-	// we can race two transitions without one being invalid.
-	const branchTemplate = `---
-name: branch
-version: "1.0"
-description: Branching workflow for conflict test
----
-
-## start
-
-Starting state.
-
-**Transitions**: [path_a, path_b]
-
-## path_a
-
-Path A.
-
-**Transitions**: [end]
-
-## path_b
-
-Path B.
-
-**Transitions**: [end]
-
-## end
-
-Done.
-`
-	conflictDetected := false
-	for attempt := 0; attempt < 200; attempt++ {
-		dir := t.TempDir()
-		tmplPath := writeTemplate(t, dir, "branch.md", branchTemplate)
-		stateDir := filepath.Join(dir, "state")
-		statePath := initWorkflow(t, tmplPath, stateDir, "conflict")
-
-		// Launch two concurrent transitions from "start".
-		// Both read version=1. One will write version=2 first.
-		// The other should detect the mismatch during persist.
-		type result struct {
-			stdout string
-			err    error
-		}
-		ch := make(chan result, 2)
-		for _, target := range []string{"path_a", "path_b"} {
-			go func(tgt string) {
-				out, _, err := runKoto(t, "transition", tgt, "--state", statePath)
-				ch <- result{out, err}
-			}(target)
-		}
-
-		r1 := <-ch
-		r2 := <-ch
-
-		// Check if either got a version_conflict.
-		for _, r := range []result{r1, r2} {
-			if r.err != nil && len(r.stdout) > 0 {
-				var m map[string]interface{}
-				if json.Unmarshal([]byte(r.stdout), &m) == nil {
-					if errObj, ok := m["error"].(map[string]interface{}); ok {
-						if code, _ := errObj["code"].(string); code == "version_conflict" {
-							conflictDetected = true
-						}
-					}
-				}
-			}
-		}
-		if conflictDetected {
-			break
-		}
-	}
-
-	if !conflictDetected {
-		// The race condition is hard to trigger deterministically from
-		// outside the process. The version conflict mechanism is
-		// thoroughly covered by engine unit tests (TestVersionConflict_*
-		// in engine_test.go). This integration test validates the
-		// end-to-end path when it hits the timing window; if it can't
-		// trigger the race, log it rather than failing CI.
-		t.Log("version_conflict race not triggered in 200 attempts; " +
-			"mechanism covered by engine unit tests")
 	}
 }
