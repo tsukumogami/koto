@@ -957,7 +957,7 @@ func TestTransitionError_JSONOmitempty(t *testing.T) {
 }
 
 func TestTransitionError_AllCodes(t *testing.T) {
-	// Verify all six error codes are defined and serialize correctly.
+	// Verify all seven error codes are defined and serialize correctly.
 	codes := []string{
 		ErrTerminalState,
 		ErrInvalidTransition,
@@ -965,6 +965,7 @@ func TestTransitionError_AllCodes(t *testing.T) {
 		ErrTemplateMismatch,
 		ErrVersionConflict,
 		ErrRewindFailed,
+		ErrGateFailed,
 	}
 
 	expected := []string{
@@ -974,6 +975,7 @@ func TestTransitionError_AllCodes(t *testing.T) {
 		"template_mismatch",
 		"version_conflict",
 		"rewind_failed",
+		"gate_failed",
 	}
 
 	for i, code := range codes {
@@ -2007,4 +2009,759 @@ func TestEvidence_OmitemptyWhenEmpty(t *testing.T) {
 	// This is expected and fine -- the field will be present as {}.
 	// The key behavior is that schema_version 1 files (which lack the
 	// field entirely) are handled correctly by Load.
+}
+
+// --- Gate evaluation tests (issue #16) ---
+
+// gatedMachine returns a machine where "start" has two gates:
+//   - task_defined: field_not_empty on "task"
+//   - status_check: field_equals on "status" == "ready"
+//
+// start -> middle -> done (terminal)
+func gatedMachine() *Machine {
+	return &Machine{
+		Name:         "gated-machine",
+		InitialState: "start",
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"middle"},
+				Gates: map[string]*GateDecl{
+					"task_defined": {
+						Type:  "field_not_empty",
+						Field: "task",
+					},
+					"status_check": {
+						Type:  "field_equals",
+						Field: "status",
+						Value: "ready",
+					},
+				},
+			},
+			"middle": {
+				Transitions: []string{"done"},
+			},
+			"done": {
+				Terminal: true,
+			},
+		},
+	}
+}
+
+func TestGate_FieldNotEmpty_PassingCase(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "start",
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"middle"},
+				Gates: map[string]*GateDecl{
+					"task_defined": {
+						Type:  "field_not_empty",
+						Field: "task",
+					},
+				},
+			},
+			"middle": {
+				Transitions: []string{"done"},
+			},
+			"done": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Transition with evidence that satisfies the gate.
+	err = eng.Transition("middle", WithEvidence(map[string]string{"task": "build feature"}))
+	if err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	if got := eng.CurrentState(); got != "middle" {
+		t.Errorf("CurrentState() = %q, want %q", got, "middle")
+	}
+}
+
+func TestGate_FieldNotEmpty_FailsMissingKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "start",
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"middle"},
+				Gates: map[string]*GateDecl{
+					"task_defined": {
+						Type:  "field_not_empty",
+						Field: "task",
+					},
+				},
+			},
+			"middle": {
+				Transitions: []string{"done"},
+			},
+			"done": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Transition without the required evidence key.
+	err = eng.Transition("middle")
+	if err == nil {
+		t.Fatal("Transition() expected gate_failed error")
+	}
+
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T", err)
+	}
+	if te.Code != ErrGateFailed {
+		t.Errorf("error code = %q, want %q", te.Code, ErrGateFailed)
+	}
+	if te.CurrentState != "start" {
+		t.Errorf("current_state = %q, want %q", te.CurrentState, "start")
+	}
+	if te.TargetState != "middle" {
+		t.Errorf("target_state = %q, want %q", te.TargetState, "middle")
+	}
+}
+
+func TestGate_FieldNotEmpty_FailsEmptyString(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "start",
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"middle"},
+				Gates: map[string]*GateDecl{
+					"task_defined": {
+						Type:  "field_not_empty",
+						Field: "task",
+					},
+				},
+			},
+			"middle": {
+				Transitions: []string{"done"},
+			},
+			"done": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Supply empty string for the field.
+	err = eng.Transition("middle", WithEvidence(map[string]string{"task": ""}))
+	if err == nil {
+		t.Fatal("Transition() expected gate_failed error for empty string")
+	}
+
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T", err)
+	}
+	if te.Code != ErrGateFailed {
+		t.Errorf("error code = %q, want %q", te.Code, ErrGateFailed)
+	}
+}
+
+func TestGate_FieldEquals_PassingCase(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "start",
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"middle"},
+				Gates: map[string]*GateDecl{
+					"status_check": {
+						Type:  "field_equals",
+						Field: "status",
+						Value: "ready",
+					},
+				},
+			},
+			"middle": {
+				Transitions: []string{"done"},
+			},
+			"done": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	err = eng.Transition("middle", WithEvidence(map[string]string{"status": "ready"}))
+	if err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	if got := eng.CurrentState(); got != "middle" {
+		t.Errorf("CurrentState() = %q, want %q", got, "middle")
+	}
+}
+
+func TestGate_FieldEquals_FailsWrongValue(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "start",
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"middle"},
+				Gates: map[string]*GateDecl{
+					"status_check": {
+						Type:  "field_equals",
+						Field: "status",
+						Value: "ready",
+					},
+				},
+			},
+			"middle": {
+				Transitions: []string{"done"},
+			},
+			"done": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	err = eng.Transition("middle", WithEvidence(map[string]string{"status": "not_ready"}))
+	if err == nil {
+		t.Fatal("Transition() expected gate_failed error for wrong value")
+	}
+
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T", err)
+	}
+	if te.Code != ErrGateFailed {
+		t.Errorf("error code = %q, want %q", te.Code, ErrGateFailed)
+	}
+}
+
+func TestGate_FieldEquals_FailsMissingKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "start",
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"middle"},
+				Gates: map[string]*GateDecl{
+					"status_check": {
+						Type:  "field_equals",
+						Field: "status",
+						Value: "ready",
+					},
+				},
+			},
+			"middle": {
+				Transitions: []string{"done"},
+			},
+			"done": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	err = eng.Transition("middle")
+	if err == nil {
+		t.Fatal("Transition() expected gate_failed error for missing key")
+	}
+
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T", err)
+	}
+	if te.Code != ErrGateFailed {
+		t.Errorf("error code = %q, want %q", te.Code, ErrGateFailed)
+	}
+}
+
+func TestGate_ANDLogic_FirstPassesSecondFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, gatedMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Supply evidence that satisfies field_not_empty("task") but NOT
+	// field_equals("status", "ready").
+	err = eng.Transition("middle", WithEvidence(map[string]string{
+		"task":   "build feature",
+		"status": "not_ready",
+	}))
+	if err == nil {
+		t.Fatal("Transition() expected gate_failed error (AND logic: second gate fails)")
+	}
+
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T", err)
+	}
+	if te.Code != ErrGateFailed {
+		t.Errorf("error code = %q, want %q", te.Code, ErrGateFailed)
+	}
+
+	// State should not have changed.
+	if got := eng.CurrentState(); got != "start" {
+		t.Errorf("CurrentState() = %q after failed gate, want %q", got, "start")
+	}
+}
+
+func TestGate_ANDLogic_AllGatesPass(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, gatedMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Supply evidence that satisfies both gates.
+	err = eng.Transition("middle", WithEvidence(map[string]string{
+		"task":   "build feature",
+		"status": "ready",
+	}))
+	if err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	if got := eng.CurrentState(); got != "middle" {
+		t.Errorf("CurrentState() = %q, want %q", got, "middle")
+	}
+}
+
+func TestGate_NamespaceCollision_EvidenceShadowsVariable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "start",
+		DeclaredVars: map[string]bool{"TASK": true, "REPO": true},
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"middle"},
+			},
+			"middle": {
+				Transitions: []string{"done"},
+			},
+			"done": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Attempt to transition with evidence that shadows a declared variable.
+	err = eng.Transition("middle", WithEvidence(map[string]string{"TASK": "override"}))
+	if err == nil {
+		t.Fatal("Transition() expected error for namespace collision")
+	}
+
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T", err)
+	}
+	if te.Code != ErrGateFailed {
+		t.Errorf("error code = %q, want %q", te.Code, ErrGateFailed)
+	}
+	if te.CurrentState != "start" {
+		t.Errorf("current_state = %q, want %q", te.CurrentState, "start")
+	}
+	if te.TargetState != "middle" {
+		t.Errorf("target_state = %q, want %q", te.TargetState, "middle")
+	}
+
+	wantMsg := `evidence key "TASK" shadows declared variable`
+	if te.Message != wantMsg {
+		t.Errorf("message = %q, want %q", te.Message, wantMsg)
+	}
+
+	// State should not have changed.
+	if got := eng.CurrentState(); got != "start" {
+		t.Errorf("CurrentState() = %q after failed collision check, want %q", got, "start")
+	}
+}
+
+func TestGate_GateFailedError_Shape(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "start",
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"middle"},
+				Gates: map[string]*GateDecl{
+					"task_defined": {
+						Type:  "field_not_empty",
+						Field: "task",
+					},
+				},
+			},
+			"middle": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	err = eng.Transition("middle")
+	if err == nil {
+		t.Fatal("Transition() expected gate_failed error")
+	}
+
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T", err)
+	}
+
+	// Verify the TransitionError shape.
+	if te.Code != ErrGateFailed {
+		t.Errorf("code = %q, want %q", te.Code, ErrGateFailed)
+	}
+	if te.CurrentState != "start" {
+		t.Errorf("current_state = %q, want %q", te.CurrentState, "start")
+	}
+	if te.TargetState != "middle" {
+		t.Errorf("target_state = %q, want %q", te.TargetState, "middle")
+	}
+	if te.Message == "" {
+		t.Error("message should not be empty")
+	}
+
+	// Verify JSON serialization shape.
+	data, err := json.Marshal(te)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+	if m["code"] != "gate_failed" {
+		t.Errorf("JSON code = %v, want %q", m["code"], "gate_failed")
+	}
+	if m["current_state"] != "start" {
+		t.Errorf("JSON current_state = %v, want %q", m["current_state"], "start")
+	}
+	if m["target_state"] != "middle" {
+		t.Errorf("JSON target_state = %v, want %q", m["target_state"], "middle")
+	}
+}
+
+func TestGate_NoGatesDefined_TransitionSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	// Use the default testMachine which has no gates.
+	eng, err := Init(path, testMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	if err := eng.Transition("middle"); err != nil {
+		t.Fatalf("Transition() error: %v (states with no gates should transition normally)", err)
+	}
+
+	if got := eng.CurrentState(); got != "middle" {
+		t.Errorf("CurrentState() = %q, want %q", got, "middle")
+	}
+}
+
+func TestGate_EvidencePersistsAcrossRewind(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "start",
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"middle"},
+				Gates: map[string]*GateDecl{
+					"task_defined": {
+						Type:  "field_not_empty",
+						Field: "task",
+					},
+				},
+			},
+			"middle": {
+				Transitions: []string{"done"},
+			},
+			"done": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// First transition: supply evidence that satisfies the gate.
+	err = eng.Transition("middle", WithEvidence(map[string]string{"task": "build feature"}))
+	if err != nil {
+		t.Fatalf("Transition(middle) error: %v", err)
+	}
+
+	// Rewind back to start.
+	if err := eng.Rewind("start"); err != nil {
+		t.Fatalf("Rewind(start) error: %v", err)
+	}
+
+	// Evidence should persist after rewind.
+	ev := eng.Evidence()
+	if ev["task"] != "build feature" {
+		t.Errorf("Evidence[task] = %q after rewind, want %q", ev["task"], "build feature")
+	}
+
+	// The accumulated evidence should satisfy the gate on the second
+	// attempt without supplying new evidence.
+	err = eng.Transition("middle")
+	if err != nil {
+		t.Fatalf("Transition(middle) after rewind error: %v (accumulated evidence should satisfy gate)", err)
+	}
+
+	if got := eng.CurrentState(); got != "middle" {
+		t.Errorf("CurrentState() = %q, want %q", got, "middle")
+	}
+}
+
+func TestGate_AccumulatedEvidence_SatisfiesGate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "first",
+		States: map[string]*MachineState{
+			"first": {
+				Transitions: []string{"second"},
+			},
+			"second": {
+				Transitions: []string{"third"},
+				Gates: map[string]*GateDecl{
+					"need_result": {
+						Type:  "field_not_empty",
+						Field: "result",
+					},
+				},
+			},
+			"third": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// First transition: supply evidence on a state that has no gates.
+	err = eng.Transition("second", WithEvidence(map[string]string{"result": "pass"}))
+	if err != nil {
+		t.Fatalf("Transition(second) error: %v", err)
+	}
+
+	// Second transition: the gate on "second" checks evidence. The
+	// accumulated evidence from the prior transition should satisfy it.
+	err = eng.Transition("third")
+	if err != nil {
+		t.Fatalf("Transition(third) error: %v (accumulated evidence should satisfy gate)", err)
+	}
+}
+
+func TestGate_NamespaceCollision_NoCollisionWhenNoDeclaredVars(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	// Machine with no DeclaredVars -- evidence keys should never collide.
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "start",
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"done"},
+			},
+			"done": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	err = eng.Transition("done", WithEvidence(map[string]string{"TASK": "anything"}))
+	if err != nil {
+		t.Fatalf("Transition() error: %v (no declared vars, no collision possible)", err)
+	}
+}
+
+func TestGate_NamespaceCollision_NonShadowingEvidenceAllowed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "start",
+		DeclaredVars: map[string]bool{"TASK": true},
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"done"},
+			},
+			"done": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Evidence key "result" doesn't shadow any declared variable.
+	err = eng.Transition("done", WithEvidence(map[string]string{"result": "pass"}))
+	if err != nil {
+		t.Fatalf("Transition() error: %v (evidence key does not shadow declared variable)", err)
+	}
+}
+
+func TestGate_ErrGateFailed_Constant(t *testing.T) {
+	if ErrGateFailed != "gate_failed" {
+		t.Errorf("ErrGateFailed = %q, want %q", ErrGateFailed, "gate_failed")
+	}
+}
+
+func TestGate_FieldNotEmpty_UsesEffectiveEvidence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "first",
+		States: map[string]*MachineState{
+			"first": {
+				Transitions: []string{"second"},
+			},
+			"second": {
+				Transitions: []string{"done"},
+				Gates: map[string]*GateDecl{
+					"need_task": {
+						Type:  "field_not_empty",
+						Field: "task",
+					},
+				},
+			},
+			"done": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Supply evidence on the first transition (no gates here).
+	if err := eng.Transition("second", WithEvidence(map[string]string{"task": "build it"})); err != nil {
+		t.Fatalf("Transition(second) error: %v", err)
+	}
+
+	// Gate on "second" checks effective evidence, which includes
+	// accumulated evidence from previous transitions. No new evidence
+	// needed here.
+	if err := eng.Transition("done"); err != nil {
+		t.Fatalf("Transition(done) error: %v", err)
+	}
+}
+
+func TestGate_StateNotMutatedOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	machine := &Machine{
+		Name:         "test",
+		InitialState: "start",
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"middle"},
+				Gates: map[string]*GateDecl{
+					"need_approval": {
+						Type:  "field_equals",
+						Field: "approved",
+						Value: "yes",
+					},
+				},
+			},
+			"middle": {Terminal: true},
+		},
+	}
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	origVersion := eng.Snapshot().Version
+	origHistLen := len(eng.History())
+
+	// Attempt transition that fails the gate.
+	err = eng.Transition("middle", WithEvidence(map[string]string{"approved": "no"}))
+	if err == nil {
+		t.Fatal("Transition() expected gate_failed error")
+	}
+
+	// State should not have changed.
+	if got := eng.CurrentState(); got != "start" {
+		t.Errorf("CurrentState() = %q after gate failure, want %q", got, "start")
+	}
+	snap := eng.Snapshot()
+	if snap.Version != origVersion {
+		t.Errorf("Version = %d after gate failure, want %d", snap.Version, origVersion)
+	}
+	if len(snap.History) != origHistLen {
+		t.Errorf("History length = %d after gate failure, want %d", len(snap.History), origHistLen)
+	}
+	// Evidence should NOT have been merged since gate failed before commit.
+	if len(snap.Evidence) != 0 {
+		t.Errorf("Evidence = %v after gate failure, want empty", snap.Evidence)
+	}
 }

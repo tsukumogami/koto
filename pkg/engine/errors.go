@@ -26,6 +26,10 @@ const (
 	// target was not found in history (and is not the initial state),
 	// or the target is a terminal state.
 	ErrRewindFailed = "rewind_failed"
+
+	// ErrGateFailed indicates one or more gates on the current state
+	// did not pass during a transition attempt.
+	ErrGateFailed = "gate_failed"
 )
 
 // TransitionError represents a structured engine error that serializes

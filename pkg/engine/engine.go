@@ -163,6 +163,43 @@ func (e *Engine) Transition(target string, opts ...TransitionOption) error {
 		}
 	}
 
+	// Namespace collision check: evidence keys must not shadow declared
+	// variable names. This runs before gate evaluation.
+	if len(cfg.evidence) > 0 && len(e.machine.DeclaredVars) > 0 {
+		for k := range cfg.evidence {
+			if e.machine.DeclaredVars[k] {
+				return &TransitionError{
+					Code:         ErrGateFailed,
+					Message:      fmt.Sprintf("evidence key %q shadows declared variable", k),
+					CurrentState: current,
+					TargetState:  target,
+				}
+			}
+		}
+	}
+
+	// Gate evaluation: all gates on the current state must pass (AND
+	// logic) before the transition commits. Gates check the evidence
+	// map, which includes both accumulated evidence and evidence being
+	// supplied in this transition.
+	if len(ms.Gates) > 0 {
+		// Build the effective evidence: accumulated state evidence
+		// merged with the evidence being supplied in this transition
+		// (new evidence overwrites existing keys, same as the commit
+		// semantics below).
+		effectiveEvidence := make(map[string]string, len(e.state.Evidence)+len(cfg.evidence))
+		for k, v := range e.state.Evidence {
+			effectiveEvidence[k] = v
+		}
+		for k, v := range cfg.evidence {
+			effectiveEvidence[k] = v
+		}
+
+		if err := evaluateGates(ms.Gates, effectiveEvidence, current, target); err != nil {
+			return err
+		}
+	}
+
 	prev := deepCopyState(e.state)
 
 	// Build the history entry, recording any evidence supplied.
@@ -503,6 +540,52 @@ func deepCopyState(s State) State {
 	}
 
 	return cp
+}
+
+// evaluateGates checks all gates on a state using AND logic. Every gate
+// must pass for the transition to proceed. Gates check the evidence map
+// only, not the merged variables+evidence context.
+func evaluateGates(gates map[string]*GateDecl, evidence map[string]string, current, target string) error {
+	for name, gate := range gates {
+		switch gate.Type {
+		case "field_not_empty":
+			val, exists := evidence[gate.Field]
+			if !exists || val == "" {
+				return &TransitionError{
+					Code:         ErrGateFailed,
+					Message:      fmt.Sprintf("gate %q failed: field %q must be non-empty", name, gate.Field),
+					CurrentState: current,
+					TargetState:  target,
+				}
+			}
+
+		case "field_equals":
+			val, exists := evidence[gate.Field]
+			if !exists {
+				return &TransitionError{
+					Code:         ErrGateFailed,
+					Message:      fmt.Sprintf("gate %q failed: field %q not found in evidence", name, gate.Field),
+					CurrentState: current,
+					TargetState:  target,
+				}
+			}
+			if val != gate.Value {
+				return &TransitionError{
+					Code:         ErrGateFailed,
+					Message:      fmt.Sprintf("gate %q failed: field %q is %q, want %q", name, gate.Field, val, gate.Value),
+					CurrentState: current,
+					TargetState:  target,
+				}
+			}
+
+		default:
+			// Unknown gate types (e.g., "command") are not evaluated by
+			// this function. Issue #17 will add command gate execution.
+			// For now, unknown types pass silently to avoid blocking
+			// transitions on gates that this code doesn't yet handle.
+		}
+	}
+	return nil
 }
 
 func contains(ss []string, s string) bool {
