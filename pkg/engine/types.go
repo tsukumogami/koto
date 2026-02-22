@@ -36,6 +36,7 @@ type Machine struct {
 	Name         string
 	InitialState string
 	States       map[string]*MachineState
+	DeclaredVars map[string]bool
 }
 
 // MachineState defines a single state in the machine, including its
@@ -43,4 +44,15 @@ type Machine struct {
 type MachineState struct {
 	Transitions []string
 	Terminal    bool
+	Gates       map[string]*GateDecl
+}
+
+// GateDecl represents a gate declaration on a machine state. Gates are
+// preconditions that must be satisfied before entering the state.
+type GateDecl struct {
+	Type    string
+	Field   string
+	Value   string
+	Command string
+	Timeout int // seconds, 0 = default (30s)
 }

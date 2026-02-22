@@ -254,15 +254,41 @@ func (e *Engine) Machine() *Machine {
 	for name, ms := range e.machine.States {
 		transitions := make([]string, len(ms.Transitions))
 		copy(transitions, ms.Transitions)
+
+		var gates map[string]*GateDecl
+		if ms.Gates != nil {
+			gates = make(map[string]*GateDecl, len(ms.Gates))
+			for gn, gd := range ms.Gates {
+				gates[gn] = &GateDecl{
+					Type:    gd.Type,
+					Field:   gd.Field,
+					Value:   gd.Value,
+					Command: gd.Command,
+					Timeout: gd.Timeout,
+				}
+			}
+		}
+
 		states[name] = &MachineState{
 			Transitions: transitions,
 			Terminal:    ms.Terminal,
+			Gates:       gates,
 		}
 	}
+
+	var declaredVars map[string]bool
+	if e.machine.DeclaredVars != nil {
+		declaredVars = make(map[string]bool, len(e.machine.DeclaredVars))
+		for k, v := range e.machine.DeclaredVars {
+			declaredVars[k] = v
+		}
+	}
+
 	return &Machine{
 		Name:         e.machine.Name,
 		InitialState: e.machine.InitialState,
 		States:       states,
+		DeclaredVars: declaredVars,
 	}
 }
 
