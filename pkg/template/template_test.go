@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -606,28 +607,15 @@ Finished.
 	}
 
 	// Section should not contain the transitions line.
-	if contains(section, "**Transitions**") {
+	if strings.Contains(section, "**Transitions**") {
 		t.Errorf("Sections[work] contains transitions line: %q", section)
 	}
 
 	// Section should contain the directive content.
-	if !contains(section, "Do some work here.") {
+	if !strings.Contains(section, "Do some work here.") {
 		t.Errorf("Sections[work] missing directive content: %q", section)
 	}
-	if !contains(section, "More details about the work.") {
+	if !strings.Contains(section, "More details about the work.") {
 		t.Errorf("Sections[work] missing second line: %q", section)
 	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsSubstring(s, substr))
-}
-
-func containsSubstring(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

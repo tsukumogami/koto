@@ -48,6 +48,8 @@ type Template struct {
 // markdown headings, constructs an engine.Machine, and computes a
 // SHA-256 hash of the full file content.
 //
+// The first ## heading in the body becomes the machine's initial state.
+//
 // Parse returns an error if:
 //   - the file cannot be read
 //   - the front-matter delimiters are missing or malformed
@@ -325,7 +327,7 @@ func parseSections(body string) (stateNames []string, sections map[string]string
 		}
 
 		// Check for transitions line: "**Transitions**: [state-a, state-b]"
-		if isTransitionsLine(trimmed) {
+		if strings.HasPrefix(trimmed, "**Transitions**:") {
 			targets, parseErr := parseTransitionsLine(trimmed)
 			if parseErr != nil {
 				return nil, nil, nil, fmt.Errorf("state %q: %w", currentState, parseErr)
@@ -341,11 +343,6 @@ func parseSections(body string) (stateNames []string, sections map[string]string
 	flushState()
 
 	return stateNames, sections, transitions, nil
-}
-
-// isTransitionsLine checks whether a line matches the transitions pattern.
-func isTransitionsLine(line string) bool {
-	return strings.HasPrefix(line, "**Transitions**:")
 }
 
 // parseTransitionsLine extracts state names from a transitions line like
