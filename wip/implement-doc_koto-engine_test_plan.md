@@ -303,6 +303,6 @@ Total scenarios: 25
 - `koto next --state wip/koto-agent-task.state.json` (verify action: done)
 - `koto query --state wip/koto-agent-task.state.json` (verify full history including rewind)
 **Expected**: The full agent workflow completes. Directives contain interpolated `{{TASK}}` values. Rewind preserves history and re-advancing works. Terminal state returns `action: "done"`. The state file is a self-contained record of everything that happened. This validates the design's core promise: an agent can init a workflow, follow directives, recover from errors via rewind, and reach completion with a full audit trail.
-**Status**: pending
+**Status**: passed
 
 ---
