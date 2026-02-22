@@ -1,0 +1,117 @@
+{
+  "pr_status": "implementing",
+  "design_doc": "docs/designs/DESIGN-koto-template-format.md",
+  "branch": "docs/koto-template-format",
+  "pr_number": 12,
+  "integrity_hash": "sha256:09b52dbe34fd53ada960c9a9fe0c5f235090ece30d8061b83d4a1f616e0f1221",
+  "issues": [
+    {
+      "number": 13,
+      "title": "feat(template): define compiled template format with JSON parsing",
+      "status": "scrutinized",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "code",
+      "dependencies": [],
+      "commits": [
+        "89ca56a"
+      ],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-1",
+        "scenario-2",
+        "scenario-3",
+        "scenario-4",
+        "scenario-5",
+        "scenario-6",
+        "scenario-7",
+        "scenario-8"
+      ]
+    },
+    {
+      "number": 14,
+      "title": "feat(template): implement source format compiler",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        13
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-9",
+        "scenario-10",
+        "scenario-11",
+        "scenario-12",
+        "scenario-13"
+      ]
+    },
+    {
+      "number": 15,
+      "title": "feat(engine): add evidence support with transition options",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-14",
+        "scenario-15"
+      ]
+    },
+    {
+      "number": 16,
+      "title": "feat(engine): implement field-based gate evaluation",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        13,
+        15
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-16",
+        "scenario-17",
+        "scenario-18"
+      ]
+    },
+    {
+      "number": 17,
+      "title": "feat(engine): implement command gate execution",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        16
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-19",
+        "scenario-20"
+      ]
+    }
+  ],
+  "skipped_issues": [
+    {
+      "number": 18,
+      "reason": "",
+      "label": "",
+      "blocked_by": null
+    }
+  ],
+  "test_plan_file": "wip/implement-doc_koto-template-format_test_plan.md"
+}
