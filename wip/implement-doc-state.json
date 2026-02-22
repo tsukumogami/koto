@@ -3,13 +3,13 @@
   "design_doc": "docs/designs/DESIGN-koto-engine.md",
   "branch": "docs/koto-engine",
   "pr_number": 2,
-  "integrity_hash": "sha256:d7e6ceda4bdb1133245f560fe0a0d2958fd709c953dafc9321536a3cdaac5ded",
+  "integrity_hash": "sha256:374ba4697e8a796278e5f19eb3f751318d8de99ccbf06d6b0da2e2eed80514ec",
   "issues": [
     {
       "number": 4,
       "title": "feat(engine): implement walking skeleton with init, transition, and next",
-      "status": "pushed",
-      "ci_status": "pending",
+      "status": "completed",
+      "ci_status": "passed",
       "ci_fix_attempts": 0,
       "issue_type": "code",
       "dependencies": [],
@@ -74,16 +74,27 @@
     {
       "number": 5,
       "title": "feat(engine): add rewind, cancel, and query methods",
-      "status": "pending",
+      "status": "scrutinized",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "code",
       "dependencies": [
         4
       ],
-      "commits": [],
-      "agent_type": "",
-      "summary": null,
+      "commits": [
+        "48e9dcd"
+      ],
+      "agent_type": "coder",
+      "summary": {
+        "narrative": "",
+        "files_changed": [
+          "pkg/engine/engine.go",
+          "pkg/engine/engine_test.go"
+        ],
+        "tests_added": 11,
+        "key_decisions": "Rewind uses rewind_failed error code for all failure modes with distinct messages. Cancel delegates directly to os.Remove. Added TestSnapshot_ReturnsCopy for full copy-safety verification.",
+        "requirements_map": []
+      },
       "testable_scenarios": [
         "scenario-10",
         "scenario-11",

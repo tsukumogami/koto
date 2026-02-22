@@ -118,7 +118,7 @@ Total scenarios: 25
 - `koto transition state-c --state <path>`
 - `koto rewind --to state-b --state <path>`
 **Expected**: Exit code 0. State file shows `current_state: "state-b"`. History contains a new entry with `type: "rewind"`, `from: "state-c"`, `to: "state-b"`. Version incremented.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -130,7 +130,7 @@ Total scenarios: 25
 - `koto transition state-b --state <path>`
 - `koto rewind --to <initial-state> --state <path>`
 **Expected**: Exit code 0. `current_state` reverts to the machine's initial state. The initial state need not appear as a `to` field in history because it is always a valid rewind target.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -141,7 +141,7 @@ Total scenarios: 25
 - (Advance workflow to terminal state)
 - `koto rewind --to <non-terminal-state> --state <path>`
 **Expected**: Exit code 0. `current_state` is now the non-terminal target. This is the recovery path when a workflow reaches an undesired terminal state.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -152,7 +152,7 @@ Total scenarios: 25
 - `koto init --name test-workflow --template <path> --state-dir <dir>`
 - `koto rewind --to never-visited-state --state <path>`
 **Expected**: Exit code 1. Error JSON with `code: "rewind_failed"`.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -164,7 +164,7 @@ Total scenarios: 25
 - `koto transition state-b --state <path>`
 - `koto rewind --to <terminal-state> --state <path>`
 **Expected**: Exit code 1. Error JSON with `code: "rewind_failed"`. Rewinding to a terminal state would leave the workflow stuck.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -176,7 +176,7 @@ Total scenarios: 25
 - `koto cancel --state <path>`
 - `ls <state-file-path>`
 **Expected**: Cancel exits 0 with confirmation message. The state file no longer exists on disk. No other files in the directory are removed.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -186,7 +186,7 @@ Total scenarios: 25
 **Commands**:
 - `go test ./pkg/engine/... -run TestCopySafety -v`
 **Expected**: Unit tests confirm that `Variables()`, `History()`, and `Snapshot()` return copies. Mutating returned values does not affect engine internal state.
-**Status**: pending
+**Status**: passed
 
 ---
 
