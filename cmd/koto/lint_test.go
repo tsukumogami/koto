@@ -55,7 +55,7 @@ func TestGovulncheck(t *testing.T) {
 func rungo(t *testing.T, args ...string) {
 	t.Helper()
 
-	cmd := exec.Command("go", args...)
+	cmd := exec.Command("go", args...) //nolint:gosec // G204: test helper runs go subcommands with known args
 	if output, err := cmd.CombinedOutput(); err != nil {
 		if ee := (*exec.ExitError)(nil); errors.As(err, &ee) && len(ee.Stderr) > 0 {
 			t.Fatalf("%v: %v\n%s", cmd, err, ee.Stderr)
