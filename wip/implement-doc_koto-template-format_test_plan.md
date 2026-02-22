@@ -21,9 +21,9 @@ Total scenarios: 20
 - [x] scenario-13
 - [x] scenario-14
 - [x] scenario-15
-- [ ] scenario-16
-- [ ] scenario-17
-- [ ] scenario-18
+- [x] scenario-16
+- [x] scenario-17
+- [x] scenario-18
 - [ ] scenario-19
 - [ ] scenario-20
 
@@ -218,7 +218,7 @@ Total scenarios: 20
 - Call `Transition("plan", WithEvidence(map[string]string{"TASK": ""}))`
 - Call `Transition("plan", WithEvidence(map[string]string{"TASK": "build feature"}))`
 **Expected**: First two transitions fail with `gate_failed` error. Third transition succeeds because "TASK" is non-empty.
-**Status**: pending
+**Status**: passed (2026-02-22)
 
 ---
 
@@ -230,7 +230,7 @@ Total scenarios: 20
 - Call `Transition` with evidence `{"status": "pending"}`
 - Call `Transition` with evidence `{"status": "approved"}`
 **Expected**: First transition fails with `gate_failed`. Second transition succeeds.
-**Status**: pending
+**Status**: passed (2026-02-22)
 
 ---
 
@@ -241,7 +241,7 @@ Total scenarios: 20
 - Create a machine with `DeclaredVars` including "TASK"
 - Call `Transition("plan", WithEvidence(map[string]string{"TASK": "value"}))`
 **Expected**: Transition fails with error `"evidence key \"TASK\" shadows declared variable"` before any gate evaluation runs.
-**Status**: pending
+**Status**: passed (2026-02-22)
 
 ---
 
