@@ -1,0 +1,149 @@
+{
+  "pr_status": "implementing",
+  "design_doc": "docs/designs/DESIGN-koto-engine.md",
+  "branch": "docs/koto-engine",
+  "pr_number": 2,
+  "integrity_hash": "sha256:38630408513c6e86350692d3e1977a7fcddebb0bce2f6205d00653f48166b319",
+  "issues": [
+    {
+      "number": 4,
+      "title": "feat(engine): implement walking skeleton with init, transition, and next",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-1",
+        "scenario-2",
+        "scenario-3",
+        "scenario-4",
+        "scenario-5",
+        "scenario-6",
+        "scenario-7",
+        "scenario-8",
+        "scenario-9"
+      ]
+    },
+    {
+      "number": 5,
+      "title": "feat(engine): add rewind, cancel, and query methods",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        4
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-10",
+        "scenario-11",
+        "scenario-12",
+        "scenario-13",
+        "scenario-14",
+        "scenario-15",
+        "scenario-16"
+      ]
+    },
+    {
+      "number": 6,
+      "title": "feat(engine): add version conflict detection and TransitionError JSON serialization",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        4
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-17",
+        "scenario-18",
+        "scenario-19"
+      ]
+    },
+    {
+      "number": 7,
+      "title": "feat(template): implement template parsing and interpolation",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        4
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-20",
+        "scenario-21"
+      ]
+    },
+    {
+      "number": 8,
+      "title": "feat(discover): implement state file discovery",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        4
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-22"
+      ]
+    },
+    {
+      "number": 9,
+      "title": "feat(cli): add remaining CLI subcommands",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        5,
+        6,
+        7,
+        8
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-23",
+        "scenario-24"
+      ]
+    },
+    {
+      "number": 10,
+      "title": "test(engine): add integration tests for full workflow lifecycle",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        9
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-25"
+      ]
+    }
+  ],
+  "skipped_issues": null,
+  "test_plan_file": null
+}
