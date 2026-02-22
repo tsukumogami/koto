@@ -24,11 +24,11 @@ koto needs a programming language for state machines. The source format (what hu
 koto templates must serve two audiences: humans who write and maintain workflow definitions, and the engine that executes them deterministically. The v1 design tried a single format for both, creating heading collision, dual transition sources, and parsing fragility. These problems stem from conflating the source format with the execution format.
 
 **Decision:**
-Template source files (.md with YAML frontmatter) are the primary artifact -- stored, versioned, and shared. A deterministic compiler produces JSON for the engine to read at runtime. Compilation is one-way, like a programming language compiler. The engine reads compiled JSON using only Go's stdlib (zero dependencies). An optional LLM-assisted linter helps authors write valid source but sits outside the compile path. Evidence gates (field_not_empty, field_equals, command with 30s default timeout) are declared per state, evaluated on exit. Evidence persists across rewind.
+Template source files (.md with YAML frontmatter) are the primary artifact -- stored, versioned, and shared. A deterministic compiler produces JSON for the engine to read at runtime. Compilation is one-way, like a programming language compiler. The engine reads compiled JSON using only Go's stdlib (zero dependencies). Evidence gates (field_not_empty, field_equals, command with 30s default timeout) are declared per state, evaluated on exit. Evidence persists across rewind. CLI commands, search paths, and LLM-assisted validation are deferred to a separate tooling design.
 
 **Rationale:**
 The source/compiled separation eliminates heading collision (JSON has no headings) and format debates (each format does what it's designed for). The "programming language" model is familiar to every developer. YAML frontmatter is the industry standard for structured metadata in markdown documents. JSON as the compiled target uses Go's stdlib, keeping the engine dependency-free. The compilation step is invisible in practice -- koto init compiles in memory.
 
 ## Current Status
-**Phase:** 5 - Decision documented, ready for architecture detail
+**Phase:** 8 - Design complete, scope narrowed to format spec only (CLI/tooling deferred)
 **Last Updated:** 2026-02-22

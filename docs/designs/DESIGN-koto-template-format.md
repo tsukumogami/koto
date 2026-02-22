@@ -18,8 +18,7 @@ rationale: |
   and format debates (each format does what it's designed for). The "programming
   language" model is familiar to every developer. YAML frontmatter is the industry
   standard for structured metadata in markdown. JSON as the compiled target uses Go's
-  stdlib, keeping the engine dependency-free. The compilation step is invisible in
-  practice -- koto init compiles in memory.
+  stdlib, keeping the engine dependency-free.
 ---
 
 # DESIGN: koto Template Format Specification
@@ -63,18 +62,21 @@ There is no decompiler. If you want to edit a template, you edit the source. The
 **In scope:**
 - Source format specification (the "programming language" for templates)
 - Compiled format specification (what the engine reads)
-- Deterministic compiler from source to compiled format
+- Compilation rules (how source deterministically produces compiled output)
 - Evidence gate declaration syntax
 - Variable declaration syntax
-- Template search path and resolution
-- Validation contract (parse-time, compile-time, explicit)
-- LLM-assisted validation architecture (where it fits, what it can/cannot do)
+- Validation contract (what constitutes valid source and valid compiled output)
 
 **Out of scope:**
+- CLI commands and user-facing tooling (how compilation is invoked, template subcommands)
+- Template search path and resolution (how koto finds templates at runtime)
+- LLM-assisted validation architecture (how/whether LLMs help with authoring)
 - Evidence gate evaluation logic (how the engine checks gates at transition time)
 - LLM integration implementation details (model selection, prompting strategy)
 - Template registry or community distribution
 - Built-in template content (that's the quick-task template design, #13)
+
+The CLI/tooling layer (compile commands, search paths, linter) needs its own design that builds on this format specification.
 
 ## Decision Drivers
 
@@ -119,8 +121,8 @@ The template source (`.md` files) is the primary artifact -- stored, versioned, 
 
 - **Source format** (Markdown): What humans write and store. YAML frontmatter for structure, markdown body for directives. Renders on GitHub. This is the "programming language" for koto state machines.
 - **Compiled format** (JSON): What the engine reads at runtime. Deterministic, schema-validatable, zero-ambiguity. Derived from source, not authored directly.
-- **Compiler**: `koto template compile template.md` produces JSON. Same input always produces same output. No LLMs involved. `koto init` compiles in memory -- no persistent JSON file needed.
-- **Linter**: `koto template lint template.md` validates source and suggests fixes. Optionally uses LLMs for ambiguity resolution.
+- **Compiler**: Deterministic function from source to JSON. Same input always produces same output. No LLMs involved.
+- **Linter** (future): Validates source and suggests fixes. May optionally use LLMs for ambiguity resolution. Never in the compile path.
 
 There is no decompiler. The source format is the artifact of record. To edit a template, edit the source.
 
@@ -147,7 +149,7 @@ The compiler produces JSON. The engine reads JSON using Go's `encoding/json` (st
 - Already used by koto for state files (consistent ecosystem)
 - Well-supported by every language and tool
 
-The compiled format is ephemeral -- `koto init` compiles source in memory and never writes a JSON file to disk unless explicitly requested via `koto template compile`. This is the same as running `go run` vs `go build`: the compiled artifact exists in memory unless you ask for it.
+The compiled format is ephemeral -- like a compiled binary, it's derived from source and doesn't need to be persisted. How and when compilation happens (at init, on demand, cached) is a CLI/tooling concern.
 
 #### Alternatives Considered
 
@@ -266,47 +268,18 @@ Gates on a state are exit conditions: all must pass (AND logic) before leaving t
 
 **Inline gate syntax in markdown**: Declare gates in the body using special syntax. Rejected because it mixes machine configuration with content -- exactly the problem the dual-format approach solves.
 
-### Decision 5: Template Search Path
+### Design Boundary: CLI and Tooling
 
-How does koto find templates?
+The following topics are intentionally deferred to a separate CLI/tooling design:
 
-#### Chosen: Three-tier search with explicit override
+- **Template search path**: How koto finds templates at runtime (project-local, user-global, explicit path)
+- **CLI commands**: `koto template compile/validate/lint/new` and their flags
+- **LLM-assisted validation**: Whether and how LLMs help authors write valid source
+- **Compile flow**: Whether compilation is explicit, implicit (at init time), or both
 
-Template resolution:
+This design specifies what valid source and compiled output look like. How users produce, find, and validate templates is a CLI concern.
 
-1. **Explicit path**: If `--template` is a file path (contains `/` or `.`), use it directly. Accepts `.md` source files and `.koto.json` pre-compiled files.
-2. **Project-local**: `.koto/templates/<name>.md` (relative to git root or CWD).
-3. **User-global**: `~/.config/koto/templates/<name>.md` (respects `$XDG_CONFIG_HOME`).
-
-Source files are the expected format. `koto init` compiles them in memory. First match wins.
-
-### Decision 6: LLM-Assisted Validation
-
-Where do LLMs fit in the template workflow?
-
-#### Chosen: Optional linter, outside the parse path
-
-LLMs are confined to the `koto template lint` command. They are never invoked during `koto init`, `koto next`, `koto transition`, or any engine operation.
-
-The linter workflow:
-
-1. **Deterministic checks first**: Parse YAML frontmatter, validate against schema, check state references, verify heading matches. These are fast, free, and deterministic.
-2. **LLM checks second (optional)**: If deterministic checks pass, optionally invoke an LLM to review:
-   - Directive quality (are instructions clear enough for an agent?)
-   - Gate completeness (should this state have gates?)
-   - Variable usage (are all declared variables used in directives?)
-3. **LLM fixes (optional)**: If deterministic checks fail, optionally invoke an LLM to suggest fixes:
-   - "State 'assess' has no matching ## heading in body. Did you mean ## Assess?"
-   - "Variable TASK is declared but never referenced in any directive."
-4. **All fixes are suggestions**: The linter outputs suggestions. The human applies them. The compiler only processes the result after the human is done editing.
-
-The LLM is a tool for humans, not a component of the system. koto works without it.
-
-#### Alternatives Considered
-
-**LLM in the compilation path**: Use LLMs to handle ambiguous markdown-to-JSON conversion. Rejected because it makes compilation non-deterministic. Same input could produce different output depending on model, temperature, or prompt changes.
-
-**No LLM support**: Ignore LLMs entirely. The deterministic tooling is sufficient. The LLM linter is optional and can be added later without changing the architecture. This is a reasonable simplification for Phase 1.
+**One architectural constraint carries forward:** LLMs must never be in the compilation path. Compilation is deterministic. LLMs, if used, belong in optional validation/linting tooling.
 
 ## Decision Outcome
 
@@ -316,20 +289,18 @@ koto templates use a source-and-compiled architecture. Template source files (`.
 
 The source format uses YAML frontmatter for state machine structure and markdown body for directive content. It's the "programming language" for koto workflows -- designed for humans to read, write, and version.
 
-The compiled JSON format uses Go's standard library (`encoding/json`) with zero external dependencies. It's ephemeral -- produced in memory by `koto init` and never persisted unless explicitly requested.
-
-An optional LLM-assisted linter helps humans write valid source, like a linter for a programming language. It sits outside the compile path. koto works without it.
+The compiled JSON format uses Go's standard library (`encoding/json`) with zero external dependencies. How compilation is invoked at runtime is a separate CLI/tooling design.
 
 ### Rationale
 
 The source/compiled separation eliminates the heading collision problem (JSON has no headings), removes format debates (each format does what it's designed for), and lets the engine parse with zero ambiguity. The compilation step is deterministic -- same source always produces the same compiled output.
 
-This maps to a well-understood model: source code and compilation. The cost is a compilation step, but it's invisible in practice because `koto init` compiles in memory. Template authors only ever interact with the source format, just as programmers only interact with source code.
+This maps to a well-understood model: source code and compilation. Template authors interact with the source format, just as programmers interact with source code. How compilation is invoked at runtime is a CLI/tooling concern built on top of this format specification.
 
 ### Trade-offs Accepted
 
-- **Compilation step**: Source must be compiled before the engine can use it. Mitigated: `koto init` compiles in memory transparently. Authors never see JSON unless they ask for it.
-- **go-yaml dependency in compiler**: The compiler (not the engine) depends on go-yaml for parsing YAML frontmatter. The engine remains dependency-free. Acceptable because the dependency is confined to tooling.
+- **Compilation step**: Source must be compiled before the engine can use it. How compilation is invoked (explicit command, implicit at init, etc.) is a CLI design concern.
+- **go-yaml dependency in compiler**: The compiler (not the engine) depends on go-yaml for parsing YAML frontmatter. The engine remains dependency-free. Acceptable because the dependency is confined to the compiler package.
 - **JSON directives are unreadable**: The compiled format embeds markdown as JSON strings with escape sequences. Acceptable because humans don't read the compiled format -- they read the source.
 - **No LLM gates**: Only deterministic gate types (field checks, commands) in Phase 1. LLM-based evaluation (prompt gates) deferred to a separate design.
 
@@ -581,63 +552,17 @@ Single-pass `{{KEY}}` replacement. Unresolved placeholders remain as-is.
 
 Command gate strings are NOT interpolated. This is a security boundary -- verified by explicit tests.
 
-### Template Search Path
-
-When `--template` doesn't contain `/` or `.`:
-
-1. `.koto/templates/<name>.md` (project-local)
-2. `~/.config/koto/templates/<name>.md` (user-global, respects `$XDG_CONFIG_HOME`)
-
-Source files (`.md`) are the expected format in the search path. `koto init` compiles them in memory. First match wins. Pre-compiled `.koto.json` files are also accepted at explicit paths for specialized use cases (CI caching, programmatic generation).
-
-### Tooling Commands
-
-```
-koto template compile <input.md> [-o output.koto.json]   # explicit compilation (optional)
-koto template validate <file.md>                          # structural + semantic checks
-koto template lint <file.md>                              # validate + optional LLM suggestions
-koto template new <name>                                  # scaffold a new template
-```
-
-`koto init --template <file>` compiles source in memory. No persistent JSON file is created. `koto template compile` exists for debugging and CI caching, not as a required step in the normal workflow.
-
-### LLM Linter Architecture
-
-The linter is optional and separate from compilation -- like a code linter for a programming language:
-
-```
-Author writes template.md (source)
-        |
-        v
-[Deterministic validation]  ← schema checks, state references, type validation
-        |
-    pass / fail
-       / \
-      /   \
-     v     v
-  [OK]  [LLM suggests fixes]  ← "Did you mean ## assess instead of ## Assess?"
-           |
-           v
-   Author reviews + applies fixes
-           |
-           v
-   [Re-validate]
-           |
-           v
-   [Compile to JSON]  ← deterministic, no LLM
-```
-
-The LLM never touches the compilation path. It's a development-time assistant that helps authors write valid source. koto works without it.
+*Template search path, CLI commands, and LLM-assisted validation are deferred to a separate CLI/tooling design.*
 
 ## Implementation Approach
 
-### Phase 1: Compiled Format and Engine Integration
+### Phase 1: Compiled Format
 
 Define the JSON schema and implement parsing in `pkg/template/`:
 - `CompiledTemplate` struct with JSON tags
 - `ParseJSON([]byte) (*Template, error)` -- validates compiled JSON
-- Build `engine.Machine` from parsed compiled template
-- JSON Schema file for validation and debugging
+- Build `engine.Machine` from parsed compiled template (including gates on `MachineState`)
+- JSON Schema file for validation
 - Unit tests for every validation rule
 
 No external dependencies. Uses `encoding/json` from stdlib.
@@ -648,40 +573,22 @@ Implement the compiler as a separate package (`pkg/template/compile/`):
 - Parse YAML frontmatter (go-yaml v3 dependency here, not in engine)
 - Extract directive content from markdown body using declared state list
 - Produce `CompiledTemplate` struct
-- `koto template compile` CLI command (for debugging and CI)
-- Unit tests for compilation edge cases (heading collision, missing sections)
+- Compiler warnings for heading collision (state name matches subheading in another state)
+- Unit tests for compilation edge cases (heading collision, missing sections, empty commands)
 
-### Phase 3: Template Search Path
-
-Add search path resolution to the CLI:
-- `resolveTemplatePath` in `cmd/koto/`
-- Git root detection for project-local search
-- XDG config directory for user-global search
-- Source files (`.md`) are the expected format
-
-### Phase 4: Evidence Gates
+### Phase 3: Evidence Gates
 
 Extend the engine for evidence:
 - `Evidence map[string]string` in `engine.State`
 - `Transition(target string, opts ...TransitionOption) error`
 - Gate evaluation between validation and commit
 - `gate_failed` error code
-- Command gate execution (`sh -c`, project root CWD, no interpolation)
+- Command gate execution (`sh -c`, project root CWD, no interpolation, timeout)
+- Namespace collision rejection (evidence key shadows declared variable)
 
-### Phase 5: Backward Compatibility
+### Phase 4: CLI and Tooling (separate design)
 
-Support the legacy format during transition:
-- Detect `---` frontmatter with flat `key: value` syntax (legacy)
-- Compile to `CompiledTemplate` in memory
-- Emit deprecation warning
-- Remove after one release cycle (user base is currently zero)
-
-### Phase 6: Validation and Linter
-
-Implement `koto template validate` and `koto template lint`:
-- Structural validation (parse-time checks against source)
-- Semantic validation (reachability, cross-references)
-- Optional LLM integration for lint suggestions
+How compilation is invoked, template search paths, validation commands, and LLM-assisted linting. Builds on this format specification but is a distinct design.
 
 ## Security Considerations
 
@@ -695,7 +602,7 @@ Not applicable. Templates are local files. No downloads at runtime.
 
 **Command gate timeout**: Default 30-second timeout prevents indefinite blocking. Configurable per gate. A timed-out command fails the gate (transition is rejected).
 
-Mitigation: command gates execute only during transitions, not during parse or validate. `koto template validate` does NOT execute commands. Review templates before use (same trust model as Makefiles).
+Mitigation: command gates execute only during transitions, not during parse or validation. Validation tools should NOT execute commands. Review templates before use (same trust model as Makefiles).
 
 ### Supply Chain Risks
 
@@ -728,20 +635,19 @@ Mitigation: command gates execute only during transitions, not during parse or v
 
 - Heading collision eliminated: the compiled format has no headings. The engine never sees markdown ambiguity.
 - Format debates resolved: the source format is designed for humans, the compiled format for the engine. Each does what it's designed for.
-- Zero engine dependencies: `encoding/json` is stdlib. go-yaml is confined to the compiler.
+- Zero engine dependencies: `encoding/json` is stdlib. go-yaml is confined to the compiler package.
 - Source format renders on GitHub: YAML frontmatter + markdown body is a standard GitHub renders well.
-- LLM assistance without LLM dependency: the linter is optional. koto works without it. LLMs help authors, not the system.
-- Clean extension point: new gate types, new fields, and schema evolution all work through schema versioning.
+- Clean extension point: new gate types, new fields, and format evolution all work through version bumps.
 - Clear mental model: source code and compilation is a pattern every developer already knows.
 
 ### Negative
 
-- Compilation step: source must be compiled before the engine can use it. Invisible in practice (`koto init` compiles in memory), but adds internal complexity.
-- JSON directives are unreadable: the compiled format embeds markdown as JSON strings with escape sequences. This complicates debugging, though `koto template compile` can produce formatted JSON for inspection.
-- go-yaml dependency in compiler: adds a dependency to the tooling layer. Acceptable for a well-maintained, widely-used library.
+- Compilation step: source must be compiled before the engine can use it. Adds internal complexity.
+- JSON directives are unreadable: the compiled format embeds markdown as JSON strings with escape sequences.
+- go-yaml dependency in compiler: adds a dependency to the compiler package.
 
 ### Mitigations
 
-- `koto init` compiles transparently -- authors never see JSON in normal use
-- `koto template compile -o` produces formatted JSON for debugging when needed
 - The compiler is a small, focused component (~200 lines) that's easy to understand and maintain
+- The compiled format is an internal representation, not a user-facing artifact
+- go-yaml is well-maintained and widely used; the dependency is confined to one package
