@@ -75,7 +75,7 @@ jobs:
       - run: go mod download
 
       - name: Run lint tests
-        run: go test -v -run 'Test(GolangCILint|GoFmt|GoModTidy|GoVet|Govulncheck)' .
+        run: go test -v -run 'Test(GolangCILint|GoFmt|GoModTidy|GoVet|Govulncheck)' ./cmd/koto/
 
   validate:
     name: validate
