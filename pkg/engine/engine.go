@@ -94,7 +94,8 @@ func Load(statePath string, machine *Machine) (*Engine, error) {
 }
 
 // Transition advances to the target state. It validates the transition
-// is allowed, updates state, and persists atomically.
+// is allowed, updates state, and persists atomically. If persistence
+// fails, the in-memory state is restored to its pre-transition value.
 func (e *Engine) Transition(target string) error {
 	current := e.state.CurrentState
 	ms, ok := e.machine.States[current]
@@ -125,6 +126,8 @@ func (e *Engine) Transition(target string) error {
 		}
 	}
 
+	prev := deepCopyState(e.state)
+
 	e.state.CurrentState = target
 	e.state.Version++
 	e.state.History = append(e.state.History, HistoryEntry{
@@ -134,7 +137,11 @@ func (e *Engine) Transition(target string) error {
 		Type:      "transition",
 	})
 
-	return e.persist()
+	if err := e.persist(); err != nil {
+		e.state = prev
+		return err
+	}
+	return nil
 }
 
 // Rewind resets to a prior state. The target must have been visited
@@ -181,6 +188,8 @@ func (e *Engine) Rewind(target string) error {
 		}
 	}
 
+	prev := deepCopyState(e.state)
+
 	from := e.state.CurrentState
 	e.state.CurrentState = target
 	e.state.Version++
@@ -191,7 +200,11 @@ func (e *Engine) Rewind(target string) error {
 		Type:      "rewind",
 	})
 
-	return e.persist()
+	if err := e.persist(); err != nil {
+		e.state = prev
+		return err
+	}
+	return nil
 }
 
 // Cancel deletes the state file, abandoning the workflow.
@@ -348,6 +361,27 @@ func atomicWrite(path string, data []byte) error {
 
 	success = true
 	return nil
+}
+
+// deepCopyState returns a deep copy of a State value, duplicating the
+// History slice and Variables map so the copy shares no references with
+// the original.
+func deepCopyState(s State) State {
+	cp := s
+
+	if s.Variables != nil {
+		cp.Variables = make(map[string]string, len(s.Variables))
+		for k, v := range s.Variables {
+			cp.Variables[k] = v
+		}
+	}
+
+	if s.History != nil {
+		cp.History = make([]HistoryEntry, len(s.History))
+		copy(cp.History, s.History)
+	}
+
+	return cp
 }
 
 func contains(ss []string, s string) bool {

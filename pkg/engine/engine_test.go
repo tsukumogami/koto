@@ -1250,6 +1250,144 @@ func TestErrorCodes_TriggeredByCorrectConditions(t *testing.T) {
 	}
 }
 
+func TestTransition_StateRestoredOnPersistFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+	machine := testMachine()
+
+	eng, err := Init(path, machine, InitMeta{
+		Name:      "test",
+		Variables: map[string]string{"KEY": "value"},
+	})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Capture the state before the failed transition.
+	origState := eng.CurrentState()
+	origVersion := eng.Snapshot().Version
+	origHistLen := len(eng.History())
+
+	// Tamper with on-disk version to force a version_conflict on next persist.
+	data, err := os.ReadFile(path) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("ReadFile() error: %v", err)
+	}
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+	state.Version = 99
+	modified, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+	if err := os.WriteFile(path, modified, 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	// Attempt transition -- should fail with version_conflict.
+	err = eng.Transition("middle")
+	if err == nil {
+		t.Fatal("Transition() expected version_conflict error")
+	}
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T: %v", err, err)
+	}
+	if te.Code != ErrVersionConflict {
+		t.Errorf("error code = %q, want %q", te.Code, ErrVersionConflict)
+	}
+
+	// Verify the engine's in-memory state was restored.
+	if got := eng.CurrentState(); got != origState {
+		t.Errorf("CurrentState() = %q after failed persist, want %q", got, origState)
+	}
+	snap := eng.Snapshot()
+	if snap.Version != origVersion {
+		t.Errorf("Version = %d after failed persist, want %d", snap.Version, origVersion)
+	}
+	if len(snap.History) != origHistLen {
+		t.Errorf("History length = %d after failed persist, want %d", len(snap.History), origHistLen)
+	}
+	if snap.Variables["KEY"] != "value" {
+		t.Errorf("Variables[KEY] = %q after failed persist, want %q", snap.Variables["KEY"], "value")
+	}
+}
+
+func TestRewind_StateRestoredOnPersistFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+	machine := rewindMachine()
+
+	eng, err := Init(path, machine, InitMeta{
+		Name:      "test",
+		Variables: map[string]string{"KEY": "value"},
+	})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Advance so we have a rewind target.
+	if err := eng.Transition("research"); err != nil {
+		t.Fatalf("Transition(research) error: %v", err)
+	}
+	if err := eng.Transition("implementing"); err != nil {
+		t.Fatalf("Transition(implementing) error: %v", err)
+	}
+
+	// Capture the state before the failed rewind.
+	origState := eng.CurrentState()
+	origVersion := eng.Snapshot().Version
+	origHistLen := len(eng.History())
+
+	// Tamper with on-disk version to force a version_conflict.
+	data, err := os.ReadFile(path) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("ReadFile() error: %v", err)
+	}
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+	state.Version = 99
+	modified, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+	if err := os.WriteFile(path, modified, 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	// Attempt rewind -- should fail with version_conflict.
+	err = eng.Rewind("research")
+	if err == nil {
+		t.Fatal("Rewind() expected version_conflict error")
+	}
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T: %v", err, err)
+	}
+	if te.Code != ErrVersionConflict {
+		t.Errorf("error code = %q, want %q", te.Code, ErrVersionConflict)
+	}
+
+	// Verify the engine's in-memory state was restored.
+	if got := eng.CurrentState(); got != origState {
+		t.Errorf("CurrentState() = %q after failed persist, want %q", got, origState)
+	}
+	snap := eng.Snapshot()
+	if snap.Version != origVersion {
+		t.Errorf("Version = %d after failed persist, want %d", snap.Version, origVersion)
+	}
+	if len(snap.History) != origHistLen {
+		t.Errorf("History length = %d after failed persist, want %d", len(snap.History), origHistLen)
+	}
+	if snap.Variables["KEY"] != "value" {
+		t.Errorf("Variables[KEY] = %q after failed persist, want %q", snap.Variables["KEY"], "value")
+	}
+}
+
 // keysOf returns the keys of a map for diagnostic output.
 func keysOf(m map[string]interface{}) []string {
 	keys := make([]string, 0, len(m))
