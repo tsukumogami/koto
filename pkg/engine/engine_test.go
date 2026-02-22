@@ -1397,6 +1397,35 @@ func keysOf(m map[string]interface{}) []string {
 	return keys
 }
 
+func TestHistory_DeepCopiesEvidence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, testMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Transition with evidence.
+	if err := eng.Transition("middle", WithEvidence(map[string]string{"key": "original"})); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	// Get history and mutate the returned entry's Evidence map.
+	hist := eng.History()
+	if len(hist) != 1 {
+		t.Fatalf("History length = %d, want 1", len(hist))
+	}
+	hist[0].Evidence["key"] = "tampered"
+
+	// Get history again -- internal state should be unchanged.
+	hist2 := eng.History()
+	if hist2[0].Evidence["key"] != "original" {
+		t.Errorf("History()[0].Evidence[key] = %q, want %q (Evidence map was not deep copied)",
+			hist2[0].Evidence["key"], "original")
+	}
+}
+
 // --- Evidence support tests (issue #15) ---
 
 func TestTransition_WithEvidence_MergesIntoState(t *testing.T) {

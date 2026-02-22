@@ -292,10 +292,21 @@ func (e *Engine) Evidence() map[string]string {
 	return out
 }
 
-// History returns the transition history.
+// History returns the transition history. Each entry is a deep copy;
+// mutating the returned slice or its Evidence maps will not affect the
+// engine's internal state.
 func (e *Engine) History() []HistoryEntry {
 	out := make([]HistoryEntry, len(e.state.History))
 	copy(out, e.state.History)
+	for i, entry := range out {
+		if entry.Evidence != nil {
+			m := make(map[string]string, len(entry.Evidence))
+			for k, v := range entry.Evidence {
+				m[k] = v
+			}
+			out[i].Evidence = m
+		}
+	}
 	return out
 }
 
@@ -480,6 +491,15 @@ func deepCopyState(s State) State {
 	if s.History != nil {
 		cp.History = make([]HistoryEntry, len(s.History))
 		copy(cp.History, s.History)
+		for i, entry := range cp.History {
+			if entry.Evidence != nil {
+				m := make(map[string]string, len(entry.Evidence))
+				for k, v := range entry.Evidence {
+					m[k] = v
+				}
+				cp.History[i].Evidence = m
+			}
+		}
 	}
 
 	return cp
