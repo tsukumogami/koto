@@ -501,3 +501,387 @@ func TestTransition_PersistsToFile(t *testing.T) {
 		t.Errorf("loaded Version = %d, want 2", snap.Version)
 	}
 }
+
+// rewindMachine returns a machine with multiple non-terminal states for
+// testing rewind scenarios:
+// start -> research -> implementing -> review -> done (terminal)
+//
+//	\-> escalated (terminal)
+func rewindMachine() *Machine {
+	return &Machine{
+		Name:         "rewind-machine",
+		InitialState: "start",
+		States: map[string]*MachineState{
+			"start": {
+				Transitions: []string{"research"},
+			},
+			"research": {
+				Transitions: []string{"implementing"},
+			},
+			"implementing": {
+				Transitions: []string{"review"},
+			},
+			"review": {
+				Transitions: []string{"done", "escalated"},
+			},
+			"done": {
+				Terminal: true,
+			},
+			"escalated": {
+				Terminal: true,
+			},
+		},
+	}
+}
+
+func TestRewind_ToPreviouslyVisitedState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, rewindMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Advance through several states
+	for _, target := range []string{"research", "implementing", "review"} {
+		if err := eng.Transition(target); err != nil {
+			t.Fatalf("Transition(%q) error: %v", target, err)
+		}
+	}
+
+	// Rewind to a previously visited non-terminal state
+	if err := eng.Rewind("research"); err != nil {
+		t.Fatalf("Rewind(research) error: %v", err)
+	}
+
+	if got := eng.CurrentState(); got != "research" {
+		t.Errorf("CurrentState() = %q, want %q", got, "research")
+	}
+
+	snap := eng.Snapshot()
+	// Init version=1, 3 transitions +1 each = version 4, +1 for rewind = version 5
+	if snap.Version != 5 {
+		t.Errorf("Version = %d, want 5", snap.Version)
+	}
+
+	// History should have 4 entries: 3 transitions + 1 rewind
+	if len(snap.History) != 4 {
+		t.Fatalf("History length = %d, want 4", len(snap.History))
+	}
+
+	last := snap.History[3]
+	if last.From != "review" {
+		t.Errorf("rewind entry From = %q, want %q", last.From, "review")
+	}
+	if last.To != "research" {
+		t.Errorf("rewind entry To = %q, want %q", last.To, "research")
+	}
+	if last.Type != "rewind" {
+		t.Errorf("rewind entry Type = %q, want %q", last.Type, "rewind")
+	}
+}
+
+func TestRewind_ToInitialState_NoHistory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, rewindMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Advance past the initial state
+	if err := eng.Transition("research"); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	// Rewind to initial state -- valid even though "start" never appears as
+	// a "to" field in history (the engine was initialized there, never
+	// transitioned TO it).
+	if err := eng.Rewind("start"); err != nil {
+		t.Fatalf("Rewind(start) error: %v", err)
+	}
+
+	if got := eng.CurrentState(); got != "start" {
+		t.Errorf("CurrentState() = %q, want %q", got, "start")
+	}
+}
+
+func TestRewind_FromTerminalState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, rewindMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Advance to a terminal state
+	for _, target := range []string{"research", "implementing", "review", "escalated"} {
+		if err := eng.Transition(target); err != nil {
+			t.Fatalf("Transition(%q) error: %v", target, err)
+		}
+	}
+
+	if got := eng.CurrentState(); got != "escalated" {
+		t.Fatalf("CurrentState() = %q, want %q (should be terminal)", got, "escalated")
+	}
+
+	// Rewind from terminal to a previously visited non-terminal state
+	if err := eng.Rewind("implementing"); err != nil {
+		t.Fatalf("Rewind(implementing) error: %v", err)
+	}
+
+	if got := eng.CurrentState(); got != "implementing" {
+		t.Errorf("CurrentState() = %q, want %q", got, "implementing")
+	}
+}
+
+func TestRewind_ToNeverVisitedState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, rewindMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Only advance to "research"
+	if err := eng.Transition("research"); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	// Try to rewind to "implementing" which was never visited
+	err = eng.Rewind("implementing")
+	if err == nil {
+		t.Fatal("Rewind() expected error for never-visited state")
+	}
+
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T", err)
+	}
+	if te.Code != "rewind_failed" {
+		t.Errorf("error code = %q, want %q", te.Code, "rewind_failed")
+	}
+}
+
+func TestRewind_ToTerminalState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, rewindMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Advance to terminal and rewind back
+	for _, target := range []string{"research", "implementing", "review", "done"} {
+		if err := eng.Transition(target); err != nil {
+			t.Fatalf("Transition(%q) error: %v", target, err)
+		}
+	}
+
+	// Rewind to review (valid)
+	if err := eng.Rewind("review"); err != nil {
+		t.Fatalf("Rewind(review) error: %v", err)
+	}
+
+	// Try to rewind TO a terminal state
+	err = eng.Rewind("done")
+	if err == nil {
+		t.Fatal("Rewind() expected error for terminal target")
+	}
+
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T", err)
+	}
+	if te.Code != "rewind_failed" {
+		t.Errorf("error code = %q, want %q", te.Code, "rewind_failed")
+	}
+}
+
+func TestRewind_ToUnknownState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, rewindMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	err = eng.Rewind("nonexistent")
+	if err == nil {
+		t.Fatal("Rewind() expected error for unknown state")
+	}
+
+	te, ok := err.(*TransitionError)
+	if !ok {
+		t.Fatalf("expected *TransitionError, got %T", err)
+	}
+	if te.Code != "rewind_failed" {
+		t.Errorf("error code = %q, want %q", te.Code, "rewind_failed")
+	}
+}
+
+func TestRewind_PersistsToFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+	machine := rewindMachine()
+
+	eng, err := Init(path, machine, InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	if err := eng.Transition("research"); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+	if err := eng.Rewind("start"); err != nil {
+		t.Fatalf("Rewind() error: %v", err)
+	}
+
+	// Reload and verify persistence
+	loaded, err := Load(path, machine)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if got := loaded.CurrentState(); got != "start" {
+		t.Errorf("loaded CurrentState() = %q, want %q", got, "start")
+	}
+
+	snap := loaded.Snapshot()
+	if snap.Version != 3 {
+		t.Errorf("loaded Version = %d, want 3", snap.Version)
+	}
+	if len(snap.History) != 2 {
+		t.Fatalf("loaded History length = %d, want 2", len(snap.History))
+	}
+	if snap.History[1].Type != "rewind" {
+		t.Errorf("loaded History[1].Type = %q, want %q", snap.History[1].Type, "rewind")
+	}
+}
+
+func TestCancel_RemovesStateFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, testMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	if err := eng.Cancel(); err != nil {
+		t.Fatalf("Cancel() error: %v", err)
+	}
+
+	// Verify file no longer exists
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("state file still exists after Cancel(): err = %v", err)
+	}
+}
+
+func TestCancel_ReturnsErrorOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	// Use a path to a file that doesn't exist
+	path := filepath.Join(dir, "nonexistent.state.json")
+
+	eng := &Engine{
+		path: path,
+	}
+
+	err := eng.Cancel()
+	if err == nil {
+		t.Fatal("Cancel() expected error for nonexistent file")
+	}
+}
+
+func TestSnapshot_ReturnsCopy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, testMachine(), InitMeta{
+		Name:      "test",
+		Variables: map[string]string{"KEY": "original"},
+	})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	if err := eng.Transition("middle"); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	snap := eng.Snapshot()
+
+	// Mutate the returned snapshot's variables
+	snap.Variables["KEY"] = "tampered"
+	if got := eng.Variables()["KEY"]; got != "original" {
+		t.Errorf("Variables()[KEY] = %q, want %q (snapshot mutation affected engine)", got, "original")
+	}
+
+	// Mutate the returned snapshot's history
+	snap.History[0].From = "tampered"
+	if got := eng.History()[0].From; got != "start" {
+		t.Errorf("History()[0].From = %q, want %q (snapshot mutation affected engine)", got, "start")
+	}
+
+	// Mutate the returned snapshot's current state
+	snap.CurrentState = "tampered"
+	if got := eng.CurrentState(); got != "middle" {
+		t.Errorf("CurrentState() = %q, want %q (snapshot mutation affected engine)", got, "middle")
+	}
+}
+
+func TestRewind_HistoryPreserved(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "koto-test.state.json")
+
+	eng, err := Init(path, rewindMachine(), InitMeta{Name: "test"})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Advance: start -> research -> implementing
+	if err := eng.Transition("research"); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+	if err := eng.Transition("implementing"); err != nil {
+		t.Fatalf("Transition() error: %v", err)
+	}
+
+	// Rewind to research
+	if err := eng.Rewind("research"); err != nil {
+		t.Fatalf("Rewind() error: %v", err)
+	}
+
+	// The full history should be preserved (not truncated)
+	hist := eng.History()
+	if len(hist) != 3 {
+		t.Fatalf("History length = %d, want 3", len(hist))
+	}
+
+	// Verify all entries are intact
+	expected := []struct {
+		from, to, typ string
+	}{
+		{"start", "research", "transition"},
+		{"research", "implementing", "transition"},
+		{"implementing", "research", "rewind"},
+	}
+
+	for i, want := range expected {
+		if hist[i].From != want.from {
+			t.Errorf("History[%d].From = %q, want %q", i, hist[i].From, want.from)
+		}
+		if hist[i].To != want.to {
+			t.Errorf("History[%d].To = %q, want %q", i, hist[i].To, want.to)
+		}
+		if hist[i].Type != want.typ {
+			t.Errorf("History[%d].Type = %q, want %q", i, hist[i].Type, want.typ)
+		}
+	}
+}

@@ -137,6 +137,69 @@ func (e *Engine) Transition(target string) error {
 	return e.persist()
 }
 
+// Rewind resets to a prior state. The target must have been visited
+// (appear in history as a "to" field) or be the machine's initial state.
+// Rewinding to a terminal state is not allowed. Rewinding from a terminal
+// state is allowed (this is the recovery path).
+func (e *Engine) Rewind(target string) error {
+	ms, ok := e.machine.States[target]
+	if !ok {
+		return &TransitionError{
+			Code:         "rewind_failed",
+			Message:      fmt.Sprintf("cannot rewind to %q: state not found in machine definition", target),
+			CurrentState: e.state.CurrentState,
+			TargetState:  target,
+		}
+	}
+
+	if ms.Terminal {
+		return &TransitionError{
+			Code:         "rewind_failed",
+			Message:      fmt.Sprintf("cannot rewind to %q: target is a terminal state", target),
+			CurrentState: e.state.CurrentState,
+			TargetState:  target,
+		}
+	}
+
+	// The initial state is always a valid rewind target.
+	if target != e.machine.InitialState {
+		// Check that the target appears in history as a "to" field.
+		found := false
+		for _, entry := range e.state.History {
+			if entry.To == target {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return &TransitionError{
+				Code:         "rewind_failed",
+				Message:      fmt.Sprintf("cannot rewind to %q: state has never been visited", target),
+				CurrentState: e.state.CurrentState,
+				TargetState:  target,
+			}
+		}
+	}
+
+	from := e.state.CurrentState
+	e.state.CurrentState = target
+	e.state.Version++
+	e.state.History = append(e.state.History, HistoryEntry{
+		From:      from,
+		To:        target,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Type:      "rewind",
+	})
+
+	return e.persist()
+}
+
+// Cancel deletes the state file, abandoning the workflow.
+// Returns an error if the state file cannot be removed.
+func (e *Engine) Cancel() error {
+	return os.Remove(e.path)
+}
+
 // CurrentState returns the name of the current state.
 func (e *Engine) CurrentState() string {
 	return e.state.CurrentState
