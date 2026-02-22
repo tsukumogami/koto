@@ -24,8 +24,8 @@ Total scenarios: 20
 - [x] scenario-16
 - [x] scenario-17
 - [x] scenario-18
-- [ ] scenario-19
-- [ ] scenario-20
+- [x] scenario-19
+- [x] scenario-20
 
 ---
 
@@ -253,7 +253,7 @@ Total scenarios: 20
 - Call `Transition` to leave that state
 - Change the gate to `command: "exit 0"` and retry
 **Expected**: First transition fails with `gate_failed` indicating a command gate failure. Second transition succeeds. CWD is git repo root (or process CWD if not in git repo). Command stdout/stderr are not captured in the error.
-**Status**: pending
+**Status**: passed (2026-02-22)
 
 ---
 
@@ -268,6 +268,6 @@ Total scenarios: 20
 - Call `Transition` with that gate
 - Inspect the actual command that was executed
 **Expected**: Timed-out command fails the gate with a timeout indication in the error message. The `{{TASK}}` placeholder in the command string is NOT expanded -- it is passed literally to `sh -c`. This is a security boundary: command strings are never interpolated.
-**Status**: pending
+**Status**: passed (2026-02-22)
 
 ---

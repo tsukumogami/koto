@@ -1,0 +1,29 @@
+{
+  "issue": 17,
+  "reviews": [
+    {
+      "focus": "pragmatic",
+      "blocking_count": 0,
+      "advisory_count": 3,
+      "detail_file": "wip/research/implement-doc_review_pragmatic_issue17.md"
+    },
+    {
+      "focus": "architect",
+      "blocking_count": 0,
+      "advisory_count": 3,
+      "detail_file": "wip/research/implement-doc_review_architect_issue17.md"
+    },
+    {
+      "focus": "maintainer",
+      "blocking_count": 0,
+      "advisory_count": 3,
+      "detail_file": "wip/research/implement-doc_review_maintainer_issue17.md"
+    }
+  ],
+  "qa": {
+    "scenarios_tested": 2,
+    "scenarios_passed": 2,
+    "scenarios_failed": 0,
+    "detail_file": "wip/research/implement-doc_validation_issue17.md"
+  }
+}

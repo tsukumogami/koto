@@ -41,8 +41,8 @@ rationale: |
 | ~~_Adds `Evidence map[string]string` to engine state, introduces the `TransitionOption` functional pattern with `WithEvidence()`, bumps `schema_version` to 2 with backward-compatible load, and updates the controller to merge evidence into the interpolation context. Evidence persists across rewind._~~ | | |
 | ~~[#16: feat(engine): implement field-based gate evaluation](https://github.com/tsukumogami/koto/issues/16)~~ | ~~[#13](https://github.com/tsukumogami/koto/issues/13), [#15](https://github.com/tsukumogami/koto/issues/15)~~ | ~~testable~~ |
 | ~~_Inserts gate evaluation between validation and commit in `Transition()`. Implements `field_not_empty` and `field_equals` gate types with AND logic, adds `gate_failed` error code, and rejects evidence keys that shadow declared variables. Establishes the evaluation framework that command gates extend._~~ | | |
-| [#17: feat(engine): implement command gate execution](https://github.com/tsukumogami/koto/issues/17) | [#16](https://github.com/tsukumogami/koto/issues/16) | critical |
-| _Adds the `command` gate type: `sh -c` execution from project root with configurable timeout (default 30s). No variable interpolation in command strings -- this security boundary is verified by explicit tests. Timed-out commands fail the gate._ | | |
+| ~~[#17: feat(engine): implement command gate execution](https://github.com/tsukumogami/koto/issues/17)~~ | ~~[#16](https://github.com/tsukumogami/koto/issues/16)~~ | ~~critical~~ |
+| ~~_Adds the `command` gate type: `sh -c` execution from project root with configurable timeout (default 30s). No variable interpolation in command strings -- this security boundary is verified by explicit tests. Timed-out commands fail the gate._~~ | | |
 | [#18: docs: design CLI and tooling for template compilation](https://github.com/tsukumogami/koto/issues/18) | [#13](https://github.com/tsukumogami/koto/issues/13) | simple |
 | _Designs the CLI commands, template search paths, compile flow, and optional LLM-assisted validation that build on this format specification. This is Phase 4 of the implementation approach -- deferred to its own design because CLI/tooling concerns are separate from format specification._ | | |
 
@@ -80,8 +80,7 @@ graph TD
     classDef needsDesign fill:#e1bee7
     classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
 
-    class I13,I14,I15,I16 done
-    class I17 ready
+    class I13,I14,I15,I16,I17 done
     class I18 needsDesign
 ```
 
