@@ -14,11 +14,11 @@ Total scenarios: 20
 - [x] scenario-6
 - [x] scenario-7
 - [x] scenario-8
-- [ ] scenario-9
-- [ ] scenario-10
-- [ ] scenario-11
-- [ ] scenario-12
-- [ ] scenario-13
+- [x] scenario-9
+- [x] scenario-10
+- [x] scenario-11
+- [x] scenario-12
+- [x] scenario-13
 - [ ] scenario-14
 - [ ] scenario-15
 - [ ] scenario-16
@@ -131,7 +131,7 @@ Total scenarios: 20
 - Call `compile.Compile(sourceBytes)`
 - Validate the result by passing it through `template.ParseJSON`
 **Expected**: Compiler returns a valid `CompiledTemplate`. The compiled output passes all ParseJSON validation. Directives contain the markdown content from the body sections, with leading/trailing whitespace trimmed. `format_version` is 1.
-**Status**: pending
+**Status**: passed (2026-02-22)
 
 ---
 
@@ -142,7 +142,7 @@ Total scenarios: 20
 - Create a source template where a state's directive body contains `### Decision Criteria` (a subheading that is NOT a declared state)
 - Compile it
 **Expected**: The `### Decision Criteria` heading is treated as directive content, not a state boundary. The compiled output includes it within the state's directive text.
-**Status**: pending
+**Status**: passed (2026-02-22)
 
 ---
 
@@ -153,7 +153,7 @@ Total scenarios: 20
 - Create a source template where state `assess`'s directive body contains `## plan` and `plan` is also a declared state
 - Compile it
 **Expected**: Compiler emits a warning: `"state %q directive contains ## heading matching state %q; is this intentional?"`. Compilation still succeeds and the heading is treated as directive content of `assess`, not the start of `plan`.
-**Status**: pending
+**Status**: passed (2026-02-22)
 
 ---
 
@@ -164,7 +164,7 @@ Total scenarios: 20
 - Create a source template that declares a state `verify` in frontmatter but has no `## verify` heading in the markdown body
 - Compile it
 **Expected**: Compilation fails with a clear error indicating that the declared state has no matching section in the body.
-**Status**: pending
+**Status**: passed (2026-02-22)
 
 ---
 
@@ -176,7 +176,7 @@ Total scenarios: 20
 - Compare the serialized JSON bytes from both compilations
 - Compute SHA-256 hash of both outputs
 **Expected**: Both compilations produce byte-identical JSON output and identical SHA-256 hashes. JSON keys are sorted.
-**Status**: pending
+**Status**: passed (2026-02-22)
 
 ---
 
