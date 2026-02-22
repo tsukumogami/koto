@@ -19,8 +19,8 @@ Total scenarios: 20
 - [x] scenario-11
 - [x] scenario-12
 - [x] scenario-13
-- [ ] scenario-14
-- [ ] scenario-15
+- [x] scenario-14
+- [x] scenario-15
 - [ ] scenario-16
 - [ ] scenario-17
 - [ ] scenario-18
@@ -191,7 +191,7 @@ Total scenarios: 20
 - Call `Rewind("state2")`
 - Verify `Engine.Evidence()` still contains both key1 and key2
 **Expected**: Evidence merges across transitions (append/overwrite). Evidence persists unchanged after rewind. History entries record evidence supplied per transition.
-**Status**: pending
+**Status**: passed (2026-02-22)
 
 ---
 
@@ -204,7 +204,7 @@ Total scenarios: 20
 - Verify the engine initializes with an empty Evidence map
 - Init a new engine and verify it creates schema_version 2
 **Expected**: `Load` accepts v1 files and initializes empty evidence. New files are created with schema_version 2.
-**Status**: pending
+**Status**: passed (2026-02-22)
 
 ---
 
