@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 problem: |
   AI coding agents running multi-step workflows lack reliable execution control.
   They skip prescribed steps, lose progress across session boundaries, and can't
@@ -30,7 +30,71 @@ rationale: |
 
 ## Status
 
-**Accepted**
+**Planned**
+
+## Implementation Issues
+
+### Milestone: [koto State Machine Engine](https://github.com/tsukumogami/koto/milestone/1)
+
+| Issue | Dependencies | Tier |
+|-------|--------------|------|
+| [#4: feat(engine): implement walking skeleton with init, transition, and next](https://github.com/tsukumogami/koto/issues/4) | None | testable |
+| _Establishes the Go module, core types (`State`, `Machine`, `Engine`), `Init`/`Load`/`Transition` methods, atomic persistence, and a minimal CLI with `init`/`transition`/`next` subcommands. Uses a hardcoded `Machine` -- real template parsing comes later._ | | |
+| [#5: feat(engine): add rewind, cancel, and query methods](https://github.com/tsukumogami/koto/issues/5) | [#4](https://github.com/tsukumogami/koto/issues/4) | testable |
+| _Builds on the engine from #4 to add `Rewind` (with history preservation), `Cancel` (state file deletion), and copy-safe query methods. Completes the full Engine API surface._ | | |
+| [#6: feat(engine): add version conflict detection and TransitionError JSON serialization](https://github.com/tsukumogami/koto/issues/6) | [#4](https://github.com/tsukumogami/koto/issues/4) | testable |
+| _Hardens the error layer: every engine failure returns a structured `TransitionError` with a machine-parseable code. Adds version conflict detection (optimistic concurrency) and template hash mismatch checking._ | | |
+| [#7: feat(template): implement template parsing and interpolation](https://github.com/tsukumogami/koto/issues/7) | [#4](https://github.com/tsukumogami/koto/issues/4) | testable |
+| _Creates `pkg/template/` with `Parse`, `Interpolate`, and SHA-256 hash computation. Converts template files into `engine.Machine` instances, replacing the hardcoded stub from #4._ | | |
+| [#8: feat(discover): implement state file discovery](https://github.com/tsukumogami/koto/issues/8) | [#4](https://github.com/tsukumogami/koto/issues/4) | simple |
+| _Small, self-contained package that scans a directory for `koto-*.state.json` files and returns workflow metadata. Enables the `workflows` command and auto-selection when only one state file exists._ | | |
+| [#9: feat(cli): add remaining CLI subcommands](https://github.com/tsukumogami/koto/issues/9) | [#5](https://github.com/tsukumogami/koto/issues/5), [#6](https://github.com/tsukumogami/koto/issues/6), [#7](https://github.com/tsukumogami/koto/issues/7), [#8](https://github.com/tsukumogami/koto/issues/8) | testable |
+| _Integration point: wires template parsing into `init`/`next`, adds `query`/`status`/`rewind`/`cancel`/`validate`/`workflows` subcommands, and implements `--state` flag with auto-selection. Completes the full CLI surface._ | | |
+| [#10: test(engine): add integration tests for full workflow lifecycle](https://github.com/tsukumogami/koto/issues/10) | [#9](https://github.com/tsukumogami/koto/issues/9) | testable |
+| _CLI-level integration tests that exercise the complete lifecycle: init from template, advance through states, rewind, cancel, multi-workflow discovery, and all error paths (invalid transition, template mismatch, version conflict)._ | | |
+
+### Dependency Graph
+
+```mermaid
+graph TD
+    subgraph Phase1["Phase 1: Walking Skeleton"]
+        I4["#4: Walking skeleton"]
+    end
+
+    subgraph Phase2["Phase 2: Refinements"]
+        I5["#5: Rewind, cancel, query"]
+        I6["#6: Version conflict, errors"]
+        I7["#7: Template parsing"]
+        I8["#8: State file discovery"]
+    end
+
+    subgraph Phase3["Phase 3: Integration"]
+        I9["#9: Remaining CLI subcommands"]
+        I10["#10: Integration tests"]
+    end
+
+    I4 --> I5
+    I4 --> I6
+    I4 --> I7
+    I4 --> I8
+    I5 --> I9
+    I6 --> I9
+    I7 --> I9
+    I8 --> I9
+    I9 --> I10
+
+    classDef done fill:#c8e6c9
+    classDef ready fill:#bbdefb
+    classDef blocked fill:#fff9c4
+    classDef needsDesign fill:#e1bee7
+    classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
+
+    class I4 ready
+    class I5,I6,I7,I8 blocked
+    class I9,I10 blocked
+```
+
+**Legend**: Green = done, Blue = ready, Yellow = blocked, Purple = needs-design, Orange = tracks-design
 
 ## Context and Problem Statement
 
