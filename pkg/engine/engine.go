@@ -579,10 +579,12 @@ func evaluateGates(gates map[string]*GateDecl, evidence map[string]string, curre
 			}
 
 		default:
-			// Unknown gate types (e.g., "command") are not evaluated by
-			// this function. Issue #17 will add command gate execution.
-			// For now, unknown types pass silently to avoid blocking
-			// transitions on gates that this code doesn't yet handle.
+			return &TransitionError{
+				Code:         ErrGateFailed,
+				Message:      fmt.Sprintf("gate %q failed: unknown gate type %q", name, gate.Type),
+				CurrentState: current,
+				TargetState:  target,
+			}
 		}
 	}
 	return nil
