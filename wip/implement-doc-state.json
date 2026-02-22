@@ -3,12 +3,12 @@
   "design_doc": "docs/designs/DESIGN-koto-engine.md",
   "branch": "docs/koto-engine",
   "pr_number": 2,
-  "integrity_hash": "sha256:7ec53940c9389610ede65cf0295772e8f5d868b923ed5e2c954ea8cd80e55386",
+  "integrity_hash": "sha256:d7e6ceda4bdb1133245f560fe0a0d2958fd709c953dafc9321536a3cdaac5ded",
   "issues": [
     {
       "number": 4,
       "title": "feat(engine): implement walking skeleton with init, transition, and next",
-      "status": "scrutinized",
+      "status": "pushed",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
       "issue_type": "code",
@@ -33,6 +33,31 @@
         "tests_added": 17,
         "key_decisions": "Controller.New takes only *engine.Engine (template parsing deferred to #7). Stub machine uses three states (ready-\u003erunning-\u003edone). .gitignore changed from koto to /koto. lint_test.go moved to cmd/koto/.",
         "requirements_map": []
+      },
+      "reviewer_results": {
+        "issue": 4,
+        "reviewers": [
+          {
+            "focus": "pragmatic",
+            "blocking_count": 0,
+            "advisory_count": 5,
+            "detail_file": "wip/research/implement-doc_review_pragmatic_issue4.md"
+          },
+          {
+            "focus": "architect",
+            "blocking_count": 0,
+            "advisory_count": 1,
+            "detail_file": "wip/research/implement-doc_review_architect_issue4.md"
+          },
+          {
+            "focus": "maintainer",
+            "blocking_count": 2,
+            "advisory_count": 5,
+            "detail_file": "wip/research/implement-doc_review_maintainer_issue4.md",
+            "blocking_resolved": true,
+            "resolution_commit": "7750791"
+          }
+        ]
       },
       "testable_scenarios": [
         "scenario-1",

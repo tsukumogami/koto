@@ -38,8 +38,8 @@ rationale: |
 
 | Issue | Dependencies | Tier |
 |-------|--------------|------|
-| [#4: feat(engine): implement walking skeleton with init, transition, and next](https://github.com/tsukumogami/koto/issues/4) | None | testable |
-| _Establishes the Go module, core types (`State`, `Machine`, `Engine`), `Init`/`Load`/`Transition` methods, atomic persistence, and a minimal CLI with `init`/`transition`/`next` subcommands. Uses a hardcoded `Machine` -- real template parsing comes later._ | | |
+| ~~[#4: feat(engine): implement walking skeleton with init, transition, and next](https://github.com/tsukumogami/koto/issues/4)~~ | ~~None~~ | ~~testable~~ |
+| ~~_Establishes the Go module, core types (`State`, `Machine`, `Engine`), `Init`/`Load`/`Transition` methods, atomic persistence, and a minimal CLI with `init`/`transition`/`next` subcommands. Uses a hardcoded `Machine` -- real template parsing comes later._~~ | | |
 | [#5: feat(engine): add rewind, cancel, and query methods](https://github.com/tsukumogami/koto/issues/5) | [#4](https://github.com/tsukumogami/koto/issues/4) | testable |
 | _Builds on the engine from #4 to add `Rewind` (with history preservation), `Cancel` (state file deletion), and copy-safe query methods. Completes the full Engine API surface._ | | |
 | [#6: feat(engine): add version conflict detection and TransitionError JSON serialization](https://github.com/tsukumogami/koto/issues/6) | [#4](https://github.com/tsukumogami/koto/issues/4) | testable |
@@ -89,8 +89,8 @@ graph TD
     classDef needsDesign fill:#e1bee7
     classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
 
-    class I4 ready
-    class I5,I6,I7,I8 blocked
+    class I4 done
+    class I5,I6,I7,I8 ready
     class I9,I10 blocked
 ```
 
