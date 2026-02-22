@@ -3,12 +3,12 @@
   "design_doc": "docs/designs/DESIGN-koto-engine.md",
   "branch": "docs/koto-engine",
   "pr_number": 2,
-  "integrity_hash": "sha256:a163abaa6e3fdb3086a5a5053cd6046bfe8bac011a48424be91c6e92561c7ebf",
+  "integrity_hash": "sha256:7ec53940c9389610ede65cf0295772e8f5d868b923ed5e2c954ea8cd80e55386",
   "issues": [
     {
       "number": 4,
       "title": "feat(engine): implement walking skeleton with init, transition, and next",
-      "status": "implemented",
+      "status": "scrutinized",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
       "issue_type": "code",

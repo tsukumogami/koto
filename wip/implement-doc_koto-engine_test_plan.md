@@ -13,7 +13,7 @@ Total scenarios: 25
 - `go build ./...`
 - `go vet ./...`
 **Expected**: Both commands exit 0 with no output. No external dependencies beyond the Go standard library.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -24,7 +24,7 @@ Total scenarios: 25
 - `koto init --name test-workflow --template /tmp/test.md --state-dir /tmp/test-dir`
 - `cat /tmp/test-dir/koto-test-workflow.state.json`
 **Expected**: State file exists at the expected path. JSON contains `schema_version: 1`, `version: 1`, `current_state` set to the machine's initial state, empty `history` array, and a `workflow` object with `name`, `template_hash`, `template_path`, and `created_at` fields.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -34,7 +34,7 @@ Total scenarios: 25
 **Commands**:
 - `koto init --name test-workflow --template /tmp/test.md --state-dir /tmp/test-dir`
 **Expected**: stdout is valid JSON matching `{"state": "<initial-state>", "path": "<state-file-path>"}`. Exit code 0.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -45,7 +45,7 @@ Total scenarios: 25
 - `koto init --name test-workflow --template /tmp/test.md --state-dir /tmp/test-dir`
 - `koto transition <next-state> --state /tmp/test-dir/koto-test-workflow.state.json`
 **Expected**: stdout is valid JSON matching `{"state": "<next-state>", "version": 2}`. The state file on disk reflects `current_state` as the target state, `version` as 2, and history has one entry with `type: "transition"`.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -57,7 +57,7 @@ Total scenarios: 25
 - `koto transition <intermediate-states...> --state <path>` (advance to terminal)
 - `koto transition <any-state> --state <path>`
 **Expected**: Exit code 1. stdout is JSON: `{"error": {"code": "terminal_state", "message": "...", "current_state": "<terminal>"}}`.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -68,7 +68,7 @@ Total scenarios: 25
 - `koto init --name test-workflow --template /tmp/test.md --state-dir /tmp/test-dir`
 - `koto transition nonexistent-target --state <path>`
 **Expected**: Exit code 1. stdout is JSON with `error.code` equal to `"invalid_transition"` and `error.valid_transitions` listing the allowed targets from the current state.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -79,7 +79,7 @@ Total scenarios: 25
 - `koto init --name test-workflow --template /tmp/test.md --state-dir /tmp/test-dir`
 - `koto next --state <path>`
 **Expected**: stdout is valid JSON with `action: "execute"`, `state` matching the current state, and a non-empty `directive` string. Exit code 0.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -90,7 +90,7 @@ Total scenarios: 25
 - (Advance workflow to terminal state via init + transitions)
 - `koto next --state <path>`
 **Expected**: stdout is valid JSON with `action: "done"`, `state` matching the terminal state, and a `message` field. Exit code 0.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -105,7 +105,7 @@ Total scenarios: 25
 - `koto validate`
 - `koto workflows`
 **Expected**: Each command outputs JSON with `error.code` equal to `"not_implemented"`. These stubs are placeholders until later issues implement them.
-**Status**: pending
+**Status**: passed
 
 ---
 
