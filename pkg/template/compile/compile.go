@@ -218,12 +218,12 @@ func splitFrontMatter(content string) (header, body string, err error) {
 // declared state names to identify state boundaries.
 //
 // Only ## headings whose text matches a declared state name are treated as
-// state boundaries. Other headings (### Decision Criteria, ## Something Else)
-// become part of the directive content for the current state.
+// state boundaries, and only the FIRST occurrence of each state's heading
+// starts its section (first-wins). Subsequent ## headings for an already-seen
+// state are treated as directive content of the current state, with a warning.
 //
-// When a ## heading inside a state's content matches another declared state,
-// the compiler emits a warning because the heading acts as a boundary and the
-// previous state's directive may be shorter than intended.
+// Headings that don't match any declared state (### subheadings, ## non-state)
+// are always treated as directive content.
 func parseBody(body string, declaredStates map[string]bool) (map[string]string, []Warning, error) {
 	directives := make(map[string]string)
 	var warnings []Warning
@@ -233,6 +233,9 @@ func parseBody(body string, declaredStates map[string]bool) (map[string]string, 
 	if body != "" {
 		lines = strings.Split(body, "\n")
 	}
+
+	// Track which states have had their heading claimed.
+	seenStates := make(map[string]bool, len(declaredStates))
 
 	var currentState string
 	var contentLines []string
@@ -248,23 +251,29 @@ func parseBody(body string, declaredStates map[string]bool) (map[string]string, 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 
-		// Check for ## heading.
+		// Check for ## heading (but not ### or deeper).
 		if strings.HasPrefix(trimmed, "## ") && !strings.HasPrefix(trimmed, "### ") {
 			headingName := strings.TrimSpace(trimmed[3:])
 			if headingName != "" && declaredStates[headingName] {
-				// This heading matches a declared state: it's a state boundary.
-				if currentState != "" {
-					// Emit warning: we're inside a state and found a ## heading
-					// matching another declared state.
-					warnings = append(warnings, Warning{
-						Message: fmt.Sprintf(
-							"state %q directive contains ## heading matching state %q; is this intentional?",
-							currentState, headingName,
-						),
-					})
+				if seenStates[headingName] {
+					// This state was already claimed. Treat the heading as
+					// content of the current state and warn.
+					if currentState != "" {
+						warnings = append(warnings, Warning{
+							Message: fmt.Sprintf(
+								"state %q directive contains ## heading matching state %q; is this intentional?",
+								currentState, headingName,
+							),
+						})
+						contentLines = append(contentLines, line)
+					}
+					continue
 				}
+
+				// First occurrence of this state heading: treat as boundary.
 				flushState()
 				currentState = headingName
+				seenStates[headingName] = true
 				continue
 			}
 		}

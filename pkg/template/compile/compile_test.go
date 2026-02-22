@@ -244,26 +244,31 @@ Work is complete.
 }
 
 // TestCompile_HeadingCollisionWarning (scenario 11) verifies that when a
-// state's directive area contains a ## heading matching another declared
-// state, the compiler emits a warning but still succeeds.
+// state's directive area contains a ## heading matching an already-seen
+// declared state, the compiler emits a warning and treats it as content
+// (first-wins semantics).
 func TestCompile_HeadingCollisionWarning(t *testing.T) {
-	// In this template, the assess state's body contains a ## plan line.
-	// Since "plan" is a declared state, the ## plan heading acts as a
-	// state boundary, ending the assess section earlier than the author
-	// may have intended. The compiler warns about this.
+	// The plan section appears first as a normal boundary. Then inside
+	// the assess section, a second ## plan heading appears. Since plan
+	// was already claimed, the second occurrence is treated as directive
+	// content of assess, and a warning is emitted.
 	source := `---
 name: collision-test
 version: "1.0"
-initial_state: assess
+initial_state: plan
 
 states:
-  assess:
-    transitions: [plan]
   plan:
+    transitions: [assess]
+  assess:
     transitions: [done]
   done:
     terminal: true
 ---
+
+## plan
+
+Create an implementation plan.
 
 ## assess
 
@@ -271,7 +276,7 @@ First part of assess.
 
 ## plan
 
-Create an implementation plan.
+This looks like plan but it's inside assess.
 
 ## done
 
@@ -288,7 +293,7 @@ Work is complete.
 		t.Fatal("Compile() returned nil template")
 	}
 
-	// Should have at least one warning about the heading collision.
+	// Should have a warning about the duplicate ## plan inside assess.
 	found := false
 	for _, w := range warnings {
 		if strings.Contains(w.Message, "state \"assess\" directive contains ## heading matching state \"plan\"") {
@@ -300,16 +305,25 @@ Work is complete.
 		t.Errorf("expected warning about assess/plan heading collision, got warnings: %v", warnings)
 	}
 
-	// The assess directive should only contain content before ## plan.
+	// The plan directive should contain the FIRST occurrence's content only.
+	plan := ct.States["plan"]
+	if !strings.Contains(plan.Directive, "Create an implementation plan.") {
+		t.Errorf("States[plan].Directive should contain 'Create an implementation plan.', got: %q", plan.Directive)
+	}
+	if strings.Contains(plan.Directive, "looks like plan") {
+		t.Errorf("States[plan].Directive should NOT contain second occurrence text, got: %q", plan.Directive)
+	}
+
+	// The assess directive should contain the ## plan heading as content.
 	assess := ct.States["assess"]
 	if !strings.Contains(assess.Directive, "First part of assess.") {
 		t.Errorf("States[assess].Directive should contain 'First part of assess.', got: %q", assess.Directive)
 	}
-
-	// The plan directive should contain its content.
-	plan := ct.States["plan"]
-	if !strings.Contains(plan.Directive, "Create an implementation plan.") {
-		t.Errorf("States[plan].Directive should contain 'Create an implementation plan.', got: %q", plan.Directive)
+	if !strings.Contains(assess.Directive, "## plan") {
+		t.Errorf("States[assess].Directive should contain '## plan' as content, got: %q", assess.Directive)
+	}
+	if !strings.Contains(assess.Directive, "This looks like plan but it's inside assess.") {
+		t.Errorf("States[assess].Directive should contain duplicate heading's content, got: %q", assess.Directive)
 	}
 }
 
