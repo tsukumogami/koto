@@ -250,7 +250,7 @@ Total scenarios: 25
 **Commands**:
 - `go test ./pkg/discover/... -v`
 **Expected**: `Find` returns an empty slice for empty directories. Returns correct `Workflow` structs for directories with one or more `koto-*.state.json` files. Non-matching files are ignored. Corrupted files produce partial results plus a non-nil error.
-**Status**: pending
+**Status**: passed
 
 ---
 
