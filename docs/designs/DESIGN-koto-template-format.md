@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 problem: |
   koto templates must serve two audiences: humans who write and maintain workflow
   definitions, and the engine that executes them deterministically. A single format
@@ -25,7 +25,59 @@ rationale: |
 
 ## Status
 
-**Accepted**
+**Planned**
+
+## Implementation Issues
+
+### Milestone: [koto Template Format Specification](https://github.com/tsukumogami/koto/milestone/2)
+
+| Issue | Dependencies | Tier |
+|-------|--------------|------|
+| [#13: feat(template): define compiled template format with JSON parsing](https://github.com/tsukumogami/koto/issues/13) | None | testable |
+| _Defines `CompiledTemplate`, `VariableDecl`, `StateDecl`, and `GateDecl` Go types with JSON tags, implements `ParseJSON()` with all 13 validation rules, adds `Gates` to `MachineState`, and builds `engine.Machine` from compiled JSON. This is the foundation that both the compiler and gate evaluation build on._ | | |
+| [#14: feat(template): implement source format compiler](https://github.com/tsukumogami/koto/issues/14) | [#13](https://github.com/tsukumogami/koto/issues/13) | testable |
+| _Creates `pkg/template/compile/` with go-yaml v3 to parse YAML frontmatter and extract markdown directives by matching `## headings` against declared states. Produces deterministic JSON with sorted keys and SHA-256 hash. Emits heading collision warnings._ | | |
+| [#15: feat(engine): add evidence support with transition options](https://github.com/tsukumogami/koto/issues/15) | None | testable |
+| _Adds `Evidence map[string]string` to engine state, introduces the `TransitionOption` functional pattern with `WithEvidence()`, bumps `schema_version` to 2 with backward-compatible load, and updates the controller to merge evidence into the interpolation context. Evidence persists across rewind._ | | |
+| [#16: feat(engine): implement field-based gate evaluation](https://github.com/tsukumogami/koto/issues/16) | [#13](https://github.com/tsukumogami/koto/issues/13), [#15](https://github.com/tsukumogami/koto/issues/15) | testable |
+| _Inserts gate evaluation between validation and commit in `Transition()`. Implements `field_not_empty` and `field_equals` gate types with AND logic, adds `gate_failed` error code, and rejects evidence keys that shadow declared variables. Establishes the evaluation framework that command gates extend._ | | |
+| [#17: feat(engine): implement command gate execution](https://github.com/tsukumogami/koto/issues/17) | [#16](https://github.com/tsukumogami/koto/issues/16) | critical |
+| _Adds the `command` gate type: `sh -c` execution from project root with configurable timeout (default 30s). No variable interpolation in command strings -- this security boundary is verified by explicit tests. Timed-out commands fail the gate._ | | |
+
+### Dependency Graph
+
+```mermaid
+graph TD
+    subgraph Phase1["Phase 1: Compiled Format"]
+        I13["#13: Compiled template types"]
+    end
+
+    subgraph Phase2["Phase 2: Source Compiler"]
+        I14["#14: Source format compiler"]
+    end
+
+    subgraph Phase3["Phase 3: Evidence Gates"]
+        I15["#15: Evidence support"]
+        I16["#16: Field gate evaluation"]
+        I17["#17: Command gate execution"]
+    end
+
+    I13 --> I14
+    I13 --> I16
+    I15 --> I16
+    I16 --> I17
+
+    classDef done fill:#c8e6c9
+    classDef ready fill:#bbdefb
+    classDef blocked fill:#fff9c4
+    classDef needsDesign fill:#e1bee7
+    classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
+
+    class I13,I15 ready
+    class I14,I16,I17 blocked
+```
+
+**Legend**: Green = done, Blue = ready, Yellow = blocked, Purple = needs-design, Orange = tracks-design
 
 ## Context and Problem Statement
 
