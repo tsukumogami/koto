@@ -618,7 +618,7 @@ func TestScenario24_MultiWorkflowAutoSelection(t *testing.T) {
 // --- loadTemplateFromState tests ---
 
 func TestLoadTemplateFromState_MissingFile(t *testing.T) {
-	_, err := loadTemplateFromState("/nonexistent/path.json")
+	_, _, err := loadTemplateFromState("/nonexistent/path.json")
 	if err == nil {
 		t.Fatal("expected error for nonexistent state file")
 	}
@@ -640,7 +640,7 @@ func TestLoadTemplateFromState_EmptyTemplatePath(t *testing.T) {
 		t.Fatalf("WriteFile() error: %v", err)
 	}
 
-	_, err := loadTemplateFromState(statePath)
+	_, _, err := loadTemplateFromState(statePath)
 	if err == nil {
 		t.Fatal("expected error for empty template_path")
 	}

@@ -186,9 +186,18 @@ func cmdTransition(args []string) error {
 		return err
 	}
 
-	tmpl, err := loadTemplateFromState(resolved)
+	tmpl, storedHash, err := loadTemplateFromState(resolved)
 	if err != nil {
 		return err
+	}
+
+	if storedHash != tmpl.Hash {
+		return &engine.TransitionError{
+			Code: engine.ErrTemplateMismatch,
+			Message: fmt.Sprintf(
+				"template hash mismatch: state file has %q but template on disk is %q",
+				storedHash, tmpl.Hash),
+		}
 	}
 
 	eng, err := engine.Load(resolved, tmpl.Machine)
@@ -218,7 +227,7 @@ func cmdNext(args []string) error {
 		return err
 	}
 
-	tmpl, err := loadTemplateFromState(resolved)
+	tmpl, _, err := loadTemplateFromState(resolved)
 	if err != nil {
 		return err
 	}
@@ -251,7 +260,7 @@ func cmdQuery(args []string) error {
 		return err
 	}
 
-	tmpl, err := loadTemplateFromState(resolved)
+	tmpl, _, err := loadTemplateFromState(resolved)
 	if err != nil {
 		return err
 	}
@@ -275,7 +284,7 @@ func cmdStatus(args []string) error {
 		return err
 	}
 
-	tmpl, err := loadTemplateFromState(resolved)
+	tmpl, _, err := loadTemplateFromState(resolved)
 	if err != nil {
 		return err
 	}
@@ -308,9 +317,18 @@ func cmdRewind(args []string) error {
 		return err
 	}
 
-	tmpl, err := loadTemplateFromState(resolved)
+	tmpl, storedHash, err := loadTemplateFromState(resolved)
 	if err != nil {
 		return err
+	}
+
+	if storedHash != tmpl.Hash {
+		return &engine.TransitionError{
+			Code: engine.ErrTemplateMismatch,
+			Message: fmt.Sprintf(
+				"template hash mismatch: state file has %q but template on disk is %q",
+				storedHash, tmpl.Hash),
+		}
 	}
 
 	eng, err := engine.Load(resolved, tmpl.Machine)
@@ -340,7 +358,7 @@ func cmdCancel(args []string) error {
 		return err
 	}
 
-	tmpl, err := loadTemplateFromState(resolved)
+	tmpl, _, err := loadTemplateFromState(resolved)
 	if err != nil {
 		return err
 	}
@@ -369,26 +387,18 @@ func cmdValidate(args []string) error {
 		return err
 	}
 
-	// Read the state file to get the stored template path and hash.
-	stateData, err := os.ReadFile(resolved) //nolint:gosec // G304: CLI reads user-specified state path
+	tmpl, storedHash, err := loadTemplateFromState(resolved)
 	if err != nil {
-		return fmt.Errorf("read state file: %w", err)
-	}
-	var state engine.State
-	if err := json.Unmarshal(stateData, &state); err != nil {
-		return fmt.Errorf("parse state file: %w", err)
+		return err
 	}
 
-	// Parse the template to get its current hash.
-	tmpl, err := template.Parse(state.Workflow.TemplatePath)
-	if err != nil {
-		return fmt.Errorf("read template: %w", err)
-	}
-
-	if state.Workflow.TemplateHash != tmpl.Hash {
-		fmt.Printf("MISMATCH: state file hash %s does not match template on disk %s\n",
-			state.Workflow.TemplateHash, tmpl.Hash)
-		os.Exit(1)
+	if storedHash != tmpl.Hash {
+		return &engine.TransitionError{
+			Code: engine.ErrTemplateMismatch,
+			Message: fmt.Sprintf(
+				"template hash mismatch: state file has %q but template on disk is %q",
+				storedHash, tmpl.Hash),
+		}
 	}
 
 	fmt.Println("OK: template hash matches")
@@ -448,39 +458,46 @@ func resolveStatePath(statePath, stateDir string) (string, error) {
 	}
 }
 
-// loadTemplateFromState reads a state file, extracts the template path,
-// and parses the template. This is the standard way to recover the Machine
-// and Template for commands that operate on an existing workflow.
-func loadTemplateFromState(statePath string) (*template.Template, error) {
+// loadTemplateFromState reads a state file, extracts the template path
+// and stored template hash, and parses the template. This is the standard
+// way to recover the Machine and Template for commands that operate on an
+// existing workflow. The returned storedHash is the template hash recorded
+// in the state file at init time.
+func loadTemplateFromState(statePath string) (tmpl *template.Template, storedHash string, err error) {
 	data, err := os.ReadFile(statePath) //nolint:gosec // G304: CLI reads user-specified state path
 	if err != nil {
-		return nil, fmt.Errorf("read state file: %w", err)
+		return nil, "", fmt.Errorf("read state file: %w", err)
 	}
 
-	// Minimal parse to extract template_path.
+	// Minimal parse to extract template_path and template_hash.
 	var header struct {
 		Workflow struct {
 			TemplatePath string `json:"template_path"`
+			TemplateHash string `json:"template_hash"`
 		} `json:"workflow"`
 	}
 	if err := json.Unmarshal(data, &header); err != nil {
-		return nil, fmt.Errorf("parse state file: %w", err)
+		return nil, "", fmt.Errorf("parse state file: %w", err)
 	}
 
 	if header.Workflow.TemplatePath == "" {
-		return nil, fmt.Errorf("state file has no template_path")
+		return nil, "", fmt.Errorf("state file has no template_path")
 	}
 
-	tmpl, err := template.Parse(header.Workflow.TemplatePath)
+	tmpl, err = template.Parse(header.Workflow.TemplatePath)
 	if err != nil {
-		return nil, fmt.Errorf("parse template: %w", err)
+		return nil, "", fmt.Errorf("parse template: %w", err)
 	}
 
-	return tmpl, nil
+	return tmpl, header.Workflow.TemplateHash, nil
 }
 
+// isFlag reports whether s looks like a flag argument. It checks for
+// a "--" prefix, matching the double-dash convention used by all koto
+// flags (--name, --state, --var, etc.). Single-dash values like "-1"
+// are not treated as flags, so they can appear as flag values.
 func isFlag(s string) bool {
-	return len(s) > 0 && s[0] == '-'
+	return strings.HasPrefix(s, "--")
 }
 
 func printJSON(v interface{}) error {
