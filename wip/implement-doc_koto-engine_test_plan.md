@@ -230,7 +230,7 @@ Total scenarios: 25
 **Commands**:
 - `go test ./pkg/template/... -v`
 **Expected**: Tests confirm that `Parse` reads a template file and returns a `Template` with correct `Name`, `Machine.InitialState`, `Sections` map, `Variables` map, and `Hash` (SHA-256 formatted as `sha256:<hex>`). Invalid templates return parse errors. Undefined transition targets cause errors.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -240,7 +240,7 @@ Total scenarios: 25
 **Commands**:
 - `go test ./pkg/template/... -run TestInterpolate -v`
 **Expected**: `Interpolate("Hello {{NAME}}, task: {{TASK}}", {"NAME": "agent"})` returns `"Hello agent, task: {{TASK}}"`. Unresolved `{{TASK}}` is left as-is. Single-pass replacement.
-**Status**: pending
+**Status**: passed
 
 ---
 

@@ -1,0 +1,27 @@
+{
+  "issue": 7,
+  "reviewers": [
+    {
+      "focus": "pragmatic",
+      "blocking_count": 2,
+      "advisory_count": 2,
+      "detail_file": "wip/research/implement-doc_review_pragmatic_issue7.md",
+      "blocking_resolved": true,
+      "resolution_commit": "0673825"
+    },
+    {
+      "focus": "architect",
+      "blocking_count": 0,
+      "advisory_count": 3,
+      "detail_file": "wip/research/implement-doc_review_architect_issue7.md"
+    },
+    {
+      "focus": "maintainer",
+      "blocking_count": 1,
+      "advisory_count": 6,
+      "detail_file": "wip/research/implement-doc_review_maintainer_issue7.md",
+      "blocking_resolved": true,
+      "resolution_commit": "0673825"
+    }
+  ]
+}

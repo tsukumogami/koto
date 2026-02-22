@@ -44,8 +44,8 @@ rationale: |
 | ~~_Builds on the engine from #4 to add `Rewind` (with history preservation), `Cancel` (state file deletion), and copy-safe query methods. Completes the full Engine API surface._~~ | | |
 | ~~[#6: feat(engine): add version conflict detection and TransitionError JSON serialization](https://github.com/tsukumogami/koto/issues/6)~~ | ~~[#4](https://github.com/tsukumogami/koto/issues/4)~~ | ~~testable~~ |
 | ~~_Hardens the error layer: every engine failure returns a structured `TransitionError` with a machine-parseable code. Adds version conflict detection (optimistic concurrency) and template hash mismatch checking._~~ | | |
-| [#7: feat(template): implement template parsing and interpolation](https://github.com/tsukumogami/koto/issues/7) | [#4](https://github.com/tsukumogami/koto/issues/4) | testable |
-| _Creates `pkg/template/` with `Parse`, `Interpolate`, and SHA-256 hash computation. Converts template files into `engine.Machine` instances, replacing the hardcoded stub from #4._ | | |
+| ~~[#7: feat(template): implement template parsing and interpolation](https://github.com/tsukumogami/koto/issues/7)~~ | ~~[#4](https://github.com/tsukumogami/koto/issues/4)~~ | ~~testable~~ |
+| ~~_Creates `pkg/template/` with `Parse`, `Interpolate`, and SHA-256 hash computation. Converts template files into `engine.Machine` instances, replacing the hardcoded stub from #4._~~ | | |
 | [#8: feat(discover): implement state file discovery](https://github.com/tsukumogami/koto/issues/8) | [#4](https://github.com/tsukumogami/koto/issues/4) | simple |
 | _Small, self-contained package that scans a directory for `koto-*.state.json` files and returns workflow metadata. Enables the `workflows` command and auto-selection when only one state file exists._ | | |
 | [#9: feat(cli): add remaining CLI subcommands](https://github.com/tsukumogami/koto/issues/9) | [#5](https://github.com/tsukumogami/koto/issues/5), [#6](https://github.com/tsukumogami/koto/issues/6), [#7](https://github.com/tsukumogami/koto/issues/7), [#8](https://github.com/tsukumogami/koto/issues/8) | testable |
@@ -89,8 +89,8 @@ graph TD
     classDef needsDesign fill:#e1bee7
     classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
 
-    class I4,I5,I6 done
-    class I7,I8 ready
+    class I4,I5,I6,I7 done
+    class I8 ready
     class I9,I10 blocked
 ```
 
