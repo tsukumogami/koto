@@ -1,9 +1,17 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"os"
 
-var version = "dev"
+	"github.com/tsukumogami/koto/internal/buildinfo"
+)
 
 func main() {
-	fmt.Println("koto", version)
+	if len(os.Args) > 1 && os.Args[1] == "version" {
+		fmt.Println("koto", buildinfo.Version())
+		return
+	}
+
+	fmt.Println("koto", buildinfo.Version())
 }
