@@ -58,38 +58,58 @@ func main() {
 	}
 }
 
-func cmdInit(args []string) error {
-	var name, templatePath, stateDir string
-	var varFlags []string
+// parsedArgs holds the result of argument parsing.
+type parsedArgs struct {
+	flags      map[string]string   // single-value flags (--name, --state, etc.)
+	multi      map[string][]string // multi-value flags (--var)
+	positional []string            // non-flag arguments
+}
+
+// parseFlags parses command arguments into flags and positional args.
+// Flags are expected in --key value format. Multi-value flag names
+// (like "--var") can appear multiple times and their values accumulate.
+func parseFlags(args []string, multiFlags map[string]bool) (*parsedArgs, error) {
+	result := &parsedArgs{
+		flags: make(map[string]string),
+		multi: make(map[string][]string),
+	}
 
 	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--name":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--name requires a value")
-			}
-			i++
-			name = args[i]
-		case "--template":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--template requires a value")
-			}
-			i++
-			templatePath = args[i]
-		case "--state-dir":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state-dir requires a value")
-			}
-			i++
-			stateDir = args[i]
-		case "--var":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--var requires a KEY=VALUE argument")
-			}
-			i++
-			varFlags = append(varFlags, args[i])
+		arg := args[i]
+		if !isFlag(arg) {
+			result.positional = append(result.positional, arg)
+			continue
+		}
+
+		// Consume the next argument as the flag value.
+		if i+1 >= len(args) {
+			return nil, fmt.Errorf("%s requires a value", arg)
+		}
+		next := args[i+1]
+		if isFlag(next) {
+			return nil, fmt.Errorf("%s requires a value", arg)
+		}
+		i++ // advance past the value
+
+		if multiFlags[arg] {
+			result.multi[arg] = append(result.multi[arg], next)
+		} else {
+			result.flags[arg] = next
 		}
 	}
+
+	return result, nil
+}
+
+func cmdInit(args []string) error {
+	p, err := parseFlags(args, map[string]bool{"--var": true})
+	if err != nil {
+		return err
+	}
+
+	name := p.flags["--name"]
+	templatePath := p.flags["--template"]
+	stateDir := p.flags["--state-dir"]
 
 	if name == "" {
 		return fmt.Errorf("--name is required")
@@ -114,11 +134,11 @@ func cmdInit(args []string) error {
 	}
 
 	// Merge variables: start with template defaults, then overlay --var flags.
-	variables := make(map[string]string, len(tmpl.Variables)+len(varFlags))
+	variables := make(map[string]string, len(tmpl.Variables)+len(p.multi["--var"]))
 	for k, v := range tmpl.Variables {
 		variables[k] = v
 	}
-	for _, kv := range varFlags {
+	for _, kv := range p.multi["--var"] {
 		parts := strings.SplitN(kv, "=", 2)
 		if len(parts) != 2 {
 			return fmt.Errorf("invalid --var format %q: expected KEY=VALUE", kv)
@@ -151,34 +171,17 @@ func cmdInit(args []string) error {
 }
 
 func cmdTransition(args []string) error {
-	var target, statePath, stateDir string
-
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--state":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state requires a value")
-			}
-			i++
-			statePath = args[i]
-		case "--state-dir":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state-dir requires a value")
-			}
-			i++
-			stateDir = args[i]
-		default:
-			if target == "" && !isFlag(args[i]) {
-				target = args[i]
-			}
-		}
+	p, err := parseFlags(args, nil)
+	if err != nil {
+		return err
 	}
 
-	if target == "" {
+	if len(p.positional) == 0 {
 		return fmt.Errorf("target state is required")
 	}
+	target := p.positional[0]
 
-	resolved, err := resolveStatePath(statePath, stateDir)
+	resolved, err := resolveStatePath(p.flags["--state"], p.flags["--state-dir"])
 	if err != nil {
 		return err
 	}
@@ -205,26 +208,12 @@ func cmdTransition(args []string) error {
 }
 
 func cmdNext(args []string) error {
-	var statePath, stateDir string
-
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--state":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state requires a value")
-			}
-			i++
-			statePath = args[i]
-		case "--state-dir":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state-dir requires a value")
-			}
-			i++
-			stateDir = args[i]
-		}
+	p, err := parseFlags(args, nil)
+	if err != nil {
+		return err
 	}
 
-	resolved, err := resolveStatePath(statePath, stateDir)
+	resolved, err := resolveStatePath(p.flags["--state"], p.flags["--state-dir"])
 	if err != nil {
 		return err
 	}
@@ -252,26 +241,12 @@ func cmdNext(args []string) error {
 }
 
 func cmdQuery(args []string) error {
-	var statePath, stateDir string
-
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--state":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state requires a value")
-			}
-			i++
-			statePath = args[i]
-		case "--state-dir":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state-dir requires a value")
-			}
-			i++
-			stateDir = args[i]
-		}
+	p, err := parseFlags(args, nil)
+	if err != nil {
+		return err
 	}
 
-	resolved, err := resolveStatePath(statePath, stateDir)
+	resolved, err := resolveStatePath(p.flags["--state"], p.flags["--state-dir"])
 	if err != nil {
 		return err
 	}
@@ -290,26 +265,12 @@ func cmdQuery(args []string) error {
 }
 
 func cmdStatus(args []string) error {
-	var statePath, stateDir string
-
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--state":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state requires a value")
-			}
-			i++
-			statePath = args[i]
-		case "--state-dir":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state-dir requires a value")
-			}
-			i++
-			stateDir = args[i]
-		}
+	p, err := parseFlags(args, nil)
+	if err != nil {
+		return err
 	}
 
-	resolved, err := resolveStatePath(statePath, stateDir)
+	resolved, err := resolveStatePath(p.flags["--state"], p.flags["--state-dir"])
 	if err != nil {
 		return err
 	}
@@ -332,36 +293,17 @@ func cmdStatus(args []string) error {
 }
 
 func cmdRewind(args []string) error {
-	var target, statePath, stateDir string
-
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--to":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--to requires a value")
-			}
-			i++
-			target = args[i]
-		case "--state":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state requires a value")
-			}
-			i++
-			statePath = args[i]
-		case "--state-dir":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state-dir requires a value")
-			}
-			i++
-			stateDir = args[i]
-		}
+	p, err := parseFlags(args, nil)
+	if err != nil {
+		return err
 	}
 
+	target := p.flags["--to"]
 	if target == "" {
 		return fmt.Errorf("--to is required")
 	}
 
-	resolved, err := resolveStatePath(statePath, stateDir)
+	resolved, err := resolveStatePath(p.flags["--state"], p.flags["--state-dir"])
 	if err != nil {
 		return err
 	}
@@ -388,26 +330,12 @@ func cmdRewind(args []string) error {
 }
 
 func cmdCancel(args []string) error {
-	var statePath, stateDir string
-
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--state":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state requires a value")
-			}
-			i++
-			statePath = args[i]
-		case "--state-dir":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state-dir requires a value")
-			}
-			i++
-			stateDir = args[i]
-		}
+	p, err := parseFlags(args, nil)
+	if err != nil {
+		return err
 	}
 
-	resolved, err := resolveStatePath(statePath, stateDir)
+	resolved, err := resolveStatePath(p.flags["--state"], p.flags["--state-dir"])
 	if err != nil {
 		return err
 	}
@@ -426,31 +354,17 @@ func cmdCancel(args []string) error {
 		return err
 	}
 
-	fmt.Println("workflow cancelled")
+	fmt.Println("workflow canceled")
 	return nil
 }
 
 func cmdValidate(args []string) error {
-	var statePath, stateDir string
-
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--state":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state requires a value")
-			}
-			i++
-			statePath = args[i]
-		case "--state-dir":
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state-dir requires a value")
-			}
-			i++
-			stateDir = args[i]
-		}
+	p, err := parseFlags(args, nil)
+	if err != nil {
+		return err
 	}
 
-	resolved, err := resolveStatePath(statePath, stateDir)
+	resolved, err := resolveStatePath(p.flags["--state"], p.flags["--state-dir"])
 	if err != nil {
 		return err
 	}
@@ -482,16 +396,14 @@ func cmdValidate(args []string) error {
 }
 
 func cmdWorkflows(args []string) error {
-	stateDir := "wip"
+	p, err := parseFlags(args, nil)
+	if err != nil {
+		return err
+	}
 
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--state-dir" {
-			if i+1 >= len(args) || isFlag(args[i+1]) {
-				return fmt.Errorf("--state-dir requires a value")
-			}
-			i++
-			stateDir = args[i]
-		}
+	stateDir := p.flags["--state-dir"]
+	if stateDir == "" {
+		stateDir = "wip"
 	}
 
 	workflows, err := discover.Find(stateDir)

@@ -299,11 +299,9 @@ func TestParse_HashChangesWithContent(t *testing.T) {
 		t.Fatalf("WriteFile() error: %v", err)
 	}
 
-	// Write a slightly different template.
+	// Write a different template (must be valid and parseable).
 	path2 := filepath.Join(dir, "template2.md")
-	modified := validTemplate + "\n## extra\n\nExtra state.\n"
-	// Need the extra state to be reachable or terminal, and not break parse.
-	modified = `---
+	modified := `---
 name: modified
 ---
 
