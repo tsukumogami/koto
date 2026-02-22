@@ -7,11 +7,13 @@ import (
 	"fmt"
 
 	"github.com/tsukumogami/koto/pkg/engine"
+	"github.com/tsukumogami/koto/pkg/template"
 )
 
 // Controller generates directives for the current workflow state.
 type Controller struct {
-	eng *engine.Engine
+	eng  *engine.Engine
+	tmpl *template.Template
 }
 
 // Directive represents an instruction for the agent.
@@ -22,32 +24,30 @@ type Directive struct {
 	Message   string `json:"message,omitempty"`   // completion message (done only)
 }
 
-// New creates a controller wrapping the given engine. The templateHash
-// parameter is the SHA-256 hash of the current template file on disk.
-// If it does not match the hash stored in the engine's state file,
-// New returns a template_mismatch error.
-//
-// Pass an empty string to skip hash verification (useful when the
-// template package is not yet available).
-func New(eng *engine.Engine, templateHash string) (*Controller, error) {
-	if templateHash != "" {
+// New creates a controller wrapping the given engine. If tmpl is non-nil,
+// its hash is compared to the hash stored in the engine's state file.
+// A mismatch returns a template_mismatch error. When tmpl is nil, hash
+// verification is skipped and Next returns a generic directive stub.
+func New(eng *engine.Engine, tmpl *template.Template) (*Controller, error) {
+	if tmpl != nil {
 		storedHash := eng.Snapshot().Workflow.TemplateHash
-		if storedHash != templateHash {
+		if storedHash != tmpl.Hash {
 			return nil, &engine.TransitionError{
 				Code: engine.ErrTemplateMismatch,
 				Message: fmt.Sprintf(
 					"template hash mismatch: state file has %q but template on disk is %q",
-					storedHash, templateHash),
+					storedHash, tmpl.Hash),
 			}
 		}
 	}
-	return &Controller{eng: eng}, nil
+	return &Controller{eng: eng, tmpl: tmpl}, nil
 }
 
 // Next returns the directive for the current state.
 //
-// For non-terminal states, returns action="execute" with a stub directive
-// string. For terminal states, returns action="done".
+// For non-terminal states, returns action="execute" with the interpolated
+// template section content. For terminal states, returns action="done".
+// If the controller has no template, a generic stub directive is returned.
 func (c *Controller) Next() (*Directive, error) {
 	current := c.eng.CurrentState()
 	machine := c.eng.Machine()
@@ -69,9 +69,16 @@ func (c *Controller) Next() (*Directive, error) {
 		}, nil
 	}
 
+	directive := "Execute the " + current + " phase of the workflow."
+	if c.tmpl != nil {
+		if section, ok := c.tmpl.Sections[current]; ok {
+			directive = template.Interpolate(section, c.eng.Variables())
+		}
+	}
+
 	return &Directive{
 		Action:    "execute",
 		State:     current,
-		Directive: "Execute the " + current + " phase of the workflow.",
+		Directive: directive,
 	}, nil
 }

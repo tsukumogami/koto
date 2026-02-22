@@ -1,10 +1,13 @@
 package controller
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tsukumogami/koto/pkg/engine"
+	"github.com/tsukumogami/koto/pkg/template"
 )
 
 func testMachine() *engine.Machine {
@@ -22,6 +25,31 @@ func testMachine() *engine.Machine {
 	}
 }
 
+// writeTestTemplate writes a template file and returns its path.
+func writeTestTemplate(t *testing.T, dir, content string) string {
+	t.Helper()
+	path := filepath.Join(dir, "template.md")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+	return path
+}
+
+const testTemplateContent = `---
+name: test-machine
+---
+
+## start
+
+Do the {{TASK}} work now.
+
+**Transitions**: [done]
+
+## done
+
+Work is complete.
+`
+
 func TestNext_NonTerminalState(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "koto-test.state.json")
@@ -31,7 +59,7 @@ func TestNext_NonTerminalState(t *testing.T) {
 		t.Fatalf("Init() error: %v", err)
 	}
 
-	ctrl, err := New(eng, "")
+	ctrl, err := New(eng, nil)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -68,7 +96,7 @@ func TestNext_TerminalState(t *testing.T) {
 		t.Fatalf("Transition() error: %v", err)
 	}
 
-	ctrl, err := New(eng, "")
+	ctrl, err := New(eng, nil)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -93,18 +121,24 @@ func TestNext_TerminalState(t *testing.T) {
 
 func TestNew_TemplateHashMatch(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "koto-test.state.json")
+	tmplPath := writeTestTemplate(t, dir, testTemplateContent)
 
-	eng, err := engine.Init(path, testMachine(), engine.InitMeta{
+	tmpl, err := template.Parse(tmplPath)
+	if err != nil {
+		t.Fatalf("template.Parse() error: %v", err)
+	}
+
+	statePath := filepath.Join(dir, "koto-test.state.json")
+	eng, err := engine.Init(statePath, tmpl.Machine, engine.InitMeta{
 		Name:         "test",
-		TemplateHash: "sha256:abc123",
+		TemplateHash: tmpl.Hash,
 	})
 	if err != nil {
 		t.Fatalf("Init() error: %v", err)
 	}
 
 	// Same hash should succeed.
-	ctrl, err := New(eng, "sha256:abc123")
+	ctrl, err := New(eng, tmpl)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -115,18 +149,24 @@ func TestNew_TemplateHashMatch(t *testing.T) {
 
 func TestNew_TemplateHashMismatch(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "koto-test.state.json")
+	tmplPath := writeTestTemplate(t, dir, testTemplateContent)
 
-	eng, err := engine.Init(path, testMachine(), engine.InitMeta{
+	tmpl, err := template.Parse(tmplPath)
+	if err != nil {
+		t.Fatalf("template.Parse() error: %v", err)
+	}
+
+	statePath := filepath.Join(dir, "koto-test.state.json")
+	eng, err := engine.Init(statePath, tmpl.Machine, engine.InitMeta{
 		Name:         "test",
-		TemplateHash: "sha256:abc123",
+		TemplateHash: "sha256:different",
 	})
 	if err != nil {
 		t.Fatalf("Init() error: %v", err)
 	}
 
-	// Different hash should fail with template_mismatch.
-	_, err = New(eng, "sha256:different")
+	// Hash mismatch should fail.
+	_, err = New(eng, tmpl)
 	if err == nil {
 		t.Fatal("New() expected error for template hash mismatch")
 	}
@@ -140,7 +180,7 @@ func TestNew_TemplateHashMismatch(t *testing.T) {
 	}
 }
 
-func TestNew_EmptyHashSkipsVerification(t *testing.T) {
+func TestNew_NilTemplateSkipsVerification(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "koto-test.state.json")
 
@@ -152,12 +192,56 @@ func TestNew_EmptyHashSkipsVerification(t *testing.T) {
 		t.Fatalf("Init() error: %v", err)
 	}
 
-	// Empty hash should skip verification.
-	ctrl, err := New(eng, "")
+	// Nil template should skip verification.
+	ctrl, err := New(eng, nil)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
 	if ctrl == nil {
 		t.Fatal("New() returned nil controller")
+	}
+}
+
+func TestNext_WithTemplate_InterpolatesVariables(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeTestTemplate(t, dir, testTemplateContent)
+
+	tmpl, err := template.Parse(tmplPath)
+	if err != nil {
+		t.Fatalf("template.Parse() error: %v", err)
+	}
+
+	statePath := filepath.Join(dir, "koto-test.state.json")
+	eng, err := engine.Init(statePath, tmpl.Machine, engine.InitMeta{
+		Name:         "test",
+		TemplateHash: tmpl.Hash,
+		Variables:    map[string]string{"TASK": "important"},
+	})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	ctrl, err := New(eng, tmpl)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	d, err := ctrl.Next()
+	if err != nil {
+		t.Fatalf("Next() error: %v", err)
+	}
+
+	if d.Action != "execute" {
+		t.Errorf("Action = %q, want %q", d.Action, "execute")
+	}
+
+	// The directive should contain the interpolated variable.
+	if !strings.Contains(d.Directive, "important") {
+		t.Errorf("Directive = %q, want it to contain %q (interpolated variable)", d.Directive, "important")
+	}
+
+	// The directive should not contain the raw placeholder.
+	if strings.Contains(d.Directive, "{{TASK}}") {
+		t.Errorf("Directive = %q, should not contain unresolved placeholder {{TASK}}", d.Directive)
 	}
 }

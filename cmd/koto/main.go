@@ -1,16 +1,17 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/tsukumogami/koto/internal/buildinfo"
 	"github.com/tsukumogami/koto/pkg/controller"
+	"github.com/tsukumogami/koto/pkg/discover"
 	"github.com/tsukumogami/koto/pkg/engine"
+	"github.com/tsukumogami/koto/pkg/template"
 )
 
 func main() {
@@ -30,8 +31,18 @@ func main() {
 		err = cmdTransition(os.Args[2:])
 	case "next":
 		err = cmdNext(os.Args[2:])
-	case "rewind", "cancel", "query", "status", "validate", "workflows":
-		err = cmdStub(os.Args[1])
+	case "query":
+		err = cmdQuery(os.Args[2:])
+	case "status":
+		err = cmdStatus(os.Args[2:])
+	case "rewind":
+		err = cmdRewind(os.Args[2:])
+	case "cancel":
+		err = cmdCancel(os.Args[2:])
+	case "validate":
+		err = cmdValidate(os.Args[2:])
+	case "workflows":
+		err = cmdWorkflows(os.Args[2:])
 	default:
 		printError("unknown_command", fmt.Sprintf("unknown command: %s", os.Args[1]))
 		os.Exit(1)
@@ -49,6 +60,7 @@ func main() {
 
 func cmdInit(args []string) error {
 	var name, templatePath, stateDir string
+	var varFlags []string
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -70,6 +82,12 @@ func cmdInit(args []string) error {
 			}
 			i++
 			stateDir = args[i]
+		case "--var":
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--var requires a KEY=VALUE argument")
+			}
+			i++
+			varFlags = append(varFlags, args[i])
 		}
 	}
 
@@ -83,36 +101,44 @@ func cmdInit(args []string) error {
 		stateDir = "wip"
 	}
 
-	// Resolve template path to absolute
+	// Resolve template path to absolute.
 	absTemplatePath, err := filepath.Abs(templatePath)
 	if err != nil {
 		return fmt.Errorf("resolve template path: %w", err)
 	}
 
-	// Compute template hash
-	templateData, err := os.ReadFile(absTemplatePath) //nolint:gosec // G304: CLI reads user-specified template path
+	// Parse the template file.
+	tmpl, err := template.Parse(absTemplatePath)
 	if err != nil {
-		return fmt.Errorf("read template file: %w", err)
+		return err
 	}
-	hash := sha256.Sum256(templateData)
-	templateHash := "sha256:" + hex.EncodeToString(hash[:])
 
-	// Ensure state directory exists
+	// Merge variables: start with template defaults, then overlay --var flags.
+	variables := make(map[string]string, len(tmpl.Variables)+len(varFlags))
+	for k, v := range tmpl.Variables {
+		variables[k] = v
+	}
+	for _, kv := range varFlags {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid --var format %q: expected KEY=VALUE", kv)
+		}
+		variables[parts[0]] = parts[1]
+	}
+
+	// Ensure state directory exists.
 	stateDir = filepath.Clean(stateDir)
-	if err := os.MkdirAll(stateDir, 0o750); err != nil { //nolint:gosec // G703: stateDir is cleaned; CLI accepts user-specified paths
+	if err := os.MkdirAll(stateDir, 0o750); err != nil { //nolint:gosec // G301: stateDir is cleaned; CLI accepts user-specified paths
 		return fmt.Errorf("create state directory: %w", err)
 	}
 
 	statePath := filepath.Join(stateDir, fmt.Sprintf("koto-%s.state.json", name))
 
-	// Use a hardcoded stub machine for this skeleton.
-	// Real template parsing will replace this in issue #7.
-	machine := stubMachine()
-
-	eng, err := engine.Init(statePath, machine, engine.InitMeta{
+	eng, err := engine.Init(statePath, tmpl.Machine, engine.InitMeta{
 		Name:         name,
-		TemplateHash: templateHash,
+		TemplateHash: tmpl.Hash,
 		TemplatePath: absTemplatePath,
+		Variables:    variables,
 	})
 	if err != nil {
 		return err
@@ -125,7 +151,7 @@ func cmdInit(args []string) error {
 }
 
 func cmdTransition(args []string) error {
-	var target, statePath string
+	var target, statePath, stateDir string
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -135,6 +161,12 @@ func cmdTransition(args []string) error {
 			}
 			i++
 			statePath = args[i]
+		case "--state-dir":
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state-dir requires a value")
+			}
+			i++
+			stateDir = args[i]
 		default:
 			if target == "" && !isFlag(args[i]) {
 				target = args[i]
@@ -145,13 +177,18 @@ func cmdTransition(args []string) error {
 	if target == "" {
 		return fmt.Errorf("target state is required")
 	}
-	if statePath == "" {
-		return fmt.Errorf("--state is required")
+
+	resolved, err := resolveStatePath(statePath, stateDir)
+	if err != nil {
+		return err
 	}
 
-	machine := stubMachine()
+	tmpl, err := loadTemplateFromState(resolved)
+	if err != nil {
+		return err
+	}
 
-	eng, err := engine.Load(statePath, machine)
+	eng, err := engine.Load(resolved, tmpl.Machine)
 	if err != nil {
 		return err
 	}
@@ -168,30 +205,41 @@ func cmdTransition(args []string) error {
 }
 
 func cmdNext(args []string) error {
-	var statePath string
+	var statePath, stateDir string
 
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--state" {
+		switch args[i] {
+		case "--state":
 			if i+1 >= len(args) || isFlag(args[i+1]) {
 				return fmt.Errorf("--state requires a value")
 			}
 			i++
 			statePath = args[i]
+		case "--state-dir":
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state-dir requires a value")
+			}
+			i++
+			stateDir = args[i]
 		}
 	}
 
-	if statePath == "" {
-		return fmt.Errorf("--state is required")
-	}
-
-	machine := stubMachine()
-
-	eng, err := engine.Load(statePath, machine)
+	resolved, err := resolveStatePath(statePath, stateDir)
 	if err != nil {
 		return err
 	}
 
-	ctrl, err := controller.New(eng, "")
+	tmpl, err := loadTemplateFromState(resolved)
+	if err != nil {
+		return err
+	}
+
+	eng, err := engine.Load(resolved, tmpl.Machine)
+	if err != nil {
+		return err
+	}
+
+	ctrl, err := controller.New(eng, tmpl)
 	if err != nil {
 		return err
 	}
@@ -203,31 +251,320 @@ func cmdNext(args []string) error {
 	return printJSON(d)
 }
 
-func cmdStub(name string) error {
-	return &engine.TransitionError{
-		Code:    "not_implemented",
-		Message: fmt.Sprintf("%s is not yet implemented", name),
+func cmdQuery(args []string) error {
+	var statePath, stateDir string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--state":
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state requires a value")
+			}
+			i++
+			statePath = args[i]
+		case "--state-dir":
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state-dir requires a value")
+			}
+			i++
+			stateDir = args[i]
+		}
+	}
+
+	resolved, err := resolveStatePath(statePath, stateDir)
+	if err != nil {
+		return err
+	}
+
+	tmpl, err := loadTemplateFromState(resolved)
+	if err != nil {
+		return err
+	}
+
+	eng, err := engine.Load(resolved, tmpl.Machine)
+	if err != nil {
+		return err
+	}
+
+	return printJSON(eng.Snapshot())
+}
+
+func cmdStatus(args []string) error {
+	var statePath, stateDir string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--state":
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state requires a value")
+			}
+			i++
+			statePath = args[i]
+		case "--state-dir":
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state-dir requires a value")
+			}
+			i++
+			stateDir = args[i]
+		}
+	}
+
+	resolved, err := resolveStatePath(statePath, stateDir)
+	if err != nil {
+		return err
+	}
+
+	tmpl, err := loadTemplateFromState(resolved)
+	if err != nil {
+		return err
+	}
+
+	eng, err := engine.Load(resolved, tmpl.Machine)
+	if err != nil {
+		return err
+	}
+
+	snap := eng.Snapshot()
+	fmt.Printf("Workflow: %s\n", snap.Workflow.Name)
+	fmt.Printf("State:    %s\n", snap.CurrentState)
+	fmt.Printf("History:  %d entries\n", len(snap.History))
+	return nil
+}
+
+func cmdRewind(args []string) error {
+	var target, statePath, stateDir string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--to":
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--to requires a value")
+			}
+			i++
+			target = args[i]
+		case "--state":
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state requires a value")
+			}
+			i++
+			statePath = args[i]
+		case "--state-dir":
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state-dir requires a value")
+			}
+			i++
+			stateDir = args[i]
+		}
+	}
+
+	if target == "" {
+		return fmt.Errorf("--to is required")
+	}
+
+	resolved, err := resolveStatePath(statePath, stateDir)
+	if err != nil {
+		return err
+	}
+
+	tmpl, err := loadTemplateFromState(resolved)
+	if err != nil {
+		return err
+	}
+
+	eng, err := engine.Load(resolved, tmpl.Machine)
+	if err != nil {
+		return err
+	}
+
+	if err := eng.Rewind(target); err != nil {
+		return err
+	}
+
+	snap := eng.Snapshot()
+	return printJSON(map[string]interface{}{
+		"state":   snap.CurrentState,
+		"version": snap.Version,
+	})
+}
+
+func cmdCancel(args []string) error {
+	var statePath, stateDir string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--state":
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state requires a value")
+			}
+			i++
+			statePath = args[i]
+		case "--state-dir":
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state-dir requires a value")
+			}
+			i++
+			stateDir = args[i]
+		}
+	}
+
+	resolved, err := resolveStatePath(statePath, stateDir)
+	if err != nil {
+		return err
+	}
+
+	tmpl, err := loadTemplateFromState(resolved)
+	if err != nil {
+		return err
+	}
+
+	eng, err := engine.Load(resolved, tmpl.Machine)
+	if err != nil {
+		return err
+	}
+
+	if err := eng.Cancel(); err != nil {
+		return err
+	}
+
+	fmt.Println("workflow cancelled")
+	return nil
+}
+
+func cmdValidate(args []string) error {
+	var statePath, stateDir string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--state":
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state requires a value")
+			}
+			i++
+			statePath = args[i]
+		case "--state-dir":
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state-dir requires a value")
+			}
+			i++
+			stateDir = args[i]
+		}
+	}
+
+	resolved, err := resolveStatePath(statePath, stateDir)
+	if err != nil {
+		return err
+	}
+
+	// Read the state file to get the stored template path and hash.
+	stateData, err := os.ReadFile(resolved) //nolint:gosec // G304: CLI reads user-specified state path
+	if err != nil {
+		return fmt.Errorf("read state file: %w", err)
+	}
+	var state engine.State
+	if err := json.Unmarshal(stateData, &state); err != nil {
+		return fmt.Errorf("parse state file: %w", err)
+	}
+
+	// Parse the template to get its current hash.
+	tmpl, err := template.Parse(state.Workflow.TemplatePath)
+	if err != nil {
+		return fmt.Errorf("read template: %w", err)
+	}
+
+	if state.Workflow.TemplateHash != tmpl.Hash {
+		fmt.Printf("MISMATCH: state file hash %s does not match template on disk %s\n",
+			state.Workflow.TemplateHash, tmpl.Hash)
+		os.Exit(1)
+	}
+
+	fmt.Println("OK: template hash matches")
+	return nil
+}
+
+func cmdWorkflows(args []string) error {
+	stateDir := "wip"
+
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--state-dir" {
+			if i+1 >= len(args) || isFlag(args[i+1]) {
+				return fmt.Errorf("--state-dir requires a value")
+			}
+			i++
+			stateDir = args[i]
+		}
+	}
+
+	workflows, err := discover.Find(stateDir)
+	if err != nil {
+		return err
+	}
+
+	return printJSON(workflows)
+}
+
+// resolveStatePath determines the state file path from explicit --state,
+// or by auto-selecting when exactly one state file exists in the state
+// directory. When multiple state files exist and no --state is given,
+// it returns an error listing the available files.
+func resolveStatePath(statePath, stateDir string) (string, error) {
+	if statePath != "" {
+		return statePath, nil
+	}
+
+	if stateDir == "" {
+		stateDir = "wip"
+	}
+
+	workflows, err := discover.Find(stateDir)
+	if err != nil {
+		return "", fmt.Errorf("scan state directory: %w", err)
+	}
+
+	switch len(workflows) {
+	case 0:
+		return "", fmt.Errorf("no state files found in %s", stateDir)
+	case 1:
+		return workflows[0].Path, nil
+	default:
+		var paths []string
+		for _, w := range workflows {
+			paths = append(paths, w.Path)
+		}
+		return "", fmt.Errorf(
+			"multiple state files found in %s, use --state to select one: %s",
+			stateDir, strings.Join(paths, ", "))
 	}
 }
 
-// stubMachine returns a hardcoded three-state machine for the walking
-// skeleton. Real template parsing will replace this in issue #7.
-func stubMachine() *engine.Machine {
-	return &engine.Machine{
-		Name:         "stub",
-		InitialState: "ready",
-		States: map[string]*engine.MachineState{
-			"ready": {
-				Transitions: []string{"running"},
-			},
-			"running": {
-				Transitions: []string{"done"},
-			},
-			"done": {
-				Terminal: true,
-			},
-		},
+// loadTemplateFromState reads a state file, extracts the template path,
+// and parses the template. This is the standard way to recover the Machine
+// and Template for commands that operate on an existing workflow.
+func loadTemplateFromState(statePath string) (*template.Template, error) {
+	data, err := os.ReadFile(statePath) //nolint:gosec // G304: CLI reads user-specified state path
+	if err != nil {
+		return nil, fmt.Errorf("read state file: %w", err)
 	}
+
+	// Minimal parse to extract template_path.
+	var header struct {
+		Workflow struct {
+			TemplatePath string `json:"template_path"`
+		} `json:"workflow"`
+	}
+	if err := json.Unmarshal(data, &header); err != nil {
+		return nil, fmt.Errorf("parse state file: %w", err)
+	}
+
+	if header.Workflow.TemplatePath == "" {
+		return nil, fmt.Errorf("state file has no template_path")
+	}
+
+	tmpl, err := template.Parse(header.Workflow.TemplatePath)
+	if err != nil {
+		return nil, fmt.Errorf("parse template: %w", err)
+	}
+
+	return tmpl, nil
 }
 
 func isFlag(s string) bool {
