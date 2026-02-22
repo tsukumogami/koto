@@ -43,6 +43,8 @@ rationale: |
 | _Inserts gate evaluation between validation and commit in `Transition()`. Implements `field_not_empty` and `field_equals` gate types with AND logic, adds `gate_failed` error code, and rejects evidence keys that shadow declared variables. Establishes the evaluation framework that command gates extend._ | | |
 | [#17: feat(engine): implement command gate execution](https://github.com/tsukumogami/koto/issues/17) | [#16](https://github.com/tsukumogami/koto/issues/16) | critical |
 | _Adds the `command` gate type: `sh -c` execution from project root with configurable timeout (default 30s). No variable interpolation in command strings -- this security boundary is verified by explicit tests. Timed-out commands fail the gate._ | | |
+| [#18: docs: design CLI and tooling for template compilation](https://github.com/tsukumogami/koto/issues/18) | [#13](https://github.com/tsukumogami/koto/issues/13) | simple |
+| _Designs the CLI commands, template search paths, compile flow, and optional LLM-assisted validation that build on this format specification. This is Phase 4 of the implementation approach -- deferred to its own design because CLI/tooling concerns are separate from format specification._ | | |
 
 ### Dependency Graph
 
@@ -62,8 +64,13 @@ graph TD
         I17["#17: Command gate execution"]
     end
 
+    subgraph Phase4["Phase 4: CLI and Tooling"]
+        I18["#18: CLI/tooling design"]
+    end
+
     I13 --> I14
     I13 --> I16
+    I13 --> I18
     I15 --> I16
     I16 --> I17
 
@@ -75,6 +82,7 @@ graph TD
 
     class I13,I15 ready
     class I14,I16,I17 blocked
+    class I18 needsDesign
 ```
 
 **Legend**: Green = done, Blue = ready, Yellow = blocked, Purple = needs-design, Orange = tracks-design
