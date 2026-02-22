@@ -3,19 +3,37 @@
   "design_doc": "docs/designs/DESIGN-koto-engine.md",
   "branch": "docs/koto-engine",
   "pr_number": 2,
-  "integrity_hash": "sha256:38630408513c6e86350692d3e1977a7fcddebb0bce2f6205d00653f48166b319",
+  "integrity_hash": "sha256:a163abaa6e3fdb3086a5a5053cd6046bfe8bac011a48424be91c6e92561c7ebf",
   "issues": [
     {
       "number": 4,
       "title": "feat(engine): implement walking skeleton with init, transition, and next",
-      "status": "pending",
+      "status": "implemented",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "code",
       "dependencies": [],
-      "commits": [],
-      "agent_type": "",
-      "summary": null,
+      "commits": [
+        "32c5794"
+      ],
+      "agent_type": "coder",
+      "summary": {
+        "narrative": "",
+        "files_changed": [
+          ".gitignore",
+          "cmd/koto/main.go",
+          "cmd/koto/lint_test.go",
+          "pkg/engine/types.go",
+          "pkg/engine/errors.go",
+          "pkg/engine/engine.go",
+          "pkg/engine/engine_test.go",
+          "pkg/controller/controller.go",
+          "pkg/controller/controller_test.go"
+        ],
+        "tests_added": 17,
+        "key_decisions": "Controller.New takes only *engine.Engine (template parsing deferred to #7). Stub machine uses three states (ready-\u003erunning-\u003edone). .gitignore changed from koto to /koto. lint_test.go moved to cmd/koto/.",
+        "requirements_map": []
+      },
       "testable_scenarios": [
         "scenario-1",
         "scenario-2",
