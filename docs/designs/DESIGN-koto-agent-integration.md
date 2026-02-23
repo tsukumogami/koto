@@ -93,7 +93,7 @@ A koto workflow skill consists of a SKILL.md (agent instructions) and a template
 
 #### Chosen: Plugin for Reference Templates, Project-Scoped for Custom
 
-**Reference templates** are published as a Claude Code plugin in a dedicated repository (`koto-skills` or similar). The plugin bundles:
+**Reference templates** are published as a Claude Code plugin inside the koto repository (under `plugins/koto-skills/`), just as tsuku keeps recipes in a folder under its repo. The plugin bundles:
 - One skill per workflow template (SKILL.md + template file)
 - A Stop hook that detects active koto state files
 
@@ -124,7 +124,7 @@ Rejected as the primary distribution mechanism because the hard part isn't gener
 - **Stop hook PATH availability.** If `koto` isn't on PATH in the hook's shell environment, the hook fails silently. This is more likely than the malicious binary scenario and should be documented.
 - **Evidence supply at transition time.** The `koto transition` command currently accepts only a target state name and `--state`/`--state-dir` flags. There is no `--evidence key=value` flag in v0.1.0. Evidence is only accessible via the Go library API. Generated SKILL.md files must reflect the current CLI surface and be updated when the evidence flag ships.
 - **Cross-platform plugin equivalents.** Cursor launched a marketplace in February 2026 that supports the Agent Skills standard. Codex and Windsurf use simpler conventions (AGENTS.md, rules files) without a plugin layer. Cross-platform distribution of the hook requires platform-specific files alongside the standardized SKILL.md.
-- **SKILL.md drift.** The SKILL.md documents koto's CLI behavior (JSON response shapes, command flags, execution loop). When koto's CLI changes, the SKILL.md needs updating. No automated synchronization mechanism exists -- this is a manual maintenance coupling between the koto binary and the plugin repository.
+- **SKILL.md drift.** The SKILL.md documents koto's CLI behavior (JSON response shapes, command flags, execution loop). When koto's CLI changes, the SKILL.md needs updating. Since both live in the same repo, CLI PRs can update the skill in the same commit -- but there's no automated check enforcing this.
 
 ## Decision Outcome
 
@@ -138,7 +138,7 @@ The Agent Skills standard means koto's SKILL.md files work across platforms. The
 
 Agent platforms already solve the distribution problem. Claude Code has plugins, marketplaces, and team auto-install. Cursor has a marketplace. Codex and Windsurf have filesystem conventions. The Agent Skills standard provides cross-platform portability.
 
-Building distribution into koto (search paths, `go:embed`, registries, generate commands) would duplicate ecosystem capabilities while coupling skill updates to koto releases. The plugin model lets reference skills evolve independently: a new workflow template can be published to the plugin without a koto release.
+Building distribution into koto (search paths, `go:embed`, registries, generate commands) would duplicate ecosystem capabilities. The plugin model uses Claude Code's native distribution stack. Skills and the engine live in the same repo, so CLI changes and skill updates can be coordinated in the same PR.
 
 koto's compile-and-cache path already handles the engine side. `koto init --template <path>` compiles the template, caches the result keyed by source hash, and records the absolute path in the state file. Every subsequent `koto next` re-reads and re-verifies the template. No modifications needed.
 
@@ -155,23 +155,45 @@ koto's compile-and-cache path already handles the engine side. `koto init --temp
 
 The implementation produces two artifacts, neither of which requires koto code changes:
 
-1. **`koto-skills` plugin repository** -- a Claude Code plugin containing reference workflow skills and a Stop hook
+1. **Plugin and marketplace directories** inside the koto repo -- reference workflow skills, Stop hook, and marketplace manifest
 2. **Documentation** -- a guide for creating custom koto workflow skills
 
-### Plugin Repository Structure
+### Plugin and Marketplace Layout
+
+The plugin lives inside the koto repo, following the same pattern as Anthropic's own `claude-code` repo (which hosts plugins under `plugins/`). The marketplace manifest at the repo root points to plugin subdirectories via relative paths.
 
 ```
-koto-skills/
+koto/
 ├── .claude-plugin/
-│   └── plugin.json              # Plugin manifest
-├── skills/
-│   └── quick-task/
-│       ├── SKILL.md             # Agent instructions for quick-task workflow
-│       └── quick-task.md        # The workflow template
-└── hooks.json                   # Stop hook for session continuity
+│   └── marketplace.json              # Marketplace catalog (repo root)
+├── plugins/
+│   └── koto-skills/
+│       ├── .claude-plugin/
+│       │   └── plugin.json           # Plugin manifest
+│       ├── skills/
+│       │   └── quick-task/
+│       │       └── SKILL.md          # Agent instructions + embedded template
+│       └── hooks.json                # Stop hook for session continuity
+└── ... (engine source, cmd/, pkg/, etc.)
 ```
 
-**`plugin.json`:**
+**`marketplace.json`** (at repo root):
+
+```json
+{
+  "name": "koto",
+  "owner": { "name": "tsukumogami" },
+  "plugins": [
+    {
+      "name": "koto-skills",
+      "source": "./plugins/koto-skills",
+      "description": "Workflow skills for koto"
+    }
+  ]
+}
+```
+
+**`plugin.json`** (in `plugins/koto-skills/`):
 
 ```json
 {
@@ -182,33 +204,15 @@ koto-skills/
 }
 ```
 
-Each workflow template gets its own skill directory under `skills/`. Adding a new workflow means adding a new directory with SKILL.md + template -- no coordination with the koto binary release.
-
-### Marketplace
-
-A marketplace enables `/plugin install` discovery:
-
+Users install:
 ```
-koto-marketplace/
-└── .claude-plugin/
-    └── marketplace.json
+/plugin marketplace add tsukumogami/koto
+/plugin install koto-skills@koto
 ```
 
-```json
-{
-  "name": "koto",
-  "owner": { "name": "tsukumogami" },
-  "plugins": [
-    {
-      "name": "koto-skills",
-      "source": { "source": "github", "repo": "tsukumogami/koto-skills" },
-      "description": "Workflow skills for koto"
-    }
-  ]
-}
-```
+Claude Code clones the koto repo and resolves the `./plugins/koto-skills` path from the marketplace source field. Only the plugin subtree is cached locally.
 
-Users install: `/plugin marketplace add tsukumogami/koto-marketplace`, then `/plugin install koto-skills@koto`.
+Each workflow template gets its own skill directory under `skills/`. Adding a new workflow means adding a new directory with a SKILL.md -- no separate repo, no coordination with the koto binary release beyond a normal commit.
 
 Teams can auto-install by adding to their project's `.claude/settings.json`:
 
@@ -216,7 +220,7 @@ Teams can auto-install by adding to their project's `.claude/settings.json`:
 {
   "extraKnownMarketplaces": {
     "koto": {
-      "source": { "source": "github", "repo": "tsukumogami/koto-marketplace" }
+      "source": { "source": "github", "repo": "tsukumogami/koto" }
     }
   },
   "enabledPlugins": {
@@ -302,7 +306,7 @@ For platforms without the Agent Skills standard, the same information goes into 
 - **AGENTS.md** -- for Codex and Windsurf (a markdown file at the repo root with koto workflow instructions)
 - **`.cursor/rules/koto.mdc`** -- for older Cursor versions that don't support Agent Skills
 
-The plugin repository includes these alternative formats as documentation or as ready-to-copy files. Cross-platform authoring guidance is part of the documentation artifact.
+The koto repo includes these alternative formats as documentation or as ready-to-copy files under `plugins/`. Cross-platform authoring guidance is part of the documentation artifact.
 
 ### Author-Driven Flow
 
@@ -315,18 +319,18 @@ No changes needed. The existing flow:
 
 Once the template compiles cleanly, the author writes a SKILL.md alongside it. The SKILL.md documents the workflow's states, evidence keys, and execution loop. The author can reference the compiled output to extract state names and gate definitions.
 
-For project-scoped skills, the author commits both files to `.claude/skills/<name>/`. For contributing to the koto-skills plugin, the author submits a PR to the plugin repository.
+For project-scoped skills, the author commits both files to `.claude/skills/<name>/`. For contributing to the koto-skills plugin, the author submits a PR to the koto repo adding a skill directory under `plugins/koto-skills/skills/`.
 
 ## Implementation Approach
 
-### Phase 1: Plugin Repository and Marketplace
+### Phase 1: Plugin and Marketplace Structure
 
-Create two new repositories:
+Add the plugin and marketplace directories to the koto repo:
 
-- **`tsukumogami/koto-skills`** -- the Claude Code plugin with `plugin.json`, hooks.json, and skill directories
-- **`tsukumogami/koto-marketplace`** -- the marketplace manifest pointing to koto-skills
+- **`.claude-plugin/marketplace.json`** at the repo root
+- **`plugins/koto-skills/`** with `plugin.json`, `hooks.json`, and skill directories
 
-This is repository setup and JSON/markdown file creation. No Go code.
+This is directory setup and JSON/markdown file creation. No Go code, no new repositories.
 
 ### Phase 2: Quick-Task Reference Skill
 
@@ -371,9 +375,9 @@ Create the alternative format files:
 
 ### Supply Chain Risks
 
-**Plugin source.** The koto-skills plugin is hosted on GitHub under the `tsukumogami` organization. Users trust the plugin by installing it. A compromised GitHub account could push a malicious plugin update. Mitigation: the plugin repository follows standard GitHub protections (branch protection, required reviews). Users can pin to a specific version or commit.
+**Plugin source.** The koto-skills plugin lives inside the koto repo under `plugins/`. Users trust the plugin by installing it. A compromised GitHub account could push a malicious plugin update. Mitigation: the koto repo follows standard GitHub protections (branch protection, required reviews). Plugin changes go through the same PR review as engine changes. Users can pin to a specific commit.
 
-**Marketplace trust.** The koto marketplace points to the koto-skills plugin. A compromised marketplace could redirect to a malicious plugin. Mitigation: marketplace sources are explicit (GitHub org/repo); Claude Code displays the source before installation.
+**Marketplace trust.** The marketplace manifest at the koto repo root points to the plugin subdirectory. A compromised repo could modify both. Mitigation: marketplace and plugin are in the same repo under the same protections; Claude Code displays the source before installation.
 
 **Template content.** The workflow template contains directive text in `## STATE:` sections. These directives are returned by `koto next` and displayed to the agent as instructions. Unlike inert metadata, directive text directly influences agent behavior -- a malicious directive could instruct the agent to run harmful commands. Mitigation: templates are either committed to version control (reviewed via PR) or installed from a trusted plugin. The documentation for custom skill authoring should call out that directive text is agent-visible and must be reviewed with the same scrutiny as the SKILL.md itself.
 
@@ -401,7 +405,7 @@ Create the alternative format files:
 - No koto code changes required -- the engine already has everything it needs
 - Uses established distribution mechanisms (plugins, marketplaces) instead of building new ones
 - Agent Skills standard provides cross-platform reach (Claude Code, Codex, Cursor, Windsurf, Gemini CLI)
-- Reference skills can be updated independently of koto releases
+- Skills and engine in the same repo -- CLI changes and skill updates coordinated in one PR
 - Project-scoped custom skills are version-controlled and reviewed via PR
 - The Stop hook addresses the most common failure (agents quitting mid-workflow)
 
