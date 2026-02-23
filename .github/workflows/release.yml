@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # GoReleaser creates the draft release and builds Go binaries
+  release:
+    name: Release (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5  # v6.2.0
+        with:
+          go-version-file: "go.mod"
+          cache-dependency-path: go.sum
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error::go.mod or go.sum is not tidy. Cannot release with untidy module files."
+            exit 1
+          fi
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a  # v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update release with notes from tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Fetch tag annotations (not included in checkout)
+          git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}" --force
+          # Extract full tag annotation message
+          git tag -l --format='%(contents)' "${TAG}" > /tmp/release-notes.md
+          echo "Release notes extracted:"
+          cat /tmp/release-notes.md
+          # Update the release body with our curated notes
+          gh release edit "$TAG" --notes-file /tmp/release-notes.md
+          echo "Updated release $TAG with release notes"
+
+  finalize-release:
+    name: Finalize Release
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all artifacts present
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+
+          EXPECTED_ARTIFACTS=(
+            "koto-linux-amd64_${VERSION}_linux_amd64"
+            "koto-linux-arm64_${VERSION}_linux_arm64"
+            "koto-darwin-amd64_${VERSION}_darwin_amd64"
+            "koto-darwin-arm64_${VERSION}_darwin_arm64"
+          )
+
+          echo "Verifying all ${#EXPECTED_ARTIFACTS[@]} artifacts are present..."
+          ASSETS=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+
+          for artifact in "${EXPECTED_ARTIFACTS[@]}"; do
+            if ! echo "$ASSETS" | grep -q "^${artifact}$"; then
+              echo "ERROR: Missing artifact: $artifact"
+              exit 1
+            fi
+            echo "Found: $artifact"
+          done
+          echo "All artifacts verified"
+
+      - name: Download artifacts and generate checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p ./artifacts
+          cd ./artifacts
+
+          # Download all binary artifacts (exclude existing checksums.txt from goreleaser)
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "koto-*" \
+            --skip-existing
+
+          # Generate unified checksums for all binaries
+          sha256sum koto-* > checksums.txt
+          echo "Generated checksums.txt:"
+          cat checksums.txt
+
+      - name: Upload checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" ./artifacts/checksums.txt --clobber
+          echo "Uploaded checksums.txt"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Published release $TAG"
