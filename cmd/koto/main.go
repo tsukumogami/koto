@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/tsukumogami/koto/internal/buildinfo"
+	"github.com/tsukumogami/koto/pkg/cache"
 	"github.com/tsukumogami/koto/pkg/controller"
 	"github.com/tsukumogami/koto/pkg/discover"
 	"github.com/tsukumogami/koto/pkg/engine"
@@ -138,20 +139,50 @@ func cmdInit(args []string) error {
 		return fmt.Errorf("read template file: %w", err)
 	}
 
-	// Compile the source template.
-	ct, _, err := compile.Compile(sourceBytes)
-	if err != nil {
-		return fmt.Errorf("compile template: %w", err)
+	// Compute the source hash for cache lookup.
+	sum := sha256.Sum256(sourceBytes)
+	sourceHash := hex.EncodeToString(sum[:])
+
+	// Check the compilation cache. Cache errors are non-fatal.
+	var compiledJSON []byte
+	if cached, cacheErr := cache.Get(sourceHash); cacheErr != nil {
+		fmt.Fprintf(os.Stderr, "cache read: %v\n", cacheErr)
+	} else if cached != nil {
+		compiledJSON = cached
 	}
 
-	// Validate the compiled output through ParseJSON round-trip.
-	compiledJSON, err := json.Marshal(ct)
-	if err != nil {
-		return fmt.Errorf("marshal compiled template: %w", err)
+	var ct *template.CompiledTemplate
+	if compiledJSON != nil {
+		// Cache hit: validate the cached JSON.
+		ct, err = template.ParseJSON(compiledJSON)
+		if err != nil {
+			// Cached data is corrupt; fall through to recompilation.
+			fmt.Fprintf(os.Stderr, "cache data invalid, recompiling: %v\n", err)
+			compiledJSON = nil
+		}
 	}
-	ct, err = template.ParseJSON(compiledJSON)
-	if err != nil {
-		return fmt.Errorf("validate compiled template: %w", err)
+
+	if compiledJSON == nil {
+		// Cache miss or invalid: compile the source template.
+		ct, _, err = compile.Compile(sourceBytes)
+		if err != nil {
+			return fmt.Errorf("compile template: %w", err)
+		}
+
+		// Validate the compiled output through ParseJSON round-trip.
+		compiledJSON, err = json.Marshal(ct)
+		if err != nil {
+			return fmt.Errorf("marshal compiled template: %w", err)
+		}
+		ct, err = template.ParseJSON(compiledJSON)
+		if err != nil {
+			return fmt.Errorf("validate compiled template: %w", err)
+		}
+
+		// Store in cache. Cache errors are non-fatal.
+		if cacheErr := cache.Put(sourceHash, compiledJSON); cacheErr != nil {
+			fmt.Fprintf(os.Stderr, "cache write: %v\n", cacheErr)
+		}
 	}
 
 	// Build the engine machine.
