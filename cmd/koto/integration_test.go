@@ -36,27 +36,32 @@ const integrationTemplate = `---
 name: integration
 version: "1.0"
 description: Integration test workflow
+initial_state: assess
 variables:
-  TASK: default-task
+  TASK:
+    default: default-task
+states:
+  assess:
+    transitions: [plan]
+  plan:
+    transitions: [implement]
+  implement:
+    transitions: [done]
+  done:
+    terminal: true
 ---
 
 ## assess
 
 Assess the task: {{TASK}}.
 
-**Transitions**: [plan]
-
 ## plan
 
 Create a plan for {{TASK}}.
 
-**Transitions**: [implement]
-
 ## implement
 
 Build the solution.
-
-**Transitions**: [done]
 
 ## done
 
@@ -543,16 +548,47 @@ func TestIntegration_TemplateMismatch(t *testing.T) {
 
 	statePath := initWorkflow(t, tmplPath, stateDir, "mismatch-test")
 
-	// Modify the template file after init (append a newline to change hash).
-	f, err := os.OpenFile(tmplPath, os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // G304: test modifies its own template file
-	if err != nil {
-		t.Fatalf("open template for append: %v", err)
+	// Modify the template directive content to change the compiled hash.
+	// A trailing newline wouldn't change the compiled output, so we
+	// rewrite the directive text which changes the compiled JSON.
+	modifiedTemplate := `---
+name: integration
+version: "1.0"
+description: Integration test workflow
+initial_state: assess
+variables:
+  TASK:
+    default: default-task
+states:
+  assess:
+    transitions: [plan]
+  plan:
+    transitions: [implement]
+  implement:
+    transitions: [done]
+  done:
+    terminal: true
+---
+
+## assess
+
+MODIFIED directive content.
+
+## plan
+
+Create a plan for {{TASK}}.
+
+## implement
+
+Build the solution.
+
+## done
+
+Work is complete.
+`
+	if err := os.WriteFile(tmplPath, []byte(modifiedTemplate), 0o600); err != nil {
+		t.Fatalf("rewrite template: %v", err)
 	}
-	if _, err := f.WriteString("\n"); err != nil {
-		f.Close()
-		t.Fatalf("append to template: %v", err)
-	}
-	f.Close()
 
 	// next should fail with template_mismatch.
 	stdout, _, err := runKoto(t, "next", "--state", statePath)

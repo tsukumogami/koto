@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,34 +11,39 @@ import (
 
 	"github.com/tsukumogami/koto/pkg/discover"
 	"github.com/tsukumogami/koto/pkg/engine"
-	"github.com/tsukumogami/koto/pkg/template"
+	"github.com/tsukumogami/koto/pkg/template/compile"
 )
 
 const lifecycleTemplate = `---
 name: lifecycle
 version: "1.0"
 description: A test lifecycle workflow
+initial_state: assess
 variables:
-  TASK: default-task
+  TASK:
+    default: default-task
+states:
+  assess:
+    transitions: [plan]
+  plan:
+    transitions: [implement]
+  implement:
+    transitions: [done]
+  done:
+    terminal: true
 ---
 
 ## assess
 
 Assess the task: {{TASK}}.
 
-**Transitions**: [plan]
-
 ## plan
 
 Create a plan for {{TASK}}.
 
-**Transitions**: [implement]
-
 ## implement
 
 Build the solution.
-
-**Transitions**: [done]
 
 ## done
 
@@ -217,10 +224,6 @@ func TestCmdNext_ReturnsDirective(t *testing.T) {
 	}
 
 	statePath := filepath.Join(stateDir, "koto-next-test.state.json")
-
-	// Read the template to verify the directive uses interpolated content.
-	tmpl, _ := template.Parse(tmplPath)
-	_ = tmpl // used only to verify the test is meaningful
 
 	// cmdNext outputs to stdout; we just check it doesn't error.
 	if err := cmdNext([]string{"--state", statePath}); err != nil {
@@ -646,5 +649,237 @@ func TestLoadTemplateFromState_EmptyTemplatePath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no template_path") {
 		t.Errorf("error should mention template_path: %v", err)
+	}
+}
+
+// --- Compiler path migration tests ---
+
+func TestCmdInit_StoresCompilerHash(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	stateDir := filepath.Join(dir, "state")
+
+	err := cmdInit([]string{
+		"--name", "hash-test",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+	})
+	if err != nil {
+		t.Fatalf("cmdInit() error: %v", err)
+	}
+
+	statePath := filepath.Join(stateDir, "koto-hash-test.state.json")
+	data, _ := os.ReadFile(statePath) //nolint:gosec // G304: test reads file it created
+	var state engine.State
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("parse state: %v", err)
+	}
+
+	storedHash := state.Workflow.TemplateHash
+	if !strings.HasPrefix(storedHash, "sha256:") {
+		t.Fatalf("stored hash = %q, want sha256: prefix", storedHash)
+	}
+
+	// Compute the legacy (raw source) hash.
+	sourceBytes, _ := os.ReadFile(tmplPath) //nolint:gosec // G304: test reads file it created
+	sum := sha256.Sum256(sourceBytes)
+	legacyHash := "sha256:" + hex.EncodeToString(sum[:])
+
+	// Stored hash must NOT be the legacy hash.
+	if storedHash == legacyHash {
+		t.Errorf("stored hash equals legacy source hash; init should store compiler hash")
+	}
+
+	// Stored hash should be the compiler hash.
+	ct, _, err := compile.Compile(sourceBytes)
+	if err != nil {
+		t.Fatalf("compile.Compile() error: %v", err)
+	}
+	compilerHash, _, err := compile.Hash(ct)
+	if err != nil {
+		t.Fatalf("compile.Hash() error: %v", err)
+	}
+	if storedHash != compilerHash {
+		t.Errorf("stored hash = %q, want compiler hash %q", storedHash, compilerHash)
+	}
+}
+
+func TestLoadTemplateFromState_CompilerHashMatch(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	stateDir := filepath.Join(dir, "state")
+
+	// Init creates a state file with the compiler hash.
+	err := cmdInit([]string{
+		"--name", "compiler-hash",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+	})
+	if err != nil {
+		t.Fatalf("cmdInit() error: %v", err)
+	}
+
+	statePath := filepath.Join(stateDir, "koto-compiler-hash.state.json")
+
+	tmpl, storedHash, err := loadTemplateFromState(statePath)
+	if err != nil {
+		t.Fatalf("loadTemplateFromState() error: %v", err)
+	}
+
+	if tmpl == nil {
+		t.Fatal("tmpl is nil")
+	}
+	if tmpl.Hash != storedHash {
+		t.Errorf("tmpl.Hash = %q, storedHash = %q; should match", tmpl.Hash, storedHash)
+	}
+	if tmpl.Machine == nil {
+		t.Fatal("tmpl.Machine is nil")
+	}
+	if len(tmpl.Sections) == 0 {
+		t.Error("tmpl.Sections is empty; should have state directives")
+	}
+}
+
+func TestLoadTemplateFromState_LegacyHashFallback(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+
+	// Read source to compute legacy hash.
+	sourceBytes, _ := os.ReadFile(tmplPath) //nolint:gosec // G304: test reads file it created
+	sum := sha256.Sum256(sourceBytes)
+	legacyHash := "sha256:" + hex.EncodeToString(sum[:])
+
+	// Manually create a state file with the legacy hash (simulating a
+	// workflow initialized with the old Parse()-based path).
+	statePath := filepath.Join(dir, "koto-legacy.state.json")
+	stateData := map[string]interface{}{
+		"schema_version": 2,
+		"workflow": map[string]string{
+			"name":          "legacy-wf",
+			"template_hash": legacyHash,
+			"template_path": tmplPath,
+			"created_at":    "2025-01-01T00:00:00Z",
+		},
+		"version":       1,
+		"current_state": "assess",
+		"variables":     map[string]string{"TASK": "default-task"},
+		"history":       []interface{}{},
+	}
+	data, _ := json.Marshal(stateData)
+	if err := os.WriteFile(statePath, data, 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	tmpl, storedHash, err := loadTemplateFromState(statePath)
+	if err != nil {
+		t.Fatalf("loadTemplateFromState() error: %v", err)
+	}
+
+	// The returned storedHash should be the legacy hash.
+	if storedHash != legacyHash {
+		t.Errorf("storedHash = %q, want %q", storedHash, legacyHash)
+	}
+
+	// tmpl.Hash should be set to the stored (legacy) hash so that
+	// callers' storedHash != tmpl.Hash checks remain valid.
+	if tmpl.Hash != legacyHash {
+		t.Errorf("tmpl.Hash = %q, want legacy hash %q", tmpl.Hash, legacyHash)
+	}
+
+	if tmpl.Machine == nil {
+		t.Fatal("tmpl.Machine is nil")
+	}
+}
+
+func TestLoadTemplateFromState_NeitherHashMatches(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+
+	// Create a state file with a fabricated hash that matches neither
+	// the compiler hash nor the legacy hash.
+	statePath := filepath.Join(dir, "koto-mismatch.state.json")
+	stateData := map[string]interface{}{
+		"schema_version": 2,
+		"workflow": map[string]string{
+			"name":          "mismatch-wf",
+			"template_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+			"template_path": tmplPath,
+			"created_at":    "2025-01-01T00:00:00Z",
+		},
+		"version":       1,
+		"current_state": "assess",
+		"variables":     map[string]string{},
+		"history":       []interface{}{},
+	}
+	data, _ := json.Marshal(stateData)
+	if err := os.WriteFile(statePath, data, 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	_, _, err := loadTemplateFromState(statePath)
+	if err == nil {
+		t.Fatal("expected error for hash mismatch")
+	}
+
+	te, ok := err.(*engine.TransitionError)
+	if !ok {
+		t.Fatalf("expected *engine.TransitionError, got %T: %v", err, err)
+	}
+	if te.Code != engine.ErrTemplateMismatch {
+		t.Errorf("error code = %q, want %q", te.Code, engine.ErrTemplateMismatch)
+	}
+}
+
+func TestCmdValidate_UsesCompilerPath(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	stateDir := filepath.Join(dir, "state")
+
+	// Init with the compiler path.
+	if err := cmdInit([]string{
+		"--name", "validate-compiler",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+	}); err != nil {
+		t.Fatalf("cmdInit() error: %v", err)
+	}
+
+	statePath := filepath.Join(stateDir, "koto-validate-compiler.state.json")
+
+	// validate should succeed since both init and validate use compiler path.
+	if err := cmdValidate([]string{"--state", statePath}); err != nil {
+		t.Fatalf("cmdValidate() error: %v", err)
+	}
+}
+
+func TestCmdNext_ReturnsCompiledDirective(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	stateDir := filepath.Join(dir, "state")
+
+	if err := cmdInit([]string{
+		"--name", "directive-test",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+		"--var", "TASK=build feature",
+	}); err != nil {
+		t.Fatalf("cmdInit() error: %v", err)
+	}
+
+	statePath := filepath.Join(stateDir, "koto-directive-test.state.json")
+
+	// Load the template through the compiler path.
+	tmpl, _, err := loadTemplateFromState(statePath)
+	if err != nil {
+		t.Fatalf("loadTemplateFromState() error: %v", err)
+	}
+
+	// The Sections map should have entries from StateDecl.Directive.
+	assessDirective, ok := tmpl.Sections["assess"]
+	if !ok {
+		t.Fatal("Sections[assess] not found")
+	}
+	if !strings.Contains(assessDirective, "{{TASK}}") {
+		t.Errorf("Sections[assess] = %q, expected to contain {{TASK}} placeholder", assessDirective)
 	}
 }

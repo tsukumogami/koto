@@ -565,7 +565,7 @@ func TestEngineMachineDeepCopy_IncludesGates(t *testing.T) {
 	// Mutate gates on the copy.
 	copy1.States["start"].Gates["check"].Field = "TAMPERED"
 	copy1.States["start"].Gates["injected"] = &engine.GateDecl{
-		Type:  "command",
+		Type:    "command",
 		Command: "echo evil",
 	}
 
@@ -656,6 +656,148 @@ func TestParseJSON_RoundTrip(t *testing.T) {
 	}
 	if len(ct2.States) != len(ct.States) {
 		t.Errorf("round-trip States count = %d, want %d", len(ct2.States), len(ct.States))
+	}
+}
+
+func TestToTemplate_PopulatesSections(t *testing.T) {
+	ct, err := ParseJSON([]byte(validCompiledJSON))
+	if err != nil {
+		t.Fatalf("ParseJSON() error: %v", err)
+	}
+
+	tmpl, err := ct.ToTemplate()
+	if err != nil {
+		t.Fatalf("ToTemplate() error: %v", err)
+	}
+
+	// Sections should map state names to directive text.
+	if len(tmpl.Sections) != len(ct.States) {
+		t.Fatalf("Sections count = %d, want %d", len(tmpl.Sections), len(ct.States))
+	}
+
+	for name, sd := range ct.States {
+		got, ok := tmpl.Sections[name]
+		if !ok {
+			t.Errorf("Sections[%q] not found", name)
+			continue
+		}
+		if got != sd.Directive {
+			t.Errorf("Sections[%q] = %q, want %q", name, got, sd.Directive)
+		}
+	}
+}
+
+func TestToTemplate_PopulatesVariablesFromDefaults(t *testing.T) {
+	ct, err := ParseJSON([]byte(validCompiledJSON))
+	if err != nil {
+		t.Fatalf("ParseJSON() error: %v", err)
+	}
+
+	tmpl, err := ct.ToTemplate()
+	if err != nil {
+		t.Fatalf("ToTemplate() error: %v", err)
+	}
+
+	// Variables should contain default values from VariableDecl.
+	if len(tmpl.Variables) != len(ct.Variables) {
+		t.Fatalf("Variables count = %d, want %d", len(tmpl.Variables), len(ct.Variables))
+	}
+
+	// PR_URL has no default (empty string).
+	if tmpl.Variables["PR_URL"] != "" {
+		t.Errorf("Variables[PR_URL] = %q, want empty", tmpl.Variables["PR_URL"])
+	}
+
+	// REVIEWER has default "auto".
+	if tmpl.Variables["REVIEWER"] != "auto" {
+		t.Errorf("Variables[REVIEWER] = %q, want %q", tmpl.Variables["REVIEWER"], "auto")
+	}
+}
+
+func TestToTemplate_BuildsMachine(t *testing.T) {
+	ct, err := ParseJSON([]byte(validCompiledJSON))
+	if err != nil {
+		t.Fatalf("ParseJSON() error: %v", err)
+	}
+
+	tmpl, err := ct.ToTemplate()
+	if err != nil {
+		t.Fatalf("ToTemplate() error: %v", err)
+	}
+
+	if tmpl.Machine == nil {
+		t.Fatal("Machine is nil")
+	}
+	if tmpl.Machine.Name != ct.Name {
+		t.Errorf("Machine.Name = %q, want %q", tmpl.Machine.Name, ct.Name)
+	}
+	if tmpl.Machine.InitialState != ct.InitialState {
+		t.Errorf("Machine.InitialState = %q, want %q", tmpl.Machine.InitialState, ct.InitialState)
+	}
+	if len(tmpl.Machine.States) != len(ct.States) {
+		t.Errorf("Machine.States count = %d, want %d", len(tmpl.Machine.States), len(ct.States))
+	}
+}
+
+func TestToTemplate_Metadata(t *testing.T) {
+	ct, err := ParseJSON([]byte(validCompiledJSON))
+	if err != nil {
+		t.Fatalf("ParseJSON() error: %v", err)
+	}
+
+	tmpl, err := ct.ToTemplate()
+	if err != nil {
+		t.Fatalf("ToTemplate() error: %v", err)
+	}
+
+	if tmpl.Name != "review-workflow" {
+		t.Errorf("Name = %q, want %q", tmpl.Name, "review-workflow")
+	}
+	if tmpl.Version != "2.0" {
+		t.Errorf("Version = %q, want %q", tmpl.Version, "2.0")
+	}
+	if tmpl.Description != "A code review workflow" {
+		t.Errorf("Description = %q, want %q", tmpl.Description, "A code review workflow")
+	}
+
+	// Hash and Path are empty; caller sets them.
+	if tmpl.Hash != "" {
+		t.Errorf("Hash = %q, want empty (caller sets it)", tmpl.Hash)
+	}
+	if tmpl.Path != "" {
+		t.Errorf("Path = %q, want empty (caller sets it)", tmpl.Path)
+	}
+}
+
+func TestToTemplate_NoVariables(t *testing.T) {
+	data := []byte(`{
+		"format_version": 1,
+		"name": "simple",
+		"version": "1.0",
+		"initial_state": "start",
+		"states": {
+			"start": {
+				"directive": "Begin.",
+				"terminal": true
+			}
+		}
+	}`)
+
+	ct, err := ParseJSON(data)
+	if err != nil {
+		t.Fatalf("ParseJSON() error: %v", err)
+	}
+
+	tmpl, err := ct.ToTemplate()
+	if err != nil {
+		t.Fatalf("ToTemplate() error: %v", err)
+	}
+
+	if tmpl.Variables == nil {
+		t.Fatal("Variables is nil, want empty map")
+	}
+	if len(tmpl.Variables) != 0 {
+		t.Errorf("Variables count = %d, want 0", len(tmpl.Variables))
 	}
 }
 

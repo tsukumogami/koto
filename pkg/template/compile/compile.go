@@ -30,10 +30,10 @@ func (w Warning) String() string {
 
 // sourceFrontmatter is the YAML structure expected in the frontmatter.
 type sourceFrontmatter struct {
-	Name         string                       `yaml:"name"`
-	Version      string                       `yaml:"version"`
-	Description  string                       `yaml:"description"`
-	InitialState string                       `yaml:"initial_state"`
+	Name         string                        `yaml:"name"`
+	Version      string                        `yaml:"version"`
+	Description  string                        `yaml:"description"`
+	InitialState string                        `yaml:"initial_state"`
 	Variables    map[string]sourceVariableDecl `yaml:"variables"`
 	States       map[string]sourceStateDecl    `yaml:"states"`
 }

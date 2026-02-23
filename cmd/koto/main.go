@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"github.com/tsukumogami/koto/pkg/discover"
 	"github.com/tsukumogami/koto/pkg/engine"
 	"github.com/tsukumogami/koto/pkg/template"
+	"github.com/tsukumogami/koto/pkg/template/compile"
 )
 
 func main() {
@@ -127,10 +130,41 @@ func cmdInit(args []string) error {
 		return fmt.Errorf("resolve template path: %w", err)
 	}
 
-	// Parse the template file.
-	tmpl, err := template.Parse(absTemplatePath)
+	// Read the source file.
+	sourceBytes, err := os.ReadFile(absTemplatePath) //nolint:gosec // G304: CLI reads user-specified template path
 	if err != nil {
-		return err
+		return fmt.Errorf("read template file: %w", err)
+	}
+
+	// Compile the source template.
+	ct, _, err := compile.Compile(sourceBytes)
+	if err != nil {
+		return fmt.Errorf("compile template: %w", err)
+	}
+
+	// Validate the compiled output through ParseJSON round-trip.
+	compiledJSON, err := json.Marshal(ct)
+	if err != nil {
+		return fmt.Errorf("marshal compiled template: %w", err)
+	}
+	ct, err = template.ParseJSON(compiledJSON)
+	if err != nil {
+		return fmt.Errorf("validate compiled template: %w", err)
+	}
+
+	// Build the engine machine.
+	machine := ct.BuildMachine()
+
+	// Compute the compiler hash (SHA-256 of compiled JSON, not raw source).
+	templateHash, _, err := compile.Hash(ct)
+	if err != nil {
+		return fmt.Errorf("hash compiled template: %w", err)
+	}
+
+	// Convert to Template for variable defaults.
+	tmpl, err := ct.ToTemplate()
+	if err != nil {
+		return fmt.Errorf("convert compiled template: %w", err)
 	}
 
 	// Merge variables: start with template defaults, then overlay --var flags.
@@ -154,9 +188,9 @@ func cmdInit(args []string) error {
 
 	statePath := filepath.Join(stateDir, fmt.Sprintf("koto-%s.state.json", name))
 
-	eng, err := engine.Init(statePath, tmpl.Machine, engine.InitMeta{
+	eng, err := engine.Init(statePath, machine, engine.InitMeta{
 		Name:         name,
-		TemplateHash: tmpl.Hash,
+		TemplateHash: templateHash,
 		TemplatePath: absTemplatePath,
 		Variables:    variables,
 	})
@@ -459,10 +493,13 @@ func resolveStatePath(statePath, stateDir string) (string, error) {
 }
 
 // loadTemplateFromState reads a state file, extracts the template path
-// and stored template hash, and parses the template. This is the standard
-// way to recover the Machine and Template for commands that operate on an
-// existing workflow. The returned storedHash is the template hash recorded
-// in the state file at init time.
+// and stored template hash, compiles the template via the compiler path,
+// and performs dual-hash comparison. If the compiler hash matches the
+// stored hash, the template is returned directly. If not, the legacy hash
+// (SHA-256 of raw source) is tried. On legacy match, a deprecation warning
+// is printed to stderr and the returned template's Hash is set to the
+// stored hash so that callers' existing storedHash != tmpl.Hash checks
+// remain valid. If neither hash matches, ErrTemplateMismatch is returned.
 func loadTemplateFromState(statePath string) (tmpl *template.Template, storedHash string, err error) {
 	data, err := os.ReadFile(statePath) //nolint:gosec // G304: CLI reads user-specified state path
 	if err != nil {
@@ -484,12 +521,66 @@ func loadTemplateFromState(statePath string) (tmpl *template.Template, storedHas
 		return nil, "", fmt.Errorf("state file has no template_path")
 	}
 
-	tmpl, err = template.Parse(header.Workflow.TemplatePath)
+	// Read the source file.
+	sourceBytes, err := os.ReadFile(header.Workflow.TemplatePath) //nolint:gosec // G304: CLI reads template path from state file
 	if err != nil {
-		return nil, "", fmt.Errorf("parse template: %w", err)
+		return nil, "", fmt.Errorf("read template file: %w", err)
 	}
 
-	return tmpl, header.Workflow.TemplateHash, nil
+	// Compile the source template.
+	ct, _, err := compile.Compile(sourceBytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("compile template: %w", err)
+	}
+
+	// Validate through ParseJSON round-trip.
+	compiledJSON, err := json.Marshal(ct)
+	if err != nil {
+		return nil, "", fmt.Errorf("marshal compiled template: %w", err)
+	}
+	ct, err = template.ParseJSON(compiledJSON)
+	if err != nil {
+		return nil, "", fmt.Errorf("validate compiled template: %w", err)
+	}
+
+	// Compute the compiler hash.
+	compilerHash, _, err := compile.Hash(ct)
+	if err != nil {
+		return nil, "", fmt.Errorf("hash compiled template: %w", err)
+	}
+
+	// Convert to Template via adapter.
+	tmpl, err = ct.ToTemplate()
+	if err != nil {
+		return nil, "", fmt.Errorf("convert compiled template: %w", err)
+	}
+	tmpl.Path = header.Workflow.TemplatePath
+	tmpl.Hash = compilerHash
+
+	// Dual-hash comparison: try compiler hash first.
+	if compilerHash == header.Workflow.TemplateHash {
+		return tmpl, header.Workflow.TemplateHash, nil
+	}
+
+	// Fall back to legacy hash (SHA-256 of raw source bytes).
+	sum := sha256.Sum256(sourceBytes)
+	legacyHash := "sha256:" + hex.EncodeToString(sum[:])
+
+	if legacyHash == header.Workflow.TemplateHash {
+		fmt.Fprintln(os.Stderr, "note: workflow uses legacy template hash; re-init to upgrade")
+		// Set tmpl.Hash to the stored hash so callers' storedHash != tmpl.Hash
+		// checks remain valid.
+		tmpl.Hash = header.Workflow.TemplateHash
+		return tmpl, header.Workflow.TemplateHash, nil
+	}
+
+	// Neither hash matches.
+	return nil, "", &engine.TransitionError{
+		Code: engine.ErrTemplateMismatch,
+		Message: fmt.Sprintf(
+			"template hash mismatch: state file has %q but template on disk produces %q (compiler) or %q (legacy)",
+			header.Workflow.TemplateHash, compilerHash, legacyHash),
+	}
 }
 
 // isFlag reports whether s looks like a flag argument. It checks for

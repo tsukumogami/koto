@@ -11,13 +11,13 @@ import (
 // template. It contains the full state machine definition, variable
 // declarations, and metadata needed to build an engine.Machine.
 type CompiledTemplate struct {
-	FormatVersion int                    `json:"format_version"`
-	Name          string                 `json:"name"`
-	Version       string                 `json:"version"`
-	Description   string                 `json:"description,omitempty"`
-	InitialState  string                 `json:"initial_state"`
+	FormatVersion int                     `json:"format_version"`
+	Name          string                  `json:"name"`
+	Version       string                  `json:"version"`
+	Description   string                  `json:"description,omitempty"`
+	InitialState  string                  `json:"initial_state"`
 	Variables     map[string]VariableDecl `json:"variables,omitempty"`
-	States        map[string]StateDecl   `json:"states"`
+	States        map[string]StateDecl    `json:"states"`
 }
 
 // VariableDecl declares a template variable with optional description,
@@ -100,6 +100,34 @@ func ParseJSON(data []byte) (*CompiledTemplate, error) {
 	}
 
 	return &ct, nil
+}
+
+// ToTemplate converts a CompiledTemplate to a Template struct for use
+// with the controller. Sections are populated from StateDecl.Directive
+// fields, Variables from VariableDecl.Default values, Machine from
+// BuildMachine(), and Hash from the caller-supplied hash. Path must be
+// set by the caller after this method returns.
+func (ct *CompiledTemplate) ToTemplate() (*Template, error) {
+	machine := ct.BuildMachine()
+
+	sections := make(map[string]string, len(ct.States))
+	for name, sd := range ct.States {
+		sections[name] = sd.Directive
+	}
+
+	variables := make(map[string]string, len(ct.Variables))
+	for name, vd := range ct.Variables {
+		variables[name] = vd.Default
+	}
+
+	return &Template{
+		Name:        ct.Name,
+		Version:     ct.Version,
+		Description: ct.Description,
+		Machine:     machine,
+		Sections:    sections,
+		Variables:   variables,
+	}, nil
 }
 
 // BuildMachine converts the compiled template into an engine.Machine
