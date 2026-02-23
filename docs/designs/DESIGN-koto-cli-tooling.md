@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 spawned_from:
   issue: 18
   repo: tsukumogami/koto
@@ -26,7 +26,46 @@ rationale: |
 
 ## Status
 
-**Accepted**
+**Planned**
+
+## Implementation Issues
+
+### Milestone: [koto CLI and Template Tooling](https://github.com/tsukumogami/koto/milestone/3)
+
+| Issue | Dependencies | Tier |
+|-------|--------------|------|
+| [#19: refactor(cli): migrate init and post-init commands to compiler path](https://github.com/tsukumogami/koto/issues/19) | None | critical |
+| _Switches `cmdInit` and `loadTemplateFromState()` from the legacy `Parse()` path to `compile.Compile()` + `ParseJSON()`. Adds `ToTemplate()` adapter and dual-hash comparison so existing workflows initialized with the legacy parser keep working._ | | |
+| [#20: feat(cli): add koto template compile command](https://github.com/tsukumogami/koto/issues/20) | None | testable |
+| _Adds the `koto template compile <path>` authoring command that compiles a source template and writes compiled JSON to stdout. This is the Path 2 feedback loop for template authors._ | | |
+| [#21: feat(cli): add compilation cache for deployed templates](https://github.com/tsukumogami/koto/issues/21) | [#19](https://github.com/tsukumogami/koto/issues/19) | testable |
+| _Creates `pkg/cache/` and integrates it into `cmdInit` so repeated calls with the same deployed template skip recompilation. This is the Path 1 optimization for skills and scripts._ | | |
+| [#22: chore(template): deprecate legacy Parse function](https://github.com/tsukumogami/koto/issues/22) | [#19](https://github.com/tsukumogami/koto/issues/19) | simple |
+| _Adds a Go-style deprecation notice to `Parse()` and migrates integration tests to the compiler path. No production behavior changes._ | | |
+
+### Dependency Graph
+
+```mermaid
+graph LR
+    I19["#19: Migrate init to compiler path"]
+    I20["#20: Template compile command"]
+    I21["#21: Compilation cache"]
+    I22["#22: Deprecate Parse"]
+
+    I19 --> I21
+    I19 --> I22
+
+    classDef done fill:#c8e6c9
+    classDef ready fill:#bbdefb
+    classDef blocked fill:#fff9c4
+    classDef needsDesign fill:#e1bee7
+    classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
+
+    class I19,I20 ready
+    class I21,I22 blocked
+```
+
+**Legend**: Green = done, Blue = ready, Yellow = blocked, Purple = needs-design, Orange = tracks-design
 
 ## Upstream Design Reference
 
