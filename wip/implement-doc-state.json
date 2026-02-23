@@ -3,19 +3,39 @@
   "design_doc": "docs/designs/DESIGN-koto-installation.md",
   "branch": "docs/koto-installation",
   "pr_number": 24,
-  "integrity_hash": "sha256:8cec6b79ebcd232563cfb66559fbf821aee2325a6201650a039d79c1aef1fc1b",
+  "integrity_hash": "sha256:152402fd6fe0df1be9322543ea2d4dd1c2cc858bdeb6d93ec4fce3cfb8a76563",
   "issues": [
     {
       "number": 25,
       "title": "ci(release): add GoReleaser config and release workflow",
-      "status": "pending",
-      "ci_status": "pending",
+      "status": "completed",
+      "ci_status": "passed",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "code",
       "dependencies": [],
-      "commits": [],
-      "agent_type": "",
-      "summary": null,
+      "commits": [
+        "1174c40"
+      ],
+      "agent_type": "coder",
+      "summary": {
+        "narrative": "",
+        "files_changed": [
+          ".goreleaser.yaml",
+          ".github/workflows/release.yml"
+        ],
+        "tests_added": 0,
+        "key_decisions": "Mirror tsuku release infra exactly",
+        "requirements_map": {}
+      },
+      "reviewer_results": {
+        "reviews": [
+          {
+            "agent": "pragmatic-reviewer",
+            "verdict": "approve",
+            "comments": "PR #29 merged by user"
+          }
+        ]
+      },
       "testable_scenarios": [
         "scenario-1",
         "scenario-2",

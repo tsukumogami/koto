@@ -7,7 +7,7 @@ Total scenarios: 14
 ---
 
 ## Scenario 1: GoReleaser config file exists and parses correctly
-**ID**: scenario-1
+**ID**: [x] scenario-1
 **Testable after**: #25
 **Category**: infrastructure
 **Commands**:
@@ -20,7 +20,7 @@ Total scenarios: 14
 ---
 
 ## Scenario 2: GoReleaser config contains required build settings
-**ID**: scenario-2
+**ID**: [x] scenario-2
 **Testable after**: #25
 **Category**: infrastructure
 **Commands**:
@@ -37,7 +37,7 @@ Total scenarios: 14
 ---
 
 ## Scenario 3: GoReleaser config targets correct platforms (no Windows)
-**ID**: scenario-3
+**ID**: [x] scenario-3
 **Testable after**: #25
 **Category**: infrastructure
 **Commands**:
@@ -52,7 +52,7 @@ Total scenarios: 14
 ---
 
 ## Scenario 4: Release workflow has two-job pipeline structure
-**ID**: scenario-4
+**ID**: [x] scenario-4
 **Testable after**: #25
 **Category**: infrastructure
 **Commands**:
@@ -69,7 +69,7 @@ Total scenarios: 14
 ---
 
 ## Scenario 5: Release job contains GoReleaser, mod tidy check, and tag annotation steps
-**ID**: scenario-5
+**ID**: [x] scenario-5
 **Testable after**: #25
 **Category**: infrastructure
 **Commands**:
@@ -84,7 +84,7 @@ Total scenarios: 14
 ---
 
 ## Scenario 6: Finalize job verifies artifacts and publishes
-**ID**: scenario-6
+**ID**: [x] scenario-6
 **Testable after**: #25
 **Category**: infrastructure
 **Commands**:

@@ -19,8 +19,8 @@ rationale: |
 
 | Issue | Dependencies | Tier |
 |-------|--------------|------|
-| [#25: ci(release): add GoReleaser config and release workflow](https://github.com/tsukumogami/koto/issues/25) | None | testable |
-| _Creates `.goreleaser.yaml` and `.github/workflows/release.yml` mirroring tsuku's two-job pipeline (release + finalize-release). Produces raw binaries for linux/darwin on amd64/arm64 with checksum generation and tag-annotation release notes._ | | |
+| ~~[#25: ci(release): add GoReleaser config and release workflow](https://github.com/tsukumogami/koto/issues/25)~~ | ~~None~~ | ~~testable~~ |
+| ~~_Creates `.goreleaser.yaml` and `.github/workflows/release.yml` mirroring tsuku's two-job pipeline (release + finalize-release). Produces raw binaries for linux/darwin on amd64/arm64 with checksum generation and tag-annotation release notes._~~ | | |
 | [#26: ci(release): validate release pipeline with v0.1.0](https://github.com/tsukumogami/koto/issues/26) | [#25](https://github.com/tsukumogami/koto/issues/25) | testable |
 | _Tags and pushes v0.1.0 to exercise the full pipeline end-to-end. Validates that all 4 binaries are built, checksums are correct, and the release is published. Produces the real release assets that the install script and tsuku recipe need to test against._ | | |
 | [#27: feat(install): add self-contained install script](https://github.com/tsukumogami/koto/issues/27) | [#26](https://github.com/tsukumogami/koto/issues/26) | testable |
@@ -47,8 +47,9 @@ graph LR
     classDef needsDesign fill:#e1bee7
     classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
 
-    class I25 ready
-    class I26,I27,I28 blocked
+    class I25 done
+    class I26 ready
+    class I27,I28 blocked
 ```
 
 **Legend**: Green = done, Blue = ready, Yellow = blocked, Purple = needs-design, Orange = tracks-design
