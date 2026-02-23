@@ -11,6 +11,7 @@ import (
 
 	"github.com/tsukumogami/koto/pkg/discover"
 	"github.com/tsukumogami/koto/pkg/engine"
+	"github.com/tsukumogami/koto/pkg/template"
 	"github.com/tsukumogami/koto/pkg/template/compile"
 )
 
@@ -881,5 +882,247 @@ func TestCmdNext_ReturnsCompiledDirective(t *testing.T) {
 	}
 	if !strings.Contains(assessDirective, "{{TASK}}") {
 		t.Errorf("Sections[assess] = %q, expected to contain {{TASK}} placeholder", assessDirective)
+	}
+}
+
+// --- cmdTemplate tests ---
+
+func TestCmdTemplate_NoSubcommand(t *testing.T) {
+	err := cmdTemplate(nil)
+	if err == nil {
+		t.Fatal("expected error when no subcommand given")
+	}
+	if !strings.Contains(err.Error(), "usage:") {
+		t.Errorf("error should contain usage hint: %v", err)
+	}
+}
+
+func TestCmdTemplate_UnknownSubcommand(t *testing.T) {
+	err := cmdTemplate([]string{"nonexistent"})
+	if err == nil {
+		t.Fatal("expected error for unknown subcommand")
+	}
+	if !strings.Contains(err.Error(), "unknown template subcommand") {
+		t.Errorf("error should mention unknown subcommand: %v", err)
+	}
+}
+
+// --- cmdTemplateCompile tests ---
+
+func TestCmdTemplateCompile_Success(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+
+	err := cmdTemplateCompile([]string{tmplPath})
+	if err != nil {
+		t.Fatalf("cmdTemplateCompile() error: %v", err)
+	}
+}
+
+func TestCmdTemplateCompile_OutputIsValidJSON(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	outputPath := filepath.Join(dir, "compiled.json")
+
+	err := cmdTemplateCompile([]string{tmplPath, "--output", outputPath})
+	if err != nil {
+		t.Fatalf("cmdTemplateCompile() error: %v", err)
+	}
+
+	data, err := os.ReadFile(outputPath) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("read output file: %v", err)
+	}
+
+	var ct map[string]interface{}
+	if err := json.Unmarshal(data, &ct); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+
+	// Verify expected top-level fields.
+	if ct["name"] != "lifecycle" {
+		t.Errorf("name = %v, want %q", ct["name"], "lifecycle")
+	}
+	if ct["initial_state"] != "assess" {
+		t.Errorf("initial_state = %v, want %q", ct["initial_state"], "assess")
+	}
+	if _, ok := ct["states"]; !ok {
+		t.Error("missing 'states' field in compiled output")
+	}
+}
+
+func TestCmdTemplateCompile_OutputFileFlag(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	outputPath := filepath.Join(dir, "output.json")
+
+	err := cmdTemplateCompile([]string{tmplPath, "--output", outputPath})
+	if err != nil {
+		t.Fatalf("cmdTemplateCompile() error: %v", err)
+	}
+
+	// Output file should exist and contain valid JSON.
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Fatalf("output file not created: %v", err)
+	}
+
+	data, err := os.ReadFile(outputPath) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+
+	var ct map[string]interface{}
+	if err := json.Unmarshal(data, &ct); err != nil {
+		t.Fatalf("output file is not valid JSON: %v", err)
+	}
+}
+
+func TestCmdTemplateCompile_MissingPath(t *testing.T) {
+	err := cmdTemplateCompile(nil)
+	if err == nil {
+		t.Fatal("expected error when no path given")
+	}
+	if !strings.Contains(err.Error(), "usage:") {
+		t.Errorf("error should contain usage hint: %v", err)
+	}
+}
+
+func TestCmdTemplateCompile_NonexistentFile(t *testing.T) {
+	err := cmdTemplateCompile([]string{"/nonexistent/path/template.md"})
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+	if !strings.Contains(err.Error(), "read source file") {
+		t.Errorf("error should mention reading source file: %v", err)
+	}
+}
+
+func TestCmdTemplateCompile_InvalidTemplate(t *testing.T) {
+	dir := t.TempDir()
+	badPath := filepath.Join(dir, "bad.md")
+	if err := os.WriteFile(badPath, []byte("not yaml frontmatter at all\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	err := cmdTemplateCompile([]string{badPath})
+	if err == nil {
+		t.Fatal("expected error for invalid template")
+	}
+	if !strings.Contains(err.Error(), "compile") {
+		t.Errorf("error should mention compilation failure: %v", err)
+	}
+}
+
+func TestCmdTemplateCompile_WarningsWrittenToStderr(t *testing.T) {
+	// Create a template with a heading collision to trigger a warning.
+	// The "start" heading appears twice -- first occurrence is claimed,
+	// second triggers a warning.
+	warningTemplate := `---
+name: warning-test
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions: [done]
+  done:
+    terminal: true
+---
+
+## start
+
+First section.
+
+## start
+
+Duplicate heading -- should produce a warning.
+
+## done
+
+All done.
+`
+	dir := t.TempDir()
+	tmplPath := filepath.Join(dir, "warning.md")
+	if err := os.WriteFile(tmplPath, []byte(warningTemplate), 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	// Capture stderr by redirecting os.Stderr temporarily.
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe() error: %v", err)
+	}
+	os.Stderr = w
+
+	compileErr := cmdTemplateCompile([]string{tmplPath})
+
+	w.Close()
+	os.Stderr = origStderr
+
+	buf := make([]byte, 4096)
+	n, _ := r.Read(buf)
+	r.Close()
+
+	if compileErr != nil {
+		t.Fatalf("cmdTemplateCompile() error: %v", compileErr)
+	}
+
+	stderrStr := string(buf[:n])
+	if !strings.Contains(stderrStr, "warning:") {
+		t.Errorf("stderr should contain 'warning:' prefix, got: %q", stderrStr)
+	}
+}
+
+func TestCmdTemplateCompile_RoundTrip(t *testing.T) {
+	// Verify that the compiled output can be parsed back through ParseJSON.
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	outputPath := filepath.Join(dir, "compiled.json")
+
+	err := cmdTemplateCompile([]string{tmplPath, "--output", outputPath})
+	if err != nil {
+		t.Fatalf("cmdTemplateCompile() error: %v", err)
+	}
+
+	data, err := os.ReadFile(outputPath) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+
+	// Round-trip through ParseJSON to validate the output format.
+	ct, err := template.ParseJSON(data)
+	if err != nil {
+		t.Fatalf("ParseJSON() error: %v", err)
+	}
+
+	if ct.Name != "lifecycle" {
+		t.Errorf("Name = %q, want %q", ct.Name, "lifecycle")
+	}
+	if ct.InitialState != "assess" {
+		t.Errorf("InitialState = %q, want %q", ct.InitialState, "assess")
+	}
+	if len(ct.States) != 4 {
+		t.Errorf("len(States) = %d, want 4", len(ct.States))
+	}
+}
+
+func TestCmdTemplate_ExistingCommandsUnaffected(t *testing.T) {
+	// Verify that adding the template subcommand doesn't break existing
+	// commands by running a quick init/validate cycle.
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	stateDir := filepath.Join(dir, "state")
+
+	if err := cmdInit([]string{
+		"--name", "unaffected-test",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+	}); err != nil {
+		t.Fatalf("cmdInit() error: %v", err)
+	}
+
+	statePath := filepath.Join(stateDir, "koto-unaffected-test.state.json")
+	if err := cmdValidate([]string{"--state", statePath}); err != nil {
+		t.Fatalf("cmdValidate() error: %v", err)
 	}
 }

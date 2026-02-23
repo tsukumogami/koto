@@ -46,6 +46,8 @@ func main() {
 		err = cmdValidate(os.Args[2:])
 	case "workflows":
 		err = cmdWorkflows(os.Args[2:])
+	case "template":
+		err = cmdTemplate(os.Args[2:])
 	default:
 		printError("unknown_command", fmt.Sprintf("unknown command: %s", os.Args[1]))
 		os.Exit(1)
@@ -456,6 +458,68 @@ func cmdWorkflows(args []string) error {
 	}
 
 	return printJSON(workflows)
+}
+
+func cmdTemplate(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: koto template <subcommand>\navailable subcommands: compile")
+	}
+
+	switch args[0] {
+	case "compile":
+		return cmdTemplateCompile(args[1:])
+	default:
+		return fmt.Errorf("unknown template subcommand: %s", args[0])
+	}
+}
+
+func cmdTemplateCompile(args []string) error {
+	p, err := parseFlags(args, nil)
+	if err != nil {
+		return err
+	}
+
+	if len(p.positional) == 0 {
+		return fmt.Errorf("usage: koto template compile <path> [--output <file>]")
+	}
+
+	sourcePath := p.positional[0]
+	outputPath := p.flags["--output"]
+
+	// Read the source file.
+	sourceBytes, err := os.ReadFile(sourcePath) //nolint:gosec // G304: CLI reads user-specified template path
+	if err != nil {
+		return fmt.Errorf("read source file: %w", err)
+	}
+
+	// Compile the source template.
+	ct, warnings, err := compile.Compile(sourceBytes)
+	if err != nil {
+		return fmt.Errorf("compile: %w", err)
+	}
+
+	// Print warnings to stderr.
+	for _, w := range warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w.Message) //nolint:gosec // G705: warning message is from compiler, not user input
+	}
+
+	// Marshal to JSON.
+	compiledJSON, err := json.MarshalIndent(ct, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal compiled template: %w", err)
+	}
+	compiledJSON = append(compiledJSON, '\n')
+
+	// Write to output file or stdout.
+	if outputPath != "" {
+		if err := os.WriteFile(outputPath, compiledJSON, 0o644); err != nil { //nolint:gosec // G306: compiled template output is not sensitive
+			return fmt.Errorf("write output file: %w", err)
+		}
+		return nil
+	}
+
+	fmt.Print(string(compiledJSON))
+	return nil
 }
 
 // resolveStatePath determines the state file path from explicit --state,
