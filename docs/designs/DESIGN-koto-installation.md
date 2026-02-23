@@ -3,9 +3,9 @@ status: Proposed
 problem: |
   koto has a working engine, template compiler, and cache, but no way to install the binary. Users must clone the repo and run go build. There are also no built-in templates, so the first-run experience requires authoring a template before trying anything. Both problems block adoption.
 decision: |
-  GoReleaser builds multi-platform binaries on tag push. A self-contained install script (curl|sh) is the primary installation channel, installing to ~/.koto/bin/ with checksum verification and PATH setup. tsuku gets a recipe for dogfooding. Third-party package managers (Homebrew, apt, etc.) are deferred until the tool is stable. Built-in templates are compiled into the binary via go:embed. A three-layer template search path in pkg/resolve checks project-local, user-level, and built-in locations.
+  Release automation mirrors tsuku's existing pipeline: GoReleaser builds raw binaries (format: binary, no archives) on tag push, creates a draft GitHub release with tag-annotation release notes, and a finalize job verifies artifacts and publishes. A self-contained install script (curl|sh, served from GitHub) is the primary installation channel, installing to ~/.koto/bin/ with checksum verification and PATH setup. tsuku gets a recipe for dogfooding. Third-party package managers are deferred until stable. Built-in templates ship via go:embed with a three-layer search path in pkg/resolve.
 rationale: |
-  A self-contained install script gives koto full control over the installation experience without depending on third-party package manager ecosystems that add maintenance burden during early development. The script follows the same pattern as tsuku and Claude Code (curl|sh, checksum verification, shell PATH integration). The tsuku recipe eats our own dogfood and validates koto's GitHub releases as a distribution source. Deferring Homebrew and other package managers avoids the cost of maintaining tap repos, formula updates, and cross-repo secrets while the CLI surface is still changing rapidly.
+  Mirroring tsuku's release infrastructure means we don't reinvent the wheel and can grow in complexity alongside it. A self-contained install script gives koto full control over the installation experience without depending on third-party package ecosystems. The script follows the same pattern as tsuku and Claude Code (curl|sh, checksum verification, shell PATH integration), served directly from GitHub since we don't own a custom domain yet. The tsuku recipe eats our own dogfood. Deferring Homebrew and other package managers avoids maintaining tap repos and cross-repo secrets while the CLI surface is still changing.
 ---
 # DESIGN: koto Installation and Distribution
 
@@ -30,8 +30,8 @@ This design covers **step 1 only**. Step 3 is the engine (already built). Step 2
 ### Scope
 
 **In scope:**
-- Release automation via GoReleaser and GitHub Actions
-- Self-contained install script (`curl -fsSL https://get.koto.dev | sh`)
+- Release automation via GoReleaser and GitHub Actions (mirroring tsuku's pipeline)
+- Self-contained install script served from GitHub (`curl -fsSL <github-raw-url> | sh`)
 - tsuku recipe for koto (eating our own dogfood)
 - Built-in template distribution via `go:embed`
 - Template search path (project-local, user-level, built-in)
@@ -61,13 +61,23 @@ This design covers **step 1 only**. Step 3 is the engine (already built). Step 2
 
 koto needs to go from a git tag to published binaries across platforms. This happens on every release and must be reliable.
 
-#### Chosen: GoReleaser via GitHub Actions
+#### Chosen: GoReleaser via GitHub Actions (mirroring tsuku)
 
-GoReleaser is the standard tool for Go CLI releases. A push to a semver tag (e.g., `v0.1.0`) triggers a GitHub Actions workflow that builds binaries for linux/darwin (amd64/arm64), creates archives with checksums, and publishes to GitHub Releases.
+The release pipeline mirrors tsuku's existing infrastructure so both projects grow in complexity together rather than diverging. A push to a semver tag (e.g., `v0.1.0`) triggers a GitHub Actions workflow with two jobs:
 
-The `.goreleaser.yml` config is declarative. It specifies the build matrix, archive format (tar.gz), and ldflags for version embedding. GoReleaser handles changelog generation from commits since the previous tag.
+1. **`release` job**: Runs GoReleaser to build binaries, then replaces the auto-generated release body with the git tag annotation message (release notes live in the tag, not a CHANGELOG file or GoReleaser config).
+2. **`finalize-release` job**: Verifies all expected artifacts are present, regenerates a unified `checksums.txt`, and publishes the draft.
 
-Version information is already embedded at build time via ldflags into `internal/buildinfo` package variables. The `koto version` subcommand and `debug.BuildInfo` fallback are implemented. GoReleaser's ldflags target `github.com/tsukumogami/koto/internal/buildinfo.version` and `.commit` (not `main.*`).
+Key GoReleaser configuration choices (all matching tsuku):
+- **`format: binary`**: Raw executables, no tar.gz archives. Simpler for the install script and tsuku recipe to consume.
+- **Binary naming**: `koto-{{ .Os }}-{{ .Arch }}` with `no_unique_dist_dir: true`
+- **Draft release**: `make_latest: true`, `prerelease: auto`. The release stays draft until the finalize job publishes it.
+- **Changelog disabled**: Release notes come from git tag annotations, set via `gh release edit` in the release job.
+- **ldflags**: `-s -w` (strip debug info), `-X github.com/tsukumogami/koto/internal/buildinfo.version={{.Version}}`, `-X github.com/tsukumogami/koto/internal/buildinfo.commit={{.Commit}}`
+- **Build flags**: `-trimpath`, `-buildvcs=false`, `CGO_ENABLED=0`, `mod_timestamp` set to commit timestamp -- all for reproducible builds.
+- **Platforms**: linux/darwin, amd64/arm64. No Windows.
+
+Version information is already embedded at build time via ldflags into `internal/buildinfo` package variables. The `koto version` subcommand and `debug.BuildInfo` fallback are implemented. The GoReleaser ldflags target `internal/buildinfo`, not `main`.
 
 #### Alternatives Considered
 
@@ -81,13 +91,13 @@ Users need a way to install koto that doesn't require Go tooling or a third-part
 
 #### Chosen: Self-contained install script
 
-A shell script served at `https://get.koto.dev` (or a path on the koto website) that downloads the correct binary for the user's platform, verifies its checksum, and installs it to `~/.koto/bin/`. Usage:
+A shell script hosted in the koto repository and served via GitHub's raw content URL. It downloads the correct binary for the user's platform, verifies its checksum, and installs it to `~/.koto/bin/`. Usage:
 
 ```bash
-curl -fsSL https://get.koto.dev | sh
+curl -fsSL https://raw.githubusercontent.com/tsukumogami/koto/main/website/install.sh | sh
 ```
 
-This follows the same pattern used by tsuku (`curl -fsSL https://get.tsuku.dev/now | sh`), Claude Code (`curl -fsSL https://claude.ai/install.sh | sh`), Deno, Bun, and Rust/rustup. The pattern is well-understood by developers.
+This follows the same pattern used by tsuku, Claude Code, Deno, Bun, and Rust/rustup. We don't own a custom domain for koto yet, so the script is served directly from GitHub. If a custom domain is acquired later, the URL can change without affecting the script's behavior.
 
 The script:
 1. **Detects platform**: `uname -s` for OS (linux/darwin), `uname -m` for arch (amd64/arm64), with normalization
@@ -130,13 +140,13 @@ repo = "koto"
 
 [install]
 actions = [
-    { type = "download", url = "https://github.com/tsukumogami/koto/releases/download/v{{version}}/koto_{{version}}_{{os}}_{{arch}}.tar.gz" },
-    { type = "extract" },
-    { type = "install_binaries", pattern = "koto" },
+    { type = "download", url = "https://github.com/tsukumogami/koto/releases/download/v{{version}}/koto-{{os}}-{{arch}}" },
+    { type = "chmod", mode = "755" },
+    { type = "install_binaries", pattern = "koto-*" },
 ]
 ```
 
-This is a standard tsuku recipe -- nothing special about it. It uses the same GitHub releases version provider and download/extract/install pattern as other recipes in the registry.
+Since GoReleaser uses `format: binary` (raw executables, no archives), the recipe downloads the binary directly -- no extract step needed. This matches how tsuku's own binary is distributed.
 
 The tsuku channel and the install script are independent. tsuku installs to `~/.tsuku/bin/`, the install script installs to `~/.koto/bin/`. Users pick one. If they have tsuku, `tsuku install koto` is the natural choice. If not, the install script works without dependencies.
 
@@ -184,7 +194,7 @@ The first match wins. A project-local template with the same name as a built-in 
 
 ### Summary
 
-koto gets a release pipeline and two installation channels. GoReleaser builds multi-platform binaries on tag push and publishes to GitHub Releases with checksums. A self-contained install script (`curl -fsSL https://get.koto.dev | sh`) downloads the right binary, verifies its checksum, installs to `~/.koto/bin/`, and sets up PATH. A tsuku recipe provides a second channel for tsuku users. Third-party package managers (Homebrew, apt, etc.) are deferred until the CLI surface stabilizes.
+koto gets a release pipeline mirroring tsuku's and two installation channels. GoReleaser builds raw binaries (no archives) on tag push, creates a draft GitHub release with tag-annotation release notes, and a finalize job verifies artifacts and publishes. A self-contained install script (served from GitHub) downloads the right binary, verifies its checksum, installs to `~/.koto/bin/`, and sets up PATH. A tsuku recipe provides a second channel for tsuku users. Third-party package managers (Homebrew, apt, etc.) are deferred until the CLI surface stabilizes.
 
 Built-in templates are compiled into the binary via `go:embed`. A three-layer template search path checks project-local (`.koto/templates/`), user-level (`$KOTO_HOME/templates/`), and built-in (embedded) locations in that order. The first match wins. No world-writable directories appear in the default path.
 
@@ -192,22 +202,24 @@ This design covers getting the binary installed (step 1). How agents discover an
 
 ### Rationale
 
-A self-contained install script gives koto full control over the installation experience during early development. There are no external dependencies (no package manager accounts, no tap repos, no cross-repo secrets), and the script follows a pattern developers already trust. The `~/.koto/bin/` install location reuses the existing `~/.koto/` convention and opens the door for a future `koto update` command.
+Mirroring tsuku's release infrastructure means we don't reinvent the wheel. Both projects use GoReleaser with the same conventions (raw binary format, draft releases, tag-annotation notes, finalize job). As koto grows in complexity (e.g., companion binaries, additional platforms), we can follow the same patterns tsuku already solved.
 
-The tsuku recipe validates koto's GitHub releases as a distribution source and eats our own dogfood. It's also zero additional infrastructure -- the recipe is a TOML file in tsuku's existing registry.
+A self-contained install script gives koto full control over the installation experience during early development. Serving it from GitHub avoids the need for a custom domain while still being a stable, auditable URL. The `~/.koto/bin/` install location reuses the existing `~/.koto/` convention and opens the door for a future `koto update` command.
 
-Deferring Homebrew and other package managers avoids maintaining formula repos and secrets while the CLI surface is changing. GoReleaser already produces the release assets those channels need, so adding them later is a configuration change, not a redesign.
+The tsuku recipe validates koto's GitHub releases as a distribution source and eats our own dogfood. It's zero additional infrastructure -- just a TOML file in tsuku's existing registry.
 
-GoReleaser, `go:embed`, and the three-layer search path reinforce each other. GoReleaser produces a hermetic binary that includes embedded templates, so every installation method gets the same built-in templates without extra steps. The search path's override model works because `go:embed` makes the built-in layer always present. And `KOTO_HOME` serves both the cache (already shipped) and the template search path, keeping the configuration surface small.
+Deferring Homebrew and other package managers avoids maintaining formula repos and cross-repo secrets while the CLI surface is changing. GoReleaser already produces the release assets those channels need, so adding them later is a configuration change, not a redesign.
+
+GoReleaser, `go:embed`, and the three-layer search path reinforce each other. GoReleaser produces a hermetic binary that includes embedded templates, so every installation method gets the same built-in templates without extra steps. The search path's override model works because `go:embed` makes the built-in layer always present.
 
 ## Solution Architecture
 
 ### Components
 
 ```
-.goreleaser.yml          -- Build matrix, archive config
+.goreleaser.yaml         -- Build matrix, binary config (mirrors tsuku)
 .github/workflows/
-  release.yml            -- Tag-triggered GoReleaser workflow
+  release.yml            -- Tag-triggered: release + finalize-release jobs
 website/
   install.sh             -- Self-contained install script
 cmd/koto/
@@ -233,12 +245,13 @@ No new code is needed for version infrastructure. The existing output format may
 
 ### Install Script
 
-The install script lives at `website/install.sh` in the koto repo (following tsuku's pattern where `website/install.sh` is served at `https://get.tsuku.dev/now`). It's a standalone bash script with `set -euo pipefail`.
+The install script lives at `website/install.sh` in the koto repo (following tsuku's pattern). It's served via GitHub raw URL since we don't own a custom domain yet. It's a standalone bash script with `set -euo pipefail`, closely mirroring tsuku's `website/install.sh`.
 
-Key behaviors:
-- **Platform detection**: Normalizes `uname` output to GoReleaser's naming convention (`linux`/`darwin`, `amd64`/`arm64`)
+Key behaviors (all matching tsuku's installer):
+- **Platform detection**: `uname -s` + `uname -m`, normalized to `linux`/`darwin` and `amd64`/`arm64`. Fails fast on unsupported platforms.
 - **Version resolution**: Queries `api.github.com/repos/tsukumogami/koto/releases/latest`. Supports `$GITHUB_TOKEN` to avoid rate limiting.
-- **Checksum verification**: Downloads `checksums.txt` from the release, looks up the binary's hash, verifies with `sha256sum` or `shasum -a 256`. Exits on mismatch -- no fallback, no skip.
+- **Download URL**: Matches GoReleaser binary naming: `koto-${OS}-${ARCH}` (raw binary, no archive).
+- **Checksum verification**: Downloads `checksums.txt` from the release, greps for the binary, verifies with `sha256sum` or `shasum -a 256`. Warns if neither tool is available (matching tsuku's behavior).
 - **Install directory**: `$KOTO_INSTALL_DIR` or `~/.koto/bin/koto`. Creates dirs with `mkdir -p`.
 - **PATH setup**: Writes `~/.koto/env` with `export PATH="${KOTO_HOME:-$HOME/.koto}/bin:$PATH"`. Sources from shell rc files based on `$SHELL` (bash: `.bashrc` + `.bash_profile`/`.profile`; zsh: `.zshenv`). Idempotent. Skippable with `--no-modify-path`.
 - **Cleanup**: `trap 'rm -rf "$TEMP_DIR"' EXIT`
@@ -270,20 +283,37 @@ Each template is a directory containing a `template.md` file (e.g., `quick-task/
 
 ### GoReleaser Configuration
 
-Target platforms: `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`. Windows deferred.
+Mirrors tsuku's `.goreleaser.yaml`:
 
-Archives: `tar.gz` for all platforms. Checksum file (`checksums.txt`) published alongside release assets. The install script and tsuku recipe both depend on this naming convention.
+- **Platforms**: linux/amd64, linux/arm64, darwin/amd64, darwin/arm64. No Windows.
+- **Format**: `binary` (raw executables, no tar.gz). Binary naming: `koto-{{ .Os }}-{{ .Arch }}`.
+- **ldflags**: `-s -w -X ...buildinfo.version={{.Version}} -X ...buildinfo.commit={{.Commit}}`
+- **Build flags**: `-trimpath`, `-buildvcs=false`, `CGO_ENABLED=0`
+- **`mod_timestamp`**: Commit timestamp for reproducibility
+- **Release**: Draft, `make_latest: true`, `prerelease: auto`
+- **Changelog**: Disabled (release notes come from git tag annotations)
+- **Checksums**: `checksums.txt` with sha256
 
 ### Release Workflow
 
+Mirrors tsuku's two-job pipeline:
+
 ```
-git tag v0.1.0
+git tag -a v0.1.0 -m "Release notes here..."
 git push origin v0.1.0
   --> GitHub Actions: .github/workflows/release.yml
-    --> GoReleaser: build + archive + checksum + GitHub Release
+
+  Job 1: release
+    --> GoReleaser: build binaries + checksums + draft GitHub Release
+    --> gh release edit: replace body with tag annotation message
+
+  Job 2: finalize-release (depends on: release)
+    --> Verify all 4 expected artifacts present (koto-{linux,darwin}-{amd64,arm64})
+    --> Regenerate unified checksums.txt
+    --> Publish draft: gh release edit --draft=false
 ```
 
-After the release is published, users can install immediately via the install script (which queries the GitHub API for the latest release) or via `tsuku install koto` (which uses the same GitHub releases API).
+After the release is published, users can install immediately via the install script or `tsuku install koto` (both query the GitHub API for the latest release).
 
 ## Implementation Approach
 
@@ -292,13 +322,12 @@ After the release is published, users can install immediately via the install sc
 `internal/buildinfo/version.go` and `cmd/koto/main.go` version subcommand already exist. No work needed.
 
 ### Phase 2: GoReleaser and release workflow
-- Add `.goreleaser.yml` configuration (ldflags targeting `internal/buildinfo`, tar.gz archives, checksums.txt)
-- Add `.github/workflows/release.yml`
+- Add `.goreleaser.yaml` mirroring tsuku's config (format: binary, ldflags targeting `internal/buildinfo`, draft release, changelog disabled)
+- Add `.github/workflows/release.yml` with two jobs: `release` (GoReleaser + tag-annotation notes) and `finalize-release` (verify artifacts, unified checksums, publish)
 - Tag and test first release (`v0.1.0`) -- this release ships without template search path or built-ins, which is intentional for validating the release pipeline
 
 ### Phase 3: Install script and tsuku recipe
-- Write `website/install.sh` following tsuku's pattern (platform detection, checksum verification, PATH setup)
-- Set up hosting so the script is available at a stable URL
+- Write `website/install.sh` adapting tsuku's install script (platform detection, binary naming, checksum verification, PATH setup to `~/.koto/bin/`)
 - Add `koto.toml` recipe to tsuku's `recipes/` directory
 - Test both channels: install script on linux/darwin, `tsuku install koto`
 
@@ -319,7 +348,7 @@ After the release is published, users can install immediately via the install sc
 
 ### Download Verification
 
-GoReleaser generates a `checksums.txt` file containing SHA-256 hashes for every release artifact. The install script downloads this file and verifies the binary's checksum before installation -- this is mandatory, not optional. On checksum mismatch the script exits immediately with an error.
+The finalize-release job regenerates a unified `checksums.txt` file containing SHA-256 hashes for every release artifact. The install script downloads this file and verifies the binary's checksum before installation. On checksum mismatch the script exits with an error (matching tsuku's behavior, which warns but continues if no checksum tool is available).
 
 `go install` builds from source, so download verification isn't applicable.
 
@@ -329,13 +358,13 @@ Cosign-based artifact signing is planned for v0.2.0. For v0.1.0, checksum verifi
 
 The curl-pipe-sh pattern has known risks: network MITM could serve a different script, and the script runs with the user's full permissions. Mitigations:
 
-- The script is served over HTTPS. `curl -fsSL` fails on HTTP errors and follows redirects.
+- The script is served from `raw.githubusercontent.com` over HTTPS. `curl -fsSL` fails on HTTP errors.
 - The script only downloads from `github.com` (a trusted domain) and verifies checksums from the same release.
 - The script does not require `sudo` or elevated permissions. It installs to the user's home directory.
 - The script source is committed to the koto repository and can be audited before running.
 - Users who don't trust curl-pipe-sh can download the binary manually from GitHub Releases and verify checksums themselves.
 
-The script doesn't phone home or collect telemetry. It makes exactly two HTTPS requests: one to the GitHub API (version resolution) and one to GitHub Releases (binary download). The checksums.txt download is a third request from the same release.
+The script doesn't phone home or collect telemetry. It makes three HTTPS requests: GitHub API (version resolution), GitHub Releases (binary download), and GitHub Releases (checksums.txt).
 
 ### Execution Isolation
 
