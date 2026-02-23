@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 problem: |
   koto's template compiler is fully implemented as a Go library but unreachable from
   the CLI. Templates reach users through two distinct paths -- deployed by skills/plugins
@@ -22,7 +22,7 @@ rationale: |
 
 ## Status
 
-**Proposed**
+**Accepted**
 
 ## Upstream Design Reference
 
