@@ -1,22 +1,21 @@
 ---
 status: Proposed
 problem: |
-  koto's template compiler and evidence system are fully implemented as Go libraries
-  but unreachable from the command line. Templates reach users through two distinct
-  paths -- deployed by skills/plugins (Path 1) or authored manually (Path 2) -- but
-  neither path has CLI support. The init command uses a legacy parser, the transition
-  command has no evidence flag, and there are no authoring tools.
+  koto's template compiler is fully implemented as a Go library but unreachable from
+  the CLI. Templates reach users through two distinct paths -- deployed by skills/plugins
+  or authored manually -- but neither path has CLI support. The init command still uses
+  a legacy parser, and there are no authoring tools for template development.
 decision: |
-  koto init compiles templates implicitly and caches the result for deployed templates
-  (Path 1). Template authors (Path 2) get a feedback loop via koto template compile,
-  inspect, and list commands. A search path (project-local, user-global) serves
-  name-based resolution for authored templates. koto transition gets --evidence flags.
-  LLM-assisted validation is deferred to a future design.
+  koto init compiles templates implicitly and caches the result for deployed templates.
+  Template authors get a feedback loop via koto template compile and inspect commands.
+  Both paths use explicit file paths. Search paths, template list, and the evidence
+  flag are deferred to future designs.
 rationale: |
   Separating the two distribution paths avoids forcing one path's UX on the other.
   Deployed templates want silent, cached compilation. Authored templates want feedback.
   Both paths use the same compiler; the difference is what koto does around the
-  compilation. The evidence flag is the minimum change that unblocks gate-based workflows.
+  compilation. Deferring search and evidence keeps the design focused on the
+  compilation pipeline that everything else builds on.
 ---
 
 # DESIGN: koto CLI and Template Tooling
@@ -45,11 +44,11 @@ Today, `koto init --template <path>` loads templates through a legacy parser (`p
 
 Three specific gaps block real-world usage:
 
-1. **No compilation path in the CLI.** The compiler exists as `pkg/template/compile.Compile()` but there's no way to invoke it from `koto`. Users can't compile templates, inspect compiled output, or validate source files.
+1. **No compilation path in the CLI.** The compiler exists as `pkg/template/compile.Compile()` but there's no way to invoke it from `koto`. Users can't compile templates, inspect compiled output, or validate source files. **(This design addresses this gap.)**
 
-2. **No template discovery.** `--template` requires a file path. There's no way to say `koto init --template quick-task` and have koto find the template. Projects can't ship templates alongside their code in a discoverable way.
+2. **No template discovery.** `--template` requires a file path. There's no way to say `koto init --template quick-task` and have koto find the template. Projects can't ship templates alongside their code in a discoverable way. **(Deferred to a future design -- search paths and `template list`.)**
 
-3. **No evidence from the CLI.** The engine's `WithEvidence()` option works, but `koto transition` doesn't expose it. Any state with a `field_not_empty` or `field_equals` gate is a dead end from the command line.
+3. **No evidence from the CLI.** The engine's `WithEvidence()` option works, but `koto transition` doesn't expose it. Any state with a `field_not_empty` or `field_equals` gate is a dead end from the command line. **(Deferred to a future design -- `--evidence` flag.)**
 
 ### Distribution Paths
 
@@ -73,9 +72,9 @@ A user writes a template for their own project or for personal use. They're iter
 In this path:
 - The template is expected to have errors (the user is developing it)
 - Compilation feedback is the primary value -- clear errors, warnings, and a way to inspect the result
-- Name-based search matters for convenience (`koto init --template my-workflow` instead of a full path)
+- The user passes an explicit path to `koto init --template ./templates/my-workflow.md`
 - Caching is counterproductive (the source changes on every edit)
-- `koto template compile`, `inspect`, and `list` are the authoring tools
+- `koto template compile` and `inspect` are the authoring tools
 
 These two paths have different priorities but share the same underlying compilation machinery. The design should handle both without forcing one path's UX on the other.
 
@@ -84,13 +83,15 @@ These two paths have different priorities but share the same underlying compilat
 **In scope:**
 - How `koto init` compiles and loads templates (implicit compilation, both paths)
 - Compilation caching for deployed templates (Path 1)
-- Template authoring tools: `koto template compile`, `inspect`, `list` (Path 2)
-- Template search path resolution for user-authored templates (Path 2)
-- `koto transition --evidence key=value` flag (both paths)
+- Template authoring tools: `koto template compile` and `inspect` (Path 2)
 - Deprecation of the legacy `Parse()` path
 
+**Deferred to future designs:**
+- Template search path resolution and `koto template list` (name-based lookup for Path 2)
+- `koto transition --evidence key=value` flag (unblocking gate-based workflows)
+- LLM-assisted validation or linting
+
 **Out of scope:**
-- LLM-assisted validation or linting (deferred to its own design)
 - Template distribution mechanism (plugins, registries -- that's the distribution platform's job)
 - Built-in template content (that's the quick-task template, separate work)
 - Template versioning or dependency resolution
@@ -103,7 +104,6 @@ These two paths have different priorities but share the same underlying compilat
 - **Both paths use the same compiler**: One compilation pipeline, two UX modes. No separate "dev mode" compiler.
 - **No new dependencies in the engine**: The engine reads compiled JSON with stdlib only. All new dependencies (if any) stay in the CLI or compiler packages.
 - **Backward compatibility**: Existing `koto init` invocations that pass a file path should keep working during the transition.
-- **Evidence accessibility**: Gate-based workflows need evidence from the CLI. This is the minimum viable interface.
 
 ## Considered Options
 
@@ -113,7 +113,7 @@ These two paths have different priorities but share the same underlying compilat
 
 #### Chosen: Implicit compilation with optional caching
 
-`koto init` always compiles the template automatically. The caller passes a source path (or name, resolved via search path for Path 2), koto compiles it to JSON, validates it, and starts the workflow.
+`koto init` always compiles the template automatically. The caller passes a source path, koto compiles it to JSON, validates it, and starts the workflow.
 
 **Path 1 (deployed):** The compiled output can be cached in `~/.koto/cache/` keyed by source file hash. On subsequent runs, if the source hash matches a cached entry, koto skips compilation and uses the cached JSON. This is a performance optimization for templates that don't change between runs -- a skill calling `koto init` repeatedly with the same template shouldn't pay compilation cost each time. Cache invalidation is by source hash: if the source changes, the cache misses and recompilation happens.
 
@@ -131,27 +131,7 @@ Rejected because caching belongs in koto's own directory, not the template's dir
 
 ### Decision 2: Template Search Path
 
-Path 1 (deployed) always passes explicit paths -- the skill knows where its template lives. Search paths exist for Path 2 (authoring), where a user wants to say `--template my-workflow` and have koto find it in a known location.
-
-#### Chosen: Explicit path detection with project-local and user-global search
-
-koto resolves template names through a fixed search order:
-
-1. **Explicit path**: If `--template` contains a `/` or ends in `.md`, treat it as a file path (absolute or relative to CWD). No search. This is the only mode Path 1 uses.
-2. **Project-local**: Look for `./templates/<name>.md` and `./.koto/templates/<name>.md` relative to the git root (or CWD if not in a git repo).
-3. **User-global**: Look for `~/.koto/templates/<name>.md`.
-
-First match wins. If no match is found, return an error listing the paths searched.
-
-The `.md` extension is added automatically when searching by name. `--template my-workflow` looks for `my-workflow.md`.
-
-#### Alternatives Considered
-
-**Configurable search path (environment variable)**: A `KOTO_TEMPLATE_PATH` variable listing directories to search, like `PATH` or `GOPATH`. Premature -- Path 2 users authoring their own templates don't have enough variety to justify custom search paths. Users with unusual directory layouts pass explicit paths (which is what Path 1 does anyway).
-Rejected because the fixed hierarchy covers Path 2 without configuration burden.
-
-**Explicit paths only**: No search path, always require a file path. This is already how Path 1 works. For Path 2, it means `koto init --template ./templates/my-workflow.md` instead of `koto init --template my-workflow`. The extra typing is minor, but establishing project-local conventions (`./templates/`) lets `koto template list` show what's available.
-Rejected because the search path has low implementation cost and enables `template list`.
+**Deferred.** Both distribution paths use explicit file paths for now. Path 1 callers already pass explicit paths (the skill knows where its template lives). Path 2 users pass explicit paths too (`koto init --template ./templates/my-workflow.md`). Name-based resolution, search path conventions, and `koto template list` are deferred until we have enough usage patterns to design them well.
 
 ### Decision 3: LLM-Assisted Validation
 
@@ -173,7 +153,7 @@ Rejected because we'd be designing around unknowns.
 
 ### Decision 4: Template Authoring Commands
 
-Path 2 users need tools for the feedback loop: compile to see errors, inspect to see the result, list to see what's available. These are authoring tools that Path 1 callers (skills, scripts) don't need. How should they be organized?
+Path 2 users need tools for the feedback loop: compile to see errors, inspect to see the result. These are authoring tools that Path 1 callers (skills, scripts) don't need. How should they be organized?
 
 #### Chosen: `koto template` subcommand group
 
@@ -181,13 +161,12 @@ Authoring operations live under `koto template <subcommand>`:
 
 - `koto template compile <path>` -- compile source to JSON, write to stdout. The primary feedback tool: shows errors, warnings, and the compiled output.
 - `koto template inspect <path>` -- human-readable summary of a template. Shows states, transitions, gates, and variables without the full JSON.
-- `koto template list` -- show available templates from the search path (project-local and user-global).
 
-This groups authoring tools together and keeps the top-level namespace reserved for workflow operations (`init`, `transition`, `next`, etc.). Path 1 callers never need these commands.
+This groups authoring tools together and keeps the top-level namespace reserved for workflow operations (`init`, `transition`, `next`, etc.). Path 1 callers never need these commands. Future additions like `template list` (deferred with search path) will fit naturally under this group.
 
 #### Alternatives Considered
 
-**Flat commands**: `koto compile`, `koto inspect`, `koto list-templates`. Fewer keystrokes, but clutters the top-level namespace with authoring tools that most users (Path 1) don't use.
+**Flat commands**: `koto compile`, `koto inspect`. Fewer keystrokes, but clutters the top-level namespace with authoring tools that most users (Path 1) don't use.
 Rejected because the top-level namespace should be reserved for workflow operations.
 
 ## Decision Outcome
@@ -198,23 +177,23 @@ Templates reach users through two distribution paths, and the CLI serves each di
 
 **Path 1 (deployed templates):** A skill or script calls `koto init --template <explicit-path>`. koto compiles the source, caches the compiled JSON in `~/.koto/cache/` (keyed by source hash), and starts the workflow. On subsequent runs with the same template, the cache eliminates compilation. The caller never interacts with template authoring tools.
 
-**Path 2 (user-authored templates):** A user developing their own template uses `koto template compile` and `koto template inspect` as their feedback loop. When ready, they run `koto init --template my-workflow` and koto finds the template via search path (project-local, then user-global). No caching -- the source changes on every edit.
+**Path 2 (user-authored templates):** A user developing their own template uses `koto template compile` and `koto template inspect` as their feedback loop. When ready, they run `koto init --template ./templates/my-workflow.md` with an explicit path.
 
-**Both paths:** `koto transition` gets a `--evidence key=value` flag (repeatable) that passes evidence to the engine's `WithEvidence()` option. This unblocks all gate-based workflows from the CLI. The legacy `Parse()` function is deprecated; `koto init` switches to the compiler path internally.
+**Both paths:** The `--template` flag always takes an explicit file path. The legacy `Parse()` function is deprecated; `koto init` switches to the compiler path internally.
+
+**Deferred:** Name-based template search (`koto init --template my-workflow`), `koto template list`, and `koto transition --evidence` are deferred to future designs.
 
 ### Rationale
 
 Separating the two distribution paths avoids forcing one path's UX on the other. Path 1 callers (skills, scripts) want silent compilation with no overhead -- caching serves this. Path 2 users (template authors) want feedback -- authoring tools serve this. Both paths use the same compiler; the difference is in what koto does around the compilation (cache vs feedback).
 
-The search path exists for Path 2 only. Path 1 always uses explicit paths because the caller already knows where the template is. This keeps the search path simple and avoids confusing interactions with plugin directories.
-
-Deferring LLM validation avoids designing around unknowns. The compiler's error messages are the validation layer for Path 2 authoring. When we understand which LLM checks are useful, that becomes its own design.
+Deferring the search path and evidence flag keeps this design focused on the compilation pipeline, which is the foundation that both deferred features build on. The search path needs usage patterns to design well. The evidence flag is a CLI concern that can be added independently once the compiler migration is stable.
 
 ### Trade-offs Accepted
 
-- **Cache adds filesystem state**: `~/.koto/cache/` accumulates compiled templates. This is bounded (one file per unique source hash, small files) and can be cleared manually. The alternative is recompiling on every `koto init`, which is fast but unnecessary for unchanged templates.
-- **No configurable search path**: The fixed hierarchy can't be customized. Path 1 doesn't need it (explicit paths), and Path 2 users with unusual layouts pass explicit paths.
-- **No linter**: Template authors get compiler errors but no suggestions or LLM-powered fixes. The compiler's error messages are specific enough for Phase 1.
+- **Cache adds filesystem state**: `~/.koto/cache/` accumulates compiled templates. This is bounded (one file per unique source hash, small files) and can be cleared manually.
+- **Explicit paths only**: Both paths require explicit file paths for now. This is slightly verbose for Path 2 users but avoids designing search path conventions prematurely.
+- **No linter**: Template authors get compiler errors but no suggestions or LLM-powered fixes. The compiler's error messages are specific enough for now.
 - **Legacy parser not removed**: `Parse()` is deprecated but not deleted. Removing it is a separate cleanup once all callers are migrated.
 
 ## Solution Architecture
@@ -226,11 +205,11 @@ Deferring LLM validation avoids designing around unknowns. The compiler's error 
 The init command changes internally but keeps the same interface:
 
 ```
-koto init --template <path-or-name> --name <workflow-name> [--var KEY=VALUE]... [--state-dir <dir>]
+koto init --template <path> --name <workflow-name> [--var KEY=VALUE]... [--state-dir <dir>]
 ```
 
 New behavior:
-1. Resolve `--template` argument (path detection vs name search)
+1. Read the source file at `--template` path
 2. Hash the source file
 3. Check `~/.koto/cache/` for a cached compilation matching the source hash
 4. On cache miss: compile via `compile.Compile(sourceBytes)`, write to cache
@@ -239,21 +218,7 @@ New behavior:
 7. Compute compiled hash via `compile.Hash(compiledJSON)` for state file
 8. Call `engine.Init()` with the machine and metadata
 
-The `--template` argument resolution:
-- Contains `/` or ends in `.md` → treat as file path (Path 1: deployed templates always use this)
-- Otherwise → search by name: `<name>.md` through the search path (Path 2: user-authored)
-
-Template names are flat strings (no directory nesting). `--template myorg/quick-task` triggers path mode because of the `/`. Namespaced template names aren't supported in Phase 1.
-
-#### `koto transition`
-
-Adds `--evidence` flag:
-
-```
-koto transition <target> [--evidence KEY=VALUE]... [--state <path>] [--state-dir <dir>]
-```
-
-The `--evidence` flag is repeatable. Each `KEY=VALUE` pair is parsed and passed to `engine.Transition()` via `WithEvidence()`.
+The `--template` argument is always treated as a file path (absolute or relative to CWD). Both distribution paths pass explicit paths.
 
 #### `koto validate`
 
@@ -302,22 +267,6 @@ Terminal:      done, escalate
 
 Useful for reviewing what a template does without reading the raw source or full compiled JSON.
 
-#### `koto template list`
-
-```
-koto template list [--search-dir <dir>]
-```
-
-Lists user-authored templates from the search path:
-
-```
-NAME          VERSION  DESCRIPTION                LOCATION
-quick-task    1.0      A focused task workflow     ./templates/quick-task.md
-code-review   1.0      Code review workflow        ~/.koto/templates/code-review.md
-```
-
-The `--search-dir` flag adds an additional search directory (useful for testing). This command only scans the search path directories (project-local and user-global). It doesn't find deployed templates inside plugin directories -- those are managed by the distribution platform, not koto.
-
 ### Compilation Cache
 
 Compiled templates are cached in `~/.koto/cache/` to avoid redundant compilation. This primarily benefits Path 1 (deployed templates that don't change between runs) but works for both paths.
@@ -339,63 +288,18 @@ Behavior:
 
 The cache has no expiration. Old entries accumulate but are small (compiled JSON is a few KB). A `koto cache clear` command (or just `rm -rf ~/.koto/cache/`) handles cleanup if needed.
 
-### Template Search Path
-
-Resolution order (first match wins):
-
-1. **Explicit path**: Input contains `/` or ends in `.md`
-2. **Project-local**:
-   - `<git-root>/templates/<name>.md`
-   - `<git-root>/.koto/templates/<name>.md`
-3. **User-global**:
-   - `~/.koto/templates/<name>.md`
-
-Git root is detected via `git rev-parse --show-toplevel`. If not in a git repo, CWD is used instead.
-
-When resolving by name, if a project-local match shadows a user-global template with the same name, koto prints a note to stderr: `note: using <local-path> (shadows <global-path>)`. This makes the precedence visible without breaking scripts that parse stdout.
-
-For `template list`, all search path directories are scanned. Duplicate names show only the first match (same precedence as resolution).
-
 ### Package Changes
 
 #### `cmd/koto/main.go`
 
 - Add `template` subcommand dispatcher
-- Add `cmdTemplateCompile`, `cmdTemplateInspect`, `cmdTemplateList` handlers
+- Add `cmdTemplateCompile`, `cmdTemplateInspect` handlers
 - Modify `cmdInit` to use compiler path with cache lookup
-- Add `--evidence` flag to `cmdTransition`
-- Add `resolveTemplatePath()` for search path logic
 
 #### `pkg/template/template.go`
 
 - Add deprecation comment to `Parse()` function
 - No code changes (backward compat)
-
-#### New: `pkg/resolve/resolve.go`
-
-Template search path resolution:
-
-```go
-package resolve
-
-// Resolve finds a template by name or path.
-// If input contains "/" or ends in ".md", it's treated as a path.
-// Otherwise, search: project-local then user-global.
-func Resolve(input string) (string, error)
-
-// List returns all templates found in the search path.
-func List() ([]TemplateInfo, error)
-
-// TemplateInfo holds metadata about a discovered template.
-type TemplateInfo struct {
-    Name        string
-    Version     string
-    Description string
-    Path        string
-}
-```
-
-The `List()` function reads YAML frontmatter from each `.md` file in the search directories to extract name, version, and description. It doesn't compile the templates.
 
 #### New: `pkg/cache/cache.go`
 
@@ -450,22 +354,9 @@ func (ct *CompiledTemplate) ToTemplate() (*Template, error)
 
 This keeps the controller unchanged and confines the migration to the CLI and template packages.
 
-### Evidence Parsing
-
-The `--evidence` flag accepts `KEY=VALUE` format. Parsing splits on the first `=`:
-
-```go
-func parseEvidence(flags []string) (map[string]string, error)
-```
-
-- `key=value` → `{"key": "value"}`
-- `key=` → `{"key": ""}` (empty value, valid)
-- `key` (no `=`) → error: `"invalid evidence format %q: expected KEY=VALUE"`
-- `=value` (empty key) → error: `"invalid evidence format %q: key must not be empty"`
-
 ## Implementation Approach
 
-### Phase 1a: Compiler Path Migration (atomic)
+### Phase 1: Compiler Path Migration (atomic)
 
 This phase must land as a single unit -- `cmdInit` and `loadTemplateFromState()` must migrate together to avoid hash mismatches. After this phase, both distribution paths use the compiler.
 
@@ -475,24 +366,11 @@ This phase must land as a single unit -- `cmdInit` and `loadTemplateFromState()`
 - Implement dual-hash comparison (compiler hash with legacy fallback)
 - Update `koto validate` to use compiler path
 
-### Phase 1b: Evidence Flag
-
-- Add `--evidence` flag to `cmdTransition`
-- Implement `parseEvidence()` for `KEY=VALUE` parsing
-- Wire evidence into `engine.Transition()` via `WithEvidence()`
-
-### Phase 2a: Template Search Path (Path 2 support)
-
-- Create `pkg/resolve/` package for template resolution
-- Add `resolveTemplatePath()` with search path logic and shadow warnings
-- Wire search path into `cmdInit` for name-based resolution
-
-### Phase 2b: Template Authoring Commands (Path 2 tools)
+### Phase 2: Template Authoring Commands (Path 2 tools)
 
 - Add `template` subcommand dispatcher
-- Add `koto template compile` command (always fresh, no cache)
+- Add `koto template compile` command (always compiles fresh, no cache)
 - Add `koto template inspect` command
-- Add `koto template list` command
 
 ### Phase 3: Compilation Cache (Path 1 optimization)
 
@@ -509,15 +387,15 @@ This phase must land as a single unit -- `cmdInit` and `loadTemplateFromState()`
 
 ### Download Verification
 
-Not applicable. This design doesn't download templates from external sources. Templates are local files read from the filesystem. The template search path looks only at local directories (project-local and user home). No network requests are made.
+Not applicable. This design doesn't download templates from external sources. Templates are local files read from the filesystem. No network requests are made.
 
 ### Execution Isolation
 
-Template compilation doesn't execute any code. The compiler parses YAML and extracts markdown -- no shell commands, no file writes beyond the state file.
+Template compilation doesn't execute any code. The compiler parses YAML and extracts markdown -- no shell commands, no file writes beyond the state file and cache directory.
 
-Command gates (defined in the template) execute during transitions, but that's the engine's responsibility (already implemented in #17). The CLI's `--evidence` flag only passes data to the engine; it doesn't execute commands.
+Command gates (defined in the template) execute during transitions, but that's the engine's responsibility (already implemented in #17). This design doesn't change gate execution.
 
-The template search path reads files from predictable locations (`./templates/`, `~/.koto/templates/`). It follows symlinks by default (Go's `os.ReadFile` behavior). The search path is not configurable via environment variables, limiting the attack surface for path injection.
+The compilation cache writes to `~/.koto/cache/`, which is within koto's own home directory. Cache files contain only compiled JSON derived from the source template -- no user data, no credentials.
 
 ### Supply Chain Risks
 
@@ -525,46 +403,40 @@ Templates are local files, not downloaded packages. The trust model matches Make
 
 The risk is that a user runs `koto init` with a template they haven't reviewed. This is the same risk as running `make` in an untrusted repo. Mitigation: `koto template inspect` shows what a template does before init. Command gates are visible in the inspect output.
 
-### User Data Exposure
+For Path 1 (deployed templates), the trust boundary is the distribution platform (Claude Code plugin system, project `.claude/` directory). koto trusts the template at the path it's given.
 
-The `--evidence` flag passes key-value pairs to the engine's state file. Evidence is stored in the local state file (JSON on disk). No evidence is transmitted externally.
+### User Data Exposure
 
 Template compilation reads the source file and produces JSON. No data leaves the machine. The compiled output contains only what's in the source file.
 
-`koto template list` reads YAML frontmatter from files in the search path. It doesn't transmit any data.
-
-### Evidence and Directive Interpolation
-
-The controller merges evidence into the interpolation context used for directive text (`{{KEY}}` placeholders). The namespace collision check blocks evidence from shadowing declared variables, but undeclared placeholder keys in directives can be set via `--evidence`. In the single-user CLI, this is fine -- the user controls both the evidence and the template. But if koto is used in pipelines where evidence comes from untrusted external sources, this becomes a way to rewrite agent instructions. This risk is noted for future design consideration; no code changes are needed for single-user CLI usage.
+The compilation cache stores compiled JSON on disk (`~/.koto/cache/`). This is derived from the source template and contains no user data beyond what's already in the template file.
 
 ### Mitigations
 
 | Risk | Mitigation | Residual Risk |
 |------|------------|---------------|
-| Malicious template in search path | `koto template inspect` shows gates before init | User must remember to inspect |
-| Symlink in template directory | Go's os.ReadFile follows symlinks | Template could reference unexpected file |
-| Evidence containing sensitive data | State files created with 0600 permissions (via os.CreateTemp) | Sensitive evidence still on disk |
-| Search path collision (local shadows global) | Shadow warning printed to stderr | User may ignore the warning |
-| Evidence as interpolation vector | Namespace collision check blocks declared vars | Undeclared placeholders can be set via evidence |
+| Malicious template at explicit path | `koto template inspect` shows gates before init | User must remember to inspect |
+| Symlink at template path | Go's os.ReadFile follows symlinks | Template could reference unexpected file |
+| Cache poisoning | Cache keyed by source hash; attacker needs write access to `~/.koto/cache/` | If attacker has write access to home dir, cache is the least of the problems |
 
 ## Consequences
 
 ### Positive
 
-- Gate-based workflows become usable from the CLI (the `--evidence` flag unblocks them)
 - Path 1 (deployed): compilation cache eliminates redundant work for skills that call `koto init` repeatedly
-- Path 2 (authoring): `compile`, `inspect`, and `list` provide a feedback loop for template development
+- Path 2 (authoring): `compile` and `inspect` provide a feedback loop for template development
 - The compiler path replaces the legacy parser, using the validated format specification
 - Both distribution paths use the same compiler, avoiding divergent behavior
+- Focused scope (no search path, no evidence flag) means fewer moving parts to get wrong
 
 ### Negative
 
 - Two template loading paths exist during the transition (legacy `Parse()` and new compiler)
 - Compilation cache adds filesystem state (`~/.koto/cache/`) that can grow unbounded
-- No LLM validation means template authors rely on compiler error messages only
+- Gate-based workflows remain blocked from the CLI until the evidence flag is designed separately
 
 ### Mitigations
 
 - Legacy `Parse()` gets a deprecation notice pointing to the compiler path
 - Cache files are small and clearable (`rm -rf ~/.koto/cache/` or future `koto cache clear`)
-- Compiler error messages are already specific and actionable (13 validation rules)
+- Evidence flag is the next logical design after this one lands
