@@ -1,9 +1,5 @@
 ---
 status: Proposed
-spawned_from:
-  issue: 315
-  repo: tsukumogami/vision
-  parent_design: docs/designs/DESIGN-workflow-tool-oss.md
 problem: |
   koto v0.1.0 ships a working state machine engine and is installable, but no AI agent
   will use it because nothing connects the binary on PATH to the agent's execution context.
@@ -36,15 +32,6 @@ rationale: |
 ## Status
 
 **Proposed**
-
-## Upstream Design Reference
-
-This design implements the agent integration component described in the upstream strategic design for koto's multi-workflow orchestration system.
-
-**Relevant sections:**
-- Decision 6: Standard Binary Distribution + Skill-Based Agent Integration
-- Required Tactical Design: DESIGN-koto-agent-integration.md
-- CLI Surface: `koto generate claude-code`, `koto generate agents-md`, `koto workflows --json`
 
 ## Context and Problem Statement
 
