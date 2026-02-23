@@ -104,7 +104,7 @@ Returns the complete state as JSON, including workflow metadata, variables, and 
 
 ## Key concepts
 
-**Templates** define the workflow: states, transitions between them, and directive text for each state. Variables (`{{KEY}}`) are interpolated into directives at runtime.
+**Templates** define the workflow: states, transitions between them, and directive text for each state. Variables (`{{KEY}}`) are interpolated into directives at runtime. Use `koto template compile` to validate templates during development and see the compiled JSON output.
 
 **State files** (`koto-<name>.state.json`) track progress. They're written atomically -- a crash mid-write can't corrupt them. A version counter detects concurrent modifications.
 
@@ -112,7 +112,7 @@ Returns the complete state as JSON, including workflow metadata, variables, and 
 
 ## Documentation
 
-- [CLI usage guide](docs/guides/cli-usage.md) -- all subcommands with examples
+- [CLI usage guide](docs/guides/cli-usage.md) -- all subcommands with examples, including template authoring tools
 - [Go library guide](docs/guides/library-usage.md) -- using `pkg/engine` as an imported package
 - [Error code reference](docs/reference/error-codes.md) -- structured error codes and handling
 
