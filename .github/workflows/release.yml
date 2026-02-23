@@ -67,13 +67,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
 
           EXPECTED_ARTIFACTS=(
-            "koto-linux-amd64_${VERSION}_linux_amd64"
-            "koto-linux-arm64_${VERSION}_linux_arm64"
-            "koto-darwin-amd64_${VERSION}_darwin_amd64"
-            "koto-darwin-arm64_${VERSION}_darwin_arm64"
+            "koto-linux-amd64"
+            "koto-linux-arm64"
+            "koto-darwin-amd64"
+            "koto-darwin-arm64"
           )
 
           echo "Verifying all ${#EXPECTED_ARTIFACTS[@]} artifacts are present..."
