@@ -104,9 +104,9 @@ func ParseJSON(data []byte) (*CompiledTemplate, error) {
 
 // ToTemplate converts a CompiledTemplate to a Template struct for use
 // with the controller. Sections are populated from StateDecl.Directive
-// fields, Variables from VariableDecl.Default values, Machine from
-// BuildMachine(), and Hash from the caller-supplied hash. Path must be
-// set by the caller after this method returns.
+// fields, Variables from VariableDecl.Default values, and Machine from
+// BuildMachine(). Hash and Path are left empty; the caller must set
+// them after this method returns.
 func (ct *CompiledTemplate) ToTemplate() (*Template, error) {
 	machine := ct.BuildMachine()
 
