@@ -11,11 +11,12 @@ The main packages:
 | Package | Import Path | Purpose |
 |---------|-------------|---------|
 | engine | `pkg/engine` | State machine, persistence, transitions |
-| template | `pkg/template` | Parse template files into Machine definitions |
+| template | `pkg/template` | Template types, interpolation, compiled template parsing |
+| compile | `pkg/template/compile` | Compile source templates into the intermediate format |
 | controller | `pkg/controller` | Generate directives from engine state + template |
 | discover | `pkg/discover` | Find active state files in a directory |
 
-Most consumers only need `engine`. The other packages are useful if you want template parsing or directive generation.
+Most consumers only need `engine`. The other packages are useful if you want template compilation or directive generation.
 
 ## Building a Machine
 
@@ -47,18 +48,48 @@ States with `Terminal: true` have no outgoing transitions. The workflow ends whe
 
 ### From a template file
 
-```go
-import "github.com/tsukumogami/koto/pkg/template"
+The compiler reads a source template (YAML front-matter + markdown body), validates it, and produces a `CompiledTemplate`. From there, `ToTemplate()` gives you the `Machine`, `Sections`, and `Variables` needed by the engine and controller.
 
-tmpl, err := template.Parse("/path/to/workflow.md")
+```go
+import (
+    "os"
+
+    "github.com/tsukumogami/koto/pkg/template"
+    "github.com/tsukumogami/koto/pkg/template/compile"
+)
+
+sourceBytes, err := os.ReadFile("/path/to/workflow.md")
 if err != nil {
     log.Fatal(err)
 }
 
-// tmpl.Machine is ready to use with engine.Init or engine.Load
-// tmpl.Hash is the SHA-256 for integrity checking
+// Compile source into the intermediate format.
+ct, warnings, err := compile.Compile(sourceBytes)
+if err != nil {
+    log.Fatal(err)
+}
+// warnings contains non-fatal issues found during compilation.
+
+// Compute a deterministic hash of the compiled output.
+hash, _, err := compile.Hash(ct)
+if err != nil {
+    log.Fatal(err)
+}
+
+// Convert to a Template for use with the engine and controller.
+tmpl, err := ct.ToTemplate()
+if err != nil {
+    log.Fatal(err)
+}
+tmpl.Hash = hash
+tmpl.Path = "/path/to/workflow.md"
+
+// tmpl.Machine is ready for engine.Init or engine.Load
 // tmpl.Sections maps state names to their directive text
+// tmpl.Variables holds default values from variable declarations
 ```
+
+> **Note:** The older `template.Parse()` function is deprecated. It reads a source file and returns a `Template` directly, but it skips the compiler pipeline and uses a legacy hash (SHA-256 of raw source bytes). New code should use `compile.Compile()` + `ct.ToTemplate()` as shown above.
 
 ## Creating a workflow
 
@@ -71,7 +102,7 @@ machine := buildMachine()
 
 eng, err := engine.Init("wip/koto-deploy.state.json", machine, engine.InitMeta{
     Name:         "deploy",
-    TemplateHash: "sha256:abc123...",  // from template.Hash, or your own
+    TemplateHash: "sha256:abc123...",  // from compile.Hash, or your own
     TemplatePath: "/path/to/template.md",
     Variables: map[string]string{
         "ENV":     "production",
@@ -215,16 +246,26 @@ See the [error code reference](../reference/error-codes.md) for the full list of
 
 ## Using the controller
 
-The controller combines an engine with a parsed template to generate directives. It handles template hash verification and variable interpolation.
+The controller combines an engine with a compiled template to generate directives. It handles template hash verification and variable interpolation.
 
 ```go
 import (
+    "os"
+
     "github.com/tsukumogami/koto/pkg/controller"
-    "github.com/tsukumogami/koto/pkg/template"
     "github.com/tsukumogami/koto/pkg/engine"
+    "github.com/tsukumogami/koto/pkg/template"
+    "github.com/tsukumogami/koto/pkg/template/compile"
 )
 
-tmpl, _ := template.Parse("/path/to/workflow.md")
+// Compile the source template.
+sourceBytes, _ := os.ReadFile("/path/to/workflow.md")
+ct, _, _ := compile.Compile(sourceBytes)
+hash, _, _ := compile.Hash(ct)
+
+tmpl, _ := ct.ToTemplate()
+tmpl.Hash = hash
+
 eng, _ := engine.Load("wip/koto-deploy.state.json", tmpl.Machine)
 
 ctrl, err := controller.New(eng, tmpl)

@@ -19,7 +19,7 @@ Total entries: 3
 **Section**: From a template file, Using the controller
 **Prerequisite issues**: #19, #22
 **Update type**: modify
-**Status**: pending
+**Status**: updated
 **Details**: Replace the two `template.Parse()` code examples (lines ~52-61 and ~227-228) with the compiler path: `compile.Compile(sourceBytes)` followed by `template.ParseJSON(compiledJSON)` and `CompiledTemplate.ToTemplate()`. Add the `compile` package to the import table. Note that `Parse()` is deprecated. Keep the `Interpolate` section unchanged since that helper is unaffected.
 
 ---
