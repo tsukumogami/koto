@@ -24,29 +24,30 @@ koto has a working compiler and engine but no way to invoke them from the comman
 - Decision 3 (LLM validation): Defer entirely vs design stub vs full linter
 - Decision 4 (Template commands): Flat vs subcommand group
 
-## Decision (Phase 5)
+## Distribution Paths (Phase 2 update)
+- Path 1 (deployed): Template bundled with skill/plugin, explicit path, expected valid, cache compilation
+- Path 2 (authored): User writes template manually, needs feedback loop, search path for convenience
+
+## Decision (Phase 5, revised Phase 8)
 
 **Problem:**
 koto's template compiler and evidence system are fully implemented as Go libraries
-but unreachable from the command line. Users can't compile templates, find templates
-by name, or supply evidence during transitions. The CLI's init command still uses
-the legacy parser that can't handle gates or nested YAML. This gap blocks all
-real-world usage of the template format.
+but unreachable from the command line. Templates reach users through two distinct
+paths -- deployed by skills/plugins (Path 1) or authored manually (Path 2) -- but
+neither path has CLI support.
 
 **Decision:**
-Implicit compilation at init time with an explicit compile command for debugging.
-Templates are found via a three-level search path (explicit path, project-local
-./templates/, user-global ~/.koto/templates/). The transition command gets --evidence
-flags. A template inspect command shows compiled output for debugging. LLM-assisted
-validation is deferred entirely to a future design.
+koto init compiles templates implicitly and caches the result for deployed templates
+(Path 1). Template authors (Path 2) get a feedback loop via koto template compile,
+inspect, and list commands. A search path (project-local, user-global) serves
+name-based resolution for authored templates. koto transition gets --evidence flags.
 
 **Rationale:**
-Implicit compilation keeps the simple case simple (koto init --template quick-task
-just works) while the explicit compile command serves debugging and CI. The search
-path follows the same convention as PATH, Go modules, and npm: local overrides
-global. Deferring LLM validation avoids designing an integration surface we don't
-need yet. The evidence flag is the minimal change that unblocks gate-based workflows.
+Separating the two distribution paths avoids forcing one path's UX on the other.
+Deployed templates want silent, cached compilation. Authored templates want feedback.
+Both paths use the same compiler; the difference is what koto does around the
+compilation. The evidence flag is the minimum change that unblocks gate-based workflows.
 
 ## Current Status
-**Phase:** 5 - Decision
+**Phase:** 8 - Final Review
 **Last Updated:** 2026-02-22
