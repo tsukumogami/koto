@@ -43,6 +43,10 @@ type Template struct {
 	Path        string            // filesystem path to the template file
 }
 
+// Deprecated: Use compile.Compile() + template.ParseJSON() instead.
+// Parse() uses a legacy source format and does not support evidence gates,
+// nested YAML structures, or the source/compiled hash format.
+//
 // Parse reads a template file at the given path and returns a Template.
 // It extracts the YAML front-matter header, parses state sections from
 // markdown headings, constructs an engine.Machine, and computes a
