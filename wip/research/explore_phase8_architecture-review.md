@@ -1,243 +1,251 @@
-# Architecture Review: DESIGN-koto-agent-integration.md
+# Architecture Review: DESIGN-koto-agent-integration
 
 **Reviewer**: architect-reviewer
 **Date**: 2026-02-23
-**Design**: `/home/dangazineu/dev/workspace/tsuku/tsuku-7/public/koto/docs/designs/DESIGN-koto-agent-integration.md`
-**Scope**: Solution Architecture, Implementation Approach, Consequences
+**Document**: `/home/dangazineu/dev/workspace/tsuku/tsuku-7/public/koto/docs/designs/DESIGN-koto-agent-integration.md`
+**Codebase state**: koto v0.1.x, post CLI tooling design (issues #19-#22 done)
 
 ## Summary
 
-The design proposes three capabilities: (1) embedded template registry with search path, (2) `koto generate` for platform-specific agent integration files, (3) extended `koto workflows` discovery. The architecture is mostly sound and fits the existing codebase patterns. There are five findings: two blocking, three advisory.
+The design proposes two capabilities: (1) `koto generate <platform>` to scaffold agent integration files from an existing template, and (2) a Stop hook for session continuity. It adds one new package (`pkg/generate/`) and extends the CLI. The architecture fits the existing codebase well. There are two blocking findings (both about the generated hook command not matching the actual CLI output) and four advisory findings.
 
 ---
 
-## Finding 1: `pkg/registry/` duplicates home directory resolution from `pkg/cache/`
+## 1. Is the architecture clear enough to implement?
 
-**Severity**: Blocking (parallel pattern)
+**Yes, with two gaps that need resolution before implementation starts.**
 
-The design introduces `pkg/registry/` with its own `~/.koto/templates/` resolution and `$KOTO_HOME` handling. The codebase already has this pattern in `pkg/cache/cache.go:17-26`:
+The design is concrete about what to build: `pkg/generate/` with two generation targets, surfaced through `koto generate <platform>`. The data flow diagrams match the existing CLI patterns. The decision to make the agent skill the distribution unit (rather than building search paths, go:embed, or a registry) is sound and eliminates infrastructure that koto doesn't need.
 
-```go
-func cacheDir() (string, error) {
-    if kotoHome := os.Getenv("KOTO_HOME"); kotoHome != "" {
-        return filepath.Join(kotoHome, "cache"), nil
-    }
-    home, err := os.UserHomeDir()
-    if err != nil {
-        return "", fmt.Errorf("resolve home directory: %w", err)
-    }
-    return filepath.Join(home, ".koto", "cache"), nil
-}
-```
+### Gap 1: TemplateMetadata extraction source is underspecified
 
-`pkg/registry/extract.go` will need identical logic for `~/.koto/templates/<version>/`. When `$KOTO_HOME` semantics change (or a `--koto-home` flag is added), both packages need updating.
+The design defines a `TemplateMetadata` struct with `States []StateInfo`, `Variables []VariableInfo`, etc. It says the generator "compiles the template, extracts metadata" but doesn't specify whether metadata comes from the compiled `CompiledTemplate` or a new parsing path.
 
-**Recommendation**: Extract a shared `kotoHome()` function (or small `pkg/paths/` package) that returns the root `~/.koto` (or `$KOTO_HOME`) path. Both `cache` and `registry` derive their subdirectories from it. This is a small change but prevents the pattern from being copied a third time when `koto doctor` or template cleanup is added.
+Looking at the existing code:
+- `template.CompiledTemplate` (`pkg/template/compiled.go:13-21`) has `States map[string]StateDecl` and `Variables map[string]VariableDecl`
+- `template.StateDecl` (`pkg/template/compiled.go:33-38`) has `Gates map[string]engine.GateDecl`, `Transitions []string`, `Terminal bool`
+- `template.VariableDecl` (`pkg/template/compiled.go:25-29`) has `Description`, `Required`, `Default`
 
----
+All the information `TemplateMetadata` needs is already in `CompiledTemplate`. The `TemplateMetadata` type hierarchy (`StateInfo`, `GateInfo`, `VariableInfo`) mirrors existing types with different names. This creates a schema-drift risk: if `GateDecl` gains a new field, `GateInfo` must be updated separately.
 
-## Finding 2: `pkg/generate/` imports `pkg/registry/` but the dependency direction is unclear in the design
+**Recommendation**: Use `CompiledTemplate` directly in the generator. Add projection helpers only if the generator needs computed fields not on `CompiledTemplate`. Don't define `TemplateMetadata` as a parallel public type speculatively.
 
-**Severity**: Advisory
+### Gap 2: Hook merge semantics specified in prose but not concretely
 
-The design shows `Generator` holding a `*registry.Registry` field. This is fine for the current proposal. But the generated skill file content needs to include template metadata (names, descriptions, state lists), which means `generate` depends on both `registry` and the `template` package for parsing frontmatter.
+The design says "merges hook entries (replace koto's entry, preserve others)" for `.claude/hooks.json`. It doesn't specify:
+- How to identify "koto's entry" in the Stop hook array (command substring match? metadata field?)
+- What happens when `hooks.json` doesn't exist, exists but isn't valid JSON, or has a `Stop` key that isn't an array
 
-The dependency chain would be: `generate -> registry -> template -> engine`. This is a clean downward flow, consistent with the existing pattern (`controller -> template -> engine`). No issue with the proposed direction.
-
-However, the design doesn't show how `generate` gets state machine information for templates. The `TemplateInfo` struct has `Description` and `Name` but no `States` field. The skill file is supposed to include "the template's state machine description so the agent understands the workflow structure." To get state lists, `generate` would need to parse/compile each template, which means it depends on `compile` (and transitively on `yaml.v3`).
-
-**Recommendation**: Add a `States []string` field to `TemplateInfo` (the design's JSON for `koto workflows` already shows it). Document that `Registry.List()` compiles each template to extract state names. This makes the dependency on `compile` explicit in the registry, not hidden in generate.
+**Recommendation**: Match on the command string containing `koto workflows`. Document this convention in a code comment. Handle edge cases: missing file = create fresh, invalid JSON = error and abort, wrong type for `Stop` = error and abort.
 
 ---
 
-## Finding 3: `koto workflows` output format changes break the existing JSON contract
+## 2. Are there missing components or interfaces?
 
-**Severity**: Blocking (state contract violation)
+### 2a. Stop hook command doesn't match actual `koto workflows` output (Blocking)
 
-Currently `koto workflows` (line 475-492 in `cmd/koto/main.go`) returns:
-
-```go
-func cmdWorkflows(args []string) error {
-    // ...
-    workflows, err := discover.Find(stateDir)
-    // ...
-    return printJSON(workflows)
-}
-```
-
-This outputs a JSON array:
-```json
-[{"path":"...", "name":"...", "current_state":"...", ...}]
-```
-
-The design proposes changing it to an object:
-```json
-{"templates": [...], "active": [...]}
-```
-
-This is a breaking change to the JSON output that `koto workflows` currently produces. Any agent or script parsing the array format breaks silently -- they get an object where they expect an array. The design says "Preserve backward compatibility: existing JSON output format for `active` is unchanged" but this is incorrect: the top-level shape changes from array to object.
-
-**Recommendation**: One of two approaches:
-
-(a) **Version the output.** Add `--format v2` or just accept the break since koto is pre-1.0. If going this route, document it as a breaking change in the release notes and bump the minor version.
-
-(b) **Separate commands.** Keep `koto workflows` returning the existing array format. Add `koto workflows --all` (or `koto discovery --json`) for the combined templates + active output. This is slightly more complex but avoids breaking existing consumers.
-
-Option (a) is simpler and acceptable for a pre-1.0 project. But the design must acknowledge the break explicitly rather than claiming backward compatibility.
-
----
-
-## Finding 4: Template extraction to `~/.koto/templates/<version>/` creates a second path-resolution concern for `loadTemplateFromState`
-
-**Severity**: Advisory
-
-When `koto init --template quick-task` extracts to `~/.koto/templates/v0.2.0/quick-task.md` and stores that absolute path in the state file, the existing `loadTemplateFromState()` function (line 598-679 in `main.go`) will read from that path on every `koto next` / `koto transition`. This works correctly -- the path is stable and versioned.
-
-However, if the user deletes `~/.koto/` or changes `$KOTO_HOME` between init and next, the absolute path breaks. The design mentions this implicitly ("Configurable via `$KOTO_HOME`") but doesn't address what happens when the env var changes mid-workflow.
-
-This is not a new problem -- explicit `--template /some/path` has the same risk. The design doesn't make it worse. But it's worth noting in the Uncertainties section because the built-in template path is less obvious to users than an explicit path they chose.
-
-**Recommendation**: No code change needed. Add a sentence to the Uncertainties section noting that `$KOTO_HOME` changes mid-workflow will cause "template file not found" errors, and the fix is to either set `$KOTO_HOME` back or re-init the workflow.
-
----
-
-## Finding 5: Hook implementation in the design contradicts itself
-
-**Severity**: Advisory
-
-The design shows two different hook implementations:
-
-In the "Generated File Content" section (line 437):
-```json
-{
-  "hooks": {
-    "Stop": [{
-      "type": "command",
-      "command": "koto workflows --json 2>/dev/null | grep -q '\"active\":\\[\\]' || echo 'Active koto workflow detected.'"
-    }]
-  }
-}
-```
-
-But in the Security section (line 494):
-> The generated Claude Code hook runs a shell command (`ls wip/koto-*.state.json`) on every Stop event.
-
-These describe different detection mechanisms. The `koto workflows --json` approach is better because it works regardless of `--state-dir` configuration (as the design itself argues at line 443). The `ls wip/koto-*.state.json` approach hardcodes the default state directory.
-
-Additionally, the `grep -q '"active":\[\]'` pattern will break if the JSON is pretty-printed or if there are spaces in the serialization. A more reliable approach:
-
+The generated hook:
 ```sh
-koto workflows --json 2>/dev/null | grep -q '"active":\s*\[\s*\]' || echo '...'
+koto workflows --json 2>/dev/null | grep -q '"active":\[\]' || echo 'Active koto workflow detected.'
 ```
 
-Or even better, since `koto` controls its own output format, add a dedicated exit code: `koto workflows --check-active` returns 0 if active workflows exist, 1 if not. This avoids fragile grep parsing.
+Current `cmdWorkflows` (`cmd/koto/main.go:475-492`) outputs a JSON **array** from `discover.Find()`, which returns `[]discover.Workflow`:
+```json
+[{"path":"wip/koto-foo.state.json","name":"foo","current_state":"planning",...}]
+```
 
-**Recommendation**: Make the Security section consistent with the hook definition. Consider whether `koto workflows` should have a `--check-active` flag that returns a non-zero exit code when no active workflows exist, eliminating the grep.
+There's no `"active"` key in the output. The grep pattern `'"active":\[\]'` would never match. Additionally, the logic is inverted: `grep -q '"active":\[\]'` succeeds when the active list is *empty*, so `|| echo` fires when `grep` fails (no match = active list is not empty). But since the pattern can never match, the hook would always fire.
+
+**Recommendation**: Since `koto workflows` already outputs JSON, drop `--json` and use:
+```sh
+koto workflows 2>/dev/null | grep -q '"current_state"' && echo 'Active koto workflow detected. Run koto next to continue.'
+```
+
+This checks if any state file metadata is in the output. Empty output (`[]`) has no `"current_state"`, so the warning only fires when workflows exist.
+
+### 2b. `--json` flag cannot work with the current CLI flag parser (Blocking)
+
+The hook command uses `koto workflows --json`. Looking at `parseFlags` (`cmd/koto/main.go:77-108`):
+
+```go
+func parseFlags(args []string, multiFlags map[string]bool) (*parsedArgs, error) {
+    // ...
+    if i+1 >= len(args) {
+        return nil, fmt.Errorf("%s requires a value", arg)
+    }
+    next := args[i+1]
+    if isFlag(next) {
+        return nil, fmt.Errorf("%s requires a value", arg)
+    }
+    // ...
+}
+```
+
+Every flag requires a value argument. `--json` alone would return `"--json requires a value"`. There's no boolean flag support.
+
+**Recommendation**: Don't add `--json`. `koto workflows` already outputs JSON. The hook command should use `koto workflows` without `--json`.
+
+### 2c. `koto transition --evidence` not yet implemented but referenced in execution loop (Advisory)
+
+The design's execution loop (step 6) shows:
+```
+koto transition <target> --evidence key=value
+```
+
+The current `cmdTransition` doesn't handle `--evidence`. This was explicitly deferred in the CLI tooling design. Agents following the generated SKILL.md would fail when trying to supply evidence.
+
+The design doesn't claim to implement `--evidence`, but the generated skill file would contain instructions to use it.
+
+**Recommendation**: Either (a) implement `--evidence` as a prerequisite for Phase 2, or (b) Phase 2's generated SKILL.md omits evidence instructions and documents evidence support as "coming soon." The design should explicitly call out this dependency.
+
+### 2d. `koto generate` subcommand fits the existing CLI dispatch pattern (No issue)
+
+The current CLI uses `cmdTemplate` as a nested subcommand dispatcher. `koto generate` follows the identical pattern:
+
+```go
+case "generate":
+    err = cmdGenerate(os.Args[2:])
+```
+
+with `cmdGenerate` dispatching to `cmdGenerateClaudeCode` and `cmdGenerateAgentsMD`. Clean fit.
 
 ---
 
-## Question 1: Is the architecture clear enough to implement?
+## 3. Are the implementation phases correctly sequenced?
 
-**Yes, with caveats.** The three components (registry, generate, discovery) are well-defined and the interfaces are concrete enough to code against. The `Registry` struct and `Generator` struct have clear methods and return types.
+**Correct, with one implicit dependency.**
 
-Two gaps need clarification before implementation:
+- **Phase 1 (Metadata Extraction)**: Depends on `pkg/template/compile` (exists). Clean foundation. No blockers.
+- **Phase 2 (Claude Code Generation)**: Depends on Phase 1. Also implicitly depends on:
+  - The hook command matching actual CLI output (findings 2a/2b, must be resolved first)
+  - `--evidence` flag existence (finding 2c, can be deferred if SKILL.md is scoped accordingly)
+- **Phase 3 (AGENTS.md Generation)**: Depends on Phase 1. Independent of Phase 2. Could run in parallel.
 
-1. **How does `Registry.List()` get state names from templates?** The design shows state names in the `koto workflows` JSON output but `TemplateInfo` doesn't include them. Getting states requires compilation, which requires reading the template source. The design should specify whether `List()` does a full compile or reads a cached compiled form.
+The phases are correctly ordered: extract metadata first, then use it to generate files. The missing explicit dependency is that Phase 2's hook generation requires fixing the `koto workflows` output assumption.
 
-2. **What happens when `koto generate` runs but no templates are discoverable?** The design doesn't specify the error case. Should it generate a skill file with an empty templates section, or error out?
-
----
-
-## Question 2: Are there missing components or interfaces?
-
-One missing component: **a shared `kotoHome` resolver.** The `pkg/cache/` package already has `cacheDir()` with `$KOTO_HOME` logic. The new `pkg/registry/` will duplicate this. A small shared package (even just a `pkg/paths/koto_home.go` file) prevents the parallel pattern.
-
-One missing interface detail: **the `Registry.Resolve()` method's extraction behavior.** The design says "koto extracts the embedded template to a versioned location on first use" but the `Resolve()` signature just returns `(string, error)`. The extraction side-effect should be documented on the method. Callers need to know that `Resolve` may write to the filesystem.
+**Recommendation**: Add a Phase 0 prerequisite: resolve the hook command to match the actual `koto workflows` output format. This is a design-level fix, not a code change.
 
 ---
 
-## Question 3: Are the implementation phases correctly sequenced?
+## 4. Does the proposed package structure fit the existing codebase?
 
-**Mostly yes.** Phase 1 (registry) must come before Phase 2 (generate) because generate needs registry to enumerate templates. Phase 3 (discovery extension) is independent of Phase 2 and could be done in parallel.
+**Good fit.**
 
-**Phase 4 (quick-task template) should be Phase 1.** The design says Phase 1 creates the registry and embeds the template. But the template content needs to exist to embed it. Writing the quick-task template is a prerequisite for the `go:embed` directive. Phase 4 should be the first thing done, or folded into Phase 1.
-
-Recommended order:
-1. Write the quick-task template (current Phase 4, moved up)
-2. Template registry and search path (current Phase 1, including `go:embed` of the template)
-3. Extended discovery (current Phase 3) -- can start in parallel with Phase 2
-4. Integration file generation (current Phase 2)
-
----
-
-## Question 4: Are there simpler alternatives we overlooked?
-
-**For template distribution: the current approach is appropriate.** `go:embed` is the simplest way to ship templates with zero runtime cost and no network dependency. The search path (project -> user -> built-in) follows standard conventions (like `git config` or `npm` resolution).
-
-**For agent integration: consider a single-file approach first.** The design generates three files for Claude Code (skill, command, hook). The command file (`koto-run.md`) duplicates what the skill file already teaches the agent. An agent that reads the skill file already knows how to run `koto init` + `koto next`. The slash command adds convenience but also adds a file to maintain.
-
-Simpler alternative: start with skill file + hook only. Add the command file later if users request it. This reduces the generated surface area from 3 files to 2.
-
-**For discovery: the combined endpoint is the right call.** Requiring agents to make two calls (`koto template list --json` + `koto workflows --json`) when one suffices adds friction for no benefit. The combined response is correct.
-
----
-
-## Question 5: Does the proposed package structure fit the existing codebase?
-
-**Yes, with one adjustment.** The existing structure:
+### Dependency direction: correct
 
 ```
 cmd/koto/main.go
-internal/buildinfo/
-pkg/cache/
-pkg/controller/
-pkg/discover/
-pkg/engine/
-pkg/template/
-pkg/template/compile/
+  -> pkg/generate/           (NEW: CLI imports generate)
+  -> pkg/template/compile/   (existing)
+
+pkg/generate/
+  -> pkg/template/           (reads CompiledTemplate -- correct downward dependency)
+  -> pkg/template/compile/   (compiles source templates -- correct)
 ```
 
-The proposed additions:
+No upward dependencies. No circular dependencies. `generate` sits at the same level as `controller` -- both consume template/engine output.
+
+### `pkg/generate/` vs `internal/generate/`
+
+The design places the package under `pkg/`, consistent with all other koto packages (`pkg/engine/`, `pkg/template/`, `pkg/controller/`, `pkg/cache/`, `pkg/discover/`). The only `internal/` package is `internal/buildinfo/`.
+
+If the generator is CLI-only (unlikely to be imported by external Go code), `internal/` would be more appropriate. But given the existing convention of everything under `pkg/`, this is consistent. Not worth changing.
+
+### File organization: clean
+
 ```
-pkg/registry/       # NEW
-pkg/generate/       # NEW
-pkg/templates/      # NEW (embedded files)
-```
-
-**`pkg/templates/` (embedded template files) should be `pkg/registry/templates/` or just embedded in `pkg/registry/`.** Having a `pkg/templates/` alongside `pkg/template/` is confusing. One is a parser package, the other is raw file storage. Nesting the embedded templates under `pkg/registry/` makes the relationship clear: the registry owns both the resolution logic and the built-in template files.
-
-The dependency graph after the change:
-
-```
-cmd/koto/main.go
-  -> pkg/registry      (template resolution, embeds built-in templates)
-  -> pkg/generate      (integration file generation)
-  -> pkg/controller    (directive generation)
-  -> pkg/discover      (state file scanning)
-  -> pkg/cache         (compilation cache)
-  -> pkg/engine        (state machine core)
-  -> pkg/template      (template parsing, compilation)
-  -> internal/buildinfo
-
-generate -> registry -> template/compile -> template -> engine
-                     -> cache (for $KOTO_HOME path resolution, shared)
-controller -> template -> engine
-discover -> engine (types only, for JSON tag alignment)
+pkg/generate/
+  generate.go     -- shared metadata extraction
+  claudecode.go   -- Claude Code target
+  agentsmd.go     -- AGENTS.md target
 ```
 
-No circular dependencies. All new packages flow downward. The only concern is the `pkg/templates/` vs `pkg/template/` naming collision, which is easily resolved by nesting.
+Adding a new target (e.g., `cursor.go`) follows the pattern without touching existing files.
+
+### No new external dependencies
+
+The generate package uses `pkg/template/compile` (which uses `gopkg.in/yaml.v3`), `encoding/json` (for hooks.json merge), and stdlib filesystem ops. No new external deps. Matches koto's constraint.
 
 ---
 
-## Architecture Fit Summary
+## 5. Is the design appropriately minimal?
 
-| Aspect | Assessment |
-|--------|-----------|
-| Package structure | Fits existing layout; rename `pkg/templates/` to avoid collision with `pkg/template/` |
-| Dependency direction | Clean downward flow; no inversions |
-| CLI surface | `koto generate` is a new subcommand (slot already exists in the dispatch switch); `koto template list` extends existing `koto template` subcommand |
-| State contract | No new state fields; existing state file format unchanged |
-| Zero-dependency constraint | `go:embed` is stdlib; no new external deps. `yaml.v3` already present for `compile` |
-| Parallel patterns | Home directory resolution duplicated between `cache` and `registry` -- extract shared helper |
+**Yes. The design does one thing (generate scaffold files) and avoids building infrastructure for hypothetical needs.**
 
-The design is implementable and architecturally sound. The two blocking findings (home directory duplication, workflows JSON contract break) are straightforward to address before implementation begins.
+### What the design correctly avoids:
+
+1. **Template search paths**: Not needed; skills carry their template.
+2. **Template registry**: Not needed; git is the distribution mechanism.
+3. **go:embed templates**: Not needed; templates live in the project, not the binary.
+4. **Auto-sync for stale generated files**: Deferred to hypothetical `koto doctor`. Version headers suffice.
+5. **Complex hook protocol**: Single shell command, not a daemon.
+
+### One area of potential over-engineering: `TemplateMetadata` type hierarchy
+
+As noted in Gap 1, the design defines `TemplateMetadata`, `StateInfo`, `GateInfo`, and `VariableInfo` as new public types that mirror `CompiledTemplate`, `StateDecl`, `GateDecl`, and `VariableDecl`. Comparing the types:
+
+| Design type | Existing type | Missing fields |
+|---|---|---|
+| `StateInfo.Name` | (map key in `CompiledTemplate.States`) | None |
+| `StateInfo.Terminal` | `StateDecl.Terminal` | None |
+| `StateInfo.Transitions` | `StateDecl.Transitions` | None |
+| `StateInfo.Gates []GateInfo` | `StateDecl.Gates map[string]engine.GateDecl` | None |
+| `GateInfo.Name` | (map key in `StateDecl.Gates`) | None |
+| `GateInfo.Type` | `GateDecl.Type` | None |
+| `GateInfo.Field` | `GateDecl.Field` | None |
+| `VariableInfo.Name` | (map key in `CompiledTemplate.Variables`) | None |
+| `VariableInfo.Description` | `VariableDecl.Description` | None |
+| `VariableInfo.Required` | `VariableDecl.Required` | None |
+| `VariableInfo.Default` | `VariableDecl.Default` | None |
+
+Every field in the new types has a direct counterpart. The only structural difference is converting map keys into struct fields (`.Name`). This doesn't warrant parallel public types.
+
+**Recommendation**: Use unexported helper functions that iterate over `CompiledTemplate.States` and `CompiledTemplate.Variables` maps directly when generating output. If a name-carrying struct is needed internally, make it unexported.
+
+---
+
+## 6. Additional findings
+
+### 6a. Symlink protection on template copy (Advisory)
+
+The design mentions the template copy uses "the same symlink protection as engine state file writes." The engine's check is in `atomicWrite()` (`pkg/engine/engine.go:500-503`), which is unexported. The generate package would need to duplicate the 3-line Lstat check. Acceptable duplication for now; not worth extracting a shared utility for one callsite.
+
+### 6b. `--dry-run` flag introduces boolean flag pattern (Advisory)
+
+The current `parseFlags` requires every flag to have a value. `--dry-run` is boolean. The implementer needs to either:
+- Add boolean flag support to `parseFlags` (small change, benefits future boolean flags)
+- Check for `--dry-run` before calling `parseFlags` (special case, simple)
+- Treat it as `--dry-run true` (awkward for users)
+
+**Recommendation**: Add boolean flag support to `parseFlags` by accepting a set of known boolean flag names. Small change with a clean pattern.
+
+### 6c. Version header access (No issue)
+
+The design's `Generator` struct has `KotoVersion string`, set by the CLI from `internal/buildinfo.Version()`. This correctly keeps `internal/buildinfo` out of `pkg/generate/` by passing the value through the CLI layer.
+
+### 6d. The design correctly simplifies compared to its predecessor
+
+The previous iteration of this design (visible in the prior version of this review file) proposed embedded templates, a registry package, search paths, and `go:embed` extraction. The current design eliminates all of that in favor of "the skill file is the distribution unit." This is a significant improvement: it removes two proposed packages (`pkg/registry/`, `pkg/templates/`), eliminates the `$KOTO_HOME/templates/<version>/` extraction path, and eliminates the `koto workflows` output format change. The reduced scope is appropriate.
+
+---
+
+## Findings summary
+
+| # | Finding | Severity | Action |
+|---|---------|----------|--------|
+| 2a | Hook grep pattern doesn't match actual `koto workflows` JSON array output | Blocking | Fix hook command to check for `"current_state"` in array output |
+| 2b | `--json` flag doesn't exist and can't work with current flag parser | Blocking | Drop `--json` from hook command; workflows already outputs JSON |
+| 2c | `--evidence` flag not yet implemented but referenced in generated execution loop | Advisory | Implement before Phase 2, or omit from first-version SKILL.md |
+| 1a | `TemplateMetadata` type hierarchy duplicates `CompiledTemplate` fields | Advisory | Use `CompiledTemplate` directly; add projection types only if needed |
+| 6b | `--dry-run` is a boolean flag in a key-value-only parser | Advisory | Add boolean flag support or special-case before parseFlags |
+| Gap 2 | Hook merge edge cases unspecified | Advisory | Document handling of missing/invalid hooks.json |
+
+## Overall assessment
+
+The design is structurally sound. It adds one new package at the correct level in the dependency graph, follows the existing CLI dispatch pattern, introduces no new external dependencies, and avoids building infrastructure koto doesn't need. The decision to make the agent skill the distribution unit is well-reasoned and eliminates complexity from the prior design iteration.
+
+The two blocking findings are about the generated Stop hook command not matching the actual `koto workflows` CLI output. These are specification errors in the generated content, not architectural problems. They're straightforward to fix in the design document before implementation begins.
+
+The biggest architectural risk is defining a parallel `TemplateMetadata` type hierarchy that drifts from `CompiledTemplate`. Using `CompiledTemplate` directly eliminates this risk.
+
+The phase sequencing works, with the caveat that the generated SKILL.md will reference `koto transition --evidence` before that flag exists. This should be an explicit decision: either add evidence support as a prerequisite or scope it out of first-version generation.
