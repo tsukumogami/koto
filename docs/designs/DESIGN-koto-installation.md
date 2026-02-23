@@ -94,7 +94,7 @@ Users need a way to install koto that doesn't require Go tooling or a third-part
 A shell script hosted in the koto repository and served via GitHub's raw content URL. It downloads the correct binary for the user's platform, verifies its checksum, and installs it to `~/.koto/bin/`. Usage:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tsukumogami/koto/main/website/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/tsukumogami/koto/main/install.sh | sh
 ```
 
 This follows the same pattern used by tsuku, Claude Code, Deno, Bun, and Rust/rustup. We don't own a custom domain for koto yet, so the script is served directly from GitHub. If a custom domain is acquired later, the URL can change without affecting the script's behavior.
@@ -220,8 +220,7 @@ GoReleaser, `go:embed`, and the three-layer search path reinforce each other. Go
 .goreleaser.yaml         -- Build matrix, binary config (mirrors tsuku)
 .github/workflows/
   release.yml            -- Tag-triggered: release + finalize-release jobs
-website/
-  install.sh             -- Self-contained install script
+install.sh               -- Self-contained install script
 cmd/koto/
   main.go                -- embed.FS declaration + passes to resolver
 internal/
@@ -245,7 +244,7 @@ No new code is needed for version infrastructure. The existing output format may
 
 ### Install Script
 
-The install script lives at `website/install.sh` in the koto repo (following tsuku's pattern). It's served via GitHub raw URL since we don't own a custom domain yet. It's a standalone bash script with `set -euo pipefail`, closely mirroring tsuku's `website/install.sh`.
+The install script lives at `install.sh` in the koto repo (following tsuku's pattern). It's served via GitHub raw URL since we don't own a custom domain yet. It's a standalone bash script with `set -euo pipefail`, closely mirroring tsuku's `install.sh`.
 
 Key behaviors (all matching tsuku's installer):
 - **Platform detection**: `uname -s` + `uname -m`, normalized to `linux`/`darwin` and `amd64`/`arm64`. Fails fast on unsupported platforms.
@@ -327,7 +326,7 @@ After the release is published, users can install immediately via the install sc
 - Tag and test first release (`v0.1.0`) -- this release ships without template search path or built-ins, which is intentional for validating the release pipeline
 
 ### Phase 3: Install script and tsuku recipe
-- Write `website/install.sh` adapting tsuku's install script (platform detection, binary naming, checksum verification, PATH setup to `~/.koto/bin/`)
+- Write `install.sh` adapting tsuku's install script (platform detection, binary naming, checksum verification, PATH setup to `~/.koto/bin/`)
 - Add `koto.toml` recipe to tsuku's `recipes/` directory
 - Test both channels: install script on linux/darwin, `tsuku install koto`
 
