@@ -36,8 +36,8 @@ rationale: |
 |-------|--------------|------|
 | ~~[#19: refactor(cli): migrate init and post-init commands to compiler path](https://github.com/tsukumogami/koto/issues/19)~~ | ~~None~~ | ~~critical~~ |
 | ~~_Switches `cmdInit` and `loadTemplateFromState()` from the legacy `Parse()` path to `compile.Compile()` + `ParseJSON()`. Adds `ToTemplate()` adapter and dual-hash comparison so existing workflows initialized with the legacy parser keep working._~~ | | |
-| [#20: feat(cli): add koto template compile command](https://github.com/tsukumogami/koto/issues/20) | None | testable |
-| _Adds the `koto template compile <path>` authoring command that compiles a source template and writes compiled JSON to stdout. This is the Path 2 feedback loop for template authors._ | | |
+| ~~[#20: feat(cli): add koto template compile command](https://github.com/tsukumogami/koto/issues/20)~~ | ~~None~~ | ~~testable~~ |
+| ~~_Adds the `koto template compile <path>` authoring command that compiles a source template and writes compiled JSON to stdout. This is the Path 2 feedback loop for template authors._~~ | | |
 | [#21: feat(cli): add compilation cache for deployed templates](https://github.com/tsukumogami/koto/issues/21) | [#19](https://github.com/tsukumogami/koto/issues/19) | testable |
 | _Creates `pkg/cache/` and integrates it into `cmdInit` so repeated calls with the same deployed template skip recompilation. This is the Path 1 optimization for skills and scripts._ | | |
 | [#22: chore(template): deprecate legacy Parse function](https://github.com/tsukumogami/koto/issues/22) | [#19](https://github.com/tsukumogami/koto/issues/19) | simple |
@@ -61,8 +61,8 @@ graph LR
     classDef needsDesign fill:#e1bee7
     classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
 
-    class I19 done
-    class I20,I21,I22 ready
+    class I19,I20 done
+    class I21,I22 ready
 ```
 
 **Legend**: Green = done, Blue = ready, Yellow = blocked, Purple = needs-design, Orange = tracks-design
