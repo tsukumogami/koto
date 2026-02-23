@@ -64,18 +64,3 @@ func Put(sourceHash string, compiledJSON []byte) error {
 
 	return nil
 }
-
-// Clear removes all files under the cache directory. The directory itself
-// is removed and recreated empty.
-func Clear() error {
-	dir, err := cacheDir()
-	if err != nil {
-		return err
-	}
-
-	if err := os.RemoveAll(dir); err != nil {
-		return fmt.Errorf("remove cache directory: %w", err)
-	}
-
-	return nil
-}

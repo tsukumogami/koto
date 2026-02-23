@@ -6,14 +6,10 @@ import (
 	"testing"
 )
 
-// setKotoHome sets KOTO_HOME for a test and restores it on cleanup.
+// setKotoHome sets KOTO_HOME for a test. t.Setenv handles restore on cleanup.
 func setKotoHome(t *testing.T, dir string) {
 	t.Helper()
-	old := os.Getenv("KOTO_HOME")
 	t.Setenv("KOTO_HOME", dir)
-	t.Cleanup(func() {
-		os.Setenv("KOTO_HOME", old) //nolint:errcheck // best-effort restore
-	})
 }
 
 func TestGet_Miss(t *testing.T) {
@@ -77,53 +73,6 @@ func TestPut_ThenGet_RoundTrip(t *testing.T) {
 	}
 	if string(got) != string(content) {
 		t.Errorf("Get() = %q, want %q", string(got), string(content))
-	}
-}
-
-func TestClear_RemovesAllFiles(t *testing.T) {
-	dir := t.TempDir()
-	setKotoHome(t, dir)
-
-	// Put two entries.
-	hash1 := "1111111111111111111111111111111111111111111111111111111111111111"
-	hash2 := "2222222222222222222222222222222222222222222222222222222222222222"
-	if err := Put(hash1, []byte(`{"a":1}`)); err != nil {
-		t.Fatalf("Put(hash1) error: %v", err)
-	}
-	if err := Put(hash2, []byte(`{"b":2}`)); err != nil {
-		t.Fatalf("Put(hash2) error: %v", err)
-	}
-
-	// Clear the cache.
-	if err := Clear(); err != nil {
-		t.Fatalf("Clear() error: %v", err)
-	}
-
-	// Both entries should be misses.
-	data1, err := Get(hash1)
-	if err != nil {
-		t.Fatalf("Get(hash1) error: %v", err)
-	}
-	if data1 != nil {
-		t.Errorf("Get(hash1) = %v after Clear(), want nil", data1)
-	}
-
-	data2, err := Get(hash2)
-	if err != nil {
-		t.Fatalf("Get(hash2) error: %v", err)
-	}
-	if data2 != nil {
-		t.Errorf("Get(hash2) = %v after Clear(), want nil", data2)
-	}
-}
-
-func TestClear_NoDirectory(t *testing.T) {
-	dir := t.TempDir()
-	setKotoHome(t, dir)
-
-	// Clear when no cache directory exists should not error.
-	if err := Clear(); err != nil {
-		t.Fatalf("Clear() error when no directory: %v", err)
 	}
 }
 
