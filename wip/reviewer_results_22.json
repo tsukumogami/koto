@@ -1,0 +1,8 @@
+{
+  "issue": 22,
+  "reviews": [
+    {"focus": "pragmatic", "blocking_count": 0, "advisory_count": 1},
+    {"focus": "architect", "blocking_count": 1, "advisory_count": 1, "blocking_resolved": true, "resolution_note": "library-usage.md update tracked as doc-2 in doc plan, will be handled by techwriter agent in this same PR"},
+    {"focus": "maintainer", "blocking_count": 0, "advisory_count": 2}
+  ]
+}
