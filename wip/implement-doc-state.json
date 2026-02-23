@@ -3,7 +3,7 @@
   "design_doc": "docs/designs/DESIGN-koto-installation.md",
   "branch": "docs/koto-installation",
   "pr_number": 24,
-  "integrity_hash": "sha256:152402fd6fe0df1be9322543ea2d4dd1c2cc858bdeb6d93ec4fce3cfb8a76563",
+  "integrity_hash": "sha256:80e985db289800f12d59903944dc17537bcfc105b1ab70ed721aa99553e505ad",
   "issues": [
     {
       "number": 25,
@@ -48,16 +48,26 @@
     {
       "number": 26,
       "title": "ci(release): validate release pipeline with v0.1.0",
-      "status": "pending",
+      "status": "completed",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "task",
       "dependencies": [
         25
       ],
       "commits": [],
       "agent_type": "",
-      "summary": null,
+      "summary": {
+        "narrative": "",
+        "files_changed": [],
+        "tests_added": 0,
+        "key_decisions": "Tagged v0.1.0 directly (no RC). Required two fix PRs (#30 name_template, #31 artifact names) before pipeline validated.",
+        "requirements_map": {
+          "scenario-7": "pass",
+          "scenario-8": "pass",
+          "scenario-9": "pass"
+        }
+      },
       "testable_scenarios": [
         "scenario-7",
         "scenario-8",

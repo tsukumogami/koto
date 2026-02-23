@@ -101,7 +101,7 @@ Total scenarios: 14
 ---
 
 ## Scenario 7: Published v0.1.0 release has correct assets
-**ID**: scenario-7
+**ID**: [x] scenario-7
 **Testable after**: #26
 **Category**: use-case
 **Environment**: manual -- requires real CI run triggered by tag push
@@ -111,12 +111,12 @@ Total scenarios: 14
 - `echo "$RELEASE_JSON" | jq '.assets | length'` -- should be `5`
 - `echo "$RELEASE_JSON" | jq -r '.assets[].name'` -- should list all 4 binaries plus checksums.txt
 **Expected**: Release `v0.1.0` is published (not draft), contains exactly 5 assets: `koto-linux-amd64`, `koto-linux-arm64`, `koto-darwin-amd64`, `koto-darwin-arm64`, and `checksums.txt`.
-**Status**: pending
+**Status**: passed
 
 ---
 
 ## Scenario 8: Checksums file is valid and matches downloaded binary
-**ID**: scenario-8
+**ID**: [x] scenario-8
 **Testable after**: #26
 **Category**: use-case
 **Environment**: manual -- requires published release on GitHub
@@ -126,12 +126,12 @@ Total scenarios: 14
 - `gh release download v0.1.0 --repo tsukumogami/koto --pattern "koto-linux-amd64" --dir "$TMPDIR"`
 - `sha256sum "$TMPDIR/koto-linux-amd64"` -- should match the entry in checksums.txt
 **Expected**: `checksums.txt` contains exactly 4 lines in valid SHA-256 format. Downloading a binary and computing its checksum matches the value in `checksums.txt`.
-**Status**: pending
+**Status**: passed
 
 ---
 
 ## Scenario 9: Downloaded binary reports correct version
-**ID**: scenario-9
+**ID**: [x] scenario-9
 **Testable after**: #26
 **Category**: use-case
 **Environment**: manual -- requires published release and matching platform binary
@@ -140,7 +140,7 @@ Total scenarios: 14
 - `chmod +x "$TMPDIR/koto-*"`
 - `"$TMPDIR/koto-*" version`
 **Expected**: Binary version output contains `0.1.0`. This validates that GoReleaser ldflags correctly injected the version into `internal/buildinfo`.
-**Status**: pending
+**Status**: passed
 
 ---
 

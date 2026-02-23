@@ -55,3 +55,21 @@ Spawned with tsuku's files as reference. Produced correct GoReleaser v2 config a
 **Friction: Standard directive says "commit to current branch" but multi-PR needs separate branches**
 
 The controller directive template includes `CRITICAL: Do NOT create or switch branches.` This doesn't apply in multi-PR mode -- each issue needs its own branch off main. Had to override the directive manually. The controller should have a multi-PR mode that changes this instruction.
+
+### Issue #26: Validate release pipeline with v0.1.0
+
+**Friction: Pipeline validation required two fix PRs before passing**
+
+The coder agent produced correct GoReleaser config for #25, but two naming mismatches weren't caught by the static scenario checks (scenarios 1-6 validated config structure, not runtime output names):
+1. PR #30: `.goreleaser.yaml` missing `name_template` in archives section -- GoReleaser default appends version and platform info to binary names
+2. PR #31: `release.yml` finalize job had hardcoded old naming convention in artifact verification
+
+This is the expected purpose of #26 (validate the pipeline end-to-end), but it required three tag-delete-retag cycles. The friction is in the iteration loop: delete release, delete tag, fix config, merge fix, re-tag, wait for CI, validate. Each cycle takes ~3 minutes.
+
+**Observation: Task issue state transition is simpler**
+
+Task issues go `in_progress -> completed` directly, skipping `implemented -> pushed`. No need for reviewer stubs or CI status flags. The state machine correctly models that operational tasks don't produce code commits.
+
+**Observation: Validation script from issue body worked as-is**
+
+The issue's validation script caught the naming mismatch immediately. Having executable validation criteria in the issue body pays for itself when the implementation needs iteration.
