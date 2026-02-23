@@ -1,29 +1,24 @@
 ---
 status: Proposed
 problem: |
-  koto v0.1.0 has a working state machine engine and is installable, but no AI agent will
-  use it because nothing connects the binary to the agent's context. The missing piece isn't
-  template distribution or a discovery protocol -- it's that the agent skill (or equivalent)
-  is the natural integration unit. A skill bundles the template with agent instructions, and
-  koto just needs to compile and cache templates on first use. Today koto init requires an
-  explicit filesystem path, which works but the compilation and caching path isn't designed
-  for this use case.
+  koto v0.1.0 has a working engine, but no AI agent uses it because nothing connects the
+  binary to the agent's context. The agent skill is the natural integration unit -- it bundles
+  the workflow template with instructions telling the agent how to call koto. The real question
+  isn't what koto should build, it's how these skills get distributed and installed into
+  projects. koto's compile-and-cache infrastructure already handles everything on the engine
+  side.
 decision: |
-  Focus on two flows. First, the agent-driven flow: an agent skill contains the workflow
-  template (as a file alongside the skill) and instructions telling the agent how to call
-  koto. The skill is the distribution unit -- install a skill, get a working koto workflow.
-  koto compiles and caches the template on first koto init, which it already does. Second,
-  the author-driven flow: a user writing or editing a template validates it with koto
-  template compile, which already exists. The design adds koto generate to produce skill
-  scaffolds for a given template, and a Stop hook to prevent agents from quitting
-  mid-workflow.
+  Distribute reference workflow skills (like quick-task) as a Claude Code plugin. Users install
+  with a single command. Custom workflow skills are project-scoped: the author writes a SKILL.md
+  alongside the template and commits both to the project repo. koto itself needs no code changes
+  for agent integration -- it already compiles templates on first koto init and caches them by
+  source hash.
 rationale: |
-  The agent skill is the right integration unit because it naturally bundles what the agent
-  needs to know (how to call koto, what evidence to supply) with the template that defines
-  the workflow. Treating template distribution and agent integration as separate problems
-  led to over-engineering (search paths, go:embed, extraction). The skill already lives in
-  the project repo, is version-controlled, and is platform-specific by nature. koto's role
-  is to compile templates and run workflows -- not to manage template distribution.
+  Agent platforms already have distribution mechanisms. Claude Code has plugins and marketplaces.
+  The Agent Skills open standard (agentskills.io) makes SKILL.md files work across Claude Code,
+  Codex, Cursor, Windsurf, and others. Building distribution infrastructure inside koto would
+  duplicate what the ecosystem already provides. koto's role is to compile templates and run
+  workflows, not to distribute skills.
 ---
 
 # DESIGN: koto Agent Integration
@@ -34,323 +29,249 @@ rationale: |
 
 ## Context and Problem Statement
 
-koto has a working state machine engine (v0.1.0) that enforces workflow progression through evidence-gated transitions and progressive disclosure. It's installable via GitHub Releases, an install script, and a tsuku recipe. But there's a gap between "koto is on PATH" and "an AI agent uses koto to run a workflow."
+koto has a working state machine engine (v0.1.0) that enforces workflow progression through evidence-gated transitions. It's installable via GitHub Releases and an install script. But there's a gap between "koto is on PATH" and "an AI agent uses koto to run a workflow."
 
-The gap isn't about template distribution or discovery protocols. It's simpler than that: the agent needs a skill (or equivalent integration file) that tells it koto exists, what commands to call, and which template to use. The skill is the natural integration unit because it bundles two things that always go together:
+The gap is a distribution problem, not a feature problem. An agent needs a skill that tells it koto exists, what commands to call, and which template to use. The skill bundles two things that always travel together. A constraint shapes the answer: koto stores absolute template paths in state files and verifies SHA-256 hashes on every operation, so templates must live at stable filesystem paths for the duration of a workflow.
 
-1. **The workflow template** -- the `.md` file that defines states, transitions, and evidence gates
-2. **Agent instructions** -- how to call koto, what evidence keys to supply, how to interpret responses
+1. **The workflow template** -- the `.md` file defining states, transitions, and evidence gates
+2. **Agent instructions** -- how to call koto, what evidence to supply, how to interpret responses
 
-These two pieces must travel together. A template without agent instructions means the agent doesn't know koto exists. Agent instructions without a template means there's nothing to run. The skill file solves both.
+Without a skill, the agent doesn't know koto exists. Without a template in the skill, there's nothing to run. And because koto needs a stable absolute path to the template, the template can't live in a transient location like a plugin cache -- it needs to be somewhere in the project that won't move. The question is: how do these skills get from "someone wrote them" to "they're installed in a developer's project" with the template at a stable path?
 
-There are two distinct flows to support:
+Two flows need support:
 
-**Agent-driven flow.** An agent skill references a template file and tells the agent how to use koto. The user installs the skill into their project (by committing the skill files), and the agent follows the instructions. koto compiles and caches the template on first `koto init`, which it already does.
+**Agent-driven flow.** A skill is installed in the project (by any mechanism). The agent reads it and follows the instructions: call `koto init --template <path>`, then loop `koto next` / execute / `koto transition`. koto compiles and caches the template on first init (existing behavior). The cache at `~/.koto/cache/` keys on the SHA-256 of the template source, so the same template is compiled only once.
 
-**Author-driven flow.** A user writing or editing a workflow template wants to validate it compiles correctly and has well-formed states, transitions, and gates. `koto template compile` already handles this. The feedback loop is: edit template, run `koto template compile`, fix errors, repeat.
+**Author-driven flow.** A template author validates their work with `koto template compile <path>`, which already exists. It reports errors and outputs compiled JSON. No new infrastructure needed.
+
+### Distribution Landscape
+
+The Agent Skills open standard (agentskills.io, launched December 2025 by Anthropic) defines a `SKILL.md` format that works across Claude Code, OpenAI Codex CLI, Cursor, Windsurf, Gemini CLI, and GitHub Copilot. This means a skill written once works across platforms.
+
+Claude Code provides a full distribution stack:
+
+| Mechanism | How it works | Friction |
+|-----------|-------------|----------|
+| Git commit | `.claude/skills/` in the repo. Auto-discovered on clone. | Zero for collaborators |
+| Personal install | Copy to `~/.claude/skills/`. Available in all projects. | Manual per-user |
+| Plugin | `/plugin install name@marketplace`. Bundles skills + hooks + commands. | One command |
+| Team auto-install | `settings.json` with `enabledPlugins`. Prompts on folder trust. | Zero after setup |
+
+Other platforms rely on simpler conventions: Cursor uses `.cursor/rules/`, Codex uses `AGENTS.md`, Windsurf uses `.windsurfrules`. All support the Agent Skills standard for cross-platform skills.
 
 ### Scope
 
 **In scope:**
-- `koto generate` command to scaffold agent skill files from a template
-- Stop hook generation for session continuity
-- Claude Code skill structure (skill file + command file + hook)
-- AGENTS.md generation for generic platform support
-- Documenting the skill-as-distribution-unit pattern
+- Plugin structure for distributing reference workflow skills
+- Skill file structure (SKILL.md content for a koto workflow)
+- Template locality: ensuring templates live at stable project-local paths
+- Stop hook for session continuity (bundled in the plugin)
+- Cross-platform support via Agent Skills standard
+- Documentation for custom template skill authoring
 
 **Out of scope:**
-- Template search paths or built-in template embedding (not needed)
-- Template registry or community sharing (future work)
-- Human interaction UX beyond the author validation flow (separate design)
+- koto CLI changes (none needed)
+- Template search paths or built-in embedding
+- `koto generate` command (deferred; may be useful later as a convenience)
 - MCP server integration
+- Template registry or community sharing marketplace
 
 ## Decision Drivers
 
-- The agent skill is the natural integration unit -- it bundles template + agent instructions
-- koto already compiles and caches templates on first use (no new compilation infrastructure needed)
-- `koto template compile` already exists for the author validation flow
-- Must work across agent platforms (Claude Code, Cursor, Codex, generic shell agents)
-- Templates need stable filesystem paths -- the engine stores absolute paths in state files
-- koto is a CLI tool, not a service -- no background process, no auto-discovery
-- The solution should be minimal: don't build infrastructure for problems that agent platform conventions already solve
+- Agent platforms already have distribution mechanisms -- use them, don't reinvent
+- The Agent Skills standard provides cross-platform reach for free
+- koto already compiles and caches templates on first `koto init` -- no engine changes needed
+- Templates need stable filesystem paths: the engine stores absolute paths in state files and verifies SHA-256 hashes on every operation
+- The solution must work for both reference templates (published by koto) and custom templates (written by project teams)
+- Minimize koto code changes -- the distribution problem is solved by the ecosystem, not by koto
 
 ## Considered Options
 
-### Decision 1: How Templates Reach Agents
+### Decision 1: How Workflow Skills Reach Users
 
-The question is how a workflow template gets from "someone wrote it" to "an agent uses it in a project." The template must end up as a file in the project (koto init needs a filesystem path), and the agent must know it exists.
+A koto workflow skill consists of a SKILL.md (agent instructions) and a template file. It needs to get into a position where the agent platform can discover and load it. For reference templates published by the koto project (like quick-task), there's a publishing question: where do they live and how do users install them?
 
-#### Chosen: Skill-as-Distribution-Unit
+#### Chosen: Plugin for Reference Templates, Project-Scoped for Custom
 
-The agent skill file is the distribution mechanism. A koto workflow skill consists of:
+**Reference templates** are published as a Claude Code plugin in a dedicated repository (`koto-skills` or similar). The plugin bundles:
+- One skill per workflow template (SKILL.md + template file)
+- A Stop hook that detects active koto state files
 
-```
-.claude/skills/quick-task/
-├── SKILL.md         # Agent instructions: how to call koto, evidence keys, response schemas
-└── quick-task.md    # The workflow template itself
-```
+Users install with `/plugin install koto-skills@koto`. The plugin's skills appear in Claude Code's skill list. When invoked, the skill instructs the agent to copy the template to a project-local path and then call koto.
 
-The skill's `SKILL.md` tells the agent: "When the user asks for a quick task, run `koto init --template .claude/skills/quick-task/quick-task.md --name <task-name> --var TASK='<description>'`, then call `koto next` and follow the directive."
+The plugin is also published to a marketplace for discoverability. Teams can enable it automatically via `settings.json`.
 
-The template lives alongside the skill file in the project repo. It's version-controlled, reviewable, and doesn't require any special distribution mechanism. koto compiles and caches it on first `koto init` (the cache lives at `~/.koto/cache/`), so subsequent operations are fast.
+**Custom templates** are project-scoped. The author writes a template, validates it with `koto template compile`, then writes a SKILL.md alongside it in `.claude/skills/<name>/`. Both files are committed to the project repo. The skill is available to anyone who clones the project.
 
-For non-Claude Code platforms:
-- **Cursor/Codex**: The template still lives in the project. An AGENTS.md section or `.cursorrules` snippet provides the equivalent agent instructions.
-- **Generic shell agents**: The template path is just a file path. Any agent with shell access can call `koto init --template <path>`.
-
-This pattern works because agent platforms already have conventions for distributing instructions to agents. koto doesn't need to reinvent this -- it just needs to fit into it.
-
-`koto generate <platform>` scaffolds these files from an existing template. Given a template path, it produces the platform-specific skill files with the correct koto CLI instructions, evidence key documentation extracted from the template, and response schema docs.
+**koto itself needs no code changes.** The compile-and-cache infrastructure already handles template processing. The skill file is just a markdown document with instructions -- koto doesn't need to know about it.
 
 #### Alternatives Considered
 
-**Embedded built-in templates with search path.** Ship templates in the koto binary via `go:embed`. Add a three-level search path (project, user, built-in) to resolve template names.
-Rejected because it solves the wrong problem. Embedding a template in the binary doesn't help if nothing tells the agent to call koto. The search path adds complexity (shadowing, extraction, versioned directories) for a problem that the agent platform's own skill/config system already solves. The template must live in the project anyway (for version control and team sharing), so embedding it in the binary is redundant.
+**Project-scoped only (no plugin).** Publish reference skill directories in koto's repo. Users copy them into their project manually.
+Rejected as the primary path because it requires users to find the skill files in koto's repo, copy them, and keep them updated. The plugin model reduces this to a single install command and provides automatic updates. Project-scoped remains the right model for custom templates.
 
-**Template registry with download-on-demand.** Templates pulled from a git-hosted registry when referenced by name.
-Rejected because it adds a network dependency and registry infrastructure. The skill file pattern distributes templates through git (clone the repo, the skill files are there). No separate registry needed.
+**Git repository distribution (no plugin layer).** Publish `koto-skills` as a plain git repo that users submodule or subtree into `.claude/skills/`.
+Rejected because it adds git submodule management overhead to every project that wants koto skills. Submodules are notoriously friction-heavy (initial setup, update commands, detached HEAD state). The plugin system provides the same "install once" experience without burdening the project's git history.
 
-**koto init scaffolds a template.** `koto init` generates a starter template in the project directory.
-Rejected as the primary flow because it conflates workflow initiation (creating a state file to start running) with template creation (authoring a new workflow). These are different actions by different people at different times. Template authoring is the author-driven flow; workflow initiation is the agent-driven flow.
-
-### Decision 2: What koto generate Produces
-
-Given that the skill is the distribution unit, what exactly should `koto generate` produce? The generator reads an existing template and scaffolds the platform-specific files around it.
-
-#### Chosen: Platform-Specific Skill Scaffolds
-
-`koto generate <platform> --template <path>` reads the template, extracts metadata (states, evidence gates, variables), and produces integration files.
-
-**`koto generate claude-code --template <path>`** produces:
-
-1. **Skill directory** with:
-   - `SKILL.md`: Agent instructions including koto CLI reference, the execution loop (init → next → execute → transition → next), evidence keys extracted from the template's gate definitions, JSON response schemas, error handling, and resume behavior
-   - A copy or symlink of the template file (so the skill is self-contained)
-
-2. **Command file** (`.claude/commands/koto-run.md`): A `/koto-run` slash command humans use to trigger the workflow. Takes an optional task description. Wraps `koto init` + `koto next`.
-
-3. **Hook entry** (merged into `.claude/hooks.json`): A Stop hook that checks for active koto state files and reminds the agent to continue. Uses `koto workflows` to detect active workflows regardless of state directory.
-
-**`koto generate agents-md --template <path>`** produces a markdown section for AGENTS.md with the same information as the skill file but in a platform-agnostic format.
-
-**Common behavior:**
-- Generated files include a version comment: `<!-- Generated by koto vX.Y.Z from template-name -->`
-- `--dry-run` previews output without writing
-- Running again overwrites skill/command files; merges hook entries (replace koto's entry, preserve others)
-- The template file is copied into the skill directory so the skill is self-contained
-
-#### Alternatives Considered
-
-**Generate only a skill file, reference template by path.** The skill points to the template elsewhere in the repo.
-Rejected as the default because it creates a fragile cross-directory dependency. If the template moves, the skill breaks. Copying the template into the skill directory makes the skill self-contained. Users who want to share one template across multiple skills can use a relative path instead.
-
-**No generate command -- users write skills manually.** Document the skill structure and let users author their own.
-Rejected as the only approach because extracting evidence keys, gate types, and state machine structure from a template is tedious and error-prone. The generator automates the mechanical part while users customize the agent instructions. However, manual authoring remains a valid advanced path.
+**`koto generate` as the primary distribution mechanism.** A `koto generate claude-code --template <path>` command scaffolds skill files from a template.
+Rejected as the primary distribution mechanism because the hard part isn't generating the SKILL.md -- it's getting the skill to the user. A generate command couples every distribution path to koto releases. The plugin model decouples them. As a secondary tool for custom skill authoring, `koto generate` could reduce the manual effort of extracting evidence keys and state descriptions from templates. That's a convenience feature for a future release, not the distribution mechanism.
 
 ### Uncertainties
 
-- **Hook effectiveness.** The Stop hook preventing agents from quitting mid-workflow has been validated with Claude Code but not broadly across versions and configurations.
-- **Template copy vs reference.** Copying the template into the skill directory means two copies in the repo. For teams with many skills sharing one template, this could be annoying. A `--reference` flag (generating a path reference instead of a copy) is a straightforward future addition.
-- **Evidence key extraction quality.** The generator extracts evidence keys from gate definitions, but the human-readable descriptions of what each key should contain come from the template author. If the template doesn't document its evidence keys well, the generated skill won't either.
-- **`--evidence` flag doesn't exist yet.** The generated skill describes `koto transition --evidence key=value`, but this flag isn't implemented in v0.1.0. The skill should either note this as a future capability or the flag should be implemented before the first skill is generated. Evidence is currently only accessible via the Go library API.
+- **Plugin system maturity.** Claude Code's plugin system is relatively new (v1.0.33+, late 2025). Plugin installation is confirmed working, but marketplace discovery and team auto-install are still being adopted. Team auto-install (`extraKnownMarketplaces`) does not work in headless mode -- a known open issue.
+- **Template delivery from plugin to project.** Claude Code injects SKILL.md content as text into the agent's context. The agent does not receive a filesystem path to the skill's directory. This means the agent can't directly copy sibling files from the plugin cache. The template content must be included in the SKILL.md itself (as a fenced code block or in the `references/` directory) so the agent can write it to a project-local path. See Template Locality in Solution Architecture.
+- **Stop hook working directory.** `koto workflows` scans `wip/` relative to the current working directory. Claude Code hooks typically run from the project root, but this isn't guaranteed across all session types. If the cwd is wrong, the hook fails silently (no false positives, just missed detection).
+- **Stop hook PATH availability.** If `koto` isn't on PATH in the hook's shell environment, the hook fails silently. This is more likely than the malicious binary scenario and should be documented.
+- **Evidence supply at transition time.** The `koto transition` command currently accepts only a target state name and `--state`/`--state-dir` flags. There is no `--evidence key=value` flag in v0.1.0. Evidence is only accessible via the Go library API. Generated SKILL.md files must reflect the current CLI surface and be updated when the evidence flag ships.
+- **Cross-platform plugin equivalents.** Cursor launched a marketplace in February 2026 that supports the Agent Skills standard. Codex and Windsurf use simpler conventions (AGENTS.md, rules files) without a plugin layer. Cross-platform distribution of the hook requires platform-specific files alongside the standardized SKILL.md.
+- **SKILL.md drift.** The SKILL.md documents koto's CLI behavior (JSON response shapes, command flags, execution loop). When koto's CLI changes, the SKILL.md needs updating. No automated synchronization mechanism exists -- this is a manual maintenance coupling between the koto binary and the plugin repository.
 
 ## Decision Outcome
 
-**Chosen: Skill-as-distribution-unit with koto generate for scaffolding**
-
 ### Summary
 
-The agent skill is the distribution unit for koto workflows. A skill bundles the workflow template with platform-specific agent instructions. koto's job is to compile templates and run workflows -- not to distribute templates.
+Reference koto workflow skills are distributed as a Claude Code plugin. Users install with `/plugin install`. Custom workflow skills are committed to the project repo under `.claude/skills/`. koto itself needs no code changes.
 
-`koto generate <platform> --template <path>` scaffolds skill files from an existing template. For Claude Code, it produces a skill directory (SKILL.md + template copy), a `/koto-run` command file, and a Stop hook. For other platforms, it produces an AGENTS.md section. The generator extracts evidence keys, state names, and variable definitions from the template so the agent instructions are accurate.
-
-The agent-driven flow works like this: the skill's SKILL.md tells the agent to run `koto init --template <path-to-template-in-skill-dir>`, then loop `koto next` / execute / `koto transition`. koto compiles and caches the template on first init (existing behavior). The Stop hook detects active state files and reminds the agent to continue if it tries to stop mid-workflow.
-
-The author-driven flow is already supported: `koto template compile <path>` validates a template, reports errors, and outputs the compiled JSON. Authors edit their template, compile to check, fix errors, repeat. No new infrastructure needed for this flow.
+The Agent Skills standard means koto's SKILL.md files work across platforms. The Stop hook (which prevents agents from quitting mid-workflow) is bundled in the plugin for Claude Code and documented for manual setup on other platforms.
 
 ### Rationale
 
-The skill-as-distribution-unit pattern works because it aligns with how agent platforms already work. Claude Code has skills. Cursor has rules. Every platform has some mechanism for giving agents project-specific instructions. koto doesn't need its own distribution system -- it needs to fit into the ones that already exist.
+Agent platforms already solve the distribution problem. Claude Code has plugins, marketplaces, and team auto-install. Cursor has a marketplace. Codex and Windsurf have filesystem conventions. The Agent Skills standard provides cross-platform portability.
 
-This eliminates the search path, go:embed extraction, versioned directories, and template registry from the previous design iteration. Those solved a problem that doesn't exist: templates don't need their own distribution channel because the skill file already distributes them.
+Building distribution into koto (search paths, `go:embed`, registries, generate commands) would duplicate ecosystem capabilities while coupling skill updates to koto releases. The plugin model lets reference skills evolve independently: a new workflow template can be published to the plugin without a koto release.
 
-koto's compile-and-cache behavior (implemented in v0.1.0) handles the performance side. The first `koto init` compiles the template and stores the result in `~/.koto/cache/`. Subsequent operations load from cache. No new caching infrastructure needed.
+koto's compile-and-cache path already handles the engine side. `koto init --template <path>` compiles the template, caches the result keyed by source hash, and records the absolute path in the state file. Every subsequent `koto next` re-reads and re-verifies the template. No modifications needed.
 
 ### Trade-offs Accepted
 
-- **Template duplication.** Copying the template into the skill directory means two copies if the template also lives elsewhere. Acceptable because skills should be self-contained, and the template is small (a few KB of markdown).
-- **No built-in templates.** koto doesn't ship with a ready-to-use template embedded in the binary. Users need a skill file in their project before an agent will use koto. Acceptable because the `koto generate` command makes creating a skill fast, and the quick-task template will be published as a standalone file that anyone can download or copy.
-- **Platform-specific generation.** Supporting a new agent platform means adding a generator target to koto. Acceptable because AGENTS.md covers the generic case, and dedicated generators are only needed for platforms with richer integration models (hooks, slash commands).
-- **Generated files can drift.** When koto updates its CLI surface, generated skill files become stale. Version headers signal when regeneration is needed. No automatic sync.
+- **No built-in templates.** koto doesn't ship with templates embedded in the binary. Users need to install the plugin or copy skill files into their project. Acceptable because the plugin install is a single command, and project-scoped skills are just files committed to git.
+- **Template must be project-local.** The state file stores absolute template paths. Templates from plugins must be copied to a stable project-local path before `koto init`. This adds a step to the agent-driven flow, but it's handled by the SKILL.md instructions -- the user never sees it.
+- **Plugin system dependency.** The primary distribution path depends on Claude Code's plugin system, which is newer than the core CLI. Acceptable because project-scoped skills remain a fully functional fallback, and the Agent Skills standard provides cross-platform reach beyond any single plugin system.
+- **Manual authoring for custom skills.** Authors write SKILL.md by hand for custom templates. A `koto generate` command could automate this later, but the manual path works and keeps koto's scope minimal.
 
 ## Solution Architecture
 
 ### Overview
 
-The implementation adds one new package (`pkg/generate/`) and extends the CLI with the `koto generate` subcommand. The existing compile and cache infrastructure handles template processing. No new external dependencies.
+The implementation produces two artifacts, neither of which requires koto code changes:
 
-### Components
+1. **`koto-skills` plugin repository** -- a Claude Code plugin containing reference workflow skills and a Stop hook
+2. **Documentation** -- a guide for creating custom koto workflow skills
+
+### Plugin Repository Structure
 
 ```
-cmd/koto/main.go              # Extended: generate subcommand
-pkg/
-├── generate/                  # NEW: skill scaffold generation
-│   ├── generate.go            # Shared logic: template parsing, metadata extraction
-│   ├── claudecode.go          # Claude Code: skill dir, command file, hook entry
-│   └── agentsmd.go            # AGENTS.md section generation
-├── template/compile/          # EXISTING: template compilation (used by generate)
-├── cache/                     # EXISTING: compiled template caching
-└── discover/                  # EXISTING: state file scanning (used by hook)
+koto-skills/
+├── .claude-plugin/
+│   └── plugin.json              # Plugin manifest
+├── skills/
+│   └── quick-task/
+│       ├── SKILL.md             # Agent instructions for quick-task workflow
+│       └── quick-task.md        # The workflow template
+└── hooks.json                   # Stop hook for session continuity
 ```
 
-### Key Interfaces
+**`plugin.json`:**
 
-**Skill Generation:**
-
-```go
-// generate.Generator scaffolds integration files from a template.
-type Generator struct {
-    TemplatePath string // path to the source template
-    OutputDir    string // project root
-    KotoVersion  string // for version headers
-}
-
-// ClaudeCode produces a skill directory, command file, and hook entry.
-func (g *Generator) ClaudeCode() ([]GeneratedFile, error)
-
-// AgentsMD produces an AGENTS.md section.
-func (g *Generator) AgentsMD() ([]GeneratedFile, error)
-
-type GeneratedFile struct {
-    Path    string // relative path from project root
-    Content []byte
-    Action  string // "created" or "updated"
-}
-
-// TemplateMetadata holds extracted template info for skill generation.
-// Implementation note: most fields map directly to CompiledTemplate fields.
-// Consider using CompiledTemplate directly rather than copying into a new type.
-type TemplateMetadata struct {
-    Name        string
-    Description string
-    Version     string
-    States      []StateInfo
-    Variables   []VariableInfo
-}
-
-type StateInfo struct {
-    Name        string
-    Terminal    bool
-    Transitions []string
-    Gates       []GateInfo
-}
-
-type GateInfo struct {
-    Name  string
-    Type  string // "field_not_empty", "field_equals", "command"
-    Field string
-}
-
-type VariableInfo struct {
-    Name        string
-    Description string
-    Required    bool
-    Default     string
+```json
+{
+  "name": "koto-skills",
+  "version": "0.1.0",
+  "description": "Workflow skills for koto -- the state machine engine for AI agent workflows",
+  "skills": ["./skills/quick-task"]
 }
 ```
 
-### Data Flow
+Each workflow template gets its own skill directory under `skills/`. Adding a new workflow means adding a new directory with SKILL.md + template -- no coordination with the koto binary release.
 
-**Agent-driven flow (using a skill):**
+### Marketplace
 
-```
-1. User runs: koto generate claude-code --template my-workflow.md
-   → Generator compiles the template, extracts metadata
-   → Produces .claude/skills/my-workflow/SKILL.md + my-workflow.md
-   → Produces .claude/commands/koto-run.md
-   → Merges Stop hook into .claude/hooks.json
-   → User commits all files to repo
-
-2. Agent reads skill, user says "/koto-run fix the login bug"
-   → Agent runs: koto init --template .claude/skills/my-workflow/my-workflow.md \
-                   --name login-fix --var TASK="fix the login bug"
-   → koto compiles template (or loads from cache), creates state file
-   → Agent calls: koto next
-   → koto returns JSON directive for current state
-   → Agent executes directive, then: koto transition <state> --evidence key=value
-   → Loop until koto returns {"action": "done"}
-
-3. If agent session ends mid-workflow:
-   → Next session: Stop hook runs koto workflows, detects active state file
-   → Hook outputs: "Active koto workflow detected. Run koto next to continue."
-   → Agent resumes with koto next
-```
-
-**Author-driven flow (writing a template):**
+A marketplace enables `/plugin install` discovery:
 
 ```
-1. Author creates or edits my-workflow.md
-2. Author runs: koto template compile my-workflow.md
-   → Compiler validates YAML frontmatter, state declarations, transitions, gates
-   → Reports errors and warnings to stderr
-   → On success: outputs compiled JSON to stdout (or --output file)
-3. Author fixes errors, repeats until clean
-4. Author runs: koto generate claude-code --template my-workflow.md
-   → Generates skill files for testing with an agent
-5. Author tests the workflow end-to-end with an agent
+koto-marketplace/
+└── .claude-plugin/
+    └── marketplace.json
 ```
 
-### Generated Skill Content
+```json
+{
+  "name": "koto",
+  "owner": { "name": "tsukumogami" },
+  "plugins": [
+    {
+      "name": "koto-skills",
+      "source": { "source": "github", "repo": "tsukumogami/koto-skills" },
+      "description": "Workflow skills for koto"
+    }
+  ]
+}
+```
 
-**Claude Code Skill (`SKILL.md`) structure:**
+Users install: `/plugin marketplace add tsukumogami/koto-marketplace`, then `/plugin install koto-skills@koto`.
 
-```markdown
+Teams can auto-install by adding to their project's `.claude/settings.json`:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "koto": {
+      "source": { "source": "github", "repo": "tsukumogami/koto-marketplace" }
+    }
+  },
+  "enabledPlugins": {
+    "koto-skills@koto": true
+  }
+}
+```
+
+### Skill File Structure
+
+A koto workflow SKILL.md follows the Agent Skills standard:
+
+```yaml
 ---
-name: <workflow-name>
-description: <from template frontmatter>
+name: quick-task
+description: |
+  Run a quick development task using koto workflow guidance. Use when the user asks to
+  implement a small feature, fix a bug, or complete a well-scoped task.
 ---
-
-# <Workflow Name>
-
-## When to Use
-
-<Describes when the agent should use this workflow.
-Placeholder for author customization.>
-
-## koto CLI Reference
-
-<Generated from koto's CLI surface. Documents init, next,
-transition, query, status, rewind, cancel, validate.
-JSON response schemas for each command.>
-
-## Workflow States
-
-<Generated from template. Lists each state, its transitions,
-evidence gates, and what the agent should do in each state.>
-
-## Evidence Keys
-
-<Generated from template gates. Documents each evidence key,
-its type (field_not_empty, field_equals, command), and what
-value the agent should supply.>
-
-## Execution Loop
-
-1. Check for active workflows: `koto workflows`
-2. If active, resume: `koto next`
-3. If starting new: `koto init --template <path> --name <name> --var KEY=VALUE`
-4. Get directive: `koto next`
-5. Execute the directive
-6. Transition: `koto transition <target> --evidence key=value`
-7. Repeat from step 4 until done
-
-## Error Handling
-
-<Documents error response format, common error codes,
-and recovery actions for each.>
 ```
 
-**Stop Hook (`.claude/hooks.json`):**
+The body covers:
+
+1. **Prerequisites** -- koto must be installed and on PATH
+2. **Template setup** -- ensure the template exists at a project-local path
+3. **Execution loop** -- the init / next / execute / transition cycle
+4. **Evidence keys** -- what to supply at each transition, extracted from the template's gate definitions
+5. **Response schemas** -- JSON shapes returned by koto commands
+6. **Error handling** -- how to recover from common errors
+7. **Resume** -- how to continue an interrupted workflow
+
+The skill content is authored by hand. Evidence keys and state descriptions come from reading the template. For reference skills published in the plugin, these are maintained by the koto project.
+
+### Template Locality
+
+koto stores the absolute template path in state files and verifies the SHA-256 hash on every operation. If the template moves or changes, the workflow breaks. This creates a constraint: **templates used by active workflows must be at stable paths.**
+
+For **project-scoped skills**, this is automatic. The template lives at `.claude/skills/<name>/<template>.md`, which is committed to the repo and doesn't move.
+
+For **plugin-distributed skills**, the template starts in the plugin's cache directory. The agent can't use this path directly -- it can change when the plugin updates, and the agent doesn't receive the skill's filesystem path (Claude Code injects SKILL.md content as text, not as a path reference).
+
+The solution: the SKILL.md includes the template content (as a fenced code block or in the skill's `references/` directory). When the skill is invoked, the agent has the template text in context. The SKILL.md instructs the agent to write it to a project-local path:
+
+```
+Before starting a new workflow:
+1. Check if .koto/templates/quick-task.md exists in the project root
+2. If not, write the template content (below) to .koto/templates/quick-task.md
+3. Run: koto init --template .koto/templates/quick-task.md --name <name> --var TASK="<description>"
+```
+
+The `.koto/templates/` directory should be committed to version control so the template is available to other collaborators and survives branch switches. `koto init` always points to a project-local file.
+
+### Stop Hook
+
+The plugin includes a `hooks.json` that detects active koto workflows on session stop:
 
 ```json
 {
@@ -365,90 +286,135 @@ and recovery actions for each.>
 }
 ```
 
-The hook runs `koto workflows` (which already outputs JSON by default) and checks whether the response contains workflow entries. If the output is an empty array `[]`, grep finds no match and the hook stays silent. If active workflows exist, their `"path"` fields trigger the match and the hook reminds the agent to continue.
+`koto workflows` outputs a JSON array of active state files. If the array contains entries (workflows in progress), grep matches on the `"path"` field and the hook outputs a reminder. If no workflows are active (empty array), the hook stays silent.
 
-**Hook merge strategy:** When merging into an existing `hooks.json`, `koto generate` identifies its own hook entry by matching commands that start with `koto workflows`. On regeneration, it replaces the matching entry. If no match exists, it appends to the `Stop` array (creating it if needed). If `hooks.json` doesn't exist or is invalid JSON, koto creates a fresh file.
+The hook runs on every Claude Code Stop event. It executes `koto` from PATH and has no side effects -- `koto workflows` only reads state files.
+
+**Limitations.** `koto workflows` scans `wip/` relative to the current working directory. Claude Code hooks typically run from the project root, which is the expected case. If the cwd is different, the hook fails silently -- no false positives, just missed detection. The hook also fails silently if `koto` isn't on PATH in the hook's shell environment. Both failure modes are safe (the agent just doesn't get a reminder).
+
+For non-Claude Code platforms, the hook must be configured manually according to each platform's conventions. The documentation covers this.
+
+### Cross-Platform Support
+
+The Agent Skills standard means koto's SKILL.md files work in any platform that supports the standard: Claude Code, OpenAI Codex CLI, Cursor, Windsurf, Gemini CLI, GitHub Copilot.
+
+For platforms without the Agent Skills standard, the same information goes into platform-specific formats:
+- **AGENTS.md** -- for Codex and Windsurf (a markdown file at the repo root with koto workflow instructions)
+- **`.cursor/rules/koto.mdc`** -- for older Cursor versions that don't support Agent Skills
+
+The plugin repository includes these alternative formats as documentation or as ready-to-copy files. Cross-platform authoring guidance is part of the documentation artifact.
+
+### Author-Driven Flow
+
+No changes needed. The existing flow:
+
+1. Author creates or edits a template (`.md` file with YAML frontmatter + `## STATE:` sections)
+2. Author runs `koto template compile <path>` to validate
+3. Compiler reports errors to stderr, outputs compiled JSON to stdout on success
+4. Author fixes errors and repeats
+
+Once the template compiles cleanly, the author writes a SKILL.md alongside it. The SKILL.md documents the workflow's states, evidence keys, and execution loop. The author can reference the compiled output to extract state names and gate definitions.
+
+For project-scoped skills, the author commits both files to `.claude/skills/<name>/`. For contributing to the koto-skills plugin, the author submits a PR to the plugin repository.
 
 ## Implementation Approach
 
-### Phase 1: Template Metadata Extraction
+### Phase 1: Plugin Repository and Marketplace
 
-Build the foundation for generation:
-- Create `pkg/generate/generate.go` with `TemplateMetadata` extraction from compiled templates
-- Extract state names, transitions, gate definitions, and variable declarations
-- This uses the existing `pkg/template/compile` package -- no new compilation logic
+Create two new repositories:
 
-### Phase 2: Claude Code Generation
+- **`tsukumogami/koto-skills`** -- the Claude Code plugin with `plugin.json`, hooks.json, and skill directories
+- **`tsukumogami/koto-marketplace`** -- the marketplace manifest pointing to koto-skills
 
-Build `koto generate claude-code`:
-- Implement skill directory generation (SKILL.md + template copy)
-- Implement command file generation (`/koto-run`)
-- Implement hook merge logic (read existing hooks.json, insert/replace koto entry, preserve others)
-- Support `--dry-run` flag
-- Include version header comments in generated files
+This is repository setup and JSON/markdown file creation. No Go code.
 
-### Phase 3: AGENTS.md Generation
+### Phase 2: Quick-Task Reference Skill
 
-Build `koto generate agents-md`:
-- Produce a markdown section with the same information as the skill file
-- Suitable for appending to an existing AGENTS.md
-- Platform-agnostic format
+Write the first reference skill for the quick-task workflow:
+
+- Author the SKILL.md with koto CLI documentation, evidence keys, execution loop, and error handling
+- Include the quick-task template in the skill directory
+- Test the full flow: plugin install, skill invocation, template copy, koto init, workflow execution
+- Validate the Stop hook works correctly
+
+### Phase 3: Documentation
+
+Write the guide for custom skill authoring:
+
+- How to structure a koto workflow skill (SKILL.md + template)
+- How to extract evidence keys and state descriptions from a template
+- How to handle template locality (project-scoped vs plugin-distributed)
+- Cross-platform formats (AGENTS.md, Cursor rules)
+- How to test a skill end-to-end
+
+### Phase 4: Cross-Platform Files (Optional)
+
+Create the alternative format files:
+
+- AGENTS.md template for Codex/Windsurf
+- `.cursor/rules/koto.mdc` for older Cursor versions
+- Include in the plugin repo or publish separately
 
 ## Security Considerations
 
 ### Download Verification
 
-**Not applicable.** This design doesn't download anything. Templates are local files in the project repo. The existing compile-and-cache path reads from the filesystem only. If a template registry with remote downloads is added in the future, this dimension would need revisiting.
+**Not applicable.** This design doesn't download anything. Templates are local files -- either committed to the project or copied from a locally-installed plugin. The plugin itself is installed by Claude Code's plugin system, which handles git clone and verification. koto's compile step validates template structure; the state file's SHA-256 hash catches any post-init modification.
 
 ### Execution Isolation
 
-**Generated integration files.** `koto generate` writes files to the project directory. Skill files and command files are static text -- agents read them as instructions but they don't execute directly.
+**Stop hook.** The plugin's hook executes `koto workflows` on every Claude Code Stop event. This runs the `koto` binary from PATH. The command is read-only (scans for state files, outputs JSON). A malicious `koto` binary earlier on PATH would be invoked automatically. Mitigation: the hook file is part of the plugin and reviewed before installation; `koto workflows` has no side effects.
 
-**Stop hook.** The generated hook invokes `koto workflows` on every Stop event. This executes the `koto` binary from PATH. The command is read-only (scans for state files, outputs JSON). Risk: a malicious `koto` binary earlier on PATH gets invoked automatically. Mitigation: the generated hook file is committed and reviewed via PR; `koto workflows` has no side effects.
+**Template copy.** The skill instructs the agent to write the template to `.koto/templates/`. The write target must not be a symlink to prevent arbitrary file overwrites. The agent's Write tool handles this (writes content to the specified path). If the template is copied via a shell command, the copy should reject symlink targets. This uses the same guard as koto's state file writes.
 
-**Template copy.** `koto generate` copies the template file into the skill directory and writes generated files to `.claude/`. All write targets follow the same symlink protection as engine state file writes: reject symlink targets at the destination to prevent arbitrary file overwrites. The symlink check (currently inline in `pkg/engine/engine.go`) should be extracted into a shared utility for use by both the engine and the generator.
+**Skill file content.** SKILL.md files are loaded into the agent's context as instructions. They influence agent behavior. A malicious SKILL.md in a plugin could instruct the agent to run harmful commands. Mitigation: plugins are installed explicitly by the user (or team admin); the plugin source is a git repository that can be audited; Claude Code prompts for trust confirmation.
 
 ### Supply Chain Risks
 
-**Generated skill files.** The skill file, command file, and hook are generated from templates in the koto binary. A compromised koto binary could generate malicious files (e.g., a hook that exfiltrates data). Mitigation: generated files are committed to version control and reviewed via PR. The `--dry-run` flag lets users inspect output before writing.
+**Plugin source.** The koto-skills plugin is hosted on GitHub under the `tsukumogami` organization. Users trust the plugin by installing it. A compromised GitHub account could push a malicious plugin update. Mitigation: the plugin repository follows standard GitHub protections (branch protection, required reviews). Users can pin to a specific version or commit.
 
-**Template content.** The skill's SKILL.md includes content extracted from the template (state names, evidence keys, descriptions). A malicious template could embed instructions that influence agent behavior through the generated skill file. Mitigation: the generator structurally separates koto's authoritative CLI documentation from template-derived metadata, and the generated files are reviewed via PR before agents use them.
+**Marketplace trust.** The koto marketplace points to the koto-skills plugin. A compromised marketplace could redirect to a malicious plugin. Mitigation: marketplace sources are explicit (GitHub org/repo); Claude Code displays the source before installation.
+
+**Template content.** The workflow template contains directive text in `## STATE:` sections. These directives are returned by `koto next` and displayed to the agent as instructions. Unlike inert metadata, directive text directly influences agent behavior -- a malicious directive could instruct the agent to run harmful commands. Mitigation: templates are either committed to version control (reviewed via PR) or installed from a trusted plugin. The documentation for custom skill authoring should call out that directive text is agent-visible and must be reviewed with the same scrutiny as the SKILL.md itself.
 
 ### User Data Exposure
 
-**Generated files contain template metadata.** Skill files include state names, evidence key names, and variable descriptions from the template. No secrets, credentials, or source code are included.
+**No network transmission.** All operations are local. koto reads and writes local files only. The plugin installation uses git clone (handled by Claude Code, not koto).
 
-**No network transmission.** All operations are local filesystem reads and writes.
+**Template metadata in skills.** SKILL.md files contain state names, evidence key names, and descriptions from the template. These are workflow structure, not secrets or user data.
 
 ### Mitigations
 
 | Risk | Mitigation | Residual Risk |
 |------|------------|---------------|
-| Stop hook invokes `koto` from PATH on every Stop event | Hook is generated, committed, and reviewed via PR; `koto workflows` is read-only | Malicious `koto` earlier on PATH gets auto-invoked |
-| Malicious template content in generated skill files | CLI docs separated from template metadata; files reviewed via PR | Agent may not respect structural boundary |
-| Stale generated files after koto upgrade | Version header in generated files; `--dry-run` for inspection | No automated drift detection |
-| Template copy destination is a symlink | Reject symlinks before writing (same guard as state file writes) | None identified |
-| Compromised koto binary generates malicious files | Generated files committed and reviewed via PR | Reviewer doesn't catch malicious content |
+| Malicious `koto` on PATH invoked by Stop hook | Hook is part of auditable plugin; `koto workflows` is read-only | Binary substitution before PATH resolution |
+| Template write target is a symlink | Reject symlinks before writing (same guard as state file writes) | None identified |
+| Compromised plugin pushes malicious skill | GitHub branch protection; user trust prompt on install | Compromised maintainer account |
+| Malicious directive text in template | Templates reviewed via PR; documentation warns about directive scrutiny | Agent executes directive instructions without further validation |
+| Stop hook fails (cwd wrong or koto not on PATH) | Safe failure mode: no reminder, no false positives | Agent may not resume interrupted workflows automatically |
+| Stale template after plugin update | Template is project-local after first copy; doesn't auto-update | User must manually update if they want newer template version |
 
 ## Consequences
 
 ### Positive
 
-- Aligns with how agent platforms already work -- skills, rules files, AGENTS.md are established patterns
-- No new distribution infrastructure (search paths, registries, go:embed extraction)
-- Self-contained skills: the template travels with the agent instructions
-- `koto generate` automates the tedious part (extracting evidence keys, state machines) while leaving agent instructions customizable
-- Author-driven flow already works via `koto template compile` -- no changes needed
-- The Stop hook addresses the most common failure mode (agents quitting mid-workflow)
+- No koto code changes required -- the engine already has everything it needs
+- Uses established distribution mechanisms (plugins, marketplaces) instead of building new ones
+- Agent Skills standard provides cross-platform reach (Claude Code, Codex, Cursor, Windsurf, Gemini CLI)
+- Reference skills can be updated independently of koto releases
+- Project-scoped custom skills are version-controlled and reviewed via PR
+- The Stop hook addresses the most common failure (agents quitting mid-workflow)
 
 ### Negative
 
-- No built-in templates in the binary -- users need to get a template file from somewhere before `koto generate` can scaffold a skill
-- Template duplication: the template lives in the skill directory and possibly also in its original location
-- Generated files drift when koto updates its CLI surface
+- No built-in templates in the koto binary -- users need to install the plugin or copy skill files
+- Plugin system is relatively new (Claude Code v1.0.33+, late 2025)
+- Template locality adds a step: the agent copies the template before first init
+- Manual SKILL.md authoring for custom templates requires reading the template to extract evidence keys and state descriptions
 
 ### Mitigations
 
-- The quick-task template will be published in koto's repo (`templates/quick-task.md`) and downloadable as a single file. `koto generate` can point at it directly
-- Template duplication is a few KB of markdown; self-containment is more valuable than deduplication
-- Version headers in generated files signal when regeneration is needed; a future `koto doctor` command could automate drift detection
+- The plugin install is a single command; project-scoped skills are just files committed to git
+- Project-scoped skills work without the plugin system -- it's a fully functional fallback
+- Template copy is a one-time operation handled by skill instructions; the user never sees it
+- A `koto generate` convenience command could be added in a future release to scaffold SKILL.md files from templates, reducing manual authoring effort
