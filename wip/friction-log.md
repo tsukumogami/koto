@@ -73,3 +73,21 @@ Task issues go `in_progress -> completed` directly, skipping `implemented -> pus
 **Observation: Validation script from issue body worked as-is**
 
 The issue's validation script caught the naming mismatch immediately. Having executable validation criteria in the issue body pays for itself when the implementation needs iteration.
+
+### Issues #27 and #28: Install script and tsuku recipe (parallel)
+
+**Observation: Parallel implementation of fan-out issues works well**
+
+Issues #27 and #28 were both unblocked after #26 and had no dependencies on each other. Spawned both coder agents in parallel -- #27 to the koto repo, #28 to the tsuku repo. Both produced correct output on first try. This is the multi-PR workflow working as designed: fan-out issues can genuinely run in parallel when they touch different files (or different repos).
+
+**Observation: Coder agents produced working code from issue specs**
+
+Both agents generated correct implementations without iteration. The install script passed all 13 static checks plus the end-to-end test. The tsuku recipe matched existing conventions. The detailed issue bodies (with validation scripts and reference recipes) gave agents enough context to work autonomously.
+
+**Friction: tsuku recipe lacks checksum verification**
+
+The `github_file` action doesn't support `checksum_url` -- it's only implemented for the `download` action. koto publishes `checksums.txt` in every release, but the recipe can't use it. Had to use `tsuku install koto --force` to bypass. This is a tsuku feature gap, not a koto problem, but it means the recipe doesn't meet the same verification standard as the install script.
+
+**Observation: Test plan scenario 14 had wrong binary path**
+
+The test plan expected `~/.tsuku/bin/koto` but tsuku installs to `~/.tsuku/tools/current/koto`. Updated the scenario. The path was wrong in the original issue spec too -- copied from conceptual docs rather than actual tsuku behavior.

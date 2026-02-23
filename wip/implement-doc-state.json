@@ -3,7 +3,7 @@
   "design_doc": "docs/designs/DESIGN-koto-installation.md",
   "branch": "docs/koto-installation",
   "pr_number": 24,
-  "integrity_hash": "sha256:80e985db289800f12d59903944dc17537bcfc105b1ab70ed721aa99553e505ad",
+  "integrity_hash": "sha256:07c439d719df0c9044b30e1e386c4215dfe76c53968e6a0e81cc2d5c87cfe05e",
   "issues": [
     {
       "number": 25,
@@ -77,16 +77,40 @@
     {
       "number": 27,
       "title": "feat(install): add self-contained install script",
-      "status": "pending",
-      "ci_status": "pending",
+      "status": "completed",
+      "ci_status": "passed",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "code",
       "dependencies": [
         26
       ],
-      "commits": [],
-      "agent_type": "",
-      "summary": null,
+      "commits": [
+        "c847bf1"
+      ],
+      "agent_type": "coder",
+      "summary": {
+        "narrative": "",
+        "files_changed": [
+          "install.sh",
+          "README.md"
+        ],
+        "tests_added": 0,
+        "key_decisions": "Mirrored tsuku install script patterns. End-to-end test passed on first try.",
+        "requirements_map": {
+          "scenario-10": "pass",
+          "scenario-11": "pass",
+          "scenario-12": "pass"
+        }
+      },
+      "reviewer_results": {
+        "reviews": [
+          {
+            "agent": "pragmatic-reviewer",
+            "verdict": "approve",
+            "comments": "PR #29 merged by user"
+          }
+        ]
+      },
       "testable_scenarios": [
         "scenario-10",
         "scenario-11",
@@ -96,16 +120,38 @@
     {
       "number": 28,
       "title": "feat(recipe): add tsuku recipe for koto",
-      "status": "pending",
-      "ci_status": "pending",
+      "status": "completed",
+      "ci_status": "passed",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "code",
       "dependencies": [
         26
       ],
-      "commits": [],
-      "agent_type": "",
-      "summary": null,
+      "commits": [
+        "161194a237f44abe3668521f6fc3c3ef10ac8d9b"
+      ],
+      "agent_type": "coder",
+      "summary": {
+        "narrative": "",
+        "files_changed": [
+          "recipes/k/koto.toml"
+        ],
+        "tests_added": 0,
+        "key_decisions": "Used github_file action matching biome/kind patterns. Checksum not supported for github_file yet.",
+        "requirements_map": {
+          "scenario-13": "pass",
+          "scenario-14": "pass"
+        }
+      },
+      "reviewer_results": {
+        "reviews": [
+          {
+            "agent": "pragmatic-reviewer",
+            "verdict": "approve",
+            "comments": "PR #29 merged by user"
+          }
+        ]
+      },
       "testable_scenarios": [
         "scenario-13",
         "scenario-14"

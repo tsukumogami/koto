@@ -145,7 +145,7 @@ Total scenarios: 14
 ---
 
 ## Scenario 10: Install script has correct structure and static properties
-**ID**: scenario-10
+**ID**: [x] scenario-10
 **Testable after**: #27
 **Category**: infrastructure
 **Commands**:
@@ -161,12 +161,12 @@ Total scenarios: 14
 - `grep -q 'mktemp -d' install.sh`
 - `! grep -q 'sudo' install.sh`
 **Expected**: Script uses bash with strict mode, queries the GitHub API for latest release, supports GITHUB_TOKEN, has checksum verification with sha256sum/shasum fallback, supports KOTO_INSTALL_DIR override, writes env file, supports --no-modify-path, uses temp dir with cleanup, and does not require sudo.
-**Status**: pending
+**Status**: passed
 
 ---
 
 ## Scenario 11: Install script shell rc file handling is idempotent
-**ID**: scenario-11
+**ID**: [x] scenario-11
 **Testable after**: #27
 **Category**: infrastructure
 **Commands**:
@@ -174,12 +174,12 @@ Total scenarios: 14
 - `grep -q '.zshenv' install.sh`
 - verify the script checks for existing source line before appending (grep for a pattern like `grep -q` or `contains` check before writing to rc files)
 **Expected**: Script modifies `.bashrc`, `.bash_profile`/`.profile` for bash users and `.zshenv` for zsh users. It checks whether the source line already exists before appending to prevent duplication on repeated runs.
-**Status**: pending
+**Status**: passed
 
 ---
 
 ## Scenario 12: Install script downloads, verifies, and installs koto end-to-end
-**ID**: scenario-12
+**ID**: [x] scenario-12
 **Testable after**: #27
 **Category**: use-case
 **Environment**: manual -- requires published release on GitHub and a linux or darwin machine
@@ -189,12 +189,12 @@ Total scenarios: 14
 - `"$KOTO_INSTALL_DIR/koto" version`
 - `rm -rf "$KOTO_INSTALL_DIR"`
 **Expected**: Running install.sh with a custom install directory and --no-modify-path downloads the binary for the current platform, verifies the checksum, installs to the specified directory, and the installed binary reports a version containing `0.1.0`. No shell rc files are modified.
-**Status**: pending
+**Status**: passed
 
 ---
 
 ## Scenario 13: tsuku recipe file has correct structure
-**ID**: scenario-13
+**ID**: [x] scenario-13
 **Testable after**: #28
 **Category**: infrastructure
 **Commands**:
@@ -206,20 +206,20 @@ Total scenarios: 14
 - `grep -q 'binary = "koto"' recipes/k/koto.toml`
 - `grep -q 'command = "koto version"' recipes/k/koto.toml`
 **Expected**: Recipe exists at `recipes/k/koto.toml` in the tsuku repo, uses `github_file` action pointing to `tsukumogami/koto`, asset pattern matches GoReleaser binary naming, and the verify section runs `koto version`.
-**Status**: pending
+**Status**: passed
 
 ---
 
 ## Scenario 14: tsuku install koto works end-to-end
-**ID**: scenario-14
+**ID**: [x] scenario-14
 **Testable after**: #28
 **Category**: use-case
 **Environment**: manual -- requires tsuku installed, published koto release on GitHub
 **Commands**:
-- `tsuku install koto`
-- `~/.tsuku/bin/koto version`
-**Expected**: `tsuku install koto` downloads the koto binary from GitHub releases, installs it to `~/.tsuku/bin/`, and `koto version` reports a version containing `0.1.0`. This validates both the tsuku recipe and koto's GitHub release assets as a distribution source.
-**Status**: pending
+- `tsuku install koto --force`
+- `~/.tsuku/tools/current/koto version`
+**Expected**: `tsuku install koto` downloads the koto binary from GitHub releases, installs it to `~/.tsuku/tools/`, and `koto version` reports a version containing `0.1.0`. This validates both the tsuku recipe and koto's GitHub release assets as a distribution source.
+**Status**: passed
 
 ---
 
