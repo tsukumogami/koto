@@ -1,42 +1,51 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/tsukumogami/koto/pkg/cache"
 	"github.com/tsukumogami/koto/pkg/discover"
 	"github.com/tsukumogami/koto/pkg/engine"
 	"github.com/tsukumogami/koto/pkg/template"
+	"github.com/tsukumogami/koto/pkg/template/compile"
 )
 
 const lifecycleTemplate = `---
 name: lifecycle
 version: "1.0"
 description: A test lifecycle workflow
+initial_state: assess
 variables:
-  TASK: default-task
+  TASK:
+    default: default-task
+states:
+  assess:
+    transitions: [plan]
+  plan:
+    transitions: [implement]
+  implement:
+    transitions: [done]
+  done:
+    terminal: true
 ---
 
 ## assess
 
 Assess the task: {{TASK}}.
 
-**Transitions**: [plan]
-
 ## plan
 
 Create a plan for {{TASK}}.
 
-**Transitions**: [implement]
-
 ## implement
 
 Build the solution.
-
-**Transitions**: [done]
 
 ## done
 
@@ -217,10 +226,6 @@ func TestCmdNext_ReturnsDirective(t *testing.T) {
 	}
 
 	statePath := filepath.Join(stateDir, "koto-next-test.state.json")
-
-	// Read the template to verify the directive uses interpolated content.
-	tmpl, _ := template.Parse(tmplPath)
-	_ = tmpl // used only to verify the test is meaningful
 
 	// cmdNext outputs to stdout; we just check it doesn't error.
 	if err := cmdNext([]string{"--state", statePath}); err != nil {
@@ -646,5 +651,841 @@ func TestLoadTemplateFromState_EmptyTemplatePath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no template_path") {
 		t.Errorf("error should mention template_path: %v", err)
+	}
+}
+
+// --- Compiler path migration tests ---
+
+func TestCmdInit_StoresCompilerHash(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	stateDir := filepath.Join(dir, "state")
+
+	err := cmdInit([]string{
+		"--name", "hash-test",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+	})
+	if err != nil {
+		t.Fatalf("cmdInit() error: %v", err)
+	}
+
+	statePath := filepath.Join(stateDir, "koto-hash-test.state.json")
+	data, _ := os.ReadFile(statePath) //nolint:gosec // G304: test reads file it created
+	var state engine.State
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("parse state: %v", err)
+	}
+
+	storedHash := state.Workflow.TemplateHash
+	if !strings.HasPrefix(storedHash, "sha256:") {
+		t.Fatalf("stored hash = %q, want sha256: prefix", storedHash)
+	}
+
+	// Compute the legacy (raw source) hash.
+	sourceBytes, _ := os.ReadFile(tmplPath) //nolint:gosec // G304: test reads file it created
+	sum := sha256.Sum256(sourceBytes)
+	legacyHash := "sha256:" + hex.EncodeToString(sum[:])
+
+	// Stored hash must NOT be the legacy hash.
+	if storedHash == legacyHash {
+		t.Errorf("stored hash equals legacy source hash; init should store compiler hash")
+	}
+
+	// Stored hash should be the compiler hash.
+	ct, _, err := compile.Compile(sourceBytes)
+	if err != nil {
+		t.Fatalf("compile.Compile() error: %v", err)
+	}
+	compilerHash, _, err := compile.Hash(ct)
+	if err != nil {
+		t.Fatalf("compile.Hash() error: %v", err)
+	}
+	if storedHash != compilerHash {
+		t.Errorf("stored hash = %q, want compiler hash %q", storedHash, compilerHash)
+	}
+}
+
+func TestLoadTemplateFromState_CompilerHashMatch(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	stateDir := filepath.Join(dir, "state")
+
+	// Init creates a state file with the compiler hash.
+	err := cmdInit([]string{
+		"--name", "compiler-hash",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+	})
+	if err != nil {
+		t.Fatalf("cmdInit() error: %v", err)
+	}
+
+	statePath := filepath.Join(stateDir, "koto-compiler-hash.state.json")
+
+	tmpl, storedHash, err := loadTemplateFromState(statePath)
+	if err != nil {
+		t.Fatalf("loadTemplateFromState() error: %v", err)
+	}
+
+	if tmpl == nil {
+		t.Fatal("tmpl is nil")
+	}
+	if tmpl.Hash != storedHash {
+		t.Errorf("tmpl.Hash = %q, storedHash = %q; should match", tmpl.Hash, storedHash)
+	}
+	if tmpl.Machine == nil {
+		t.Fatal("tmpl.Machine is nil")
+	}
+	if len(tmpl.Sections) == 0 {
+		t.Error("tmpl.Sections is empty; should have state directives")
+	}
+}
+
+func TestLoadTemplateFromState_LegacyHashFallback(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+
+	// Read source to compute legacy hash.
+	sourceBytes, _ := os.ReadFile(tmplPath) //nolint:gosec // G304: test reads file it created
+	sum := sha256.Sum256(sourceBytes)
+	legacyHash := "sha256:" + hex.EncodeToString(sum[:])
+
+	// Manually create a state file with the legacy hash (simulating a
+	// workflow initialized with the old Parse()-based path).
+	statePath := filepath.Join(dir, "koto-legacy.state.json")
+	stateData := map[string]interface{}{
+		"schema_version": 2,
+		"workflow": map[string]string{
+			"name":          "legacy-wf",
+			"template_hash": legacyHash,
+			"template_path": tmplPath,
+			"created_at":    "2025-01-01T00:00:00Z",
+		},
+		"version":       1,
+		"current_state": "assess",
+		"variables":     map[string]string{"TASK": "default-task"},
+		"history":       []interface{}{},
+	}
+	data, _ := json.Marshal(stateData)
+	if err := os.WriteFile(statePath, data, 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	tmpl, storedHash, err := loadTemplateFromState(statePath)
+	if err != nil {
+		t.Fatalf("loadTemplateFromState() error: %v", err)
+	}
+
+	// The returned storedHash should be the legacy hash.
+	if storedHash != legacyHash {
+		t.Errorf("storedHash = %q, want %q", storedHash, legacyHash)
+	}
+
+	// tmpl.Hash should be set to the stored (legacy) hash so that
+	// callers' storedHash != tmpl.Hash checks remain valid.
+	if tmpl.Hash != legacyHash {
+		t.Errorf("tmpl.Hash = %q, want legacy hash %q", tmpl.Hash, legacyHash)
+	}
+
+	if tmpl.Machine == nil {
+		t.Fatal("tmpl.Machine is nil")
+	}
+}
+
+func TestLoadTemplateFromState_NeitherHashMatches(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+
+	// Create a state file with a fabricated hash that matches neither
+	// the compiler hash nor the legacy hash.
+	statePath := filepath.Join(dir, "koto-mismatch.state.json")
+	stateData := map[string]interface{}{
+		"schema_version": 2,
+		"workflow": map[string]string{
+			"name":          "mismatch-wf",
+			"template_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+			"template_path": tmplPath,
+			"created_at":    "2025-01-01T00:00:00Z",
+		},
+		"version":       1,
+		"current_state": "assess",
+		"variables":     map[string]string{},
+		"history":       []interface{}{},
+	}
+	data, _ := json.Marshal(stateData)
+	if err := os.WriteFile(statePath, data, 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	_, _, err := loadTemplateFromState(statePath)
+	if err == nil {
+		t.Fatal("expected error for hash mismatch")
+	}
+
+	te, ok := err.(*engine.TransitionError)
+	if !ok {
+		t.Fatalf("expected *engine.TransitionError, got %T: %v", err, err)
+	}
+	if te.Code != engine.ErrTemplateMismatch {
+		t.Errorf("error code = %q, want %q", te.Code, engine.ErrTemplateMismatch)
+	}
+}
+
+func TestCmdValidate_UsesCompilerPath(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	stateDir := filepath.Join(dir, "state")
+
+	// Init with the compiler path.
+	if err := cmdInit([]string{
+		"--name", "validate-compiler",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+	}); err != nil {
+		t.Fatalf("cmdInit() error: %v", err)
+	}
+
+	statePath := filepath.Join(stateDir, "koto-validate-compiler.state.json")
+
+	// validate should succeed since both init and validate use compiler path.
+	if err := cmdValidate([]string{"--state", statePath}); err != nil {
+		t.Fatalf("cmdValidate() error: %v", err)
+	}
+}
+
+func TestCmdNext_ReturnsCompiledDirective(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	stateDir := filepath.Join(dir, "state")
+
+	if err := cmdInit([]string{
+		"--name", "directive-test",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+		"--var", "TASK=build feature",
+	}); err != nil {
+		t.Fatalf("cmdInit() error: %v", err)
+	}
+
+	statePath := filepath.Join(stateDir, "koto-directive-test.state.json")
+
+	// Load the template through the compiler path.
+	tmpl, _, err := loadTemplateFromState(statePath)
+	if err != nil {
+		t.Fatalf("loadTemplateFromState() error: %v", err)
+	}
+
+	// The Sections map should have entries from StateDecl.Directive.
+	assessDirective, ok := tmpl.Sections["assess"]
+	if !ok {
+		t.Fatal("Sections[assess] not found")
+	}
+	if !strings.Contains(assessDirective, "{{TASK}}") {
+		t.Errorf("Sections[assess] = %q, expected to contain {{TASK}} placeholder", assessDirective)
+	}
+}
+
+// --- cmdTemplate tests ---
+
+func TestCmdTemplate_NoSubcommand(t *testing.T) {
+	err := cmdTemplate(nil)
+	if err == nil {
+		t.Fatal("expected error when no subcommand given")
+	}
+	if !strings.Contains(err.Error(), "usage:") {
+		t.Errorf("error should contain usage hint: %v", err)
+	}
+}
+
+func TestCmdTemplate_UnknownSubcommand(t *testing.T) {
+	err := cmdTemplate([]string{"nonexistent"})
+	if err == nil {
+		t.Fatal("expected error for unknown subcommand")
+	}
+	if !strings.Contains(err.Error(), "unknown template subcommand") {
+		t.Errorf("error should mention unknown subcommand: %v", err)
+	}
+}
+
+// --- cmdTemplateCompile tests ---
+
+func TestCmdTemplateCompile_Success(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+
+	err := cmdTemplateCompile([]string{tmplPath})
+	if err != nil {
+		t.Fatalf("cmdTemplateCompile() error: %v", err)
+	}
+}
+
+func TestCmdTemplateCompile_OutputIsValidJSON(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	outputPath := filepath.Join(dir, "compiled.json")
+
+	err := cmdTemplateCompile([]string{tmplPath, "--output", outputPath})
+	if err != nil {
+		t.Fatalf("cmdTemplateCompile() error: %v", err)
+	}
+
+	data, err := os.ReadFile(outputPath) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("read output file: %v", err)
+	}
+
+	var ct map[string]interface{}
+	if err := json.Unmarshal(data, &ct); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+
+	// Verify expected top-level fields.
+	if ct["name"] != "lifecycle" {
+		t.Errorf("name = %v, want %q", ct["name"], "lifecycle")
+	}
+	if ct["initial_state"] != "assess" {
+		t.Errorf("initial_state = %v, want %q", ct["initial_state"], "assess")
+	}
+	if _, ok := ct["states"]; !ok {
+		t.Error("missing 'states' field in compiled output")
+	}
+}
+
+func TestCmdTemplateCompile_OutputFileFlag(t *testing.T) {
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	outputPath := filepath.Join(dir, "output.json")
+
+	err := cmdTemplateCompile([]string{tmplPath, "--output", outputPath})
+	if err != nil {
+		t.Fatalf("cmdTemplateCompile() error: %v", err)
+	}
+
+	// Output file should exist and contain valid JSON.
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Fatalf("output file not created: %v", err)
+	}
+
+	data, err := os.ReadFile(outputPath) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+
+	var ct map[string]interface{}
+	if err := json.Unmarshal(data, &ct); err != nil {
+		t.Fatalf("output file is not valid JSON: %v", err)
+	}
+}
+
+func TestCmdTemplateCompile_MissingPath(t *testing.T) {
+	err := cmdTemplateCompile(nil)
+	if err == nil {
+		t.Fatal("expected error when no path given")
+	}
+	if !strings.Contains(err.Error(), "usage:") {
+		t.Errorf("error should contain usage hint: %v", err)
+	}
+}
+
+func TestCmdTemplateCompile_NonexistentFile(t *testing.T) {
+	err := cmdTemplateCompile([]string{"/nonexistent/path/template.md"})
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+	if !strings.Contains(err.Error(), "read source file") {
+		t.Errorf("error should mention reading source file: %v", err)
+	}
+}
+
+func TestCmdTemplateCompile_InvalidTemplate(t *testing.T) {
+	dir := t.TempDir()
+	badPath := filepath.Join(dir, "bad.md")
+	if err := os.WriteFile(badPath, []byte("not yaml frontmatter at all\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	err := cmdTemplateCompile([]string{badPath})
+	if err == nil {
+		t.Fatal("expected error for invalid template")
+	}
+	if !strings.Contains(err.Error(), "compile") {
+		t.Errorf("error should mention compilation failure: %v", err)
+	}
+}
+
+func TestCmdTemplateCompile_WarningsWrittenToStderr(t *testing.T) {
+	// Create a template with a heading collision to trigger a warning.
+	// The "start" heading appears twice -- first occurrence is claimed,
+	// second triggers a warning.
+	warningTemplate := `---
+name: warning-test
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions: [done]
+  done:
+    terminal: true
+---
+
+## start
+
+First section.
+
+## start
+
+Duplicate heading -- should produce a warning.
+
+## done
+
+All done.
+`
+	dir := t.TempDir()
+	tmplPath := filepath.Join(dir, "warning.md")
+	if err := os.WriteFile(tmplPath, []byte(warningTemplate), 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	// Capture stderr by redirecting os.Stderr temporarily.
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe() error: %v", err)
+	}
+	os.Stderr = w
+
+	compileErr := cmdTemplateCompile([]string{tmplPath})
+
+	w.Close()
+	os.Stderr = origStderr
+
+	buf := make([]byte, 4096)
+	n, _ := r.Read(buf)
+	r.Close()
+
+	if compileErr != nil {
+		t.Fatalf("cmdTemplateCompile() error: %v", compileErr)
+	}
+
+	stderrStr := string(buf[:n])
+	if !strings.Contains(stderrStr, "warning:") {
+		t.Errorf("stderr should contain 'warning:' prefix, got: %q", stderrStr)
+	}
+}
+
+func TestCmdTemplateCompile_RoundTrip(t *testing.T) {
+	// Verify that the compiled output can be parsed back through ParseJSON.
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	outputPath := filepath.Join(dir, "compiled.json")
+
+	err := cmdTemplateCompile([]string{tmplPath, "--output", outputPath})
+	if err != nil {
+		t.Fatalf("cmdTemplateCompile() error: %v", err)
+	}
+
+	data, err := os.ReadFile(outputPath) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+
+	// Round-trip through ParseJSON to validate the output format.
+	ct, err := template.ParseJSON(data)
+	if err != nil {
+		t.Fatalf("ParseJSON() error: %v", err)
+	}
+
+	if ct.Name != "lifecycle" {
+		t.Errorf("Name = %q, want %q", ct.Name, "lifecycle")
+	}
+	if ct.InitialState != "assess" {
+		t.Errorf("InitialState = %q, want %q", ct.InitialState, "assess")
+	}
+	if len(ct.States) != 4 {
+		t.Errorf("len(States) = %d, want 4", len(ct.States))
+	}
+}
+
+func TestCmdTemplate_ExistingCommandsUnaffected(t *testing.T) {
+	// Verify that adding the template subcommand doesn't break existing
+	// commands by running a quick init/validate cycle.
+	dir := t.TempDir()
+	tmplPath := writeLifecycleTemplate(t, dir)
+	stateDir := filepath.Join(dir, "state")
+
+	if err := cmdInit([]string{
+		"--name", "unaffected-test",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+	}); err != nil {
+		t.Fatalf("cmdInit() error: %v", err)
+	}
+
+	statePath := filepath.Join(stateDir, "koto-unaffected-test.state.json")
+	if err := cmdValidate([]string{"--state", statePath}); err != nil {
+		t.Fatalf("cmdValidate() error: %v", err)
+	}
+}
+
+// --- Compilation cache tests ---
+
+// setKotoHome sets KOTO_HOME for a test and restores it on cleanup.
+func setKotoHome(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv("KOTO_HOME", dir)
+}
+
+func TestCmdInit_PopulatesCache(t *testing.T) {
+	dir := t.TempDir()
+	kotoHome := filepath.Join(dir, "koto-home")
+	setKotoHome(t, kotoHome)
+
+	tmplPath := writeLifecycleTemplate(t, dir)
+	stateDir := filepath.Join(dir, "state")
+
+	err := cmdInit([]string{
+		"--name", "cache-test",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+	})
+	if err != nil {
+		t.Fatalf("cmdInit() error: %v", err)
+	}
+
+	// Compute the expected source hash.
+	sourceBytes, _ := os.ReadFile(tmplPath) //nolint:gosec // G304: test reads file it created
+	sum := sha256.Sum256(sourceBytes)
+	sourceHash := hex.EncodeToString(sum[:])
+
+	// Verify the cache file exists.
+	cachePath := filepath.Join(kotoHome, "cache", sourceHash+".json")
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("cache file not created at %s: %v", cachePath, err)
+	}
+
+	// Verify the cached content is valid JSON that round-trips through ParseJSON.
+	cachedData, _ := os.ReadFile(cachePath) //nolint:gosec // G304: test reads file it created
+	ct, err := template.ParseJSON(cachedData)
+	if err != nil {
+		t.Fatalf("cached data is not valid compiled template: %v", err)
+	}
+	if ct.Name != "lifecycle" {
+		t.Errorf("cached template name = %q, want %q", ct.Name, "lifecycle")
+	}
+}
+
+func TestCmdInit_UsesCacheOnSecondRun(t *testing.T) {
+	dir := t.TempDir()
+	kotoHome := filepath.Join(dir, "koto-home")
+	setKotoHome(t, kotoHome)
+
+	tmplPath := writeLifecycleTemplate(t, dir)
+
+	// First init: populates cache.
+	stateDir1 := filepath.Join(dir, "state1")
+	err := cmdInit([]string{
+		"--name", "first-run",
+		"--template", tmplPath,
+		"--state-dir", stateDir1,
+	})
+	if err != nil {
+		t.Fatalf("first cmdInit() error: %v", err)
+	}
+
+	// Second init with the same template: should use cache.
+	stateDir2 := filepath.Join(dir, "state2")
+	err = cmdInit([]string{
+		"--name", "second-run",
+		"--template", tmplPath,
+		"--state-dir", stateDir2,
+	})
+	if err != nil {
+		t.Fatalf("second cmdInit() error: %v", err)
+	}
+
+	// Both state files should have the same template hash.
+	state1Path := filepath.Join(stateDir1, "koto-first-run.state.json")
+	state2Path := filepath.Join(stateDir2, "koto-second-run.state.json")
+
+	data1, _ := os.ReadFile(state1Path) //nolint:gosec // G304: test reads file it created
+	data2, _ := os.ReadFile(state2Path) //nolint:gosec // G304: test reads file it created
+
+	var s1, s2 engine.State
+	if err := json.Unmarshal(data1, &s1); err != nil {
+		t.Fatalf("parse state1: %v", err)
+	}
+	if err := json.Unmarshal(data2, &s2); err != nil {
+		t.Fatalf("parse state2: %v", err)
+	}
+
+	if s1.Workflow.TemplateHash != s2.Workflow.TemplateHash {
+		t.Errorf("template hashes differ: first=%q, second=%q",
+			s1.Workflow.TemplateHash, s2.Workflow.TemplateHash)
+	}
+}
+
+func TestCmdInit_CacheErrorIsNonFatal(t *testing.T) {
+	dir := t.TempDir()
+
+	// Point KOTO_HOME to a path where the cache directory can't be created.
+	// Using /dev/null as the parent makes MkdirAll fail.
+	setKotoHome(t, "/dev/null")
+
+	tmplPath := writeLifecycleTemplate(t, dir)
+	stateDir := filepath.Join(dir, "state")
+
+	// Init should succeed despite cache write failure.
+	err := cmdInit([]string{
+		"--name", "cache-error-test",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+	})
+	if err != nil {
+		t.Fatalf("cmdInit() should succeed despite cache error: %v", err)
+	}
+
+	statePath := filepath.Join(stateDir, "koto-cache-error-test.state.json")
+	if _, err := os.Stat(statePath); err != nil {
+		t.Fatalf("state file not created: %v", err)
+	}
+}
+
+func TestCmdInit_InvalidCacheDataTriggersRecompile(t *testing.T) {
+	dir := t.TempDir()
+	kotoHome := filepath.Join(dir, "koto-home")
+	setKotoHome(t, kotoHome)
+
+	tmplPath := writeLifecycleTemplate(t, dir)
+
+	// Pre-populate the cache with invalid data.
+	sourceBytes, _ := os.ReadFile(tmplPath) //nolint:gosec // G304: test reads file it created
+	sum := sha256.Sum256(sourceBytes)
+	sourceHash := hex.EncodeToString(sum[:])
+
+	if err := cache.Put(sourceHash, []byte("not valid json")); err != nil {
+		t.Fatalf("cache.Put() error: %v", err)
+	}
+
+	// Init should succeed by recompiling.
+	stateDir := filepath.Join(dir, "state")
+	err := cmdInit([]string{
+		"--name", "recompile-test",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+	})
+	if err != nil {
+		t.Fatalf("cmdInit() should succeed with corrupt cache: %v", err)
+	}
+
+	// The cache should now contain valid data (overwritten by recompile).
+	cached, err := cache.Get(sourceHash)
+	if err != nil {
+		t.Fatalf("cache.Get() error: %v", err)
+	}
+	if cached == nil {
+		t.Fatal("cache should contain recompiled data")
+	}
+	ct, err := template.ParseJSON(cached)
+	if err != nil {
+		t.Fatalf("recompiled cache data is not valid: %v", err)
+	}
+	if ct.Name != "lifecycle" {
+		t.Errorf("cached template name = %q, want %q", ct.Name, "lifecycle")
+	}
+}
+
+func TestCmdTemplateCompile_DoesNotUseCache(t *testing.T) {
+	dir := t.TempDir()
+	kotoHome := filepath.Join(dir, "koto-home")
+	setKotoHome(t, kotoHome)
+
+	tmplPath := writeLifecycleTemplate(t, dir)
+
+	// First: populate cache via init.
+	stateDir := filepath.Join(dir, "state")
+	err := cmdInit([]string{
+		"--name", "cache-populate",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+	})
+	if err != nil {
+		t.Fatalf("cmdInit() error: %v", err)
+	}
+
+	// Modify the template.
+	modifiedTemplate := `---
+name: modified
+version: "2.0"
+initial_state: start
+states:
+  start:
+    transitions: [done]
+  done:
+    terminal: true
+---
+
+## start
+
+Modified content.
+
+## done
+
+All done.
+`
+	if err := os.WriteFile(tmplPath, []byte(modifiedTemplate), 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	// template compile should reflect the modified source, not the cache.
+	outputPath := filepath.Join(dir, "compiled.json")
+	err = cmdTemplateCompile([]string{tmplPath, "--output", outputPath})
+	if err != nil {
+		t.Fatalf("cmdTemplateCompile() error: %v", err)
+	}
+
+	data, _ := os.ReadFile(outputPath) //nolint:gosec // G304: test reads file it created
+	ct, err := template.ParseJSON(data)
+	if err != nil {
+		t.Fatalf("ParseJSON() error: %v", err)
+	}
+
+	// The output should reflect the modified template, not the cached one.
+	if ct.Name != "modified" {
+		t.Errorf("compiled template name = %q, want %q (from modified source, not cache)", ct.Name, "modified")
+	}
+}
+
+// --- Scenario 13: Compilation cache stores and retrieves compiled JSON ---
+
+func TestScenario13_CacheStoresAndRetrievesCompiledJSON(t *testing.T) {
+	dir := t.TempDir()
+	kotoHome := filepath.Join(dir, "koto-home")
+	setKotoHome(t, kotoHome)
+
+	tmplPath := writeLifecycleTemplate(t, dir)
+
+	// First init: should populate the cache.
+	stateDir := filepath.Join(dir, "state")
+	err := cmdInit([]string{
+		"--name", "test1",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+	})
+	if err != nil {
+		t.Fatalf("first cmdInit() error: %v", err)
+	}
+
+	// Check that a cache file exists.
+	cacheDir := filepath.Join(kotoHome, "cache")
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		t.Fatalf("read cache directory: %v", err)
+	}
+	jsonCount := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".json") {
+			jsonCount++
+		}
+	}
+	if jsonCount == 0 {
+		t.Fatal("no .json cache files found after first init")
+	}
+
+	// Read the first state file's template hash.
+	state1Path := filepath.Join(stateDir, "koto-test1.state.json")
+	data1, _ := os.ReadFile(state1Path) //nolint:gosec // G304: test reads file it created
+	var s1 engine.State
+	if err := json.Unmarshal(data1, &s1); err != nil {
+		t.Fatalf("parse state1: %v", err)
+	}
+
+	// Second init with the same template (cache hit path).
+	stateDir2 := filepath.Join(dir, "state2")
+	err = cmdInit([]string{
+		"--name", "test2",
+		"--template", tmplPath,
+		"--state-dir", stateDir2,
+	})
+	if err != nil {
+		t.Fatalf("second cmdInit() error: %v", err)
+	}
+
+	// Both state files should contain the same template hash.
+	state2Path := filepath.Join(stateDir2, "koto-test2.state.json")
+	data2, _ := os.ReadFile(state2Path) //nolint:gosec // G304: test reads file it created
+	var s2 engine.State
+	if err := json.Unmarshal(data2, &s2); err != nil {
+		t.Fatalf("parse state2: %v", err)
+	}
+
+	if s1.Workflow.TemplateHash != s2.Workflow.TemplateHash {
+		t.Errorf("template hashes differ: first=%q, second=%q",
+			s1.Workflow.TemplateHash, s2.Workflow.TemplateHash)
+	}
+}
+
+// --- Scenario 14: koto template compile bypasses cache ---
+
+func TestScenario14_TemplateCompileBypassesCache(t *testing.T) {
+	dir := t.TempDir()
+	kotoHome := filepath.Join(dir, "koto-home")
+	setKotoHome(t, kotoHome)
+
+	tmplPath := writeLifecycleTemplate(t, dir)
+
+	// Populate cache via init.
+	stateDir := filepath.Join(dir, "state")
+	err := cmdInit([]string{
+		"--name", "cache-populate",
+		"--template", tmplPath,
+		"--state-dir", stateDir,
+	})
+	if err != nil {
+		t.Fatalf("cmdInit() error: %v", err)
+	}
+
+	// Modify the template source.
+	modifiedTemplate := `---
+name: modified-source
+version: "3.0"
+initial_state: begin
+states:
+  begin:
+    transitions: [end]
+  end:
+    terminal: true
+---
+
+## begin
+
+This is the modified begin state.
+
+## end
+
+Finished.
+`
+	if err := os.WriteFile(tmplPath, []byte(modifiedTemplate), 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	// template compile should reflect the modified source, not stale cache.
+	outputPath := filepath.Join(dir, "compiled.json")
+	err = cmdTemplateCompile([]string{tmplPath, "--output", outputPath})
+	if err != nil {
+		t.Fatalf("cmdTemplateCompile() error: %v", err)
+	}
+
+	data, _ := os.ReadFile(outputPath) //nolint:gosec // G304: test reads file it created
+	ct, err := template.ParseJSON(data)
+	if err != nil {
+		t.Fatalf("ParseJSON() error: %v", err)
+	}
+
+	if ct.Name != "modified-source" {
+		t.Errorf("compiled template name = %q, want %q", ct.Name, "modified-source")
+	}
+	if ct.InitialState != "begin" {
+		t.Errorf("compiled template initial_state = %q, want %q", ct.InitialState, "begin")
 	}
 }

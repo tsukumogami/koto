@@ -1,10 +1,15 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -24,6 +29,25 @@ type InitMeta struct {
 	Variables    map[string]string
 }
 
+// transitionConfig holds configuration for a single transition,
+// populated by TransitionOption functions.
+type transitionConfig struct {
+	evidence map[string]string
+}
+
+// TransitionOption is a functional option for Engine.Transition.
+type TransitionOption func(*transitionConfig)
+
+// WithEvidence returns a TransitionOption that attaches evidence
+// key-value pairs to a transition. Evidence is merged into
+// State.Evidence on success (new keys added, existing keys
+// overwritten) and recorded in the HistoryEntry.
+func WithEvidence(evidence map[string]string) TransitionOption {
+	return func(cfg *transitionConfig) {
+		cfg.evidence = evidence
+	}
+}
+
 // Init creates a new workflow state file and returns an engine for it.
 // The state file is written atomically to the given path.
 func Init(statePath string, machine *Machine, meta InitMeta) (*Engine, error) {
@@ -40,7 +64,7 @@ func Init(statePath string, machine *Machine, meta InitMeta) (*Engine, error) {
 	}
 
 	state := State{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Workflow: WorkflowMeta{
 			Name:         meta.Name,
 			TemplateHash: meta.TemplateHash,
@@ -50,6 +74,7 @@ func Init(statePath string, machine *Machine, meta InitMeta) (*Engine, error) {
 		Version:      1,
 		CurrentState: machine.InitialState,
 		Variables:    vars,
+		Evidence:     map[string]string{},
 		History:      []HistoryEntry{},
 	}
 
@@ -78,6 +103,14 @@ func Load(statePath string, machine *Machine) (*Engine, error) {
 		return nil, fmt.Errorf("parse state file: %w", err)
 	}
 
+	// Accept schema_version 1 (backward compat) and 2.
+	// Version 1 files lack the Evidence field; initialize it.
+	if state.SchemaVersion == 1 {
+		if state.Evidence == nil {
+			state.Evidence = map[string]string{}
+		}
+	}
+
 	if _, ok := machine.States[state.CurrentState]; !ok {
 		return nil, &TransitionError{
 			Code:         ErrUnknownState,
@@ -96,7 +129,16 @@ func Load(statePath string, machine *Machine) (*Engine, error) {
 // Transition advances to the target state. It validates the transition
 // is allowed, updates state, and persists atomically. If persistence
 // fails, the in-memory state is restored to its pre-transition value.
-func (e *Engine) Transition(target string) error {
+//
+// Optional TransitionOption values can be passed to attach evidence
+// or other metadata to the transition. Existing callers passing zero
+// options continue to compile and work unchanged.
+func (e *Engine) Transition(target string, opts ...TransitionOption) error {
+	var cfg transitionConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	current := e.state.CurrentState
 	ms, ok := e.machine.States[current]
 	if !ok {
@@ -126,16 +168,72 @@ func (e *Engine) Transition(target string) error {
 		}
 	}
 
+	// Namespace collision check: evidence keys must not shadow declared
+	// variable names. This runs before gate evaluation.
+	if len(cfg.evidence) > 0 && len(e.machine.DeclaredVars) > 0 {
+		for k := range cfg.evidence {
+			if e.machine.DeclaredVars[k] {
+				return &TransitionError{
+					Code:         ErrGateFailed,
+					Message:      fmt.Sprintf("evidence key %q shadows declared variable", k),
+					CurrentState: current,
+					TargetState:  target,
+				}
+			}
+		}
+	}
+
+	// Gate evaluation: all gates on the current state must pass (AND
+	// logic) before the transition commits. Gates check the evidence
+	// map, which includes both accumulated evidence and evidence being
+	// supplied in this transition.
+	if len(ms.Gates) > 0 {
+		// Build the effective evidence: accumulated state evidence
+		// merged with the evidence being supplied in this transition
+		// (new evidence overwrites existing keys, same as the commit
+		// semantics below).
+		effectiveEvidence := make(map[string]string, len(e.state.Evidence)+len(cfg.evidence))
+		for k, v := range e.state.Evidence {
+			effectiveEvidence[k] = v
+		}
+		for k, v := range cfg.evidence {
+			effectiveEvidence[k] = v
+		}
+
+		if err := evaluateGates(ms.Gates, effectiveEvidence, current, target); err != nil {
+			return err
+		}
+	}
+
 	prev := deepCopyState(e.state)
 
-	e.state.CurrentState = target
-	e.state.Version++
-	e.state.History = append(e.state.History, HistoryEntry{
+	// Build the history entry, recording any evidence supplied.
+	entry := HistoryEntry{
 		From:      current,
 		To:        target,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Type:      "transition",
-	})
+	}
+	if len(cfg.evidence) > 0 {
+		entry.Evidence = make(map[string]string, len(cfg.evidence))
+		for k, v := range cfg.evidence {
+			entry.Evidence[k] = v
+		}
+	}
+
+	// Merge evidence into state (new keys added, existing overwritten).
+	if len(cfg.evidence) > 0 {
+		if e.state.Evidence == nil {
+			e.state.Evidence = make(map[string]string)
+		}
+		for k, v := range cfg.evidence {
+			e.state.Evidence[k] = v
+		}
+	}
+
+	e.state.CurrentState = target
+	e.state.Version++
+	e.state.History = append(e.state.History, entry)
 
 	if err := e.persist(); err != nil {
 		e.state = prev
@@ -227,17 +325,40 @@ func (e *Engine) Variables() map[string]string {
 	return out
 }
 
-// History returns the transition history.
+// Evidence returns a copy of the accumulated evidence map.
+func (e *Engine) Evidence() map[string]string {
+	out := make(map[string]string, len(e.state.Evidence))
+	for k, v := range e.state.Evidence {
+		out[k] = v
+	}
+	return out
+}
+
+// History returns the transition history. Each entry is a deep copy;
+// mutating the returned slice or its Evidence maps will not affect the
+// engine's internal state.
 func (e *Engine) History() []HistoryEntry {
 	out := make([]HistoryEntry, len(e.state.History))
 	copy(out, e.state.History)
+	for i, entry := range out {
+		if entry.Evidence != nil {
+			m := make(map[string]string, len(entry.Evidence))
+			for k, v := range entry.Evidence {
+				m[k] = v
+			}
+			out[i].Evidence = m
+		}
+	}
 	return out
 }
 
 // Snapshot returns a copy of the full state for serialization to JSON.
+// The returned State shares no references with the engine's internal
+// state: Variables, Evidence, and History are all deep copied.
 func (e *Engine) Snapshot() State {
 	s := e.state
 	s.Variables = e.Variables()
+	s.Evidence = e.Evidence()
 	s.History = e.History()
 	return s
 }
@@ -254,15 +375,41 @@ func (e *Engine) Machine() *Machine {
 	for name, ms := range e.machine.States {
 		transitions := make([]string, len(ms.Transitions))
 		copy(transitions, ms.Transitions)
+
+		var gates map[string]*GateDecl
+		if ms.Gates != nil {
+			gates = make(map[string]*GateDecl, len(ms.Gates))
+			for gn, gd := range ms.Gates {
+				gates[gn] = &GateDecl{
+					Type:    gd.Type,
+					Field:   gd.Field,
+					Value:   gd.Value,
+					Command: gd.Command,
+					Timeout: gd.Timeout,
+				}
+			}
+		}
+
 		states[name] = &MachineState{
 			Transitions: transitions,
 			Terminal:    ms.Terminal,
+			Gates:       gates,
 		}
 	}
+
+	var declaredVars map[string]bool
+	if e.machine.DeclaredVars != nil {
+		declaredVars = make(map[string]bool, len(e.machine.DeclaredVars))
+		for k, v := range e.machine.DeclaredVars {
+			declaredVars[k] = v
+		}
+	}
+
 	return &Machine{
 		Name:         e.machine.Name,
 		InitialState: e.machine.InitialState,
 		States:       states,
+		DeclaredVars: declaredVars,
 	}
 }
 
@@ -376,12 +523,140 @@ func deepCopyState(s State) State {
 		}
 	}
 
+	if s.Evidence != nil {
+		cp.Evidence = make(map[string]string, len(s.Evidence))
+		for k, v := range s.Evidence {
+			cp.Evidence[k] = v
+		}
+	}
+
 	if s.History != nil {
 		cp.History = make([]HistoryEntry, len(s.History))
 		copy(cp.History, s.History)
+		for i, entry := range cp.History {
+			if entry.Evidence != nil {
+				m := make(map[string]string, len(entry.Evidence))
+				for k, v := range entry.Evidence {
+					m[k] = v
+				}
+				cp.History[i].Evidence = m
+			}
+		}
 	}
 
 	return cp
+}
+
+// evaluateGates checks all gates on a state using AND logic. Every gate
+// must pass for the transition to proceed. Gates check the evidence map
+// only, not the merged variables+evidence context.
+func evaluateGates(gates map[string]*GateDecl, evidence map[string]string, current, target string) error {
+	for name, gate := range gates {
+		switch gate.Type {
+		case "field_not_empty":
+			val, exists := evidence[gate.Field]
+			if !exists || val == "" {
+				return &TransitionError{
+					Code:         ErrGateFailed,
+					Message:      fmt.Sprintf("gate %q failed: field %q must be non-empty", name, gate.Field),
+					CurrentState: current,
+					TargetState:  target,
+				}
+			}
+
+		case "field_equals":
+			val, exists := evidence[gate.Field]
+			if !exists {
+				return &TransitionError{
+					Code:         ErrGateFailed,
+					Message:      fmt.Sprintf("gate %q failed: field %q not found in evidence", name, gate.Field),
+					CurrentState: current,
+					TargetState:  target,
+				}
+			}
+			if val != gate.Value {
+				return &TransitionError{
+					Code:         ErrGateFailed,
+					Message:      fmt.Sprintf("gate %q failed: field %q is %q, want %q", name, gate.Field, val, gate.Value),
+					CurrentState: current,
+					TargetState:  target,
+				}
+			}
+
+		case "command":
+			if err := evaluateCommandGate(gate, name, current, target); err != nil {
+				return err
+			}
+
+		default:
+			return &TransitionError{
+				Code:         ErrGateFailed,
+				Message:      fmt.Sprintf("gate %q failed: unknown gate type %q", name, gate.Type),
+				CurrentState: current,
+				TargetState:  target,
+			}
+		}
+	}
+	return nil
+}
+
+// evaluateCommandGate runs a command gate via sh -c and checks the exit code.
+// Exit code 0 means the gate passes; any other exit code (or timeout) fails it.
+// The command string is passed to sh -c exactly as-is with no interpolation.
+// CWD is the git repo root if available, otherwise the process CWD.
+func evaluateCommandGate(gate *GateDecl, name, current, target string) error {
+	timeout := time.Duration(gate.Timeout) * time.Second
+	if gate.Timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", gate.Command) //nolint:gosec // G204: command gate runs user-defined commands by design
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+
+	// Determine CWD: prefer git repo root, fall back to process CWD.
+	cmd.Dir = gitRepoRoot()
+
+	err := cmd.Run()
+	if err != nil {
+		// Check if the context deadline was exceeded (timeout).
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			// Kill the entire process group to clean up child processes.
+			if cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+			return &TransitionError{
+				Code:         ErrGateFailed,
+				Message:      fmt.Sprintf("gate %q failed: command timed out after %s", name, timeout),
+				CurrentState: current,
+				TargetState:  target,
+			}
+		}
+
+		return &TransitionError{
+			Code:         ErrGateFailed,
+			Message:      fmt.Sprintf("gate %q failed: command gate returned non-zero exit status", name),
+			CurrentState: current,
+			TargetState:  target,
+		}
+	}
+
+	return nil
+}
+
+// gitRepoRoot returns the git repository root directory, or the process
+// CWD if git is not available or the current directory is not in a git repo.
+func gitRepoRoot() string {
+	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output() //nolint:gosec // G204: fixed git command
+	if err != nil {
+		dir, _ := os.Getwd()
+		return dir
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func contains(ss []string, s string) bool {

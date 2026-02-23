@@ -8,6 +8,7 @@ import (
 
 	"github.com/tsukumogami/koto/pkg/engine"
 	"github.com/tsukumogami/koto/pkg/template"
+	"github.com/tsukumogami/koto/pkg/template/compile"
 )
 
 func testMachine() *engine.Machine {
@@ -25,25 +26,45 @@ func testMachine() *engine.Machine {
 	}
 }
 
-// writeTestTemplate writes a template file and returns its path.
-func writeTestTemplate(t *testing.T, dir, content string) string {
+// compileTestTemplate compiles a source template string and returns the
+// Template via ToTemplate(), along with the compiled hash.
+func compileTestTemplate(t *testing.T, source string) (*template.Template, string) {
 	t.Helper()
-	path := filepath.Join(dir, "template.md")
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatalf("WriteFile() error: %v", err)
+
+	ct, _, err := compile.Compile([]byte(source))
+	if err != nil {
+		t.Fatalf("compile.Compile() error: %v", err)
 	}
-	return path
+
+	hash, _, err := compile.Hash(ct)
+	if err != nil {
+		t.Fatalf("compile.Hash() error: %v", err)
+	}
+
+	tmpl, err := ct.ToTemplate()
+	if err != nil {
+		t.Fatalf("ToTemplate() error: %v", err)
+	}
+	tmpl.Hash = hash
+
+	return tmpl, hash
 }
 
-const testTemplateContent = `---
+const testTemplateSource = `---
 name: test-machine
+version: "1.0"
+initial_state: start
+
+states:
+  start:
+    transitions: [done]
+  done:
+    terminal: true
 ---
 
 ## start
 
 Do the {{TASK}} work now.
-
-**Transitions**: [done]
 
 ## done
 
@@ -120,18 +141,13 @@ func TestNext_TerminalState(t *testing.T) {
 }
 
 func TestNew_TemplateHashMatch(t *testing.T) {
+	tmpl, hash := compileTestTemplate(t, testTemplateSource)
+
 	dir := t.TempDir()
-	tmplPath := writeTestTemplate(t, dir, testTemplateContent)
-
-	tmpl, err := template.Parse(tmplPath)
-	if err != nil {
-		t.Fatalf("template.Parse() error: %v", err)
-	}
-
 	statePath := filepath.Join(dir, "koto-test.state.json")
 	eng, err := engine.Init(statePath, tmpl.Machine, engine.InitMeta{
 		Name:         "test",
-		TemplateHash: tmpl.Hash,
+		TemplateHash: hash,
 	})
 	if err != nil {
 		t.Fatalf("Init() error: %v", err)
@@ -148,14 +164,9 @@ func TestNew_TemplateHashMatch(t *testing.T) {
 }
 
 func TestNew_TemplateHashMismatch(t *testing.T) {
+	tmpl, _ := compileTestTemplate(t, testTemplateSource)
+
 	dir := t.TempDir()
-	tmplPath := writeTestTemplate(t, dir, testTemplateContent)
-
-	tmpl, err := template.Parse(tmplPath)
-	if err != nil {
-		t.Fatalf("template.Parse() error: %v", err)
-	}
-
 	statePath := filepath.Join(dir, "koto-test.state.json")
 	eng, err := engine.Init(statePath, tmpl.Machine, engine.InitMeta{
 		Name:         "test",
@@ -203,18 +214,13 @@ func TestNew_NilTemplateSkipsVerification(t *testing.T) {
 }
 
 func TestNext_WithTemplate_InterpolatesVariables(t *testing.T) {
+	tmpl, hash := compileTestTemplate(t, testTemplateSource)
+
 	dir := t.TempDir()
-	tmplPath := writeTestTemplate(t, dir, testTemplateContent)
-
-	tmpl, err := template.Parse(tmplPath)
-	if err != nil {
-		t.Fatalf("template.Parse() error: %v", err)
-	}
-
 	statePath := filepath.Join(dir, "koto-test.state.json")
 	eng, err := engine.Init(statePath, tmpl.Machine, engine.InitMeta{
 		Name:         "test",
-		TemplateHash: tmpl.Hash,
+		TemplateHash: hash,
 		Variables:    map[string]string{"TASK": "important"},
 	})
 	if err != nil {
@@ -243,5 +249,103 @@ func TestNext_WithTemplate_InterpolatesVariables(t *testing.T) {
 	// The directive should not contain the raw placeholder.
 	if strings.Contains(d.Directive, "{{TASK}}") {
 		t.Errorf("Directive = %q, should not contain unresolved placeholder {{TASK}}", d.Directive)
+	}
+}
+
+const testTemplateWithEvidenceSource = `---
+name: test-machine
+version: "1.0"
+initial_state: start
+
+states:
+  start:
+    transitions: [done]
+  done:
+    terminal: true
+---
+
+## start
+
+Do the {{TASK}} work. Result: {{RESULT}}
+
+## done
+
+Work is complete.
+`
+
+func TestNext_WithTemplate_MergesEvidenceIntoContext(t *testing.T) {
+	tmpl, hash := compileTestTemplate(t, testTemplateWithEvidenceSource)
+
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "koto-test.state.json")
+	eng, err := engine.Init(statePath, tmpl.Machine, engine.InitMeta{
+		Name:         "test",
+		TemplateHash: hash,
+		Variables:    map[string]string{"TASK": "important"},
+	})
+	if err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// The template has {{RESULT}} placeholder but there's no variable
+	// for it. Without evidence, it remains unresolved.
+	ctrl, err := New(eng, tmpl)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	d, err := ctrl.Next()
+	if err != nil {
+		t.Fatalf("Next() error: %v", err)
+	}
+
+	if !strings.Contains(d.Directive, "{{RESULT}}") {
+		t.Errorf("Directive = %q, want it to contain unresolved {{RESULT}}", d.Directive)
+	}
+
+	// Now rewind and add evidence via a self-transition trick:
+	// We need to use a machine that allows staying in start. Instead,
+	// let's create a fresh engine that has evidence pre-loaded.
+	// Actually, we can write a v2 state file with evidence directly.
+	stateData := `{
+		"schema_version": 2,
+		"workflow": {"name": "test", "template_hash": "` + hash + `", "template_path": "", "created_at": "2024-01-01T00:00:00Z"},
+		"version": 1,
+		"current_state": "start",
+		"variables": {"TASK": "important"},
+		"evidence": {"RESULT": "pass"},
+		"history": []
+	}`
+	statePath2 := filepath.Join(dir, "koto-test2.state.json")
+	if err := os.WriteFile(statePath2, []byte(stateData), 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	eng2, err := engine.Load(statePath2, tmpl.Machine)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	ctrl2, err := New(eng2, tmpl)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	d2, err := ctrl2.Next()
+	if err != nil {
+		t.Fatalf("Next() error: %v", err)
+	}
+
+	// The evidence value should be interpolated.
+	if !strings.Contains(d2.Directive, "pass") {
+		t.Errorf("Directive = %q, want it to contain %q (evidence value)", d2.Directive, "pass")
+	}
+	if strings.Contains(d2.Directive, "{{RESULT}}") {
+		t.Errorf("Directive = %q, should not contain unresolved {{RESULT}}", d2.Directive)
+	}
+
+	// Variables should also still be interpolated.
+	if !strings.Contains(d2.Directive, "important") {
+		t.Errorf("Directive = %q, want it to contain %q (variable value)", d2.Directive, "important")
 	}
 }

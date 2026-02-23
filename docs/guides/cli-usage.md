@@ -222,6 +222,50 @@ koto workflows --state-dir wip/
 
 Returns an empty array `[]` when no workflows are active.
 
+### template
+
+The `template` subcommand group contains authoring tools for template development. These commands aren't needed for running workflows -- they're for people writing and debugging templates.
+
+#### template compile
+
+Compiles a source template and writes the compiled JSON to stdout. Warnings go to stderr. Exits non-zero on compilation failure.
+
+```bash
+koto template compile path/to/template.md
+```
+
+**Positional argument:**
+- `<path>` -- Path to the source template file.
+
+**Optional flags:**
+- `--output <file>` -- Write compiled JSON to a file instead of stdout.
+
+**Output (JSON to stdout):**
+
+The compiled JSON representation of the template. Pipe to `jq` to explore specific fields:
+
+```bash
+koto template compile template.md | jq '.states'
+```
+
+**Warnings (stderr):**
+
+```
+warning: heading collision: "assess" appears twice
+```
+
+**Example with output file:**
+
+```bash
+koto template compile template.md --output compiled.json
+```
+
+Exit codes:
+- `0` -- Compilation succeeded.
+- Non-zero -- Compilation failed. Error details are printed as JSON to stdout.
+
+This command always compiles fresh (it doesn't use caching). It's meant for the edit-compile-check loop during template development, and for CI validation of template files.
+
 ### version
 
 Prints the koto version.

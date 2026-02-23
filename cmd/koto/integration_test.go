@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -36,27 +37,32 @@ const integrationTemplate = `---
 name: integration
 version: "1.0"
 description: Integration test workflow
+initial_state: assess
 variables:
-  TASK: default-task
+  TASK:
+    default: default-task
+states:
+  assess:
+    transitions: [plan]
+  plan:
+    transitions: [implement]
+  implement:
+    transitions: [done]
+  done:
+    terminal: true
 ---
 
 ## assess
 
 Assess the task: {{TASK}}.
 
-**Transitions**: [plan]
-
 ## plan
 
 Create a plan for {{TASK}}.
 
-**Transitions**: [implement]
-
 ## implement
 
 Build the solution.
-
-**Transitions**: [done]
 
 ## done
 
@@ -543,16 +549,47 @@ func TestIntegration_TemplateMismatch(t *testing.T) {
 
 	statePath := initWorkflow(t, tmplPath, stateDir, "mismatch-test")
 
-	// Modify the template file after init (append a newline to change hash).
-	f, err := os.OpenFile(tmplPath, os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // G304: test modifies its own template file
-	if err != nil {
-		t.Fatalf("open template for append: %v", err)
+	// Modify the template directive content to change the compiled hash.
+	// A trailing newline wouldn't change the compiled output, so we
+	// rewrite the directive text which changes the compiled JSON.
+	modifiedTemplate := `---
+name: integration
+version: "1.0"
+description: Integration test workflow
+initial_state: assess
+variables:
+  TASK:
+    default: default-task
+states:
+  assess:
+    transitions: [plan]
+  plan:
+    transitions: [implement]
+  implement:
+    transitions: [done]
+  done:
+    terminal: true
+---
+
+## assess
+
+MODIFIED directive content.
+
+## plan
+
+Create a plan for {{TASK}}.
+
+## implement
+
+Build the solution.
+
+## done
+
+Work is complete.
+`
+	if err := os.WriteFile(tmplPath, []byte(modifiedTemplate), 0o600); err != nil {
+		t.Fatalf("rewrite template: %v", err)
 	}
-	if _, err := f.WriteString("\n"); err != nil {
-		f.Close()
-		t.Fatalf("append to template: %v", err)
-	}
-	f.Close()
 
 	// next should fail with template_mismatch.
 	stdout, _, err := runKoto(t, "next", "--state", statePath)
@@ -572,5 +609,190 @@ func TestIntegration_TemplateMismatch(t *testing.T) {
 	code = errorCode(t, stdout)
 	if code != "template_mismatch" {
 		t.Errorf("transition error code = %q, want %q", code, "template_mismatch")
+	}
+}
+
+// --- Template compile integration tests ---
+
+// TestIntegration_TemplateCompile_Stdout tests that koto template compile
+// writes valid JSON to stdout and exits zero.
+func TestIntegration_TemplateCompile_Stdout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode: skipping integration test")
+	}
+
+	dir := t.TempDir()
+	tmplPath := writeTemplate(t, dir, "lifecycle.md", integrationTemplate)
+
+	stdout := mustRunKoto(t, "template", "compile", tmplPath)
+
+	// Output should be valid JSON.
+	var ct map[string]interface{}
+	if err := json.Unmarshal([]byte(stdout), &ct); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\noutput: %s", err, stdout)
+	}
+
+	// Verify expected fields.
+	if ct["name"] != "integration" {
+		t.Errorf("name = %v, want %q", ct["name"], "integration")
+	}
+	if _, ok := ct["states"]; !ok {
+		t.Error("missing 'states' in compiled output")
+	}
+}
+
+// TestIntegration_TemplateCompile_OutputFlag tests the --output flag.
+func TestIntegration_TemplateCompile_OutputFlag(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode: skipping integration test")
+	}
+
+	dir := t.TempDir()
+	tmplPath := writeTemplate(t, dir, "lifecycle.md", integrationTemplate)
+	outputPath := filepath.Join(dir, "compiled.json")
+
+	mustRunKoto(t, "template", "compile", tmplPath, "--output", outputPath)
+
+	// Output file should exist and contain valid JSON.
+	data, err := os.ReadFile(outputPath) //nolint:gosec // G304: test reads file it created
+	if err != nil {
+		t.Fatalf("read output file: %v", err)
+	}
+
+	var ct map[string]interface{}
+	if err := json.Unmarshal(data, &ct); err != nil {
+		t.Fatalf("output file is not valid JSON: %v", err)
+	}
+}
+
+// TestIntegration_TemplateCompile_MissingFile tests that a non-existent
+// path exits non-zero.
+func TestIntegration_TemplateCompile_MissingFile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode: skipping integration test")
+	}
+
+	_, _, err := runKoto(t, "template", "compile", "/nonexistent/path/template.md")
+	if err == nil {
+		t.Fatal("expected non-zero exit for missing file")
+	}
+}
+
+// TestIntegration_TemplateCompile_InvalidTemplate tests that an invalid
+// template exits non-zero.
+func TestIntegration_TemplateCompile_InvalidTemplate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode: skipping integration test")
+	}
+
+	dir := t.TempDir()
+	badPath := filepath.Join(dir, "bad.md")
+	if err := os.WriteFile(badPath, []byte("not yaml frontmatter at all\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	_, _, err := runKoto(t, "template", "compile", badPath)
+	if err == nil {
+		t.Fatal("expected non-zero exit for invalid template")
+	}
+}
+
+// TestIntegration_TemplateCompile_NoSubcommand tests that koto template
+// with no subcommand exits non-zero.
+func TestIntegration_TemplateCompile_NoSubcommand(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode: skipping integration test")
+	}
+
+	_, _, err := runKoto(t, "template")
+	if err == nil {
+		t.Fatal("expected non-zero exit for missing subcommand")
+	}
+}
+
+// TestIntegration_TemplateCompile_NoPath tests that koto template compile
+// with no path exits non-zero.
+func TestIntegration_TemplateCompile_NoPath(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode: skipping integration test")
+	}
+
+	_, _, err := runKoto(t, "template", "compile")
+	if err == nil {
+		t.Fatal("expected non-zero exit for missing path argument")
+	}
+}
+
+// TestIntegration_TemplateCompile_WarningsToStderr tests that compilation
+// warnings are printed to stderr with the "warning:" prefix.
+func TestIntegration_TemplateCompile_WarningsToStderr(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode: skipping integration test")
+	}
+
+	// Create a template with a heading collision to trigger a warning.
+	warningTemplate := `---
+name: warning-test
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions: [done]
+  done:
+    terminal: true
+---
+
+## start
+
+First section.
+
+## start
+
+Duplicate heading.
+
+## done
+
+All done.
+`
+	dir := t.TempDir()
+	tmplPath := writeTemplate(t, dir, "warning.md", warningTemplate)
+
+	stdout, stderr, err := runKoto(t, "template", "compile", tmplPath)
+	if err != nil {
+		t.Fatalf("expected success, got error: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+	}
+
+	// stdout should still be valid JSON.
+	var ct map[string]interface{}
+	if err := json.Unmarshal([]byte(stdout), &ct); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v", err)
+	}
+
+	// stderr should contain the warning.
+	if stderr == "" {
+		t.Error("stderr should contain warnings but was empty")
+	}
+	if !strings.Contains(stderr, "warning:") {
+		t.Errorf("stderr should contain 'warning:' prefix, got: %q", stderr)
+	}
+}
+
+// TestIntegration_TemplateCompile_ExistingCommandsUnaffected tests that
+// adding the template command doesn't break the existing dispatch.
+func TestIntegration_TemplateCompile_ExistingCommandsUnaffected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode: skipping integration test")
+	}
+
+	// koto with no args should fail (existing behavior).
+	_, _, err := runKoto(t)
+	if err == nil {
+		t.Fatal("expected non-zero exit for no command")
+	}
+
+	// koto version should still work.
+	stdout := mustRunKoto(t, "version")
+	if stdout == "" {
+		t.Error("version output should not be empty")
 	}
 }

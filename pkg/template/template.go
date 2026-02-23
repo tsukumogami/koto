@@ -43,6 +43,10 @@ type Template struct {
 	Path        string            // filesystem path to the template file
 }
 
+// Deprecated: Use compile.Compile() + template.ParseJSON() instead.
+// Parse() uses a legacy source format and does not support evidence gates,
+// nested YAML structures, or the source/compiled hash format.
+//
 // Parse reads a template file at the given path and returns a Template.
 // It extracts the YAML front-matter header, parses state sections from
 // markdown headings, constructs an engine.Machine, and computes a
@@ -68,7 +72,7 @@ func Parse(path string) (*Template, error) {
 	hash := "sha256:" + hex.EncodeToString(sum[:])
 
 	// Split front-matter from body.
-	header, body, err := splitFrontMatter(content)
+	header, body, err := SplitFrontMatter(content)
 	if err != nil {
 		return nil, err
 	}
@@ -183,10 +187,10 @@ func Interpolate(text string, ctx map[string]string) string {
 	return b.String()
 }
 
-// splitFrontMatter separates the YAML front-matter from the markdown body.
+// SplitFrontMatter separates the YAML front-matter from the markdown body.
 // The front-matter is delimited by "---" lines. Returns the header content
 // (between the delimiters) and the body (after the closing delimiter).
-func splitFrontMatter(content string) (header, body string, err error) {
+func SplitFrontMatter(content string) (header, body string, err error) {
 	// Trim leading whitespace/newlines.
 	trimmed := strings.TrimLeft(content, " \t\r\n")
 

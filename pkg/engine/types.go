@@ -12,6 +12,7 @@ type State struct {
 	Version       int               `json:"version"`
 	CurrentState  string            `json:"current_state"`
 	Variables     map[string]string `json:"variables"`
+	Evidence      map[string]string `json:"evidence,omitempty"`
 	History       []HistoryEntry    `json:"history"`
 }
 
@@ -25,10 +26,11 @@ type WorkflowMeta struct {
 
 // HistoryEntry records a single state change.
 type HistoryEntry struct {
-	From      string `json:"from"`
-	To        string `json:"to"`
-	Timestamp string `json:"timestamp"`
-	Type      string `json:"type"` // "transition" or "rewind"
+	From      string            `json:"from"`
+	To        string            `json:"to"`
+	Timestamp string            `json:"timestamp"`
+	Type      string            `json:"type"` // "transition" or "rewind"
+	Evidence  map[string]string `json:"evidence,omitempty"`
 }
 
 // Machine is the in-memory representation of a state machine definition.
@@ -36,6 +38,7 @@ type Machine struct {
 	Name         string
 	InitialState string
 	States       map[string]*MachineState
+	DeclaredVars map[string]bool
 }
 
 // MachineState defines a single state in the machine, including its
@@ -43,4 +46,15 @@ type Machine struct {
 type MachineState struct {
 	Transitions []string
 	Terminal    bool
+	Gates       map[string]*GateDecl
+}
+
+// GateDecl represents a gate declaration on a machine state. Gates are
+// exit conditions that must be satisfied before leaving the state.
+type GateDecl struct {
+	Type    string `json:"type"`
+	Field   string `json:"field,omitempty"`
+	Value   string `json:"value,omitempty"`
+	Command string `json:"command,omitempty"`
+	Timeout int    `json:"timeout,omitempty"` // seconds, 0 = default (30s)
 }
