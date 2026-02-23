@@ -1,0 +1,88 @@
+{
+  "pr_status": "implementing",
+  "design_doc": "docs/designs/DESIGN-koto-installation.md",
+  "branch": "docs/koto-installation",
+  "pr_number": 24,
+  "integrity_hash": "sha256:8cec6b79ebcd232563cfb66559fbf821aee2325a6201650a039d79c1aef1fc1b",
+  "issues": [
+    {
+      "number": 25,
+      "title": "ci(release): add GoReleaser config and release workflow",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-1",
+        "scenario-2",
+        "scenario-3",
+        "scenario-4",
+        "scenario-5",
+        "scenario-6"
+      ]
+    },
+    {
+      "number": 26,
+      "title": "ci(release): validate release pipeline with v0.1.0",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        25
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-7",
+        "scenario-8",
+        "scenario-9"
+      ]
+    },
+    {
+      "number": 27,
+      "title": "feat(install): add self-contained install script",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        26
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-10",
+        "scenario-11",
+        "scenario-12"
+      ]
+    },
+    {
+      "number": 28,
+      "title": "feat(recipe): add tsuku recipe for koto",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        26
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [
+        "scenario-13",
+        "scenario-14"
+      ]
+    }
+  ],
+  "skipped_issues": null,
+  "test_plan_file": "wip/implement-doc_koto-installation_test_plan.md",
+  "doc_plan_file": "wip/implement-doc_koto-installation_doc_plan.md"
+}
