@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 problem: |
   koto has a working engine, template compiler, and cache, but no way to install the binary. Users must clone the repo and run go build. There are no pre-built binaries, no release process, and no standard installation channel.
 decision: |
@@ -11,7 +11,7 @@ rationale: |
 
 ## Status
 
-**Proposed**
+**Accepted**
 
 ## Context and Problem Statement
 
