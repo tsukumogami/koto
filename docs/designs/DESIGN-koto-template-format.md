@@ -44,6 +44,7 @@ rationale: |
 | ~~[#17: feat(engine): implement command gate execution](https://github.com/tsukumogami/koto/issues/17)~~ | ~~[#16](https://github.com/tsukumogami/koto/issues/16)~~ | ~~critical~~ |
 | ~~_Adds the `command` gate type: `sh -c` execution from project root with configurable timeout (default 30s). No variable interpolation in command strings -- this security boundary is verified by explicit tests. Timed-out commands fail the gate._~~ | | |
 | [#18: docs: design CLI and tooling for template compilation](https://github.com/tsukumogami/koto/issues/18) | [#13](https://github.com/tsukumogami/koto/issues/13) | simple |
+| ^_Child: [DESIGN-koto-cli-tooling.md](DESIGN-koto-cli-tooling.md)_ | | |
 | _Designs the CLI commands, template search paths, compile flow, and optional LLM-assisted validation that build on this format specification. This is Phase 4 of the implementation approach -- deferred to its own design because CLI/tooling concerns are separate from format specification._ | | |
 
 ### Dependency Graph
@@ -81,7 +82,7 @@ graph TD
     classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
 
     class I13,I14,I15,I16,I17 done
-    class I18 needsDesign
+    class I18 tracksDesign
 ```
 
 **Legend**: Green = done, Blue = ready, Yellow = blocked, Purple = needs-design, Orange = tracks-design
