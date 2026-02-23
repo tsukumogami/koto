@@ -247,12 +247,24 @@ After the release is published, users can install immediately via the install sc
 ### Phase 2: GoReleaser and release workflow
 - Add `.goreleaser.yaml` mirroring tsuku's config (format: binary, ldflags targeting `internal/buildinfo`, draft release, changelog disabled)
 - Add `.github/workflows/release.yml` with two jobs: `release` (GoReleaser + tag-annotation notes) and `finalize-release` (verify artifacts, unified checksums, publish)
-- Tag and test first release (`v0.1.0`) -- this release validates the release pipeline
 
-### Phase 3: Install script and tsuku recipe
+### Phase 3: First release (v0.1.0)
+- Tag `v0.1.0` and push to trigger the release workflow
+- Validate the full pipeline: GoReleaser builds, draft release created, artifacts verified, checksums regenerated, release published
+- Verify the published release has all 4 expected binaries and a valid `checksums.txt`
+- Manually download and run a binary to confirm version output and basic functionality
+- This release is a prerequisite for both the install script and the tsuku recipe -- they need real release assets to download from
+
+### Phase 4: Install script
 - Write `install.sh` adapting tsuku's install script (platform detection, binary naming, checksum verification, PATH setup to `~/.koto/bin/`)
-- Add `koto.toml` recipe to tsuku's `recipes/` directory
-- Test both channels: install script on linux/darwin, `tsuku install koto`
+- Test on linux and darwin: verify it downloads the v0.1.0 binary, verifies checksum, installs correctly, and sets up PATH
+- Test `--no-modify-path` flag
+- Test with `$KOTO_INSTALL_DIR` override
+
+### Phase 5: tsuku recipe
+- Add `koto.toml` recipe to tsuku's `recipes/` directory (in the tsuku repo)
+- Test `tsuku install koto` against the published v0.1.0 release
+- Verify the installed binary reports the correct version and runs correctly from `~/.tsuku/bin/`
 
 ## Security Considerations
 
