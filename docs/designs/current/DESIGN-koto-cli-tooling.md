@@ -1,9 +1,9 @@
 ---
-status: Planned
+status: Current
 spawned_from:
   issue: 18
   repo: tsukumogami/koto
-  parent_design: docs/designs/DESIGN-koto-template-format.md
+  parent_design: docs/designs/current/DESIGN-koto-template-format.md
 problem: |
   koto's template compiler is fully implemented as a Go library but unreachable from
   the CLI. Templates reach users through two distinct paths -- deployed by skills/plugins
