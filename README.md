@@ -7,6 +7,12 @@ Agents call `koto next` to get their current directive, do the work, then call `
 ## Install
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/tsukumogami/koto/main/install.sh | sh
+```
+
+Or with Go:
+
+```bash
 go install github.com/tsukumogami/koto/cmd/koto@latest
 ```
 
