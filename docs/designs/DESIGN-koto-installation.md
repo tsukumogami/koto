@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 problem: |
   koto has a working engine, template compiler, and cache, but no way to install the binary. Users must clone the repo and run go build. There are no pre-built binaries, no release process, and no standard installation channel.
 decision: |
@@ -11,7 +11,47 @@ rationale: |
 
 ## Status
 
-**Accepted**
+**Planned**
+
+## Implementation Issues
+
+### Milestone: [koto Installation and Distribution](https://github.com/tsukumogami/koto/milestone/4)
+
+| Issue | Dependencies | Tier |
+|-------|--------------|------|
+| [#25: ci(release): add GoReleaser config and release workflow](https://github.com/tsukumogami/koto/issues/25) | None | testable |
+| _Creates `.goreleaser.yaml` and `.github/workflows/release.yml` mirroring tsuku's two-job pipeline (release + finalize-release). Produces raw binaries for linux/darwin on amd64/arm64 with checksum generation and tag-annotation release notes._ | | |
+| [#26: ci(release): validate release pipeline with v0.1.0](https://github.com/tsukumogami/koto/issues/26) | [#25](https://github.com/tsukumogami/koto/issues/25) | testable |
+| _Tags and pushes v0.1.0 to exercise the full pipeline end-to-end. Validates that all 4 binaries are built, checksums are correct, and the release is published. Produces the real release assets that the install script and tsuku recipe need to test against._ | | |
+| [#27: feat(install): add self-contained install script](https://github.com/tsukumogami/koto/issues/27) | [#26](https://github.com/tsukumogami/koto/issues/26) | testable |
+| _Writes `install.sh` at the repo root with platform detection, checksum verification, and PATH setup to `~/.koto/bin/`. Mirrors tsuku's installer. Supports `--no-modify-path` and `$KOTO_INSTALL_DIR` override._ | | |
+| [#28: feat(recipe): add tsuku recipe for koto](https://github.com/tsukumogami/koto/issues/28) | [#26](https://github.com/tsukumogami/koto/issues/26) | testable |
+| _Adds `koto.toml` to tsuku's `recipes/` directory (in the tsuku repo) using the `github_file` action for raw binary download. Validates koto's GitHub releases as a distribution source and eats our own dogfood._ | | |
+
+### Dependency Graph
+
+```mermaid
+graph LR
+    I25["#25: GoReleaser config + workflow"]
+    I26["#26: Validate with v0.1.0"]
+    I27["#27: Install script"]
+    I28["#28: tsuku recipe"]
+
+    I25 --> I26
+    I26 --> I27
+    I26 --> I28
+
+    classDef done fill:#c8e6c9
+    classDef ready fill:#bbdefb
+    classDef blocked fill:#fff9c4
+    classDef needsDesign fill:#e1bee7
+    classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
+
+    class I25 ready
+    class I26,I27,I28 blocked
+```
+
+**Legend**: Green = done, Blue = ready, Yellow = blocked, Purple = needs-design, Orange = tracks-design
 
 ## Context and Problem Statement
 
