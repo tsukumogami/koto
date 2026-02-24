@@ -3,12 +3,12 @@
   "design_doc": "docs/designs/DESIGN-koto-agent-integration.md",
   "branch": "docs/koto-agent-integration",
   "pr_number": 34,
-  "integrity_hash": "sha256:9662fba09518f83f59bb5e14fae32e90ea7d5d045eb57b39896b30c21e72acf3",
+  "integrity_hash": "sha256:73a4bcb67492a2b1e5bcc8618070eda7b2eedf7ad4d3ee7f11e1205d03edd6f7",
   "issues": [
     {
       "number": 35,
       "title": "feat(plugin): add koto-skills plugin with hello-koto skill",
-      "status": "scrutinized",
+      "status": "pushed",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
       "issue_type": "code",
@@ -29,6 +29,30 @@
         "tests_added": 0,
         "key_decisions": "Used source compiler format (YAML frontmatter + markdown body with ## STATE: headings). Template compiles cleanly. Template locality addressed with both direct plugin path and fallback copy to .koto/templates/.",
         "requirements_map": []
+      },
+      "reviewer_results": {
+        "issue": 35,
+        "reviewers": [
+          {
+            "focus": "pragmatic",
+            "blocking_count": 0,
+            "advisory_count": 1,
+            "detail_file": "wip/research/implement-doc_review_pragmatic_issue35.md"
+          },
+          {
+            "focus": "architect",
+            "blocking_count": 0,
+            "advisory_count": 2,
+            "detail_file": "wip/research/implement-doc_review_architect_issue35.md"
+          },
+          {
+            "focus": "maintainer",
+            "blocking_count": 1,
+            "advisory_count": 3,
+            "detail_file": "wip/research/implement-doc_review_maintainer_issue35.md",
+            "blocking_resolved": "Fixed in commit 0915e8e: replaced dirname $0 shell idiom with concrete copy-to-project instructions"
+          }
+        ]
       },
       "testable_scenarios": [
         "scenario-1",

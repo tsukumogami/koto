@@ -33,8 +33,8 @@ rationale: |
 
 | Issue | Dependencies | Tier |
 |-------|--------------|------|
-| [#35: feat(plugin): add koto-skills plugin with hello-koto skill](https://github.com/tsukumogami/koto/issues/35) | None | testable |
-| _Creates the marketplace manifest, plugin structure, Stop hook, and hello-koto skill. Establishes the file layout that all downstream issues build on and answers the template locality question._ | | |
+| ~~[#35: feat(plugin): add koto-skills plugin with hello-koto skill](https://github.com/tsukumogami/koto/issues/35)~~ | None | testable |
+| _~~Creates the marketplace manifest, plugin structure, Stop hook, and hello-koto skill. Establishes the file layout that all downstream issues build on and answers the template locality question.~~_ | | |
 | [#36: ci(plugin): add template and hook validation workflow](https://github.com/tsukumogami/koto/issues/36) | [#35](https://github.com/tsukumogami/koto/issues/35) | testable |
 | _Adds a GHA workflow that validates template compilation, hook behavior, and manifest schemas on PRs touching plugins/. Uses the koto binary built from the PR -- no external dependencies or API keys._ | | |
 | [#37: test(plugin): add prompt regression eval infrastructure](https://github.com/tsukumogami/koto/issues/37) | [#35](https://github.com/tsukumogami/koto/issues/35) | testable |
@@ -71,8 +71,9 @@ graph LR
     classDef needsDesign fill:#e1bee7
     classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
 
-    class I35 ready
-    class I36,I37,I38,I39,I40 blocked
+    class I35 done
+    class I36,I37,I38,I40 ready
+    class I39 blocked
 ```
 
 **Legend**: Green = done, Blue = ready, Yellow = blocked, Purple = needs-design, Orange = tracks-design
