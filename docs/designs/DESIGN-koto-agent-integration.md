@@ -270,18 +270,13 @@ koto stores the absolute template path in state files and verifies the SHA-256 h
 
 For **project-scoped skills**, this is automatic. The template lives at `.claude/skills/<name>/<template>.md`, which is committed to the repo and doesn't move.
 
-For **plugin-distributed skills**, the template starts in the plugin's cache directory. The agent can't use this path directly -- it can change when the plugin updates, and the agent doesn't receive the skill's filesystem path (Claude Code injects SKILL.md content as text, not as a path reference).
+For **plugin-distributed skills**, the template lives in the plugin's skill directory alongside the SKILL.md. The question is whether the agent can resolve this path at runtime. Two possibilities:
 
-The solution: the SKILL.md includes the template content (as a fenced code block or in the skill's `references/` directory). When the skill is invoked, the agent has the template text in context. The SKILL.md instructs the agent to write it to a project-local path:
+1. **Direct use.** The agent resolves the template's path in the plugin cache and passes it to `koto init`. The path is stable for the duration of a workflow (plugins don't update mid-session). If the plugin updates between sessions while a workflow is paused, the state file's stored path may break -- an edge case the agent can recover from by re-initializing.
 
-```
-Before starting a new workflow:
-1. Check if .koto/templates/quick-task.md exists in the project root
-2. If not, write the template content (below) to .koto/templates/quick-task.md
-3. Run: koto init --template .koto/templates/quick-task.md --name <name> --var TASK="<description>"
-```
+2. **Copy to project.** The SKILL.md instructs the agent to copy the template to a project-local path (e.g., `.koto/templates/hello-koto.md`) before calling `koto init`. The path is stable regardless of plugin updates.
 
-The `.koto/templates/` directory should be committed to version control so the template is available to other collaborators and survives branch switches. `koto init` always points to a project-local file.
+Phase 1 validates which approach works: can the agent access the template file from the plugin directory? If yes, direct use is simpler. If not, the copy fallback is straightforward. The hello-koto skill tests this explicitly.
 
 ### Stop Hook
 
@@ -342,9 +337,21 @@ Set up the plugin and marketplace structure in the koto repo, plus a minimal ski
 - **`.claude-plugin/marketplace.json`** at the repo root
 - **`plugins/koto-skills/.claude-plugin/plugin.json`** -- plugin manifest
 - **`plugins/koto-skills/hooks.json`** -- Stop hook
-- **`plugins/koto-skills/skills/hello/SKILL.md`** -- a hello-world skill. The template has one state whose directive tells the agent to say "hi" back. No gates, no evidence, no variables. Just enough to exercise: plugin installs, skill loads, agent calls `koto init`, calls `koto next`, gets a directive, calls `koto transition` to the terminal state, done.
+- **`plugins/koto-skills/skills/hello-koto/SKILL.md`** -- a hello-koto skill invoked as `/hello-koto <name>`. The template has two states (awakening + terminal), one variable (`SPIRIT_NAME`), and one `command` gate (`test -f wip/spirit-greeting.txt`). Exercises: template compilation, cache, variable interpolation, command gate, state transition, and the full next/execute/transition/done loop.
 
-Validate manually: `/plugin marketplace add tsukumogami/koto`, `/plugin install koto-skills@koto`, invoke the skill, confirm the round-trip works. Replace with quick-task once the plumbing is proven.
+The flow:
+
+| # | User | Agent | koto |
+|---|------|-------|------|
+| 1 | `/hello-koto Hasami` | | |
+| 2 | | Reads SKILL.md, runs `koto init --template <path>/hello-koto.md --name hello --var SPIRIT_NAME=Hasami` | Compiles template, caches by SHA-256, writes state file, returns `{"state":"awakening"}` |
+| 3 | | Runs `koto next` | Interpolates `{{SPIRIT_NAME}}`, returns directive: "You are Hasami, a tsukumogami... Create `wip/spirit-greeting.txt`" |
+| 4 | | Writes `wip/spirit-greeting.txt` | |
+| 5 | | Runs `koto transition eternal` | Gate: `test -f wip/spirit-greeting.txt` passes. Returns `{"state":"eternal"}` |
+| 6 | | Runs `koto next` | Returns `{"action":"done"}` |
+| 7 | | "Hasami has manifested." | |
+
+Validate manually: `/plugin marketplace add tsukumogami/koto`, `/plugin install koto-skills@koto`, `/hello-koto Hasami`. Also validates Phase 1 question: can the agent resolve the template path from the plugin directory, or does it need to copy the template to a project-local path first?
 
 ### Phase 2: CI Pipeline
 
