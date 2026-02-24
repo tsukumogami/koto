@@ -10,7 +10,7 @@ on:
 jobs:
   prompt-eval:
     name: Prompt Regression Eval
-    if: ${{ github.event.pull_request.draft != true }}
+    if: ${{ github.event.pull_request.draft != true && secrets.ANTHROPIC_API_KEY != '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,9 +26,6 @@ jobs:
 
       - name: Run prompt evals
         env:
-          # ANTHROPIC_API_KEY must be added as a repository secret by a
-          # maintainer. The eval harness exits with an error if the key
-          # is missing. See plugins/koto-skills/eval.sh for cost details.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           export PATH="$PWD:$PATH"
