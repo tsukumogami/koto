@@ -43,8 +43,8 @@ rationale: |
 | _~~Documents a structured manual test plan covering plugin install, skill invocation, workflow loop, Stop hook behavior, and failure modes. Run before releases that change plugin content.~~_ | | |
 | ~~[#39: docs(plugin): add custom skill authoring guide](https://github.com/tsukumogami/koto/issues/39)~~ | [#35](https://github.com/tsukumogami/koto/issues/35), [#36](https://github.com/tsukumogami/koto/issues/36), [#37](https://github.com/tsukumogami/koto/issues/37) | simple |
 | _~~Writes the guide for creating custom koto workflow skills, covering SKILL.md structure, template locality, contributing to the plugin, and testing with CI and evals. Uses hello-koto as the reference implementation.~~_ | | |
-| [#40: feat(plugin): add cross-platform agent files](https://github.com/tsukumogami/koto/issues/40) | [#35](https://github.com/tsukumogami/koto/issues/35) | simple |
-| _Creates AGENTS.md for Codex/Windsurf and .cursor/rules/koto.mdc for older Cursor versions. Translates the hello-koto SKILL.md content into each platform's expected format._ | | |
+| ~~[#40: feat(plugin): add cross-platform agent files](https://github.com/tsukumogami/koto/issues/40)~~ | [#35](https://github.com/tsukumogami/koto/issues/35) | simple |
+| _~~Creates AGENTS.md for Codex/Windsurf and .cursor/rules/koto.mdc for older Cursor versions. Translates the hello-koto SKILL.md content into each platform's expected format.~~_ | | |
 
 ### Dependency Graph
 
@@ -71,8 +71,7 @@ graph LR
     classDef needsDesign fill:#e1bee7
     classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
 
-    class I35,I36,I37,I38,I39 done
-    class I40 ready
+    class I35,I36,I37,I38,I39,I40 done
 ```
 
 **Legend**: Green = done, Blue = ready, Yellow = blocked, Purple = needs-design, Orange = tracks-design

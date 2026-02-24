@@ -3,7 +3,7 @@
   "design_doc": "docs/designs/DESIGN-koto-agent-integration.md",
   "branch": "docs/koto-agent-integration",
   "pr_number": 34,
-  "integrity_hash": "sha256:eeb2eab3e5c4a86de8e339e833f8efcc28e1d182088b127734d38a310eb389da",
+  "integrity_hash": "sha256:f465d8dfa7599377053b288cd113300faa325330af39c8b55c543739662f699e",
   "issues": [
     {
       "number": 35,
@@ -206,7 +206,7 @@
     {
       "number": 40,
       "title": "feat(plugin): add cross-platform agent files",
-      "status": "scrutinized",
+      "status": "completed",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
       "issue_type": "code",
@@ -260,6 +260,30 @@
             "ac": "Content consistent with SKILL.md",
             "status": "implemented",
             "evidence": "All commands, outputs, paths match"
+          }
+        ]
+      },
+      "reviewer_results": {
+        "issue": 40,
+        "reviewers": [
+          {
+            "focus": "pragmatic",
+            "blocking_count": 0,
+            "advisory_count": 1,
+            "detail_file": "wip/research/implement-doc_review_pragmatic_issue40.md"
+          },
+          {
+            "focus": "architect",
+            "blocking_count": 0,
+            "advisory_count": 2,
+            "detail_file": "wip/research/implement-doc_review_architect_issue40.md"
+          },
+          {
+            "focus": "maintainer",
+            "blocking_count": 1,
+            "advisory_count": 2,
+            "detail_file": "wip/research/implement-doc_review_maintainer_issue40.md",
+            "blocking_resolved": "Fixed in commit e64dcfe: replaced relative template reference with concrete plugin path"
           }
         ]
       },

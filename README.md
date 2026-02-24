@@ -144,6 +144,7 @@ Skills use the [Agent Skills](https://agentskills.io) open standard, which means
 - [CLI usage guide](docs/guides/cli-usage.md) -- all subcommands with examples, including template authoring tools
 - [Go library guide](docs/guides/library-usage.md) -- using `pkg/engine` as an imported package
 - [Error code reference](docs/reference/error-codes.md) -- structured error codes and handling
+- [Custom skill authoring](docs/guides/custom-skill-authoring.md) -- creating workflow skills for AI agents
 
 ## License
 
