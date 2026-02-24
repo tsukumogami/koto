@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 problem: |
   koto v0.1.0 has a working engine, but no AI agent uses it because nothing connects the
   binary to the agent's context. The agent skill is the natural integration unit -- it bundles
@@ -25,7 +25,57 @@ rationale: |
 
 ## Status
 
-**Accepted**
+**Planned**
+
+## Implementation Issues
+
+### Milestone: [koto Agent Integration](https://github.com/tsukumogami/koto/milestone/5)
+
+| Issue | Dependencies | Tier |
+|-------|--------------|------|
+| [#35: feat(plugin): add koto-skills plugin with hello-koto skill](https://github.com/tsukumogami/koto/issues/35) | None | testable |
+| _Creates the marketplace manifest, plugin structure, Stop hook, and hello-koto skill. Establishes the file layout that all downstream issues build on and answers the template locality question._ | | |
+| [#36: ci(plugin): add template and hook validation workflow](https://github.com/tsukumogami/koto/issues/36) | [#35](https://github.com/tsukumogami/koto/issues/35) | testable |
+| _Adds a GHA workflow that validates template compilation, hook behavior, and manifest schemas on PRs touching plugins/. Uses the koto binary built from the PR -- no external dependencies or API keys._ | | |
+| [#37: test(plugin): add prompt regression eval infrastructure](https://github.com/tsukumogami/koto/issues/37) | [#35](https://github.com/tsukumogami/koto/issues/35) | testable |
+| _Sets up a GHA eval harness that sends SKILL.md content to the Anthropic API and checks the model produces the expected koto command sequence. Catches behavioral regressions that structural validation misses._ | | |
+| [#38: docs(plugin): add manual test checklist for agent flow](https://github.com/tsukumogami/koto/issues/38) | [#35](https://github.com/tsukumogami/koto/issues/35) | simple |
+| _Documents a structured manual test plan covering plugin install, skill invocation, workflow loop, Stop hook behavior, and failure modes. Run before releases that change plugin content._ | | |
+| [#39: docs(plugin): add custom skill authoring guide](https://github.com/tsukumogami/koto/issues/39) | [#35](https://github.com/tsukumogami/koto/issues/35), [#36](https://github.com/tsukumogami/koto/issues/36), [#37](https://github.com/tsukumogami/koto/issues/37) | simple |
+| _Writes the guide for creating custom koto workflow skills, covering SKILL.md structure, template locality, contributing to the plugin, and testing with CI and evals. Uses hello-koto as the reference implementation._ | | |
+| [#40: feat(plugin): add cross-platform agent files](https://github.com/tsukumogami/koto/issues/40) | [#35](https://github.com/tsukumogami/koto/issues/35) | simple |
+| _Creates AGENTS.md for Codex/Windsurf and .cursor/rules/koto.mdc for older Cursor versions. Translates the hello-koto SKILL.md content into each platform's expected format._ | | |
+
+### Dependency Graph
+
+```mermaid
+graph LR
+    I35["#35: Plugin + hello-koto skill"]
+    I36["#36: CI validation workflow"]
+    I37["#37: Eval infrastructure"]
+    I38["#38: Manual test checklist"]
+    I39["#39: Skill authoring guide"]
+    I40["#40: Cross-platform files"]
+
+    I35 --> I36
+    I35 --> I37
+    I35 --> I38
+    I35 --> I40
+    I36 --> I39
+    I37 --> I39
+    I35 --> I39
+
+    classDef done fill:#c8e6c9
+    classDef ready fill:#bbdefb
+    classDef blocked fill:#fff9c4
+    classDef needsDesign fill:#e1bee7
+    classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
+
+    class I35 ready
+    class I36,I37,I38,I39,I40 blocked
+```
+
+**Legend**: Green = done, Blue = ready, Yellow = blocked, Purple = needs-design, Orange = tracks-design
 
 ## Context and Problem Statement
 
