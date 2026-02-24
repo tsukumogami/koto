@@ -30,8 +30,9 @@ For the hello-koto workflow:
 mkdir -p .koto/templates
 ```
 
-Then write the template file to `.koto/templates/hello-koto.md`. The template content
-is the `hello-koto.md` file distributed alongside this file.
+Then write the template file to `.koto/templates/hello-koto.md` with the content from
+`plugins/koto-skills/skills/hello-koto/hello-koto.md` in the koto-skills plugin. If the
+plugin isn't installed locally, find the template in the koto repository at that path.
 
 ## Execution Loop
 
