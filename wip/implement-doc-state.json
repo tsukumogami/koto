@@ -3,7 +3,7 @@
   "design_doc": "docs/designs/DESIGN-koto-agent-integration.md",
   "branch": "docs/koto-agent-integration",
   "pr_number": 34,
-  "integrity_hash": "sha256:0257a150eeb12ae84c7d88dd79f0a62255b2e02482a0b1f2d002a77a380e9bfc",
+  "integrity_hash": "sha256:91a0403605f3532cdd5d0d36b9b5154e185028d20f725ea8d40fbd1ac45a47ee",
   "issues": [
     {
       "number": 35,
@@ -69,7 +69,7 @@
     {
       "number": 36,
       "title": "ci(plugin): add template and hook validation workflow",
-      "status": "pushed",
+      "status": "completed",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
       "issue_type": "code",
@@ -120,16 +120,30 @@
     {
       "number": 37,
       "title": "test(plugin): add prompt regression eval infrastructure",
-      "status": "pending",
+      "status": "scrutinized",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "code",
       "dependencies": [
         35
       ],
-      "commits": [],
-      "agent_type": "",
-      "summary": null,
+      "commits": [
+        "b54d166"
+      ],
+      "agent_type": "coder",
+      "summary": {
+        "narrative": "",
+        "files_changed": [
+          ".github/workflows/eval-plugins.yml",
+          "plugins/koto-skills/eval.sh",
+          "plugins/koto-skills/evals/hello-koto/patterns.txt",
+          "plugins/koto-skills/evals/hello-koto/prompt.txt",
+          "plugins/koto-skills/evals/hello-koto/skill_path.txt"
+        ],
+        "tests_added": 0,
+        "key_decisions": "Shell script harness with curl (simpler than Go). File-based eval cases (new eval = new directory). Grep -P for Perl regex matching.",
+        "requirements_map": []
+      },
       "testable_scenarios": [
         "scenario-11",
         "scenario-12"
