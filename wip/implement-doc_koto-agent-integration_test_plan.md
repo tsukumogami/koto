@@ -16,7 +16,7 @@ Total scenarios: 14
 - `jq -e '.plugins | length > 0' .claude-plugin/marketplace.json`
 - `jq -e '.plugins[0].source == "./plugins/koto-skills"' .claude-plugin/marketplace.json`
 **Expected**: All jq assertions exit 0. The marketplace manifest exists at the repo root and contains the name "koto", owner "tsukumogami", and a plugins array with an entry pointing to `./plugins/koto-skills`.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -30,7 +30,7 @@ Total scenarios: 14
 - `jq -e '.skills | length > 0' plugins/koto-skills/.claude-plugin/plugin.json`
 - `jq -e '.skills[0] | contains("hello-koto")' plugins/koto-skills/.claude-plugin/plugin.json`
 **Expected**: All jq assertions exit 0. The plugin manifest has name "koto-skills", version "0.1.0", and a skills array referencing the hello-koto skill directory.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -44,7 +44,7 @@ Total scenarios: 14
 - `koto init --template plugins/koto-skills/skills/hello-koto/hello-koto.md --name hooktest --var SPIRIT_NAME=TestSpirit`
 - `HOOK_OUTPUT=$(eval "$(jq -r '.hooks.Stop[0].command' plugins/koto-skills/hooks.json)" 2>&1); echo "$HOOK_OUTPUT"`
 **Expected**: The hooks.json is valid JSON with a Stop hook of type "command". After starting a workflow, running the hook command produces output containing "Active koto workflow detected".
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -55,7 +55,7 @@ Total scenarios: 14
 - `rm -f wip/koto-hooktest.state.json`
 - `HOOK_OUTPUT=$(eval "$(jq -r '.hooks.Stop[0].command' plugins/koto-skills/hooks.json)" 2>&1); test -z "$HOOK_OUTPUT"`
 **Expected**: With no active workflows, the Stop hook command produces no output and does not emit any error messages. The exit code of the overall hook expression may be non-zero (grep finds no match), but no text is written to stdout or stderr.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -71,7 +71,7 @@ Total scenarios: 14
 - `jq -e '.states.awakening.gates.greeting_exists.type == "command"' /tmp/hello-koto-compiled.json`
 - `jq -e '.states.awakening.directive | contains("{{SPIRIT_NAME}}")' /tmp/hello-koto-compiled.json`
 **Expected**: The template compiles with exit code 0. The compiled JSON has initial_state "awakening", two states (awakening with transition to eternal, eternal as terminal), a required SPIRIT_NAME variable, a command gate on awakening, and the directive contains the `{{SPIRIT_NAME}}` interpolation marker.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -84,7 +84,7 @@ Total scenarios: 14
 - `sed -n '2,/^---$/p' plugins/koto-skills/skills/hello-koto/SKILL.md | grep -q 'name:.*hello-koto'`
 - `sed -n '2,/^---$/p' plugins/koto-skills/skills/hello-koto/SKILL.md | grep -q 'description:'`
 **Expected**: The SKILL.md file exists, starts with YAML frontmatter delimiters, and the frontmatter contains a `name` field with value "hello-koto" and a `description` field.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -100,7 +100,7 @@ Total scenarios: 14
 - `DONE_OUT=$(koto next); echo "$DONE_OUT" | jq -e '.action == "done"'`
 - `rm -f wip/koto-hello.state.json wip/spirit-greeting.txt`
 **Expected**: The full init/next/execute/transition/done loop completes. Init returns state "awakening". Next returns a directive containing "Hasami" (variable interpolation works). Transition to "eternal" succeeds after the greeting file is created (command gate passes). Next on the terminal state returns action "done".
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -113,7 +113,7 @@ Total scenarios: 14
 - `koto transition eternal 2>&1; echo "EXIT=$?"`
 - `rm -f wip/koto-gatetest.state.json`
 **Expected**: The transition command fails with a non-zero exit code because `wip/spirit-greeting.txt` does not exist and the command gate (`test -f wip/spirit-greeting.txt`) fails. This confirms gate enforcement works correctly.
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -202,6 +202,6 @@ Total scenarios: 14
 - Stop the Claude Code session mid-workflow (before transition) and verify the Stop hook outputs "Active koto workflow detected"
 - Resume the session and verify the agent can continue the workflow
 **Expected**: The full agent-driven flow works end to end through the Claude Code plugin system. The plugin installs from marketplace, the skill is discoverable, the agent follows SKILL.md instructions to call koto correctly, variable interpolation works, the command gate enforces file creation, and the workflow completes. The Stop hook fires on session stop when a workflow is active. This scenario also validates the template locality question: whether the agent can resolve the template path from the plugin directory or must copy it to a project-local path.
-**Status**: pending
+**Status**: skipped (manual environment required)
 
 ---

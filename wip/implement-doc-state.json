@@ -3,19 +3,33 @@
   "design_doc": "docs/designs/DESIGN-koto-agent-integration.md",
   "branch": "docs/koto-agent-integration",
   "pr_number": 34,
-  "integrity_hash": "sha256:04d0f8f8e8af2f373e8914592d040a2470a9b090b2e3b71c20c2048fb9341a56",
+  "integrity_hash": "sha256:9662fba09518f83f59bb5e14fae32e90ea7d5d045eb57b39896b30c21e72acf3",
   "issues": [
     {
       "number": 35,
       "title": "feat(plugin): add koto-skills plugin with hello-koto skill",
-      "status": "pending",
+      "status": "scrutinized",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "code",
       "dependencies": [],
-      "commits": [],
-      "agent_type": "",
-      "summary": null,
+      "commits": [
+        "5b4c244"
+      ],
+      "agent_type": "coder",
+      "summary": {
+        "narrative": "",
+        "files_changed": [
+          ".claude-plugin/marketplace.json",
+          "plugins/koto-skills/.claude-plugin/plugin.json",
+          "plugins/koto-skills/hooks.json",
+          "plugins/koto-skills/skills/hello-koto/SKILL.md",
+          "plugins/koto-skills/skills/hello-koto/hello-koto.md"
+        ],
+        "tests_added": 0,
+        "key_decisions": "Used source compiler format (YAML frontmatter + markdown body with ## STATE: headings). Template compiles cleanly. Template locality addressed with both direct plugin path and fallback copy to .koto/templates/.",
+        "requirements_map": []
+      },
       "testable_scenarios": [
         "scenario-1",
         "scenario-2",
