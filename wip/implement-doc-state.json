@@ -3,7 +3,7 @@
   "design_doc": "docs/designs/DESIGN-koto-agent-integration.md",
   "branch": "docs/koto-agent-integration",
   "pr_number": 34,
-  "integrity_hash": "sha256:668d6fa97542a33de33680cf1b90888e42685ba2543165c93d455029efc71ecc",
+  "integrity_hash": "sha256:a70a325a39a99f99b90f08835bda611618f9152c8c54a8c672ac5e8469cdf10e",
   "issues": [
     {
       "number": 35,
@@ -172,7 +172,7 @@
     {
       "number": 38,
       "title": "docs(plugin): add manual test checklist for agent flow",
-      "status": "in_progress",
+      "status": "completed",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
       "issue_type": "task",
@@ -189,10 +189,10 @@
     {
       "number": 39,
       "title": "docs(plugin): add custom skill authoring guide",
-      "status": "pending",
+      "status": "completed",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "task",
       "dependencies": [
         35,
         36,
