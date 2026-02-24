@@ -3,7 +3,7 @@
   "design_doc": "docs/designs/DESIGN-koto-agent-integration.md",
   "branch": "docs/koto-agent-integration",
   "pr_number": 34,
-  "integrity_hash": "sha256:a70a325a39a99f99b90f08835bda611618f9152c8c54a8c672ac5e8469cdf10e",
+  "integrity_hash": "sha256:eeb2eab3e5c4a86de8e339e833f8efcc28e1d182088b127734d38a310eb389da",
   "issues": [
     {
       "number": 35,
@@ -206,16 +206,63 @@
     {
       "number": 40,
       "title": "feat(plugin): add cross-platform agent files",
-      "status": "pending",
+      "status": "scrutinized",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "code",
       "dependencies": [
         35
       ],
-      "commits": [],
-      "agent_type": "",
-      "summary": null,
+      "commits": [
+        "3ada46b"
+      ],
+      "agent_type": "coder",
+      "summary": {
+        "narrative": "",
+        "files_changed": [
+          "plugins/koto-skills/AGENTS.md",
+          "plugins/koto-skills/.cursor/rules/koto.mdc"
+        ],
+        "tests_added": 0,
+        "key_decisions": "Placed both files under plugins/koto-skills/ so they ship with the plugin. AGENTS.md has no YAML frontmatter (Codex/Windsurf convention). The .mdc file uses Cursor expected frontmatter. Both include placement guidance.",
+        "requirements_map": [
+          {
+            "ac": "AGENTS.md exists",
+            "status": "implemented",
+            "evidence": "plugins/koto-skills/AGENTS.md"
+          },
+          {
+            "ac": ".cursor/rules/koto.mdc exists",
+            "status": "implemented",
+            "evidence": "plugins/koto-skills/.cursor/rules/koto.mdc"
+          },
+          {
+            "ac": "Both cover same core content",
+            "status": "implemented",
+            "evidence": "Both contain prerequisites, execution loop, error handling, resume"
+          },
+          {
+            "ac": "AGENTS.md follows conventions",
+            "status": "implemented",
+            "evidence": "Pure markdown, no YAML frontmatter"
+          },
+          {
+            "ac": ".mdc follows Cursor conventions",
+            "status": "implemented",
+            "evidence": "YAML frontmatter with description, globs, alwaysApply"
+          },
+          {
+            "ac": "Placement guidance in headers",
+            "status": "implemented",
+            "evidence": "Both have blockquote placement notes"
+          },
+          {
+            "ac": "Content consistent with SKILL.md",
+            "status": "implemented",
+            "evidence": "All commands, outputs, paths match"
+          }
+        ]
+      },
       "testable_scenarios": []
     }
   ],

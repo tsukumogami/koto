@@ -1,0 +1,24 @@
+{
+  "issue": 40,
+  "reviewers": [
+    {
+      "focus": "pragmatic",
+      "blocking_count": 0,
+      "advisory_count": 1,
+      "detail_file": "wip/research/implement-doc_review_pragmatic_issue40.md"
+    },
+    {
+      "focus": "architect",
+      "blocking_count": 0,
+      "advisory_count": 2,
+      "detail_file": "wip/research/implement-doc_review_architect_issue40.md"
+    },
+    {
+      "focus": "maintainer",
+      "blocking_count": 1,
+      "advisory_count": 2,
+      "detail_file": "wip/research/implement-doc_review_maintainer_issue40.md",
+      "blocking_resolved": "Fixed in commit e64dcfe: replaced relative template reference with concrete plugin path"
+    }
+  ]
+}
