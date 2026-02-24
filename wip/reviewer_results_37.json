@@ -1,8 +1,0 @@
-{
-  "issue": 37,
-  "reviewers": [
-    { "focus": "pragmatic", "blocking_count": 0, "advisory_count": 3 },
-    { "focus": "architect", "blocking_count": 0, "advisory_count": 2 },
-    { "focus": "maintainer", "blocking_count": 0, "advisory_count": 3 }
-  ]
-}
