@@ -18,21 +18,20 @@ and done detection.
 
 ## Template Setup
 
-The hello-koto template is bundled with this skill. Determine its absolute path:
+The hello-koto template (`hello-koto.md`) is in the same directory as this skill file.
+Before initializing a workflow, ensure the template is at a stable project-local path:
 
-```
-TEMPLATE_DIR="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)"
-```
-
-If the template path cannot be resolved from the plugin directory, copy it to a
-project-local path before initializing:
+1. Check if `.koto/templates/hello-koto.md` already exists in the project.
+2. If not, create it by copying the template content from this skill's directory:
 
 ```bash
 mkdir -p .koto/templates
-cp <plugin-dir>/skills/hello-koto/hello-koto.md .koto/templates/hello-koto.md
 ```
 
-Use whichever path is stable for the `--template` flag below.
+Then write the template file to `.koto/templates/hello-koto.md` with the content from
+`hello-koto.md` (the file alongside this SKILL.md).
+
+Use `.koto/templates/hello-koto.md` as the `--template` path in all koto commands below.
 
 ## Workflow
 
@@ -48,7 +47,7 @@ The user provides a `<name>` argument. The workflow has two states:
 ### 1. Initialize the workflow
 
 ```bash
-koto init --template <path>/hello-koto.md --name hello --var SPIRIT_NAME=<name>
+koto init --template .koto/templates/hello-koto.md --name hello --var SPIRIT_NAME=<name>
 ```
 
 Returns `{"state":"awakening"}`. The template is compiled and cached on first init.
