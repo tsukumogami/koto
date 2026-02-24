@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 problem: |
   koto v0.1.0 has a working engine, but no AI agent uses it because nothing connects the
   binary to the agent's context. The agent skill is the natural integration unit -- it bundles
@@ -25,7 +25,7 @@ rationale: |
 
 ## Status
 
-**Proposed**
+**Accepted**
 
 ## Context and Problem Statement
 
