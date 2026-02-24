@@ -3,7 +3,7 @@
   "design_doc": "docs/designs/DESIGN-koto-agent-integration.md",
   "branch": "docs/koto-agent-integration",
   "pr_number": 34,
-  "integrity_hash": "sha256:cfe2630d9363c7ef216e7f2c26a09a3536c3390168ea8bf62c172caf8eb4cd0b",
+  "integrity_hash": "sha256:0257a150eeb12ae84c7d88dd79f0a62255b2e02482a0b1f2d002a77a380e9bfc",
   "issues": [
     {
       "number": 35,
@@ -69,7 +69,7 @@
     {
       "number": 36,
       "title": "ci(plugin): add template and hook validation workflow",
-      "status": "scrutinized",
+      "status": "pushed",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
       "issue_type": "code",
@@ -88,6 +88,29 @@
         "tests_added": 0,
         "key_decisions": "Followed existing validate.yml pattern with draft PR skip. Three separate jobs (template, hook, schema) plus rollup. Hook test creates mock state file matching discover package naming.",
         "requirements_map": []
+      },
+      "reviewer_results": {
+        "issue": 36,
+        "reviewers": [
+          {
+            "focus": "pragmatic",
+            "blocking_count": 0,
+            "advisory_count": 2,
+            "detail_file": "wip/research/implement-doc_review_pragmatic_issue36.md"
+          },
+          {
+            "focus": "architect",
+            "blocking_count": 0,
+            "advisory_count": 4,
+            "detail_file": "wip/research/implement-doc_review_architect_issue36.md"
+          },
+          {
+            "focus": "maintainer",
+            "blocking_count": 0,
+            "advisory_count": 6,
+            "detail_file": "wip/research/implement-doc_review_maintainer_issue36.md"
+          }
+        ]
       },
       "testable_scenarios": [
         "scenario-9",

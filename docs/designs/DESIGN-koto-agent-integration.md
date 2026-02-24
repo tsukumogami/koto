@@ -35,8 +35,8 @@ rationale: |
 |-------|--------------|------|
 | ~~[#35: feat(plugin): add koto-skills plugin with hello-koto skill](https://github.com/tsukumogami/koto/issues/35)~~ | None | testable |
 | _~~Creates the marketplace manifest, plugin structure, Stop hook, and hello-koto skill. Establishes the file layout that all downstream issues build on and answers the template locality question.~~_ | | |
-| [#36: ci(plugin): add template and hook validation workflow](https://github.com/tsukumogami/koto/issues/36) | [#35](https://github.com/tsukumogami/koto/issues/35) | testable |
-| _Adds a GHA workflow that validates template compilation, hook behavior, and manifest schemas on PRs touching plugins/. Uses the koto binary built from the PR -- no external dependencies or API keys._ | | |
+| ~~[#36: ci(plugin): add template and hook validation workflow](https://github.com/tsukumogami/koto/issues/36)~~ | [#35](https://github.com/tsukumogami/koto/issues/35) | testable |
+| _~~Adds a GHA workflow that validates template compilation, hook behavior, and manifest schemas on PRs touching plugins/. Uses the koto binary built from the PR -- no external dependencies or API keys.~~_ | | |
 | [#37: test(plugin): add prompt regression eval infrastructure](https://github.com/tsukumogami/koto/issues/37) | [#35](https://github.com/tsukumogami/koto/issues/35) | testable |
 | _Sets up a GHA eval harness that sends SKILL.md content to the Anthropic API and checks the model produces the expected koto command sequence. Catches behavioral regressions that structural validation misses._ | | |
 | [#38: docs(plugin): add manual test checklist for agent flow](https://github.com/tsukumogami/koto/issues/38) | [#35](https://github.com/tsukumogami/koto/issues/35) | simple |
@@ -71,8 +71,8 @@ graph LR
     classDef needsDesign fill:#e1bee7
     classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
 
-    class I35 done
-    class I36,I37,I38,I40 ready
+    class I35,I36 done
+    class I37,I38,I40 ready
     class I39 blocked
 ```
 
