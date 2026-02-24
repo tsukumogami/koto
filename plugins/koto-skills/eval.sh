@@ -22,8 +22,8 @@
 # plugins/ with 5 eval cases costs ~$0.05-0.15 per run.
 #
 # Exit codes:
-#   0 -- all evals passed
-#   1 -- one or more evals failed or configuration error
+#   0 -- all evals passed (or skipped due to missing API key)
+#   1 -- one or more evals failed
 
 set -euo pipefail
 
@@ -39,8 +39,9 @@ API_URL="https://api.anthropic.com/v1/messages"
 # --- Validation ---
 
 if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-    echo "ERROR: ANTHROPIC_API_KEY environment variable is required"
-    exit 1
+    echo "SKIP: ANTHROPIC_API_KEY not set -- skipping prompt evals"
+    echo "Set the ANTHROPIC_API_KEY environment variable to run evals."
+    exit 0
 fi
 
 # --- Helpers ---
