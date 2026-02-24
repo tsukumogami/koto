@@ -1,0 +1,11 @@
+{
+  "name": "koto",
+  "owner": { "name": "tsukumogami" },
+  "plugins": [
+    {
+      "name": "koto-skills",
+      "source": "./plugins/koto-skills",
+      "description": "Workflow skills for koto"
+    }
+  ]
+}

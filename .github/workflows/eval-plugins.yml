@@ -1,0 +1,44 @@
+name: eval-plugins
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - 'plugins/**'
+
+jobs:
+  prompt-eval:
+    name: Prompt Regression Eval
+    if: ${{ github.event.pull_request.draft != true && secrets.ANTHROPIC_API_KEY != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: go mod download
+
+      - name: Build koto
+        run: go build -o ./koto ./cmd/koto/
+
+      - name: Run prompt evals
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          export PATH="$PWD:$PATH"
+          bash plugins/koto-skills/eval.sh
+
+  eval-plugins:
+    name: eval-plugins
+    needs: [prompt-eval]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          if [ "${{ needs.prompt-eval.result }}" = "failure" ]; then
+            exit 1
+          fi

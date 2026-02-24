@@ -1,0 +1,1 @@
+plugins/koto-skills/skills/hello-koto/SKILL.md

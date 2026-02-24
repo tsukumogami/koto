@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "koto workflows 2>/dev/null | grep -q '\"path\"' && echo 'Active koto workflow detected. Run koto next to continue.'"
+      }
+    ]
+  }
+}

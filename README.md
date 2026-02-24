@@ -116,11 +116,35 @@ Returns the complete state as JSON, including workflow metadata, variables, and 
 
 **Template integrity**: The template's SHA-256 hash is locked at init time. If someone modifies the template mid-workflow, every operation fails with `template_mismatch`. To change the template, cancel and restart.
 
+## Agent integration
+
+AI coding agents can run koto workflows through the Claude Code plugin. Install it with two commands:
+
+```
+/plugin marketplace add tsukumogami/koto
+/plugin install koto-skills@koto
+```
+
+The plugin ships with **hello-koto**, a minimal two-state skill that walks through the full loop: template setup, variable interpolation, command gates, and state transitions. Run `/hello-koto Hasami` to try it.
+
+Once a skill is installed, the agent follows a simple cycle:
+
+1. `koto init` -- start the workflow from a template
+2. `koto next` -- get the current directive
+3. Execute the work described in the directive
+4. `koto transition <state>` -- advance to the next state
+5. Repeat from step 2 until `koto next` returns `done`
+
+The plugin also includes a Stop hook that detects active workflows when a session ends, so the agent can resume where it left off.
+
+Skills use the [Agent Skills](https://agentskills.io) open standard, which means they work across Claude Code, Codex, Cursor, Windsurf, and other platforms that support it. For project-specific workflows, write a SKILL.md alongside your template in `.claude/skills/<name>/` and commit both to version control.
+
 ## Documentation
 
 - [CLI usage guide](docs/guides/cli-usage.md) -- all subcommands with examples, including template authoring tools
 - [Go library guide](docs/guides/library-usage.md) -- using `pkg/engine` as an imported package
 - [Error code reference](docs/reference/error-codes.md) -- structured error codes and handling
+- [Custom skill authoring](docs/guides/custom-skill-authoring.md) -- creating workflow skills for AI agents
 
 ## License
 

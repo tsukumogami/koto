@@ -1,0 +1,9 @@
+# Expected koto command patterns in the model response.
+# Each non-empty, non-comment line is a Perl-compatible regex (grep -P).
+# All patterns must match for the eval to pass.
+
+# The model should call koto init with the hello-koto template path.
+koto init\b.*--template\b.*hello-koto
+
+# The model should call koto next to get the directive.
+koto next
