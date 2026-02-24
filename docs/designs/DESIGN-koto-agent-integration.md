@@ -342,9 +342,9 @@ Set up the plugin and marketplace structure in the koto repo, plus a minimal ski
 - **`.claude-plugin/marketplace.json`** at the repo root
 - **`plugins/koto-skills/.claude-plugin/plugin.json`** -- plugin manifest
 - **`plugins/koto-skills/hooks.json`** -- Stop hook
-- **`plugins/koto-skills/skills/quick-task/SKILL.md`** -- a minimal skill with a bare-bones template (two or three states, one `command` gate). Just enough to exercise init, next, transition, and done.
+- **`plugins/koto-skills/skills/hello/SKILL.md`** -- a hello-world skill. The template has one state whose directive tells the agent to say "hi" back. No gates, no evidence, no variables. Just enough to exercise: plugin installs, skill loads, agent calls `koto init`, calls `koto next`, gets a directive, calls `koto transition` to the terminal state, done.
 
-Validate manually: `/plugin marketplace add tsukumogami/koto`, `/plugin install koto-skills@koto`, invoke the skill, run through the workflow.
+Validate manually: `/plugin marketplace add tsukumogami/koto`, `/plugin install koto-skills@koto`, invoke the skill, confirm the round-trip works. Replace with quick-task once the plumbing is proven.
 
 ### Phase 2: CI Pipeline
 
