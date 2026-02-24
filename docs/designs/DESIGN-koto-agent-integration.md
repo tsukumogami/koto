@@ -361,13 +361,40 @@ Write the guide for custom skill authoring:
 - Cross-platform formats (AGENTS.md, Cursor rules)
 - How to test a skill end-to-end
 
-### Phase 4: Cross-Platform Files (Optional)
+### Phase 4: Testing
+
+Build three levels of testing:
+
+**CI tests (GHA, no API keys):**
+- Schema validation: lint `plugin.json` and `marketplace.json` against Claude Code's expected structure
+- Template compilation: run `koto template compile` on every template in `plugins/koto-skills/skills/` and verify clean output
+- Hook smoke test: create a state file in `wip/`, run the Stop hook command, verify it outputs the reminder; remove the state file, verify silence
+- SKILL.md structure: validate frontmatter (name, description fields present), check required sections exist (Prerequisites, Execution Loop, Evidence Keys, Error Handling)
+- Template consistency: if the template exists both inline in SKILL.md and as a standalone file, verify they match byte-for-byte
+
+**Manual test plan (run before each skill release):**
+- Install plugin from the koto repo marketplace in a fresh project
+- Invoke the skill, verify the agent writes the template to `.koto/templates/`
+- Run the full workflow loop: init, next, execute directive, transition, repeat until done
+- Verify `koto workflows` shows the active workflow during execution
+- End a session mid-workflow, start a new session, verify the Stop hook triggers and the agent resumes
+- Test with a project that already has `.koto/templates/` populated (skip copy path)
+- Test with koto not on PATH: verify the hook fails silently, no error messages leak to the agent
+
+**Evals (GHA with API key secret):**
+- Prompt regression tests: given the SKILL.md content and a simulated user request (e.g., "implement a quick task: add input validation to the login form"), verify the model produces the correct koto command sequence (init with right flags, next, transition with right target)
+- Test that SKILL.md changes don't break the agent's ability to call koto correctly
+- Uses the Anthropic API directly, not a full Claude Code session -- cheaper and faster than end-to-end
+- Run on PRs that modify files under `plugins/` to catch regressions before merge
+- Requires `ANTHROPIC_API_KEY` as a GHA secret; cost is per-eval-run (a few cents per test case)
+
+### Phase 5: Cross-Platform Files (Optional)
 
 Create the alternative format files:
 
 - AGENTS.md template for Codex/Windsurf
 - `.cursor/rules/koto.mdc` for older Cursor versions
-- Include in the plugin repo or publish separately
+- Include under `plugins/` or publish separately
 
 ## Security Considerations
 
