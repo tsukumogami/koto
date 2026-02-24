@@ -142,6 +142,14 @@ Building distribution into koto (search paths, `go:embed`, registries, generate 
 
 koto's compile-and-cache path already handles the engine side. `koto init --template <path>` compiles the template, caches the result keyed by source hash, and records the absolute path in the state file. Every subsequent `koto next` re-reads and re-verifies the template. No modifications needed.
 
+### Plugin Layering: Core + Workflow Plugins
+
+A natural structure would be a `koto-core` plugin with shared building blocks (Stop hook, koto CLI reference, common error handling) and separate workflow plugins (`koto-quick-task`, `koto-feature-dev`) that depend on it. Each workflow plugin would carry only its SKILL.md and template, inheriting the hook and CLI docs from core.
+
+Claude Code's plugin system does not support inter-plugin dependencies. There's no `dependencies` field in the manifest schema, no automatic resolution, and plugins can't reference files outside their own directory. This is tracked as a feature request (anthropics/claude-code#9444). Until dependency support ships, each plugin must be self-contained -- duplicating the Stop hook and CLI reference across workflow plugins.
+
+For now, we bundle everything into a single `koto-skills` plugin. The duplication cost is low (the hook is one JSON entry, the CLI reference is a few paragraphs). If plugin dependencies are added later, we can split into core + workflow plugins without changing anything about how users interact with koto.
+
 ### Trade-offs Accepted
 
 - **No built-in templates.** koto doesn't ship with templates embedded in the binary. Users need to install the plugin or copy skill files into their project. Acceptable because the plugin install is a single command, and project-scoped skills are just files committed to git.
