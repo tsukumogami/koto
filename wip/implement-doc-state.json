@@ -3,7 +3,7 @@
   "design_doc": "docs/designs/DESIGN-koto-agent-integration.md",
   "branch": "docs/koto-agent-integration",
   "pr_number": 34,
-  "integrity_hash": "sha256:91a0403605f3532cdd5d0d36b9b5154e185028d20f725ea8d40fbd1ac45a47ee",
+  "integrity_hash": "sha256:668d6fa97542a33de33680cf1b90888e42685ba2543165c93d455029efc71ecc",
   "issues": [
     {
       "number": 35,
@@ -120,7 +120,7 @@
     {
       "number": 37,
       "title": "test(plugin): add prompt regression eval infrastructure",
-      "status": "scrutinized",
+      "status": "completed",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
       "issue_type": "code",
@@ -144,6 +144,26 @@
         "key_decisions": "Shell script harness with curl (simpler than Go). File-based eval cases (new eval = new directory). Grep -P for Perl regex matching.",
         "requirements_map": []
       },
+      "reviewer_results": {
+        "issue": 37,
+        "reviewers": [
+          {
+            "focus": "pragmatic",
+            "blocking_count": 0,
+            "advisory_count": 3
+          },
+          {
+            "focus": "architect",
+            "blocking_count": 0,
+            "advisory_count": 2
+          },
+          {
+            "focus": "maintainer",
+            "blocking_count": 0,
+            "advisory_count": 3
+          }
+        ]
+      },
       "testable_scenarios": [
         "scenario-11",
         "scenario-12"
@@ -152,10 +172,10 @@
     {
       "number": 38,
       "title": "docs(plugin): add manual test checklist for agent flow",
-      "status": "pending",
+      "status": "in_progress",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "task",
       "dependencies": [
         35
       ],
