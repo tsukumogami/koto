@@ -333,62 +333,60 @@ For project-scoped skills, the author commits both files to `.claude/skills/<nam
 
 ## Implementation Approach
 
-### Phase 1: Plugin and Marketplace Structure
+The focus is proving the end-to-end flow works: plugin installs, skill loads, agent calls koto, workflow completes, tests catch regressions. The first skill and tests should be minimal -- just enough to validate the plumbing. Content quality improves iteratively once the infrastructure exists.
 
-Add the plugin and marketplace directories to the koto repo:
+### Phase 1: Plugin Infrastructure
+
+Set up the plugin and marketplace structure in the koto repo, plus a minimal skill that proves the flow:
 
 - **`.claude-plugin/marketplace.json`** at the repo root
-- **`plugins/koto-skills/`** with `plugin.json`, `hooks.json`, and skill directories
+- **`plugins/koto-skills/.claude-plugin/plugin.json`** -- plugin manifest
+- **`plugins/koto-skills/hooks.json`** -- Stop hook
+- **`plugins/koto-skills/skills/quick-task/SKILL.md`** -- a minimal skill with a bare-bones template (two or three states, one `command` gate). Just enough to exercise init, next, transition, and done.
 
-This is directory setup and JSON/markdown file creation. No Go code, no new repositories.
+Validate manually: `/plugin marketplace add tsukumogami/koto`, `/plugin install koto-skills@koto`, invoke the skill, run through the workflow.
 
-### Phase 2: Quick-Task Reference Skill
+### Phase 2: CI Pipeline
 
-Write the first reference skill for the quick-task workflow:
+Add a GHA workflow that runs on PRs touching `plugins/`:
 
-- Author the SKILL.md with koto CLI documentation, evidence keys, execution loop, and error handling
-- Include the quick-task template in the skill directory
-- Test the full flow: plugin install, skill invocation, template copy, koto init, workflow execution
-- Validate the Stop hook works correctly
+- **Template compilation**: run `koto template compile` on every template under `plugins/koto-skills/skills/`. Fail if any template has errors.
+- **Hook smoke test**: create a mock state file, run the hook command, assert output. Remove state file, assert silence.
+- **Schema validation**: check `plugin.json` and `marketplace.json` have required fields (name, version/owner, skills/plugins arrays).
 
-### Phase 3: Documentation
+This uses the koto binary (built from the same PR) and shell assertions. No API keys, no external dependencies.
 
-Write the guide for custom skill authoring:
+### Phase 3: Eval Infrastructure
+
+Set up prompt regression testing in GHA:
+
+- Add `ANTHROPIC_API_KEY` as a repo secret
+- Write a test harness that sends the SKILL.md content + a user prompt to the Anthropic API and checks the model's response contains the expected koto command sequence
+- First eval: given the quick-task SKILL.md and "implement a small task: add input validation", verify the model calls `koto init` with the right template path, then `koto next`
+- Runs on PRs that modify files under `plugins/`. A few cents per run.
+- The harness should be simple (a shell script or Go test calling the API) and easy to extend as skills are added
+
+### Phase 4: Manual Test Checklist
+
+Document a structured manual test plan for validating the full agent flow before releases:
+
+- Plugin install from marketplace in a fresh project
+- Skill invocation, template write to `.koto/templates/`, full workflow loop
+- Stop hook triggers resume on session restart
+- Hook fails silently when koto isn't on PATH (no error messages leak)
+
+This is a markdown checklist committed to the repo, not automation. Run it manually before tagging a release that changes plugin content.
+
+### Phase 5: Documentation
+
+Write the custom skill authoring guide once the infrastructure is validated:
 
 - How to structure a koto workflow skill (SKILL.md + template)
-- How to extract evidence keys and state descriptions from a template
 - How to handle template locality (project-scoped vs plugin-distributed)
-- Cross-platform formats (AGENTS.md, Cursor rules)
-- How to test a skill end-to-end
+- How to add a skill to the koto-skills plugin
+- How to test a skill (using the CI pipeline and eval harness)
 
-### Phase 4: Testing
-
-Build three levels of testing:
-
-**CI tests (GHA, no API keys):**
-- Schema validation: lint `plugin.json` and `marketplace.json` against Claude Code's expected structure
-- Template compilation: run `koto template compile` on every template in `plugins/koto-skills/skills/` and verify clean output
-- Hook smoke test: create a state file in `wip/`, run the Stop hook command, verify it outputs the reminder; remove the state file, verify silence
-- SKILL.md structure: validate frontmatter (name, description fields present), check required sections exist (Prerequisites, Execution Loop, Evidence Keys, Error Handling)
-- Template consistency: if the template exists both inline in SKILL.md and as a standalone file, verify they match byte-for-byte
-
-**Manual test plan (run before each skill release):**
-- Install plugin from the koto repo marketplace in a fresh project
-- Invoke the skill, verify the agent writes the template to `.koto/templates/`
-- Run the full workflow loop: init, next, execute directive, transition, repeat until done
-- Verify `koto workflows` shows the active workflow during execution
-- End a session mid-workflow, start a new session, verify the Stop hook triggers and the agent resumes
-- Test with a project that already has `.koto/templates/` populated (skip copy path)
-- Test with koto not on PATH: verify the hook fails silently, no error messages leak to the agent
-
-**Evals (GHA with API key secret):**
-- Prompt regression tests: given the SKILL.md content and a simulated user request (e.g., "implement a quick task: add input validation to the login form"), verify the model produces the correct koto command sequence (init with right flags, next, transition with right target)
-- Test that SKILL.md changes don't break the agent's ability to call koto correctly
-- Uses the Anthropic API directly, not a full Claude Code session -- cheaper and faster than end-to-end
-- Run on PRs that modify files under `plugins/` to catch regressions before merge
-- Requires `ANTHROPIC_API_KEY` as a GHA secret; cost is per-eval-run (a few cents per test case)
-
-### Phase 5: Cross-Platform Files (Optional)
+### Phase 6: Cross-Platform Files (Optional)
 
 Create the alternative format files:
 
