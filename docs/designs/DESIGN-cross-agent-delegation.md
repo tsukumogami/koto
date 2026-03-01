@@ -353,12 +353,10 @@ After the agent receives a directive with delegation metadata, it produces a pro
 #### Chosen: koto delegate run with stdin piping
 
 ```bash
-koto delegate run --prompt /tmp/prompt.txt
+koto delegate run --prompt-file /tmp/prompt.txt
 # or, read from stdin using dash convention
-echo "prompt text" | koto delegate run --prompt -
+echo "prompt text" | koto delegate run --prompt-file -
 ```
-
-The `--prompt` flag takes a file path (or `-` for stdin). The shorter name was chosen over `--prompt-file` because the primary consumers are agents, not humans, and the flag's only argument is always a path. The dash convention for stdin follows `cat`, `docker build`, and similar tools.
 
 `delegate run` supports the same `--state` and `--state-dir` flags as other state-dependent commands (`next`, `transition`, `query`, etc.), resolved via the existing `resolveStatePath()` function.
 
@@ -457,7 +455,7 @@ At `koto next` time, the controller matches state tags against config rules, che
 The full flow:
 1. `koto next` returns directive with `delegation: {target: "gemini", available: true}`
 2. Agent reads directive, gathers context, crafts a prompt for the delegate. The directive text should include guidance for prompt construction (what context to include, what format to request) since the template author knows what the delegate needs.
-3. `koto delegate run --prompt /tmp/prompt.txt`
+3. `koto delegate run --prompt-file /tmp/prompt.txt`
 4. koto invokes the delegate CLI (e.g., `gemini -p`) in the working directory, piping the prompt via stdin. The delegate can read/write files.
 5. koto returns `{response: "...", matched_tag: "deep-reasoning", exit_code: 0, success: true}` to the agent
 6. Agent uses the response and calls `koto transition` to advance
@@ -1059,7 +1057,7 @@ The SKILL.md delegation section should cover the branching logic agents need:
    - Name the files/packages to analyze (the delegate reads them from disk).
    - Specify the expected output format.
    - Ask the delegate to report via stdout, not by writing files.
-4. Run `koto delegate run --prompt /path/to/prompt.txt`.
+4. Run `koto delegate run --prompt-file /path/to/prompt.txt`.
 5. Use the response from the delegate to inform your next action.
 6. Run `koto transition` to advance the workflow.
 ```
