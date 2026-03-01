@@ -358,6 +358,10 @@ koto delegate run --prompt /tmp/prompt.txt
 echo "prompt text" | koto delegate run --prompt -
 ```
 
+The `--prompt` flag takes a file path (or `-` for stdin). The shorter name was chosen over `--prompt-file` because the primary consumers are agents, not humans, and the flag's only argument is always a path. The dash convention for stdin follows `cat`, `docker build`, and similar tools.
+
+`delegate run` supports the same `--state` and `--state-dir` flags as other state-dependent commands (`next`, `transition`, `query`, etc.), resolved via the existing `resolveStatePath()` function.
+
 The subcommand:
 1. Reads the current state from the state file
 2. Re-resolves the delegation target from tags + config (same logic as `Next()`)
@@ -373,10 +377,12 @@ The interface between koto and the delegate CLI is deliberately simple:
 |--------|----------|
 | **Input** | Raw prompt text piped to the delegate's stdin |
 | **Output** | Raw text captured from the delegate's stdout |
+| **Stderr** | Inherited from koto's process -- delegate diagnostic output goes to the terminal |
 | **Working directory** | Delegate runs in the same working directory as koto |
 | **Environment** | Delegate inherits koto's full environment |
 | **Filesystem access** | Read-write -- delegate can read and write files like any coding agent CLI |
 | **Permissions** | Same user permissions as koto (no elevation, no sandboxing) |
+| **Signals** | SIGINT/SIGTERM propagate to the delegate process (standard process group behavior) |
 | **Interaction model** | Synchronous, non-interactive: prompt in, response out, process exits |
 
 This matches how headless coding agent CLIs already work. `claude -p` and `gemini` both accept prompts via stdin, can read/write files in the working directory, and return responses via stdout. koto doesn't try to restrict or sandbox the delegate because the delegate is a coding agent -- restricting filesystem access would make it useless for code analysis tasks.
@@ -788,7 +794,10 @@ func Load() (*Config, error) {
         return &Config{}, nil
     }
     if userCfg == nil {
-        return projCfg, nil
+        // No user config means allow_project_config is false (default).
+        // Return empty config -- don't use raw project config, which would
+        // bypass the security boundary (project could define targets).
+        return &Config{}, nil
     }
     if projCfg == nil {
         return userCfg, nil
@@ -799,14 +808,22 @@ func Load() (*Config, error) {
 
 // loadFile returns (nil, nil) for missing files, (*Config, nil) for valid files,
 // and (nil, error) for files that exist but can't be parsed.
+// After loading, validate() checks invariants: command arrays must be non-empty,
+// user-config rule targets must reference defined targets (warn if not).
+// Unknown top-level YAML keys are treated as hard errors (use yaml.v3
+// Decoder with KnownFields(true) to catch typos like "delgation:").
 
-func merge(user, project *Config) *Config {
+func merge(user, project *Config) (*Config, []string) {
     result := *user
+    var warnings []string
 
     // Only merge project delegation if user opted in
     if user.Delegation != nil && user.Delegation.AllowProjectConfig &&
        project.Delegation != nil {
         merged := *user.Delegation
+        // Deep-copy the rules slice to avoid sharing the backing array
+        merged.Rules = make([]DelegationRule, len(user.Delegation.Rules))
+        copy(merged.Rules, user.Delegation.Rules)
         // Project targets are ignored -- only user config defines binaries
         // Project timeout is ignored -- only user config controls timeout
 
@@ -823,7 +840,7 @@ func merge(user, project *Config) *Config {
                 continue // user rule takes priority
             }
             if _, ok := user.Delegation.Targets[r.Target]; !ok {
-                fmt.Fprintf(os.Stderr, "koto: project config rule for tag %q references unknown target %q (not defined in user config), skipping\n", r.Tag, r.Target)
+                warnings = append(warnings, fmt.Sprintf("project config rule for tag %q references unknown target %q (not defined in user config), skipping", r.Tag, r.Target))
                 continue
             }
             merged.Rules = append(merged.Rules, r)
@@ -832,7 +849,7 @@ func merge(user, project *Config) *Config {
         result.Delegation = &merged
     }
 
-    return &result
+    return &result, warnings
 }
 ```
 
@@ -943,11 +960,11 @@ Analyze the codebase for: {{TASK}}
 
 Think carefully about what changes are needed and why.
 
-When delegating this step, include in the prompt:
-- All source files in the affected packages
-- The go.mod file for dependency context
-- Any test files for the affected packages
-- A clear statement of what analysis is expected
+When delegating this step, the delegate runs in the working directory and
+can read files directly. Structure the prompt as:
+- State which packages to analyze (the delegate reads them from disk)
+- Describe the analysis expected and the output format
+- Ask the delegate to report findings via stdout, not by writing files
 
 ## implement
 
@@ -992,6 +1009,7 @@ delegation:
 | `cmd/koto/main.go` | Load config at startup, pass to controller via `WithDelegation()` |
 | `cmd/koto/delegate.go` | New file: `koto delegate run` subcommand |
 | `plugins/koto-skills/skills/hello-koto/SKILL.md` | Document delegation flow and prompt construction guidance |
+| `docs/guides/custom-skill-authoring.md` | Add Delegation section for skill authors |
 | `docs/guides/delegation.md` | User guide: config, tags, delegate interface, delegation flow |
 
 ## Implementation Approach
@@ -1022,7 +1040,29 @@ Implement `koto delegate run`. Stdin piping to delegate CLI, stdout capture, tim
 
 ### Phase 5: Agent Skills and Documentation
 
-Update SKILL.md with delegation flow documentation. Write `docs/guides/delegation.md` user guide. Ship the research-and-implement reference template.
+Update SKILL.md with delegation flow documentation. Update `docs/guides/custom-skill-authoring.md` with a Delegation section. Write `docs/guides/delegation.md` user guide. Ship the research-and-implement reference template with a companion delegation-aware SKILL.md.
+
+The SKILL.md delegation section should cover the branching logic agents need:
+
+```markdown
+## Delegation
+
+### Execution (updated for delegation)
+
+1. Run `koto next` to get the current directive.
+2. Check the `delegation` field in the response:
+   - **If `delegation` is present and `available` is true**: proceed to step 3.
+   - **If `delegation.fallback` is true**: handle the step yourself (reduced scope).
+   - **If `delegation` is absent**: handle the step yourself (normal execution).
+3. Craft a prompt for the delegate:
+   - State the task clearly (the delegate has no prior context).
+   - Name the files/packages to analyze (the delegate reads them from disk).
+   - Specify the expected output format.
+   - Ask the delegate to report via stdout, not by writing files.
+4. Run `koto delegate run --prompt /path/to/prompt.txt`.
+5. Use the response from the delegate to inform your next action.
+6. Run `koto transition` to advance the workflow.
+```
 
 ## Security Considerations
 
