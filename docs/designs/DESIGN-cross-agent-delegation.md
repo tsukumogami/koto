@@ -11,12 +11,15 @@ decision: |
   Add an optional tags field (string array) to state declarations and a
   config system that maps tags to delegation targets. Tags use kebab-case
   and are pattern-validated, not enum-restricted -- the initial vocabulary
-  (deep-reasoning, large-context, security) is documented, not enforced by
-  schema. format_version stays at 1 since tags are additive and Go's
-  json.Unmarshal ignores unknown fields. A new pkg/config package loads
-  YAML from user and project levels. The controller resolves tags against
-  config at Next() time and includes DelegationInfo in the Directive output.
-  A koto delegate submit subcommand handles the actual CLI invocation.
+  (deep-reasoning, large-context, specialized-tooling) is documented, not
+  enforced by schema. format_version stays at 1 since tags are additive and
+  Go's json.Unmarshal ignores unknown fields. A new pkg/config package
+  loads YAML from user and project levels with separated targets and rules.
+  The controller resolves tags against config at Next() time and includes
+  DelegationInfo in the Directive output. A koto delegate run subcommand
+  handles CLI invocation with a defined interface contract: raw prompt via
+  stdin, raw text response via stdout, delegate runs read-write in the
+  working directory.
 rationale: |
   Keeping format_version at 1 preserves backwards compatibility -- old koto
   reads new templates without errors, just ignores the tags. Free-form tags
@@ -42,7 +45,7 @@ But workflow steps have different processing characteristics. A security audit n
 
 Coding agent CLIs now support headless invocation (`claude -p`, `gemini -p`), and developers often have access to multiple agent ecosystems. koto should let templates describe what a step needs and route it to the right tool based on the user's environment.
 
-This design covers the full delegation feature: state tags in the template format, a config system for routing rules, delegation resolution in the controller, a `koto delegate submit` subcommand for CLI invocation, and agent skill updates.
+This design covers the full delegation feature: state tags in the template format, a config system for routing rules, delegation resolution in the controller, a `koto delegate run` subcommand for CLI invocation, and agent skill updates.
 
 ### Scope
 
@@ -51,9 +54,10 @@ This design covers the full delegation feature: state tags in the template forma
 - Compiled template JSON schema update
 - Tag naming conventions and initial vocabulary
 - `pkg/config` package (user-level and project-level YAML config)
-- Delegation rules in config (tag-to-target mapping)
+- Delegation targets and routing rules in config
 - `DelegationInfo` in `controller.Directive` output
-- `koto delegate submit` subcommand
+- `koto delegate run` subcommand
+- Delegate interface contract (input/output format, access model)
 - Delegate CLI availability checking and invocation
 - Agent skill documentation (SKILL.md updates)
 
@@ -64,9 +68,11 @@ This design covers the full delegation feature: state tags in the template forma
 - Delegate response persistence (the orchestrating agent decides what to do with the response)
 - Multi-turn delegation (delegate asks clarifying questions back to the orchestrator)
 - Streaming delegate responses
-- Delegates that need tool access (file reading, command execution)
+- Sandboxing or restricting delegate filesystem access
 
-Delegation is a synchronous single exchange: one prompt in, one response out. The orchestrating agent crafts a self-contained prompt, koto pipes it to the delegate CLI, and the delegate returns a complete response. This boundary is intentional -- it keeps the delegation interface simple and stateless. Future designs can extend to multi-turn or streaming if needed.
+Delegation is a synchronous single exchange: one prompt in, one response out. The orchestrating agent crafts a self-contained prompt, koto pipes it to the delegate CLI, and the delegate returns a complete response via stdout. The delegate runs in the working directory with full user permissions -- it can read and write files like any coding agent CLI. This boundary is intentional: it keeps the delegation interface simple and matches how headless coding agent CLIs already work.
+
+**Single-exchange scope guide:** This model works well for focused analysis tasks with bounded context (review a function, analyze a package). It works adequately for broad analysis where relevant context fits in the delegate's window. It works poorly for investigative tasks requiring iteration (tracing bugs across a codebase). Template authors should scope tagged states accordingly.
 
 ## Decision Drivers
 
@@ -119,7 +125,9 @@ koto documents an initial vocabulary of recommended tags:
 |-----|---------|----------|
 | `deep-reasoning` | Step benefits from extended chain-of-thought reasoning | Security audits, architecture analysis, complex debugging |
 | `large-context` | Step needs a large context window (100K+ tokens) | Codebase-wide analysis, cross-file refactoring |
-| `security` | Step involves security-sensitive analysis | Vulnerability scanning, threat modeling |
+| `specialized-tooling` | Step benefits from domain-specific tools or capabilities | Static analysis, dependency scanning, specialized linting |
+
+Tags describe processing capabilities, not domains. A security audit needs `deep-reasoning` (the capability), not a `security` tag (the domain). The tag tells the config system what kind of processing the step needs; the directive text tells the delegate what domain to focus on.
 
 These are recommendations, not requirements. Template authors can use custom tags for project-specific needs. The vocabulary is documented in koto's user guide, not enforced by schema or code.
 
@@ -204,14 +212,14 @@ for name, sd := range ct.States {
 
 koto has no config infrastructure. The delegation feature needs config for routing rules, but the config system should be general-purpose so future features don't each invent their own.
 
-#### Chosen: pkg/config with YAML, two-level precedence
+#### Chosen: pkg/config with YAML, two-level precedence, separated targets and rules
 
 A new `pkg/config` package loads YAML from two locations:
 
-1. **User config:** `~/.koto/config.yaml` (applies to all projects)
+1. **User config:** `~/.koto/config.yaml` (applies to all projects). Config resolution uses `KOTO_HOME` if set (same as the cache package), falling back to `~/.koto/`.
 2. **Project config:** `.koto/config.yaml` in the working directory (project-specific overrides)
 
-Project config is merged on top of user config. For the delegation section, project rules are appended after user rules (not replaced), and the project can override `default`.
+The delegation config separates target definitions (what binary to run) from routing rules (which tags map where). This eliminates command duplication when multiple rules route to the same target, and makes the security boundary self-documenting: targets define binaries, rules define routing.
 
 ```go
 // pkg/config/config.go
@@ -220,51 +228,62 @@ type Config struct {
 }
 
 type DelegationConfig struct {
-    Rules   []DelegationRule `yaml:"rules"`
-    Default string           `yaml:"default"` // "self" or empty
+    AllowProjectConfig bool                      `yaml:"allow_project_config"`
+    Timeout            int                       `yaml:"timeout,omitempty"` // seconds
+    Targets            map[string]DelegateTarget `yaml:"targets"`
+    Rules              []DelegationRule           `yaml:"rules"`
+}
+
+type DelegateTarget struct {
+    Command []string `yaml:"command"` // e.g., ["gemini", "-p"]
 }
 
 type DelegationRule struct {
-    Tag        string   `yaml:"tag"`
-    DelegateTo string   `yaml:"delegate_to"`
-    Command    []string `yaml:"command"` // e.g., ["gemini", "-p"]
+    Tag    string `yaml:"tag"`
+    Target string `yaml:"target"`
 }
 ```
 
 Loading precedence:
-1. Load user config (if exists)
-2. Load project config (if exists)
-3. Merge: project delegation rules append after user rules; project `default` overrides user `default`
+1. Load user config (if it exists; if present but malformed YAML, return an error -- don't swallow parse failures)
+2. Load project config (if it exists; same error handling)
+3. Merge: project delegation rules append after user rules for tags not already covered by user rules; project targets are ignored
 4. If neither exists, `Config{}` is returned (zero value, no delegation)
 
-The CLI integrates config loading in its startup path. The controller receives the resolved `DelegationConfig` (or nil).
+The CLI integrates config loading in its startup path. The controller receives the resolved `DelegationConfig` (or nil). Unknown YAML keys produce a warning to stderr (catches typos like `delgation:`).
 
 **Project config trust:** Project-level config can override delegation routing. A cloned repo could ship `.koto/config.yaml` with unexpected rules. Two layers of protection:
 
 1. **Opt-in gate:** Project-level delegation rules only take effect when the user's config includes `allow_project_config: true`. Without this, koto ignores project-level delegation rules entirely.
 
-2. **No command override from project config.** Project-level rules can only set `tag` and `delegate_to` (target name mapping). The `command` field is ignored in project config -- only user-level config can define what binary a target name maps to. This prevents a cloned repo from specifying an arbitrary binary for koto to execute.
+2. **No target definitions from project config.** Project config can only add routing rules (`tag` -> `target` mapping). Target definitions (what binary to run) come exclusively from user config. This prevents a cloned repo from specifying an arbitrary binary for koto to execute. Project config also cannot override `timeout`.
 
 ```yaml
 # ~/.koto/config.yaml
 delegation:
   allow_project_config: true   # default: false
+  timeout: 300                 # seconds
+  targets:
+    gemini:
+      command: ["gemini", "-p"]
+    claude:
+      command: ["claude", "-p", "--model", "opus"]
   rules:
     - tag: deep-reasoning
-      delegate_to: gemini
-      command: ["gemini", "-p"]  # only honored in user config
+      target: gemini
 ```
 
 ```yaml
 # .koto/config.yaml (project level)
 delegation:
   rules:
-    - tag: security
-      delegate_to: gemini    # maps to user-defined command for "gemini"
-      # command field ignored here -- user config controls the binary
+    - tag: specialized-tooling
+      target: gemini    # maps to user-defined target "gemini"
+    # targets section ignored here -- user config controls binaries
+    # timeout ignored here -- user config controls timeout
 ```
 
-When merging, project rules that reference a `delegate_to` target not defined in user config are silently dropped (no matching command to execute).
+When merging, project rules that reference a target not defined in user config are dropped with a warning to stderr. Project rules for tags already covered by user rules are also dropped (user rules take priority explicitly, not via list ordering).
 
 #### Alternatives Considered
 
@@ -331,26 +350,48 @@ The default implementation uses `exec.LookPath`. Tests inject a stub. The contro
 
 After the agent receives a directive with delegation metadata, it produces a prompt and needs to hand it to koto for invocation. The question is the interface for this handoff.
 
-#### Chosen: koto delegate submit with stdin piping
+#### Chosen: koto delegate run with stdin piping
 
 ```bash
-koto delegate submit --prompt-file /tmp/prompt.txt
+koto delegate run --prompt /tmp/prompt.txt
 # or, read from stdin using dash convention
-echo "prompt text" | koto delegate submit --prompt-file -
+echo "prompt text" | koto delegate run --prompt -
 ```
 
 The subcommand:
 1. Reads the current state from the state file
 2. Re-resolves the delegation target from tags + config (same logic as `Next()`)
 3. Pipes the prompt to the delegate CLI via stdin (not as a CLI argument, to avoid shell escaping and argument length limits)
-4. Captures stdout with a configurable timeout
-5. Returns structured JSON:
+4. Captures stdout with a configurable timeout (read via `io.LimitReader`, 10 MB cap to prevent memory exhaustion)
+5. Returns structured JSON to stdout
+
+**Delegate Interface Contract:**
+
+The interface between koto and the delegate CLI is deliberately simple:
+
+| Aspect | Contract |
+|--------|----------|
+| **Input** | Raw prompt text piped to the delegate's stdin |
+| **Output** | Raw text captured from the delegate's stdout |
+| **Working directory** | Delegate runs in the same working directory as koto |
+| **Environment** | Delegate inherits koto's full environment |
+| **Filesystem access** | Read-write -- delegate can read and write files like any coding agent CLI |
+| **Permissions** | Same user permissions as koto (no elevation, no sandboxing) |
+| **Interaction model** | Synchronous, non-interactive: prompt in, response out, process exits |
+
+This matches how headless coding agent CLIs already work. `claude -p` and `gemini` both accept prompts via stdin, can read/write files in the working directory, and return responses via stdout. koto doesn't try to restrict or sandbox the delegate because the delegate is a coding agent -- restricting filesystem access would make it useless for code analysis tasks.
+
+The delegate is **read-write by default**. If a template author wants read-only delegation (analysis only, no modifications), the directive text should instruct the delegate accordingly. koto doesn't enforce this -- it's a prompt-level concern, not a systems-level one.
+
+**Response JSON:**
 
 ```json
 {
   "response": "...",
   "delegate": "gemini",
+  "matched_tag": "deep-reasoning",
   "duration_ms": 12345,
+  "exit_code": 0,
   "success": true
 }
 ```
@@ -360,29 +401,34 @@ On failure:
 {
   "response": "",
   "delegate": "gemini",
+  "matched_tag": "deep-reasoning",
   "duration_ms": 5000,
+  "exit_code": 1,
   "success": false,
   "error": "delegate process exited with code 1"
 }
 ```
 
-The invocation uses `exec.CommandContext` with explicit args (`"gemini", "-p"`) and the prompt piped via stdin. koto never uses `sh -c` for delegate invocation.
-
-**Output size limit:** Delegate stdout is read via `io.LimitReader` with a 10 MB cap. If the delegate produces more output, koto truncates and sets `"truncated": true` in the response JSON. This prevents memory exhaustion from a misbehaving delegate.
-
-**Exit codes:** `koto delegate submit` exits 0 when the delegate was invoked, even if the delegate itself failed (the JSON response carries `success: false` with the error). Non-zero exit codes indicate koto-level errors (config missing, binary not found, prompt file unreadable). This lets agents distinguish "delegation happened but delegate reported an error" from "delegation couldn't be attempted."
-
-**Availability check:** Before invocation, koto checks that the delegate binary is in PATH. This is the same check done at `Next()` time. If the binary disappeared between `koto next` and `koto delegate submit`, the submit command returns an error.
-
-**Timeout:** Configurable in the delegation config:
-
-```yaml
-delegation:
-  timeout: 300  # seconds, default 300 (5 minutes)
-  rules:
-    - tag: deep-reasoning
-      delegate_to: gemini
+On truncation (output exceeded 10 MB):
+```json
+{
+  "response": "...(truncated)...",
+  "delegate": "gemini",
+  "matched_tag": "deep-reasoning",
+  "duration_ms": 45000,
+  "exit_code": 0,
+  "success": true,
+  "truncated": true
+}
 ```
+
+**Exit codes:** `koto delegate run` exits 0 when the delegate was invoked, even if the delegate itself failed (the JSON response carries `success: false` with the error and `exit_code`). Non-zero exit codes indicate koto-level errors (config missing, binary not found, prompt file unreadable). This follows the `gh api` convention and lets agents distinguish "delegation happened but delegate reported an error" from "delegation couldn't be attempted."
+
+**Availability check:** Before invocation, koto checks that the delegate binary is in PATH. This is the same check done at `Next()` time. If the binary disappeared between `koto next` and `koto delegate run`, the command returns a koto-level error (non-zero exit).
+
+**Prompt file lifecycle:** koto reads the prompt file but does not delete it. The agent is responsible for cleanup. SKILL.md instructions should use `mktemp` to avoid collisions.
+
+**Timeout:** Configurable in the delegation config (default 300 seconds / 5 minutes).
 
 #### Alternatives Considered
 
@@ -394,20 +440,20 @@ delegation:
 
 ### Summary
 
-State declarations gain an optional `tags` field -- a string array with kebab-case pattern validation. The initial vocabulary (`deep-reasoning`, `large-context`, `security`) is documented in guides, not enforced by schema. `format_version` stays at 1 since tags are additive and Go's unmarshaller ignores unknown fields.
+State declarations gain an optional `tags` field -- a string array with kebab-case pattern validation. Tags describe processing capabilities, not domains. The initial vocabulary (`deep-reasoning`, `large-context`, `specialized-tooling`) is documented in guides, not enforced by schema. `format_version` stays at 1 since tags are additive and Go's unmarshaller ignores unknown fields.
 
 Tags flow through the template pipeline (`sourceStateDecl` -> `StateDecl` -> `template.Template.Tags`) and skip `engine.MachineState`. The controller reads tags from the template and includes them in the `Directive` output.
 
-A new `pkg/config` package loads YAML from `~/.koto/config.yaml` (user) and `.koto/config.yaml` (project). The delegation section maps tags to targets. Project-level delegation rules require an explicit opt-in in the user's config.
+A new `pkg/config` package loads YAML from `~/.koto/config.yaml` (user) and `.koto/config.yaml` (project). The delegation config separates target definitions (what binary to run) from routing rules (which tags map where). Project config can add rules but not targets -- only user config defines binaries. Project-level delegation rules require an explicit opt-in.
 
-At `koto next` time, the controller matches state tags against config rules, checks delegate availability, and includes `DelegationInfo` in the response. The agent reads this, produces a prompt, and hands it back via `koto delegate submit`. koto invokes the delegate CLI, captures the response, and returns it to the agent.
+At `koto next` time, the controller matches state tags against config rules, checks delegate availability via a `DelegateChecker` interface, and includes `DelegationInfo` in the response. The agent reads this, produces a prompt, and hands it back via `koto delegate run`. koto invokes the delegate CLI with a simple interface contract: raw prompt piped to stdin, raw text captured from stdout. The delegate runs read-write in the working directory with full user permissions -- no sandboxing, matching how headless coding agent CLIs already operate.
 
 The full flow:
 1. `koto next` returns directive with `delegation: {target: "gemini", available: true}`
-2. Agent reads directive, gathers context, crafts a self-contained prompt
-3. `koto delegate submit --prompt-file /tmp/prompt.txt`
-4. koto invokes `gemini -p` with the prompt via stdin, captures stdout
-5. koto returns `{response: "...", success: true}` to the agent
+2. Agent reads directive, gathers context, crafts a prompt for the delegate. The directive text should include guidance for prompt construction (what context to include, what format to request) since the template author knows what the delegate needs.
+3. `koto delegate run --prompt /tmp/prompt.txt`
+4. koto invokes the delegate CLI (e.g., `gemini -p`) in the working directory, piping the prompt via stdin. The delegate can read/write files.
+5. koto returns `{response: "...", matched_tag: "deep-reasoning", exit_code: 0, success: true}` to the agent
 6. Agent uses the response and calls `koto transition` to advance
 
 When delegation isn't configured or the delegate isn't available, `koto next` returns the directive without delegation metadata (or with `fallback: true`), and the agent handles the step as it would today.
@@ -492,19 +538,22 @@ type Config struct {
 }
 
 type DelegationConfig struct {
-    AllowProjectConfig bool             `yaml:"allow_project_config"`
-    Timeout            int              `yaml:"timeout,omitempty"` // seconds
-    Rules              []DelegationRule `yaml:"rules"`
-    Default            string           `yaml:"default"`
+    AllowProjectConfig bool                      `yaml:"allow_project_config"`
+    Timeout            int                       `yaml:"timeout,omitempty"` // seconds
+    Targets            map[string]DelegateTarget `yaml:"targets"`
+    Rules              []DelegationRule           `yaml:"rules"`
+}
+
+type DelegateTarget struct {
+    Command []string `yaml:"command"` // e.g., ["gemini", "-p"]
 }
 
 type DelegationRule struct {
-    Tag        string   `yaml:"tag"`
-    DelegateTo string   `yaml:"delegate_to"`
-    Command    []string `yaml:"command"` // e.g., ["gemini", "-p"]
+    Tag    string `yaml:"tag"`
+    Target string `yaml:"target"`
 }
 
-func Load() (*Config, error)           // loads from user + project
+func Load() (*Config, error)                // loads from user + project
 func LoadFrom(path string) (*Config, error) // loads from specific path
 ```
 
@@ -697,9 +746,13 @@ func (c *Controller) resolveDelegation(tags []string) *DelegationInfo {
     for _, rule := range c.delegationCfg.Rules {
         for _, tag := range tags {
             if tag == rule.Tag {
-                available, reason := c.checker.Available(rule.Command)
+                target, ok := c.delegationCfg.Targets[rule.Target]
+                if !ok {
+                    continue // target not defined, skip rule
+                }
+                available, reason := c.checker.Available(target.Command)
                 info := &DelegationInfo{
-                    Target:     rule.DelegateTo,
+                    Target:     rule.Target,
                     MatchedTag: tag,
                     Available:  available,
                 }
@@ -721,8 +774,15 @@ func (c *Controller) resolveDelegation(tags []string) *DelegationInfo {
 // pkg/config/config.go
 
 func Load() (*Config, error) {
-    userCfg, _ := loadFile(userConfigPath())   // ~/.koto/config.yaml
-    projCfg, _ := loadFile(projectConfigPath()) // .koto/config.yaml
+    userCfg, userErr := loadFile(userConfigPath())   // $KOTO_HOME/config.yaml or ~/.koto/config.yaml
+    if userErr != nil {
+        return nil, fmt.Errorf("user config: %w", userErr) // parse error, not "file missing"
+    }
+
+    projCfg, projErr := loadFile(projectConfigPath()) // .koto/config.yaml
+    if projErr != nil {
+        return nil, fmt.Errorf("project config: %w", projErr)
+    }
 
     if userCfg == nil && projCfg == nil {
         return &Config{}, nil
@@ -737,6 +797,9 @@ func Load() (*Config, error) {
     return merge(userCfg, projCfg), nil
 }
 
+// loadFile returns (nil, nil) for missing files, (*Config, nil) for valid files,
+// and (nil, error) for files that exist but can't be parsed.
+
 func merge(user, project *Config) *Config {
     result := *user
 
@@ -744,30 +807,28 @@ func merge(user, project *Config) *Config {
     if user.Delegation != nil && user.Delegation.AllowProjectConfig &&
        project.Delegation != nil {
         merged := *user.Delegation
+        // Project targets are ignored -- only user config defines binaries
+        // Project timeout is ignored -- only user config controls timeout
 
-        // Build target->command lookup from user rules
-        userCommands := make(map[string][]string)
+        // Collect user-covered tags to prevent project overrides
+        userTags := make(map[string]bool)
         for _, r := range user.Delegation.Rules {
-            if len(r.Command) > 0 {
-                userCommands[r.DelegateTo] = r.Command
-            }
+            userTags[r.Tag] = true
         }
 
         // Only merge project rules that reference user-defined targets
+        // and don't override user-defined tag rules
         for _, r := range project.Delegation.Rules {
-            if cmd, ok := userCommands[r.DelegateTo]; ok {
-                merged.Rules = append(merged.Rules, DelegationRule{
-                    Tag:        r.Tag,
-                    DelegateTo: r.DelegateTo,
-                    Command:    cmd, // use user-defined command, ignore project command
-                })
+            if userTags[r.Tag] {
+                continue // user rule takes priority
             }
-            // silently drop rules for unknown targets
+            if _, ok := user.Delegation.Targets[r.Target]; !ok {
+                fmt.Fprintf(os.Stderr, "koto: project config rule for tag %q references unknown target %q (not defined in user config), skipping\n", r.Tag, r.Target)
+                continue
+            }
+            merged.Rules = append(merged.Rules, r)
         }
 
-        if project.Delegation.Default != "" {
-            merged.Default = project.Delegation.Default
-        }
         result.Delegation = &merged
     }
 
@@ -777,14 +838,13 @@ func merge(user, project *Config) *Config {
 
 ### Delegate CLI Integration
 
-`koto delegate submit` invokes the delegate CLI:
+`koto delegate run` invokes the delegate CLI:
 
 ```go
-func invokeDelegate(rule DelegationRule, promptPath string, timeout time.Duration) (*DelegateResponse, error) {
-    target := rule.DelegateTo
-    binary, err := exec.LookPath(rule.Command[0])
+func invokeDelegate(targetName string, target DelegateTarget, matchedTag string, promptPath string, timeout time.Duration) (*DelegateResponse, error) {
+    binary, err := exec.LookPath(target.Command[0])
     if err != nil {
-        return nil, fmt.Errorf("delegate %q: binary %q not found in PATH", target, rule.Command[0])
+        return nil, fmt.Errorf("delegate %q: binary %q not found in PATH", targetName, target.Command[0])
     }
 
     ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -795,31 +855,48 @@ func invokeDelegate(rule DelegationRule, promptPath string, timeout time.Duratio
         return nil, fmt.Errorf("read prompt file: %w", err)
     }
 
-    // Use command from config rule (e.g., ["gemini", "-p"])
-    cmd := exec.CommandContext(ctx, binary, rule.Command[1:]...)
+    // Use command from target definition (e.g., ["gemini", "-p"])
+    cmd := exec.CommandContext(ctx, binary, target.Command[1:]...)
     cmd.Stdin = bytes.NewReader(prompt)
+    // Delegate runs in the current working directory with full user permissions
 
-    var stdout bytes.Buffer
-    cmd.Stdout = io.LimitWriter(&stdout, 10*1024*1024) // 10 MB cap
+    // Capture stdout with size limit via pipe + io.LimitReader
+    stdoutPipe, err := cmd.StdoutPipe()
+    if err != nil {
+        return nil, fmt.Errorf("create stdout pipe: %w", err)
+    }
+    limitedReader := io.LimitReader(stdoutPipe, 10*1024*1024) // 10 MB cap
 
     start := time.Now()
-    err = cmd.Run()
-    duration := time.Since(start)
-    output := stdout.Bytes()
+    if err := cmd.Start(); err != nil {
+        return nil, fmt.Errorf("start delegate: %w", err)
+    }
 
-    if err != nil {
+    output, _ := io.ReadAll(limitedReader)
+    runErr := cmd.Wait()
+    duration := time.Since(start)
+
+    exitCode := 0
+    if runErr != nil {
+        if exitErr, ok := runErr.(*exec.ExitError); ok {
+            exitCode = exitErr.ExitCode()
+        }
         return &DelegateResponse{
-            Delegate:   target,
+            Delegate:   targetName,
+            MatchedTag: matchedTag,
             DurationMs: duration.Milliseconds(),
+            ExitCode:   exitCode,
             Success:    false,
-            Error:      err.Error(),
+            Error:      runErr.Error(),
         }, nil
     }
 
     return &DelegateResponse{
         Response:   string(output),
-        Delegate:   target,
+        Delegate:   targetName,
+        MatchedTag: matchedTag,
         DurationMs: duration.Milliseconds(),
+        ExitCode:   0,
         Success:    true,
     }, nil
 }
@@ -866,6 +943,12 @@ Analyze the codebase for: {{TASK}}
 
 Think carefully about what changes are needed and why.
 
+When delegating this step, include in the prompt:
+- All source files in the affected packages
+- The go.mod file for dependency context
+- Any test files for the affected packages
+- A clear statement of what analysis is expected
+
 ## implement
 
 Based on the analysis, implement the changes for: {{TASK}}
@@ -882,14 +965,16 @@ Work complete.
 delegation:
   allow_project_config: false
   timeout: 300
+  targets:
+    gemini:
+      command: ["gemini", "-p"]
+    claude:
+      command: ["claude", "-p", "--model", "opus"]
   rules:
     - tag: deep-reasoning
-      delegate_to: gemini
-      command: ["gemini", "-p"]
+      target: gemini
     - tag: large-context
-      delegate_to: gemini
-      command: ["gemini", "-p"]
-  default: self
+      target: gemini
 ```
 
 ### File Change Summary
@@ -901,13 +986,13 @@ delegation:
 | `pkg/template/compiled-template.schema.json` | Add `tags` property to `state_decl` |
 | `pkg/template/template.go` | Add `Tags map[string][]string` to `Template` |
 | `pkg/template/compiled.go` | Populate `Tags` in `ToTemplate()` |
-| `pkg/controller/controller.go` | Add `DelegationInfo`, `Tags`, `Delegation` to `Directive`, resolve in `Next()` |
-| `pkg/config/config.go` | New package: `Config`, `DelegationConfig`, `Load()`, `merge()` |
-| `pkg/config/config_test.go` | Tests for loading, merging, precedence |
-| `cmd/koto/main.go` | Load config at startup, pass to controller |
-| `cmd/koto/delegate.go` | New file: `koto delegate submit` subcommand |
-| `plugins/koto-skills/skills/hello-koto/SKILL.md` | Document delegation flow |
-| `docs/guides/delegation.md` | User guide: config, tags, delegation flow |
+| `pkg/controller/controller.go` | Add `DelegationInfo`, `DelegateChecker`, `Tags`, `Delegation` to `Directive`, functional options, resolve in `Next()` |
+| `pkg/config/config.go` | New package: `Config`, `DelegationConfig`, `DelegateTarget`, `Load()`, `merge()` |
+| `pkg/config/config_test.go` | Tests for loading, merging, precedence, project restrictions |
+| `cmd/koto/main.go` | Load config at startup, pass to controller via `WithDelegation()` |
+| `cmd/koto/delegate.go` | New file: `koto delegate run` subcommand |
+| `plugins/koto-skills/skills/hello-koto/SKILL.md` | Document delegation flow and prompt construction guidance |
+| `docs/guides/delegation.md` | User guide: config, tags, delegate interface, delegation flow |
 
 ## Implementation Approach
 
@@ -931,7 +1016,7 @@ Wire config into the controller. Implement tag-to-target resolution in `Next()`.
 
 ### Phase 4: Delegate Subcommand
 
-Implement `koto delegate submit`. Stdin piping to delegate CLI, stdout capture, timeout handling, structured JSON response.
+Implement `koto delegate run`. Stdin piping to delegate CLI, stdout capture, timeout handling, structured JSON response.
 
 **Tests:** Submit with mock delegate binary. Timeout handling. Error reporting on delegate failure.
 
@@ -949,15 +1034,13 @@ Not applicable. Delegation doesn't download artifacts. Tags are string metadata;
 
 koto invokes delegate CLIs as subprocesses using `exec.CommandContext` with explicit args -- not `sh -c`. The delegate binary is resolved via `exec.LookPath`. koto never shell-executes the delegate target identifier.
 
-Delegate invocation commands are specified in config rules. The `command` field is an explicit array of binary + args (e.g., `["gemini", "-p"]`), resolved via `exec.LookPath` against PATH. koto never shell-interprets the command -- it uses `exec.CommandContext` with the array elements directly. This means config authors control exactly which binary is invoked and with what flags.
-
-The delegate CLI runs with the same user permissions as koto. koto doesn't grant elevated permissions.
+Delegate invocation commands are specified in target definitions in user config. The `command` field is an explicit array of binary + args (e.g., `["gemini", "-p"]`), resolved via `exec.LookPath` against PATH. koto never shell-interprets the command -- it uses `exec.CommandContext` with the array elements directly. The delegate runs in the working directory with full user permissions (read-write filesystem access). koto doesn't sandbox the delegate because it's a coding agent CLI that needs filesystem access to be useful.
 
 ### Supply Chain Risks
 
 Templates and config files come from the same sources as before (local files). Tags are strings in YAML frontmatter with no executable content.
 
-Project-level config (`.koto/config.yaml`) is a new trust-bearing artifact. A cloned repository could ship delegation rules that route tags to unexpected targets. Two mitigations: (1) project-level delegation rules require `allow_project_config: true` in the user's config, and (2) project config cannot override the `command` field -- only user-level config defines what binary a target name maps to. This prevents a cloned repo from specifying an arbitrary binary for koto to execute.
+Project-level config (`.koto/config.yaml`) is a new trust-bearing artifact. A cloned repository could ship delegation rules that route tags to unexpected targets. Two mitigations: (1) project-level delegation rules require `allow_project_config: true` in the user's config, and (2) the config schema separates targets (binary definitions) from rules (tag routing). Project config can only add rules, not targets -- only user-level config defines what binaries are available. Project config also cannot override `timeout`. This prevents a cloned repo from specifying an arbitrary binary for koto to execute or setting an excessive timeout.
 
 ### User Data Exposure
 
@@ -988,10 +1071,10 @@ What koto doesn't do:
 |------|------------|---------------|
 | Codebase content sent to third-party API | Config-controlled; user explicitly enables delegation | Users may not track which tags route where |
 | Prompt injection across model boundary | Unmitigatable -- koto is a pipe; injection resistance depends on delegate provider | Cross-model injection resistance varies by provider and model |
-| Project config enables arbitrary code execution via command field | Project config cannot override `command`; only user config defines binaries | Users who opt in globally trust all project tag-to-target mappings |
+| Project config routes to arbitrary binaries | Config separates targets (user-only) from rules (project-allowed); project can't define new targets | Users who opt in globally trust all project routing rules |
 | Delegate stdout exhausts host memory | `io.LimitReader` caps output at 10 MB | Truncated responses may lose critical content |
 | Delegate prompt may contain secrets found in codebase | Agent decides prompt content; koto can't filter | Sensitive data may cross provider boundaries |
-| Delegate binary not in PATH | Availability check at `Next()` and `submit` time | Workflow loses delegation benefit |
+| Delegate binary not in PATH | Availability check at `Next()` and `run` time | Workflow loses delegation benefit |
 | Delegate binary auth broken | koto detects failure, returns error | Agent must handle fallback |
 | Unknown delegate target in config | koto logs warning, returns no delegation | Silent no-op may surprise user |
 
