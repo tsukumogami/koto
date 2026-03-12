@@ -1,5 +1,7 @@
 # Exploration Findings: unified-koto-next
 
+## Decision: Crystallize
+
 ## Core Question
 
 Can `koto next` serve as the single command for all state evolution in koto — reading the
