@@ -114,19 +114,46 @@ redirect the workflow when I've already made the decision the conditions are try
 state-evolution subcommands are added as new capabilities are introduced.
 
 **R2. Auto-advancement**
-When `koto next` is called, koto evaluates all conditions for the current state. If conditions
-are satisfied, koto advances to the next state and re-evaluates conditions there. koto continues
-advancing through states until it reaches one that requires agent action — a state with unsatisfied
-conditions or a state whose directive the agent must execute. The response reflects the final
-stopping state, not any intermediate states passed through.
+When `koto next` is called, koto evaluates conditions for the current state and advances if they
+are satisfied. koto continues advancing until it reaches a stopping condition, then returns that
+state's directive. Stopping conditions are:
+
+- Any unsatisfied condition (the agent must submit evidence or wait for an integration gate to clear)
+- A state with a processing integration configured (the agent must interpret the integration output)
+- A terminal state
+
+The response reflects the final stopping state. Intermediate states passed through automatically
+are not reported in the response but are recorded in the audit trail.
 
 `koto next` is not idempotent by design — calling it may trigger one or more state transitions if
-conditions have become satisfied since the last call (e.g., CI check has passed).
+conditions have become satisfied since the last call (e.g., a CI check has passed).
+
+**Cycle detection**: During a single `koto next` call, auto-advancement tracks visited states. If
+advancement would enter a state already visited in the current call, koto stops at the current
+state and returns its directive. Each new `koto next` call starts with a fresh visited-state set.
+
+**Chain atomicity**: Each transition in a chain is committed independently. If the process crashes
+mid-chain, the workflow recovers to the last committed state and re-evaluates from there. Conditions
+are re-evaluated on recovery — if they remain satisfied, the chain resumes. Workflows must be
+designed so condition evaluation is safe to repeat.
 
 **R3. Evidence submission**
 `koto next --with-data <file>` accepts a JSON file containing agent-supplied data. koto validates
 the submission against the current state's requirements, stores the data, re-evaluates
 conditions, and advances if they are now satisfied.
+
+Evidence is scoped to the state it is submitted in. When the workflow transitions out of a state
+(by any means, including directed transition), the state's accumulated evidence is committed to
+the audit trail and the next state starts with an empty evidence map. Conditions in a state only
+evaluate evidence submitted while in that state; they cannot reference evidence from prior states.
+
+A submission must include all fields declared by the current state — partial submissions are
+rejected with `invalid_submission`. If the agent resubmits evidence while still in the same state,
+later values for the same key overwrite earlier ones.
+
+Validation, storage, condition re-evaluation, and advancement (if conditions pass) are committed
+as a single atomic unit. If the process crashes before the state file is written, the evidence is
+not stored and must be resubmitted. Once the state file is written, the evidence is durable.
 
 **R4. Self-describing output**
 Every `koto next` response includes an `expects` field describing what the current state
@@ -174,19 +201,38 @@ to receive the directive and delegate output, one to submit the agent's interpre
 `koto next` errors are machine-parseable with typed error codes. Agents branch on error code,
 not error message text. Required error codes:
 
-- `gate_blocked`: conditions not yet satisfied; includes per-condition detail
-- `precondition_failed`: submission provided but current state doesn't accept one
-- `invalid_submission`: submission format doesn't match what the state expects
-- `integration_unavailable`: a required koto-owned integration is not accessible; includes
-  fallback guidance
+- `gate_blocked`: conditions not yet satisfied; includes per-condition detail. For branching
+  states, when submitted evidence satisfies no outgoing transition, includes per-transition detail
+  showing which conditions failed for each option.
+- `precondition_failed`: submission provided but current state doesn't accept one; or `--to` and
+  `--with-data` provided together (mutually exclusive)
+- `invalid_submission`: submission format doesn't match what the state expects, including partial
+  submissions missing required fields
+- `integration_unavailable`: a processing integration is not accessible or has timed out; includes
+  fallback guidance. Condition integrations that are unavailable fail the gate rather than
+  returning this error code.
+- `workflow_not_initialized`: `koto next` called before `koto init`; directs caller to initialize
+  first (exit 3)
+- `terminal_state`: `--to` called on a workflow already in a terminal state (exit 2)
 
 **R10a. Directed transition**
-`koto next --to <transition>` advances the workflow to the named outgoing transition without
-evaluating conditions. The named transition must be a valid outgoing transition from the
-current state; if it is not, koto returns a caller error (exit 2). The transition is recorded
-in the audit trail with a `directed: true` marker, distinguishing it from gate-cleared
-advancement. This enables agents to execute human-directed workflow redirects without the
-agent needing to determine which branch to take autonomously.
+`koto next --to <transition>` advances the workflow to the named outgoing transition, bypassing
+all condition evaluation — both shared conditions and per-transition conditions. It is a full
+human override. The named transition must be a valid outgoing transition from the current state;
+if it is not, koto returns a caller error (exit 2). Calling `--to` on a workflow already in a
+terminal state returns a caller error (exit 2) with code `terminal_state`.
+
+`--to` is always a stopping point: koto advances to the target state and returns its directive.
+No auto-advancement chain is applied from the target. The next `koto next` call (without `--to`)
+will apply normal auto-advancement from there.
+
+The transition is recorded in the audit trail with a `directed: true` marker, distinguishing it
+from gate-cleared advancement. Because directed transitions bypass conditions, they may skip
+states that would have collected evidence; template authors must ensure downstream states do not
+depend on evidence from states that can be bypassed.
+
+`--to` and `--with-data` are mutually exclusive. If both are provided, koto returns
+`precondition_failed` (exit 2).
 
 **R10. Advancement with gate failure detail**
 When conditions are not satisfied, the response includes structured detail for each unsatisfied
@@ -218,19 +264,19 @@ allows common preconditions (e.g., "tests must pass") to be declared once rather
 repeated on every transition.
 
 **R17. Template portability**
-Templates must run correctly in environments with different tooling configurations. A template
-authored in one environment (with delegation config, specific CLIs, or custom condition
-commands available) must produce valid, runnable workflows in environments without those tools.
-When optional integrations are absent, koto runs without them — the template degrades
-gracefully rather than failing at load time. Templates must not assume any specific agent
-runtime, tooling setup, or integration availability beyond what is explicitly declared as
-required.
+Templates that use processing integrations must run correctly in environments where those
+integrations are absent. When a processing integration is unavailable, koto degrades gracefully
+rather than failing at load time — the directive is returned without integration output. Condition
+integrations are exempt from this portability requirement: a condition integration that is
+unavailable fails the gate by design (R12), which is the correct behavior. Templates must not
+assume any specific agent runtime or processing integration availability.
 
 **R18. Template validation**
-`koto template compile` validates that transition-level conditions on a branching state are
-mutually exclusive — no two outgoing transitions from the same state can have conditions
-that could be satisfied simultaneously by the same evidence submission. Compile-time
-detection prevents ambiguous workflows from being run.
+A template with a branching state is invalid if two outgoing transitions from that state have
+conditions that could be satisfied simultaneously by the same evidence submission. The template
+format must be able to express this constraint so that tooling (e.g., `koto template compile`)
+can detect and reject such templates before they are run. Ambiguous branching makes the workflow
+non-deterministic and must be caught before execution.
 
 **R19. Agent-agnostic output contract**
 `koto next` JSON output makes no assumptions about the consuming agent runtime. The response
@@ -244,23 +290,34 @@ Code's tool-use model, Claude's prompt format, or any specific agent SDK. The di
 and scripts to branch without parsing error text:
 
 - `0`: success — directive returned, or state advanced and new directive returned
-- `1`: transient condition — gates not yet satisfied; caller may retry
-- `2`: caller error — bad input, invalid submission format, precondition failed
-- `3`: configuration error — template invalid, state file corrupt, integration misconfigured;
-  operator intervention required
+- `1`: transient condition — gates not yet satisfied, integration unavailable or timed out,
+  concurrent modification conflict (retry); caller may retry without operator involvement
+- `2`: caller error — bad input, invalid submission format, precondition failed, `--to` targeting
+  an invalid transition, `--to` on a terminal state, `--to` combined with `--with-data`
+- `3`: configuration error — template invalid, state file corrupt, integration misconfigured,
+  workflow not initialized; operator intervention required
 
-**R21. Signal handling**
-On SIGTERM or SIGINT, koto completes any in-progress atomic write before exiting, ensuring
-the state file is never left in a partially-written state. If a transition commit is in
-progress, it either completes or rolls back fully. The workflow is always resumable after
-a signal-induced exit.
+**R21. Signal handling and state durability**
+On SIGTERM or SIGINT, koto completes any in-progress atomic write before exiting. The atomic
+unit is a single transition commit — not the entire auto-advancement chain. If the signal arrives
+during a multi-state chain, transitions already committed remain committed; the in-progress
+transition either completes or rolls back, but prior transitions in the chain are not undone.
+The workflow recovers to the last committed state and continues normally on the next call.
+
+The state file is never left in a partially-written state. The workflow is always resumable
+after a signal-induced exit.
+
+Workflow state persists across arbitrary session boundaries. An agent session ending (without
+SIGTERM) leaves the workflow at its current state, resumable by any agent calling `koto next`.
 
 **R22. Completed workflow state preservation**
-After a workflow reaches a terminal state, its state file is preserved and queryable. The
-record includes each transition taken, the timestamp it occurred, and the evidence submitted
-that satisfied the conditions. This record persists until explicitly deleted, allowing
-post-completion audit of agent behavior independent of the agent session that ran the
-workflow.
+After a workflow reaches a terminal state, its state file is preserved. The state file contains
+the full transition history: each transition taken, the timestamp it occurred, whether it was
+gate-cleared or directed (`directed: true`), and the evidence submitted while in the originating
+state. For directed transitions that bypassed a state's conditions, the evidence record for that
+transition reflects what was submitted (which may be empty if the state was skipped). This record
+persists until explicitly deleted, allowing post-completion audit independent of the agent session
+that ran the workflow.
 
 ### Non-functional Requirements
 
@@ -270,10 +327,11 @@ command is required. The template format change for transition-level conditions 
 change; existing templates require migration.
 
 **R12. Integration availability fallback**
-For processing integrations (delegate CLIs), if the configured tool is not accessible, `koto
-next` returns the directive without integration output, and includes a `delegation.available:
-false` field so the agent can handle the directive directly. Condition integrations (CI checks,
-command gates) fail the condition if unavailable — they don't silently pass.
+For processing integrations (delegate CLIs), if the configured tool is not accessible or exceeds
+its timeout, `koto next` returns the directive without integration output and includes a
+`delegation.available: false` field so the agent can handle the directive directly. Exit code is
+1 (transient; agent may retry). Condition integrations (CI checks, command gates) fail the
+condition if unavailable or timed out — they don't silently pass.
 
 **R13. Response completeness**
 A `koto next` response must be fully self-contained. It must not require the agent to reference
@@ -284,8 +342,9 @@ all variables interpolated; the `expects` field fully describes any required sub
 
 - [ ] `koto next` with no arguments returns the current state's directive and `expects` field
 - [ ] `koto next` with no arguments advances through all states whose conditions are
-      immediately satisfied, stopping at the first state that requires agent action, and
-      returns that state's directive with `advanced: true`
+      immediately satisfied, stopping at the first state with an unsatisfied condition, a
+      processing integration, or a terminal state; returns that state's directive with
+      `advanced: true`
 - [ ] `koto next --with-data <file>` validates the submission, stores it, re-evaluates conditions,
       and advances if they now pass
 - [ ] `koto next --with-data <file>` returns `invalid_submission` error when the file doesn't
@@ -323,8 +382,9 @@ all variables interpolated; the `expects` field fully describes any required sub
 - [ ] `koto next` exits 3 when configuration is invalid (corrupt state file, bad template)
 - [ ] Sending SIGTERM while `koto next` is committing a transition results in either a
       complete commit or a clean rollback — the state file is never partially written
-- [ ] After a workflow reaches a terminal state, `koto query` returns the full transition
-      history including timestamps and evidence submitted at each step
+- [ ] After a workflow reaches a terminal state, the state file contains the full transition
+      history including timestamps, evidence submitted at each transition, and `directed: true`
+      markers for human-directed transitions
 - [ ] A developer can submit missing evidence manually via `koto next --with-data` to unblock
       a stuck workflow without re-initializing it
 - [ ] `koto next --to <transition>` advances to the named state without evaluating conditions
@@ -333,6 +393,19 @@ all variables interpolated; the `expects` field fully describes any required sub
       is not a valid outgoing transition from the current state
 - [ ] A directed transition is recorded in the state file with a `directed: true` marker,
       distinguishable from gate-cleared transitions in the audit record
+- [ ] `koto next --to <transition>` combined with `--with-data` returns `precondition_failed`
+      (exit 2)
+- [ ] `koto next --to <transition>` called on a workflow in a terminal state returns
+      `terminal_state` (exit 2)
+- [ ] `koto next` called before `koto init` returns `workflow_not_initialized` (exit 3)
+- [ ] `koto next` with a state graph containing a cycle does not loop indefinitely; it stops
+      at the point where auto-advancement would revisit an already-visited state in the same call
+- [ ] Two concurrent `koto next` calls on the same workflow produce a version conflict on the
+      second call, which exits with code 1 (transient; agent may retry)
+- [ ] Evidence submitted in state A is not present in the evidence map when the workflow enters
+      state B; each state's evidence starts empty
+- [ ] `koto next --with-data` that is missing a declared required field returns
+      `invalid_submission` rather than storing partial evidence
 
 ## Out of Scope
 
