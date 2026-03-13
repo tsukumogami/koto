@@ -78,3 +78,66 @@ declarations with per-transition conditions).
   subcommands; `koto transition` is removed
 - **Testability**: auto-advancement and gate evaluation must remain unit-testable without
   subprocess side effects; processing integrations are injected via interface
+
+## Considered Options
+
+### Decision: Where does the auto-advancement loop live?
+
+**Context:** koto next must chain through multiple state transitions in a single call,
+stopping only when blocked. This loop requires visiting-state tracking, stopping-condition
+evaluation, integration invocation, and evidence lifecycle management. The question is
+which package owns this orchestration logic.
+
+**Chosen: Controller-owned advancement loop (Approach A).**
+
+The controller already holds the workflow's config context — delegation rules, template
+path, integration configuration. Advancement is an orchestration concern, not a
+transaction concern; the engine's job is to execute one correct transition atomically,
+not to decide when to stop. Keeping orchestration in the controller preserves a minimal
+engine package that is easy to reason about and test in isolation. The `IntegrationRunner`
+interface injected into the controller follows the same pattern already established for
+delegate checking in the delegation design. No new packages are introduced, and the loop
+is unit-testable by injecting mock engine and integration runner implementations.
+
+*Alternative rejected: Engine-owned advancement (Approach B).* The engine gains an
+`Advance()` loop alongside `transitionOne()`, making it the single source of truth for
+advancement. The appeal is that "how advancement works" is answerable by reading one
+package. The cost is significant: the engine grows from ~700 to ~1100 lines and gains
+awareness of integrations, config, and agent-facing concepts — concerns it currently has
+no knowledge of. Mixing transaction logic (atomically commit one state change) with
+orchestration logic (decide when to stop chaining) in the same package makes each harder
+to navigate and the package harder to maintain. The engine package size concern is a
+long-term maintainability risk; the controller approach avoids it without sacrificing
+testability.
+
+*Alternative rejected: New workflow orchestrator layer (Approach C).* A new `pkg/workflow`
+package provides maximum architectural clarity — three explicit layers (engine, workflow,
+controller) enforced at the package import level. The engine stays a pure single-transition
+executor, and future capabilities extend `Workflow`, not the controller. The trade-off is
+real: ~300-400 lines of new infrastructure for logic that fits naturally in the controller.
+If the controller becomes a thin wrapper around `Workflow`, it loses its rationale as a
+distinct type, and callers might as well use `Workflow` directly. The architectural clarity
+benefit doesn't justify the added indirection at this stage — the controller already serves
+as the orchestration layer between CLI and engine, and the mandatory engine and template
+changes are identical regardless of approach.
+
+## Decision Outcome
+
+The controller owns the auto-advancement loop. `Engine.Transition()` is extended to support
+`TransitionDecl` (per-transition gate declarations) and evidence clearing on commit, but
+executes exactly one transition per call. The controller gains `Advance(opts AdvanceOpts)`
+which loops — calling `Engine.Transition()`, evaluating stopping conditions, and invoking
+an injected `IntegrationRunner` when a processing integration stops the chain. The CLI
+adds `--with-data` and `--to` flags routed through the controller.
+
+Key properties:
+- Engine remains a single-transition executor with an extended type model
+- Controller owns the advancement loop and integration invocation
+- `IntegrationRunner` interface injected into the controller; no subprocess side effects
+  in test paths
+- Each transition is independently committed; crash mid-chain recovers from last committed
+  state
+- Visited-state set (per `Advance()` call) prevents infinite loops on cyclic templates
+- Evidence is cleared atomically with each transition commit and archived to history
+- No new packages introduced; changes are contained to existing packages
+
