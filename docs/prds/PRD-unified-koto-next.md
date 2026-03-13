@@ -65,9 +65,10 @@ command to advance state.
 my decision, and have koto advance to the correct next state automatically, so that I don't
 need to know what the next state is called or which transitions are defined.
 
-**As an orchestrating agent in a workflow with a delegation step**, I want to call `koto next`
-and receive both the directive and the delegate's response, so that I can interpret the
-response and decide what to do with it before submitting evidence to advance state.
+**As an orchestrating agent in a workflow with a delegation step**, I want to receive the
+delegate's output alongside the directive and have it preserved across session boundaries,
+so that delegation is recoverable — if my session ends after receiving the output but before
+I've acted on it, I can resume without re-invoking the delegate.
 
 **As an orchestrating agent submitting evidence**, I want `koto next` output to tell me exactly
 what fields or data to include in my submission, so that I can construct the right payload
@@ -86,9 +87,18 @@ requires deep reasoning by tagging it, and have the routing to the actual delega
 in user config, so that my template works in any environment regardless of which tools are
 available.
 
-**As a developer debugging a stuck workflow**, I want a read-only command that shows the current
-state and which conditions are blocking advancement, so that I can diagnose problems without
-affecting workflow state.
+**As a developer with a stuck workflow**, I want to identify which evidence is missing and
+submit it manually so that I can unblock and resume the workflow without re-running it from
+the start.
+
+**As a CI/CD pipeline maintainer**, I want `koto next` to exit with distinct codes for
+different failure categories so that my pipeline can distinguish "condition not yet satisfied,
+retry later" from "workflow configuration error, operator intervention required" without
+parsing error text.
+
+**As a CI/CD pipeline maintainer**, I want koto to handle SIGTERM gracefully so that a
+pipeline timeout or job cancellation leaves the workflow in a consistent, resumable state
+rather than corrupting it mid-transition.
 
 ## Requirements
 
@@ -195,16 +205,49 @@ allows common preconditions (e.g., "tests must pass") to be declared once rather
 repeated on every transition.
 
 **R17. Template portability**
-Templates that declare delegation tags remain valid and functional in environments where no
-delegation config exists. When no config rules match the current state's tags, `koto next`
-runs without invoking a delegate. The delegate output field is absent from the response.
-Templates must not assume delegation is available.
+Templates must run correctly in environments with different tooling configurations. A template
+authored in one environment (with delegation config, specific CLIs, or custom condition
+commands available) must produce valid, runnable workflows in environments without those tools.
+When optional integrations are absent, koto runs without them — the template degrades
+gracefully rather than failing at load time. Templates must not assume any specific agent
+runtime, tooling setup, or integration availability beyond what is explicitly declared as
+required.
 
 **R18. Template validation**
 `koto template compile` validates that transition-level conditions on a branching state are
 mutually exclusive — no two outgoing transitions from the same state can have conditions
 that could be satisfied simultaneously by the same evidence submission. Compile-time
 detection prevents ambiguous workflows from being run.
+
+**R19. Agent-agnostic output contract**
+`koto next` JSON output makes no assumptions about the consuming agent runtime. The response
+schema is the complete interface contract: an agent built in any language or framework can
+consume it correctly using only the JSON spec. koto does not couple its output to Claude
+Code's tool-use model, Claude's prompt format, or any specific agent SDK. The directive text,
+`expects` schema, and error codes are runtime-neutral.
+
+**R20. Exit code semantics**
+`koto next` exits with distinct codes for distinct failure categories, enabling CI pipelines
+and scripts to branch without parsing error text:
+
+- `0`: success — directive returned, or state advanced and new directive returned
+- `1`: transient condition — gates not yet satisfied; caller may retry
+- `2`: caller error — bad input, invalid submission format, precondition failed
+- `3`: configuration error — template invalid, state file corrupt, integration misconfigured;
+  operator intervention required
+
+**R21. Signal handling**
+On SIGTERM or SIGINT, koto completes any in-progress atomic write before exiting, ensuring
+the state file is never left in a partially-written state. If a transition commit is in
+progress, it either completes or rolls back fully. The workflow is always resumable after
+a signal-induced exit.
+
+**R22. Completed workflow state preservation**
+After a workflow reaches a terminal state, its state file is preserved and queryable. The
+record includes each transition taken, the timestamp it occurred, and the evidence submitted
+that satisfied the conditions. This record persists until explicitly deleted, allowing
+post-completion audit of agent behavior independent of the agent session that ran the
+workflow.
 
 ### Non-functional Requirements
 
@@ -261,6 +304,16 @@ all variables interpolated; the `expects` field fully describes any required sub
       same state can be satisfied by the same evidence submission
 - [ ] A template with delegation tags runs without error in an environment with no delegation
       config; `koto next` returns the directive without a delegate output field
+- [ ] `koto next` exits 0 when returning a directive (no advancement or successful advancement)
+- [ ] `koto next` exits 1 when conditions are not yet satisfied (gates blocked)
+- [ ] `koto next` exits 2 when the caller provides bad input (invalid submission, precondition failed)
+- [ ] `koto next` exits 3 when configuration is invalid (corrupt state file, bad template)
+- [ ] Sending SIGTERM while `koto next` is committing a transition results in either a
+      complete commit or a clean rollback — the state file is never partially written
+- [ ] After a workflow reaches a terminal state, `koto query` returns the full transition
+      history including timestamps and evidence submitted at each step
+- [ ] A developer can submit missing evidence manually via `koto next --with-data` to unblock
+      a stuck workflow without re-initializing it
 
 ## Out of Scope
 
@@ -279,6 +332,14 @@ all variables interpolated; the `expects` field fully describes any required sub
   `koto init` — not in scope
 - **Streaming integration responses**: delegate responses are captured synchronously and
   returned in full; streaming is deferred
+- **Multi-workflow aggregate visibility**: monitoring running workflows across a project or
+  team (which are stuck, for how long, owned by whom) is a separate capability; koto's
+  state model is per-workflow and local
+- **Parameterized workflow invocation**: triggering a workflow with external inputs (e.g.,
+  "run this template on PR #847") relates to `koto init`, not `koto next`; separate PRD
+- **Integration extensibility contract**: the interface for building new koto-native
+  integrations (plugin manifest, registration mechanism, contract specification) is a
+  separate design concern from the consumer-facing `koto next` interface
 
 ## Known Limitations
 
