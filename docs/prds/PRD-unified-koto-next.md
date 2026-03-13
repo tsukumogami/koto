@@ -109,7 +109,7 @@ stopping state, not any intermediate states passed through.
 conditions have become satisfied since the last call (e.g., CI check has passed).
 
 **R3. Evidence submission**
-`koto next --submit <file>` accepts a JSON file containing agent-supplied data. koto validates
+`koto next --with-data <file>` accepts a JSON file containing agent-supplied data. koto validates
 the submission against the current state's requirements, stores the data, re-evaluates
 conditions, and advances if they are now satisfied.
 
@@ -151,7 +151,7 @@ When koto runs a processing integration (e.g., delegate CLI) during a `koto next
 integration's output is included in the response. The agent receives it as context for executing
 the directive and is responsible for interpreting the output. koto does not interpret integration
 responses — it cannot assess whether a delegate's findings are actionable, complete, or correct.
-After acting on the integration output, the agent submits evidence via `koto next --submit` to
+After acting on the integration output, the agent submits evidence via `koto next --with-data` to
 record its assessment and trigger advancement. The delegation flow is therefore two calls: one
 to receive the directive and delegate output, one to submit the agent's interpretation and advance.
 
@@ -183,7 +183,7 @@ conditions) means the transition is eligible whenever the state's shared conditi
 **R15. Evidence field declaration**
 Template authors can declare what evidence fields a state requires before it can advance.
 Each declared field has a name and a type or constraint. koto uses these declarations to
-generate the `expects` field in `koto next` output and to validate `--submit` payloads. An
+generate the `expects` field in `koto next` output and to validate `--with-data` payloads. An
 agent submitting the wrong fields or wrong types receives an `invalid_submission` error with
 the specific mismatch.
 
@@ -230,11 +230,11 @@ all variables interpolated; the `expects` field fully describes any required sub
 - [ ] `koto next` with no arguments advances through all states whose conditions are
       immediately satisfied, stopping at the first state that requires agent action, and
       returns that state's directive with `advanced: true`
-- [ ] `koto next --submit <file>` validates the submission, stores it, re-evaluates conditions,
+- [ ] `koto next --with-data <file>` validates the submission, stores it, re-evaluates conditions,
       and advances if they now pass
-- [ ] `koto next --submit <file>` returns `invalid_submission` error when the file doesn't
+- [ ] `koto next --with-data <file>` returns `invalid_submission` error when the file doesn't
       match the `expects` schema
-- [ ] `koto next --submit <file>` returns `precondition_failed` error when the current state
+- [ ] `koto next --with-data <file>` returns `precondition_failed` error when the current state
       doesn't accept submissions
 - [ ] When conditions are unsatisfied, the response lists each blocking condition by name,
       type (evidence / integration), and what it requires
@@ -242,7 +242,7 @@ all variables interpolated; the `expects` field fully describes any required sub
       by submitting evidence that satisfies that transition's conditions, without the agent
       naming the target state
 - [ ] When a processing integration (delegate) is configured for the current state, `koto next`
-      invokes it and includes the response in the output; a subsequent `koto next --submit` call
+      invokes it and includes the response in the output; a subsequent `koto next --with-data` call
       is required to record the agent's interpretation and advance state
 - [ ] When a processing integration is unavailable, `koto next` returns the directive with
       `delegation.available: false` instead of failing
