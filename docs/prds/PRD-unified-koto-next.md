@@ -73,6 +73,19 @@ response and decide what to do with it before submitting evidence to advance sta
 what fields or data to include in my submission, so that I can construct the right payload
 without consulting the template definition.
 
+**As a workflow developer authoring a branching template**, I want to declare conditions on
+individual outgoing transitions so that the workflow branches based on what the agent submits,
+without the agent needing to know state names.
+
+**As a workflow developer declaring evidence requirements**, I want to specify what fields an
+agent must submit for a state to advance, so that `koto next` can generate the `expects` schema
+automatically and validate submissions without me writing separate validation logic.
+
+**As a workflow developer configuring a delegation step**, I want to declare that a state
+requires deep reasoning by tagging it, and have the routing to the actual delegate CLI stay
+in user config, so that my template works in any environment regardless of which tools are
+available.
+
 **As a developer debugging a stuck workflow**, I want a read-only command that shows the current
 state and which conditions are blocking advancement, so that I can diagnose problems without
 affecting workflow state.
@@ -158,6 +171,41 @@ condition: condition name, what it requires, and whether the agent can satisfy i
 gate) or koto will verify it independently (integration gate). Agents use this to determine
 whether to submit evidence or to wait and call `koto next` again.
 
+### Template Authoring Requirements
+
+**R14. Per-transition condition declaration**
+The template format allows conditions to be declared on individual outgoing transitions. A
+transition declaration includes a target state and an optional set of conditions. When all
+conditions on a transition are satisfied, that transition is eligible. Template authors who
+don't need branching can continue declaring transitions as a simple list; the default (no
+conditions) means the transition is eligible whenever the state's shared conditions pass.
+
+**R15. Evidence field declaration**
+Template authors can declare what evidence fields a state requires before it can advance.
+Each declared field has a name and a type or constraint. koto uses these declarations to
+generate the `expects` field in `koto next` output and to validate `--submit` payloads. An
+agent submitting the wrong fields or wrong types receives an `invalid_submission` error with
+the specific mismatch.
+
+**R16. Shared vs. per-transition conditions**
+Template authors can declare both shared conditions (must pass before any transition is
+eligible) and per-transition conditions (specific to one outgoing transition). Shared
+conditions are evaluated first; per-transition conditions narrow the eligible set. This
+allows common preconditions (e.g., "tests must pass") to be declared once rather than
+repeated on every transition.
+
+**R17. Template portability**
+Templates that declare delegation tags remain valid and functional in environments where no
+delegation config exists. When no config rules match the current state's tags, `koto next`
+runs without invoking a delegate. The delegate output field is absent from the response.
+Templates must not assume delegation is available.
+
+**R18. Template validation**
+`koto template compile` validates that transition-level conditions on a branching state are
+mutually exclusive — no two outgoing transitions from the same state can have conditions
+that could be satisfied simultaneously by the same evidence submission. Compile-time
+detection prevents ambiguous workflows from being run.
+
 ### Non-functional Requirements
 
 **R11. Output backward compatibility scope**
@@ -202,6 +250,17 @@ all variables interpolated; the `expects` field fully describes any required sub
 - [ ] `koto next` output always includes an `advanced` field
 - [ ] A read-only subcommand (e.g., `koto status`) returns current state and unsatisfied
       conditions without modifying workflow state
+- [ ] A template with per-transition conditions compiles successfully and produces the
+      correct `expects.options` in `koto next` output at the branching state
+- [ ] A template with declared evidence fields produces a matching `expects.fields` schema
+      in `koto next` output; submitting wrong fields returns `invalid_submission`
+- [ ] A template with both shared and per-transition conditions evaluates shared conditions
+      first; a submission that fails shared conditions does not advance regardless of
+      per-transition condition satisfaction
+- [ ] `koto template compile` rejects a template where two outgoing transitions from the
+      same state can be satisfied by the same evidence submission
+- [ ] A template with delegation tags runs without error in an environment with no delegation
+      config; `koto next` returns the directive without a delegate output field
 
 ## Out of Scope
 
