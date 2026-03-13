@@ -206,6 +206,41 @@ set scoped to the current call prevents infinite loops on cyclic templates.
 - `StateDecl` gains `Processing string` field, compiled from `processing: <name>` in
   template YAML.
 
+**Template format v2 YAML (before → after):**
+
+```yaml
+# Format v1 (current)
+states:
+  gather_info:
+    transitions:
+      - analyze
+      - skip_to_output
+    gates:
+      has_data:
+        type: field_not_empty
+        field: input_file
+
+# Format v2 (new)
+states:
+  gather_info:
+    gates:                          # shared gates — evaluated before any transition
+      workflow_ready:
+        type: field_not_empty
+        field: workflow_id
+    transitions:
+      - target: analyze
+        gates:                      # per-transition gates — evaluated after shared gates
+          has_data:
+            type: field_not_empty
+            field: input_file
+      - target: skip_to_output      # no per-transition gates: always satisfied if shared pass
+    processing: delegate_cli        # optional; if set, controller stops and invokes runner
+```
+
+A state with no `gates` and single `target` transition (no per-transition gates) is
+always auto-advanced through when reached. The `processing` field and `transitions` can
+coexist; `processing` takes priority (see Data Flow).
+
 **`cmd/koto/main.go` — CLI entry point**
 
 - `cmdTransition` removed. `cmdNext` gains `--with-data <file>` (reads JSON, passes as
@@ -229,10 +264,13 @@ type AdvanceOpts struct {
 
 // AdvanceResult is returned by Advance().
 type AdvanceResult struct {
-    Directive     Directive  // current state's directive (after stopping)
-    StoppedBecause StopReason
-    Advanced      bool       // false if no transitions were taken
+    Directive       Directive         // current state's directive (after stopping)
+    StoppedBecause  StopReason
+    Advanced        bool              // false if no transitions were taken
+    IntegrationData map[string]string // non-nil when StoppedBecause == StopProcessingIntegration
 }
+// IntegrationRunner errors (non-nil error return) propagate directly as Advance() errors —
+// they indicate a system failure, not a workflow stopping condition.
 
 // TransitionDecl declares one outgoing transition (replacing []string).
 // Lives in pkg/engine/types.go.
@@ -286,8 +324,34 @@ CLI → AdvanceOpts{To: "target_state"}
 ```
 Advance detects ms.Processing != "" in current state
   → runner.Run(ms.Processing, state) → returns result data
-  → return StopProcessingIntegration with integration output
+  → return StopProcessingIntegration with integration output in AdvanceResult.IntegrationData
   → CLI formats output with expects: {submit_with: "--with-data"}
+```
+
+**`--with-data` + `--to` combined:**
+```
+CLI → AdvanceOpts{WithData: {...}, To: "target_state"}
+  → evidence is merged into the directed Transition() call
+  → gate evaluation is skipped (directed), but evidence is archived to history
+  → return StopDirected immediately
+```
+
+**State with `Processing != ""` and outgoing transitions:**
+```
+Advance checks ms.Processing BEFORE evaluating any transitions
+  → if Processing is set, runner is invoked and Advance stops (StopProcessingIntegration)
+  → outgoing transitions are never evaluated
+  → template authors: if a state has both Processing and transitions, the processing
+    integration always takes precedence; the agent submits evidence via --with-data
+    on the next call to advance through the outgoing transitions
+```
+
+**Nil IntegrationRunner:**
+```
+Controller.New() accepts a nil runner.
+If Advance() reaches a state with Processing != "" and runner is nil:
+  → return error("no IntegrationRunner configured for processing state <name>")
+Non-integration code paths (no Processing states) work normally with nil runner.
 ```
 
 ## Implementation Approach
@@ -302,6 +366,9 @@ Deliverables:
 - `pkg/engine/engine.go`: Update `Transition()` to resolve target via `TransitionDecl`
   slice; two-phase gate evaluation (shared then per-transition); evidence archive + clear
   before `persist()`; add `WithDirected` transition option
+- `pkg/engine/engine.go`: Update `deepCopyMachine()` (or equivalent) to deep-copy
+  `[]TransitionDecl` including inner `Gates map[string]*GateDecl` — naive slice copy
+  after the type change would alias gate pointers across copies
 - `pkg/engine/engine_test.go`: Update all tests that construct `MachineState` with
   `Transitions []string`; add tests for per-transition gates, evidence clearing, directed
 
@@ -350,10 +417,11 @@ downloaded, no checksums needed.
 
 **Command gates** — Gate commands are declared as static strings in template YAML and
 invoked with a timeout. Evidence values must not be interpolated into the command string
-itself; the engine passes evidence only through a controlled mechanism (explicit environment
-variable allowlist or stdin). Inherited environment must be stripped when invoking gate
-commands — retain PATH and HOME only. Templates containing command gates are trusted code;
-operators should apply the same review processes to templates as to application code.
+itself. The current `evaluateCommandGate` does not set `cmd.Env`, which means gate commands
+inherit the full process environment. This is a required fix: implementers must explicitly
+set `cmd.Env` to a minimal allowlist (PATH and HOME only) when invoking gate commands.
+Templates containing command gates are trusted code; operators should apply the same review
+processes to templates as to application code.
 
 **IntegrationRunner** — The `Processing` field in a template specifies an integration name,
 not a raw binary path. The `IntegrationRunner` implementation must resolve names through a
@@ -362,25 +430,36 @@ should be logged.
 
 **`--with-data` file reading** — The evidence file must be validated before injection: size
 limit (1 MB), valid JSON structure, bounded key and value lengths. The file path must be
-canonicalized to prevent traversal attacks.
+canonicalized to prevent symlink traversal: call `filepath.Abs` then `filepath.EvalSymlinks`,
+and verify the resolved path is within an expected prefix before reading.
+
+**State file permissions** — State files are written via atomic rename from a temp file.
+`os.CreateTemp` inherits the process umask, which typically produces 0644 (world-readable).
+Implementers must use `os.OpenFile` with explicit mode 0600 instead of `os.CreateTemp` to
+prevent the temp file from being readable during the write window.
 
 ### Supply Chain Risks
 
 koto templates are the primary supply chain artifact. Templates declare gate commands
-(shell subprocesses) and integration runner names. A compromised template can invoke
-arbitrary shell commands or unintended CLIs. Templates should be distributed with the same
-review processes as source code. The compiled template cache (SHA-256 keyed) ensures
-integrity within a session but does not verify template authorship. Future work: ECDSA
-template signing and verification before execution.
+(shell subprocesses) and integration runner names. Until template signing is implemented,
+executing any koto template is equivalent to executing arbitrary commands with the invoking
+user's environment — this is the current threat model. Templates should be distributed with
+the same review processes as source code. The compiled template cache (SHA-256 keyed)
+ensures integrity within a session but does not verify template authorship. Future work:
+ECDSA template signing and verification before execution.
 
 ### User Data Exposure
 
 Evidence submitted via `--with-data` is written to the state file and archived to history
 entries on every transition. Evidence values may include sensitive data (tokens, intermediate
-agent outputs). State files must be created with 0600 permissions. If a directive template
-interpolates evidence values into text forwarded to external services (e.g., an LLM), secrets
-in evidence would be exposed; template authors should avoid interpolating evidence keys that
-may contain sensitive values.
+agent outputs). State files must be created with 0600 permissions (see Execution Isolation
+for the required implementation approach).
+
+The current controller interpolates evidence values into directive text by default. This
+means any evidence key containing a sensitive value will appear in the formatted directive
+returned to the caller. Template authors should avoid interpolating evidence keys that may
+carry secrets; the implementation should document which evidence keys are interpolated so
+callers can make informed decisions about what to submit via `--with-data`.
 
 ## Consequences
 
