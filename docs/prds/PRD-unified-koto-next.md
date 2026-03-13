@@ -11,11 +11,12 @@ problem: |
   that checks conditions, runs integrations, and advances state when ready.
 goals: |
   Establish koto next as the single command for all state evolution. Agents call koto next
-  in a loop: koto checks all conditions (including running integration checks like CI), advances
-  state when they're satisfied, and returns the new directive. Agents submit evidence when the
+  in a loop: koto checks conditions, chains through states automatically until it reaches one
+  requiring agent action, and returns that state's directive. Agents submit evidence when the
   current state requires it, branch by satisfying transition-specific conditions rather than
-  naming a target state, and receive integration outputs (like delegate responses) directly in
-  the command's output. The CLI surface stays constant as new capabilities are added.
+  naming a target state, and receive integration outputs (like delegate responses) in the
+  response to interpret before submitting. The CLI surface stays constant as new capabilities
+  are added.
 source_issue: 43
 ---
 
@@ -65,8 +66,8 @@ my decision, and have koto advance to the correct next state automatically, so t
 need to know what the next state is called or which transitions are defined.
 
 **As an orchestrating agent in a workflow with a delegation step**, I want to call `koto next`
-and receive both the directive and the delegate's response in a single call, so that I don't
-need to manage subprocess invocation for known integrations.
+and receive both the directive and the delegate's response, so that I can interpret the
+response and decide what to do with it before submitting evidence to advance state.
 
 **As an orchestrating agent submitting evidence**, I want `koto next` output to tell me exactly
 what fields or data to include in my submission, so that I can construct the right payload
@@ -86,11 +87,12 @@ state-evolution subcommands are added as new capabilities are introduced.
 
 **R2. Auto-advancement**
 When `koto next` is called, koto evaluates all conditions for the current state. If conditions
-are satisfied, koto advances to the next state and returns the new state's directive in the
-same response. If conditions are not satisfied, koto returns the current state's directive
-without advancing.
+are satisfied, koto advances to the next state and re-evaluates conditions there. koto continues
+advancing through states until it reaches one that requires agent action — a state with unsatisfied
+conditions or a state whose directive the agent must execute. The response reflects the final
+stopping state, not any intermediate states passed through.
 
-`koto next` is not idempotent by design — calling it may trigger a state transition if
+`koto next` is not idempotent by design — calling it may trigger one or more state transitions if
 conditions have become satisfied since the last call (e.g., CI check has passed).
 
 **R3. Evidence submission**
@@ -134,7 +136,11 @@ have a built-in contract for.
 **R8. Integration output in response**
 When koto runs a processing integration (e.g., delegate CLI) during a `koto next` call, the
 integration's output is included in the response. The agent receives it as context for executing
-the directive.
+the directive and is responsible for interpreting the output. koto does not interpret integration
+responses — it cannot assess whether a delegate's findings are actionable, complete, or correct.
+After acting on the integration output, the agent submits evidence via `koto next --submit` to
+record its assessment and trigger advancement. The delegation flow is therefore two calls: one
+to receive the directive and delegate output, one to submit the agent's interpretation and advance.
 
 **R9. Structured error model**
 `koto next` errors are machine-parseable with typed error codes. Agents branch on error code,
@@ -173,8 +179,9 @@ all variables interpolated; the `expects` field fully describes any required sub
 ## Acceptance Criteria
 
 - [ ] `koto next` with no arguments returns the current state's directive and `expects` field
-- [ ] `koto next` with no arguments advances state if all conditions are satisfied, returning
-      the new directive with `advanced: true`
+- [ ] `koto next` with no arguments advances through all states whose conditions are
+      immediately satisfied, stopping at the first state that requires agent action, and
+      returns that state's directive with `advanced: true`
 - [ ] `koto next --submit <file>` validates the submission, stores it, re-evaluates conditions,
       and advances if they now pass
 - [ ] `koto next --submit <file>` returns `invalid_submission` error when the file doesn't
@@ -187,7 +194,8 @@ all variables interpolated; the `expects` field fully describes any required sub
       by submitting evidence that satisfies that transition's conditions, without the agent
       naming the target state
 - [ ] When a processing integration (delegate) is configured for the current state, `koto next`
-      invokes it and includes the response in the output
+      invokes it and includes the response in the output; a subsequent `koto next --submit` call
+      is required to record the agent's interpretation and advance state
 - [ ] When a processing integration is unavailable, `koto next` returns the directive with
       `delegation.available: false` instead of failing
 - [ ] All error responses include a typed `code` field
@@ -212,27 +220,6 @@ all variables interpolated; the `expects` field fully describes any required sub
   `koto init` — not in scope
 - **Streaming integration responses**: delegate responses are captured synchronously and
   returned in full; streaming is deferred
-
-## Open Questions
-
-**Q1. Delegate response flow**
-When koto invokes a processing integration (delegate CLI) during `koto next`, the delegate's
-output is returned in the response for the agent to use as context. But should this response
-also be automatically stored as evidence for gate evaluation? If a state has a gate requiring
-`delegate_output` to be non-empty, should koto populate that field from the delegate response
-without requiring an additional `--submit` call from the agent?
-
-*Impact:* affects whether the agent loop for delegation is one call (`koto next` runs delegate,
-stores response, auto-advances) or two calls (`koto next` runs delegate and returns output,
-then `koto next --submit` to record the response and advance).
-
-**Q2. Chain advancement**
-When `koto next` advances state and the new state's conditions are also immediately satisfied
-(e.g., a command gate that passes instantly), should koto continue advancing through states in
-a single call until it reaches a state that requires agent action? Or should it stop after one
-transition and let the agent call `koto next` again?
-
-*Impact:* affects agent loop complexity and the meaning of a single `koto next` response.
 
 ## Known Limitations
 
