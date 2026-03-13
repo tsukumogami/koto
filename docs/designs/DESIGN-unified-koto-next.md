@@ -141,3 +141,245 @@ Key properties:
 - Evidence is cleared atomically with each transition commit and archived to history
 - No new packages introduced; changes are contained to existing packages
 
+## Solution Architecture
+
+### Overview
+
+`koto next` becomes a single command that auto-advances through the state machine until
+blocked, accepts evidence submissions via `--with-data`, and supports human-directed
+transitions via `--to`. The CLI delegates to `Controller.Advance()`, which loops over
+`Engine.Transition()` calls until a stopping condition is reached. Each transition is
+independently committed; evidence is cleared atomically on each commit. A visited-state
+set scoped to the current call prevents infinite loops on cyclic templates.
+
+### Components
+
+**`pkg/engine` — single-transition executor**
+
+- `types.go`: `TransitionDecl{Target string, Gates map[string]*GateDecl}` replaces
+  `MachineState.Transitions []string`. `MachineState` gains a `Processing string` field
+  identifying the processing integration (empty means none). Shared gates remain on
+  `MachineState.Gates`.
+- `engine.go`: `Transition(target string, opts ...TransitionOption)` is updated to:
+  1. Resolve `target` to a matching `TransitionDecl` in `ms.Transitions`
+  2. Evaluate shared gates (`MachineState.Gates`) with AND logic — fail fast
+  3. Evaluate per-transition gates (`TransitionDecl.Gates`) with AND logic — fail fast
+  4. If `directed` option is set, skip gate evaluation entirely
+  5. Build `HistoryEntry` — archive current `State.Evidence`
+  6. Reset `State.Evidence = make(map[string]string)`
+  7. Commit via `persist()` — single atomic write
+
+**`pkg/controller` — advancement loop and integration orchestration**
+
+- `types.go` (new or extended): `AdvanceOpts{WithData map[string]string, To string}`.
+  `AdvanceResult{Directive Directive, StoppedBecause StopReason, Advanced bool}`.
+  `IntegrationRunner` interface: `Run(integrationName string, state State) (map[string]string, error)`.
+  `StopReason` enum: `StopGateBlocked`, `StopProcessingIntegration`, `StopTerminal`, `StopCycleDetected`, `StopDirected`.
+- `controller.go`: `Controller` gains `runner IntegrationRunner` field injected at `New()`.
+  `Advance(opts AdvanceOpts) (*AdvanceResult, error)` implements:
+  ```
+  visited := map[string]bool{}
+  loop:
+    current := eng.CurrentState()
+    ms := machine.States[current]
+    if visited[current]: return StopCycleDetected
+    visited[current] = true
+    if ms.Terminal: return StopTerminal
+    if ms.Processing != "" && !opts.To:
+      result, err := runner.Run(ms.Processing, state)
+      return StopProcessingIntegration with result
+    determine target (from opts.To, or resolve from satisfied TransitionDecl)
+    if no satisfied target: return StopGateBlocked
+    eng.Transition(target, evidence options...)
+    if opts.To: return StopDirected (always stop after directed)
+    continue loop
+  ```
+
+**`pkg/template` — format v2 compilation**
+
+- `compile/compile.go`: `sourceStateDecl.Transitions` changes from `[]string` to
+  `[]sourceTransitionDecl{Target string, Gates map[string]sourceGateDecl}`. Shared gates
+  remain as `map[string]sourceGateDecl` on the state.
+- `compiled.go`: `StateDecl.Transitions []string` → `[]engine.TransitionDecl`.
+  `FormatVersion` bumps from 1 to 2. Parser rejects format version 1 with a migration
+  error message.
+- `StateDecl` gains `Processing string` field, compiled from `processing: <name>` in
+  template YAML.
+
+**`cmd/koto/main.go` — CLI entry point**
+
+- `cmdTransition` removed. `cmdNext` gains `--with-data <file>` (reads JSON, passes as
+  evidence) and `--to <transition>` (directed target). Both flags populate `AdvanceOpts`.
+- `koto next` → `controller.Advance(opts)` → format `AdvanceResult` as JSON output.
+
+### Key Interfaces
+
+```go
+// IntegrationRunner is injected into the controller at construction time.
+// Implementations live in internal/ or cmd/.
+type IntegrationRunner interface {
+    Run(integrationName string, state engine.State) (map[string]string, error)
+}
+
+// AdvanceOpts controls a single Advance() call.
+type AdvanceOpts struct {
+    WithData map[string]string // evidence to inject into each transition
+    To       string            // directed transition target; bypasses gates
+}
+
+// AdvanceResult is returned by Advance().
+type AdvanceResult struct {
+    Directive     Directive  // current state's directive (after stopping)
+    StoppedBecause StopReason
+    Advanced      bool       // false if no transitions were taken
+}
+
+// TransitionDecl declares one outgoing transition (replacing []string).
+// Lives in pkg/engine/types.go.
+type TransitionDecl struct {
+    Target string
+    Gates  map[string]*GateDecl // per-transition gates; evaluated after shared gates
+}
+
+// MachineState gains Processing field (pkg/engine/types.go).
+type MachineState struct {
+    Transitions []TransitionDecl
+    Terminal    bool
+    Gates       map[string]*GateDecl // shared gates; evaluated before per-transition gates
+    Processing  string               // non-empty: name of processing integration to invoke
+}
+```
+
+### Data Flow
+
+**Normal `koto next` call (no flags):**
+```
+CLI
+  → Advance(AdvanceOpts{})
+  → loop:
+      CurrentState → check visited, terminal, processing
+      evaluate shared gates → evaluate per-transition gates → find satisfied target
+      if no target: return StopGateBlocked (return directive)
+      Transition(target) → archive evidence → clear evidence → persist
+      continue
+  → return AdvanceResult to CLI
+  → CLI formats as JSON
+```
+
+**Evidence submission (`koto next --with-data data.json`):**
+```
+CLI reads data.json → AdvanceOpts{WithData: {...}}
+  → Advance injects evidence into first Transition() call via WithEvidence option
+  → gate evaluation uses merged evidence → transition committed → evidence cleared
+  → auto-advancement continues from new state with empty evidence
+```
+
+**Directed transition (`koto next --to <target>`):**
+```
+CLI → AdvanceOpts{To: "target_state"}
+  → Advance skips gate evaluation for the target transition
+  → Transition(target, WithDirected(true)) → HistoryEntry.Directed = true
+  → return StopDirected immediately (always stop after directed)
+```
+
+**Processing integration stop:**
+```
+Advance detects ms.Processing != "" in current state
+  → runner.Run(ms.Processing, state) → returns result data
+  → return StopProcessingIntegration with integration output
+  → CLI formats output with expects: {submit_with: "--with-data"}
+```
+
+## Implementation Approach
+
+### Phase 1: Engine type model and evidence clearing
+
+Update the engine's data model. This is the foundation all other changes depend on.
+
+Deliverables:
+- `pkg/engine/types.go`: Add `TransitionDecl` struct; change `MachineState.Transitions`
+  from `[]string` to `[]TransitionDecl`; add `MachineState.Processing string`
+- `pkg/engine/engine.go`: Update `Transition()` to resolve target via `TransitionDecl`
+  slice; two-phase gate evaluation (shared then per-transition); evidence archive + clear
+  before `persist()`; add `WithDirected` transition option
+- `pkg/engine/engine_test.go`: Update all tests that construct `MachineState` with
+  `Transitions []string`; add tests for per-transition gates, evidence clearing, directed
+
+### Phase 2: Template format v2
+
+Update the template compilation pipeline to produce the new engine types.
+
+Deliverables:
+- `pkg/template/compile/compile.go`: Parse `transitions` as `[]sourceTransitionDecl`
+  (YAML object with `target` and `gates`); parse `processing` field on states
+- `pkg/template/compiled.go`: Update `StateDecl.Transitions` to `[]engine.TransitionDecl`;
+  add `StateDecl.Processing string`; bump `FormatVersion` to 2; add v1 rejection with
+  migration message
+- `pkg/template/compile/compile_test.go`: Update fixtures for new format
+
+### Phase 3: Controller advancement loop
+
+Add `Advance()` to the controller with the full stopping-condition loop.
+
+Deliverables:
+- `pkg/controller/types.go` (new): `AdvanceOpts`, `AdvanceResult`, `StopReason`,
+  `IntegrationRunner` interface
+- `pkg/controller/controller.go`: Add `runner IntegrationRunner` to `Controller`;
+  update `New()` to accept runner; implement `Advance(opts AdvanceOpts)`
+- `pkg/controller/controller_test.go`: Tests for each stopping condition; visited-state
+  cycle; directed transition; evidence injection
+
+### Phase 4: CLI and command cleanup
+
+Wire everything together at the CLI layer. Remove `koto transition`.
+
+Deliverables:
+- `cmd/koto/main.go`: Remove `cmdTransition`; update `cmdNext` with `--with-data` and
+  `--to` flags; route to `controller.Advance()`; format `AdvanceResult` as JSON output
+- Integration tests covering the full call path
+
+## Security Considerations
+
+_To be completed in Phase 5._
+
+## Consequences
+
+### Positive
+
+- **Single command surface**: agents call `koto next` for all state progression, eliminating
+  ordering errors and preventing invalid command sequences
+- **Evidence correctness**: per-state scoping prevents contamination across branches and loop
+  iterations; clearing is atomic with the transition commit
+- **Crash recovery**: independent per-transition commits mean any crash leaves the workflow
+  in a valid, recoverable state; no multi-state rollbacks needed
+- **Testable at every layer**: engine tests cover single-transition atomics; controller tests
+  cover the loop and stopping conditions via interface injection; no subprocess side effects
+  in any unit test path
+- **Minimal blast radius**: changes are contained to existing packages; no new packages
+  introduced; one external CLI caller of `Transition()` needs updating
+
+### Negative
+
+- **Breaking template format change**: `transitions: [string]` → `transitions: [{target, gates}]`
+  requires all existing template files to be migrated; format version 1 templates become invalid
+- **`koto transition` removed**: callers using `koto transition` directly (scripts, documentation,
+  existing workflows) must update to `koto next --to <target>`
+- **Controller grows significantly**: `Next()` (~40 lines) is joined by `Advance()` (~150-200
+  lines) plus helper methods; the controller package takes on more responsibility than before
+- **Processing integration field is new infrastructure**: `MachineState.Processing` and the
+  `IntegrationRunner` interface have no prior art in the codebase; their semantics must be
+  documented carefully to prevent misuse
+
+### Mitigations
+
+- **Template migration**: format version 2 rejection includes a clear migration error message;
+  a migration guide in the documentation covers the before/after format change
+- **`koto transition` removal**: `koto next --to` is a direct replacement with identical
+  semantics for the human-directed case; the CLI help text will document the change
+- **Controller complexity**: `Advance()` is decomposed into named helper methods
+  (`findSatisfiedTransition`, `isCycle`, `checkStoppingConditions`) to keep the loop body
+  readable; the stopping conditions map directly to PRD requirements
+- **IntegrationRunner documentation**: the interface contract is documented with a concrete
+  example (delegate CLI invocation) and the `Processing` field semantics are specified in
+  the template format guide
+
