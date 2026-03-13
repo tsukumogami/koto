@@ -53,7 +53,8 @@ requires rather than requiring agents to track it themselves.
   determine its next action from the response alone
 - The CLI surface stays constant as new capabilities (evidence submission, delegation, future
   integrations) are added
-- Branching workflows are supported without agents naming target states
+- Branching workflows are supported without agents needing foreknowledge of state names
+- Human-directed transitions allow an agent to advance to a named valid outgoing state on explicit instruction, bypassing condition evaluation
 
 ## User Stories
 
@@ -99,6 +100,10 @@ parsing error text.
 **As a CI/CD pipeline maintainer**, I want koto to handle SIGTERM gracefully so that a
 pipeline timeout or job cancellation leaves the workflow in a consistent, resumable state
 rather than corrupting it mid-transition.
+
+**As a developer supervising an agent workflow**, I want to instruct the agent to advance
+to a specific valid next state without waiting for conditions to clear, so that I can
+redirect the workflow when I've already made the decision the conditions are trying to verify.
 
 ## Requirements
 
@@ -174,6 +179,14 @@ not error message text. Required error codes:
 - `invalid_submission`: submission format doesn't match what the state expects
 - `integration_unavailable`: a required koto-owned integration is not accessible; includes
   fallback guidance
+
+**R10a. Directed transition**
+`koto next --to <transition>` advances the workflow to the named outgoing transition without
+evaluating conditions. The named transition must be a valid outgoing transition from the
+current state; if it is not, koto returns a caller error (exit 2). The transition is recorded
+in the audit trail with a `directed: true` marker, distinguishing it from gate-cleared
+advancement. This enables agents to execute human-directed workflow redirects without the
+agent needing to determine which branch to take autonomously.
 
 **R10. Advancement with gate failure detail**
 When conditions are not satisfied, the response includes structured detail for each unsatisfied
@@ -314,6 +327,12 @@ all variables interpolated; the `expects` field fully describes any required sub
       history including timestamps and evidence submitted at each step
 - [ ] A developer can submit missing evidence manually via `koto next --with-data` to unblock
       a stuck workflow without re-initializing it
+- [ ] `koto next --to <transition>` advances to the named state without evaluating conditions
+      when the named transition is a valid outgoing transition from the current state
+- [ ] `koto next --to <transition>` returns a caller error (exit 2) when the named transition
+      is not a valid outgoing transition from the current state
+- [ ] A directed transition is recorded in the state file with a `directed: true` marker,
+      distinguishable from gate-cleared transitions in the audit record
 
 ## Out of Scope
 
@@ -346,7 +365,9 @@ all variables interpolated; the `expects` field fully describes any required sub
 - Transition-level conditions are a breaking change to the template format. Existing templates
   that use state-level gates will require migration. This is acceptable given koto has no
   production users, but template authors should be aware.
-- The `koto transition` command is removed. Workflows that relied on agents explicitly naming
-  target states must be redesigned to use evidence-based branching instead.
+- The `koto transition` command is removed. Workflows that relied on agents autonomously
+  selecting target states must be redesigned to use evidence-based branching. Human-directed
+  transitions (`koto next --to`) remain available for cases where a human explicitly instructs
+  the agent to take a specific branch.
 - Processing integrations run synchronously during `koto next`. Long-running integrations
   (large codebase delegation, slow CI) will block the call for the duration of their timeout.
