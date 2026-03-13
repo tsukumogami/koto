@@ -340,7 +340,47 @@ Deliverables:
 
 ## Security Considerations
 
-_To be completed in Phase 5._
+### Download Verification
+
+Not applicable. This design adds no download capability. All changes operate on local
+state files and invoke local binaries. No external URLs are fetched, no artifacts
+downloaded, no checksums needed.
+
+### Execution Isolation
+
+**Command gates** — Gate commands are declared as static strings in template YAML and
+invoked with a timeout. Evidence values must not be interpolated into the command string
+itself; the engine passes evidence only through a controlled mechanism (explicit environment
+variable allowlist or stdin). Inherited environment must be stripped when invoking gate
+commands — retain PATH and HOME only. Templates containing command gates are trusted code;
+operators should apply the same review processes to templates as to application code.
+
+**IntegrationRunner** — The `Processing` field in a template specifies an integration name,
+not a raw binary path. The `IntegrationRunner` implementation must resolve names through a
+configured allowlist, not treat the field as an executable path. All integration invocations
+should be logged.
+
+**`--with-data` file reading** — The evidence file must be validated before injection: size
+limit (1 MB), valid JSON structure, bounded key and value lengths. The file path must be
+canonicalized to prevent traversal attacks.
+
+### Supply Chain Risks
+
+koto templates are the primary supply chain artifact. Templates declare gate commands
+(shell subprocesses) and integration runner names. A compromised template can invoke
+arbitrary shell commands or unintended CLIs. Templates should be distributed with the same
+review processes as source code. The compiled template cache (SHA-256 keyed) ensures
+integrity within a session but does not verify template authorship. Future work: ECDSA
+template signing and verification before execution.
+
+### User Data Exposure
+
+Evidence submitted via `--with-data` is written to the state file and archived to history
+entries on every transition. Evidence values may include sensitive data (tokens, intermediate
+agent outputs). State files must be created with 0600 permissions. If a directive template
+interpolates evidence values into text forwarded to external services (e.g., an LLM), secrets
+in evidence would be exposed; template authors should avoid interpolating evidence keys that
+may contain sensitive values.
 
 ## Consequences
 

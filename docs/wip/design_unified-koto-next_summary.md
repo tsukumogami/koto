@@ -28,6 +28,12 @@ isn't justified when the controller already serves as the orchestration layer.
   template format design doc already anticipated transition-level gates (deferred to Phase 2);
   cache uses SHA-256 addressing so no special invalidation needed
 
+## Security Review (Phase 5)
+**Outcome:** Option 2 — Document considerations
+**Summary:** No download/supply-chain risks from this design itself. Command gate
+environment isolation, IntegrationRunner allowlisting, evidence file validation, and
+state file permissions are the key implementation concerns. No design changes needed.
+
 ## Current Status
-**Phase:** 4 - Architecture
+**Phase:** 5 - Security
 **Last Updated:** 2026-03-13
