@@ -321,11 +321,6 @@ that ran the workflow.
 
 ### Non-functional Requirements
 
-**R11. Output backward compatibility scope**
-koto has no production users. No backward compatibility with the existing `koto transition`
-command is required. The template format change for transition-level conditions is a breaking
-change; existing templates require migration.
-
 **R12. Integration availability fallback**
 For processing integrations (delegate CLIs), if the configured tool is not accessible or exceeds
 its timeout, `koto next` returns the directive without integration output and includes a
@@ -435,9 +430,10 @@ all variables interpolated; the `expects` field fully describes any required sub
 
 ## Known Limitations
 
+- koto has no production users. No backward compatibility with the existing `koto transition`
+  command is required.
 - Transition-level conditions are a breaking change to the template format. Existing templates
-  that use state-level gates will require migration. This is acceptable given koto has no
-  production users, but template authors should be aware.
+  that use state-level gates will require migration.
 - The `koto transition` command is removed. Workflows that relied on agents autonomously
   selecting target states must be redesigned to use evidence-based branching. Human-directed
   transitions (`koto next --to`) remain available for cases where a human explicitly instructs
