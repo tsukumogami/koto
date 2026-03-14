@@ -2,7 +2,7 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
-use crate::engine::types::Event;
+use crate::engine::types::{Event, MachineState};
 
 /// Append one event as a JSON line to the state file at `path`.
 ///
@@ -75,10 +75,27 @@ pub fn derive_state(events: &[Event]) -> Option<String> {
     events.last().map(|e| e.state.clone())
 }
 
+/// Derive full machine state from an event log.
+///
+/// Scans events for the `init` event to extract `template_path` and
+/// `template_hash`, and uses the last event's `state` for `current_state`.
+/// Returns `None` if the log is empty or has no init event with template info.
+pub fn derive_machine_state(events: &[Event]) -> Option<MachineState> {
+    let current_state = events.last()?.state.clone();
+    let init = events
+        .iter()
+        .find(|e| e.event_type == "init" && e.template.is_some())?;
+    Some(MachineState {
+        current_state,
+        template_path: init.template.clone().unwrap_or_default(),
+        template_hash: init.template_hash.clone().unwrap_or_default(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::types::Event;
+    use crate::engine::types::{Event, MachineState};
     use tempfile::TempDir;
 
     fn make_event(event_type: &str, state: &str) -> Event {
@@ -169,5 +186,35 @@ mod tests {
     #[test]
     fn derive_state_returns_none_for_empty() {
         assert_eq!(derive_state(&[]), None);
+    }
+
+    #[test]
+    fn derive_machine_state_extracts_template_from_init() {
+        let events = vec![
+            Event {
+                event_type: "init".to_string(),
+                state: "gather".to_string(),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                template: Some("/cache/abc.json".to_string()),
+                template_hash: Some("deadbeef".to_string()),
+            },
+            make_event("rewind", "gather"),
+        ];
+        let ms = derive_machine_state(&events).unwrap();
+        assert_eq!(ms.current_state, "gather");
+        assert_eq!(ms.template_path, "/cache/abc.json");
+        assert_eq!(ms.template_hash, "deadbeef");
+    }
+
+    #[test]
+    fn derive_machine_state_returns_none_for_empty() {
+        assert_eq!(derive_machine_state(&[]), None);
+    }
+
+    #[test]
+    fn derive_machine_state_returns_none_without_init() {
+        // A log with no init event (shouldn't happen in practice, but guard against it)
+        let events = vec![make_event("rewind", "gather")];
+        assert!(derive_machine_state(&events).is_none());
     }
 }

@@ -23,7 +23,7 @@ pub struct Event {
 }
 
 /// Derived current state of a workflow.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MachineState {
     /// The name of the current state (last event's `state` field).
     pub current_state: String,
