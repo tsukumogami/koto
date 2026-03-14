@@ -492,10 +492,20 @@ Deliverables:
 - `koto rewind` as rewound event
 - **Tactical sub-design**: Auto-Advancement Engine
 
+## Implementation Language
+
+koto will be implemented in Rust. The event-sourced refactor represents a near-complete
+rewrite of core logic — switching languages at the same time does not add significant cost.
+The four tactical sub-designs below should target Rust (Cargo workspace, clap v4, serde,
+tokio). The external CLI contract (command names, flag names, JSON output schema) is
+unchanged; agents must not notice the language switch. A separate migration design covers
+the Go→Rust transition, workspace structure, CI changes, and sequencing.
+
 ## Required Tactical Designs
 
 | Sub-design | Repo | Scope |
 |-----------|------|-------|
+| Go→Rust Migration | koto | Cargo workspace layout, crate structure, CI, migration sequencing |
 | Event Log Format | koto | State file JSONL schema, event type taxonomy, migration |
 | Template Format v2 | koto | `accepts`/`when` syntax, compiler changes, format version |
 | CLI Output Contract | koto | `koto next` JSON schema, `expects` derivation, errors |
