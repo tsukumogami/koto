@@ -17,13 +17,13 @@ decision: |
   of what event the agent should submit next. Four tactical sub-designs implement each
   system boundary once the shared event taxonomy is accepted.
 rationale: |
-  The event log model earns the migration cost the PRD already requires. Breaking changes
-  to state file and template format are unavoidable; given that, the event log buys
-  structural evidence scoping (no policy-based clearing), simpler atomicity (append, not
-  rewrite), and a first-class audit trail. Protocol-first and declarative-language-first
-  approaches treat the output schema or template format as the design constraint, producing
-  a weaker architecture. Minimal extension avoids migration but leaves two coexisting
-  transition syntaxes and policy-based evidence clearing as ongoing maintenance burdens.
+  The event log model produces the best architecture for koto's correctness requirements.
+  It buys structural evidence scoping (no policy-based clearing), simpler atomicity
+  (append, not rewrite), and a first-class audit trail. Protocol-first and
+  declarative-language-first approaches treat the output schema or template format as the
+  design constraint, producing a weaker architecture. Minimal extension leaves two
+  coexisting transition syntaxes and policy-based evidence clearing as ongoing maintenance
+  burdens.
 ---
 
 # DESIGN: Unified koto next Command
@@ -61,8 +61,6 @@ defines the constraints each tactical design must satisfy.
   schema changes visible to agents
 - **Self-describing output**: an agent that has never seen the workflow template must be
   able to determine its next action from the `koto next` response alone
-- **Breaking change scope**: both state file format and template format changes are
-  breaking; the design must make clear what migration is required and by whom
 - **Sub-design independence**: tactical designs for CLI contract, state model, and
   template format must be implementable in sequence without circular dependencies
 - **Evidence correctness**: per-state evidence scoping is required for correctness with
@@ -84,9 +82,9 @@ in each — it's what philosophy should govern how they fit together. Choose the
 and the three systems pull in different directions. Choose right and each system's design
 follows naturally from the others.
 
-The PRD mandates breaking changes to both the state file format and the template format, so
-migration cost is unavoidable. The question is whether that migration buys a better
-long-term architecture or just the minimum viable one.
+This design introduces breaking changes to both the state file format and the template
+format. koto has not shipped a stable release, so no existing users are affected and the
+changes are made without migration concerns.
 
 #### Chosen: Event-Sourced State Machine
 
@@ -119,10 +117,8 @@ workflow. Recovery is replay from the last valid event — no partial-mutation e
 Atomic writes simplify: appending an event is simpler than the current temp-file-rename
 pattern because an append either succeeds fully or fails detectably (sequence number gap).
 
-The migration cost is real: existing state files must transform from the mutable snapshot
-format to event log format, and existing templates must be rewritten to declare event
-schemas alongside transition conditions. A migration tool and format version detection are
-required. Workflows mid-execution at migration time need careful handling.
+Both the state file format and the template format are breaking changes. This is intentional
+— koto has no released users and no existing workflows to preserve.
 
 #### Alternatives Considered
 
@@ -142,11 +138,10 @@ transition accept?" question than YAML blocks.
 
 **Minimal Extension**: Extend the existing model with the minimum changes required —
 backward-compatible template additions, policy-based evidence clearing, optional `expects`
-declarations. Lowest migration burden and fastest to ship. Rejected because the PRD already
-mandates breaking changes to both format and state file; given that, minimal extension buys
-lower scope at the cost of a weaker long-term model. Two coexisting transition syntaxes and
-policy-based evidence clearing (rather than structural scoping) create ongoing maintenance
-burden. When a breaking migration is unavoidable, the right question is what to buy with it.
+declarations. Fastest to ship, but leaves two coexisting transition syntaxes and
+policy-based evidence clearing as ongoing maintenance burdens. Rejected because the weaker
+model produces no architectural benefit; the event-sourced approach costs the same (both
+are breaking changes at this stage) and buys structural correctness guarantees.
 
 ## Decision Outcome
 
@@ -187,13 +182,14 @@ format is accepted, since all three depend on the event type taxonomy.
 
 ### Rationale
 
-The event-sourced model earns the migration cost the PRD already requires. Breaking changes
-to state file format and template format are unavoidable; the question is what architecture
-to buy with them. The mutable-state model requires policy-based evidence clearing (clear the
-map on each transition) and careful atomicity to avoid partial mutations. The event log model
-makes both unnecessary: evidence scoping is structural (events are immutable and state-tagged),
-and writes are appends (simpler atomicity guarantees). These aren't minor improvements — they
-eliminate entire categories of bugs and simplify the recovery story for long-running workflows.
+The event-sourced model produces the right architecture for koto's correctness requirements.
+The mutable-state model requires policy-based evidence clearing (clear the map on each
+transition) and careful atomicity to avoid partial mutations. The event log model makes
+both unnecessary: evidence scoping is structural (events are immutable and state-tagged),
+and writes are appends (simpler atomicity guarantees). These aren't minor improvements —
+they eliminate entire categories of bugs and simplify the recovery story for long-running
+workflows. The state file and template format changes are breaking, which is acceptable
+at koto's current pre-release stage.
 
 The approach also aligns the three systems around a single concept. Every API boundary in
 koto — what templates declare, what the state file stores, what `koto next` outputs — is
@@ -230,7 +226,7 @@ All events share: `seq` (monotonic integer), `timestamp` (RFC 3339), `type` (str
 The state file changes from a mutable JSON object to a JSONL event log:
 
 ```
-{"schema_version":3,"workflow":"my-workflow","template_hash":"abc123","created_at":"..."}
+{"schema_version":1,"workflow":"my-workflow","template_hash":"abc123","created_at":"..."}
 {"seq":1,"timestamp":"...","type":"workflow_initialized","payload":{"variables":{}}}
 {"seq":2,"timestamp":"...","type":"transitioned","payload":{"from":null,"to":"gather_info","condition_type":"auto"}}
 {"seq":3,"timestamp":"...","type":"evidence_submitted","payload":{"state":"gather_info","fields":{"input_file":"results.json"}}}
@@ -246,14 +242,8 @@ The state file changes from a mutable JSON object to a JSONL event log:
   archived in the log but excluded from the current evidence set. Only the evidence
   accumulated since the last arrival at this state is active.
 - **Atomicity**: each event is appended with fsync; a sequence number gap detects partial writes
-- **Format detection**: the migration loader distinguishes old from new format by structure,
-  not version number. The existing mutable JSON format is a single JSON object parseable in
-  one read; the new JSONL format has multiple lines. The loader reads the first line: if the
-  file has more than one line, it's JSONL; if it's a single JSON object, it's the old format
-  and must be migrated. Schema version 3 is reserved for the JSONL header; existing files at
-  schema version 1 or 2 are old-format mutable JSON objects.
-- **Migration**: on load, if the file is the old format, the engine synthesizes an event log
-  in memory and re-persists it; migration is automatic and transparent
+- **Breaking change**: the existing mutable JSON state file format is replaced entirely; this
+  is intentional and acceptable at koto's pre-release stage
 
 ### Template Format
 
@@ -297,7 +287,8 @@ states:
 States with no `accepts` block and no `when` conditions are auto-advanced through when
 their `gates` are satisfied. The template compiler validates that per-transition `when`
 conditions on the same state are mutually exclusive (same field, disjoint values) and
-rejects templates that are non-deterministic. Format version bumps from 1 to 2.
+rejects templates that are non-deterministic. The template format is a breaking change
+from the current YAML structure; acceptable at koto's pre-release stage.
 
 ### CLI Output Schema
 
@@ -382,12 +373,9 @@ Exit codes: `0` success, `1` transient (gates blocked, integration unavailable, 
 conflict), `2` caller error (bad input, invalid submission), `3` config error (corrupt
 state, invalid template, not initialized).
 
-**`koto transition` deprecation**: the existing `koto transition <target>` command is
-deprecated by this design. Directed transitions are submitted via `koto next --to <target>`
-as part of the unified command. The tactical CLI Output Contract sub-design specifies the
-removal timeline; the Phase 4 auto-advancement sub-design implements the replacement
-semantics. The `koto transition` command must not be included in any new documentation
-once the unified `koto next` is implemented.
+**`koto transition` removal**: the existing `koto transition <target>` command is removed
+by this design. Directed transitions are submitted via `koto next --to <target>` as part
+of the unified command. This is a breaking change; acceptable at koto's pre-release stage.
 
 ### Data Flow
 
@@ -431,7 +419,7 @@ once the event taxonomy (above) is accepted:
 
 | Sub-design | Scope | Depends on |
 |-----------|-------|-----------|
-| Event log format | State file schema, JSONL structure, event type definitions, migration | Nothing (foundational) |
+| Event log format | State file schema, JSONL structure, event type definitions | Nothing (foundational) |
 | Template format v2 | `accepts` block, `when` conditions, `integration` field, compiler changes | Event taxonomy |
 | CLI output contract | `koto next` JSON schema, `expects` derivation, error codes, exit codes | Event taxonomy |
 | Auto-advancement engine | Replay logic, loop, stopping conditions, integration invocation, `koto rewind` | All three above |
@@ -445,13 +433,11 @@ Accept the event type definitions and JSONL format. Everything else builds on th
 Deliverables:
 - Event taxonomy document (6 event types, all fields, sequence semantics) — including
   the `integration_invoked` output field type, which Phase 3 needs for the CLI schema
-- State file schema v3 specification (JSONL header + event lines), including format
-  detection rules for migration from legacy schema versions 1 and 2
+- State file schema specification (JSONL header + event lines)
 - Epoch boundary rule for evidence replay (evidence scoped to most recent arrival at
   each state, not all historical visits)
 - JSONL vs. JSON-array evaluation (the tactical sub-design should document this
   trade-off explicitly before committing to the line-by-line reader approach)
-- Migration spec (old JSON object → synthesized event log)
 - **Tactical sub-design**: Event Log Format
 
 ### Phase 2: Template format v2 (parallel with Phase 3)
@@ -463,7 +449,6 @@ Deliverables:
 - `when` conditions on transitions (replacing `transitions: []string`)
 - `integration` field (string tag, config-bound routing)
 - Mutual exclusivity validation in compiler
-- Format version bump 1 → 2
 - **Tactical sub-design**: Template Format v2
 
 ### Phase 3: CLI output contract (parallel with Phase 2)
@@ -506,7 +491,7 @@ the Go→Rust transition, workspace structure, CI changes, and sequencing.
 | Sub-design | Repo | Scope |
 |-----------|------|-------|
 | Go→Rust Migration | koto | Cargo workspace layout, crate structure, CI, migration sequencing |
-| Event Log Format | koto | State file JSONL schema, event type taxonomy, migration |
+| Event Log Format | koto | State file JSONL schema, event type taxonomy |
 | Template Format v2 | koto | `accepts`/`when` syntax, compiler changes, format version |
 | CLI Output Contract | koto | `koto next` JSON schema, `expects` derivation, errors |
 | Auto-Advancement Engine | koto | Replay, loop, stopping conditions, integration invocation |
@@ -581,32 +566,19 @@ to prevent tampered templates from being silently applied to existing workflows.
 
 ### Negative
 
-- **Migration is the largest of any approach**: existing state files and templates must
-  both change format; automatic migration handles state files, but templates require
-  manual rewrite by workflow authors
 - **Event replay latency grows with log length**: replaying hundreds of events on every
   `koto next` call adds measurable latency for long-running workflows; snapshot mechanism
   (optional initially) is needed for production workflows that run long
-- **Event schema immutability**: once an event is appended, its payload is permanent;
-  if the template's event schema changes mid-workflow, old events may not parse correctly
-  against the new schema; schema evolution requires versioned event types or a migration
-  strategy
 - **Template authoring is more complex**: workflow authors must understand the `accepts`/
-  `when` model to write branching workflows; the existing `transitions: []string` model
-  was simpler, even if less powerful
-- **Four tactical sub-designs before implementation**: the strategic design requires
-  accepting four sub-designs before a single line of implementation code is written;
-  the upfront design investment is higher than other approaches
+  `when` model to write branching workflows; flat `transitions: []string` was simpler
+- **Five tactical sub-designs before implementation**: the strategic design requires
+  accepting five sub-designs (including the Go→Rust migration) before a single line of
+  implementation code is written; the upfront design investment is higher than other approaches
 
 ### Mitigations
 
-- **Template migration**: a migration guide documents the before/after format change for
-  every template construct; the compiler rejects v1 templates with a clear error pointing
-  to the migration guide
 - **Replay latency**: the initial implementation skips snapshots; a snapshot event type
   is reserved in the event taxonomy so it can be added without a schema change when needed
-- **Schema evolution**: the event taxonomy spec includes versioning guidance; event types
-  carry a version field so old events remain parseable after schema changes
 - **Authoring complexity**: the template format guide includes worked examples for common
   patterns (linear, branching, looping, delegation); the compiler error messages for
   invalid `when` conditions name the conflicting transitions explicitly
