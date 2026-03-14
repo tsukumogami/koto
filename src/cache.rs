@@ -1,8 +1,10 @@
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use hex::encode as hex_encode;
 use sha2::{Digest, Sha256};
+use tempfile::Builder;
 
 use crate::template::compile::compile;
 
@@ -43,11 +45,30 @@ fn compile_cached_into(source_path: &Path, dir: &Path) -> anyhow::Result<(PathBu
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create cache directory: {}", dir.display()))?;
 
-    let tmp_path = cache_path.with_extension("tmp");
-    std::fs::write(&tmp_path, json_bytes)
-        .with_context(|| format!("failed to write cache temp file: {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, &cache_path)
-        .with_context(|| format!("failed to rename cache file: {}", cache_path.display()))?;
+    // Use a uniquely-named temp file so concurrent compilations of the same
+    // template (e.g. parallel integration tests) don't stomp on each other.
+    let mut tmp = Builder::new()
+        .suffix(".tmp")
+        .tempfile_in(dir)
+        .with_context(|| format!("failed to create temp file in: {}", dir.display()))?;
+    tmp.write_all(json_bytes)
+        .context("failed to write to cache temp file")?;
+
+    // persist() atomically renames the temp file to cache_path.
+    // POSIX rename replaces the destination atomically, so concurrent writers
+    // of the same content are all safe: the last rename wins but every writer
+    // produces identical bytes.
+    if let Err(e) = tmp.persist(&cache_path) {
+        if !cache_path.exists() {
+            return Err(anyhow::anyhow!(
+                "failed to rename cache file {}: {}",
+                cache_path.display(),
+                e.error
+            ));
+        }
+        // Another concurrent writer finished first; our temp file was cleaned
+        // up by the PersistError drop. The cache file is already in place.
+    }
 
     Ok((cache_path, hash))
 }
