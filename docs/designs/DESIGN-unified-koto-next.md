@@ -230,7 +230,7 @@ All events share: `seq` (monotonic integer), `timestamp` (RFC 3339), `type` (str
 The state file changes from a mutable JSON object to a JSONL event log:
 
 ```
-{"schema_version":2,"workflow":"my-workflow","template_hash":"abc123","created_at":"..."}
+{"schema_version":3,"workflow":"my-workflow","template_hash":"abc123","created_at":"..."}
 {"seq":1,"timestamp":"...","type":"workflow_initialized","payload":{"variables":{}}}
 {"seq":2,"timestamp":"...","type":"transitioned","payload":{"from":null,"to":"gather_info","condition_type":"auto"}}
 {"seq":3,"timestamp":"...","type":"evidence_submitted","payload":{"state":"gather_info","fields":{"input_file":"results.json"}}}
@@ -240,11 +240,20 @@ The state file changes from a mutable JSON object to a JSONL event log:
 - First line: header object (`schema_version`, `workflow`, `template_hash`, `created_at`)
 - Subsequent lines: events, one per line, in append order
 - **Current state**: `to` field of the last `transitioned` or `directed_transition` event
-- **Current evidence**: union of `evidence_submitted` events whose `payload.state` matches
-  current state (events from prior states are archived in the log but not active)
+- **Current evidence**: `evidence_submitted` events occurring after the most recent
+  `transitioned` event whose `payload.to` matches the current state — this is the epoch
+  boundary rule. Evidence from prior visits to the same state (in looping workflows) is
+  archived in the log but excluded from the current evidence set. Only the evidence
+  accumulated since the last arrival at this state is active.
 - **Atomicity**: each event is appended with fsync; a sequence number gap detects partial writes
-- **Migration**: on load, if the file is a JSON object (old format), the engine synthesizes
-  an event log in memory and re-persists it; migration is automatic and transparent
+- **Format detection**: the migration loader distinguishes old from new format by structure,
+  not version number. The existing mutable JSON format is a single JSON object parseable in
+  one read; the new JSONL format has multiple lines. The loader reads the first line: if the
+  file has more than one line, it's JSONL; if it's a single JSON object, it's the old format
+  and must be migrated. Schema version 3 is reserved for the JSONL header; existing files at
+  schema version 1 or 2 are old-format mutable JSON objects.
+- **Migration**: on load, if the file is the old format, the engine synthesizes an event log
+  in memory and re-persists it; migration is automatic and transparent
 
 ### Template Format
 
@@ -373,6 +382,13 @@ Exit codes: `0` success, `1` transient (gates blocked, integration unavailable, 
 conflict), `2` caller error (bad input, invalid submission), `3` config error (corrupt
 state, invalid template, not initialized).
 
+**`koto transition` deprecation**: the existing `koto transition <target>` command is
+deprecated by this design. Directed transitions are submitted via `koto next --to <target>`
+as part of the unified command. The tactical CLI Output Contract sub-design specifies the
+removal timeline; the Phase 4 auto-advancement sub-design implements the replacement
+semantics. The `koto transition` command must not be included in any new documentation
+once the unified `koto next` is implemented.
+
 ### Data Flow
 
 ```
@@ -427,8 +443,14 @@ once the event taxonomy (above) is accepted:
 Accept the event type definitions and JSONL format. Everything else builds on this.
 
 Deliverables:
-- Event taxonomy document (6 event types, all fields, sequence semantics)
-- State file schema v2 specification (JSONL header + event lines)
+- Event taxonomy document (6 event types, all fields, sequence semantics) — including
+  the `integration_invoked` output field type, which Phase 3 needs for the CLI schema
+- State file schema v3 specification (JSONL header + event lines), including format
+  detection rules for migration from legacy schema versions 1 and 2
+- Epoch boundary rule for evidence replay (evidence scoped to most recent arrival at
+  each state, not all historical visits)
+- JSONL vs. JSON-array evaluation (the tactical sub-design should document this
+  trade-off explicitly before committing to the line-by-line reader approach)
 - Migration spec (old JSON object → synthesized event log)
 - **Tactical sub-design**: Event Log Format
 
@@ -515,6 +537,10 @@ Integration output stored in `integration_invoked` events should be:
 - Validated against size limits before storage to prevent log bloat
 - Treated as untrusted if used in downstream interpolation contexts
 - Subject to schema validation if the integration is expected to return structured data
+
+Event log files must be created with restricted permissions (mode 0600) to limit
+access to the owning user. Evidence validation against the `accepts` schema must occur
+before appending the event to the log — not deferred post-storage.
 
 ### Template Hash Verification
 
