@@ -2,7 +2,7 @@
 
 Workflow orchestration engine for AI coding agents. koto enforces execution order through a state machine, persists progress atomically, and makes every state transition recoverable.
 
-Agents call `koto next` to get their current directive, do the work, then call `koto transition` to advance. The engine validates each transition against the workflow template and rejects anything out of order. If something goes wrong, `koto rewind` rolls back to a previous state without losing the audit trail.
+Agents call `koto next` to get their current directive and do the work. If something goes wrong, `koto rewind` rolls back to the previous state without losing the audit trail.
 
 ## Install
 
@@ -54,60 +54,34 @@ States without transitions are terminal -- the workflow ends there.
 ### 2. Initialize a workflow
 
 ```bash
-koto init --name review --template review.md --var PR_URL=https://github.com/org/repo/pull/42
+koto init review --template review.md
 ```
 
 ```json
-{"state":"assess","path":"wip/koto-review.state.json"}
+{"name":"review","state":"assess"}
 ```
 
 ### 3. Get the current directive
 
 ```bash
-koto next
+koto next review
 ```
 
 ```json
-{"action":"execute","state":"assess","directive":"Review the PR at https://github.com/org/repo/pull/42 and summarize the changes."}
+{"state":"assess","directive":"Review the PR at {{PR_URL}} and summarize the changes.","transitions":["feedback"]}
 ```
 
-### 4. Advance to the next state
+The `transitions` array shows which states can follow the current one.
 
-```bash
-koto transition feedback
-```
-
-```json
-{"state":"feedback","version":2}
-```
-
-### 5. Check workflow status
-
-```bash
-koto status
-```
-
-```
-Workflow: review
-State:    feedback
-History:  1 entries
-```
-
-### 6. Inspect full state
-
-```bash
-koto query
-```
-
-Returns the complete state as JSON, including workflow metadata, variables, and transition history.
+> **Note:** `koto transition` (advancing the workflow) is not available in this release. Transitions will be added in a future version.
 
 ## Key concepts
 
 **Templates** define the workflow: states, transitions between them, and directive text for each state. Variables (`{{KEY}}`) are interpolated into directives at runtime. Use `koto template compile` to validate templates during development and see the compiled JSON output.
 
-**State files** (`koto-<name>.state.json`) track progress. They're written atomically -- a crash mid-write can't corrupt them. A version counter detects concurrent modifications.
+**State files** (`koto-<name>.state.jsonl`) track progress in JSONL format -- one event per line, append-only. The current state is derived from the last event's `state` field.
 
-**Template integrity**: The template's SHA-256 hash is locked at init time. If someone modifies the template mid-workflow, every operation fails with `template_mismatch`. To change the template, cancel and restart.
+**Template integrity**: The template's SHA-256 hash is locked at init time and stored in the first event. If the compiled template changes, `next` will fail. To update the template, reinitialize the workflow.
 
 ## Agent integration
 
@@ -125,8 +99,7 @@ Once a skill is installed, the agent follows a simple cycle:
 1. `koto init` -- start the workflow from a template
 2. `koto next` -- get the current directive
 3. Execute the work described in the directive
-4. `koto transition <state>` -- advance to the next state
-5. Repeat from step 2 until `koto next` returns `done`
+4. Repeat from step 2
 
 The plugin also includes a Stop hook that detects active workflows when a session ends, so the agent can resume where it left off.
 
