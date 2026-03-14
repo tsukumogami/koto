@@ -16,14 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
+      - uses: dtolnay/rust-toolchain@stable
 
-      - run: go mod download
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build koto
-        run: go build -o ./koto ./cmd/koto/
+        run: cargo build --release
 
       - name: Compile all templates
         run: |
@@ -31,7 +29,7 @@ jobs:
           # Find template .md files under skills/, skipping SKILL.md files
           while IFS= read -r template; do
             echo "--- Compiling: $template"
-            if ./koto template compile "$template"; then
+            if ./target/release/koto template compile "$template"; then
               echo "PASS: $template"
             else
               echo "::error::Template compilation failed: $template"
@@ -52,36 +50,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
+      - uses: dtolnay/rust-toolchain@stable
 
-      - run: go mod download
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build koto
-        run: go build -o ./koto ./cmd/koto/
+        run: cargo build --release
 
       - name: Test Stop hook with active workflow
         run: |
           # Create a mock state file that koto workflows will discover.
-          # The discover package scans wip/ for koto-*.state.json files.
+          # The discover package scans for koto-*.state.jsonl files.
           mkdir -p wip
-          cat > wip/koto-mock.state.json << 'MOCK'
-          {
-            "workflow": {
-              "name": "mock",
-              "template_path": "/tmp/mock-template.md",
-              "created_at": "2025-01-01T00:00:00Z"
-            },
-            "current_state": "test-state"
-          }
+          cat > wip/koto-mock.state.jsonl << 'MOCK'
+          {"type":"init","state":"test-state","timestamp":"2025-01-01T00:00:00Z","template":"mock","template_hash":"abc123"}
           MOCK
 
           # Extract the hook command from hooks.json.
           HOOK_CMD=$(jq -r '.hooks.Stop[0].command' plugins/koto-skills/hooks.json)
 
           # The hook references 'koto' on PATH -- put our built binary on PATH.
-          export PATH="$PWD:$PATH"
+          export PATH="$PWD/target/release:$PATH"
 
           # Run the hook and capture output.
           OUTPUT=$(eval "$HOOK_CMD" 2>/dev/null || true)
@@ -96,10 +85,10 @@ jobs:
       - name: Test Stop hook with no active workflow
         run: |
           # Remove the mock state file so no workflows are active.
-          rm -rf wip/koto-mock.state.json
+          rm -rf wip/koto-mock.state.jsonl
 
           HOOK_CMD=$(jq -r '.hooks.Stop[0].command' plugins/koto-skills/hooks.json)
-          export PATH="$PWD:$PATH"
+          export PATH="$PWD/target/release:$PATH"
 
           OUTPUT=$(eval "$HOOK_CMD" 2>/dev/null || true)
           if [ -z "$OUTPUT" ]; then
