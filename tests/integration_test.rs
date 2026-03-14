@@ -318,6 +318,29 @@ fn rewind_fails_at_initial_state() {
     );
 }
 
+#[test]
+fn rewind_fails_for_unknown_workflow() {
+    let dir = TempDir::new().unwrap();
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["rewind", "no-such-workflow"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "rewind on unknown workflow should fail"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("error output should be valid JSON");
+    assert!(
+        json["error"].as_str().is_some(),
+        "error field should be present"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // workflows
 // ---------------------------------------------------------------------------
@@ -449,9 +472,9 @@ fn template_validate_succeeds_for_valid_template() {
 }
 
 #[test]
-fn template_validate_fails_for_invalid_json() {
+fn template_validate_fails_for_missing_required_fields() {
     let dir = TempDir::new().unwrap();
-    // Write a JSON file that lacks required fields.
+    // Write valid JSON that lacks required fields (format_version alone is not enough).
     let bad_json = dir.path().join("bad.json");
     std::fs::write(&bad_json, r#"{"format_version":1}"#).unwrap();
 
@@ -464,33 +487,6 @@ fn template_validate_fails_for_invalid_json() {
     assert!(
         !output.status.success(),
         "template validate should fail for JSON with missing required fields"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// rewind (continued)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn rewind_fails_for_unknown_workflow() {
-    let dir = TempDir::new().unwrap();
-
-    let output = koto()
-        .current_dir(dir.path())
-        .args(["rewind", "no-such-workflow"])
-        .output()
-        .unwrap();
-
-    assert!(
-        !output.status.success(),
-        "rewind on unknown workflow should fail"
-    );
-
-    let json: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("error output should be valid JSON");
-    assert!(
-        json["error"].as_str().is_some(),
-        "error field should be present"
     );
 }
 
