@@ -468,6 +468,33 @@ fn template_validate_fails_for_invalid_json() {
 }
 
 // ---------------------------------------------------------------------------
+// rewind (continued)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rewind_fails_for_unknown_workflow() {
+    let dir = TempDir::new().unwrap();
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["rewind", "no-such-workflow"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "rewind on unknown workflow should fail"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("error output should be valid JSON");
+    assert!(
+        json["error"].as_str().is_some(),
+        "error field should be present"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // full happy path sequence: init -> next -> rewind
 // ---------------------------------------------------------------------------
 
@@ -523,5 +550,28 @@ fn init_next_rewind_sequence() {
     assert!(rewind_out.status.success(), "rewind should succeed");
     let rewind_json: serde_json::Value = serde_json::from_slice(&rewind_out.stdout).unwrap();
     assert_eq!(rewind_json["name"], "seq-wf");
-    assert!(rewind_json["state"].as_str().is_some());
+    let rewound_state = rewind_json["state"]
+        .as_str()
+        .expect("state field should be present");
+
+    // next after rewind — state should match the rewound state
+    let next_after = koto()
+        .current_dir(dir.path())
+        .args(["next", "seq-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        next_after.status.success(),
+        "next after rewind should succeed"
+    );
+    let next_after_json: serde_json::Value = serde_json::from_slice(&next_after.stdout).unwrap();
+    assert_eq!(
+        next_after_json["state"].as_str(),
+        Some(rewound_state),
+        "state after rewind should match the rewound state"
+    );
+    assert!(
+        next_after_json["directive"].as_str().is_some(),
+        "directive should be present after rewind"
+    );
 }

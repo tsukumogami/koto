@@ -102,7 +102,7 @@ pub fn derive_machine_state(events: &[Event]) -> Option<MachineState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::types::{Event, MachineState};
+    use crate::engine::types::Event;
     use tempfile::TempDir;
 
     fn make_event(event_type: &str, state: &str) -> Event {
