@@ -1,7 +1,11 @@
+use std::path::Path;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::buildinfo;
+use crate::cache::compile_cached;
+use crate::template::types::CompiledTemplate;
 
 #[derive(Parser)]
 #[command(
@@ -65,6 +69,15 @@ pub enum TemplateSubcommand {
     },
 }
 
+/// Read and validate a compiled template JSON file.
+fn validate_compiled_template(path: &str) -> Result<(), String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("failed to read file: {}", e))?;
+    let template: CompiledTemplate =
+        serde_json::from_str(&content).map_err(|e| format!("invalid JSON: {}", e))?;
+    template.validate()
+}
+
 pub fn run(app: App) -> Result<()> {
     match app.command {
         Command::Version => {
@@ -93,15 +106,31 @@ pub fn run(app: App) -> Result<()> {
             std::process::exit(1);
         }
         Command::Template { subcommand } => match subcommand {
-            TemplateSubcommand::Compile { .. } => {
-                let error = serde_json::json!({"error": "not yet implemented", "command": "template compile"});
-                println!("{}", serde_json::to_string(&error)?);
-                std::process::exit(1);
+            TemplateSubcommand::Compile { source } => {
+                let source_path = Path::new(&source);
+                match compile_cached(source_path) {
+                    Ok((cache_path, _)) => {
+                        println!("{}", cache_path.display());
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let error = serde_json::json!({"error": e.to_string(), "command": "template compile"});
+                        println!("{}", serde_json::to_string(&error)?);
+                        std::process::exit(1);
+                    }
+                }
             }
-            TemplateSubcommand::Validate { .. } => {
-                let error = serde_json::json!({"error": "not yet implemented", "command": "template validate"});
-                println!("{}", serde_json::to_string(&error)?);
-                std::process::exit(1);
+            TemplateSubcommand::Validate { path } => {
+                let result = validate_compiled_template(&path);
+                match result {
+                    Ok(()) => Ok(()),
+                    Err(msg) => {
+                        let error =
+                            serde_json::json!({"error": msg, "command": "template validate"});
+                        println!("{}", serde_json::to_string(&error)?);
+                        std::process::exit(1);
+                    }
+                }
             }
         },
     }
