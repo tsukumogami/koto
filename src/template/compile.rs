@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::{anyhow, Context};
@@ -90,7 +90,7 @@ pub fn compile(source_path: &Path) -> anyhow::Result<CompiledTemplate> {
     let directives = extract_directives(&fm.states, body);
 
     // Build compiled states.
-    let mut compiled_states: HashMap<String, TemplateState> = HashMap::new();
+    let mut compiled_states: BTreeMap<String, TemplateState> = BTreeMap::new();
     for (state_name, source_state) in &fm.states {
         let directive = directives.get(state_name).cloned().unwrap_or_default();
         if directive.is_empty() {
@@ -100,7 +100,7 @@ pub fn compile(source_path: &Path) -> anyhow::Result<CompiledTemplate> {
             ));
         }
 
-        let mut compiled_gates: HashMap<String, Gate> = HashMap::new();
+        let mut compiled_gates: BTreeMap<String, Gate> = BTreeMap::new();
         for (gate_name, source_gate) in &source_state.gates {
             let gate = compile_gate(state_name, gate_name, source_gate)?;
             compiled_gates.insert(gate_name.clone(), gate);
@@ -139,7 +139,7 @@ pub fn compile(source_path: &Path) -> anyhow::Result<CompiledTemplate> {
     }
 
     // Build compiled variables.
-    let variables: HashMap<String, VariableDecl> = fm
+    let variables: BTreeMap<String, VariableDecl> = fm
         .variables
         .into_iter()
         .map(|(k, v)| {

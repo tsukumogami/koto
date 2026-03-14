@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -11,9 +11,9 @@ pub struct CompiledTemplate {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
     pub initial_state: String,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub variables: HashMap<String, VariableDecl>,
-    pub states: HashMap<String, TemplateState>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variables: BTreeMap<String, VariableDecl>,
+    pub states: BTreeMap<String, TemplateState>,
 }
 
 /// A variable declaration in a compiled template.
@@ -35,8 +35,8 @@ pub struct TemplateState {
     pub transitions: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub terminal: bool,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub gates: HashMap<String, Gate>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub gates: BTreeMap<String, Gate>,
 }
 
 /// A gate declaration in a compiled template state.
