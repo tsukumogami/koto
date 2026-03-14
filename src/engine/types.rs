@@ -36,6 +36,8 @@ pub struct MachineState {
 }
 
 /// Return the current UTC time as an ISO 8601 string.
+///
+/// Implemented without an external time crate to keep the binary self-contained.
 pub fn now_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 

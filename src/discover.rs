@@ -1,7 +1,14 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const PREFIX: &str = "koto-";
 const SUFFIX: &str = ".state.jsonl";
+
+/// Return the canonical state file path for a workflow named `name` in `dir`.
+///
+/// Path format: `<dir>/koto-<name>.state.jsonl`
+pub fn workflow_state_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{}{}{}", PREFIX, name, SUFFIX))
+}
 
 /// Find all koto workflows in `dir` by globbing `koto-*.state.jsonl`.
 ///

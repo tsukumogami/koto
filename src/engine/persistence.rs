@@ -79,7 +79,14 @@ pub fn derive_state(events: &[Event]) -> Option<String> {
 ///
 /// Scans events for the `init` event to extract `template_path` and
 /// `template_hash`, and uses the last event's `state` for `current_state`.
-/// Returns `None` if the log is empty or has no init event with template info.
+///
+/// Returns `None` in two distinct cases:
+/// - The event log is empty (workflow was never initialized).
+/// - The log exists but contains no `init` event with template info
+///   (state file is corrupt or was written by a different tool version).
+///
+/// Callers should distinguish these via `read_events`: if the read succeeds
+/// but `derive_machine_state` returns `None`, the file is corrupt.
 pub fn derive_machine_state(events: &[Event]) -> Option<MachineState> {
     let current_state = events.last()?.state.clone();
     let init = events
