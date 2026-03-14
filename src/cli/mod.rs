@@ -73,23 +73,35 @@ pub fn run(app: App) -> Result<()> {
             Ok(())
         }
         Command::Init { .. } => {
-            unimplemented!("init command is implemented in Issue 4")
+            let error = serde_json::json!({"error": "not yet implemented", "command": "init"});
+            println!("{}", serde_json::to_string(&error)?);
+            std::process::exit(1);
         }
         Command::Next { .. } => {
-            unimplemented!("next command is implemented in Issue 4")
+            let error = serde_json::json!({"error": "not yet implemented", "command": "next"});
+            println!("{}", serde_json::to_string(&error)?);
+            std::process::exit(1);
         }
         Command::Rewind { .. } => {
-            unimplemented!("rewind command is implemented in Issue 4")
+            let error = serde_json::json!({"error": "not yet implemented", "command": "rewind"});
+            println!("{}", serde_json::to_string(&error)?);
+            std::process::exit(1);
         }
         Command::Workflows => {
-            unimplemented!("workflows command is implemented in Issue 4")
+            let error = serde_json::json!({"error": "not yet implemented", "command": "workflows"});
+            println!("{}", serde_json::to_string(&error)?);
+            std::process::exit(1);
         }
         Command::Template { subcommand } => match subcommand {
             TemplateSubcommand::Compile { .. } => {
-                unimplemented!("template compile is implemented in Issue 4")
+                let error = serde_json::json!({"error": "not yet implemented", "command": "template compile"});
+                println!("{}", serde_json::to_string(&error)?);
+                std::process::exit(1);
             }
             TemplateSubcommand::Validate { .. } => {
-                unimplemented!("template validate is implemented in Issue 4")
+                let error = serde_json::json!({"error": "not yet implemented", "command": "template validate"});
+                println!("{}", serde_json::to_string(&error)?);
+                std::process::exit(1);
             }
         },
     }
