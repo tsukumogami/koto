@@ -24,36 +24,23 @@ fn sha256_hex(data: &[u8]) -> String {
     hex_encode(hasher.finalize())
 }
 
-/// Compile a template source file with caching.
+/// Core cache logic with an explicit cache directory.
 ///
-/// The cache key is the SHA256 of the compiled JSON output. On a cache miss,
-/// the source is compiled, the result is serialized to JSON, and the SHA256
-/// of that JSON is used as both the cache filename and the returned hash.
-/// On a cache hit, the cached file is deserialized and its hash re-derived
-/// from the file contents.
-///
-/// Returns `(cache_path, template_hash)` where `template_hash` is the
-/// SHA256 hex of the compiled JSON — suitable for use as `template_hash`
-/// in the JSONL init event.
-pub fn compile_cached(source_path: &Path) -> anyhow::Result<(PathBuf, String)> {
-    // Compile the source first to get the canonical compiled JSON.
+/// The cache key is SHA256 of the compiled JSON. Returns `(cache_path, hash)`.
+fn compile_cached_into(source_path: &Path, dir: &Path) -> anyhow::Result<(PathBuf, String)> {
     let compiled = compile(source_path)?;
     let json =
         serde_json::to_string_pretty(&compiled).context("failed to serialize compiled template")?;
     let json_bytes = json.as_bytes();
 
-    // The cache key is SHA256 of the compiled JSON.
     let hash = sha256_hex(json_bytes);
-    let cache_path = cache_dir().join(format!("{}.json", hash));
+    let cache_path = dir.join(format!("{}.json", hash));
 
     if cache_path.exists() {
-        // Cache hit: the compiled JSON is already stored.
         return Ok((cache_path, hash));
     }
 
-    // Cache miss: write the JSON to the cache file atomically.
-    let dir = cache_dir();
-    std::fs::create_dir_all(&dir)
+    std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create cache directory: {}", dir.display()))?;
 
     let tmp_path = cache_path.with_extension("tmp");
@@ -63,6 +50,20 @@ pub fn compile_cached(source_path: &Path) -> anyhow::Result<(PathBuf, String)> {
         .with_context(|| format!("failed to rename cache file: {}", cache_path.display()))?;
 
     Ok((cache_path, hash))
+}
+
+/// Compile a template source file with caching.
+///
+/// The cache key is the SHA256 of the compiled JSON output. On a cache miss,
+/// the source is compiled, the result is serialized to JSON, and the SHA256
+/// of that JSON is used as both the cache filename and the returned hash.
+/// On a cache hit, the cached file is returned without recompilation.
+///
+/// Returns `(cache_path, template_hash)` where `template_hash` is the
+/// SHA256 hex of the compiled JSON — suitable for use as `template_hash`
+/// in the JSONL init event.
+pub fn compile_cached(source_path: &Path) -> anyhow::Result<(PathBuf, String)> {
+    compile_cached_into(source_path, &cache_dir())
 }
 
 #[cfg(test)]
@@ -89,7 +90,6 @@ Cache test directive.
 
     #[test]
     fn sha256_known_vector() {
-        // SHA256("abc") verified with sha256sum
         let hash = sha256_hex(b"abc");
         assert_eq!(
             hash,
@@ -99,9 +99,7 @@ Cache test directive.
 
     #[test]
     fn sha256_empty() {
-        // SHA256("") verified with sha256sum
         let hash = sha256_hex(b"");
-        // Empty input has a well-known hash value
         assert_eq!(hash.len(), 64);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -111,18 +109,15 @@ Cache test directive.
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(simple_template().as_bytes()).unwrap();
 
-        // Override cache dir to a temp location.
         let cache_tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CACHE_HOME", cache_tmp.path());
+        let cache_dir = cache_tmp.path().join("koto");
 
-        // First call: cache miss — compiles and caches.
-        let (path1, hash1) = compile_cached(f.path()).unwrap();
+        let (path1, hash1) = compile_cached_into(f.path(), &cache_dir).unwrap();
         assert!(path1.exists());
         assert_eq!(hash1.len(), 64);
         assert!(hash1.chars().all(|c| c.is_ascii_hexdigit()));
 
-        // Second call: cache hit — returns same path and hash.
-        let (path2, hash2) = compile_cached(f.path()).unwrap();
+        let (path2, hash2) = compile_cached_into(f.path(), &cache_dir).unwrap();
         assert_eq!(path1, path2);
         assert_eq!(hash1, hash2);
     }
@@ -133,11 +128,10 @@ Cache test directive.
         f.write_all(simple_template().as_bytes()).unwrap();
 
         let cache_tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CACHE_HOME", cache_tmp.path());
+        let cache_dir = cache_tmp.path().join("koto");
 
-        let (cache_path, hash) = compile_cached(f.path()).unwrap();
+        let (cache_path, hash) = compile_cached_into(f.path(), &cache_dir).unwrap();
 
-        // The hash must equal SHA256 of the file written to cache.
         let written_bytes = std::fs::read(&cache_path).unwrap();
         let expected = sha256_hex(&written_bytes);
         assert_eq!(hash, expected);
