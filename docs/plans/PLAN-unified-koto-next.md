@@ -15,13 +15,13 @@ Active
 
 ## Scope Summary
 
-Produce the five issues required to implement the unified `koto next` command: a Go→Rust migration (#45, already filed) followed by four tactical design documents covering event log format, template format v2, CLI output contract, and auto-advancement engine. Each design issue spawns one accepted design that feeds implementation.
+Deliver a fully functional Rust CLI for koto through five issues: a Rust CLI foundation (#45) followed by four design+implementation issues covering event log format, template format v2, CLI output contract, and auto-advancement engine. Each issue produces both an accepted design document and the corresponding Rust implementation.
 
 ## Decomposition Strategy
 
-**Horizontal decomposition.** The strategic design `DESIGN-unified-koto-next.md` defines four Required Tactical Designs in a clear dependency order. Each tactical design is a prerequisite for the next and maps directly to a row in that table. Walking skeleton doesn't apply here — the work is documentation production, not code, so there's no integration risk to surface early. Horizontal decomposition matches the sequential nature of the design requirements.
+**Horizontal decomposition.** The strategic design `DESIGN-unified-koto-next.md` defines four tactical design phases in a clear dependency order. Each phase produces a design doc (prerequisite for the next phase) and implements the designed behavior in Rust. Walking skeleton doesn't apply — the dependency chain is inherently sequential.
 
-Phase 0 (Go→Rust Migration, koto #45) was filed independently and is included here as the gating prerequisite. The four design issues cover Phases 1–4.
+Issue #45 establishes the Rust CLI foundation: a minimal skeleton with five commands and a simple JSONL state format. Issues #46–#49 grow the CLI incrementally. After all five issues are closed, koto is a fully functional Rust CLI with complete workflow orchestration capability.
 
 ## Issue Outlines
 
@@ -33,26 +33,26 @@ _(omitted in multi-pr mode — see Implementation Issues below)_
 
 | Issue | Dependencies | Complexity |
 |-------|--------------|------------|
-| [#45: feat: migrate koto from Go to Rust](https://github.com/tsukumogami/koto/issues/45) | None | simple |
-| _Rewrite the koto CLI in Rust. All subsequent tactical designs target the Rust implementation, so this must be accepted before design work on the event log, template format, CLI contract, or advancement engine begins._ | | |
-| [#46: docs(koto): design event log format](https://github.com/tsukumogami/koto/issues/46) | [#45](https://github.com/tsukumogami/koto/issues/45) | simple |
-| _Define the JSONL event log format: six event types, epoch boundary rule, atomicity guarantees, and JSONL-vs-JSON-array evaluation. The event taxonomy and schema_version must be settled before templates or CLI output can be designed._ | | |
-| [#47: docs(koto): design template format v2](https://github.com/tsukumogami/koto/issues/47) | [#46](https://github.com/tsukumogami/koto/issues/46) | simple |
-| _With the event taxonomy accepted, design the new `accepts`/`when`/`integration` YAML blocks that replace the flat `transitions: []string` field. Covers mutual exclusivity validation and the breaking change to the template compiler._ | | |
-| [#48: docs(koto): design cli output contract](https://github.com/tsukumogami/koto/issues/48) | [#46](https://github.com/tsukumogami/koto/issues/46) | simple |
-| _Design the `koto next` JSON output schema: four response variants, `expects` field derivation from the event log, error codes, exit codes, and `--with-data`/`--to` flag behavior. Parallel with #47 — both depend only on #46._ | | |
-| [#49: docs(koto): design auto-advancement engine](https://github.com/tsukumogami/koto/issues/49) | [#46](https://github.com/tsukumogami/koto/issues/46), [#47](https://github.com/tsukumogami/koto/issues/47), [#48](https://github.com/tsukumogami/koto/issues/48) | simple |
-| _Design the event log replay loop, advancement logic with cycle detection, stopping conditions, integration runner, `koto rewind`, and SIGTERM/SIGINT signal handling. Requires the event format (#46), template semantics (#47), and CLI contract (#48) to all be accepted first._ | | |
+| [#45: feat(koto): implement Rust CLI foundation](https://github.com/tsukumogami/koto/issues/45) | None | testable |
+| _Establish the Rust single-crate binary with five commands (`version`, `init`, `next`, `rewind`, `workflows`) plus `template compile`. Uses simple JSONL state (one event per line, current state = last event's `state` field). No `koto transition`, no gate evaluation, no evidence — intentionally minimal. Deletes Go source._ | | |
+| [#46: feat(koto): implement event log format](https://github.com/tsukumogami/koto/issues/46) | [#45](https://github.com/tsukumogami/koto/issues/45) | critical |
+| _Design and implement the full JSONL event schema: six typed event types with `seq` monotonic counter, epoch boundary rule for evidence replay, and state derivation via log replay. Replaces #45's simple JSONL with the production schema._ | | |
+| [#47: feat(koto): implement template format v2](https://github.com/tsukumogami/koto/issues/47) | [#46](https://github.com/tsukumogami/koto/issues/46) | critical |
+| _Design and implement `accepts`/`when`/`integration` YAML blocks replacing `transitions: []string`. Includes mutual exclusivity validation at compile time and updated template loader in the Rust CLI._ | | |
+| [#48: feat(koto): implement unified koto next command](https://github.com/tsukumogami/koto/issues/48) | [#46](https://github.com/tsukumogami/koto/issues/46) | critical |
+| _Design and implement the full `koto next` output contract: five response variants, `--with-data` evidence submission, `--to` directed transitions (replacing `koto transition`), gate evaluation, and correct exit codes. Parallel with #47 — both depend only on #46._ | | |
+| [#49: feat(koto): implement auto-advancement engine](https://github.com/tsukumogami/koto/issues/49) | [#46](https://github.com/tsukumogami/koto/issues/46), [#47](https://github.com/tsukumogami/koto/issues/47), [#48](https://github.com/tsukumogami/koto/issues/48) | critical |
+| _Design and implement the event log replay loop, advancement logic with cycle detection and all stopping conditions, integration runner, `koto cancel`, and SIGTERM/SIGINT signal handling. Leaf node — completing this delivers a fully functional CLI._ | | |
 
 ## Dependency Graph
 
 ```mermaid
 graph TD
-    I45["#45: Go→Rust Migration (ext)"]
-    I46["#46: design event log format"]
-    I47["#47: design template format v2"]
-    I48["#48: design cli output contract"]
-    I49["#49: design auto-advancement engine"]
+    I45["#45: Rust CLI foundation"]
+    I46["#46: event log format"]
+    I47["#47: template format v2"]
+    I48["#48: unified koto next"]
+    I49["#49: auto-advancement engine"]
 
     I45 --> I46
     I46 --> I47
@@ -82,9 +82,11 @@ graph TD
 
 **Recommended order:**
 
-1. #45 (external) — Go→Rust Migration must be accepted before any tactical design targets the Rust implementation
-2. #46 — event log format; unblocks #47 and #48
-3. #47 and #48 — template format v2 and CLI output contract can proceed in parallel after #46 is accepted
-4. #49 — auto-advancement engine requires all three predecessors
+1. #45 — Rust CLI foundation: five commands, simple JSONL, template compile; deletes Go source
+2. #46 — full event log schema; unblocks #47 and #48
+3. #47 and #48 — template format v2 and unified `koto next` can proceed in parallel after #46 is merged
+4. #49 — auto-advancement engine; completing this delivers a fully functional CLI
 
-**Parallelization:** After #46 is accepted, #47 and #48 can be worked concurrently, reducing wall-clock time by one design cycle.
+**Parallelization:** After #46 merges, #47 and #48 can be worked concurrently, reducing wall-clock time by one implementation cycle.
+
+**State advance gap:** Between #45 and #48, the CLI cannot advance workflow state. This is intentional — `koto transition` is removed, and its replacement (`koto next --to`) is implemented in #48. The CLI skeleton (#45) proves the architecture; full workflow capability lands with #48.
