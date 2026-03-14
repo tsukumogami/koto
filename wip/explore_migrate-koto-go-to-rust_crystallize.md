@@ -2,22 +2,21 @@
 
 ## Chosen Type
 
-No artifact
+Design Doc
 
 ## Rationale
 
-The exploration resolved all open questions in a single round and the user
-provided clear, directive guidance on scope. The findings were immediately
-actionable as direct updates to existing artifacts: GitHub issues #45-#49
-were updated with new scopes and acceptance criteria, PLAN-unified-koto-next.md
-was updated to reflect design+implementation issues and the intentional
-state-advance gap. There is nothing left to document before implementation
-begins — the work is ready to execute via `/work-on 45`.
+The exploration resolved all implementation decisions, but those decisions need
+to persist after wip/ is deleted before the PR merges. A design doc at
+`docs/designs/DESIGN-migrate-koto-go-to-rust.md` captures the migration
+strategy, crate structure, CLI skeleton scope, state format, dependency choices,
+and the intentional exclusions — so future contributors and the implementer of
+#45 have a permanent record of why these choices were made.
 
-A design doc was considered but ranked below No artifact because all
-implementation paths were decided during exploration: single crate, clap v4,
-serde_json/serde_yml, simple JSONL state, FormatVersion=1 compiled templates.
-No competing approaches remain.
+Initial crystallize scored "No artifact" (+5) because all decisions were settled
+and the issue body covered the scope. Revised to "Design Doc" after user feedback:
+wip/ files are deleted before merge, so any decisions documented only in research
+files are lost.
 
 A plan was considered and scored well (+4) because DESIGN-unified-koto-next.md
 exists and the work is broken into issues. But the plan already exists as
