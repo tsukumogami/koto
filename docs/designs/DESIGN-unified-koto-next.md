@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-unified-koto-next.md
 problem: |
   koto's three core systems — CLI contract, state model, and workflow definition format —
@@ -30,7 +30,7 @@ rationale: |
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
@@ -173,12 +173,12 @@ states by appending `transitioned` events until a stopping condition; each event
 chain is independently durable. A crash mid-chain leaves the log at the last valid event;
 resuming replays from there.
 
-The three tactical sub-designs are: (1) event log format and state file schema, (2) template
+The four tactical sub-designs are: (1) event log format and state file schema, (2) template
 format event schema declarations and compilation pipeline, (3) CLI contract — the `koto next`
-output schema including `expects`, error codes, and integration output. A fourth sub-design
-covers the auto-advancement engine: replay, current-state derivation, loop, stopping
-conditions, and integration invocation. Each sub-design can proceed once the event log
-format is accepted, since all three depend on the event type taxonomy.
+output schema including `expects`, error codes, and integration output, and (4) the
+auto-advancement engine — replay, current-state derivation, loop, stopping conditions, and
+integration invocation. Each of sub-designs 2–4 can proceed once the event log format is
+accepted, since all three depend on the event type taxonomy.
 
 ### Rationale
 
@@ -244,6 +244,14 @@ The state file changes from a mutable JSON object to a JSONL event log:
 - **Atomicity**: each event is appended with fsync; a sequence number gap detects partial writes
 - **Breaking change**: the existing mutable JSON state file format is replaced entirely; this
   is intentional and acceptable at koto's pre-release stage
+- **Format detection**: old state files (mutable JSON format) contain a top-level `CurrentState`
+  field; new JSONL state files do not. Implementations detect the format by checking for this
+  field and must reject old-format files with a clear error rather than attempting to parse
+  them as JSONL
+- **Directed transition representation**: the PRD refers to a `directed: true` marker on
+  audit trail entries. In the event log model this is achieved structurally — `directed_transition`
+  is a distinct event type, so the type itself is the marker. There is no `directed: true` field
+  on `transitioned` events; the event type is what distinguishes the two
 
 ### Template Format
 
@@ -289,6 +297,15 @@ their `gates` are satisfied. The template compiler validates that per-transition
 conditions on the same state are mutually exclusive (same field, disjoint values) and
 rejects templates that are non-deterministic. The template format is a breaking change
 from the current YAML structure; acceptable at koto's pre-release stage.
+
+**Mutual exclusivity limitation**: the compiler can verify mutual exclusivity only for
+single-field conditions — where two transitions test the same field against disjoint values.
+For multi-field conditions (where two transitions each test different fields), the compiler
+cannot statically determine whether both could be satisfied simultaneously. Template authors
+are responsible for ensuring non-overlapping semantics in multi-field cases; the compiler
+will not catch this class of ambiguity. The tactical sub-design for template format v2 should
+document this limitation and consider whether an explicit `exclusive_with` annotation is
+needed for multi-field branching states.
 
 ### CLI Output Schema
 
@@ -354,6 +371,42 @@ from the current YAML structure; acceptable at koto's pre-release stage.
 ```json
 { "action": "done", "state": "complete", "advanced": true, "expects": null, "error": null }
 ```
+
+**Processing integration unavailable (configured tool not accessible or timed out):**
+```json
+{
+  "action": "execute",
+  "state": "delegate_analysis",
+  "directive": "Deep analysis required.",
+  "advanced": true,
+  "expects": {
+    "event_type": "evidence_submitted",
+    "fields": { "interpretation": { "type": "string", "required": true } }
+  },
+  "integration": {
+    "name": "delegate_review",
+    "available": false
+  },
+  "error": null
+}
+```
+Exit code: `1` (transient — agent may retry or handle the directive directly without integration
+output). The PRD refers to this field as `delegation.available: false`; the tactical CLI
+contract sub-design (#48) will settle the exact field name. The key requirement is that the
+agent can detect integration unavailability without parsing error text.
+
+**`op` field omitted by design**: the schema does not include an operation-type field
+(`op: read | write`). The calling agent already knows which flags it passed; `advanced: bool`
+communicates the outcome. An `op` field would echo information the agent already holds without
+giving it anything new to branch on.
+
+**Stale submission handling**: no `state` assertion field is required in `--with-data` payloads.
+If the workflow has advanced to a new state between the agent's last `koto next` call and a
+subsequent `--with-data` submission, koto validates the payload against the *current* state.
+A state that no longer accepts evidence returns `precondition_failed`; a state that accepts
+different fields returns `invalid_submission`. The epoch boundary rule and server-side
+validation against current state provide sufficient protection without a client-asserted
+state field.
 
 **Error response:**
 ```json
@@ -457,7 +510,9 @@ Deliverables:
 - `accepts` block syntax and field type definitions
 - `when` conditions on transitions (replacing `transitions: []string`)
 - `integration` field (string tag, config-bound routing)
-- Mutual exclusivity validation in compiler
+- Mutual exclusivity validation in compiler (single-field cases; see limitation note above)
+- Graceful degradation behavior: a missing integration config entry is not a template load-time
+  error; `koto next` degrades to returning the directive without integration output (PRD R17)
 
 ### Phase 3: CLI output contract (parallel with Phase 2)
 
@@ -482,6 +537,8 @@ Deliverables:
 - `--to` directed transition
 - Integration runner interface and invocation
 - `koto rewind` as rewound event
+- Signal handling: on SIGTERM or SIGINT, complete the in-progress atomic append before
+  exiting; the chain is not unwound — only the in-progress transition rolls back (PRD R21)
 
 ## Implementation Language
 
@@ -539,6 +596,12 @@ Integration output stored in `integration_invoked` events should be:
 - Treated as untrusted if used in downstream interpolation contexts
 - Subject to schema validation if the integration is expected to return structured data
 
+**Interpolation injection risk**: if integration output is interpolated into directive text
+(as the current controller does with evidence values), unsanitized subprocess output could
+inject content into directives shown to agents. Integration output must be sanitized or
+escaped before any interpolation step — not only when stored. The tactical sub-design for
+the auto-advancement engine should specify the escaping rules for directive rendering.
+
 Event log files must be created with restricted permissions (mode 0600) to limit
 access to the owning user. Evidence validation against the `accepts` schema must occur
 before appending the event to the log — not deferred post-storage.
@@ -577,9 +640,10 @@ to prevent tampered templates from being silently applied to existing workflows.
   (optional initially) is needed for production workflows that run long
 - **Template authoring is more complex**: workflow authors must understand the `accepts`/
   `when` model to write branching workflows; flat `transitions: []string` was simpler
-- **Five tactical sub-designs before implementation**: the strategic design requires
-  accepting five sub-designs (including the Go→Rust migration) before a single line of
-  implementation code is written; the upfront design investment is higher than other approaches
+- **Four tactical sub-designs before implementation**: this design spawns four tactical
+  sub-designs; combined with the prerequisite Go→Rust migration (#45, filed separately),
+  five total issues must be accepted before implementation begins; the upfront design
+  investment is higher than other approaches
 
 ### Mitigations
 
