@@ -6,22 +6,15 @@ Agents call `koto next` to get their current directive, do the work, then call `
 
 ## Install
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/tsukumogami/koto/main/install.sh | sh
-```
+Download the latest binary for your platform from the [GitHub Releases page](https://github.com/tsukumogami/koto/releases).
 
-Or with Go:
-
-```bash
-go install github.com/tsukumogami/koto/cmd/koto@latest
-```
-
-Or build from source:
+Or build from source with Rust:
 
 ```bash
 git clone https://github.com/tsukumogami/koto.git
 cd koto
-go build -o koto ./cmd/koto
+cargo build --release
+# binary is at target/release/koto
 ```
 
 ## Quick start
@@ -142,7 +135,6 @@ Skills use the [Agent Skills](https://agentskills.io) open standard, which means
 ## Documentation
 
 - [CLI usage guide](docs/guides/cli-usage.md) -- all subcommands with examples, including template authoring tools
-- [Go library guide](docs/guides/library-usage.md) -- using `pkg/engine` as an imported package
 - [Error code reference](docs/reference/error-codes.md) -- structured error codes and handling
 - [Custom skill authoring](docs/guides/custom-skill-authoring.md) -- creating workflow skills for AI agents
 
