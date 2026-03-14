@@ -73,12 +73,12 @@ pub enum TemplateSubcommand {
 }
 
 /// Read and validate a compiled template JSON file.
-fn validate_compiled_template(path: &str) -> Result<(), String> {
+fn validate_compiled_template(path: &str) -> anyhow::Result<()> {
     let content =
-        std::fs::read_to_string(path).map_err(|e| format!("failed to read file: {}", e))?;
+        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("failed to read file: {}", e))?;
     let template: CompiledTemplate =
-        serde_json::from_str(&content).map_err(|e| format!("invalid JSON: {}", e))?;
-    template.validate()
+        serde_json::from_str(&content).map_err(|e| anyhow::anyhow!("invalid JSON: {}", e))?;
+    template.validate().map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 /// Load a compiled template from a cache path.
@@ -304,23 +304,21 @@ pub fn run(app: App) -> Result<()> {
                         Ok(())
                     }
                     Err(e) => {
-                        let error = serde_json::json!({"error": e.to_string(), "command": "template compile"});
-                        println!("{}", serde_json::to_string(&error)?);
-                        std::process::exit(1);
+                        exit_with_error(serde_json::json!({
+                            "error": e.to_string(),
+                            "command": "template compile"
+                        }));
                     }
                 }
             }
             TemplateSubcommand::Validate { path } => {
-                let result = validate_compiled_template(&path);
-                match result {
-                    Ok(()) => Ok(()),
-                    Err(msg) => {
-                        let error =
-                            serde_json::json!({"error": msg, "command": "template validate"});
-                        println!("{}", serde_json::to_string(&error)?);
-                        std::process::exit(1);
-                    }
+                if let Err(e) = validate_compiled_template(&path) {
+                    exit_with_error(serde_json::json!({
+                        "error": e.to_string(),
+                        "command": "template validate"
+                    }));
                 }
+                Ok(())
             }
         },
     }
