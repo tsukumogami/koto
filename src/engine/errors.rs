@@ -1,2 +1,13 @@
-// Engine errors: typed errors via thiserror.
-// Implemented in Issue 3.
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum EngineError {
+    #[error("state not found: {0}")]
+    StateNotFound(String),
+
+    #[error("empty event log")]
+    EmptyLog,
+
+    #[error("parse error: {0}")]
+    ParseError(String),
+}
