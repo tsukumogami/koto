@@ -2,11 +2,28 @@
 status: Proposed
 upstream: docs/prds/PRD-unified-koto-next.md
 problem: |
-  To be completed after approach selection.
+  koto's three core systems — CLI contract, state model, and workflow definition format —
+  must change together to support a unified `koto next` command. The CLI contract must
+  become self-describing so agents never need out-of-band knowledge. The state model must
+  support per-state evidence scoping so evidence doesn't contaminate branching or looping
+  workflows. The template format must support per-transition conditions so workflows can
+  branch on what agents submit. These systems are interdependent; the design must make the
+  unifying architectural choice that governs how they fit together.
 decision: |
-  To be completed after approach selection.
+  Redesign koto around an event-sourced state machine. The state file becomes an
+  append-only JSONL event log; current state and per-state evidence are derived by replay.
+  The template format adds `accepts`/`when` blocks for evidence schema and routing
+  conditions. `koto next` output gains an `expects` field — a self-describing schema
+  of what event the agent should submit next. Four tactical sub-designs implement each
+  system boundary once the shared event taxonomy is accepted.
 rationale: |
-  To be completed after approach selection.
+  The event log model earns the migration cost the PRD already requires. Breaking changes
+  to state file and template format are unavoidable; given that, the event log buys
+  structural evidence scoping (no policy-based clearing), simpler atomicity (append, not
+  rewrite), and a first-class audit trail. Protocol-first and declarative-language-first
+  approaches treat the output schema or template format as the design constraint, producing
+  a weaker architecture. Minimal extension avoids migration but leaves two coexisting
+  transition syntaxes and policy-based evidence clearing as ongoing maintenance burdens.
 ---
 
 # DESIGN: Unified koto next Command
@@ -183,4 +200,378 @@ koto — what templates declare, what the state file stores, what `koto next` ou
 expressed in terms of events and their schemas. This makes the tactical sub-designs coherent:
 each one is specifying a different view of the same event taxonomy.
 
+## Solution Architecture
+
+### Overview
+
+koto's three core systems — state persistence, workflow definition, and CLI contract — are
+redesigned around a shared event taxonomy. Every operation on a workflow produces a typed,
+immutable event appended to the state file. Templates declare what events each state expects
+and what conditions route them to outgoing transitions. `koto next` output describes what
+event the agent should submit next.
+
+### Event Taxonomy
+
+Six event types cover all workflow operations:
+
+| Event type | Triggered by | Key payload fields |
+|-----------|-------------|-------------------|
+| `workflow_initialized` | `koto init` | `workflow`, `template_hash`, `variables` |
+| `transitioned` | auto-advancement | `from`, `to`, `condition_type` |
+| `evidence_submitted` | `koto next --with-data` | `state`, `fields` (key-value map) |
+| `directed_transition` | `koto next --to` | `from`, `to`, `directed: true` |
+| `integration_invoked` | processing integration stop | `state`, `integration`, `output` |
+| `rewound` | `koto rewind` | `from`, `to` |
+
+All events share: `seq` (monotonic integer), `timestamp` (RFC 3339), `type` (string).
+
+### State File Format
+
+The state file changes from a mutable JSON object to a JSONL event log:
+
+```
+{"schema_version":2,"workflow":"my-workflow","template_hash":"abc123","created_at":"..."}
+{"seq":1,"timestamp":"...","type":"workflow_initialized","payload":{"variables":{}}}
+{"seq":2,"timestamp":"...","type":"transitioned","payload":{"from":null,"to":"gather_info","condition_type":"auto"}}
+{"seq":3,"timestamp":"...","type":"evidence_submitted","payload":{"state":"gather_info","fields":{"input_file":"results.json"}}}
+{"seq":4,"timestamp":"...","type":"transitioned","payload":{"from":"gather_info","to":"analyze","condition_type":"gate"}}
+```
+
+- First line: header object (`schema_version`, `workflow`, `template_hash`, `created_at`)
+- Subsequent lines: events, one per line, in append order
+- **Current state**: `to` field of the last `transitioned` or `directed_transition` event
+- **Current evidence**: union of `evidence_submitted` events whose `payload.state` matches
+  current state (events from prior states are archived in the log but not active)
+- **Atomicity**: each event is appended with fsync; a sequence number gap detects partial writes
+- **Migration**: on load, if the file is a JSON object (old format), the engine synthesizes
+  an event log in memory and re-persists it; migration is automatic and transparent
+
+### Template Format
+
+Template YAML frontmatter adds two new blocks per state: `accepts` (evidence field schema)
+and per-transition `when` conditions. Existing `gates` (command gates, field checks) remain
+unchanged — they're for koto-verifiable conditions; `accepts`/`when` are for agent-submitted
+evidence.
+
+```yaml
+states:
+  analyze_results:
+    # Evidence field declarations (generates `expects` in koto next output)
+    accepts:
+      decision:
+        type: enum
+        values: [proceed, escalate]
+        required: true
+      rationale:
+        type: string
+        required: true
+
+    # Per-transition routing conditions
+    transitions:
+      - target: deploy
+        when:
+          decision: proceed
+      - target: escalate_review
+        when:
+          decision: escalate
+
+    # Koto-verifiable condition (not agent-submitted)
+    gates:
+      tests_passed:
+        type: command
+        command: ./check-ci.sh
+
+    # Processing integration (string tag; routing lives in user config)
+    integration: delegate_review
+```
+
+States with no `accepts` block and no `when` conditions are auto-advanced through when
+their `gates` are satisfied. The template compiler validates that per-transition `when`
+conditions on the same state are mutually exclusive (same field, disjoint values) and
+rejects templates that are non-deterministic. Format version bumps from 1 to 2.
+
+### CLI Output Schema
+
+`koto next` returns a JSON object. The schema varies by stopping condition:
+
+**Normal execution / stopped at a state requiring evidence:**
+```json
+{
+  "action": "execute",
+  "state": "analyze_results",
+  "directive": "Review the test output...",
+  "advanced": true,
+  "expects": {
+    "event_type": "evidence_submitted",
+    "fields": {
+      "decision": { "type": "enum", "values": ["proceed", "escalate"], "required": true },
+      "rationale": { "type": "string", "required": true }
+    },
+    "options": [
+      { "target": "deploy", "when": { "decision": "proceed" } },
+      { "target": "escalate_review", "when": { "decision": "escalate" } }
+    ]
+  },
+  "error": null
+}
+```
+
+**Stopped at a state with only koto-verifiable gates (no agent submission needed):**
+```json
+{
+  "action": "execute",
+  "state": "wait_for_ci",
+  "directive": "Waiting for CI to pass...",
+  "advanced": false,
+  "expects": null,
+  "blocking_conditions": [
+    { "name": "tests_passed", "type": "command", "agent_actionable": false }
+  ],
+  "error": null
+}
+```
+
+**Stopped at a processing integration:**
+```json
+{
+  "action": "execute",
+  "state": "delegate_analysis",
+  "directive": "Deep analysis required.",
+  "advanced": true,
+  "expects": {
+    "event_type": "evidence_submitted",
+    "fields": { "interpretation": { "type": "string", "required": true } }
+  },
+  "integration": {
+    "name": "delegate_review",
+    "output": "..."
+  },
+  "error": null
+}
+```
+
+**Terminal state:**
+```json
+{ "action": "done", "state": "complete", "advanced": true, "expects": null, "error": null }
+```
+
+**Error response:**
+```json
+{
+  "error": {
+    "code": "invalid_submission",
+    "message": "Missing required field: rationale",
+    "details": [{ "field": "rationale", "reason": "required but not provided" }]
+  }
+}
+```
+
+Error codes: `gate_blocked`, `invalid_submission`, `precondition_failed`,
+`integration_unavailable`, `terminal_state`, `workflow_not_initialized`.
+
+Exit codes: `0` success, `1` transient (gates blocked, integration unavailable, version
+conflict), `2` caller error (bad input, invalid submission), `3` config error (corrupt
+state, invalid template, not initialized).
+
+### Data Flow
+
+```
+koto next [--with-data data.json] [--to target]
+  │
+  ├─ Load state file (JSONL): derive current state + current evidence by log replay
+  ├─ Load compiled template (SHA-256 cache)
+  │
+  ├─ If --with-data:
+  │   ├─ Validate payload against current state's `accepts` schema
+  │   ├─ Append evidence_submitted event → fsync
+  │   └─ Continue to advancement evaluation
+  │
+  ├─ If --to:
+  │   ├─ Validate target is a valid outgoing transition
+  │   ├─ Append directed_transition event → fsync
+  │   └─ Return immediately (always stops after directed)
+  │
+  ├─ Advancement loop:
+  │   ├─ visited := {}
+  │   └─ loop:
+  │       ├─ current := last transitioned.to
+  │       ├─ if visited[current]: stop (cycle detected)
+  │       ├─ visited[current] = true
+  │       ├─ if terminal: stop
+  │       ├─ if integration configured: invoke runner, append integration_invoked → stop
+  │       ├─ evaluate gates: if any fail → stop (gate_blocked)
+  │       ├─ if accepts block: evaluate which transition's `when` conditions match current evidence
+  │       │   ├─ if none match: stop (expects evidence submission)
+  │       │   └─ if match: append transitioned event → fsync → continue loop
+  │       └─ if no accepts and gates pass: append transitioned event → fsync → continue
+  │
+  └─ Return koto next output JSON
+```
+
+### Sub-Design Boundaries
+
+This strategic design spawns four tactical sub-designs, each independently implementable
+once the event taxonomy (above) is accepted:
+
+| Sub-design | Scope | Depends on |
+|-----------|-------|-----------|
+| Event log format | State file schema, JSONL structure, event type definitions, migration | Nothing (foundational) |
+| Template format v2 | `accepts` block, `when` conditions, `integration` field, compiler changes | Event taxonomy |
+| CLI output contract | `koto next` JSON schema, `expects` derivation, error codes, exit codes | Event taxonomy |
+| Auto-advancement engine | Replay logic, loop, stopping conditions, integration invocation, `koto rewind` | All three above |
+
+## Implementation Approach
+
+### Phase 1: Event taxonomy and log format (foundational)
+
+Accept the event type definitions and JSONL format. Everything else builds on this.
+
+Deliverables:
+- Event taxonomy document (6 event types, all fields, sequence semantics)
+- State file schema v2 specification (JSONL header + event lines)
+- Migration spec (old JSON object → synthesized event log)
+- **Tactical sub-design**: Event Log Format
+
+### Phase 2: Template format v2 (parallel with Phase 3)
+
+Add event schema declarations to the template format. Can proceed once Phase 1 is accepted.
+
+Deliverables:
+- `accepts` block syntax and field type definitions
+- `when` conditions on transitions (replacing `transitions: []string`)
+- `integration` field (string tag, config-bound routing)
+- Mutual exclusivity validation in compiler
+- Format version bump 1 → 2
+- **Tactical sub-design**: Template Format v2
+
+### Phase 3: CLI output contract (parallel with Phase 2)
+
+Define the `koto next` JSON output schema. Can proceed once Phase 1 is accepted.
+
+Deliverables:
+- Complete output schema (`action`, `state`, `directive`, `advanced`, `expects`, `blocking_conditions`, `integration`, `error`)
+- `expects` field derivation rules (from template `accepts` + `when`)
+- Error code taxonomy and structured error format
+- Exit code mapping
+- `--with-data` and `--to` flag behavior spec
+- **Tactical sub-design**: CLI Output Contract
+
+### Phase 4: Auto-advancement engine (after Phases 1-3)
+
+Implement the advancement loop, replay, and all stopping conditions. Depends on the
+accepted outputs of Phases 1-3.
+
+Deliverables:
+- Event log reader / replay (current state derivation, current evidence derivation)
+- Advancement loop with visited-state cycle detection
+- `--with-data` payload validation against `accepts` schema
+- `--to` directed transition
+- Integration runner interface and invocation
+- `koto rewind` as rewound event
+- **Tactical sub-design**: Auto-Advancement Engine
+
+## Required Tactical Designs
+
+| Sub-design | Repo | Scope |
+|-----------|------|-------|
+| Event Log Format | koto | State file JSONL schema, event type taxonomy, migration |
+| Template Format v2 | koto | `accepts`/`when` syntax, compiler changes, format version |
+| CLI Output Contract | koto | `koto next` JSON schema, `expects` derivation, errors |
+| Auto-Advancement Engine | koto | Replay, loop, stopping conditions, integration invocation |
+
+## Security Considerations
+
+### Command Gates and Integration Invocation
+
+koto executes arbitrary shell commands via two mechanisms: command gates (evaluate exit
+codes to allow transitions) and integration invocation (run user-configured subprocesses
+and record output). Both are correct by design when template sources are trusted.
+
+Templates come from two sources in koto's workflow:
+
+- **Plugin-installed templates:** Reviewed as part of the plugin; installation requires
+  explicit user action.
+- **Project-scoped templates:** Committed to the project repository and reviewed via PR.
+
+**Implementation constraint:** Integration names must resolve from a closed set (project
+configuration or plugin manifest), not from arbitrary strings in template files. A template
+declaring `integration: some-name` tells koto to route to the configured handler for
+`some-name`; the actual command or process is defined in user or project configuration,
+not in the template itself.
+
+Command gates already enforce this implicitly: the command string is authored by the
+developer who writes the template. If koto is extended to load templates from untrusted
+sources, command gates require additional validation.
+
+### Evidence Persistence
+
+The event log persists evidence (agent-submitted data) and integration output as plaintext
+JSON. Event logs may contain sensitive data submitted by agents — API keys, credentials,
+or sensitive analysis output. Event log files should be protected like any file containing
+secrets. They are not suitable for committing to public repositories.
+
+Integration output stored in `integration_invoked` events should be:
+
+- Validated against size limits before storage to prevent log bloat
+- Treated as untrusted if used in downstream interpolation contexts
+- Subject to schema validation if the integration is expected to return structured data
+
+### Template Hash Verification
+
+The design retains SHA-256 hash verification of templates: the `template_hash` field in
+the JSONL header ties the event log to the exact template version it was created with.
+Replaying events against a modified template is detected and rejected. This is sufficient
+to prevent tampered templates from being silently applied to existing workflows.
+
+## Consequences
+
+### Positive
+
+- **Evidence scoping is structural**: per-state evidence is a property of the event log
+  model — there is no global evidence map to accidentally contaminate; this eliminates
+  an entire class of correctness bugs
+- **Audit trail is first-class**: the event log is the state file; every action, its
+  inputs, and its timestamp are preserved in replay order; debugging and recovery are
+  trivial
+- **Simpler atomicity**: appending an event is simpler than the current full-document
+  rewrite; a sequence number gap reliably detects partial writes without a separate
+  checksum
+- **Recovery is well-defined**: replay from the last valid event is standard and
+  predictable; no edge cases around partial state mutations
+- **Agent contract is explicit**: the `expects` field gives agents a typed schema for
+  their next action; agents never need to consult templates or secondary commands
+- **Sub-designs are coherent**: all four tactical designs are specifying different views
+  of the same event taxonomy; changes to one propagate naturally to the others
+
+### Negative
+
+- **Migration is the largest of any approach**: existing state files and templates must
+  both change format; automatic migration handles state files, but templates require
+  manual rewrite by workflow authors
+- **Event replay latency grows with log length**: replaying hundreds of events on every
+  `koto next` call adds measurable latency for long-running workflows; snapshot mechanism
+  (optional initially) is needed for production workflows that run long
+- **Event schema immutability**: once an event is appended, its payload is permanent;
+  if the template's event schema changes mid-workflow, old events may not parse correctly
+  against the new schema; schema evolution requires versioned event types or a migration
+  strategy
+- **Template authoring is more complex**: workflow authors must understand the `accepts`/
+  `when` model to write branching workflows; the existing `transitions: []string` model
+  was simpler, even if less powerful
+- **Four tactical sub-designs before implementation**: the strategic design requires
+  accepting four sub-designs before a single line of implementation code is written;
+  the upfront design investment is higher than other approaches
+
+### Mitigations
+
+- **Template migration**: a migration guide documents the before/after format change for
+  every template construct; the compiler rejects v1 templates with a clear error pointing
+  to the migration guide
+- **Replay latency**: the initial implementation skips snapshots; a snapshot event type
+  is reserved in the event taxonomy so it can be added without a schema change when needed
+- **Schema evolution**: the event taxonomy spec includes versioning guidance; event types
+  carry a version field so old events remain parseable after schema changes
+- **Authoring complexity**: the template format guide includes worked examples for common
+  patterns (linear, branching, looping, delegation); the compiler error messages for
+  invalid `when` conditions name the conflicting transitions explicitly
 

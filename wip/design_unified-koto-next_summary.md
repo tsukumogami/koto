@@ -2,38 +2,61 @@
 
 ## Input Context (Phase 0)
 **Source PRD:** docs/prds/PRD-unified-koto-next.md
-**Problem (implementation framing):** The engine's gate model, evidence model, and controller
-loop all need structural changes to support a single `koto next` command that auto-advances,
-accepts evidence submissions, and handles human-directed transitions.
+**Problem (implementation framing):** Three systems need to change together: the CLI
+contract (self-describing output, expects schema, error codes), the state model (per-state
+evidence scoping, structured audit trail), and the workflow definition format (per-transition
+conditions, integration declarations). The design makes unifying high-level choices across
+all three and spawns tactical sub-designs for each.
+
+## Approaches Investigated (Phase 1)
+- **Protocol-first**: design the JSON output contract first; state and template derive from it
+- **Declarative language first**: template format is the source of truth; CLI and state derive from it
+- **Minimal extension**: backward-compatible additions to the existing model; lowest migration burden
+- **Event-sourced state machine**: append-only event log; per-state evidence scoping is structural
 
 ## Selected Approach (Phase 2)
-
-Approach A: Controller-owned advancement loop. The engine stays a single-transition
-executor with an extended type model (`TransitionDecl`). The controller gains `Advance()`
-with visited-state tracking and stopping-condition evaluation. `IntegrationRunner` is
-injected into the controller. No new packages. Chosen over engine-owned (Approach B)
-because mixing transaction and orchestration logic in the engine creates long-term
-maintainability risk; chosen over new workflow layer (Approach C) because the indirection
-isn't justified when the controller already serves as the orchestration layer.
+Event-sourced state machine. State file becomes an append-only event log of typed, immutable
+events. Per-state evidence scoping is structural (events are state-tagged, no global map to
+clear). Template format adds event schema declarations. CLI `expects` field is derived from
+the current state's event schema. Chosen over minimal extension because the PRD already
+mandates breaking changes — the event log buys a stronger long-term model with that migration.
+Chosen over protocol-first and declarative-language-first because it produces a better
+protocol and template language as consequences of its structure, rather than treating either
+as a design constraint.
 
 ## Investigation Findings (Phase 3)
 
-- **engine-types**: `TransitionDecl` is a new struct replacing `[]string`; `GateDecl` reused as-is;
-  evidence clearing is 2-line addition before `persist()`; external caller blast radius minimal
-  (one CLI callsite)
-- **controller-loop**: No `DelegateChecker` or `IntegrationRunner` pattern exists yet — must be
-  designed; `MachineState` has no integration metadata fields; `Directive` is a flat struct with
-  no HATEOAS schema; `IntegrationRunner` must be injected at construction time
-- **template-format**: Format version field exists (v1 → v2 bump); pipeline clean and well-separated;
-  template format design doc already anticipated transition-level gates (deferred to Phase 2);
-  cache uses SHA-256 addressing so no special invalidation needed
+- **event-log-schema**: Current state file is a mutable JSON snapshot. Event log replaces it
+  with JSONL (header line + one event per line). Six event types cover all PRD operations.
+  Current state and current evidence are both derivable from the log. Automatic migration
+  on first load. Snapshots optional for performance.
+- **template-event-schema**: New `accepts` block declares evidence field schemas per state.
+  `when` conditions on transitions replace flat transition string list. `integration` field
+  is a string tag. Format version bumps to 2. Mutual exclusivity detected at compile time
+  for simple same-field conditions. Existing `gates` coexist with `accepts`/`when`.
+- **cli-output-contract**: Current output has only `action`, `state`, `directive`/`message`.
+  New output adds: `advanced` bool, `expects` (event_type + fields + options), `blocking_conditions`
+  for gate-blocked states, `integration` field for processing integration output. Structured
+  error with typed codes (gate_blocked, invalid_submission, precondition_failed, etc.).
+  Exit codes 0/1/2/3 per PRD R20.
+
+## Architecture Summary (Phase 4)
+
+Six event types define the shared vocabulary across all three systems. State file is JSONL
+(header + one event per line); current state and evidence derived by replay. Template format
+v2 adds `accepts`/`when`/`integration` blocks; `gates` unchanged. CLI output gains `advanced`,
+`expects`, `blocking_conditions`, `integration`, structured `error`. Auto-advancement loop
+chains `transitioned` events with visited-state cycle detection; each event independently
+fsynced. Four tactical sub-designs (Event Log Format, Template Format v2, CLI Output Contract,
+Auto-Advancement Engine) each depends on the accepted event taxonomy.
 
 ## Security Review (Phase 5)
 **Outcome:** Option 2 — Document considerations
-**Summary:** No download/supply-chain risks from this design itself. Command gate
-environment isolation, IntegrationRunner allowlisting, evidence file validation, and
-state file permissions are the key implementation concerns. No design changes needed.
+**Summary:** No download or supply chain risks from this design. Integration invocation
+(external subprocess via string tag) and evidence persistence in the event log are the
+relevant dimensions. Both manageable via implementation constraints: integration names
+must resolve from a closed set in config; event logs treated like secrets-containing files.
 
 ## Current Status
 **Phase:** 6 - Final Review
-**Last Updated:** 2026-03-13
+**Last Updated:** 2026-03-14
