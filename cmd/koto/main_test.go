@@ -1160,7 +1160,7 @@ func TestCmdInit_PopulatesCache(t *testing.T) {
 
 	// Verify the cache file exists.
 	cachePath := filepath.Join(kotoHome, "cache", sourceHash+".json")
-	if _, err := os.Stat(cachePath); err != nil {
+	if _, err := os.Stat(cachePath); err != nil { //nolint:gosec // G703: path is constructed from sha256 hash, not user input
 		t.Fatalf("cache file not created at %s: %v", cachePath, err)
 	}
 
