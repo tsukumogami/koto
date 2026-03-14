@@ -3,7 +3,7 @@
     "Stop": [
       {
         "type": "command",
-        "command": "koto workflows 2>/dev/null | grep -q '\"path\"' && echo 'Active koto workflow detected. Run koto next to continue.'"
+        "command": "WORKFLOWS=$(koto workflows 2>/dev/null); if [ \"$WORKFLOWS\" != \"[]\" ] && [ -n \"$WORKFLOWS\" ] && echo \"$WORKFLOWS\" | grep -qE '^\\[.*\\]$'; then echo 'Active koto workflow detected. Run `koto next <name>` to resume.'; fi"
       }
     ]
   }

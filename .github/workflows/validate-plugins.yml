@@ -60,11 +60,8 @@ jobs:
       - name: Test Stop hook with active workflow
         run: |
           # Create a mock state file that koto workflows will discover.
-          # The discover package scans for koto-*.state.jsonl files.
-          mkdir -p wip
-          cat > wip/koto-mock.state.jsonl << 'MOCK'
-          {"type":"init","state":"test-state","timestamp":"2025-01-01T00:00:00Z","template":"mock","template_hash":"abc123"}
-          MOCK
+          # The discover package scans for koto-*.state.jsonl files in the current directory.
+          printf '{"type":"init","state":"test-state","timestamp":"2025-01-01T00:00:00Z","template":"mock","template_hash":"abc123"}\n' > koto-mock.state.jsonl
 
           # Extract the hook command from hooks.json.
           HOOK_CMD=$(jq -r '.hooks.Stop[0].command' plugins/koto-skills/hooks.json)
@@ -85,7 +82,7 @@ jobs:
       - name: Test Stop hook with no active workflow
         run: |
           # Remove the mock state file so no workflows are active.
-          rm -rf wip/koto-mock.state.jsonl
+          rm -f koto-mock.state.jsonl
 
           HOOK_CMD=$(jq -r '.hooks.Stop[0].command' plugins/koto-skills/hooks.json)
           export PATH="$PWD/target/release:$PATH"
