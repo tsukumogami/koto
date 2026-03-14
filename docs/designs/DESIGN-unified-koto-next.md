@@ -426,6 +426,16 @@ once the event taxonomy (above) is accepted:
 
 ## Implementation Approach
 
+### Phase 0: Go→Rust migration (prerequisite)
+
+Establish the Rust workspace before any new architecture work begins. All subsequent
+phases target Rust.
+
+Deliverables:
+- Cargo workspace layout and crate structure
+- CI pipeline updated (go test → cargo test, go build → cargo build)
+- Existing Go functionality ported or removed; external CLI contract preserved
+
 ### Phase 1: Event taxonomy and log format (foundational)
 
 Accept the event type definitions and JSONL format. Everything else builds on this.
@@ -438,7 +448,6 @@ Deliverables:
   each state, not all historical visits)
 - JSONL vs. JSON-array evaluation (the tactical sub-design should document this
   trade-off explicitly before committing to the line-by-line reader approach)
-- **Tactical sub-design**: Event Log Format
 
 ### Phase 2: Template format v2 (parallel with Phase 3)
 
@@ -449,7 +458,6 @@ Deliverables:
 - `when` conditions on transitions (replacing `transitions: []string`)
 - `integration` field (string tag, config-bound routing)
 - Mutual exclusivity validation in compiler
-- **Tactical sub-design**: Template Format v2
 
 ### Phase 3: CLI output contract (parallel with Phase 2)
 
@@ -461,7 +469,6 @@ Deliverables:
 - Error code taxonomy and structured error format
 - Exit code mapping
 - `--with-data` and `--to` flag behavior spec
-- **Tactical sub-design**: CLI Output Contract
 
 ### Phase 4: Auto-advancement engine (after Phases 1-3)
 
@@ -475,7 +482,6 @@ Deliverables:
 - `--to` directed transition
 - Integration runner interface and invocation
 - `koto rewind` as rewound event
-- **Tactical sub-design**: Auto-Advancement Engine
 
 ## Implementation Language
 
@@ -488,13 +494,13 @@ the Go→Rust transition, workspace structure, CI changes, and sequencing.
 
 ## Required Tactical Designs
 
-| Sub-design | Repo | Scope |
-|-----------|------|-------|
-| Go→Rust Migration | koto | Cargo workspace layout, crate structure, CI, migration sequencing |
-| Event Log Format | koto | State file JSONL schema, event type taxonomy |
-| Template Format v2 | koto | `accepts`/`when` syntax, compiler changes, format version |
-| CLI Output Contract | koto | `koto next` JSON schema, `expects` derivation, errors |
-| Auto-Advancement Engine | koto | Replay, loop, stopping conditions, integration invocation |
+| Phase | Sub-design | Scope |
+|-------|-----------|-------|
+| 0 | Go→Rust Migration | Cargo workspace layout, crate structure, CI, sequencing |
+| 1 | Event Log Format | State file JSONL schema, event type taxonomy |
+| 2 | Template Format v2 | `accepts`/`when` syntax, compiler changes |
+| 3 | CLI Output Contract | `koto next` JSON schema, `expects` derivation, errors |
+| 4 | Auto-Advancement Engine | Replay, loop, stopping conditions, integration invocation |
 
 ## Security Considerations
 
