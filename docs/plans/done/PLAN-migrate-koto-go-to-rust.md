@@ -2,7 +2,7 @@
 schema: plan/v1
 status: Done
 execution_mode: single-pr
-upstream: docs/designs/DESIGN-migrate-koto-go-to-rust.md
+upstream: docs/designs/current/DESIGN-migrate-koto-go-to-rust.md
 milestone: "Migrate koto from Go to Rust"
 issue_count: 5
 ---
@@ -37,7 +37,7 @@ module layout stubs, CI workflows replacing the Go toolchain, and `koto version`
 working end-to-end. Delete all Go source from the repository.
 
 **Acceptance Criteria**:
-- `Cargo.toml` present with all dependencies from `docs/designs/DESIGN-migrate-koto-go-to-rust.md`:
+- `Cargo.toml` present with all dependencies from `docs/designs/current/DESIGN-migrate-koto-go-to-rust.md`:
   production (clap v4 derive, serde v1 derive, serde_json, serde_yml, thiserror,
   anyhow, tempfile), unix target (wait-timeout), dev (assert_cmd, assert_fs, tempfile)
 - Module stubs exist at all paths from the design's crate layout: `src/main.rs`,
