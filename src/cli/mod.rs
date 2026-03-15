@@ -1,13 +1,17 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::buildinfo;
-use crate::cache::compile_cached;
-use crate::discover::{find_workflows, workflow_state_path};
-use crate::engine::persistence::{append_event, derive_machine_state, read_events};
-use crate::engine::types::{now_iso8601, Event};
+use crate::cache::{compile_cached, sha256_hex};
+use crate::discover::{find_workflows_with_metadata, workflow_state_path};
+use crate::engine::errors::EngineError;
+use crate::engine::persistence::{
+    append_event, append_header, derive_machine_state, derive_state_from_log, read_events,
+};
+use crate::engine::types::{now_iso8601, EventPayload, StateFileHeader};
 use crate::template::types::CompiledTemplate;
 
 #[derive(Parser)]
@@ -89,10 +93,26 @@ fn load_compiled_template(path: &str) -> anyhow::Result<CompiledTemplate> {
         .map_err(|e| anyhow::anyhow!("failed to parse template {}: {}", path, e))
 }
 
-/// Print a JSON error and exit with code 1.
+/// Print a JSON error and exit with the given code.
 fn exit_with_error(error: serde_json::Value) -> ! {
+    exit_with_error_code(error, 1)
+}
+
+/// Print a JSON error and exit with a specific exit code.
+fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
     println!("{}", serde_json::to_string(&error).unwrap_or_default());
-    std::process::exit(1);
+    std::process::exit(code);
+}
+
+/// Determine the exit code for an engine error by downcasting to EngineError.
+///
+/// Returns exit code 3 for corrupted state files, and exit code 1 for all
+/// other errors.
+fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
+    match err.downcast_ref::<EngineError>() {
+        Some(EngineError::StateFileCorrupted(_)) => 3,
+        _ => 1,
+    }
 }
 
 pub fn run(app: App) -> Result<()> {
@@ -135,15 +155,41 @@ pub fn run(app: App) -> Result<()> {
             };
 
             let initial_state = compiled.initial_state.clone();
-            let event = Event {
-                event_type: "init".to_string(),
-                state: initial_state.clone(),
-                timestamp: now_iso8601(),
-                template: Some(cache_path_str),
-                template_hash: Some(hash),
-            };
+            let ts = now_iso8601();
 
-            if let Err(e) = append_event(&state_path, &event) {
+            // Write header line
+            let header = StateFileHeader {
+                schema_version: 1,
+                workflow: name.clone(),
+                template_hash: hash,
+                created_at: ts.clone(),
+            };
+            if let Err(e) = append_header(&state_path, &header) {
+                exit_with_error(serde_json::json!({
+                    "error": e.to_string(),
+                    "command": "init"
+                }));
+            }
+
+            // Write workflow_initialized event (seq 1)
+            let init_payload = EventPayload::WorkflowInitialized {
+                template_path: cache_path_str,
+                variables: HashMap::new(),
+            };
+            if let Err(e) = append_event(&state_path, &init_payload, &ts) {
+                exit_with_error(serde_json::json!({
+                    "error": e.to_string(),
+                    "command": "init"
+                }));
+            }
+
+            // Write initial transitioned event (seq 2, from: null)
+            let transition_payload = EventPayload::Transitioned {
+                from: None,
+                to: initial_state.clone(),
+                condition_type: "auto".to_string(),
+            };
+            if let Err(e) = append_event(&state_path, &transition_payload, &ts) {
                 exit_with_error(serde_json::json!({
                     "error": e.to_string(),
                     "command": "init"
@@ -170,38 +216,63 @@ pub fn run(app: App) -> Result<()> {
                 }));
             }
 
-            let events = match read_events(&state_path) {
-                Ok(e) => e,
+            let (header, events) = match read_events(&state_path) {
+                Ok(result) => result,
                 Err(err) => {
-                    exit_with_error(serde_json::json!({
-                        "error": err.to_string(),
-                        "command": "next"
-                    }));
+                    let code = exit_code_for_engine_error(&err);
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": err.to_string(),
+                            "command": "next"
+                        }),
+                        code,
+                    );
                 }
             };
 
             if events.is_empty() {
                 exit_with_error(serde_json::json!({
-                    "error": "state file is empty",
+                    "error": "state file has no events",
                     "command": "next"
                 }));
             }
 
-            let machine_state = match derive_machine_state(&events) {
+            let machine_state = match derive_machine_state(&header, &events) {
                 Some(ms) => ms,
                 None => {
                     exit_with_error(serde_json::json!({
-                        "error": "corrupt state file",
+                        "error": "corrupt state file: cannot derive current state",
                         "command": "next"
                     }));
                 }
             };
 
-            let compiled = match load_compiled_template(&machine_state.template_path) {
+            // Verify the cached template hash matches the header's template_hash.
+            let template_bytes = match std::fs::read(&machine_state.template_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    exit_with_error(serde_json::json!({
+                        "error": format!("failed to read template {}: {}", machine_state.template_path, e),
+                        "command": "next"
+                    }));
+                }
+            };
+            let actual_hash = sha256_hex(&template_bytes);
+            if actual_hash != machine_state.template_hash {
+                exit_with_error(serde_json::json!({
+                    "error": format!(
+                        "template hash mismatch: header says {} but cached template hashes to {}",
+                        machine_state.template_hash, actual_hash
+                    ),
+                    "command": "next"
+                }));
+            }
+
+            let compiled: CompiledTemplate = match serde_json::from_slice(&template_bytes) {
                 Ok(t) => t,
                 Err(e) => {
                     exit_with_error(serde_json::json!({
-                        "error": e.to_string(),
+                        "error": format!("failed to parse template {}: {}", machine_state.template_path, e),
                         "command": "next"
                     }));
                 }
@@ -239,33 +310,57 @@ pub fn run(app: App) -> Result<()> {
                 }));
             }
 
-            let events = match read_events(&state_path) {
-                Ok(e) => e,
+            let (_header, events) = match read_events(&state_path) {
+                Ok(result) => result,
                 Err(err) => {
-                    exit_with_error(serde_json::json!({
-                        "error": err.to_string(),
-                        "command": "rewind"
-                    }));
+                    let code = exit_code_for_engine_error(&err);
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": err.to_string(),
+                            "command": "rewind"
+                        }),
+                        code,
+                    );
                 }
             };
 
-            if events.len() <= 1 {
+            // Find the current state and the state to rewind to.
+            // The current state comes from the last state-changing event.
+            // To rewind, we need to find the second-to-last state-changing event.
+            let state_changing: Vec<&crate::engine::types::Event> = events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.payload,
+                        EventPayload::Transitioned { .. }
+                            | EventPayload::DirectedTransition { .. }
+                            | EventPayload::Rewound { .. }
+                    )
+                })
+                .collect();
+
+            if state_changing.len() <= 1 {
                 exit_with_error(serde_json::json!({
                     "error": "already at initial state, cannot rewind",
                     "command": "rewind"
                 }));
             }
 
-            let prev_state = events[events.len() - 2].state.clone();
-            let event = Event {
-                event_type: "rewind".to_string(),
-                state: prev_state.clone(),
-                timestamp: now_iso8601(),
-                template: None,
-                template_hash: None,
+            let current_state = derive_state_from_log(&events).unwrap_or_default();
+            let prev_event = state_changing[state_changing.len() - 2];
+            let prev_state = match &prev_event.payload {
+                EventPayload::Transitioned { to, .. } => to.clone(),
+                EventPayload::DirectedTransition { to, .. } => to.clone(),
+                EventPayload::Rewound { to, .. } => to.clone(),
+                _ => unreachable!(),
             };
 
-            if let Err(e) = append_event(&state_path, &event) {
+            let rewind_payload = EventPayload::Rewound {
+                from: current_state,
+                to: prev_state.clone(),
+            };
+
+            if let Err(e) = append_event(&state_path, &rewind_payload, &now_iso8601()) {
                 exit_with_error(serde_json::json!({
                     "error": e.to_string(),
                     "command": "rewind"
@@ -283,8 +378,8 @@ pub fn run(app: App) -> Result<()> {
         }
         Command::Workflows => {
             let current_dir = std::env::current_dir()?;
-            let names = match find_workflows(&current_dir) {
-                Ok(n) => n,
+            let metadata = match find_workflows_with_metadata(&current_dir) {
+                Ok(m) => m,
                 Err(e) => {
                     exit_with_error(serde_json::json!({
                         "error": e.to_string(),
@@ -292,7 +387,7 @@ pub fn run(app: App) -> Result<()> {
                     }));
                 }
             };
-            println!("{}", serde_json::to_string(&names)?);
+            println!("{}", serde_json::to_string(&metadata)?);
             Ok(())
         }
         Command::Template { subcommand } => match subcommand {

@@ -40,19 +40,27 @@ Run `koto template compile <path>` to see the full compilation error.
 
 Run `koto workflows` to list active workflows.
 
-**Corrupt state file** — the JSONL file exists but all lines are malformed or it's empty:
+**Corrupt state file (exit code 3)** -- the state file exists but can't be parsed. This covers empty files, invalid JSON, and sequence number gaps:
 
 ```json
-{"error":"corrupt state file","command":"next"}
+{"error":"state file corrupted: sequence gap at line 4: expected seq 3, got 5","command":"next"}
 ```
 
-Inspect the file directly. Each line should be a valid JSON event object.
+Inspect the file directly. The first line should be a header with `schema_version`, and each subsequent line should be a valid event with a monotonic `seq` number. A truncated final line (e.g., from a crash) is recovered automatically -- only interior corruption triggers this error.
+
+**No events in state file** -- the state file has a header but no event lines:
+
+```json
+{"error":"state file has no events","command":"next"}
+```
 
 ---
 
 ### rewind
 
-**Already at initial state** — only one event exists, so there's nothing to rewind to:
+**Corrupt state file (exit code 3)** -- same as `next` above.
+
+**Already at initial state** -- only one state-changing event exists, so there's nothing to rewind to:
 
 ```json
 {"error":"already at initial state, cannot rewind","command":"rewind"}

@@ -61,6 +61,8 @@ koto init review --template review.md
 {"name":"review","state":"assess"}
 ```
 
+This creates a state file with three lines: a header (schema version, workflow name, template hash, timestamp), a `workflow_initialized` event, and an initial `transitioned` event.
+
 ### 3. Get the current directive
 
 ```bash
@@ -79,7 +81,7 @@ The `transitions` array shows which states can follow the current one.
 
 **Templates** define the workflow: states, transitions between them, and directive text for each state. Variables (`{{KEY}}`) are interpolated into directives at runtime. Use `koto template compile` to validate templates during development and see the compiled JSON output.
 
-**State files** (`koto-<name>.state.jsonl`) track progress in JSONL format -- one event per line, append-only. The current state is derived from the last event's `state` field.
+**State files** (`koto-<name>.state.jsonl`) use an event log format. The first line is a header with the schema version, workflow name, template hash, and creation timestamp. Subsequent lines are typed events with monotonic sequence numbers and type-specific payloads. The current state is derived by replaying the log -- specifically, the `to` field of the last state-changing event.
 
 **Template integrity**: The template's SHA-256 hash is locked at init time and stored in the first event. If the compiled template changes, `next` will fail. To update the template, reinitialize the workflow.
 

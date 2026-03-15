@@ -20,7 +20,7 @@ fn cache_dir() -> PathBuf {
 }
 
 /// Compute the SHA256 hex digest of a byte slice.
-fn sha256_hex(data: &[u8]) -> String {
+pub fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex_encode(hasher.finalize())

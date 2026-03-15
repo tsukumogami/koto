@@ -95,9 +95,39 @@ fn init_creates_state_file() {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    let state_path = dir.path().join("koto-my-wf.state.jsonl");
+    assert!(state_path.exists(), "state file should be created");
+
+    // Verify the state file has exactly 3 lines: header + workflow_initialized + transitioned.
+    let state_content = std::fs::read_to_string(&state_path).unwrap();
+    let lines: Vec<&str> = state_content.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "state file should have 3 lines (header + 2 events), got {}",
+        lines.len()
+    );
+
+    // Verify the header line has schema_version.
+    let header: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("header line should be valid JSON");
+    assert_eq!(
+        header["schema_version"].as_u64(),
+        Some(1),
+        "header should have schema_version=1"
+    );
+    assert_eq!(
+        header["workflow"].as_str(),
+        Some("my-wf"),
+        "header workflow should match"
+    );
     assert!(
-        dir.path().join("koto-my-wf.state.jsonl").exists(),
-        "state file should be created"
+        header["template_hash"].as_str().is_some(),
+        "header should have template_hash"
+    );
+    assert!(
+        header["created_at"].as_str().is_some(),
+        "header should have created_at"
     );
 
     let json: serde_json::Value =
@@ -230,10 +260,10 @@ fn rewind_appends_rewind_event() {
         .output()
         .unwrap();
 
-    // Append a second event directly so the state file has 2+ events,
-    // making rewind possible (init-only state has exactly 1 event).
+    // Append a transitioned event so there are 2+ state-changing events,
+    // making rewind possible (init writes header + workflow_initialized + transitioned).
     let state_path = dir.path().join("koto-rewind-wf.state.jsonl");
-    let extra_event = r#"{"type":"transition","state":"done","timestamp":"2026-01-01T00:00:00Z"}"#;
+    let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .append(true)
@@ -271,7 +301,7 @@ fn rewind_appends_rewind_event() {
         "rewind should append one new event line"
     );
 
-    // The last line must be a rewind event.
+    // The last line must be a rewind event with from/to payload.
     let last_line = std::fs::read_to_string(&state_path)
         .unwrap()
         .lines()
@@ -282,8 +312,26 @@ fn rewind_appends_rewind_event() {
         serde_json::from_str(&last_line).expect("last line should be valid JSON");
     assert_eq!(
         last_event["type"].as_str(),
-        Some("rewind"),
-        "last event should be a rewind event"
+        Some("rewound"),
+        "last event should be a rewound event"
+    );
+    assert!(
+        last_event["payload"]["from"].as_str().is_some(),
+        "rewound event should have payload.from"
+    );
+    assert!(
+        last_event["payload"]["to"].as_str().is_some(),
+        "rewound event should have payload.to"
+    );
+    assert_eq!(
+        last_event["payload"]["from"].as_str(),
+        Some("done"),
+        "rewound event should rewind from 'done'"
+    );
+    assert_eq!(
+        last_event["payload"]["to"].as_str(),
+        Some("start"),
+        "rewound event should rewind to 'start'"
     );
 }
 
@@ -376,9 +424,23 @@ fn workflows_returns_array_with_workflow() {
         .as_array()
         .expect("workflows output should be a JSON array");
     assert!(
-        arr.iter().any(|v| v.as_str() == Some("listed-wf")),
-        "array should contain the initialized workflow name, got: {:?}",
+        arr.iter().any(|v| v["name"].as_str() == Some("listed-wf")),
+        "array should contain an object with the initialized workflow name, got: {:?}",
         arr
+    );
+
+    // Verify the object has the expected metadata fields.
+    let wf = arr
+        .iter()
+        .find(|v| v["name"].as_str() == Some("listed-wf"))
+        .expect("should find listed-wf in array");
+    assert!(
+        wf["created_at"].as_str().is_some(),
+        "created_at field should be present"
+    );
+    assert!(
+        wf["template_hash"].as_str().is_some(),
+        "template_hash field should be present"
     );
 }
 
@@ -526,16 +588,18 @@ fn init_next_rewind_sequence() {
     assert!(next_json["directive"].as_str().is_some());
     assert!(next_json["transitions"].is_array());
 
-    // Append a second event to enable rewind.
+    // Append a transitioned event to enable rewind (init writes 3 lines:
+    // header + workflow_initialized + transitioned, so we need a second transition).
     let state_path = dir.path().join("koto-seq-wf.state.jsonl");
-    let extra = r#"{"type":"transition","state":"done","timestamp":"2026-01-01T00:00:00Z"}"#;
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&state_path)
-        .unwrap();
-    writeln!(f, "{}", extra).unwrap();
-    drop(f);
+    let extra = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&state_path)
+            .unwrap();
+        writeln!(f, "{}", extra).unwrap();
+    }
 
     // rewind
     let rewind_out = koto()
@@ -569,5 +633,117 @@ fn init_next_rewind_sequence() {
     assert!(
         next_after_json["directive"].as_str().is_some(),
         "directive should be present after rewind"
+    );
+
+    // Verify the last event in the state file is a rewound event.
+    let state_content = std::fs::read_to_string(&state_path).unwrap();
+    let last_line = state_content.lines().last().unwrap().to_string();
+    let last_event: serde_json::Value =
+        serde_json::from_str(&last_line).expect("last event should be valid JSON");
+    assert_eq!(
+        last_event["type"].as_str(),
+        Some("rewound"),
+        "last event should be a rewound event after rewind"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// corrupted state files
+// ---------------------------------------------------------------------------
+
+#[test]
+fn corrupted_state_file_rejected_with_exit_code_3() {
+    let dir = TempDir::new().unwrap();
+    let state_path = dir.path().join("koto-corrupt.state.jsonl");
+    std::fs::write(&state_path, "this is not valid json at all\n").unwrap();
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "corrupt"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "next should fail for corrupted state file"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "exit code should be 3 for corrupted state file"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("error output should be valid JSON");
+    assert!(
+        json["error"].as_str().is_some(),
+        "error field should be present for corrupted file"
+    );
+}
+
+#[test]
+fn rewind_event_has_from_and_to_in_payload() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    koto()
+        .current_dir(dir.path())
+        .args(["init", "payload-wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    // Append a transitioned event so rewind is possible.
+    let state_path = dir.path().join("koto-payload-wf.state.jsonl");
+    let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&state_path)
+            .unwrap();
+        writeln!(f, "{}", extra_event).unwrap();
+    }
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["rewind", "payload-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "rewind should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Read the last event from the state file and verify it has the right shape.
+    let state_content = std::fs::read_to_string(&state_path).unwrap();
+    let last_line = state_content.lines().last().unwrap().to_string();
+    let last_event: serde_json::Value =
+        serde_json::from_str(&last_line).expect("last event should be valid JSON");
+
+    assert_eq!(
+        last_event["type"].as_str(),
+        Some("rewound"),
+        "last event type should be 'rewound'"
+    );
+    assert_eq!(
+        last_event["payload"]["from"].as_str(),
+        Some("done"),
+        "payload.from should be 'done'"
+    );
+    assert_eq!(
+        last_event["payload"]["to"].as_str(),
+        Some("start"),
+        "payload.to should be 'start'"
+    );
+    assert!(
+        last_event["seq"].as_u64().is_some(),
+        "rewound event should have a seq number"
+    );
+    assert!(
+        last_event["timestamp"].as_str().is_some(),
+        "rewound event should have a timestamp"
     );
 }
