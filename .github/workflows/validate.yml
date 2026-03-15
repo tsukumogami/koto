@@ -32,54 +32,86 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
+      - uses: dtolnay/rust-toolchain@stable
 
-      - run: go mod download
+      - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            go test -short -race -coverprofile=coverage.out ./...
-          else
-            go test -short ./...
-          fi
+        run: cargo test
 
-      - name: Upload coverage to Codecov
-        if: github.event_name == 'push'
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: coverage.out
-          fail_ci_if_error: true
-
-      - name: Check for test artifacts
-        run: |
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "::error::Tests left artifacts in the source tree."
-            git status --porcelain
-            exit 1
-          fi
-
-  lint-tests:
-    name: Lint Tests
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version-file: go.mod
+          components: rustfmt
 
-      - run: go mod download
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Run lint tests
-        run: go test -v -run 'Test(GolangCILint|GoFmt|GoModTidy|GoVet|Govulncheck)' ./cmd/koto/
+      - name: Check formatting
+        run: cargo fmt --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+
+  audit:
+    name: Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run audit
+        run: cargo audit
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Generate coverage report
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
 
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, lint-tests]
+    needs: [check-artifacts, unit-tests, fmt, clippy, audit]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -87,6 +119,8 @@ jobs:
         run: |
           if [ "${{ needs.check-artifacts.result }}" = "failure" ] || \
              [ "${{ needs.unit-tests.result }}" = "failure" ] || \
-             [ "${{ needs.lint-tests.result }}" = "failure" ]; then
+             [ "${{ needs.fmt.result }}" = "failure" ] || \
+             [ "${{ needs.clippy.result }}" = "failure" ] || \
+             [ "${{ needs.audit.result }}" = "failure" ]; then
             exit 1
           fi

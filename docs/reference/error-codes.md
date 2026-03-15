@@ -1,194 +1,85 @@
 # Error Code Reference
 
-Every engine error is a `TransitionError` with a structured JSON shape. The CLI wraps it in an `error` envelope:
+Every error from the koto CLI is a JSON object with an `error` field and a `command` field:
 
 ```json
-{
-  "error": {
-    "code": "invalid_transition",
-    "message": "cannot transition from \"assess\" to \"done\": not in allowed transitions [plan]",
-    "current_state": "assess",
-    "target_state": "done",
-    "valid_transitions": ["plan"]
-  }
-}
+{"error":"workflow 'my-workflow' not found","command":"next"}
 ```
 
-The `code` field is stable and safe to match against programmatically. The `message` field is human-readable and may change between versions. Fields like `current_state`, `target_state`, and `valid_transitions` are included when relevant and omitted otherwise.
+The `error` field is a human-readable message. The `command` field identifies which subcommand produced the error. Both fields are always present.
 
-In Go code, errors are `*engine.TransitionError` values:
+## Error conditions by command
 
-```go
-type TransitionError struct {
-    Code             string   `json:"code"`
-    Message          string   `json:"message"`
-    CurrentState     string   `json:"current_state,omitempty"`
-    TargetState      string   `json:"target_state,omitempty"`
-    ValidTransitions []string `json:"valid_transitions,omitempty"`
-}
-```
+### init
 
-## Error codes
-
-### terminal_state
-
-The current state is terminal (no outgoing transitions). The workflow is finished.
-
-**When it occurs:** Calling `transition` when the workflow has already reached a terminal state.
-
-**Example:**
+**Workflow already exists** — a `koto-<name>.state.jsonl` file exists in the current directory:
 
 ```json
-{
-  "error": {
-    "code": "terminal_state",
-    "message": "cannot transition from terminal state \"done\"",
-    "current_state": "done",
-    "target_state": "assess"
-  }
-}
+{"error":"workflow 'my-workflow' already exists","command":"init"}
 ```
 
-**How to handle:** The workflow is complete. Call `next` to confirm -- it returns `{"action":"done"}`. If the terminal state is unexpected (e.g., the workflow reached an error state), use `rewind` to roll back to an earlier state and try a different path.
+Rename the workflow or delete the existing state file.
+
+**Invalid template** — the template file can't be compiled:
+
+```json
+{"error":"failed to parse template: missing required field 'initial_state'","command":"init"}
+```
+
+Run `koto template compile <path>` to see the full compilation error.
 
 ---
 
-### invalid_transition
+### next
 
-The target state isn't reachable from the current state. The transition isn't in the allowed list.
-
-**When it occurs:** Calling `transition <target>` when `target` isn't in the current state's transitions.
-
-**Example:**
+**Workflow not found** — no state file for the given name in the current directory:
 
 ```json
-{
-  "error": {
-    "code": "invalid_transition",
-    "message": "cannot transition from \"assess\" to \"done\": not in allowed transitions [plan]",
-    "current_state": "assess",
-    "target_state": "done",
-    "valid_transitions": ["plan"]
-  }
-}
+{"error":"workflow 'my-workflow' not found","command":"next"}
 ```
 
-**How to handle:** Check `valid_transitions` to see what's actually allowed from the current state. For agents, this usually means the agent picked the wrong next state. Use the `valid_transitions` array to choose a correct target.
+Run `koto workflows` to list active workflows.
+
+**Corrupt state file** — the JSONL file exists but all lines are malformed or it's empty:
+
+```json
+{"error":"corrupt state file","command":"next"}
+```
+
+Inspect the file directly. Each line should be a valid JSON event object.
 
 ---
 
-### unknown_state
+### rewind
 
-A state name in the state file doesn't exist in the machine definition. This indicates a corrupted state file or an incompatible machine definition.
-
-**When it occurs:**
-- `Load` finds a `current_state` that isn't in the machine.
-- `Init` is called with a machine whose `InitialState` doesn't exist in its own states map.
-
-**Example:**
+**Already at initial state** — only one event exists, so there's nothing to rewind to:
 
 ```json
-{
-  "error": {
-    "code": "unknown_state",
-    "message": "current state \"planning\" not found in machine definition",
-    "current_state": "planning"
-  }
-}
+{"error":"already at initial state, cannot rewind","command":"rewind"}
 ```
 
-**How to handle:** This shouldn't happen during normal operation. It means either the state file was manually edited, or the template/machine definition changed incompatibly. Cancel the workflow and reinitialize.
+**Workflow not found:**
+
+```json
+{"error":"workflow 'my-workflow' not found","command":"rewind"}
+```
 
 ---
 
-### template_mismatch
+### template compile
 
-The template file on disk has a different SHA-256 hash than the one recorded when the workflow was initialized. Someone modified the template after the workflow started.
-
-**When it occurs:** Calling `next`, `transition`, `rewind`, or `validate` when the template file has changed since `init`.
-
-**Example:**
+**Compilation failed** — invalid YAML, missing required fields, or unknown gate type:
 
 ```json
-{
-  "error": {
-    "code": "template_mismatch",
-    "message": "template hash mismatch: state file has \"sha256:abc...\" but template on disk is \"sha256:def...\""
-  }
-}
+{"error":"missing required field 'initial_state'","command":"template compile"}
 ```
-
-**How to handle:** There's no override flag -- this is by design. The template defines the workflow rules, and changing them mid-execution breaks the integrity guarantee. Options:
-
-1. **Restore the original template.** If the change was accidental (editor auto-save, formatting tool), revert the template file to its original content.
-2. **Cancel and restart.** If the template change is intentional, run `koto cancel` and `koto init` with the updated template.
-3. **Diagnose.** Run `koto validate` to confirm the mismatch. The state file's `workflow.template_hash` field shows the expected hash.
 
 ---
 
-### version_conflict
+### template validate
 
-The state file's version counter changed between when the engine read it and when it tried to write. Another process modified the file in between.
-
-**When it occurs:** Calling `transition` or `rewind` when another process wrote to the same state file concurrently.
-
-**Example:**
+**Schema invalid** — the compiled JSON doesn't match the expected schema:
 
 ```json
-{
-  "error": {
-    "code": "version_conflict",
-    "message": "version conflict: expected version 3 but found 4 on disk"
-  }
-}
+{"error":"invalid JSON: missing field `format_version`","command":"template validate"}
 ```
-
-**How to handle:** Re-read the state file and check the current state. The other writer may have already made the transition you intended. In most cases, reloading and retrying is the right approach:
-
-```bash
-# Check what state the file is actually in
-koto query
-
-# Retry the operation if still needed
-koto transition <target>
-```
-
-For library consumers, this means calling `engine.Load` again to get a fresh view of the state file.
-
----
-
-### rewind_failed
-
-The rewind target is invalid. Either the state was never visited, or the target is a terminal state.
-
-**When it occurs:** Calling `rewind --to <target>` when:
-- The target state has never appeared as a destination in the transition history (and isn't the initial state).
-- The target state is terminal (rewinding there would leave the workflow stuck).
-
-**Example (never visited):**
-
-```json
-{
-  "error": {
-    "code": "rewind_failed",
-    "message": "cannot rewind to \"implement\": state has never been visited",
-    "current_state": "plan",
-    "target_state": "implement"
-  }
-}
-```
-
-**Example (terminal target):**
-
-```json
-{
-  "error": {
-    "code": "rewind_failed",
-    "message": "cannot rewind to \"done\": target is a terminal state",
-    "current_state": "implement",
-    "target_state": "done"
-  }
-}
-```
-
-**How to handle:** Check the transition history (`koto query`) to see which states have been visited. You can only rewind to states that appear as a `to` field in the history, plus the machine's initial state which is always valid.

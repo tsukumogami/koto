@@ -15,20 +15,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
+      - uses: dtolnay/rust-toolchain@stable
 
-      - run: go mod download
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build koto
-        run: go build -o ./koto ./cmd/koto/
+        run: cargo build --release
 
       - name: Run prompt evals
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          export PATH="$PWD:$PATH"
+          export PATH="$PWD/target/release:$PATH"
           bash plugins/koto-skills/eval.sh
 
   eval-plugins:

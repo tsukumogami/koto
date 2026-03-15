@@ -9,53 +9,102 @@ permissions:
   contents: write
 
 jobs:
-  # GoReleaser creates the draft release and builds Go binaries
-  release:
-    name: Release (Go)
-    runs-on: ubuntu-latest
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: koto-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: koto-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: koto-darwin-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: koto-darwin-arm64
     steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5  # v6.2.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version-file: "go.mod"
-          cache-dependency-path: go.sum
+          targets: ${{ matrix.target }}
 
-      - name: Verify go.mod is tidy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (Linux cross-compilation)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo install cross --locked
+
+      - name: Build (Linux, cross)
+        if: matrix.os == 'ubuntu-latest'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (macOS, native)
+        if: matrix.os == 'macos-latest'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
         run: |
-          go mod tidy
-          if ! git diff --exit-code go.mod go.sum; then
-            echo "::error::go.mod or go.sum is not tidy. Cannot release with untidy module files."
-            exit 1
-          fi
+          cp target/${{ matrix.target }}/release/koto ${{ matrix.artifact }}
 
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a  # v6
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
 
-      - name: Update release with notes from tag
+  release:
+    name: Create Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd ./artifacts
+          sha256sum koto-* > checksums.txt
+          echo "Generated checksums.txt:"
+          cat checksums.txt
+
+      - name: Extract release notes from tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}" --force
+          git tag -l --format='%(contents)' "${TAG}" > /tmp/release-notes.md
+          echo "Release notes:"
+          cat /tmp/release-notes.md
+
+      - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          # Fetch tag annotations (not included in checkout)
-          git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}" --force
-          # Extract full tag annotation message
-          git tag -l --format='%(contents)' "${TAG}" > /tmp/release-notes.md
-          echo "Release notes extracted:"
-          cat /tmp/release-notes.md
-          # Update the release body with our curated notes
-          gh release edit "$TAG" --notes-file /tmp/release-notes.md
-          echo "Updated release $TAG with release notes"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file /tmp/release-notes.md \
+            ./artifacts/koto-linux-amd64 \
+            ./artifacts/koto-linux-arm64 \
+            ./artifacts/koto-darwin-amd64 \
+            ./artifacts/koto-darwin-arm64 \
+            ./artifacts/checksums.txt
 
   finalize-release:
     name: Finalize Release
@@ -86,38 +135,3 @@ jobs:
             echo "Found: $artifact"
           done
           echo "All artifacts verified"
-
-      - name: Download artifacts and generate checksums
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          mkdir -p ./artifacts
-          cd ./artifacts
-
-          # Download all binary artifacts (exclude existing checksums.txt from goreleaser)
-          gh release download "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern "koto-*" \
-            --skip-existing
-
-          # Generate unified checksums for all binaries
-          sha256sum koto-* > checksums.txt
-          echo "Generated checksums.txt:"
-          cat checksums.txt
-
-      - name: Upload checksums
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" ./artifacts/checksums.txt --clobber
-          echo "Uploaded checksums.txt"
-
-      - name: Publish release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
-          echo "Published release $TAG"
