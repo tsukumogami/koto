@@ -9,3 +9,6 @@
 
 # Local environment
 .local.env
+
+# Internal tooling (not for public repo)
+.claude/
