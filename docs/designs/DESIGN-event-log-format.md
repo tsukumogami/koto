@@ -1,5 +1,5 @@
 ---
-status: Planned
+status: Current
 problem: |
   koto's state model (from issue #45) uses a minimal JSONL format with no sequence
   numbers, no typed payloads, and no header line. This is intentionally incomplete —
@@ -27,7 +27,7 @@ rationale: |
 
 ## Status
 
-Planned
+Current
 
 ## Upstream Design Reference
 

@@ -1,6 +1,6 @@
 ---
 schema: plan/v1
-status: Draft
+status: Done
 execution_mode: single-pr
 upstream: docs/designs/DESIGN-migrate-koto-go-to-rust.md
 milestone: "Migrate koto from Go to Rust"
@@ -11,7 +11,7 @@ issue_count: 5
 
 ## Status
 
-Draft
+Done
 
 ## Scope Summary
 
