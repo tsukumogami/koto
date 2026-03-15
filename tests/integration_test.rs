@@ -230,10 +230,10 @@ fn rewind_appends_rewind_event() {
         .output()
         .unwrap();
 
-    // Append a second event directly so the state file has 2+ events,
-    // making rewind possible (init-only state has exactly 1 event).
+    // Append a transitioned event so there are 2+ state-changing events,
+    // making rewind possible (init writes header + workflow_initialized + transitioned).
     let state_path = dir.path().join("koto-rewind-wf.state.jsonl");
-    let extra_event = r#"{"type":"transition","state":"done","timestamp":"2026-01-01T00:00:00Z"}"#;
+    let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .append(true)
@@ -282,8 +282,8 @@ fn rewind_appends_rewind_event() {
         serde_json::from_str(&last_line).expect("last line should be valid JSON");
     assert_eq!(
         last_event["type"].as_str(),
-        Some("rewind"),
-        "last event should be a rewind event"
+        Some("rewound"),
+        "last event should be a rewound event"
     );
 }
 
@@ -526,16 +526,18 @@ fn init_next_rewind_sequence() {
     assert!(next_json["directive"].as_str().is_some());
     assert!(next_json["transitions"].is_array());
 
-    // Append a second event to enable rewind.
+    // Append a transitioned event to enable rewind (init writes 3 lines:
+    // header + workflow_initialized + transitioned, so we need a second transition).
     let state_path = dir.path().join("koto-seq-wf.state.jsonl");
-    let extra = r#"{"type":"transition","state":"done","timestamp":"2026-01-01T00:00:00Z"}"#;
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&state_path)
-        .unwrap();
-    writeln!(f, "{}", extra).unwrap();
-    drop(f);
+    let extra = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&state_path)
+            .unwrap();
+        writeln!(f, "{}", extra).unwrap();
+    }
 
     // rewind
     let rewind_out = koto()
