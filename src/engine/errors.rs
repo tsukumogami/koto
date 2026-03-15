@@ -18,7 +18,4 @@ pub enum EngineError {
 
     #[error("state file corrupted: {0}")]
     StateFileCorrupted(String),
-
-    #[error("incompatible state file format: {0}")]
-    IncompatibleFormat(String),
 }

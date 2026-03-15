@@ -104,11 +104,8 @@ fn read_last_seq(path: &Path) -> anyhow::Result<u64> {
 
 /// Read the header line from a state file.
 ///
-/// Performs three-tier format detection:
-/// 1. First line has `current_state` or `CurrentState` -> old Go format
-/// 2. First line has `type` but no `schema_version` -> #45 simple JSONL
-/// 3. First line has `schema_version: 1` -> new format
-/// 4. First line is not parseable JSON -> corrupted
+/// Parses the first line as a `StateFileHeader`. If it doesn't parse,
+/// the file is treated as corrupted.
 pub fn read_header(path: &Path) -> anyhow::Result<StateFileHeader> {
     let file = std::fs::File::open(path)
         .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
@@ -117,7 +114,9 @@ pub fn read_header(path: &Path) -> anyhow::Result<StateFileHeader> {
     let first_line = reader
         .lines()
         .next()
-        .ok_or_else(|| anyhow::anyhow!("state file is empty"))?
+        .ok_or_else(|| {
+            EngineError::StateFileCorrupted("state file is empty".to_string())
+        })?
         .map_err(|e| anyhow::anyhow!("failed to read first line: {}", e))?;
 
     let trimmed = first_line.trim();
@@ -127,50 +126,14 @@ pub fn read_header(path: &Path) -> anyhow::Result<StateFileHeader> {
         );
     }
 
-    detect_and_parse_header(trimmed)
+    parse_header(trimmed)
 }
 
-/// Three-tier format detection on the first line of a state file.
-fn detect_and_parse_header(first_line: &str) -> anyhow::Result<StateFileHeader> {
-    let val: serde_json::Value = serde_json::from_str(first_line).map_err(|_| {
-        EngineError::StateFileCorrupted(
-            "first line is not valid JSON; state file may be corrupted".to_string(),
-        )
-    })?;
-
-    let obj = val.as_object().ok_or_else(|| {
-        EngineError::StateFileCorrupted("first line is not a JSON object".to_string())
-    })?;
-
-    // Tier 1: Old Go format (has current_state or CurrentState)
-    if obj.contains_key("current_state") || obj.contains_key("CurrentState") {
-        return Err(EngineError::IncompatibleFormat(
-            "state file uses old Go format; delete and re-initialize with 'koto init'".to_string(),
-        )
-        .into());
-    }
-
-    // Tier 2: #45 simple JSONL format (has "type" but no "schema_version")
-    if obj.contains_key("type") && !obj.contains_key("schema_version") {
-        return Err(EngineError::IncompatibleFormat(
-            "state file uses an older format; delete and re-initialize with 'koto init'"
-                .to_string(),
-        )
-        .into());
-    }
-
-    // Tier 3: New format (has schema_version)
-    if obj.contains_key("schema_version") {
-        let header: StateFileHeader = serde_json::from_str(first_line).map_err(|e| {
-            EngineError::StateFileCorrupted(format!("failed to parse header: {}", e))
-        })?;
-        return Ok(header);
-    }
-
-    Err(EngineError::StateFileCorrupted(
-        "first line is not a recognized state file format".to_string(),
-    )
-    .into())
+/// Parse a header line as a `StateFileHeader`.
+fn parse_header(first_line: &str) -> anyhow::Result<StateFileHeader> {
+    serde_json::from_str::<StateFileHeader>(first_line).map_err(|e| {
+        EngineError::StateFileCorrupted(format!("failed to parse header: {}", e)).into()
+    })
 }
 
 /// Read all events from the JSONL state file at `path`.
@@ -198,7 +161,7 @@ pub fn read_events(path: &Path) -> anyhow::Result<(StateFileHeader, Vec<Event>)>
     }
 
     // Parse header (first line)
-    let header = detect_and_parse_header(lines[0].trim())?;
+    let header = parse_header(lines[0].trim())?;
 
     // Parse events (remaining lines)
     let event_lines = &lines[1..];
@@ -482,50 +445,6 @@ mod tests {
         assert_eq!(parsed_header, header);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].seq, 1);
-    }
-
-    // -----------------------------------------------------------------------
-    // Format detection
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn go_format_first_line_produces_error() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-go.state.jsonl");
-        std::fs::write(
-            &path,
-            r#"{"current_state":"gather","template":"/path","template_hash":"abc"}"#,
-        )
-        .unwrap();
-
-        let result = read_events(&path);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("old Go format"),
-            "should detect Go format, got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn issue45_format_first_line_produces_error() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-45.state.jsonl");
-        std::fs::write(
-            &path,
-            r#"{"type":"init","state":"gather","timestamp":"2026-01-01T00:00:00Z"}"#,
-        )
-        .unwrap();
-
-        let result = read_events(&path);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("older format"),
-            "should detect #45 format, got: {}",
-            err
-        );
     }
 
     // -----------------------------------------------------------------------

@@ -648,84 +648,8 @@ fn init_next_rewind_sequence() {
 }
 
 // ---------------------------------------------------------------------------
-// format detection: legacy and corrupted state files
+// corrupted state files
 // ---------------------------------------------------------------------------
-
-#[test]
-fn go_format_state_file_rejected_with_exit_code_3() {
-    let dir = TempDir::new().unwrap();
-    let state_path = dir.path().join("koto-old-go.state.jsonl");
-    std::fs::write(
-        &state_path,
-        r#"{"current_state":"gather","template":"/path/to/template","template_hash":"abc123"}"#,
-    )
-    .unwrap();
-
-    let output = koto()
-        .current_dir(dir.path())
-        .args(["next", "old-go"])
-        .output()
-        .unwrap();
-
-    assert!(
-        !output.status.success(),
-        "next should fail for Go-format state file"
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(3),
-        "exit code should be 3 for incompatible Go format"
-    );
-
-    let json: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("error output should be valid JSON");
-    assert!(
-        json["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("old Go format"),
-        "error should mention old Go format, got: {}",
-        json["error"]
-    );
-}
-
-#[test]
-fn issue45_format_state_file_rejected_with_exit_code_3() {
-    let dir = TempDir::new().unwrap();
-    let state_path = dir.path().join("koto-old-45.state.jsonl");
-    std::fs::write(
-        &state_path,
-        r#"{"type":"init","state":"gather","timestamp":"2026-01-01T00:00:00Z"}"#,
-    )
-    .unwrap();
-
-    let output = koto()
-        .current_dir(dir.path())
-        .args(["next", "old-45"])
-        .output()
-        .unwrap();
-
-    assert!(
-        !output.status.success(),
-        "next should fail for #45-format state file"
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(3),
-        "exit code should be 3 for incompatible #45 format"
-    );
-
-    let json: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("error output should be valid JSON");
-    assert!(
-        json["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("older format"),
-        "error should mention older format, got: {}",
-        json["error"]
-    );
-}
 
 #[test]
 fn corrupted_state_file_rejected_with_exit_code_3() {
@@ -754,33 +678,6 @@ fn corrupted_state_file_rejected_with_exit_code_3() {
     assert!(
         json["error"].as_str().is_some(),
         "error field should be present for corrupted file"
-    );
-}
-
-#[test]
-fn rewind_on_go_format_state_file_rejected_with_exit_code_3() {
-    let dir = TempDir::new().unwrap();
-    let state_path = dir.path().join("koto-rw-go.state.jsonl");
-    std::fs::write(
-        &state_path,
-        r#"{"current_state":"gather","template":"/path","template_hash":"abc"}"#,
-    )
-    .unwrap();
-
-    let output = koto()
-        .current_dir(dir.path())
-        .args(["rewind", "rw-go"])
-        .output()
-        .unwrap();
-
-    assert!(
-        !output.status.success(),
-        "rewind should fail for Go-format state file"
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(3),
-        "exit code should be 3 for incompatible Go format on rewind"
     );
 }
 

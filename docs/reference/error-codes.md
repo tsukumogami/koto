@@ -40,23 +40,7 @@ Run `koto template compile <path>` to see the full compilation error.
 
 Run `koto workflows` to list active workflows.
 
-**Incompatible state file format (exit code 3)** -- the state file uses an older format that's no longer supported. Two cases:
-
-Old Go format (has `current_state` field):
-
-```json
-{"error":"incompatible state file format: state file uses old Go format; delete and re-initialize with 'koto init'","command":"next"}
-```
-
-Older JSONL format from #45 (has `type` but no `schema_version`):
-
-```json
-{"error":"incompatible state file format: state file uses an older format; delete and re-initialize with 'koto init'","command":"next"}
-```
-
-Delete the state file and run `koto init` again to create a new one in the current format.
-
-**Corrupt state file (exit code 3)** -- the state file exists but can't be parsed. This covers empty files, invalid JSON, unrecognized formats, and sequence number gaps:
+**Corrupt state file (exit code 3)** -- the state file exists but can't be parsed. This covers empty files, invalid JSON, and sequence number gaps:
 
 ```json
 {"error":"state file corrupted: sequence gap at line 4: expected seq 3, got 5","command":"next"}
@@ -74,7 +58,7 @@ Inspect the file directly. The first line should be a header with `schema_versio
 
 ### rewind
 
-**Incompatible or corrupt state file (exit code 3)** -- same format detection errors as `next` apply to `rewind`. See the `next` section above for details.
+**Corrupt state file (exit code 3)** -- same as `next` above.
 
 **Already at initial state** -- only one state-changing event exists, so there's nothing to rewind to:
 

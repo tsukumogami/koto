@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Planned
 problem: |
   koto's state model (from issue #45) uses a minimal JSONL format with no sequence
   numbers, no typed payloads, and no header line. This is intentionally incomplete —
@@ -27,7 +27,7 @@ rationale: |
 
 ## Status
 
-Proposed
+Planned
 
 ## Upstream Design Reference
 
@@ -184,17 +184,26 @@ since koto has no released users.
 
 ---
 
-### Decision 5: `koto query` / `koto log` in this issue
+### Decision 5: `koto state` (renamed from `koto query`) in this issue
 
 **Chosen: Defer to post-#49**
 
-The Go implementation had `koto query` returning a full snapshot (current state,
+`koto state` is a snapshot command that replays the event log and returns a
+computed JSON object representing the current picture of the workflow: current
+state, active evidence (scoped by epoch boundary), full transition history, and
+variables. Unlike `koto log` (which would dump raw JSONL events without
+interpretation), `koto state` applies the replay rules and gives the caller a
+derived view. The command was called `koto query` in the Go implementation;
+renamed to `koto state` because the command returns workflow state, not an
+arbitrary query.
+
+The Go implementation had `koto state` returning a full snapshot (current state,
 evidence, history, variables). The new event log provides the same information via
-replay, but the shape of a query response depends on `expects` field decisions
-(#47) and the unified output contract (#48). Adding `koto query` in #46 forces
+replay, but the shape of a state response depends on `expects` field decisions
+(#47) and the unified output contract (#48). Adding `koto state` in #46 forces
 those decisions prematurely. The JSONL log is directly machine-readable; agents can
 inspect it without a dedicated command. This is intentional — the migration design
-explicitly listed `koto query` as "Excluded | #48 or later."
+explicitly listed `koto state` as "Excluded | #48 or later."
 
 ## Decision Outcome
 
@@ -283,6 +292,14 @@ For this issue (#46), only `workflow_initialized` and `rewound` are implemented.
 The other four types are defined here so #47, #48, and #49 can reference the
 accepted taxonomy.
 
+**`directed_transition` vs `rewound`:** both change the current state, but they
+serve different purposes. `directed_transition` is a forward move — the agent
+chooses a specific outgoing edge at a branching point (target must be a valid
+transition from the current state). `rewound` is a backward move — returning to
+a previously visited state for recovery or retry (target must be a state already
+in the log's history). The distinction matters for the audit trail: inspecting
+the log reveals whether a state was reached by normal progression or by rollback.
+
 **State-changing event types:** `transitioned`, `directed_transition`, `rewound`.
 These are the only types that affect current state derivation and epoch boundaries.
 
@@ -327,19 +344,18 @@ Seq is monotonically increasing by 1, starting at 1. The header line has no seq.
 - Writer reads the last event's seq from the file before each append
 - New event gets `last_seq + 1`; `workflow_initialized` gets seq 1
 
-### File Format Detection
+### Header Parsing
 
-`read_events` detects the format before parsing:
-
-1. Read the first line
-2. If the first line has a `current_state` or `CurrentState` field → old Go format;
-   error with message directing user to delete and re-init
-3. If the first line has a `type` field (but not `schema_version`) → #45 simple JSONL;
-   error with message directing user to delete and re-init
-4. If the first line has `schema_version: 1` → new format; proceed
-5. If the first line is not parseable JSON → corrupted; error
+`read_events` parses the first line as a `StateFileHeader`. If parsing fails
+(invalid JSON or missing required fields), the file is treated as corrupted.
 
 ### `koto workflows` Output
+
+`koto workflows` is a discovery command: it scans the current directory for
+`koto-*.state.jsonl` files and lists all active workflows. A project directory
+can have multiple concurrent workflows (e.g., `koto-deploy.state.jsonl`,
+`koto-review.state.jsonl`), and agents or users run this command to see what's
+available before interacting with a specific workflow via `koto next`.
 
 The command reads the header line of each `koto-*.state.jsonl` file and returns:
 
@@ -384,7 +400,7 @@ Results are sorted by name. This is a breaking change from the #45 string-array 
    the corrected state derivation rule
 2. **`src/engine/persistence.rs`**: Update `append_event` (mode 0600, sync_data,
    writer-managed seq); rewrite `read_events` (header parsing, gap detection,
-   format detection); add `derive_state_from_log` function (revised rule including
+   header parsing, gap detection); add `derive_state_from_log` function (revised rule including
    `rewound`); add `derive_evidence` function (epoch boundary rule)
 3. **`src/discover.rs`**: Add `find_workflows_with_metadata` returning header fields;
    update existing `find_workflows` or replace with the new function
@@ -475,7 +491,5 @@ appending the event.
 
 ### Mitigations
 
-- **Breaking change**: the format detection code in `read_events` rejects old files
-  with a clear error message telling users to delete and re-init. No silent data loss.
 - **Replay latency**: the `integration_invoked` event type reserves space in the
   taxonomy for a future snapshot event. Adding it later doesn't require a schema change.

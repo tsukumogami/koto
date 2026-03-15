@@ -106,11 +106,11 @@ fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
 
 /// Determine the exit code for an engine error by downcasting to EngineError.
 ///
-/// Returns exit code 3 for corrupted or incompatible state files,
-/// and exit code 1 for all other errors.
+/// Returns exit code 3 for corrupted state files, and exit code 1 for all
+/// other errors.
 fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
     match err.downcast_ref::<EngineError>() {
-        Some(EngineError::StateFileCorrupted(_) | EngineError::IncompatibleFormat(_)) => 3,
+        Some(EngineError::StateFileCorrupted(_)) => 3,
         _ => 1,
     }
 }
