@@ -2,7 +2,7 @@
 schema: plan/v1
 status: Done
 execution_mode: single-pr
-upstream: docs/designs/DESIGN-event-log-format.md
+upstream: docs/designs/current/DESIGN-event-log-format.md
 milestone: "Event Log Format"
 issue_count: 4
 ---
