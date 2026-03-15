@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use crate::buildinfo;
 use crate::cache::compile_cached;
 use crate::discover::{find_workflows, workflow_state_path};
+use crate::engine::errors::EngineError;
 use crate::engine::persistence::{
     append_event, append_header, derive_machine_state, derive_state_from_log, read_events,
 };
@@ -101,6 +102,17 @@ fn exit_with_error(error: serde_json::Value) -> ! {
 fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
     println!("{}", serde_json::to_string(&error).unwrap_or_default());
     std::process::exit(code);
+}
+
+/// Determine the exit code for an engine error by downcasting to EngineError.
+///
+/// Returns exit code 3 for corrupted or incompatible state files,
+/// and exit code 1 for all other errors.
+fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
+    match err.downcast_ref::<EngineError>() {
+        Some(EngineError::StateFileCorrupted(_) | EngineError::IncompatibleFormat(_)) => 3,
+        _ => 1,
+    }
 }
 
 pub fn run(app: App) -> Result<()> {
@@ -207,30 +219,14 @@ pub fn run(app: App) -> Result<()> {
             let (header, events) = match read_events(&state_path) {
                 Ok(result) => result,
                 Err(err) => {
-                    // Check if this is an incompatible format error (exit code 3)
-                    let err_str = err.to_string();
-                    if err_str.contains("old Go format") || err_str.contains("older format") {
-                        exit_with_error_code(
-                            serde_json::json!({
-                                "error": err_str,
-                                "command": "next"
-                            }),
-                            3,
-                        );
-                    }
-                    if err_str.contains("corrupted") {
-                        exit_with_error_code(
-                            serde_json::json!({
-                                "error": err_str,
-                                "command": "next"
-                            }),
-                            3,
-                        );
-                    }
-                    exit_with_error(serde_json::json!({
-                        "error": err_str,
-                        "command": "next"
-                    }));
+                    let code = exit_code_for_engine_error(&err);
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": err.to_string(),
+                            "command": "next"
+                        }),
+                        code,
+                    );
                 }
             };
 
@@ -296,23 +292,14 @@ pub fn run(app: App) -> Result<()> {
             let (_header, events) = match read_events(&state_path) {
                 Ok(result) => result,
                 Err(err) => {
-                    let err_str = err.to_string();
-                    if err_str.contains("old Go format")
-                        || err_str.contains("older format")
-                        || err_str.contains("corrupted")
-                    {
-                        exit_with_error_code(
-                            serde_json::json!({
-                                "error": err_str,
-                                "command": "rewind"
-                            }),
-                            3,
-                        );
-                    }
-                    exit_with_error(serde_json::json!({
-                        "error": err_str,
-                        "command": "rewind"
-                    }));
+                    let code = exit_code_for_engine_error(&err);
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": err.to_string(),
+                            "command": "rewind"
+                        }),
+                        code,
+                    );
                 }
             };
 

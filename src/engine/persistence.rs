@@ -80,28 +80,26 @@ pub fn append_event(path: &Path, payload: &EventPayload, timestamp: &str) -> any
 }
 
 /// Read the last event's seq from the file. Returns 0 if no events exist.
+///
+/// Reads only the last non-empty non-header line's seq, since in a valid
+/// file seq equals line index. This avoids silently masking corruption
+/// where events appear out of order.
 fn read_last_seq(path: &Path) -> anyhow::Result<u64> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read state file {}: {}", path.display(), e))?;
 
-    let mut last_seq: u64 = 0;
+    // Find the last non-empty line after the header.
+    let event_lines: Vec<&str> = content.lines().skip(1).collect();
+    let last_line = event_lines.iter().rev().find(|l| !l.trim().is_empty());
 
-    for line in content.lines().skip(1) {
-        // skip header (line 0)
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(seq) = val.get("seq").and_then(|s| s.as_u64()) {
-                if seq > last_seq {
-                    last_seq = seq;
-                }
-            }
+    match last_line {
+        None => Ok(0),
+        Some(line) => {
+            let val: serde_json::Value = serde_json::from_str(line.trim())
+                .map_err(|e| anyhow::anyhow!("failed to parse last event line: {}", e))?;
+            Ok(val.get("seq").and_then(|s| s.as_u64()).unwrap_or(0))
         }
     }
-
-    Ok(last_seq)
 }
 
 /// Read the header line from a state file.
