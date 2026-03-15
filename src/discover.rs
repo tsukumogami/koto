@@ -44,19 +44,9 @@ pub fn find_workflows_with_metadata(dir: &Path) -> anyhow::Result<Vec<WorkflowMe
     Ok(results)
 }
 
-/// Find all koto workflows in `dir` by globbing `koto-*.state.jsonl`.
-///
-/// Returns workflow names with the `koto-` prefix and `.state.jsonl` suffix stripped.
-pub fn find_workflows(dir: &Path) -> anyhow::Result<Vec<String>> {
-    let mut names = find_workflow_names(dir)?;
-    names.sort();
-    Ok(names)
-}
-
 /// Scan `dir` for `koto-*.state.jsonl` files and return the extracted names.
 ///
-/// Names are returned unsorted. Both `find_workflows` and
-/// `find_workflows_with_metadata` build on this.
+/// Names are returned unsorted. Used by `find_workflows_with_metadata`.
 fn find_workflow_names(dir: &Path) -> anyhow::Result<Vec<String>> {
     let mut names = Vec::new();
 
@@ -105,48 +95,6 @@ mod tests {
         let path = dir.join(format!("koto-{}.state.jsonl", workflow_name));
         std::fs::write(path, content).unwrap();
     }
-
-    // -----------------------------------------------------------------------
-    // find_workflows (existing tests)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn find_workflows_returns_correct_names() {
-        let dir = TempDir::new().unwrap();
-        touch(dir.path(), "koto-my-workflow.state.jsonl");
-        touch(dir.path(), "koto-another.state.jsonl");
-        touch(dir.path(), "koto-third.state.jsonl");
-        // Should not be included:
-        touch(dir.path(), "other-file.txt");
-        touch(dir.path(), "koto-.state.jsonl"); // empty name
-
-        let mut names = find_workflows(dir.path()).unwrap();
-        names.sort();
-
-        assert_eq!(names, vec!["another", "my-workflow", "third"]);
-    }
-
-    #[test]
-    fn find_workflows_empty_dir() {
-        let dir = TempDir::new().unwrap();
-        let names = find_workflows(dir.path()).unwrap();
-        assert!(names.is_empty());
-    }
-
-    #[test]
-    fn find_workflows_ignores_non_matching_files() {
-        let dir = TempDir::new().unwrap();
-        touch(dir.path(), "state.jsonl");
-        touch(dir.path(), "koto-foo.json");
-        touch(dir.path(), "prefix-koto-foo.state.jsonl");
-
-        let names = find_workflows(dir.path()).unwrap();
-        assert!(names.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // find_workflows_with_metadata
-    // -----------------------------------------------------------------------
 
     #[test]
     fn metadata_returns_valid_headers() {
