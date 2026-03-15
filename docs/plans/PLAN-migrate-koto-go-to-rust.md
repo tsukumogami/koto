@@ -183,8 +183,7 @@ graph TD
     classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
     classDef tracksPlan fill:#FFE0B2,stroke:#F57C00,color:#000
 
-    class I1 ready
-    class I2,I3,I4,I5 blocked
+    class I1,I2,I3,I4,I5 done
 ```
 
 **Legend**: Green = done, Blue = ready, Yellow = blocked
