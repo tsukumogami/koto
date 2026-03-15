@@ -5,8 +5,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::buildinfo;
-use crate::cache::compile_cached;
-use crate::discover::{find_workflows, workflow_state_path};
+use crate::cache::{compile_cached, sha256_hex};
+use crate::discover::{find_workflows_with_metadata, workflow_state_path};
 use crate::engine::errors::EngineError;
 use crate::engine::persistence::{
     append_event, append_header, derive_machine_state, derive_state_from_log, read_events,
@@ -247,11 +247,32 @@ pub fn run(app: App) -> Result<()> {
                 }
             };
 
-            let compiled = match load_compiled_template(&machine_state.template_path) {
+            // Verify the cached template hash matches the header's template_hash.
+            let template_bytes = match std::fs::read(&machine_state.template_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    exit_with_error(serde_json::json!({
+                        "error": format!("failed to read template {}: {}", machine_state.template_path, e),
+                        "command": "next"
+                    }));
+                }
+            };
+            let actual_hash = sha256_hex(&template_bytes);
+            if actual_hash != machine_state.template_hash {
+                exit_with_error(serde_json::json!({
+                    "error": format!(
+                        "template hash mismatch: header says {} but cached template hashes to {}",
+                        machine_state.template_hash, actual_hash
+                    ),
+                    "command": "next"
+                }));
+            }
+
+            let compiled: CompiledTemplate = match serde_json::from_slice(&template_bytes) {
                 Ok(t) => t,
                 Err(e) => {
                     exit_with_error(serde_json::json!({
-                        "error": e.to_string(),
+                        "error": format!("failed to parse template {}: {}", machine_state.template_path, e),
                         "command": "next"
                     }));
                 }
@@ -357,8 +378,8 @@ pub fn run(app: App) -> Result<()> {
         }
         Command::Workflows => {
             let current_dir = std::env::current_dir()?;
-            let names = match find_workflows(&current_dir) {
-                Ok(n) => n,
+            let metadata = match find_workflows_with_metadata(&current_dir) {
+                Ok(m) => m,
                 Err(e) => {
                     exit_with_error(serde_json::json!({
                         "error": e.to_string(),
@@ -366,7 +387,7 @@ pub fn run(app: App) -> Result<()> {
                     }));
                 }
             };
-            println!("{}", serde_json::to_string(&names)?);
+            println!("{}", serde_json::to_string(&metadata)?);
             Ok(())
         }
         Command::Template { subcommand } => match subcommand {

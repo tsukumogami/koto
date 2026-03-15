@@ -376,9 +376,23 @@ fn workflows_returns_array_with_workflow() {
         .as_array()
         .expect("workflows output should be a JSON array");
     assert!(
-        arr.iter().any(|v| v.as_str() == Some("listed-wf")),
-        "array should contain the initialized workflow name, got: {:?}",
+        arr.iter().any(|v| v["name"].as_str() == Some("listed-wf")),
+        "array should contain an object with the initialized workflow name, got: {:?}",
         arr
+    );
+
+    // Verify the object has the expected metadata fields.
+    let wf = arr
+        .iter()
+        .find(|v| v["name"].as_str() == Some("listed-wf"))
+        .expect("should find listed-wf in array");
+    assert!(
+        wf["created_at"].as_str().is_some(),
+        "created_at field should be present"
+    );
+    assert!(
+        wf["template_hash"].as_str().is_some(),
+        "template_hash field should be present"
     );
 }
 
