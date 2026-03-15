@@ -8,7 +8,12 @@ koto's CLI manages workflow state for AI coding agents. All commands output JSON
 
 ## State file resolution
 
-Each workflow has a state file named `koto-<name>.state.jsonl` in the current directory. The file uses JSONL format — one JSON event per line. The current state is the `state` field of the last event.
+Each workflow has a state file named `koto-<name>.state.jsonl` in the current directory. The file uses an event log format:
+
+- **Line 1 (header):** JSON object with `schema_version`, `workflow`, `template_hash`, and `created_at`.
+- **Lines 2+:** Typed events, each with a monotonic `seq` number, `timestamp`, `type`, and a type-specific `payload`.
+
+The current state is derived by replaying the log -- it's the `to` field of the last state-changing event (`transitioned`, `directed_transition`, or `rewound`).
 
 ```
 koto-my-workflow.state.jsonl
@@ -39,6 +44,8 @@ koto init <name> --template <path>
 {"name":"my-workflow","state":"assess"}
 ```
 
+The state file starts with three lines: a header, a `workflow_initialized` event (seq 1), and an initial `transitioned` event (seq 2, from: null, to: the template's initial state).
+
 Exits non-zero if a workflow with that name already exists or if the template is invalid.
 
 ### next
@@ -59,7 +66,7 @@ The `transitions` array lists the states reachable from the current state. Exits
 
 ### rewind
 
-Rolls back the workflow to the previous state by appending a rewind event to the JSONL file.
+Rolls back the workflow to the previous state by appending a `rewound` event to the state file.
 
 ```bash
 koto rewind <name>
@@ -71,7 +78,7 @@ koto rewind <name>
 {"name":"my-workflow","state":"assess"}
 ```
 
-Exits non-zero if the workflow is already at the initial state (only one event exists). Rewind is non-destructive -- it appends a new event rather than truncating history, so the full event log is preserved.
+The `rewound` event payload contains `from` (the current state) and `to` (the state being rewound to). Exits non-zero if the workflow is already at the initial state (only one state-changing event exists). Rewind is non-destructive -- it appends a new event rather than truncating history, so the full event log is preserved.
 
 ### workflows
 
@@ -84,10 +91,10 @@ koto workflows
 **Output (JSON):**
 
 ```json
-["my-workflow","task-42"]
+[{"name":"my-workflow","created_at":"2026-03-15T10:00:00Z","template_hash":"a1b2c3..."},{"name":"task-42","created_at":"2026-03-15T11:30:00Z","template_hash":"d4e5f6..."}]
 ```
 
-Returns an empty array `[]` when no workflows are found.
+Each object contains the workflow name, creation timestamp, and template hash read from the state file header. Returns an empty array `[]` when no workflows are found.
 
 ### template
 
