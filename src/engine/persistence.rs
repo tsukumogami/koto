@@ -114,9 +114,7 @@ pub fn read_header(path: &Path) -> anyhow::Result<StateFileHeader> {
     let first_line = reader
         .lines()
         .next()
-        .ok_or_else(|| {
-            EngineError::StateFileCorrupted("state file is empty".to_string())
-        })?
+        .ok_or_else(|| EngineError::StateFileCorrupted("state file is empty".to_string()))?
         .map_err(|e| anyhow::anyhow!("failed to read first line: {}", e))?;
 
     let trimmed = first_line.trim();
