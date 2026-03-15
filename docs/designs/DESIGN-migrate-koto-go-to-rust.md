@@ -1,5 +1,5 @@
 ---
-status: Planned
+status: Current
 upstream: docs/designs/DESIGN-unified-koto-next.md
 problem: |
   koto is ~2,100 lines of Go across engine, controller, template, cache, and CLI
@@ -23,7 +23,7 @@ rationale: |
 
 ## Status
 
-Planned
+Current
 
 ## Upstream Design Reference
 
