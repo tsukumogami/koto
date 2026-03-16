@@ -137,7 +137,9 @@ pub fn compile(source_path: &Path) -> anyhow::Result<CompiledTemplate> {
             .map(|st| match st {
                 SourceTransition::Structured { target, when } => Transition {
                     target: target.clone(),
-                    when: when.as_ref().map(|w| w.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                    when: when
+                        .as_ref()
+                        .map(|w| w.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
                 },
             })
             .collect();

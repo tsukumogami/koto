@@ -437,11 +437,7 @@ mod tests {
             when: Some(when),
         }];
         let err = t.validate().unwrap_err();
-        assert!(
-            err.contains("not declared in accepts"),
-            "got: {}",
-            err
-        );
+        assert!(err.contains("not declared in accepts"), "got: {}", err);
     }
 
     #[test]
@@ -588,11 +584,7 @@ mod tests {
             },
         ];
         let err = t.validate().unwrap_err();
-        assert!(
-            err.contains("not mutually exclusive"),
-            "got: {}",
-            err
-        );
+        assert!(err.contains("not mutually exclusive"), "got: {}", err);
         assert!(err.contains("share no fields"), "got: {}", err);
     }
 
@@ -639,11 +631,7 @@ mod tests {
             },
         ];
         let err = t.validate().unwrap_err();
-        assert!(
-            err.contains("not mutually exclusive"),
-            "got: {}",
-            err
-        );
+        assert!(err.contains("not mutually exclusive"), "got: {}", err);
         assert!(err.contains("identical values"), "got: {}", err);
     }
 
