@@ -25,6 +25,12 @@ Unified Model: remove field gates entirely, keep only command gates alongside
 accepts/when. Field gates are redundant in the event-sourced model where evidence
 enters through --with-data and is scoped by the epoch boundary.
 
+## Investigation Findings (Phase 3)
+- **Rust types**: TemplateState adds accepts, integration, structured transitions. Gate removes field types, keeps only command. New FieldSchema and Transition types.
+- **Compiler changes**: New mutual exclusivity validation (group by field, check duplicate values). when fields must reference accepts schema. Field gates rejected with helpful error.
+- **Downstream impact**: hello-koto survives unchanged (command gates only). Integration tests need v2 template format. Plugin CI adapts transparently.
+- No contradictions or deal-breakers found.
+
 ## Current Status
-**Phase:** 2 - Present Approaches
+**Phase:** 3 - Deep Investigation
 **Last Updated:** 2026-03-15
