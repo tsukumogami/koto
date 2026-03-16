@@ -127,6 +127,91 @@ mental model (two evaluation phases for the same data), semantic ambiguities (fi
 required by gate but optional in accepts?), and degrades the self-describing
 principle (agents see an `expects` field they can't submit to while gates block).
 
+### Decision: What scope of mutual exclusivity validation
+
+When two transitions from the same state have `when` conditions, the compiler needs
+to detect conflicts (same field, same value = non-deterministic). The question is
+how far the compiler goes in checking this.
+
+#### Chosen: Single-field only
+
+The compiler validates mutual exclusivity only for transitions whose `when` condition
+has exactly one field. It groups these by field name and checks for duplicate values.
+Multi-field conditions (e.g., `{decision: proceed, priority: high}`) are left to the
+template author.
+
+Single-field enum branching is the dominant routing pattern. Checking it catches the
+most common mistake (two transitions matching the same evidence) with a simple
+algorithm: group by field, check for duplicates.
+
+#### Alternatives Considered
+
+**Validate all combinations**: Attempt to prove mutual exclusivity for multi-field
+conditions by checking all field-value combinations. Rejected because it's
+combinatorially expensive and requires reasoning about field independence that the
+compiler doesn't have. Two conditions like `{decision: proceed, priority: high}`
+and `{decision: proceed, priority: low}` look disjoint on `priority`, but only if
+the agent always submits both fields. The compiler can't know that.
+
+**Skip validation entirely**: Don't check mutual exclusivity at all; detect conflicts
+at runtime. Rejected because the single-field case is trivial to check and catches
+real mistakes. Deferring everything to runtime means agents hit non-deterministic
+routing errors that could have been caught at compile time.
+
+### Decision: How `koto next` output changes in issue #47
+
+With v2, `transitions` changes from `Vec<String>` to `Vec<Transition>`. Serializing
+the structured type directly would change the `koto next` JSON output from
+`["target1", "target2"]` to `[{"target": "target1"}, {"target": "target2"}]`.
+
+#### Chosen: Keep current output, defer contract change to #48
+
+`koto next` maps structured transitions to target names
+(`transitions.iter().map(|t| &t.target)`) and outputs the same flat string array as
+v1. The `accepts` and `when` data are loaded internally but don't appear in output.
+Issue #48 designs the full output contract (adding `expects`, `integration.available`)
+as a separate change.
+
+This keeps issue boundaries clean. #47's job is the template format, not the CLI
+output contract. If #47 changed the output shape, #48 would have to work around an
+interim format rather than designing the output from scratch.
+
+#### Alternatives Considered
+
+**Output structured transitions**: Serialize v2 `Transition` objects directly in
+`koto next` output. Rejected because this preempts #48's output contract design.
+The `when` conditions in CLI output have no consumer until the advancement engine
+(#49) exists, so exposing them early adds complexity with no benefit.
+
+**Flat list plus accepts**: Extract targets as flat strings but also add the `accepts`
+block to output so agents can see what evidence to submit. A reasonable middle ground,
+but still preempts #48's `expects` field design. Better to let #48 design the full
+agent-facing output schema in one pass.
+
+### Decision: How the `integration` field compiles
+
+States can declare an `integration` tag naming a processing tool. The question is
+whether the compiler validates integration names against project configuration.
+
+#### Chosen: Verbatim passthrough, no compile-time validation
+
+The compiler stores `integration` as `Option<String>`, passing the string through
+from YAML to compiled JSON with no name validation. The only check is that the
+string is non-empty if present.
+
+The strategic design explicitly says missing integration config is not a template
+load-time error. Integration names resolve at runtime from project configuration.
+The compiler can't know what integrations are installed, and templates should be
+portable across projects with different integration setups.
+
+#### Alternatives Considered
+
+**Validate against config**: Check integration names against a project config file
+at compile time. Rejected because it couples template compilation to project-specific
+configuration, breaking portability. A template compiled in one project would fail
+in another that has the same integration under a different name. The integration
+runner (#49) handles resolution at runtime where project config is available.
+
 ## Decision Outcome
 
 ### Summary
