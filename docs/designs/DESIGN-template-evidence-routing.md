@@ -1,32 +1,34 @@
 ---
 status: Proposed
 problem: |
-  koto's template format v1 uses flat transition lists (transitions: [target1, target2])
-  with no way to express evidence-driven routing or processing integrations. As the
-  event log format (#46) adds typed events like evidence_submitted, the template format
-  must declare what evidence each state accepts, how submitted values route to outgoing
-  transitions, and which states invoke external processing tools. Without these
+  koto's template format currently uses flat transition lists (transitions: [target1,
+  target2]) with no way to express evidence-driven routing or processing integrations.
+  As the event log format (#46) adds typed events like evidence_submitted, the template
+  format must declare what evidence each state accepts, how submitted values route to
+  outgoing transitions, and which states invoke external processing tools. Without these
   declarations, agents can't know what data to submit, and the advancement engine can't
   route transitions based on evidence values.
 decision: |
-  Replace FormatVersion=1 with FormatVersion=2. Add three constructs to the template
-  format: accepts blocks (per-state evidence field schema with types and required flags),
-  when conditions on transitions (field-value equality matching for routing), and an
-  integration field (string tag for processing tool routing). Remove field gates
-  (field_not_empty, field_equals) entirely since accepts/when replaces them. Only command
-  gates survive. When conditions use AND semantics (all fields must match). The compiler
-  validates pairwise mutual exclusivity of when conditions at compile time and rejects
-  non-deterministic templates.
+  Add three constructs to the template format: accepts blocks (per-state evidence field
+  schema with types and required flags), when conditions on transitions (field-value
+  equality matching for routing), and an integration field (string tag for processing
+  tool routing). Remove field gates (field_not_empty, field_equals) entirely since
+  accepts/when replaces them. Only command gates survive. When conditions use AND
+  semantics (all fields must match). The compiler validates pairwise mutual exclusivity
+  of when conditions at compile time and rejects non-deterministic templates. The
+  format_version remains 1.
 rationale: |
-  In v2's event-sourced model, evidence only enters through koto next --with-data and is
+  In the event-sourced model, evidence only enters through koto next --with-data and is
   scoped to the current state via the epoch boundary rule. Field gates that check
   agent-submitted evidence are redundant with accepts/when, which handles the same use
   cases more expressively. Removing them yields two orthogonal concepts (command gates
   for environment, accepts/when for agent evidence) with no overlap or interaction rules
-  to define. koto has no users, so this is a clean break.
+  to define. koto has no users, so this is a clean break with no migration concerns.
+  The format_version stays at 1 because koto hasn't shipped yet -- there's no released
+  v1 to distinguish from.
 ---
 
-# DESIGN: Template Format v2
+# DESIGN: Template Format -- Evidence Routing
 
 ## Status
 
@@ -36,12 +38,12 @@ Proposed
 
 Strategic design: `docs/designs/DESIGN-unified-koto-next.md` (status: Planned)
 
-This tactical design implements Phase 2 (Template Format v2) from the strategic design.
+This tactical design implements Phase 2 (Template Format) from the strategic design.
 Relevant sections: Template Format, Sub-Design Boundaries, Implementation Approach Phase 2.
 
 ## Context and Problem Statement
 
-koto's template format v1 defines workflows as states with flat transition lists
+koto's template format defines workflows as states with flat transition lists
 and koto-verifiable gates. A state declares its outgoing transitions as a list of
 target state names (`transitions: [deploy, escalate_review]`) and optional gates
 that block advancement until conditions are met.
@@ -49,7 +51,7 @@ that block advancement until conditions are met.
 This works for linear workflows where states have a single outgoing path. But the
 event-sourced state model from #46 introduces `evidence_submitted` events where
 agents provide structured data, and the advancement engine needs to route to
-different transitions based on that data. The v1 format has no way to express:
+different transitions based on that data. The current format has no way to express:
 
 - What fields an agent should submit at a given state (evidence schema)
 - Which transition fires when specific evidence values are provided (conditional routing)
@@ -60,8 +62,8 @@ The strategic design (`DESIGN-unified-koto-next.md`) defines the high-level shap
 `integration` tags for processing tools. This tactical design specifies the exact
 YAML syntax, compiled JSON schema, compiler validation rules, and Rust types.
 
-koto has no released users, so this is a clean format break with no migration
-concerns.
+koto has no released users, so these changes go directly into format_version 1
+with no migration concerns.
 
 ## Decision Drivers
 
@@ -73,7 +75,7 @@ concerns.
 - **Clean separation of concerns**: Gates check environmental conditions (CI passed,
   file exists). Evidence routing checks agent-submitted data. These shouldn't overlap.
 - **Minimal complexity**: Only add what's needed for the advancement engine. No
-  operator extensibility, no complex condition DSL, no multi-field validation
+  operator extensibility, no complex condition DSL
 - **Existing gate compatibility**: Command gates remain useful for environmental
   checks and shouldn't be removed
 
@@ -81,12 +83,13 @@ concerns.
 
 ### Decision: How to handle the overlap between field gates and accepts/when
 
-v1 has three gate types: `field_not_empty`, `field_equals`, and `command`. The first
-two check agent-submitted evidence (does a field exist? does it equal a value?). The
-new `accepts`/`when` system also checks agent-submitted evidence, but with more
-expressiveness (typed schemas, conditional routing, mutual exclusivity validation).
+The current code has three gate types: `field_not_empty`, `field_equals`, and
+`command`. The first two check agent-submitted evidence (does a field exist? does
+it equal a value?). The new `accepts`/`when` system also checks agent-submitted
+evidence, but with more expressiveness (typed schemas, conditional routing, mutual
+exclusivity validation).
 
-In v2's event-sourced model, evidence only enters the system through explicit agent
+In the event-sourced model, evidence only enters the system through explicit agent
 submission (`koto next --with-data`), and it's scoped to the current state by the
 epoch boundary rule. This means field gates and `accepts`/`when` operate on the
 same data through different mechanisms. The question is whether to keep both, restrict
@@ -94,8 +97,8 @@ their interaction, or remove the redundant one.
 
 #### Chosen: Unified Model (remove field gates)
 
-Remove `field_not_empty` and `field_equals` gate types entirely from v2. Only
-`command` gates survive. Everything field gates expressed is now expressed through
+Remove `field_not_empty` and `field_equals` gate types entirely. Only `command`
+gates survive. Everything field gates expressed is now expressed through
 `accepts`/`when`:
 
 - `field_not_empty: decision` becomes `accepts: {decision: {type: string, required: true}}`
@@ -119,8 +122,8 @@ koto has no users, so removing field gates is a clean break with no migration co
 **Strict Separation**: Keep field gates but forbid them on states with `accepts`
 blocks (compiler error). This eliminates the overlap ambiguity but keeps dead code
 around. If field gates only work on states without `accepts`, they're checking
-evidence on states that have no evidence schema, which is contradictory in the v2
-model where evidence is scoped to the current state.
+evidence on states that have no evidence schema, which is contradictory in the
+event-sourced model where evidence is scoped to the current state.
 
 **Coexistence with Precedence**: Allow field gates and `accepts` on the same state,
 with gates evaluating first as prerequisites. Rejected because it creates a complex
@@ -202,15 +205,15 @@ errors at runtime are harder to debug than compiler errors.
 
 ### Decision: How `koto next` output changes in issue #47
 
-With v2, `transitions` changes from `Vec<String>` to `Vec<Transition>`. Serializing
-the structured type directly would change the `koto next` JSON output from
-`["target1", "target2"]` to `[{"target": "target1"}, {"target": "target2"}]`.
+With this change, `transitions` changes from `Vec<String>` to `Vec<Transition>`.
+Serializing the structured type directly would change the `koto next` JSON output
+from `["target1", "target2"]` to `[{"target": "target1"}, {"target": "target2"}]`.
 
 #### Chosen: Keep current output, defer contract change to #48
 
 `koto next` maps structured transitions to target names
-(`transitions.iter().map(|t| &t.target)`) and outputs the same flat string array as
-v1. The `accepts` and `when` data are loaded internally but don't appear in output.
+(`transitions.iter().map(|t| &t.target)`) and outputs the same flat string array.
+The `accepts` and `when` data are loaded internally but don't appear in output.
 Issue #48 designs the full output contract (adding `expects`, `integration.available`)
 as a separate change.
 
@@ -220,7 +223,7 @@ interim format rather than designing the output from scratch.
 
 #### Alternatives Considered
 
-**Output structured transitions**: Serialize v2 `Transition` objects directly in
+**Output structured transitions**: Serialize `Transition` objects directly in
 `koto next` output. Rejected because this preempts #48's output contract design.
 The `when` conditions in CLI output have no consumer until the advancement engine
 (#49) exists, so exposing them early adds complexity with no benefit.
@@ -258,8 +261,8 @@ runner (#49) handles resolution at runtime where project config is available.
 
 ### Summary
 
-Template format v2 replaces the flat `transitions: [target1, target2]` list with
-three new constructs and removes field gates.
+The template format gains three new constructs and drops field gates. The
+`format_version` stays at 1 since koto hasn't shipped yet.
 
 Each state can declare an `accepts` block: a map of field names to schemas. Each
 field has a `type` (enum, string), a `required` flag, and for enums a `values` list
@@ -282,13 +285,12 @@ actual command at runtime through project configuration. Missing config is not a
 compile-time error.
 
 `field_not_empty` and `field_equals` gate types are removed. `command` gates remain
-unchanged. The `format_version` field bumps from 1 to 2.
+unchanged.
 
 ### Rationale
 
 The unified model produces the simplest design because it follows from the
-event-sourced architecture. In v1, evidence was a mutable map that gates could
-inspect at any time. In v2, evidence enters through typed events and is scoped by
+event-sourced architecture. Evidence enters through typed events and is scoped by
 the epoch boundary. Field gates were checking the same data that `accepts`/`when`
 now handles with better expressiveness and compile-time validation. Keeping both
 would require defining interaction rules for no practical benefit. Removing field
@@ -298,14 +300,14 @@ gates yields a net code reduction and fewer concepts for template authors.
 
 ### Overview
 
-Template format v2 adds three constructs to the template schema and removes two gate
-types. The changes touch three files: type definitions (`src/template/types.rs`),
-the compiler (`src/template/compile.rs`), and the CLI (`src/cli/mod.rs`). The compiled
-JSON output gains new fields but keeps its flat structure.
+This design adds three constructs to the template schema and removes two gate types.
+The changes touch three files: type definitions (`src/template/types.rs`), the
+compiler (`src/template/compile.rs`), and the CLI (`src/cli/mod.rs`). The compiled
+JSON output gains new fields but keeps its flat structure. `format_version` remains 1.
 
 ### YAML Source Format
 
-A v2 template source looks like this:
+A template with evidence routing looks like this:
 
 ```yaml
 ---
@@ -353,14 +355,14 @@ Escalate to senior review team.
 Review workflow complete.
 ```
 
-States without `accepts` or `when` use the same syntax as v1 but with structured
+States without `accepts` or `when` use the same syntax as before but with structured
 transition objects instead of plain strings.
 
 ### Compiled Types
 
-Four Rust types define the v2 compiled schema:
+Four Rust types define the compiled schema:
 
-**TemplateState** gains three fields over v1:
+**TemplateState** gains three fields:
 - `accepts: Option<BTreeMap<String, FieldSchema>>` -- evidence field schema
 - `transitions: Vec<Transition>` -- replaces `Vec<String>`
 - `integration: Option<String>` -- processing tool tag
@@ -403,21 +405,21 @@ values. The check is O(n^2) in transitions per state, which is fine in practice.
 
 ### CLI Impact
 
-`koto next` currently serializes `transitions: Vec<String>` directly. With v2,
-transitions become `Vec<Transition>` (structured objects with `target` and `when`).
-Serializing these directly would break the current output contract. For issue #47
-scope, `koto next` maps structured transitions to target names
+`koto next` currently serializes `transitions: Vec<String>` directly. After this
+change, transitions become `Vec<Transition>` (structured objects with `target` and
+`when`). Serializing these directly would break the current output contract. For
+issue #47 scope, `koto next` maps structured transitions to target names
 (`transitions.iter().map(|t| &t.target)`) to preserve the current flat string array
 output. The full output contract change (adding `expects`, `integration.available`)
 is #48's responsibility.
 
 `koto template compile` and `koto template validate` work unchanged once the types
-and compiler support v2.
+and compiler support the new constructs.
 
 ### Data Flow
 
 ```
-Template YAML  -->  compile()  -->  Compiled JSON (format_version: 2)
+Template YAML  -->  compile()  -->  Compiled JSON (format_version: 1)
                        |
                   Validation:
                   - when/accepts consistency
@@ -443,9 +445,8 @@ Update `src/template/types.rs`:
 - Remove `GATE_TYPE_FIELD_NOT_EMPTY` and `GATE_TYPE_FIELD_EQUALS` constants
 - Clean up dead `field` and `value` fields on `Gate` struct (only `command` and
   `timeout` are needed for command gates)
-- Update `validate()`: accept `format_version: 2` (currently hard-rejects anything
-  other than 1), add v2 rules (when/accepts consistency, mutual exclusivity, scalar
-  value check, gate type restriction)
+- Update `validate()` to add new rules (when/accepts consistency, mutual exclusivity,
+  scalar value check, gate type restriction)
 
 Deliverables:
 - Updated `src/template/types.rs`
@@ -456,13 +457,12 @@ Deliverables:
 Update `src/template/compile.rs`:
 - Add `SourceTransition` and `SourceFieldSchema` deserialization types
 - Update `SourceState` with `accepts`, `integration`, structured `transitions`
-- Replace `compile_gate()` with v2 version that only accepts command gates
+- Update `compile_gate()` to only accept command gates
 - Transform source types to compiled types (HashMap to BTreeMap, source to compiled)
-- Set `format_version: 2`
 
 Deliverables:
 - Updated `src/template/compile.rs`
-- Compiler tests for v2 templates (valid and invalid)
+- Compiler tests for templates with evidence routing (valid and invalid)
 
 ### Phase 3: CLI and Tests
 
@@ -471,8 +471,8 @@ Update `src/cli/mod.rs`:
   (preserving current output format for #48)
 
 Update integration tests:
-- Convert all test templates from v1 to v2 format (including `minimal_template()`
-  and any embedded template fixtures in `compile.rs` tests)
+- Convert all test templates to use structured transitions (including
+  `minimal_template()` and any embedded template fixtures in `compile.rs` tests)
 - Update hello-koto template transitions from `[done]` to `[{target: done}]`
 - Add test cases for new validation errors
 
@@ -488,14 +488,14 @@ Deliverables:
 
 ### Download verification
 
-Not applicable. Template format v2 doesn't change how binaries or templates are
-downloaded. Templates are local markdown files read from disk.
+Not applicable. This change doesn't affect how binaries or templates are downloaded.
+Templates are local markdown files read from disk.
 
 ### Execution isolation
 
 Command gates execute shell commands with the same permissions as the koto process.
-This is unchanged from v1. The v2 format doesn't add new execution vectors: `accepts`
-and `when` are declarative schema, and `integration` is a string tag that doesn't
+This is unchanged. The new constructs don't add execution vectors: `accepts` and
+`when` are declarative schema, and `integration` is a string tag that doesn't
 execute anything at compile time. The integration runner (#49) handles execution
 with its own isolation model.
 
@@ -544,6 +544,5 @@ exposure vectors.
   Requiring a shared discriminator makes the routing logic explicit and deterministic.
   This is a compile-time constraint that pushes template authors toward clearer designs.
 - The `serde_json::Value` flexibility is intentional: it allows future type extensions
-  (numeric comparisons, boolean flags) without schema changes. Current v2 templates
-  use string equality matching, which the compiler does validate for enum fields.
-
+  (numeric comparisons, boolean flags) without schema changes. Current templates use
+  string equality matching, which the compiler does validate for enum fields.

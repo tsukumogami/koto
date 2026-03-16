@@ -1,12 +1,13 @@
-# Design Summary: template-format-v2
+# Design Summary: template-evidence-routing
 
 ## Input Context (Phase 0)
 **Source:** Freeform topic (from /explore research on issue #47)
-**Problem:** koto's template format v1 can't express evidence-driven routing or
+**Problem:** koto's template format can't express evidence-driven routing or
 processing integrations. The event log format (#46) needs templates to declare
 evidence schemas and conditional transitions.
-**Constraints:** No users to migrate. Must support the advancement engine's needs
-(#49). Field gates and accepts/when must not overlap semantically.
+**Constraints:** No users to migrate. format_version stays at 1. Must support the
+advancement engine's needs (#49). Field gates and accepts/when must not overlap
+semantically.
 
 ## Explore Research Available
 - `wip/research/explore_template-format-v2_r1_lead-v2-compiled-schema.md`
@@ -28,7 +29,7 @@ enters through --with-data and is scoped by the epoch boundary.
 ## Investigation Findings (Phase 3)
 - **Rust types**: TemplateState adds accepts, integration, structured transitions. Gate removes field types, keeps only command. New FieldSchema and Transition types.
 - **Compiler changes**: New mutual exclusivity validation (group by field, check duplicate values). when fields must reference accepts schema. Field gates rejected with helpful error.
-- **Downstream impact**: hello-koto survives unchanged (command gates only). Integration tests need v2 template format. Plugin CI adapts transparently.
+- **Downstream impact**: hello-koto survives unchanged (command gates only). Integration tests need updated template format. Plugin CI adapts transparently.
 - No contradictions or deal-breakers found.
 
 ## Security Review (Phase 5)
