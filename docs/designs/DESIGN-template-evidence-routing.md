@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 problem: |
   koto's template format currently uses flat transition lists (transitions: [target1,
   target2]) with no way to express evidence-driven routing or processing integrations.
@@ -32,7 +32,7 @@ rationale: |
 
 ## Status
 
-Accepted
+Planned
 
 ## Upstream Design Reference
 

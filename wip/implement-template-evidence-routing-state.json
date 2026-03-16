@@ -1,0 +1,108 @@
+{
+  "pr_status": "implementing",
+  "design_doc": "docs/plans/PLAN-template-evidence-routing.md",
+  "branch": "docs/template-format-v2",
+  "pr_number": 55,
+  "integrity_hash": "sha256:090974a7086c060840a30ab86890ade90a3b74a0cee0c4ec486c08fc5f284435",
+  "issues": [
+    {
+      "number": 1,
+      "title": "feat(koto): add evidence routing types",
+      "status": "completed",
+      "ci_status": "passed",
+      "ci_fix_attempts": 0,
+      "issue_type": "code",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": "Rewrote types.rs with Transition, FieldSchema, updated Gate (removed field_not_empty/field_equals), 6 validation rules, 16 unit tests",
+      "testable_scenarios": []
+    },
+    {
+      "number": 2,
+      "title": "feat(koto): update compiler for evidence routing",
+      "status": "completed",
+      "ci_status": "passed",
+      "ci_fix_attempts": 0,
+      "issue_type": "code",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": "Rewrote compile.rs with SourceTransition, SourceFieldSchema, gate restriction, source-to-compiled transformation, compiler tests",
+      "testable_scenarios": [
+        "scenario-1",
+        "scenario-2",
+        "scenario-3",
+        "scenario-4",
+        "scenario-5",
+        "scenario-6",
+        "scenario-7",
+        "scenario-8",
+        "scenario-9",
+        "scenario-10",
+        "scenario-11",
+        "scenario-12",
+        "scenario-13",
+        "scenario-14",
+        "scenario-15",
+        "scenario-16",
+        "scenario-17",
+        "scenario-19",
+        "scenario-23",
+        "scenario-24"
+      ]
+    },
+    {
+      "number": 3,
+      "title": "feat(koto): adapt CLI for structured transitions",
+      "status": "completed",
+      "ci_status": "passed",
+      "ci_fix_attempts": 0,
+      "issue_type": "code",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": "Updated koto next to map structured transitions to flat target string array",
+      "testable_scenarios": [
+        "scenario-18"
+      ]
+    },
+    {
+      "number": 4,
+      "title": "test(koto): update tests for evidence routing",
+      "status": "completed",
+      "ci_status": "passed",
+      "ci_fix_attempts": 0,
+      "issue_type": "code",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": "Migrated minimal_template() from flat transitions to structured syntax, all 17 integration tests pass",
+      "testable_scenarios": [
+        "scenario-21",
+        "scenario-22"
+      ]
+    },
+    {
+      "number": 5,
+      "title": "chore(koto): update plugin templates for evidence routing",
+      "status": "completed",
+      "ci_status": "passed",
+      "ci_fix_attempts": 0,
+      "issue_type": "code",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": "Updated hello-koto template transitions from flat [eternal] to structured - target: eternal",
+      "testable_scenarios": [
+        "scenario-20"
+      ]
+    }
+  ],
+  "skipped_issues": null,
+  "test_plan_file": "wip/implement-template-evidence-routing-test_plan.md",
+  "doc_plan_file": "wip/implement-template-evidence-routing-doc_plan.md",
+  "source_doc_type": "plan",
+  "execution_mode": "single-pr",
+  "deliverable_type": "mixed"
+}

@@ -13,7 +13,8 @@ version: "1.0"
 initial_state: start
 states:
   start:
-    transitions: [done]
+    transitions:
+      - target: done
   done:
     terminal: true
 ---

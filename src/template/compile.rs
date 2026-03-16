@@ -5,8 +5,7 @@ use anyhow::{anyhow, Context};
 use serde::Deserialize;
 
 use super::types::{
-    CompiledTemplate, Gate, TemplateState, VariableDecl, GATE_TYPE_COMMAND, GATE_TYPE_FIELD_EQUALS,
-    GATE_TYPE_FIELD_NOT_EMPTY,
+    CompiledTemplate, FieldSchema, Gate, TemplateState, Transition, VariableDecl, GATE_TYPE_COMMAND,
 };
 
 /// YAML front-matter structure of a template source file.
@@ -39,21 +38,46 @@ struct SourceVariable {
 #[derive(Debug, Deserialize, Default)]
 struct SourceState {
     #[serde(default)]
-    transitions: Vec<String>,
+    transitions: Vec<SourceTransition>,
     #[serde(default)]
     terminal: bool,
     #[serde(default)]
     gates: HashMap<String, SourceGate>,
+    #[serde(default)]
+    accepts: HashMap<String, SourceFieldSchema>,
+    #[serde(default)]
+    integration: Option<String>,
+}
+
+/// A transition in source YAML: either a bare string or a structured object.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SourceTransition {
+    /// Structured: `{target: "done", when: {field: value}}`
+    Structured {
+        target: String,
+        #[serde(default)]
+        when: Option<HashMap<String, serde_json::Value>>,
+    },
+}
+
+/// Field schema in source YAML for an `accepts` block.
+#[derive(Debug, Deserialize)]
+struct SourceFieldSchema {
+    #[serde(rename = "type")]
+    field_type: String,
+    #[serde(default)]
+    required: bool,
+    #[serde(default)]
+    values: Vec<String>,
+    #[serde(default)]
+    description: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct SourceGate {
     #[serde(rename = "type")]
     gate_type: String,
-    #[serde(default)]
-    field: String,
-    #[serde(default)]
-    value: String,
     #[serde(default)]
     command: String,
     #[serde(default)]
@@ -106,25 +130,63 @@ pub fn compile(source_path: &Path) -> anyhow::Result<CompiledTemplate> {
             compiled_gates.insert(gate_name.clone(), gate);
         }
 
+        // Transform source transitions to compiled transitions.
+        let compiled_transitions: Vec<Transition> = source_state
+            .transitions
+            .iter()
+            .map(|st| match st {
+                SourceTransition::Structured { target, when } => Transition {
+                    target: target.clone(),
+                    when: when.as_ref().map(|w| w.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                },
+            })
+            .collect();
+
+        // Transform source accepts to compiled accepts.
+        let compiled_accepts: Option<BTreeMap<String, FieldSchema>> =
+            if source_state.accepts.is_empty() {
+                None
+            } else {
+                Some(
+                    source_state
+                        .accepts
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                FieldSchema {
+                                    field_type: v.field_type.clone(),
+                                    required: v.required,
+                                    values: v.values.clone(),
+                                    description: v.description.clone(),
+                                },
+                            )
+                        })
+                        .collect(),
+                )
+            };
+
         compiled_states.insert(
             state_name.clone(),
             TemplateState {
                 directive,
-                transitions: source_state.transitions.clone(),
+                transitions: compiled_transitions,
                 terminal: source_state.terminal,
                 gates: compiled_gates,
+                accepts: compiled_accepts,
+                integration: source_state.integration.clone(),
             },
         );
     }
 
     // Validate transition targets exist.
     for (state_name, state) in &compiled_states {
-        for target in &state.transitions {
-            if !compiled_states.contains_key(target) {
+        for transition in &state.transitions {
+            if !compiled_states.contains_key(&transition.target) {
                 return Err(anyhow!(
                     "state {:?} references undefined transition target {:?}",
                     state_name,
-                    target
+                    transition.target
                 ));
             }
         }
@@ -154,7 +216,7 @@ pub fn compile(source_path: &Path) -> anyhow::Result<CompiledTemplate> {
         })
         .collect();
 
-    Ok(CompiledTemplate {
+    let template = CompiledTemplate {
         format_version: 1,
         name: fm.name,
         version: fm.version,
@@ -162,43 +224,18 @@ pub fn compile(source_path: &Path) -> anyhow::Result<CompiledTemplate> {
         initial_state: fm.initial_state,
         variables,
         states: compiled_states,
-    })
+    };
+
+    // Run validation rules (includes evidence routing validation).
+    template
+        .validate()
+        .map_err(|e| anyhow!("validation error: {}", e))?;
+
+    Ok(template)
 }
 
 fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyhow::Result<Gate> {
     match source.gate_type.as_str() {
-        GATE_TYPE_FIELD_NOT_EMPTY => {
-            if source.field.is_empty() {
-                return Err(anyhow!(
-                    "state {:?} gate {:?}: missing required field \"field\"",
-                    state_name,
-                    gate_name
-                ));
-            }
-            Ok(Gate {
-                gate_type: source.gate_type.clone(),
-                field: source.field.clone(),
-                value: String::new(),
-                command: String::new(),
-                timeout: 0,
-            })
-        }
-        GATE_TYPE_FIELD_EQUALS => {
-            if source.field.is_empty() {
-                return Err(anyhow!(
-                    "state {:?} gate {:?}: missing required field \"field\"",
-                    state_name,
-                    gate_name
-                ));
-            }
-            Ok(Gate {
-                gate_type: source.gate_type.clone(),
-                field: source.field.clone(),
-                value: source.value.clone(),
-                command: String::new(),
-                timeout: 0,
-            })
-        }
         GATE_TYPE_COMMAND => {
             if source.command.is_empty() {
                 return Err(anyhow!(
@@ -209,17 +246,17 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
             }
             Ok(Gate {
                 gate_type: source.gate_type.clone(),
-                field: String::new(),
-                value: String::new(),
                 command: source.command.clone(),
                 timeout: source.timeout,
             })
         }
-        unknown => Err(anyhow!(
-            "state {:?} gate {:?}: unknown type {:?}",
+        other => Err(anyhow!(
+            "state {:?} gate {:?}: unsupported gate type {:?}. \
+             Field-based gates (field_not_empty, field_equals) have been replaced by accepts/when. \
+             Use accepts blocks for evidence schema and when conditions for routing.",
             state_name,
             gate_name,
-            unknown
+            other
         )),
     }
 }
@@ -336,7 +373,8 @@ variables:
 
 states:
   assess:
-    transitions: [done]
+    transitions:
+      - target: done
   done:
     terminal: true
 ---
@@ -361,7 +399,9 @@ Work is complete.
 
         let assess = &result.states["assess"];
         assert_eq!(assess.directive, "Analyze the task: {{TASK}}");
-        assert_eq!(assess.transitions, vec!["done"]);
+        assert_eq!(assess.transitions.len(), 1);
+        assert_eq!(assess.transitions[0].target, "done");
+        assert!(assess.transitions[0].when.is_none());
 
         let done = &result.states["done"];
         assert!(done.terminal);
@@ -459,7 +499,6 @@ states:
     gates:
       my_gate:
         type: unknown_type
-        field: SOMETHING
 ---
 
 ## start
@@ -469,10 +508,60 @@ Directive.
         let f = write_temp(src);
         let err = compile(f.path()).unwrap_err();
         assert!(
-            err.to_string().contains("unknown type"),
+            err.to_string().contains("unsupported gate type"),
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn field_not_empty_gate_rejected() {
+        let src = r#"---
+name: test
+version: "1.0"
+initial_state: start
+states:
+  start:
+    terminal: true
+    gates:
+      my_gate:
+        type: field_not_empty
+---
+
+## start
+
+Directive.
+"#;
+        let f = write_temp(src);
+        let err = compile(f.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported gate type"), "got: {}", msg);
+        assert!(msg.contains("accepts/when"), "got: {}", msg);
+    }
+
+    #[test]
+    fn field_equals_gate_rejected() {
+        let src = r#"---
+name: test
+version: "1.0"
+initial_state: start
+states:
+  start:
+    terminal: true
+    gates:
+      my_gate:
+        type: field_equals
+---
+
+## start
+
+Directive.
+"#;
+        let f = write_temp(src);
+        let err = compile(f.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported gate type"), "got: {}", msg);
+        assert!(msg.contains("accepts/when"), "got: {}", msg);
     }
 
     #[test]
@@ -533,7 +622,8 @@ version: "1.0"
 initial_state: start
 states:
   start:
-    transitions: [nonexistent]
+    transitions:
+      - target: nonexistent
 ---
 
 ## start
@@ -574,5 +664,172 @@ Hello.
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn accepts_when_integration_compiles() {
+        let src = r#"---
+name: review
+version: "1.0"
+initial_state: analyze
+states:
+  analyze:
+    integration: delegate_review
+    accepts:
+      decision:
+        type: enum
+        values: [proceed, escalate]
+        required: true
+    transitions:
+      - target: deploy
+        when:
+          decision: proceed
+      - target: review
+        when:
+          decision: escalate
+  deploy:
+    transitions:
+      - target: done
+  review:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## analyze
+
+Review the results.
+
+## deploy
+
+Deploy to production.
+
+## review
+
+Escalate to senior review.
+
+## done
+
+Complete.
+"#;
+        let f = write_temp(src);
+        let result = compile(f.path()).unwrap();
+
+        let analyze = &result.states["analyze"];
+        assert_eq!(analyze.integration, Some("delegate_review".to_string()));
+        assert!(analyze.accepts.is_some());
+        let accepts = analyze.accepts.as_ref().unwrap();
+        assert!(accepts.contains_key("decision"));
+        let schema = &accepts["decision"];
+        assert_eq!(schema.field_type, "enum");
+        assert!(schema.required);
+        assert_eq!(schema.values, vec!["proceed", "escalate"]);
+
+        assert_eq!(analyze.transitions.len(), 2);
+        assert_eq!(analyze.transitions[0].target, "deploy");
+        assert!(analyze.transitions[0].when.is_some());
+        let when = analyze.transitions[0].when.as_ref().unwrap();
+        assert_eq!(when["decision"], serde_json::json!("proceed"));
+    }
+
+    #[test]
+    fn command_gate_alongside_accepts_when() {
+        let src = r#"---
+name: mixed
+version: "1.0"
+initial_state: check
+states:
+  check:
+    accepts:
+      decision:
+        type: enum
+        values: [go, stop]
+        required: true
+    transitions:
+      - target: done
+        when:
+          decision: go
+      - target: halt
+        when:
+          decision: stop
+    gates:
+      ci:
+        type: command
+        command: ./check-ci.sh
+  done:
+    terminal: true
+  halt:
+    terminal: true
+---
+
+## check
+
+Check the environment and decide.
+
+## done
+
+Proceed.
+
+## halt
+
+Stop.
+"#;
+        let f = write_temp(src);
+        compile(f.path()).unwrap();
+    }
+
+    #[test]
+    fn compiled_json_round_trips_with_evidence_routing() {
+        let src = r#"---
+name: evidence-rt
+version: "1.0"
+initial_state: decide
+states:
+  decide:
+    accepts:
+      choice:
+        type: enum
+        values: [a, b]
+        required: true
+    transitions:
+      - target: path_a
+        when:
+          choice: a
+      - target: path_b
+        when:
+          choice: b
+    integration: my_tool
+  path_a:
+    transitions:
+      - target: done
+  path_b:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## decide
+
+Pick a path.
+
+## path_a
+
+Path A.
+
+## path_b
+
+Path B.
+
+## done
+
+Complete.
+"#;
+        let f = write_temp(src);
+        let compiled = compile(f.path()).unwrap();
+        let json = serde_json::to_string(&compiled).unwrap();
+        let restored: CompiledTemplate = serde_json::from_str(&json).unwrap();
+        assert_eq!(compiled, restored);
     }
 }

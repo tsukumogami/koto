@@ -289,12 +289,18 @@ pub fn run(app: App) -> Result<()> {
                 }
             };
 
+            let transition_targets: Vec<&str> = template_state
+                .transitions
+                .iter()
+                .map(|t| t.target.as_str())
+                .collect();
+
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::json!({
                     "state": current_state,
                     "directive": template_state.directive,
-                    "transitions": template_state.transitions
+                    "transitions": transition_targets
                 }))?
             );
             Ok(())

@@ -11,7 +11,8 @@ variables:
 
 states:
   awakening:
-    transitions: [eternal]
+    transitions:
+      - target: eternal
     gates:
       greeting_exists:
         type: command
