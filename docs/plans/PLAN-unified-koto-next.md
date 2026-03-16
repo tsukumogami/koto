@@ -70,8 +70,8 @@ graph TD
     classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
     classDef tracksPlan fill:#FFE0B2,stroke:#F57C00,color:#000
 
-    class I45,I46 done
-    class I47,I48 ready
+    class I45,I46,I47 done
+    class I48 ready
     class I49 blocked
 ```
 

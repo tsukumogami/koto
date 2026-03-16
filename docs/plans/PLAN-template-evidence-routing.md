@@ -1,8 +1,8 @@
 ---
 schema: plan/v1
-status: Draft
+status: Done
 execution_mode: single-pr
-upstream: docs/designs/DESIGN-template-evidence-routing.md
+upstream: docs/designs/current/DESIGN-template-evidence-routing.md
 milestone: "Unified koto next Command"
 issue_count: 5
 ---
@@ -11,7 +11,7 @@ issue_count: 5
 
 ## Status
 
-Draft
+Done
 
 ## Scope Summary
 
@@ -39,24 +39,24 @@ validation rules.
 
 **Acceptance Criteria**:
 
-- [ ] Add `Transition` struct with `target: String` and `when: Option<BTreeMap<String, serde_json::Value>>`
-- [ ] Add `FieldSchema` struct with `field_type: String`, `required: bool`, optional `values: Vec<String>`, optional `description: String`
-- [ ] Add `accepts: Option<BTreeMap<String, FieldSchema>>` field to `TemplateState`
-- [ ] Add `integration: Option<String>` field to `TemplateState`
-- [ ] Change `TemplateState.transitions` from `Vec<String>` to `Vec<Transition>`
-- [ ] Remove `GATE_TYPE_FIELD_NOT_EMPTY` and `GATE_TYPE_FIELD_EQUALS` constants
-- [ ] Remove `field` and `value` fields from `Gate` struct
-- [ ] Update `validate()`: reject non-command gate types with error pointing to `accepts`/`when`
-- [ ] Update `validate()`: transition target extraction uses `t.target` instead of bare string
-- [ ] Validate `when` fields reference fields in the state's `accepts` block
-- [ ] Validate `when` values for enum fields appear in the field's `values` list
-- [ ] Reject empty `when` blocks
-- [ ] Validate `when` conditions require the state to have an `accepts` block
-- [ ] Validate `when` condition values are JSON scalars (reject arrays and objects)
-- [ ] Validate pairwise mutual exclusivity of `when` conditions across transitions on the same state
-- [ ] Validate `FieldSchema.field_type` is one of: enum, string, number, boolean
-- [ ] Validate enum-typed fields have a non-empty `values` list
-- [ ] Unit tests for all new validation rules
+- [x] Add `Transition` struct with `target: String` and `when: Option<BTreeMap<String, serde_json::Value>>`
+- [x] Add `FieldSchema` struct with `field_type: String`, `required: bool`, optional `values: Vec<String>`, optional `description: String`
+- [x] Add `accepts: Option<BTreeMap<String, FieldSchema>>` field to `TemplateState`
+- [x] Add `integration: Option<String>` field to `TemplateState`
+- [x] Change `TemplateState.transitions` from `Vec<String>` to `Vec<Transition>`
+- [x] Remove `GATE_TYPE_FIELD_NOT_EMPTY` and `GATE_TYPE_FIELD_EQUALS` constants
+- [x] Remove `field` and `value` fields from `Gate` struct
+- [x] Update `validate()`: reject non-command gate types with error pointing to `accepts`/`when`
+- [x] Update `validate()`: transition target extraction uses `t.target` instead of bare string
+- [x] Validate `when` fields reference fields in the state's `accepts` block
+- [x] Validate `when` values for enum fields appear in the field's `values` list
+- [x] Reject empty `when` blocks
+- [x] Validate `when` conditions require the state to have an `accepts` block
+- [x] Validate `when` condition values are JSON scalars (reject arrays and objects)
+- [x] Validate pairwise mutual exclusivity of `when` conditions across transitions on the same state
+- [x] Validate `FieldSchema.field_type` is one of: enum, string, number, boolean
+- [x] Validate enum-typed fields have a non-empty `values` list
+- [x] Unit tests for all new validation rules
 
 All six evidence routing validation rules live in `validate()` on compiled types.
 The compiler (Issue 2) handles source-to-compiled transformation and gate type
@@ -77,21 +77,21 @@ templates and transform them into the compiled types added in Issue 1. Restrict
 
 **Acceptance Criteria**:
 
-- [ ] Add `SourceTransition` struct with `target: String` and `when: Option<HashMap<String, serde_json::Value>>`
-- [ ] Add `SourceFieldSchema` struct with `field_type: String`, `required: bool`, `values: Vec<String>`, `description: String`
-- [ ] Update `SourceState` to include `accepts`, `integration`, and structured `transitions`
-- [ ] `compile_gate()` rejects `field_not_empty` with error pointing to `accepts`/`when`
-- [ ] `compile_gate()` rejects `field_equals` with error pointing to `accepts`/`when`
-- [ ] `compile_gate()` continues to accept `command` gates unchanged
-- [ ] Transform `HashMap<String, SourceFieldSchema>` to `BTreeMap<String, FieldSchema>`
-- [ ] Transform `Vec<SourceTransition>` to `Vec<Transition>`
-- [ ] Pass `integration: Option<String>` through to compiled `TemplateState`
-- [ ] Transition target validation updated to extract from structured transitions
-- [ ] Compiler test: valid template with `accepts`, `when`, and `integration` compiles correctly
-- [ ] Compiler test: `field_not_empty` gate produces error mentioning `accepts`/`when`
-- [ ] Compiler test: `field_equals` gate produces error mentioning `accepts`/`when`
-- [ ] Compiler test: command gates alongside `accepts`/`when` compile successfully
-- [ ] Existing compiler tests updated for structured transition syntax
+- [x] Add `SourceTransition` struct with `target: String` and `when: Option<HashMap<String, serde_json::Value>>`
+- [x] Add `SourceFieldSchema` struct with `field_type: String`, `required: bool`, `values: Vec<String>`, `description: String`
+- [x] Update `SourceState` to include `accepts`, `integration`, and structured `transitions`
+- [x] `compile_gate()` rejects `field_not_empty` with error pointing to `accepts`/`when`
+- [x] `compile_gate()` rejects `field_equals` with error pointing to `accepts`/`when`
+- [x] `compile_gate()` continues to accept `command` gates unchanged
+- [x] Transform `HashMap<String, SourceFieldSchema>` to `BTreeMap<String, FieldSchema>`
+- [x] Transform `Vec<SourceTransition>` to `Vec<Transition>`
+- [x] Pass `integration: Option<String>` through to compiled `TemplateState`
+- [x] Transition target validation updated to extract from structured transitions
+- [x] Compiler test: valid template with `accepts`, `when`, and `integration` compiles correctly
+- [x] Compiler test: `field_not_empty` gate produces error mentioning `accepts`/`when`
+- [x] Compiler test: `field_equals` gate produces error mentioning `accepts`/`when`
+- [x] Compiler test: command gates alongside `accepts`/`when` compile successfully
+- [x] Existing compiler tests updated for structured transition syntax
 
 The six validation rules (when/accepts consistency, mutual exclusivity, etc.) live in
 `validate()` (Issue 1). The compiler calls `validate()` after compilation.
@@ -109,11 +109,11 @@ The six validation rules (when/accepts consistency, mutual exclusivity, etc.) li
 
 **Acceptance Criteria**:
 
-- [ ] `koto next` extracts target names using `transitions.iter().map(|t| &t.target)`
-- [ ] Output JSON preserves current format: `{"state": "...", "directive": "...", "transitions": ["target1", "target2"]}`
-- [ ] No `accepts`, `when`, or `integration` fields appear in `koto next` output
-- [ ] Existing integration tests for `koto next` continue to pass
-- [ ] `koto template compile` and `koto template validate` work without CLI-side changes
+- [x] `koto next` extracts target names using `transitions.iter().map(|t| &t.target)`
+- [x] Output JSON preserves current format: `{"state": "...", "directive": "...", "transitions": ["target1", "target2"]}`
+- [x] No `accepts`, `when`, or `integration` fields appear in `koto next` output
+- [x] Existing integration tests for `koto next` continue to pass
+- [x] `koto template compile` and `koto template validate` work without CLI-side changes
 
 **Dependencies**: Issue 1, Issue 2
 
@@ -128,12 +128,12 @@ test coverage for evidence routing templates.
 
 **Acceptance Criteria**:
 
-- [ ] `minimal_template()` in `tests/integration_test.rs` uses `- target: done` instead of `[done]`
-- [ ] All embedded templates in `src/template/compile.rs` `#[cfg(test)]` module use structured transition objects
-- [ ] All existing tests pass after fixture migration
-- [ ] Integration test: full workflow with `accepts`, `when`-routed transitions, and `integration`
-- [ ] Integration test: template with command gates alongside `accepts`/`when` works end-to-end
-- [ ] Integration test: template with unconditional transitions alongside `accepts` states works end-to-end
+- [x] `minimal_template()` in `tests/integration_test.rs` uses `- target: done` instead of `[done]`
+- [x] All embedded templates in `src/template/compile.rs` `#[cfg(test)]` module use structured transition objects
+- [x] All existing tests pass after fixture migration
+- [x] Integration test: full workflow with `accepts`, `when`-routed transitions, and `integration`
+- [x] Integration test: template with command gates alongside `accepts`/`when` works end-to-end
+- [x] Integration test: template with unconditional transitions alongside `accepts` states works end-to-end
 
 Unit tests for individual validation rules are covered by Issues 1 and 2.
 
@@ -149,9 +149,9 @@ Unit tests for individual validation rules are covered by Issues 1 and 2.
 
 **Acceptance Criteria**:
 
-- [ ] `hello-koto.md` transitions updated from `[eternal]` to `[{target: eternal}]`
-- [ ] Any other plugin templates discovered during implementation similarly updated
-- [ ] `koto template compile` succeeds on the updated hello-koto template
+- [x] `hello-koto.md` transitions updated from `[eternal]` to `[{target: eternal}]`
+- [x] Any other plugin templates discovered during implementation similarly updated
+- [x] `koto template compile` succeeds on the updated hello-koto template
 
 **Dependencies**: Issue 2
 
