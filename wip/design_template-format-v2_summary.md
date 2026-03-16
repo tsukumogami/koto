@@ -15,6 +15,11 @@ evidence schemas and conditional transitions.
 - `wip/research/explore_template-format-v2_r1_lead-next-loading.md`
 - `wip/research/explore_template-format-v2_r1_lead-integration-field.md`
 
+## Approaches Investigated (Phase 1)
+- **Strict Separation**: Field gates forbidden on accepts states. Two clean control models. No deal-breakers.
+- **Coexistence with Precedence**: Both allowed, gates first. Complex mental model, semantic ambiguities.
+- **Unified Model**: Remove field gates entirely. Simplest model, minor expressiveness gap.
+
 ## Current Status
-**Phase:** 0 - Setup (Freeform, from /explore handoff)
+**Phase:** 1 - Approach Discovery
 **Last Updated:** 2026-03-15
