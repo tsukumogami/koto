@@ -14,8 +14,9 @@ decision: |
   when conditions on transitions (field-value equality matching for routing), and an
   integration field (string tag for processing tool routing). Remove field gates
   (field_not_empty, field_equals) entirely since accepts/when replaces them. Only command
-  gates survive. The compiler validates mutual exclusivity of single-field when conditions
-  at compile time and rejects non-deterministic templates.
+  gates survive. When conditions use AND semantics (all fields must match). The compiler
+  validates pairwise mutual exclusivity of when conditions at compile time and rejects
+  non-deterministic templates.
 rationale: |
   In v2's event-sourced model, evidence only enters through koto next --with-data and is
   scoped to the current state via the epoch boundary rule. Field gates that check
@@ -127,36 +128,77 @@ mental model (two evaluation phases for the same data), semantic ambiguities (fi
 required by gate but optional in accepts?), and degrades the self-describing
 principle (agents see an `expects` field they can't submit to while gates block).
 
-### Decision: What scope of mutual exclusivity validation
+### Decision: What `when` matching semantics to use
 
-When two transitions from the same state have `when` conditions, the compiler needs
-to detect conflicts (same field, same value = non-deterministic). The question is
-how far the compiler goes in checking this.
+A `when` condition is a map of field names to expected values. When the map has
+multiple fields, the matching rule determines whether a transition fires.
 
-#### Chosen: Single-field only
+#### Chosen: AND semantics (all fields must match)
 
-The compiler validates mutual exclusivity only for transitions whose `when` condition
-has exactly one field. It groups these by field name and checks for duplicate values.
-Multi-field conditions (e.g., `{decision: proceed, priority: high}`) are left to the
-template author.
+A transition's `when` condition matches only if every field in the map equals its
+expected value in the submitted evidence. `when: {decision: proceed, priority: high}`
+matches only when the agent submits both `decision=proceed` AND `priority=high`.
 
-Single-field enum branching is the dominant routing pattern. Checking it catches the
-most common mistake (two transitions matching the same evidence) with a simple
-algorithm: group by field, check for duplicates.
+This is the standard semantics for key-value condition maps. SQL WHERE clauses,
+Kubernetes label selectors, and GitHub Actions `on` filters all use AND for
+multiple conditions. OR semantics would require a different syntax (e.g., a list
+of conditions) to avoid surprising template authors.
 
 #### Alternatives Considered
 
-**Validate all combinations**: Attempt to prove mutual exclusivity for multi-field
-conditions by checking all field-value combinations. Rejected because it's
-combinatorially expensive and requires reasoning about field independence that the
-compiler doesn't have. Two conditions like `{decision: proceed, priority: high}`
-and `{decision: proceed, priority: low}` look disjoint on `priority`, but only if
-the agent always submits both fields. The compiler can't know that.
+**OR semantics (any field matches)**: A transition fires if any field matches. This
+would make `when: {decision: proceed, priority: high}` fire when either field
+matches, which is unintuitive for a map structure. It also makes mutual exclusivity
+harder to reason about -- two conditions that share no fields would both fire for
+any evidence submission. Rejected because the syntax suggests AND and OR would
+require a different structure.
 
-**Skip validation entirely**: Don't check mutual exclusivity at all; detect conflicts
-at runtime. Rejected because the single-field case is trivial to check and catches
-real mistakes. Deferring everything to runtime means agents hit non-deterministic
-routing errors that could have been caught at compile time.
+### Decision: What scope of mutual exclusivity validation
+
+When two transitions from the same state have `when` conditions, the compiler needs
+to detect conflicts (two transitions could match the same evidence). With AND
+semantics, the question is how far the compiler goes in checking this.
+
+#### Chosen: Pairwise field-level exclusivity
+
+The compiler checks all pairs of transitions from the same state. Two transitions
+are provably exclusive if they share at least one field with disjoint values. Because
+`when` uses AND semantics, a single field disagreement is enough to guarantee the
+conditions can't both match.
+
+For example:
+- `{decision: proceed, priority: high}` vs `{decision: proceed, priority: low}` --
+  exclusive on `priority` (different values), even though `decision` overlaps.
+- `{decision: proceed}` vs `{decision: escalate}` -- exclusive on `decision`.
+- `{decision: proceed}` vs `{priority: high}` -- NOT provably exclusive. No shared
+  field, so both could match if the agent submits `{decision: proceed, priority: high}`.
+
+The algorithm: for each pair of transitions with `when` conditions, find shared
+fields. If any shared field has different values, the pair is exclusive. If no shared
+field exists, or all shared fields have the same value, the compiler rejects the
+template as potentially non-deterministic.
+
+This catches both single-field and multi-field conflicts without combinatorial
+explosion. The check is O(n^2) in the number of transitions per state, which is
+fine since states rarely have more than a handful of transitions.
+
+#### Alternatives Considered
+
+**Single-field only**: Only validate transitions whose `when` has exactly one field.
+Multi-field conditions are left to the template author. Simpler to implement, but
+misses real conflicts. Two transitions with `{decision: proceed, priority: high}` and
+`{decision: proceed, priority: high}` (identical multi-field conditions) would pass
+the compiler unchecked. The pairwise check is only marginally more complex and catches
+strictly more errors.
+
+**Full satisfiability analysis**: Model conditions as logical formulas and check
+whether any assignment satisfies both. Correct but overkill -- the pairwise
+field-level check covers every practical case. Full SAT analysis adds complexity
+with no real benefit for equality-only conditions.
+
+**Skip validation entirely**: Detect conflicts at runtime only. Rejected because
+compile-time validation catches real mistakes cheaply. Non-deterministic routing
+errors at runtime are harder to debug than compiler errors.
 
 ### Decision: How `koto next` output changes in issue #47
 
@@ -226,12 +268,13 @@ should submit at this state.
 
 Transitions change from plain strings to structured objects. Each transition has a
 `target` state and an optional `when` condition: a map of field names to expected
-values. When an agent submits evidence via `--with-data`, the advancement engine
+values. `when` uses AND semantics -- all fields must match for the transition to
+fire. When an agent submits evidence via `--with-data`, the advancement engine
 matches the submitted values against each transition's `when` conditions and routes
-to the first match. The compiler validates that single-field `when` conditions are
-mutually exclusive (disjoint values on the same field) and rejects non-deterministic
-templates. Multi-field conditions can't be statically verified and are the template
-author's responsibility.
+to the first match. The compiler validates that `when` conditions across a state's
+transitions are mutually exclusive: for each pair of transitions, at least one
+shared field must have disjoint values. If two transitions share no fields or agree
+on all shared fields, the compiler rejects the template as non-deterministic.
 
 States can declare an `integration` field: a string tag naming a processing tool.
 The compiler stores it verbatim. The integration runner (#49) resolves the tag to an
@@ -342,8 +385,9 @@ The compiler adds six validation rules and removes two:
 1. `when` fields must reference fields declared in the state's `accepts` block
 2. `when` values for enum fields must appear in the field's `values` list
 3. Empty `when` blocks are rejected
-4. Single-field `when` conditions across a state's transitions must be mutually
-   exclusive (no two transitions match the same field value)
+4. Pairwise mutual exclusivity: for each pair of transitions with `when` conditions,
+   at least one shared field must have disjoint values. Transitions with no shared
+   fields are rejected as potentially non-deterministic.
 5. `when` conditions require the state to have an `accepts` block
 6. `when` condition values must be JSON scalars (strings, numbers, booleans); arrays
    and objects are rejected
@@ -352,9 +396,10 @@ The compiler adds six validation rules and removes two:
 1. `field_not_empty` gate validation
 2. `field_equals` gate validation
 
-The mutual exclusivity check groups single-field transitions by field name, then
-checks for duplicate values within each group. Multi-field conditions can't be
-statically verified and are the template author's responsibility.
+The mutual exclusivity check works pairwise across all transitions with `when`
+conditions on the same state. Because `when` uses AND semantics (all fields must
+match), two conditions are provably exclusive if any shared field has different
+values. The check is O(n^2) in transitions per state, which is fine in practice.
 
 ### CLI Impact
 
@@ -483,8 +528,9 @@ exposure vectors.
 
 - `accepts` syntax is more verbose than field gates for simple required-field checks:
   `accepts: {decision: {type: string, required: true}}` vs `field_not_empty: decision`
-- Multi-field `when` conditions can't be statically validated, so non-deterministic
-  multi-field routing won't be caught until runtime
+- Transitions with `when` conditions on disjoint fields (no shared field names) can't
+  be proven exclusive at compile time and are rejected, even if they might be safe in
+  practice. Template authors must add a shared discriminator field.
 - The `serde_json::Value` type for `when` condition values is loosely typed; the
   compiler validates enum values but other types are checked only at runtime
 
@@ -493,10 +539,10 @@ exposure vectors.
 - The verbosity cost is minimal in practice because `accepts` carries more information
   (type, description) that field gates didn't support. Template authors write `accepts`
   once per state, not per transition.
-- Multi-field `when` conditions are expected to be rare. The design explicitly scopes
-  compile-time validation to single-field cases, which covers the common routing pattern
-  (enum-based branching). Documentation will note the author's responsibility for
-  multi-field correctness.
+- Rejecting disjoint-field conditions is the safe default. If two transitions test
+  completely different fields, both could match any evidence that includes both fields.
+  Requiring a shared discriminator makes the routing logic explicit and deterministic.
+  This is a compile-time constraint that pushes template authors toward clearer designs.
 - The `serde_json::Value` flexibility is intentional: it allows future type extensions
   (numeric comparisons, boolean flags) without schema changes. Current v2 templates
   use string equality matching, which the compiler does validate for enum fields.
