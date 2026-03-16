@@ -20,6 +20,11 @@ evidence schemas and conditional transitions.
 - **Coexistence with Precedence**: Both allowed, gates first. Complex mental model, semantic ambiguities.
 - **Unified Model**: Remove field gates entirely. Simplest model, minor expressiveness gap.
 
+## Selected Approach (Phase 2)
+Unified Model: remove field gates entirely, keep only command gates alongside
+accepts/when. Field gates are redundant in the event-sourced model where evidence
+enters through --with-data and is scoped by the epoch boundary.
+
 ## Current Status
-**Phase:** 1 - Approach Discovery
+**Phase:** 2 - Present Approaches
 **Last Updated:** 2026-03-15
