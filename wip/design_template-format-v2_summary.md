@@ -31,6 +31,15 @@ enters through --with-data and is scoped by the epoch boundary.
 - **Downstream impact**: hello-koto survives unchanged (command gates only). Integration tests need v2 template format. Plugin CI adapts transparently.
 - No contradictions or deal-breakers found.
 
+## Security Review (Phase 5)
+**Outcome:** Option 3 (N/A with justification)
+**Summary:** Purely declarative schema change with no new execution paths, downloads, or data exposure.
+
+## Final Review (Phase 6)
+**Architecture review:** No blockers. Applied 5 advisory improvements (transition mapping, validate() version check, Gate cleanup, scalar validation, template migration notes).
+**Security review:** No blockers. Added scalar-only validation for when values.
+**Strawman check:** Both rejected alternatives have genuine depth from advocate research.
+
 ## Current Status
-**Phase:** 3 - Deep Investigation
+**Phase:** 6 - Final Review (complete)
 **Last Updated:** 2026-03-15

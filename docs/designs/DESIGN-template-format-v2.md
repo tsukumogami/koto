@@ -166,3 +166,253 @@ now handles with better expressiveness and compile-time validation. Keeping both
 would require defining interaction rules for no practical benefit. Removing field
 gates yields a net code reduction and fewer concepts for template authors.
 
+## Solution Architecture
+
+### Overview
+
+Template format v2 adds three constructs to the template schema and removes two gate
+types. The changes touch three files: type definitions (`src/template/types.rs`),
+the compiler (`src/template/compile.rs`), and the CLI (`src/cli/mod.rs`). The compiled
+JSON output gains new fields but keeps its flat structure.
+
+### YAML Source Format
+
+A v2 template source looks like this:
+
+```yaml
+---
+name: review-workflow
+version: "1.0"
+initial_state: analyze_results
+states:
+  analyze_results:
+    integration: delegate_review
+    accepts:
+      decision:
+        type: enum
+        values: [proceed, escalate]
+        required: true
+      rationale:
+        type: string
+        required: true
+    transitions:
+      - target: deploy
+        when:
+          decision: proceed
+      - target: escalate_review
+        when:
+          decision: escalate
+    gates:
+      tests_passed:
+        type: command
+        command: ./check-ci.sh
+  deploy:
+    transitions:
+      - target: complete
+  escalate_review:
+    transitions:
+      - target: complete
+  complete:
+    terminal: true
+---
+## analyze_results
+Review the test output and decide the next step.
+## deploy
+Deploy to production.
+## escalate_review
+Escalate to senior review team.
+## complete
+Review workflow complete.
+```
+
+States without `accepts` or `when` use the same syntax as v1 but with structured
+transition objects instead of plain strings.
+
+### Compiled Types
+
+Four Rust types define the v2 compiled schema:
+
+**TemplateState** gains three fields over v1:
+- `accepts: Option<BTreeMap<String, FieldSchema>>` -- evidence field schema
+- `transitions: Vec<Transition>` -- replaces `Vec<String>`
+- `integration: Option<String>` -- processing tool tag
+
+**Transition** (new): holds `target: String` and `when: Option<BTreeMap<String, serde_json::Value>>`.
+Unconditional transitions omit `when`. Conditional transitions map field names to
+expected values.
+
+**FieldSchema** (new): holds `field_type: String` (enum, string, number, boolean),
+`required: bool`, optional `values: Vec<String>` for enums, and optional `description`.
+
+**Gate**: `GATE_TYPE_FIELD_NOT_EMPTY` and `GATE_TYPE_FIELD_EQUALS` constants are
+removed; only `GATE_TYPE_COMMAND` remains. The `field` and `value` fields on the
+struct are removed since command gates don't use them. The compiler rejects field
+gate types with an error message pointing to `accepts`/`when` as the replacement.
+
+### Compiler Validation
+
+The compiler adds six validation rules and removes two:
+
+**Added:**
+1. `when` fields must reference fields declared in the state's `accepts` block
+2. `when` values for enum fields must appear in the field's `values` list
+3. Empty `when` blocks are rejected
+4. Single-field `when` conditions across a state's transitions must be mutually
+   exclusive (no two transitions match the same field value)
+5. `when` conditions require the state to have an `accepts` block
+6. `when` condition values must be JSON scalars (strings, numbers, booleans); arrays
+   and objects are rejected
+
+**Removed:**
+1. `field_not_empty` gate validation
+2. `field_equals` gate validation
+
+The mutual exclusivity check groups single-field transitions by field name, then
+checks for duplicate values within each group. Multi-field conditions can't be
+statically verified and are the template author's responsibility.
+
+### CLI Impact
+
+`koto next` currently serializes `transitions: Vec<String>` directly. With v2,
+transitions become `Vec<Transition>` (structured objects with `target` and `when`).
+Serializing these directly would break the current output contract. For issue #47
+scope, `koto next` maps structured transitions to target names
+(`transitions.iter().map(|t| &t.target)`) to preserve the current flat string array
+output. The full output contract change (adding `expects`, `integration.available`)
+is #48's responsibility.
+
+`koto template compile` and `koto template validate` work unchanged once the types
+and compiler support v2.
+
+### Data Flow
+
+```
+Template YAML  -->  compile()  -->  Compiled JSON (format_version: 2)
+                       |
+                  Validation:
+                  - when/accepts consistency
+                  - mutual exclusivity
+                  - gate type restriction
+                       |
+                       v
+                 CompiledTemplate
+                       |
+          koto next reads compiled template
+          extracts targets from transitions
+          outputs current format (until #48)
+```
+
+## Implementation Approach
+
+### Phase 1: Type Definitions
+
+Update `src/template/types.rs`:
+- Add `Transition` and `FieldSchema` structs
+- Add `accepts`, `integration` fields to `TemplateState`
+- Change `transitions` from `Vec<String>` to `Vec<Transition>`
+- Remove `GATE_TYPE_FIELD_NOT_EMPTY` and `GATE_TYPE_FIELD_EQUALS` constants
+- Clean up dead `field` and `value` fields on `Gate` struct (only `command` and
+  `timeout` are needed for command gates)
+- Update `validate()`: accept `format_version: 2` (currently hard-rejects anything
+  other than 1), add v2 rules (when/accepts consistency, mutual exclusivity, scalar
+  value check, gate type restriction)
+
+Deliverables:
+- Updated `src/template/types.rs`
+- Unit tests for new validation rules
+
+### Phase 2: Compiler
+
+Update `src/template/compile.rs`:
+- Add `SourceTransition` and `SourceFieldSchema` deserialization types
+- Update `SourceState` with `accepts`, `integration`, structured `transitions`
+- Replace `compile_gate()` with v2 version that only accepts command gates
+- Transform source types to compiled types (HashMap to BTreeMap, source to compiled)
+- Set `format_version: 2`
+
+Deliverables:
+- Updated `src/template/compile.rs`
+- Compiler tests for v2 templates (valid and invalid)
+
+### Phase 3: CLI and Tests
+
+Update `src/cli/mod.rs`:
+- Adjust `koto next` to extract target names from structured transitions
+  (preserving current output format for #48)
+
+Update integration tests:
+- Convert all test templates from v1 to v2 format (including `minimal_template()`
+  and any embedded template fixtures in `compile.rs` tests)
+- Update hello-koto template transitions from `[done]` to `[{target: done}]`
+- Add test cases for new validation errors
+
+Note: all three phases land in a single PR. Phase 1 changes break compilation
+until Phase 2 updates the compiler, so these aren't independently mergeable.
+
+Deliverables:
+- Updated `src/cli/mod.rs`
+- Updated `tests/integration_test.rs`
+- Updated plugin templates
+
+## Security Considerations
+
+### Download verification
+
+Not applicable. Template format v2 doesn't change how binaries or templates are
+downloaded. Templates are local markdown files read from disk.
+
+### Execution isolation
+
+Command gates execute shell commands with the same permissions as the koto process.
+This is unchanged from v1. The v2 format doesn't add new execution vectors: `accepts`
+and `when` are declarative schema, and `integration` is a string tag that doesn't
+execute anything at compile time. The integration runner (#49) handles execution
+with its own isolation model.
+
+### Supply chain risks
+
+Not applicable. Templates are authored locally, not fetched from a registry. The
+compiler reads local files only. No new external dependencies are introduced.
+
+### User data exposure
+
+`accepts` schemas describe what fields agents should submit but don't transmit data
+themselves. Evidence data flows through `koto next --with-data`, which is an existing
+CLI path. The `integration` tag is stored in compiled JSON on disk. No new data
+exposure vectors.
+
+## Consequences
+
+### Positive
+
+- Two orthogonal concepts (command gates for environment, accepts/when for evidence)
+  with no overlap or interaction rules
+- Compile-time detection of non-deterministic templates through mutual exclusivity
+  validation
+- Self-describing templates: the `accepts` block tells agents exactly what to submit
+  without external documentation
+- Net code reduction from removing field gate types and their validation logic
+- Clean foundation for #48 (output contract) and #49 (integration runner) to build on
+
+### Negative
+
+- `accepts` syntax is more verbose than field gates for simple required-field checks:
+  `accepts: {decision: {type: string, required: true}}` vs `field_not_empty: decision`
+- Multi-field `when` conditions can't be statically validated, so non-deterministic
+  multi-field routing won't be caught until runtime
+- The `serde_json::Value` type for `when` condition values is loosely typed; the
+  compiler validates enum values but other types are checked only at runtime
+
+### Mitigations
+
+- The verbosity cost is minimal in practice because `accepts` carries more information
+  (type, description) that field gates didn't support. Template authors write `accepts`
+  once per state, not per transition.
+- Multi-field `when` conditions are expected to be rare. The design explicitly scopes
+  compile-time validation to single-field cases, which covers the common routing pattern
+  (enum-based branching). Documentation will note the author's responsibility for
+  multi-field correctness.
+- The `serde_json::Value` flexibility is intentional: it allows future type extensions
+  (numeric comparisons, boolean flags) without schema changes. Current v2 templates
+  use string equality matching, which the compiler does validate for enum fields.
+
