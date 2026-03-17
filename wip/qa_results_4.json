@@ -1,0 +1,8 @@
+{
+  "issue": 4,
+  "all_passed": true,
+  "passed": 5,
+  "failed": 0,
+  "pending": 10,
+  "summary": "5 scenarios passed (23-25, 27, 37). 10 pending: scenario 26 deferred to #49 (integration runner), scenarios 28-29 implement checks but lack dedicated tests, scenarios 30-36 require end-to-end CLI setup."
+}

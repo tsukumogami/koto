@@ -212,7 +212,8 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next.rs`)
 **Expected**: `dispatch_next()` with a terminal `TemplateState` returns `NextResponse::Terminal` with the correct state name and `advanced` flag.
-**Status**: pending
+**Status**: passed
+**Verified by**: `terminal_state_returns_terminal`, `terminal_state_with_advanced_true`
 
 ### Scenario 24: Dispatcher classifies gate-blocked state
 **ID**: scenario-24
@@ -221,7 +222,8 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next.rs`)
 **Expected**: `dispatch_next()` with non-passing gate results returns `NextResponse::GateBlocked` with all blocking conditions listed.
-**Status**: pending
+**Status**: passed
+**Verified by**: `gate_blocked_when_gate_failed`, `gate_blocked_when_gate_timed_out`, `gate_blocked_when_gate_errored`, `gate_blocked_includes_all_failures`
 
 ### Scenario 25: Dispatcher classifies evidence-required state
 **ID**: scenario-25
@@ -230,7 +232,8 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next.rs`)
 **Expected**: `dispatch_next()` with a state that has `accepts` and no gates returns `NextResponse::EvidenceRequired` with a populated `expects` field.
-**Status**: pending
+**Status**: passed
+**Verified by**: `evidence_required_with_accepts`, `evidence_required_advanced_flag_propagates`
 
 ### Scenario 26: Dispatcher classifies integration state
 **ID**: scenario-26
@@ -240,6 +243,7 @@ Issues covered: 4
 - `cargo test` (unit tests in `src/cli/next.rs`)
 **Expected**: `dispatch_next()` with a state that has an `integration` field (and it is available) returns `NextResponse::Integration`.
 **Status**: pending
+**Reason**: The dispatcher always returns `IntegrationUnavailable` for integration states; the `Integration` (available) branch is deferred to #49. No test exercises the available-integration path because the code path does not exist yet. `integration_takes_priority_over_accepts` confirms integration detection priority but returns `IntegrationUnavailable`.
 
 ### Scenario 27: Dispatcher classifies integration-unavailable state
 **ID**: scenario-27
@@ -248,7 +252,8 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next.rs`)
 **Expected**: `dispatch_next()` with a state that has an `integration` field (and it is unavailable) returns `NextResponse::IntegrationUnavailable`.
-**Status**: pending
+**Status**: passed
+**Verified by**: `integration_unavailable_when_declared`, `integration_unavailable_with_expects`
 
 ### Scenario 28: --with-data and --to are mutually exclusive
 **ID**: scenario-28
@@ -258,6 +263,7 @@ Issues covered: 4
 - `cargo build && ./target/debug/koto next --with-data '{}' --to some_state test-wf`
 **Expected**: Exit code 2. Error message indicates the two flags cannot be used together.
 **Status**: pending
+**Reason**: Code implements the check (src/cli/mod.rs lines 382-389) but no unit or integration test exercises it. Needs a CLI integration test.
 
 ### Scenario 29: --with-data payload size limit enforced
 **ID**: scenario-29
@@ -267,6 +273,7 @@ Issues covered: 4
 - Generate a 2MB JSON string and pass via `--with-data`
 **Expected**: Exit code 2. Error message indicates payload exceeds size limit.
 **Status**: pending
+**Reason**: Code implements the check (src/cli/mod.rs MAX_WITH_DATA_BYTES=1048576, lines 393-402) but no unit or integration test exercises it. Needs a CLI integration test.
 
 ---
 
@@ -283,6 +290,7 @@ Issues covered: 4
 - `koto next test-wf`
 **Expected**: JSON output has `"action": "done"`, `"state": "done"`, `"advanced": false`, `"error": null`. Exit code 0.
 **Status**: pending
+**Reason**: No integration test covers advancing to a terminal state and calling `koto next`. The existing `init_next_rewind_sequence` test calls `next` on the initial (non-terminal) state only.
 
 ### Scenario 31: Full koto next on state with gates that fail returns gate_blocked
 **ID**: scenario-31
@@ -294,6 +302,7 @@ Issues covered: 4
 - `koto next test-wf`
 **Expected**: JSON output has `"action": "execute"`, `"blocking_conditions"` array with one entry showing `"status": "failed"`, `"type": "command"`, `"agent_actionable": false`. Exit code 1.
 **Status**: pending
+**Reason**: No integration test uses a template with gates. Requires a template with command gates to test end-to-end.
 
 ### Scenario 32: Full evidence submission flow via --with-data
 **ID**: scenario-32
@@ -306,6 +315,7 @@ Issues covered: 4
 - `koto next --with-data '{"decision": "proceed"}' test-wf` (should accept and advance)
 **Expected**: First `koto next` returns `expects` with `event_type: "evidence_submitted"`, `fields` containing `decision` with `type: "enum"`, and `options` listing the two transition targets. Second `koto next --with-data` succeeds (exit 0) and the workflow state changes.
 **Status**: pending
+**Reason**: No integration test exercises `--with-data`. Requires a template with `accepts` block and conditional transitions.
 
 ### Scenario 33: Invalid evidence submission returns structured error
 **ID**: scenario-33
@@ -317,6 +327,7 @@ Issues covered: 4
 - `koto next --with-data '{"name": 42, "extra": "field"}' test-wf`
 **Expected**: Exit code 2. JSON error has `"code": "invalid_submission"` and `details` array with entries for the type mismatch on `name` and the unknown field `extra`.
 **Status**: pending
+**Reason**: No integration test exercises `--with-data` with invalid evidence. Requires a template with `accepts` block.
 
 ### Scenario 34: Directed transition via --to advances state and returns new state info
 **ID**: scenario-34
@@ -328,6 +339,7 @@ Issues covered: 4
 - `koto next --to analyze test-wf`
 **Expected**: Exit code 0. Response describes the `analyze` state. No gate evaluation occurs. A `directed_transition` event is appended to the state log.
 **Status**: pending
+**Reason**: No integration test exercises `--to`. Requires a multi-state template.
 
 ### Scenario 35: Agent-driven workflow loop using only koto next output
 **ID**: scenario-35
@@ -341,6 +353,7 @@ Issues covered: 4
 - `koto next test-wf` (check new state)
 **Expected**: Each `koto next` response is self-describing. The agent never needs to read the template file. The `expects` schema tells the agent what fields to submit, what types they are, and what options route to which states. The workflow progresses from `gather` through to its next state based on evidence.
 **Status**: pending
+**Reason**: Full end-to-end agent loop scenario. No integration test covers the multi-step `next` / `--with-data` / `next` cycle. Requires a template with accepts, gates, and conditional transitions.
 
 ### Scenario 36: Gate timeout kills entire process group
 **ID**: scenario-36
@@ -353,6 +366,7 @@ Issues covered: 4
 - After the command returns, verify no orphaned sleep processes remain
 **Expected**: `koto next` returns within ~2 seconds (not 300). The response shows `blocking_conditions` with `"status": "timed_out"`. No orphaned `sleep 300` processes remain (process group was killed).
 **Status**: pending
+**Reason**: The unit test `timed_out_gate` verifies timeout behavior at the gate evaluator level (passed). No integration test verifies this through the full CLI with `koto next` and process group cleanup.
 
 ### Scenario 37: koto next on non-existent workflow returns error
 **ID**: scenario-37
@@ -361,4 +375,5 @@ Issues covered: 4
 **Commands**:
 - `koto next nonexistent-workflow`
 **Expected**: Exit code 1. JSON error message indicates workflow not found. Uses the existing pre-dispatch error shape `{"error": "...", "command": "next"}`.
-**Status**: pending
+**Status**: passed
+**Verified by**: Integration test `next_fails_for_unknown_workflow` -- confirms non-zero exit code and structured error JSON with `error.code` field.
