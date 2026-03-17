@@ -3,7 +3,7 @@
   "design_doc": "docs/plans/PLAN-koto-cli-output-contract.md",
   "branch": "docs/koto-cli-output-contract",
   "pr_number": 56,
-  "integrity_hash": "sha256:50c740f2343ee53e2a52ad1a54adf11d5610bc9ba8e5dfa71e38a6ff07f1e2ea",
+  "integrity_hash": "sha256:8609b018cabade8dcd3b333b0519b6d5dbc33eb15ea1c24aa4b1897a3d27ae28",
   "issues": [
     {
       "number": 1,
@@ -132,7 +132,7 @@
     {
       "number": 2,
       "title": "feat(koto): implement evidence validation and expects derivation",
-      "status": "scrutinized",
+      "status": "pushed",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
       "issue_type": "code",
@@ -204,6 +204,33 @@
             "status": "implemented"
           }
         ]
+      },
+      "reviewer_results": {
+        "issue": 2,
+        "reviews": [
+          {
+            "focus": "pragmatic",
+            "blocking_count": 0,
+            "advisory_count": 2
+          },
+          {
+            "focus": "architect",
+            "blocking_count": 0,
+            "advisory_count": 0
+          },
+          {
+            "focus": "maintainer",
+            "blocking_count": 0,
+            "advisory_count": 4
+          }
+        ]
+      },
+      "qa_results": {
+        "issue": 2,
+        "all_passed": true,
+        "passed": 8,
+        "failed": 0,
+        "summary": "All 8 scenarios passed."
       },
       "testable_scenarios": [
         "scenario-10",

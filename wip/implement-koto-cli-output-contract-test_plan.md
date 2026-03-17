@@ -14,7 +14,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next_types.rs`)
 **Expected**: Serialized JSON includes `action: "execute"`, `state`, `directive`, `advanced`, `expects` (object), `error: null`. Fields `blocking_conditions` and `integration` are absent.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 2: NextResponse GateBlocked serializes correct JSON shape
 **ID**: scenario-2
@@ -23,7 +23,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next_types.rs`)
 **Expected**: Serialized JSON includes `action: "execute"`, `state`, `directive`, `advanced`, `blocking_conditions` (array), `expects: null`, `error: null`. Field `integration` is absent.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 3: NextResponse Integration serializes correct JSON shape
 **ID**: scenario-3
@@ -32,7 +32,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next_types.rs`)
 **Expected**: Serialized JSON includes `action: "execute"`, `state`, `directive`, `advanced`, `expects` (object or null), `integration` (object), `error: null`. Field `blocking_conditions` is absent.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 4: NextResponse IntegrationUnavailable serializes correct JSON shape
 **ID**: scenario-4
@@ -41,7 +41,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next_types.rs`)
 **Expected**: Serialized JSON includes `action: "execute"`, `state`, `directive`, `advanced`, `expects` (object or null), `integration` (object with `available: false`), `error: null`. Field `blocking_conditions` is absent.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 5: NextResponse Terminal serializes correct JSON shape
 **ID**: scenario-5
@@ -50,7 +50,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next_types.rs`)
 **Expected**: Serialized JSON includes `action: "done"`, `state`, `advanced`, `error: null`. Fields `directive`, `expects`, `blocking_conditions`, and `integration` are absent or null per the field presence table (`expects: null`, `directive` absent).
-**Status**: pending
+**Status**: passed
 
 ### Scenario 6: NextErrorCode serializes as snake_case strings
 **ID**: scenario-6
@@ -59,7 +59,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next_types.rs`)
 **Expected**: Each NextErrorCode variant serializes to its snake_case form: `gate_blocked`, `invalid_submission`, `precondition_failed`, `integration_unavailable`, `terminal_state`, `workflow_not_initialized`.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 7: NextErrorCode exit code mapping
 **ID**: scenario-7
@@ -68,7 +68,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next_types.rs`)
 **Expected**: `gate_blocked` and `integration_unavailable` map to exit code 1. `invalid_submission`, `precondition_failed`, `terminal_state`, `workflow_not_initialized` map to exit code 2.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 8: ExpectsSchema omits options when empty
 **ID**: scenario-8
@@ -77,7 +77,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next_types.rs`)
 **Expected**: When `options` is an empty Vec, the `options` key is absent from serialized JSON. When non-empty, it appears.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 9: ExpectsFieldSchema serializes field_type as "type" and omits empty values
 **ID**: scenario-9
@@ -86,7 +86,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next_types.rs`)
 **Expected**: JSON key is `"type"` not `"field_type"`. When `values` is empty, the `values` key is absent.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 10: Evidence validation rejects missing required fields
 **ID**: scenario-10
@@ -95,7 +95,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/engine/evidence.rs`)
 **Expected**: Submitting `{}` against a schema with a required field returns an error with per-field detail naming the missing field.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 11: Evidence validation rejects type mismatches for each type
 **ID**: scenario-11
@@ -104,7 +104,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/engine/evidence.rs`)
 **Expected**: Submitting a number where a string is expected, a string where a number is expected, a string where a boolean is expected, and a non-matching string for an enum field each produce a type mismatch error detail.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 12: Evidence validation rejects unknown fields
 **ID**: scenario-12
@@ -113,7 +113,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/engine/evidence.rs`)
 **Expected**: Submitting `{"unknown_field": "value"}` against a schema that does not declare `unknown_field` returns an error detail for the unknown field.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 13: Evidence validation collects all errors without short-circuit
 **ID**: scenario-13
@@ -122,7 +122,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/engine/evidence.rs`)
 **Expected**: Submitting a payload with multiple problems (missing required field AND unknown field AND type mismatch) returns error details for all three problems in one response.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 14: Evidence validation accepts valid payload
 **ID**: scenario-14
@@ -131,7 +131,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/engine/evidence.rs`)
 **Expected**: Submitting a payload matching all schema requirements returns `Ok(())`.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 15: derive_expects returns None for state without accepts
 **ID**: scenario-15
@@ -140,7 +140,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next_types.rs`)
 **Expected**: A `TemplateState` with `accepts: None` produces `None` from `derive_expects`.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 16: derive_expects populates options from conditional transitions
 **ID**: scenario-16
@@ -149,7 +149,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next_types.rs`)
 **Expected**: A state with `accepts` and two transitions with `when` conditions produces an `ExpectsSchema` with `event_type: "evidence_submitted"`, correct `fields`, and `options` containing both transition targets and their `when` maps.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 17: derive_expects omits options when no transitions have when
 **ID**: scenario-17
@@ -158,7 +158,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (unit tests in `src/cli/next_types.rs`)
 **Expected**: A state with `accepts` but only unconditional transitions produces an `ExpectsSchema` with empty `options` (which serializes without the `options` key).
-**Status**: pending
+**Status**: passed
 
 ### Scenario 18: Gate evaluator passes gate on exit 0
 **ID**: scenario-18

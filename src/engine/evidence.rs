@@ -22,7 +22,11 @@ pub struct EvidenceValidationError {
 impl fmt::Display for EvidenceValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "evidence validation failed: ")?;
-        let reasons: Vec<&str> = self.field_errors.iter().map(|e| e.reason.as_str()).collect();
+        let reasons: Vec<&str> = self
+            .field_errors
+            .iter()
+            .map(|e| e.reason.as_str())
+            .collect();
         write!(f, "{}", reasons.join("; "))
     }
 }
@@ -125,27 +129,25 @@ fn validate_field_type(
                 });
             }
         }
-        "enum" => {
-            match value.as_str() {
-                Some(s) => {
-                    if !schema.values.contains(&s.to_string()) {
-                        errors.push(FieldError {
-                            field: field_name.to_string(),
-                            reason: format!(
-                                "value {:?} is not in allowed values {:?}",
-                                s, schema.values
-                            ),
-                        });
-                    }
-                }
-                None => {
+        "enum" => match value.as_str() {
+            Some(s) => {
+                if !schema.values.contains(&s.to_string()) {
                     errors.push(FieldError {
                         field: field_name.to_string(),
-                        reason: format!("expected string for enum, got {}", json_type_name(value)),
+                        reason: format!(
+                            "value {:?} is not in allowed values {:?}",
+                            s, schema.values
+                        ),
                     });
                 }
             }
-        }
+            None => {
+                errors.push(FieldError {
+                    field: field_name.to_string(),
+                    reason: format!("expected string for enum, got {}", json_type_name(value)),
+                });
+            }
+        },
         _ => {
             // Unsupported field type -- this should be caught by template validation,
             // but handle it defensively.
@@ -173,11 +175,7 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 mod tests {
     use super::*;
 
-    fn make_schema(
-        field_type: &str,
-        required: bool,
-        values: Vec<&str>,
-    ) -> FieldSchema {
+    fn make_schema(field_type: &str, required: bool, values: Vec<&str>) -> FieldSchema {
         FieldSchema {
             field_type: field_type.to_string(),
             required,
@@ -223,7 +221,9 @@ mod tests {
         let err = validate_evidence(&data, &accepts).unwrap_err();
         assert_eq!(err.field_errors.len(), 1);
         assert_eq!(err.field_errors[0].field, "decision");
-        assert!(err.field_errors[0].reason.contains("required field missing"));
+        assert!(err.field_errors[0]
+            .reason
+            .contains("required field missing"));
     }
 
     #[test]
@@ -309,7 +309,9 @@ mod tests {
 
         let err = validate_evidence(&data, &accepts).unwrap_err();
         assert_eq!(err.field_errors.len(), 1);
-        assert!(err.field_errors[0].reason.contains("expected string for enum"));
+        assert!(err.field_errors[0]
+            .reason
+            .contains("expected string for enum"));
     }
 
     #[test]
