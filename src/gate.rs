@@ -29,22 +29,36 @@ pub enum GateResult {
     Error { message: String },
 }
 
-/// Evaluate all gates in `gates`, running each command with `working_dir` as
-/// the current directory. Every gate is evaluated regardless of individual
-/// results (no short-circuit).
+/// Evaluate all command gates in `gates`, running each command with
+/// `working_dir` as the current directory. Every gate is evaluated regardless
+/// of individual results (no short-circuit).
+///
+/// Only gates with `gate_type == "command"` are evaluated. Gates with
+/// unrecognized types are skipped with a `GateResult::Error` explaining that
+/// the type is not supported by this evaluator.
 pub fn evaluate_gates(
     gates: &BTreeMap<String, Gate>,
     working_dir: &Path,
 ) -> BTreeMap<String, GateResult> {
     let mut results = BTreeMap::new();
     for (name, gate) in gates {
-        let result = evaluate_single_gate(gate, working_dir);
+        let result = if gate.gate_type != crate::template::types::GATE_TYPE_COMMAND {
+            GateResult::Error {
+                message: format!(
+                    "unsupported gate type '{}'; only command gates are evaluated",
+                    gate.gate_type
+                ),
+            }
+        } else {
+            evaluate_single_gate(gate, working_dir)
+        };
         results.insert(name.clone(), result);
     }
     results
 }
 
 fn evaluate_single_gate(gate: &Gate, working_dir: &Path) -> GateResult {
+    // timeout=0 is the serde default, meaning "no override"; use the module default.
     let timeout = if gate.timeout == 0 {
         Duration::from_secs(DEFAULT_TIMEOUT_SECS)
     } else {
