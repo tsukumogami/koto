@@ -1,8 +1,8 @@
 ---
 schema: plan/v1
-status: Draft
+status: Done
 execution_mode: single-pr
-upstream: docs/designs/DESIGN-koto-cli-output-contract.md
+upstream: docs/designs/current/DESIGN-koto-cli-output-contract.md
 milestone: "koto CLI Output Contract"
 issue_count: 4
 ---
@@ -11,7 +11,7 @@ issue_count: 4
 
 ## Status
 
-Draft
+Done
 
 ## Scope Summary
 
