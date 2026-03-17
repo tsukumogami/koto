@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use serde::ser::SerializeMap;
 use serde::Serialize;
 
+use crate::template::types::TemplateState;
+
 /// The five possible responses from `koto next`.
 ///
 /// Each variant maps 1:1 to a JSON output shape. Custom `Serialize`
@@ -216,6 +218,47 @@ pub struct IntegrationUnavailableMarker {
 pub struct ErrorDetail {
     pub field: String,
     pub reason: String,
+}
+
+/// Derive an `ExpectsSchema` from a template state's `accepts` block and transitions.
+///
+/// Returns `None` when the state has no `accepts` block. When present, maps each
+/// `FieldSchema` to `ExpectsFieldSchema` and populates `options` from transitions
+/// that have `when` conditions. Options are omitted entirely when no transitions
+/// have `when`.
+pub fn derive_expects(state: &TemplateState) -> Option<ExpectsSchema> {
+    let accepts = state.accepts.as_ref()?;
+
+    let fields: BTreeMap<String, ExpectsFieldSchema> = accepts
+        .iter()
+        .map(|(name, schema)| {
+            (
+                name.clone(),
+                ExpectsFieldSchema {
+                    field_type: schema.field_type.clone(),
+                    required: schema.required,
+                    values: schema.values.clone(),
+                },
+            )
+        })
+        .collect();
+
+    let options: Vec<TransitionOption> = state
+        .transitions
+        .iter()
+        .filter_map(|t| {
+            t.when.as_ref().map(|when| TransitionOption {
+                target: t.target.clone(),
+                when: when.clone(),
+            })
+        })
+        .collect();
+
+    Some(ExpectsSchema {
+        event_type: "evidence_submitted".to_string(),
+        fields,
+        options,
+    })
 }
 
 #[cfg(test)]
@@ -689,5 +732,173 @@ mod tests {
         let options = json["options"].as_array().unwrap();
         assert_eq!(options.len(), 1);
         assert_eq!(options[0]["target"], "next");
+    }
+
+    // -- derive_expects tests --
+
+    use crate::template::types::{FieldSchema, Transition};
+
+    fn make_template_state(
+        accepts: Option<BTreeMap<String, FieldSchema>>,
+        transitions: Vec<Transition>,
+    ) -> TemplateState {
+        TemplateState {
+            directive: "Do the thing.".to_string(),
+            transitions,
+            terminal: false,
+            gates: BTreeMap::new(),
+            accepts,
+            integration: None,
+        }
+    }
+
+    #[test]
+    fn derive_expects_no_accepts_returns_none() {
+        let state = make_template_state(None, vec![]);
+        assert!(derive_expects(&state).is_none());
+    }
+
+    #[test]
+    fn derive_expects_with_accepts_and_conditional_transitions() {
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "decision".to_string(),
+            FieldSchema {
+                field_type: "enum".to_string(),
+                required: true,
+                values: vec!["proceed".to_string(), "escalate".to_string()],
+                description: String::new(),
+            },
+        );
+        accepts.insert(
+            "notes".to_string(),
+            FieldSchema {
+                field_type: "string".to_string(),
+                required: false,
+                values: vec![],
+                description: "Optional notes".to_string(),
+            },
+        );
+
+        let mut when_proceed = BTreeMap::new();
+        when_proceed.insert("decision".to_string(), serde_json::json!("proceed"));
+        let mut when_escalate = BTreeMap::new();
+        when_escalate.insert("decision".to_string(), serde_json::json!("escalate"));
+
+        let transitions = vec![
+            Transition {
+                target: "implement".to_string(),
+                when: Some(when_proceed),
+            },
+            Transition {
+                target: "review".to_string(),
+                when: Some(when_escalate),
+            },
+        ];
+
+        let state = make_template_state(Some(accepts), transitions);
+        let expects = derive_expects(&state).unwrap();
+
+        assert_eq!(expects.event_type, "evidence_submitted");
+        assert_eq!(expects.fields.len(), 2);
+
+        // Check field mapping
+        let decision_field = &expects.fields["decision"];
+        assert_eq!(decision_field.field_type, "enum");
+        assert!(decision_field.required);
+        assert_eq!(
+            decision_field.values,
+            vec!["proceed".to_string(), "escalate".to_string()]
+        );
+
+        let notes_field = &expects.fields["notes"];
+        assert_eq!(notes_field.field_type, "string");
+        assert!(!notes_field.required);
+        assert!(notes_field.values.is_empty());
+
+        // Check options
+        assert_eq!(expects.options.len(), 2);
+        assert_eq!(expects.options[0].target, "implement");
+        assert_eq!(
+            expects.options[0].when["decision"],
+            serde_json::json!("proceed")
+        );
+        assert_eq!(expects.options[1].target, "review");
+        assert_eq!(
+            expects.options[1].when["decision"],
+            serde_json::json!("escalate")
+        );
+
+        // Verify serialization: field_type -> "type", options present
+        let json = serde_json::to_value(&expects).unwrap();
+        assert_eq!(json["fields"]["decision"]["type"], "enum");
+        assert!(json["fields"]["decision"].get("field_type").is_none());
+        assert!(json.get("options").is_some());
+    }
+
+    #[test]
+    fn derive_expects_with_accepts_no_conditional_transitions() {
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "data".to_string(),
+            FieldSchema {
+                field_type: "string".to_string(),
+                required: true,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+
+        // Unconditional transition only
+        let transitions = vec![Transition {
+            target: "next_state".to_string(),
+            when: None,
+        }];
+
+        let state = make_template_state(Some(accepts), transitions);
+        let expects = derive_expects(&state).unwrap();
+
+        assert_eq!(expects.event_type, "evidence_submitted");
+        assert_eq!(expects.fields.len(), 1);
+        assert!(expects.options.is_empty());
+
+        // When serialized, options should be omitted
+        let json = serde_json::to_value(&expects).unwrap();
+        assert!(json.get("options").is_none());
+    }
+
+    #[test]
+    fn derive_expects_mixed_conditional_and_unconditional() {
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "choice".to_string(),
+            FieldSchema {
+                field_type: "enum".to_string(),
+                required: true,
+                values: vec!["a".to_string(), "b".to_string()],
+                description: String::new(),
+            },
+        );
+
+        let mut when = BTreeMap::new();
+        when.insert("choice".to_string(), serde_json::json!("a"));
+
+        let transitions = vec![
+            Transition {
+                target: "path_a".to_string(),
+                when: Some(when),
+            },
+            Transition {
+                target: "fallback".to_string(),
+                when: None,
+            },
+        ];
+
+        let state = make_template_state(Some(accepts), transitions);
+        let expects = derive_expects(&state).unwrap();
+
+        // Only the conditional transition appears in options
+        assert_eq!(expects.options.len(), 1);
+        assert_eq!(expects.options[0].target, "path_a");
     }
 }
