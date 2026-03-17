@@ -36,6 +36,11 @@
 ## Selected Approach (Phase 2)
 Response type dispatch: NextResponse enum with five typed variants, NextError enum with six error codes, pure dispatcher function. Matches existing EventPayload/EngineError patterns. Chosen for compile-time output contract enforcement.
 
+## Investigation Findings (Phase 3)
+- **Serialization**: Custom `impl Serialize` using `serialize_map` (same pattern as `Event`). No `Deserialize` needed. Six supporting types. Errors use plain `#[derive(Serialize)]`.
+- **Gate evaluation**: `wait-timeout` (already a dep) + `libc::setpgid`/`killpg` via `pre_exec`. AND semantics (all gates evaluated). New `src/gate.rs` module. Evaluates in CLI handler, dispatcher receives `BTreeMap<String, GateResult>`.
+- **Expects derivation**: Structural assembly, not computation. `accepts` -> `fields` (rename `field_type` to `type`), conditional transitions -> `options`, `event_type` = constant. Gap: policy for `options` when state has `accepts` but only unconditional transitions (omit `options`).
+
 ## Current Status
-**Phase:** 2 - Present Approaches
+**Phase:** 3 - Deep Investigation
 **Last Updated:** 2026-03-16
