@@ -1,3 +1,5 @@
+pub mod next_types;
+
 use std::collections::HashMap;
 use std::path::Path;
 
