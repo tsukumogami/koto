@@ -70,12 +70,22 @@ koto next review
 ```
 
 ```json
-{"state":"assess","directive":"Review the PR at {{PR_URL}} and summarize the changes.","transitions":["feedback"]}
+{
+  "action": "execute",
+  "state": "assess",
+  "directive": "Review the PR at {{PR_URL}} and summarize the changes.",
+  "advanced": false,
+  "expects": {
+    "event_type": "evidence_submitted",
+    "fields": {
+      "summary": {"type": "string", "required": true}
+    }
+  },
+  "error": null
+}
 ```
 
-The `transitions` array shows which states can follow the current one.
-
-> **Note:** `koto transition` (advancing the workflow) is not available in this release. Transitions will be added in a future version.
+The `action` field is `"execute"` while work remains and `"done"` at the terminal state. The `expects` object tells the agent what evidence to submit. The `advanced` flag is `true` when the call itself caused a state change (via `--with-data` or `--to`).
 
 ## Key concepts
 
@@ -99,9 +109,10 @@ The plugin ships with **hello-koto**, a minimal two-state skill that walks throu
 Once a skill is installed, the agent follows a simple cycle:
 
 1. `koto init` -- start the workflow from a template
-2. `koto next` -- get the current directive
+2. `koto next` -- get the current directive and `expects` schema
 3. Execute the work described in the directive
-4. Repeat from step 2
+4. `koto next --with-data '{...}'` -- submit evidence matching the schema, or `koto next --to <state>` for a directed transition
+5. Repeat from step 2 until `action` is `"done"`
 
 The plugin also includes a Stop hook that detects active workflows when a session ends, so the agent can resume where it left off.
 

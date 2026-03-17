@@ -32,13 +32,52 @@ Run `koto template compile <path>` to see the full compilation error.
 
 ### next
 
-**Workflow not found** — no state file for the given name in the current directory:
+The `next` command has two error paths:
+
+1. **Pre-dispatch I/O errors** use the flat format (`{"error": "...", "command": "next"}`). These fire before the dispatcher runs -- corrupt state files, missing templates, hash mismatches.
+2. **Domain errors** use a structured format with a code, message, and optional field-level details. These come from the dispatcher and validation logic.
+
+#### Structured domain errors
+
+Domain errors use this shape:
 
 ```json
-{"error":"workflow 'my-workflow' not found","command":"next"}
+{
+  "error": {
+    "code": "invalid_submission",
+    "message": "evidence validation failed",
+    "details": [
+      {"field": "decision", "reason": "required field missing"}
+    ]
+  }
+}
 ```
 
-Run `koto workflows` to list active workflows.
+The `details` array is empty when the error isn't field-specific. The six error codes:
+
+| Code | Exit | Meaning |
+|------|:----:|---------|
+| `gate_blocked` | 1 | One or more command gates failed or timed out. Transient -- may resolve on retry. |
+| `integration_unavailable` | 1 | The state declares an integration but no runner is available. Transient. |
+| `invalid_submission` | 2 | The `--with-data` payload is malformed, too large, or fails schema validation. Caller must fix the payload. |
+| `precondition_failed` | 2 | A logical precondition wasn't met: `--with-data` and `--to` used together, `--to` targets an invalid state, or the state has no `accepts` block. |
+| `terminal_state` | 2 | Evidence was submitted to a terminal state. The workflow is already done. |
+| `workflow_not_initialized` | 2 | No state file found for the given workflow name. |
+
+Exit code 1 means transient -- the agent can retry without changing its behavior. Exit code 2 means the agent must change something (fix the payload, pick a different target, etc.).
+
+#### Exit code mapping
+
+| Exit code | Category | When |
+|:---------:|----------|------|
+| 0 | Success | Normal response (any variant) |
+| 1 | Transient | `gate_blocked`, `integration_unavailable`, engine I/O errors |
+| 2 | Caller error | `invalid_submission`, `precondition_failed`, `terminal_state`, `workflow_not_initialized` |
+| 3 | Infrastructure | Corrupt state file, template hash mismatch, template parse failure |
+
+#### Pre-dispatch I/O errors
+
+These still use the flat format and aren't domain errors:
 
 **Corrupt state file (exit code 3)** -- the state file exists but can't be parsed. This covers empty files, invalid JSON, and sequence number gaps:
 
@@ -47,6 +86,14 @@ Run `koto workflows` to list active workflows.
 ```
 
 Inspect the file directly. The first line should be a header with `schema_version`, and each subsequent line should be a valid event with a monotonic `seq` number. A truncated final line (e.g., from a crash) is recovered automatically -- only interior corruption triggers this error.
+
+**Template hash mismatch (exit code 3)** -- the compiled template on disk doesn't match the hash recorded at init time:
+
+```json
+{"error":"template hash mismatch: header says abc123 but cached template hashes to def456","command":"next"}
+```
+
+Reinitialize the workflow to pick up the new template.
 
 **No events in state file** -- the state file has a header but no event lines:
 

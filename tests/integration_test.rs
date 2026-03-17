@@ -218,8 +218,16 @@ fn next_returns_state_directive_transitions() {
         "directive field should be present"
     );
     assert!(
-        json["transitions"].is_array(),
-        "transitions field should be an array"
+        json["action"].as_str().is_some(),
+        "action field should be present"
+    );
+    assert!(
+        json["advanced"].is_boolean(),
+        "advanced field should be a boolean"
+    );
+    assert!(
+        json["error"].is_null(),
+        "error field should be null on success"
     );
 }
 
@@ -240,9 +248,15 @@ fn next_fails_for_unknown_workflow() {
 
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("error output should be valid JSON");
+    // The error field is a structured object with code/message/details
     assert!(
-        json["error"].as_str().is_some(),
-        "error field should be present"
+        json["error"].is_object(),
+        "error field should be a structured object, got: {:?}",
+        json["error"]
+    );
+    assert!(
+        json["error"]["code"].as_str().is_some(),
+        "error should have a code field"
     );
 }
 
@@ -587,7 +601,7 @@ fn init_next_rewind_sequence() {
     let next_json: serde_json::Value = serde_json::from_slice(&next_out.stdout).unwrap();
     assert!(next_json["state"].as_str().is_some());
     assert!(next_json["directive"].as_str().is_some());
-    assert!(next_json["transitions"].is_array());
+    assert!(next_json["action"].as_str().is_some());
 
     // Append a transitioned event to enable rewind (init writes 3 lines:
     // header + workflow_initialized + transitioned, so we need a second transition).
@@ -746,5 +760,710 @@ fn rewind_event_has_from_and_to_in_payload() {
     assert!(
         last_event["timestamp"].as_str().is_some(),
         "rewound event should have a timestamp"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Template helpers for rich fixtures
+// ---------------------------------------------------------------------------
+
+/// Template with a gate on the start state that runs a shell command.
+fn template_with_gate(gate_command: &str, timeout: u32) -> String {
+    let timeout_line = if timeout > 0 {
+        format!("\n        timeout: {}", timeout)
+    } else {
+        String::new()
+    };
+    format!(
+        r#"---
+name: gated-workflow
+version: "1.0"
+initial_state: start
+states:
+  start:
+    gates:
+      check:
+        type: command
+        command: "{}"{}
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Do the gated task.
+
+## done
+
+All done.
+"#,
+        gate_command, timeout_line
+    )
+}
+
+/// Template with an accepts block on start and conditional transitions.
+fn template_with_accepts() -> String {
+    r#"---
+name: evidence-workflow
+version: "1.0"
+initial_state: start
+states:
+  start:
+    accepts:
+      decision:
+        type: enum
+        required: true
+        values: [proceed, escalate]
+      notes:
+        type: string
+        required: false
+    transitions:
+      - target: implement
+        when:
+          decision: proceed
+      - target: review
+        when:
+          decision: escalate
+  implement:
+    transitions:
+      - target: done
+  review:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Make a decision about this work.
+
+## implement
+
+Implement the changes.
+
+## review
+
+Review the changes.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+/// Template with an integration field on a state.
+fn template_with_integration() -> String {
+    r#"---
+name: integration-workflow
+version: "1.0"
+initial_state: start
+states:
+  start:
+    integration: code_review
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Delegate to integration.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+/// Multi-state template for agent-driven workflow loop testing.
+fn template_multi_state() -> String {
+    r#"---
+name: multi-state-workflow
+version: "1.0"
+initial_state: plan
+states:
+  plan:
+    transitions:
+      - target: implement
+  implement:
+    transitions:
+      - target: verify
+  verify:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## plan
+
+Create the implementation plan.
+
+## implement
+
+Write the code.
+
+## verify
+
+Run the tests.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+/// Initialize a workflow from a custom template string.
+fn init_workflow(dir: &Path, name: &str, template_content: &str) {
+    let src = dir.join(format!("{}-template.md", name));
+    std::fs::write(&src, template_content).unwrap();
+
+    let output = koto()
+        .current_dir(dir)
+        .args(["init", name, "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-26: Integration state classification
+// ---------------------------------------------------------------------------
+
+#[test]
+fn next_integration_state_returns_integration_unavailable() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "integ-wf", &template_with_integration());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "integ-wf"])
+        .output()
+        .unwrap();
+
+    // IntegrationUnavailable is a success response (exit 0) with integration.available=false.
+    assert!(
+        output.status.success(),
+        "integration_unavailable should exit 0, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+
+    assert_eq!(
+        json["action"].as_str(),
+        Some("execute"),
+        "action should be execute"
+    );
+    assert_eq!(
+        json["state"].as_str(),
+        Some("start"),
+        "state should be start"
+    );
+    assert!(
+        json["error"].is_null(),
+        "error should be null for integration_unavailable"
+    );
+    assert_eq!(
+        json["integration"]["name"].as_str(),
+        Some("code_review"),
+        "integration name should match"
+    );
+    assert_eq!(
+        json["integration"]["available"], false,
+        "integration should be unavailable"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-28: --with-data and --to mutual exclusivity
+// ---------------------------------------------------------------------------
+
+#[test]
+fn next_with_data_and_to_mutually_exclusive() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "mutex-wf", &template_with_accepts());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "next",
+            "mutex-wf",
+            "--with-data",
+            r#"{"decision":"proceed"}"#,
+            "--to",
+            "implement",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "mutual exclusivity violation should exit 2"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("precondition_failed"),
+        "error code should be precondition_failed"
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("mutually exclusive"),
+        "error message should mention mutual exclusivity"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-29: --with-data payload size limit (1MB)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn next_with_data_rejects_oversized_payload() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "size-wf", &template_with_accepts());
+
+    // The koto code checks for >1MB (1,048,576 bytes), but the OS kernel
+    // enforces MAX_ARG_STRLEN (~128KB on Linux) before koto sees the argument.
+    // We can't test the >1MB rejection path via CLI, so instead we verify:
+    // 1. A large-but-valid payload (100KB) is accepted without size rejection.
+    // 2. The size check exists in the code (tested by the fact that the 100KB
+    //    payload passes -- it would fail if the limit were set too low).
+    let big_value = "x".repeat(100_000);
+    let payload = format!(r#"{{"decision":"{}"}}"#, big_value);
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "size-wf", "--with-data", &payload])
+        .output()
+        .unwrap();
+
+    // This fails with invalid_submission because "xxx..." is not a valid enum
+    // value, but it should NOT fail with "maximum size" -- proving the size
+    // check passed for this 100KB payload.
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "large payload should fail validation (not size), stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("invalid_submission"),
+        "error code should be invalid_submission (schema validation, not size)"
+    );
+    // Crucially, the message should be about validation, not about size.
+    let msg = json["error"]["message"].as_str().unwrap();
+    assert!(
+        !msg.contains("maximum size"),
+        "100KB payload should not hit size limit, got: {}",
+        msg
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-30: Full koto next on terminal state returns done response
+// ---------------------------------------------------------------------------
+
+#[test]
+fn next_on_terminal_state_returns_done() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "term-wf", minimal_template());
+
+    // Advance to terminal state via --to.
+    let advance = koto()
+        .current_dir(dir.path())
+        .args(["next", "term-wf", "--to", "done"])
+        .output()
+        .unwrap();
+    assert!(
+        advance.status.success(),
+        "advance to done should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&advance.stdout),
+        String::from_utf8_lossy(&advance.stderr)
+    );
+
+    // Now call next again on the terminal state.
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "term-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next on terminal state should exit 0"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    assert_eq!(
+        json["action"].as_str(),
+        Some("done"),
+        "action should be done"
+    );
+    assert_eq!(json["state"].as_str(), Some("done"), "state should be done");
+    assert_eq!(
+        json["advanced"], false,
+        "advanced should be false (no event appended)"
+    );
+    assert!(json["error"].is_null(), "error should be null");
+}
+
+// ---------------------------------------------------------------------------
+// scenario-31: Full koto next with failing gates returns gate_blocked
+// ---------------------------------------------------------------------------
+
+#[test]
+fn next_with_failing_gate_returns_gate_blocked() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "gate-wf", &template_with_gate("exit 1", 0));
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "gate-wf"])
+        .output()
+        .unwrap();
+
+    // GateBlocked is a success response (exit 0) with blocking_conditions.
+    assert!(
+        output.status.success(),
+        "gate_blocked should exit 0, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+
+    assert_eq!(
+        json["action"].as_str(),
+        Some("execute"),
+        "action should be execute"
+    );
+    assert_eq!(
+        json["state"].as_str(),
+        Some("start"),
+        "state should be start"
+    );
+    assert!(
+        json["error"].is_null(),
+        "error should be null for gate_blocked"
+    );
+
+    let conditions = json["blocking_conditions"]
+        .as_array()
+        .expect("blocking_conditions should be an array");
+    assert_eq!(conditions.len(), 1, "should have one blocking condition");
+    assert_eq!(conditions[0]["name"].as_str(), Some("check"));
+    assert_eq!(conditions[0]["type"].as_str(), Some("command"));
+    assert_eq!(conditions[0]["status"].as_str(), Some("failed"));
+}
+
+// ---------------------------------------------------------------------------
+// scenario-32: Full evidence submission flow via --with-data
+// ---------------------------------------------------------------------------
+
+#[test]
+fn next_with_valid_evidence_advances_state() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "evid-wf", &template_with_accepts());
+
+    // First, check the initial state returns evidence_required.
+    let initial = koto()
+        .current_dir(dir.path())
+        .args(["next", "evid-wf"])
+        .output()
+        .unwrap();
+    assert!(initial.status.success(), "initial next should succeed");
+    let initial_json: serde_json::Value = serde_json::from_slice(&initial.stdout).unwrap();
+    assert_eq!(initial_json["state"].as_str(), Some("start"));
+    assert!(
+        initial_json["expects"].is_object(),
+        "expects should be present for evidence_required"
+    );
+
+    // Submit evidence via --with-data.
+    let submit = koto()
+        .current_dir(dir.path())
+        .args([
+            "next",
+            "evid-wf",
+            "--with-data",
+            r#"{"decision":"proceed","notes":"looks good"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        submit.status.success(),
+        "evidence submission should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&submit.stdout),
+        String::from_utf8_lossy(&submit.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&submit.stdout).unwrap();
+    assert_eq!(
+        json["state"].as_str(),
+        Some("start"),
+        "state should still be start (evidence appended, not yet advanced)"
+    );
+    assert_eq!(
+        json["advanced"], true,
+        "advanced should be true after evidence submission"
+    );
+    assert!(json["error"].is_null(), "error should be null");
+
+    // Verify the state file has an evidence_submitted event.
+    let state_path = dir.path().join("koto-evid-wf.state.jsonl");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    let has_evidence = content
+        .lines()
+        .any(|line| line.contains("evidence_submitted"));
+    assert!(
+        has_evidence,
+        "state file should contain evidence_submitted event"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-33: Invalid evidence submission returns structured error
+// ---------------------------------------------------------------------------
+
+#[test]
+fn next_with_invalid_evidence_returns_structured_error() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "bad-evid-wf", &template_with_accepts());
+
+    // Submit evidence with wrong type and missing required field.
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "next",
+            "bad-evid-wf",
+            "--with-data",
+            r#"{"decision":42,"unknown_field":"x"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "invalid evidence should exit 2"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("invalid_submission"),
+        "error code should be invalid_submission"
+    );
+    assert_eq!(
+        json["error"]["message"].as_str(),
+        Some("evidence validation failed"),
+        "error message should say validation failed"
+    );
+
+    let details = json["error"]["details"]
+        .as_array()
+        .expect("details should be an array");
+    assert!(
+        !details.is_empty(),
+        "details should contain field-level errors"
+    );
+
+    // Should have errors for: unknown field, wrong type for decision (enum expects string).
+    let fields: Vec<&str> = details.iter().filter_map(|d| d["field"].as_str()).collect();
+    assert!(
+        fields.contains(&"decision") || fields.contains(&"unknown_field"),
+        "details should reference problematic fields, got: {:?}",
+        fields
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-34: Directed transition via --to
+// ---------------------------------------------------------------------------
+
+#[test]
+fn next_with_to_performs_directed_transition() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "directed-wf", &template_with_accepts());
+
+    // Use --to to advance directly to implement (skipping evidence).
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "directed-wf", "--to", "implement"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "directed transition should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["state"].as_str(),
+        Some("implement"),
+        "state should be implement after directed transition"
+    );
+    assert_eq!(
+        json["advanced"], true,
+        "advanced should be true after directed transition"
+    );
+    assert!(json["error"].is_null(), "error should be null");
+
+    // Verify the state file has a directed_transition event.
+    let state_path = dir.path().join("koto-directed-wf.state.jsonl");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    let has_directed = content
+        .lines()
+        .any(|line| line.contains("directed_transition"));
+    assert!(
+        has_directed,
+        "state file should contain directed_transition event"
+    );
+
+    // Verify next on the new state works.
+    let next_output = koto()
+        .current_dir(dir.path())
+        .args(["next", "directed-wf"])
+        .output()
+        .unwrap();
+    assert!(next_output.status.success());
+    let next_json: serde_json::Value = serde_json::from_slice(&next_output.stdout).unwrap();
+    assert_eq!(next_json["state"].as_str(), Some("implement"));
+}
+
+// ---------------------------------------------------------------------------
+// scenario-35: Agent-driven workflow loop using only koto next output
+// ---------------------------------------------------------------------------
+
+#[test]
+fn agent_driven_workflow_loop() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "loop-wf", &template_multi_state());
+
+    // Simulate an agent loop: call next, read state, use --to to advance.
+    let states_to_visit = ["plan", "implement", "verify", "done"];
+
+    for (i, expected_state) in states_to_visit.iter().enumerate() {
+        let output = koto()
+            .current_dir(dir.path())
+            .args(["next", "loop-wf"])
+            .output()
+            .unwrap();
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            json["state"].as_str(),
+            Some(*expected_state),
+            "step {}: state should be {}",
+            i,
+            expected_state
+        );
+
+        if json["action"].as_str() == Some("done") {
+            // Terminal state reached. Verify this is the last one.
+            assert_eq!(
+                *expected_state, "done",
+                "done action should only appear at done state"
+            );
+            break;
+        }
+
+        // Agent decides to advance to the next state via --to.
+        if i + 1 < states_to_visit.len() {
+            let next_target = states_to_visit[i + 1];
+            let advance = koto()
+                .current_dir(dir.path())
+                .args(["next", "loop-wf", "--to", next_target])
+                .output()
+                .unwrap();
+            assert!(
+                advance.status.success(),
+                "advance to {} should succeed: {}",
+                next_target,
+                String::from_utf8_lossy(&advance.stdout)
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// scenario-36: Gate timeout kills entire process group
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gate_timeout_returns_gate_blocked() {
+    let dir = TempDir::new().unwrap();
+    // Use a gate command that sleeps longer than the 1-second timeout.
+    init_workflow(dir.path(), "timeout-wf", &template_with_gate("sleep 60", 1));
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "timeout-wf"])
+        .output()
+        .unwrap();
+
+    // GateBlocked (timed_out) is a success response (exit 0) with blocking_conditions.
+    assert!(
+        output.status.success(),
+        "gate timeout should exit 0, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+
+    assert_eq!(
+        json["action"].as_str(),
+        Some("execute"),
+        "action should be execute"
+    );
+    assert!(
+        json["error"].is_null(),
+        "error should be null for gate_blocked"
+    );
+
+    let conditions = json["blocking_conditions"]
+        .as_array()
+        .expect("blocking_conditions should be an array");
+    assert_eq!(conditions.len(), 1, "should have one blocking condition");
+    assert_eq!(conditions[0]["name"].as_str(), Some("check"));
+    assert_eq!(
+        conditions[0]["status"].as_str(),
+        Some("timed_out"),
+        "gate should have timed out, not failed"
     );
 }

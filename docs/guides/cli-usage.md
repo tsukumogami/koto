@@ -50,19 +50,118 @@ Exits non-zero if a workflow with that name already exists or if the template is
 
 ### next
 
-Returns the directive for the current state. This is the main agent-facing command -- it tells the agent what to do next.
+Returns the directive for the current state. This is the main agent-facing command -- it tells the agent what to do next, what evidence to submit, and whether any gates are blocking.
 
 ```bash
-koto next <name>
+koto next <name> [--with-data <json>] [--to <target>]
 ```
 
-**Output (JSON):**
+**Positional argument:**
+- `<name>` -- Workflow name.
+
+**Optional flags:**
+- `--with-data <json>` -- Submit evidence as a JSON object, validated against the state's `accepts` schema. On success, appends an `evidence_submitted` event and sets `advanced: true` in the response.
+- `--to <target>` -- Directed transition to a named state. The target must be a valid transition from the current state. Appends a `directed_transition` event, then dispatches on the new state (skipping gate evaluation).
+
+These flags are mutually exclusive. Passing both produces a `precondition_failed` error with exit code 2. The `--with-data` payload is capped at 1 MB.
+
+**Response variants:**
+
+Every successful response is a JSON object with an `action` field (`"execute"` or `"done"`) and an `error` field set to `null`. The remaining fields depend on the variant.
+
+| Field | EvidenceRequired | GateBlocked | Integration | IntegrationUnavailable | Terminal |
+|-------|:---:|:---:|:---:|:---:|:---:|
+| `action` | `"execute"` | `"execute"` | `"execute"` | `"execute"` | `"done"` |
+| `state` | yes | yes | yes | yes | yes |
+| `directive` | yes | yes | yes | yes | -- |
+| `advanced` | yes | yes | yes | yes | yes |
+| `expects` | object | `null` | object or `null` | object or `null` | `null` |
+| `blocking_conditions` | -- | array | -- | -- | -- |
+| `integration` | -- | -- | object | object | -- |
+| `error` | `null` | `null` | `null` | `null` | `null` |
+
+"yes" = always present. "--" = absent from the JSON (not `null`, just missing). "object or `null`" = present as an object when the state has an `accepts` block, `null` otherwise.
+
+**EvidenceRequired** -- the state expects the agent to do work and submit evidence:
 
 ```json
-{"state":"assess","directive":"Review the PR at https://github.com/org/repo/pull/42 and summarize the changes.","transitions":["feedback"]}
+{
+  "action": "execute",
+  "state": "review",
+  "directive": "Review the code changes.",
+  "advanced": false,
+  "expects": {
+    "event_type": "evidence_submitted",
+    "fields": {
+      "decision": {"type": "enum", "required": true, "values": ["proceed", "escalate"]}
+    },
+    "options": [
+      {"target": "implement", "when": {"decision": "proceed"}}
+    ]
+  },
+  "error": null
+}
 ```
 
-The `transitions` array lists the states reachable from the current state. Exits non-zero if the workflow isn't found.
+The `expects.options` array is omitted when no transitions have `when` conditions. The `values` array on a field is omitted when empty.
+
+**GateBlocked** -- one or more command gates failed, timed out, or errored:
+
+```json
+{
+  "action": "execute",
+  "state": "deploy",
+  "directive": "Deploy to staging.",
+  "advanced": false,
+  "expects": null,
+  "blocking_conditions": [
+    {"name": "ci_check", "type": "command", "status": "failed", "agent_actionable": false}
+  ],
+  "error": null
+}
+```
+
+Possible `status` values: `"failed"`, `"timed_out"`, `"error"`. Passing gates don't appear in the array.
+
+**Integration / IntegrationUnavailable** -- the state declares an integration. When the runner is available, you get `Integration` with the output. When unavailable, you get `IntegrationUnavailable` with `available: false`:
+
+```json
+{
+  "action": "execute",
+  "state": "delegate",
+  "directive": "Run the integration.",
+  "advanced": false,
+  "expects": null,
+  "integration": {"name": "code_review", "available": false},
+  "error": null
+}
+```
+
+**Terminal** -- the workflow has ended:
+
+```json
+{
+  "action": "done",
+  "state": "done",
+  "advanced": true,
+  "expects": null,
+  "error": null
+}
+```
+
+Terminal responses don't include `directive`, `blocking_conditions`, or `integration`.
+
+**Dispatcher classification order:**
+
+The dispatcher evaluates the current state in this order and returns the first match:
+
+1. Terminal state -> `Terminal`
+2. Any gate failed/timed_out/errored -> `GateBlocked`
+3. Integration declared -> `Integration` or `IntegrationUnavailable`
+4. Accepts block exists -> `EvidenceRequired`
+5. Fallback -> `EvidenceRequired` with empty `expects` (auto-advance candidate)
+
+**Error responses** use the structured format described in the [error code reference](../reference/error-codes.md). Domain errors exit with code 1 (transient) or 2 (caller error). Infrastructure errors (corrupt state, template hash mismatch) exit with code 3.
 
 ### rewind
 
@@ -155,23 +254,32 @@ koto init task-42 --template workflow.md
 # Main loop
 while true; do
   result=$(koto next task-42)
-  transitions=$(echo "$result" | jq -r '.transitions[]')
+  action=$(echo "$result" | jq -r '.action')
+
+  # Terminal state -- workflow is done
+  if [ "$action" = "done" ]; then
+    break
+  fi
 
   # Agent does the work described in .directive
   # ...
 
-  # Check if we're done
-  if [ -z "$transitions" ]; then
-    break
+  # Submit evidence if the state expects it
+  expects=$(echo "$result" | jq -r '.expects // empty')
+  if [ -n "$expects" ]; then
+    result=$(koto next task-42 --with-data '{"decision": "proceed"}')
   fi
 done
+```
+
+Use `--to` for directed transitions when the agent needs to jump to a specific state:
+
+```bash
+koto next task-42 --to feedback
 ```
 
 To roll back after an unexpected result:
 
 ```bash
-# Rewind to the previous state
 koto rewind task-42
 ```
-
-> **Note:** Workflow advancement (`koto transition`) is not available in this release. Transitions will be added in a future version.

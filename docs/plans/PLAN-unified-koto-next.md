@@ -39,8 +39,9 @@ _(omitted in multi-pr mode — see Implementation Issues below)_
 | _Design and implement the full JSONL event schema: six typed event types with `seq` monotonic counter, epoch boundary rule for evidence replay, and state derivation via log replay. Replaces #45's simple JSONL with the production schema._ | | |
 | [#47: feat(koto): implement template evidence routing](https://github.com/tsukumogami/koto/issues/47) | [#46](https://github.com/tsukumogami/koto/issues/46) | critical |
 | _Design and implement `accepts`/`when`/`integration` YAML blocks replacing `transitions: []string`. Includes mutual exclusivity validation at compile time and updated template loader in the Rust CLI._ | | |
-| [#48: feat(koto): implement unified koto next command](https://github.com/tsukumogami/koto/issues/48) | [#46](https://github.com/tsukumogami/koto/issues/46) | critical |
-| _Design and implement the full `koto next` output contract: five response variants, `--with-data` evidence submission, `--to` directed transitions (replacing `koto transition`), gate evaluation, and correct exit codes. Parallel with #47 — both depend only on #46._ | | |
+| ~~[#48: feat(koto): implement unified koto next command](https://github.com/tsukumogami/koto/issues/48)~~ | ~~[#46](https://github.com/tsukumogami/koto/issues/46)~~ | ~~critical~~ |
+| ~~^_Child: [PLAN-koto-cli-output-contract.md](done/PLAN-koto-cli-output-contract.md)_~~ | | |
+| ~~_Design and implement the full `koto next` output contract: five response variants, `--with-data` evidence submission, `--to` directed transitions (replacing `koto transition`), gate evaluation, and correct exit codes. Parallel with #47 — both depend only on #46._~~ | | |
 | [#49: feat(koto): implement auto-advancement engine](https://github.com/tsukumogami/koto/issues/49) | [#46](https://github.com/tsukumogami/koto/issues/46), [#47](https://github.com/tsukumogami/koto/issues/47), [#48](https://github.com/tsukumogami/koto/issues/48) | critical |
 | _Design and implement the event log replay loop, advancement logic with cycle detection and all stopping conditions, integration runner, `koto cancel`, and SIGTERM/SIGINT signal handling. Leaf node — completing this delivers a fully functional CLI._ | | |
 
@@ -71,8 +72,8 @@ graph TD
     classDef tracksPlan fill:#FFE0B2,stroke:#F57C00,color:#000
 
     class I45,I46,I47 done
-    class I48 ready
-    class I49 blocked
+    class I48 done
+    class I49 ready
 ```
 
 **Legend**: Green = done, Blue = ready, Yellow = blocked, Purple = needs-design, Orange = tracks-design/tracks-plan
