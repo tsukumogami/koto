@@ -28,6 +28,11 @@
 - Signal handling (SIGTERM/SIGINT)
 - Cycle detection in advancement loop
 
+## Approaches Investigated (Phase 1)
+- **Monolithic handler**: Single run_next() function with branching. Matches existing codebase style, minimal blast radius, ~300-400 lines new code.
+- **Pipeline stages**: Composable stage functions with shared NextContext struct. Each stage independently testable, natural processing order, Option-heavy context.
+- **Response type dispatch**: NextResponse enum with five variants + NextError enum. Compile-time exhaustiveness, serialization correctness by construction, ~600-650 lines new code.
+
 ## Current Status
-**Phase:** 0 - Setup
+**Phase:** 1 - Approach Discovery
 **Last Updated:** 2026-03-16
