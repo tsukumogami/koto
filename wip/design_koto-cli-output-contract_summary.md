@@ -33,6 +33,9 @@
 - **Pipeline stages**: Composable stage functions with shared NextContext struct. Each stage independently testable, natural processing order, Option-heavy context.
 - **Response type dispatch**: NextResponse enum with five variants + NextError enum. Compile-time exhaustiveness, serialization correctness by construction, ~600-650 lines new code.
 
+## Selected Approach (Phase 2)
+Response type dispatch: NextResponse enum with five typed variants, NextError enum with six error codes, pure dispatcher function. Matches existing EventPayload/EngineError patterns. Chosen for compile-time output contract enforcement.
+
 ## Current Status
-**Phase:** 1 - Approach Discovery
+**Phase:** 2 - Present Approaches
 **Last Updated:** 2026-03-16
