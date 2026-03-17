@@ -167,7 +167,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (integration tests in `src/gate.rs`)
 **Expected**: A gate with command `true` (or `exit 0`) returns `GateResult::Passed`.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 19: Gate evaluator reports failure on non-zero exit
 **ID**: scenario-19
@@ -176,7 +176,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (integration tests in `src/gate.rs`)
 **Expected**: A gate with command `exit 42` returns `GateResult::Failed { exit_code: 42 }`.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 20: Gate evaluator handles timeout
 **ID**: scenario-20
@@ -185,7 +185,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (integration tests in `src/gate.rs`)
 **Expected**: A gate with command `sleep 60` and timeout of 1 second returns `GateResult::TimedOut`. The spawned sleep process and its process group are killed.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 21: Gate evaluator handles non-existent command
 **ID**: scenario-21
@@ -194,7 +194,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (integration tests in `src/gate.rs`)
 **Expected**: A gate with a non-existent command returns `GateResult::Error` or `GateResult::Failed` (depending on how `sh -c` handles it -- likely exit 127).
-**Status**: pending
+**Status**: passed
 
 ### Scenario 22: Gate evaluator runs all gates without short-circuit
 **ID**: scenario-22
@@ -203,7 +203,7 @@ Issues covered: 4
 **Commands**:
 - `cargo test` (integration tests in `src/gate.rs`)
 **Expected**: Given three gates (one passing, one failing, one timing out), all three results are present in the returned BTreeMap.
-**Status**: pending
+**Status**: passed
 
 ### Scenario 23: Dispatcher classifies terminal state
 **ID**: scenario-23
