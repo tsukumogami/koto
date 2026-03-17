@@ -218,8 +218,16 @@ fn next_returns_state_directive_transitions() {
         "directive field should be present"
     );
     assert!(
-        json["transitions"].is_array(),
-        "transitions field should be an array"
+        json["action"].as_str().is_some(),
+        "action field should be present"
+    );
+    assert!(
+        json["advanced"].is_boolean(),
+        "advanced field should be a boolean"
+    );
+    assert!(
+        json["error"].is_null(),
+        "error field should be null on success"
     );
 }
 
@@ -240,9 +248,15 @@ fn next_fails_for_unknown_workflow() {
 
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("error output should be valid JSON");
+    // The error field is a structured object with code/message/details
     assert!(
-        json["error"].as_str().is_some(),
-        "error field should be present"
+        json["error"].is_object(),
+        "error field should be a structured object, got: {:?}",
+        json["error"]
+    );
+    assert!(
+        json["error"]["code"].as_str().is_some(),
+        "error should have a code field"
     );
 }
 
@@ -587,7 +601,7 @@ fn init_next_rewind_sequence() {
     let next_json: serde_json::Value = serde_json::from_slice(&next_out.stdout).unwrap();
     assert!(next_json["state"].as_str().is_some());
     assert!(next_json["directive"].as_str().is_some());
-    assert!(next_json["transitions"].is_array());
+    assert!(next_json["action"].as_str().is_some());
 
     // Append a transitioned event to enable rewind (init writes 3 lines:
     // header + workflow_initialized + transitioned, so we need a second transition).

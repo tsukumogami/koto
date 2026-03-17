@@ -1,3 +1,4 @@
+pub mod next;
 pub mod next_types;
 
 use std::collections::HashMap;
@@ -15,6 +16,9 @@ use crate::engine::persistence::{
 };
 use crate::engine::types::{now_iso8601, EventPayload, StateFileHeader};
 use crate::template::types::CompiledTemplate;
+
+/// Maximum payload size for --with-data (1 MB).
+const MAX_WITH_DATA_BYTES: usize = 1_048_576;
 
 #[derive(Parser)]
 #[command(
@@ -45,6 +49,14 @@ pub enum Command {
     Next {
         /// Workflow name
         name: String,
+
+        /// Submit evidence as JSON (validated against accepts schema)
+        #[arg(long = "with-data")]
+        with_data: Option<String>,
+
+        /// Directed transition to a named state
+        #[arg(long)]
+        to: Option<String>,
     },
 
     /// Roll back the workflow to the previous state
@@ -207,106 +219,11 @@ pub fn run(app: App) -> Result<()> {
             );
             Ok(())
         }
-        Command::Next { name } => {
-            let current_dir = std::env::current_dir()?;
-            let state_path = workflow_state_path(&current_dir, &name);
-
-            if !state_path.exists() {
-                exit_with_error(serde_json::json!({
-                    "error": format!("workflow '{}' not found", name),
-                    "command": "next"
-                }));
-            }
-
-            let (header, events) = match read_events(&state_path) {
-                Ok(result) => result,
-                Err(err) => {
-                    let code = exit_code_for_engine_error(&err);
-                    exit_with_error_code(
-                        serde_json::json!({
-                            "error": err.to_string(),
-                            "command": "next"
-                        }),
-                        code,
-                    );
-                }
-            };
-
-            if events.is_empty() {
-                exit_with_error(serde_json::json!({
-                    "error": "state file has no events",
-                    "command": "next"
-                }));
-            }
-
-            let machine_state = match derive_machine_state(&header, &events) {
-                Some(ms) => ms,
-                None => {
-                    exit_with_error(serde_json::json!({
-                        "error": "corrupt state file: cannot derive current state",
-                        "command": "next"
-                    }));
-                }
-            };
-
-            // Verify the cached template hash matches the header's template_hash.
-            let template_bytes = match std::fs::read(&machine_state.template_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    exit_with_error(serde_json::json!({
-                        "error": format!("failed to read template {}: {}", machine_state.template_path, e),
-                        "command": "next"
-                    }));
-                }
-            };
-            let actual_hash = sha256_hex(&template_bytes);
-            if actual_hash != machine_state.template_hash {
-                exit_with_error(serde_json::json!({
-                    "error": format!(
-                        "template hash mismatch: header says {} but cached template hashes to {}",
-                        machine_state.template_hash, actual_hash
-                    ),
-                    "command": "next"
-                }));
-            }
-
-            let compiled: CompiledTemplate = match serde_json::from_slice(&template_bytes) {
-                Ok(t) => t,
-                Err(e) => {
-                    exit_with_error(serde_json::json!({
-                        "error": format!("failed to parse template {}: {}", machine_state.template_path, e),
-                        "command": "next"
-                    }));
-                }
-            };
-
-            let current_state = &machine_state.current_state;
-            let template_state = match compiled.states.get(current_state) {
-                Some(s) => s,
-                None => {
-                    exit_with_error(serde_json::json!({
-                        "error": format!("state '{}' not found in template", current_state),
-                        "command": "next"
-                    }));
-                }
-            };
-
-            let transition_targets: Vec<&str> = template_state
-                .transitions
-                .iter()
-                .map(|t| t.target.as_str())
-                .collect();
-
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "state": current_state,
-                    "directive": template_state.directive,
-                    "transitions": transition_targets
-                }))?
-            );
-            Ok(())
-        }
+        Command::Next {
+            name,
+            with_data,
+            to,
+        } => handle_next(name, with_data, to),
         Command::Rewind { name } => {
             let current_dir = std::env::current_dir()?;
             let state_path = workflow_state_path(&current_dir, &name);
@@ -425,4 +342,374 @@ pub fn run(app: App) -> Result<()> {
             }
         },
     }
+}
+
+/// Handle the `koto next` command with full output contract support.
+///
+/// Flow:
+/// 1. Validate flag combinations (--with-data and --to are mutually exclusive)
+/// 2. Enforce payload size limit on --with-data
+/// 3. Load state file and template
+/// 4. If --to: validate target, append directed_transition event, re-derive
+///    state, dispatch on new state (skip gate evaluation)
+/// 5. If --with-data: validate evidence against accepts schema, append
+///    evidence_submitted event
+/// 6. Evaluate command gates (unless --to)
+/// 7. Call dispatcher with pre-computed inputs
+/// 8. Serialize response and exit with correct code
+#[cfg(unix)]
+fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> Result<()> {
+    use crate::cli::next::{dispatch_next, NextFlags};
+    use crate::cli::next_types::{ErrorDetail, NextError, NextErrorCode};
+    use crate::engine::evidence::validate_evidence;
+    use crate::gate::evaluate_gates;
+
+    // 1. Mutual exclusivity check
+    if with_data.is_some() && to.is_some() {
+        let err = NextError {
+            code: NextErrorCode::PreconditionFailed,
+            message: "--with-data and --to are mutually exclusive".to_string(),
+            details: vec![],
+        };
+        let json = serde_json::json!({"error": err});
+        exit_with_error_code(json, err.code.exit_code());
+    }
+
+    // 2. Payload size limit
+    if let Some(ref data_str) = with_data {
+        if data_str.len() > MAX_WITH_DATA_BYTES {
+            let err = NextError {
+                code: NextErrorCode::InvalidSubmission,
+                message: format!(
+                    "--with-data payload exceeds maximum size of {} bytes",
+                    MAX_WITH_DATA_BYTES
+                ),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code());
+        }
+    }
+
+    // 3. Load state file and template
+    let current_dir = std::env::current_dir()?;
+    let state_path = workflow_state_path(&current_dir, &name);
+
+    if !state_path.exists() {
+        let err = NextError {
+            code: NextErrorCode::WorkflowNotInitialized,
+            message: format!("workflow '{}' not found", name),
+            details: vec![],
+        };
+        let json = serde_json::json!({"error": err});
+        exit_with_error_code(json, err.code.exit_code());
+    }
+
+    let (header, events) = match read_events(&state_path) {
+        Ok(result) => result,
+        Err(err) => {
+            let code = exit_code_for_engine_error(&err);
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": err.to_string(),
+                    "command": "next"
+                }),
+                code,
+            );
+        }
+    };
+
+    if events.is_empty() {
+        exit_with_error(serde_json::json!({
+            "error": "state file has no events",
+            "command": "next"
+        }));
+    }
+
+    let machine_state = match derive_machine_state(&header, &events) {
+        Some(ms) => ms,
+        None => {
+            exit_with_error(serde_json::json!({
+                "error": "corrupt state file: cannot derive current state",
+                "command": "next"
+            }));
+        }
+    };
+
+    // Verify template hash
+    let template_bytes = match std::fs::read(&machine_state.template_path) {
+        Ok(b) => b,
+        Err(e) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!("failed to read template {}: {}", machine_state.template_path, e),
+                    "command": "next"
+                }),
+                3,
+            );
+        }
+    };
+    let actual_hash = sha256_hex(&template_bytes);
+    if actual_hash != machine_state.template_hash {
+        exit_with_error_code(
+            serde_json::json!({
+                "error": format!(
+                    "template hash mismatch: header says {} but cached template hashes to {}",
+                    machine_state.template_hash, actual_hash
+                ),
+                "command": "next"
+            }),
+            3,
+        );
+    }
+
+    let compiled: CompiledTemplate = match serde_json::from_slice(&template_bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!("failed to parse template {}: {}", machine_state.template_path, e),
+                    "command": "next"
+                }),
+                3,
+            );
+        }
+    };
+
+    // Track whether we appended an event (for the `advanced` flag).
+    let mut advanced = false;
+
+    // 4. Handle --to (directed transition)
+    if let Some(ref target) = to {
+        let current_state = &machine_state.current_state;
+
+        // Look up the current template state to validate the target.
+        let current_template_state = match compiled.states.get(current_state) {
+            Some(s) => s,
+            None => {
+                exit_with_error_code(
+                    serde_json::json!({
+                        "error": format!("state '{}' not found in template", current_state),
+                        "command": "next"
+                    }),
+                    3,
+                );
+            }
+        };
+
+        // Validate target is a valid transition from current state.
+        let valid_targets: Vec<&str> = current_template_state
+            .transitions
+            .iter()
+            .map(|t| t.target.as_str())
+            .collect();
+
+        if !valid_targets.contains(&target.as_str()) {
+            let err = NextError {
+                code: NextErrorCode::PreconditionFailed,
+                message: format!(
+                    "state '{}' does not have a transition to '{}'",
+                    current_state, target
+                ),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code());
+        }
+
+        // Validate target state exists in template.
+        if !compiled.states.contains_key(target) {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!("target state '{}' not found in template", target),
+                    "command": "next"
+                }),
+                3,
+            );
+        }
+
+        // Append directed_transition event.
+        let payload = EventPayload::DirectedTransition {
+            from: current_state.clone(),
+            to: target.clone(),
+        };
+        if let Err(e) = append_event(&state_path, &payload, &now_iso8601()) {
+            exit_with_error(serde_json::json!({
+                "error": e.to_string(),
+                "command": "next"
+            }));
+        }
+        advanced = true;
+
+        // Dispatch on the new (target) state, skip gate evaluation.
+        let target_template_state = compiled.states.get(target).unwrap();
+        let flags = NextFlags {
+            with_data: false,
+            to: true,
+        };
+        let gate_results = std::collections::BTreeMap::new();
+
+        match dispatch_next(
+            target,
+            target_template_state,
+            advanced,
+            &gate_results,
+            &flags,
+        ) {
+            Ok(resp) => {
+                println!("{}", serde_json::to_string(&resp)?);
+                std::process::exit(0);
+            }
+            Err(err) => {
+                let code = err.code.exit_code();
+                let json = serde_json::json!({"error": err});
+                exit_with_error_code(json, code);
+            }
+        }
+    }
+
+    // Get current state info for evidence validation and dispatch.
+    let current_state = &machine_state.current_state;
+    let template_state = match compiled.states.get(current_state) {
+        Some(s) => s,
+        None => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!("state '{}' not found in template", current_state),
+                    "command": "next"
+                }),
+                3,
+            );
+        }
+    };
+
+    // 5. Handle --with-data (evidence submission)
+    if let Some(ref data_str) = with_data {
+        // Check that the current state is not terminal.
+        if template_state.terminal {
+            let err = NextError {
+                code: NextErrorCode::TerminalState,
+                message: format!(
+                    "cannot submit evidence: state '{}' is terminal",
+                    current_state
+                ),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code());
+        }
+
+        // Check that the state has an accepts block.
+        let accepts = match &template_state.accepts {
+            Some(a) => a,
+            None => {
+                let err = NextError {
+                    code: NextErrorCode::PreconditionFailed,
+                    message: format!(
+                        "state '{}' does not accept evidence (no accepts block)",
+                        current_state
+                    ),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": err});
+                exit_with_error_code(json, err.code.exit_code());
+            }
+        };
+
+        // Parse the JSON payload.
+        let data: serde_json::Value = match serde_json::from_str(data_str) {
+            Ok(v) => v,
+            Err(e) => {
+                let err = NextError {
+                    code: NextErrorCode::InvalidSubmission,
+                    message: format!("invalid JSON in --with-data: {}", e),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": err});
+                exit_with_error_code(json, err.code.exit_code());
+            }
+        };
+
+        // Validate evidence against schema.
+        if let Err(validation_err) = validate_evidence(&data, accepts) {
+            let details: Vec<ErrorDetail> = validation_err
+                .field_errors
+                .iter()
+                .map(|fe| ErrorDetail {
+                    field: fe.field.clone(),
+                    reason: fe.reason.clone(),
+                })
+                .collect();
+            let err = NextError {
+                code: NextErrorCode::InvalidSubmission,
+                message: "evidence validation failed".to_string(),
+                details,
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code());
+        }
+
+        // Append evidence_submitted event.
+        let fields: HashMap<String, serde_json::Value> = data
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let payload = EventPayload::EvidenceSubmitted {
+            state: current_state.clone(),
+            fields,
+        };
+        if let Err(e) = append_event(&state_path, &payload, &now_iso8601()) {
+            exit_with_error(serde_json::json!({
+                "error": e.to_string(),
+                "command": "next"
+            }));
+        }
+        advanced = true;
+    }
+
+    // 6. Evaluate command gates (skip if --to, which was handled above)
+    let gate_results = if template_state.gates.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        evaluate_gates(&template_state.gates, &current_dir)
+    };
+
+    // 7. Call dispatcher
+    let flags = NextFlags {
+        with_data: with_data.is_some(),
+        to: false,
+    };
+
+    match dispatch_next(
+        current_state,
+        template_state,
+        advanced,
+        &gate_results,
+        &flags,
+    ) {
+        Ok(resp) => {
+            println!("{}", serde_json::to_string(&resp)?);
+            std::process::exit(0);
+        }
+        Err(err) => {
+            let code = err.code.exit_code();
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, code);
+        }
+    }
+}
+
+/// Non-unix stub for handle_next.
+#[cfg(not(unix))]
+fn handle_next(name: String, _with_data: Option<String>, _to: Option<String>) -> Result<()> {
+    exit_with_error_code(
+        serde_json::json!({
+            "error": "koto next is only supported on unix platforms",
+            "command": "next"
+        }),
+        3,
+    );
 }
