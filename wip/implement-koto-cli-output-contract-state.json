@@ -3,19 +3,102 @@
   "design_doc": "docs/plans/PLAN-koto-cli-output-contract.md",
   "branch": "docs/koto-cli-output-contract",
   "pr_number": 56,
-  "integrity_hash": "sha256:0e6f4ddc3ac201c5c7d6c8c6c0be7f8da8e3f4e33a472944a6f14795d502d5ae",
+  "integrity_hash": "sha256:50c740f2343ee53e2a52ad1a54adf11d5610bc9ba8e5dfa71e38a6ff07f1e2ea",
   "issues": [
     {
       "number": 1,
       "title": "feat(koto): implement response types and serialization",
-      "status": "pending",
-      "ci_status": "pending",
+      "status": "completed",
+      "ci_status": "passed",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "code",
       "dependencies": [],
-      "commits": [],
-      "agent_type": "",
-      "summary": null,
+      "commits": [
+        "94486d9e6cfc5619e8bb4991a9e1621ec59f4deb"
+      ],
+      "agent_type": "coder",
+      "summary": {
+        "narrative": "",
+        "files_changed": [
+          "src/cli/next_types.rs",
+          "src/cli/mod.rs"
+        ],
+        "tests_added": 20,
+        "key_decisions": "Followed existing Event serialize_map pattern. Terminal omits directive (absent not null). Used BTreeMap for deterministic JSON ordering.",
+        "requirements_map": [
+          {
+            "ac": "src/cli/next_types.rs exists and is included in src/cli/mod.rs",
+            "status": "implemented"
+          },
+          {
+            "ac": "NextResponse enum has five variants",
+            "status": "implemented"
+          },
+          {
+            "ac": "Custom impl Serialize for NextResponse using serialize_map",
+            "status": "implemented"
+          },
+          {
+            "ac": "NextError struct with code, message, details",
+            "status": "implemented"
+          },
+          {
+            "ac": "NextErrorCode serializes as snake_case",
+            "status": "implemented"
+          },
+          {
+            "ac": "Supporting types defined",
+            "status": "implemented"
+          },
+          {
+            "ac": "ExpectsSchema.options skip_serializing_if",
+            "status": "implemented"
+          },
+          {
+            "ac": "ExpectsFieldSchema.values skip_serializing_if",
+            "status": "implemented"
+          },
+          {
+            "ac": "Exit code derivation method",
+            "status": "implemented"
+          },
+          {
+            "ac": "Unit tests for all variants",
+            "status": "implemented"
+          },
+          {
+            "ac": "All tests pass",
+            "status": "implemented"
+          }
+        ]
+      },
+      "reviewer_results": {
+        "issue": 1,
+        "reviews": [
+          {
+            "focus": "pragmatic",
+            "blocking_count": 0,
+            "advisory_count": 0
+          },
+          {
+            "focus": "architect",
+            "blocking_count": 0,
+            "advisory_count": 0
+          },
+          {
+            "focus": "maintainer",
+            "blocking_count": 0,
+            "advisory_count": 2
+          }
+        ]
+      },
+      "qa_results": {
+        "issue": 1,
+        "all_passed": true,
+        "passed": 9,
+        "failed": 0,
+        "summary": "All 9 scenarios passed."
+      },
       "testable_scenarios": [
         "scenario-1",
         "scenario-2",
@@ -49,14 +132,79 @@
     {
       "number": 2,
       "title": "feat(koto): implement evidence validation and expects derivation",
-      "status": "pending",
+      "status": "scrutinized",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "code",
       "dependencies": [],
-      "commits": [],
-      "agent_type": "",
-      "summary": null,
+      "commits": [
+        "914e61a9d76520aed1e09a35d3ac57b885dd1d96"
+      ],
+      "agent_type": "coder",
+      "summary": {
+        "narrative": "",
+        "files_changed": [
+          "src/engine/evidence.rs",
+          "src/engine/mod.rs",
+          "src/cli/next_types.rs"
+        ],
+        "tests_added": 18,
+        "key_decisions": "EvidenceValidationError is a standalone domain error with FieldError structs (not ErrorDetail) to keep engine independent of CLI. CLI maps FieldError -\u003e ErrorDetail.",
+        "requirements_map": [
+          {
+            "ac": "validate_evidence implemented",
+            "status": "implemented"
+          },
+          {
+            "ac": "EvidenceValidationError domain error",
+            "status": "implemented"
+          },
+          {
+            "ac": "Rejects missing required fields",
+            "status": "implemented"
+          },
+          {
+            "ac": "Rejects type mismatches",
+            "status": "implemented"
+          },
+          {
+            "ac": "Rejects unknown fields",
+            "status": "implemented"
+          },
+          {
+            "ac": "Collects all errors",
+            "status": "implemented"
+          },
+          {
+            "ac": "derive_expects implemented",
+            "status": "implemented"
+          },
+          {
+            "ac": "Returns None without accepts",
+            "status": "implemented"
+          },
+          {
+            "ac": "Sets event_type constant",
+            "status": "implemented"
+          },
+          {
+            "ac": "Maps FieldSchema to ExpectsFieldSchema",
+            "status": "implemented"
+          },
+          {
+            "ac": "Populates options from when conditions",
+            "status": "implemented"
+          },
+          {
+            "ac": "Evidence validation tests",
+            "status": "implemented"
+          },
+          {
+            "ac": "Expects derivation tests",
+            "status": "implemented"
+          }
+        ]
+      },
       "testable_scenarios": [
         "scenario-10",
         "scenario-11",
