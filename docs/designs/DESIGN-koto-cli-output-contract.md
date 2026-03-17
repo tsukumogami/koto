@@ -117,6 +117,135 @@ pipeline was supposed to improve. The auto-advancement loop in #49 further break
 linearity. The approach adds ceremony without the compile-time guarantees that
 response dispatch provides.
 
+### Decision 2: Gate evaluation behavior
+
+**Context:** How to handle multiple gates on a single state, and what OS primitives
+to use for process isolation and timeout.
+
+**Chosen: Evaluate all gates (no short-circuit), report all failures.**
+
+The output must list every blocking condition so agents and humans get a complete
+picture of what's preventing advancement. All gates are evaluated even if earlier
+ones fail. Process group isolation uses `libc::setpgid`/`killpg` via `pre_exec`
+(two POSIX calls) rather than a full crate. The `wait-timeout` crate (already a
+dependency) handles timeout. This keeps the dependency footprint minimal while
+giving correct process tree cleanup on timeout.
+
+*Alternative rejected: Short-circuit on first failure.* Evaluating only until the
+first gate fails would be faster, but the output would show one blocking condition
+when three are actually blocking. The agent retries, hits the next one, retries
+again. This wastes cycles. Since gate count per state is small (typically 1-3) and
+each has a 30-second timeout cap, evaluating all is cheap relative to the
+information gain.
+
+*Alternative rejected: `nix` crate for process management.* The `nix` crate
+provides safe wrappers for `setpgid` and `killpg`, but it's a heavy dependency
+(~30 modules) for two POSIX calls. Raw `libc` with a thin safe wrapper matches the
+codebase's minimal-dependency approach (no external time crate, custom ISO 8601
+formatting).
+
+### Decision 3: Expects derivation for mixed transitions
+
+**Context:** When a state has an `accepts` block but some or all transitions lack
+`when` conditions, what should `expects.options` contain?
+
+**Chosen: Omit `options` when no transitions have `when` conditions.**
+
+This follows the `skip_serializing_if` convention used throughout the codebase.
+An empty `options` array would be noise -- it tells the agent nothing useful. When
+`options` is absent, the agent knows to submit evidence (the `fields` are present)
+but that evidence doesn't drive routing. This is the "data collection without
+branching" pattern: evidence is recorded for audit but the state advances on a
+single deterministic path.
+
+Only transitions with `when` conditions appear in `options`. Unconditional
+transitions are handled by the auto-advancement engine and don't surface in the
+agent-facing contract.
+
+*Alternative rejected: Empty array (`"options": []`).* Present but empty is
+technically unambiguous, but it's a field that carries no information. The absence
+of `options` is cleaner and consistent with how other optional output fields
+(like `integration`) are handled -- present when meaningful, absent otherwise.
+
+*Alternative rejected: Include unconditional transitions as `{"target": "...",
+"when": null}`.* This leaks transition targets that the agent can't act on through
+evidence submission. Unconditional transitions advance automatically; telling the
+agent about them in `expects` suggests it should do something, when it shouldn't.
+
+### Decision 4: Evidence validation strictness
+
+**Context:** When `--with-data` provides a JSON payload, should unknown fields
+(not declared in `accepts`) be rejected or silently ignored?
+
+**Chosen: Strict validation -- reject unknown fields.**
+
+Unknown fields in evidence are likely bugs (typo in field name, submitting against
+the wrong state's schema). Rejecting them with a clear `invalid_submission` error
+and per-field details lets the agent self-correct immediately. Silent acceptance
+would persist bad data in the event log where it's harder to diagnose.
+
+The `accepts` schema is the contract between template author and agent. Strict
+validation enforces that contract in both directions: required fields must be
+present, and only declared fields are accepted.
+
+*Alternative rejected: Permissive validation (ignore unknown fields).* This is
+the common approach for forward compatibility (new producers, old consumers). But
+koto's evidence model is different: the template author defines the schema, and
+the agent is the producer. If the agent sends fields the template doesn't declare,
+something is wrong. Permissive validation hides that signal.
+
+### Decision 5: Directed transitions and gate evaluation
+
+**Context:** When `koto next --to <target>` performs a directed transition, should
+gates on the target state be evaluated?
+
+**Chosen: Skip gate evaluation for `--to` transitions.**
+
+Directed transitions are fire-and-forget: append a `directed_transition` event
+and return immediately. The agent explicitly chose the target state -- gate
+evaluation on the target is the responsibility of the next `koto next` call
+(which evaluates the new current state's gates). This matches the strategic
+design's data flow where `--to` "returns immediately" after appending.
+
+Gate evaluation applies to the current state during read-only or evidence
+submission calls. It answers "can we leave this state?" not "can we enter
+that state?"
+
+*Alternative rejected: Evaluate target state gates after transition.* This would
+combine two operations (transition + gate check) in one call. But it creates
+ambiguity: if target gates fail, did the transition happen? The event log says
+yes (the `directed_transition` event was appended), but the output says blocked.
+Keeping the operations separate -- transition, then evaluate on next call --
+avoids this inconsistency.
+
+### Decision 6: Error handling layers
+
+**Context:** How to handle the two categories of errors: infrastructure failures
+(can't read state file, template hash mismatch) and domain-level failures (bad
+evidence, terminal state, gates blocked).
+
+**Chosen: Dual error paths -- pre-dispatch I/O errors use the existing pattern,
+domain errors use the new `NextError` type.**
+
+Pre-dispatch errors (template load failure, hash mismatch, corrupt state file)
+fire before the dispatcher is called. They use the existing `exit_with_error_code`
+/ `anyhow` pattern with `{"error": "<message>", "command": "next"}` shape and
+exit codes 1 or 3. Domain errors from the dispatcher use `NextError` with
+structured `{"error": {"code": "...", "message": "...", "details": [...]}}` and
+exit codes 1 or 2.
+
+The two paths coexist because they serve different consumers: pre-dispatch errors
+are infrastructure problems (operator fixes them), domain errors are workflow
+problems (agents handle them programmatically via error codes).
+
+*Alternative rejected: Unified error type for all errors.* Wrapping infrastructure
+errors in `NextError` would give them structured codes and details fields. But
+infrastructure errors don't have meaningful codes -- "template file not found" isn't
+one of the six domain error codes. Adding infrastructure-specific codes (e.g.,
+`template_not_found`, `hash_mismatch`) expands the error taxonomy beyond the
+strategic design's specification. The existing pattern handles these adequately,
+and the exit code (3 for config errors) already lets agents distinguish them.
+
 ## Decision Outcome
 
 `koto next` will be implemented using typed response enums with a pure dispatcher
