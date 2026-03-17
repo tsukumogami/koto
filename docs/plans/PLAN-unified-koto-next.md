@@ -15,7 +15,7 @@ Active
 
 ## Scope Summary
 
-Deliver a fully functional Rust CLI for koto through five issues: a Rust CLI foundation (#45) followed by four design+implementation issues covering event log format, template format v2, CLI output contract, and auto-advancement engine. Each issue produces both an accepted design document and the corresponding Rust implementation.
+Deliver a fully functional Rust CLI for koto through five issues: a Rust CLI foundation (#45) followed by four design+implementation issues covering event log format, template evidence routing, CLI output contract, and auto-advancement engine. Each issue produces both an accepted design document and the corresponding Rust implementation.
 
 ## Decomposition Strategy
 
@@ -37,7 +37,7 @@ _(omitted in multi-pr mode — see Implementation Issues below)_
 | _Establish the Rust single-crate binary with five commands (`version`, `init`, `next`, `rewind`, `workflows`) plus `template compile`. Uses simple JSONL state (one event per line, current state = last event's `state` field). No `koto transition`, no gate evaluation, no evidence — intentionally minimal. Deletes Go source._ | | |
 | [#46: feat(koto): implement event log format](https://github.com/tsukumogami/koto/issues/46) | [#45](https://github.com/tsukumogami/koto/issues/45) | critical |
 | _Design and implement the full JSONL event schema: six typed event types with `seq` monotonic counter, epoch boundary rule for evidence replay, and state derivation via log replay. Replaces #45's simple JSONL with the production schema._ | | |
-| [#47: feat(koto): implement template format v2](https://github.com/tsukumogami/koto/issues/47) | [#46](https://github.com/tsukumogami/koto/issues/46) | critical |
+| [#47: feat(koto): implement template evidence routing](https://github.com/tsukumogami/koto/issues/47) | [#46](https://github.com/tsukumogami/koto/issues/46) | critical |
 | _Design and implement `accepts`/`when`/`integration` YAML blocks replacing `transitions: []string`. Includes mutual exclusivity validation at compile time and updated template loader in the Rust CLI._ | | |
 | [#48: feat(koto): implement unified koto next command](https://github.com/tsukumogami/koto/issues/48) | [#46](https://github.com/tsukumogami/koto/issues/46) | critical |
 | _Design and implement the full `koto next` output contract: five response variants, `--with-data` evidence submission, `--to` directed transitions (replacing `koto transition`), gate evaluation, and correct exit codes. Parallel with #47 — both depend only on #46._ | | |
@@ -50,7 +50,7 @@ _(omitted in multi-pr mode — see Implementation Issues below)_
 graph TD
     I45["#45: Rust CLI foundation"]
     I46["#46: event log format"]
-    I47["#47: template format v2"]
+    I47["#47: template evidence routing"]
     I48["#48: unified koto next"]
     I49["#49: auto-advancement engine"]
 
@@ -70,9 +70,9 @@ graph TD
     classDef tracksDesign fill:#FFE0B2,stroke:#F57C00,color:#000
     classDef tracksPlan fill:#FFE0B2,stroke:#F57C00,color:#000
 
-    class I45 done
-    class I46 ready
-    class I47,I48,I49 blocked
+    class I45,I46,I47 done
+    class I48 ready
+    class I49 blocked
 ```
 
 **Legend**: Green = done, Blue = ready, Yellow = blocked, Purple = needs-design, Orange = tracks-design/tracks-plan
@@ -85,7 +85,7 @@ graph TD
 
 1. #45 — Rust CLI foundation: five commands, simple JSONL, template compile; deletes Go source
 2. #46 — full event log schema; unblocks #47 and #48
-3. #47 and #48 — template format v2 and unified `koto next` can proceed in parallel after #46 is merged
+3. #47 and #48 — template evidence routing and unified `koto next` can proceed in parallel after #46 is merged
 4. #49 — auto-advancement engine; completing this delivers a fully functional CLI
 
 **Parallelization:** After #46 merges, #47 and #48 can be worked concurrently, reducing wall-clock time by one implementation cycle.

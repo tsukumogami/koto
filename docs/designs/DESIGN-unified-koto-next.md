@@ -303,7 +303,7 @@ single-field conditions — where two transitions test the same field against di
 For multi-field conditions (where two transitions each test different fields), the compiler
 cannot statically determine whether both could be satisfied simultaneously. Template authors
 are responsible for ensuring non-overlapping semantics in multi-field cases; the compiler
-will not catch this class of ambiguity. The tactical sub-design for template format v2 should
+will not catch this class of ambiguity. The tactical sub-design for template evidence routing should
 document this limitation and consider whether an explicit `exclusive_with` annotation is
 needed for multi-field branching states.
 
@@ -473,7 +473,7 @@ once the event taxonomy (above) is accepted:
 | Sub-design | Scope | Depends on |
 |-----------|-------|-----------|
 | Event log format | State file schema, JSONL structure, event type definitions | Nothing (foundational) |
-| Template format v2 | `accepts` block, `when` conditions, `integration` field, compiler changes | Event taxonomy |
+| Template evidence routing | `accepts` block, `when` conditions, `integration` field, compiler changes | Event taxonomy |
 | CLI output contract | `koto next` JSON schema, `expects` derivation, error codes, exit codes | Event taxonomy |
 | Auto-advancement engine | Replay logic, loop, stopping conditions, integration invocation, `koto rewind` | All three above |
 
@@ -502,7 +502,7 @@ Deliverables:
 - JSONL vs. JSON-array evaluation (the tactical sub-design should document this
   trade-off explicitly before committing to the line-by-line reader approach)
 
-### Phase 2: Template format v2 (parallel with Phase 3)
+### Phase 2: Template evidence routing (parallel with Phase 3)
 
 Add event schema declarations to the template format. Can proceed once Phase 1 is accepted.
 
@@ -555,7 +555,7 @@ the Go→Rust transition, workspace structure, CI changes, and sequencing.
 |-------|-----------|-------|
 | 0 | Go→Rust Migration | Cargo workspace layout, crate structure, CI, sequencing |
 | 1 | Event Log Format | State file JSONL schema, event type taxonomy |
-| 2 | Template Format v2 | `accepts`/`when` syntax, compiler changes |
+| 2 | Template Evidence Routing | `accepts`/`when` syntax, compiler changes |
 | 3 | CLI Output Contract | `koto next` JSON schema, `expects` derivation, errors |
 | 4 | Auto-Advancement Engine | Replay, loop, stopping conditions, integration invocation |
 
