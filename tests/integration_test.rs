@@ -965,9 +965,20 @@ fn next_integration_state_returns_integration_unavailable() {
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
 
-    assert_eq!(json["action"].as_str(), Some("execute"), "action should be execute");
-    assert_eq!(json["state"].as_str(), Some("start"), "state should be start");
-    assert!(json["error"].is_null(), "error should be null for integration_unavailable");
+    assert_eq!(
+        json["action"].as_str(),
+        Some("execute"),
+        "action should be execute"
+    );
+    assert_eq!(
+        json["state"].as_str(),
+        Some("start"),
+        "state should be start"
+    );
+    assert!(
+        json["error"].is_null(),
+        "error should be null for integration_unavailable"
+    );
     assert_eq!(
         json["integration"]["name"].as_str(),
         Some("code_review"),
@@ -1110,9 +1121,16 @@ fn next_on_terminal_state_returns_done() {
 
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
-    assert_eq!(json["action"].as_str(), Some("done"), "action should be done");
+    assert_eq!(
+        json["action"].as_str(),
+        Some("done"),
+        "action should be done"
+    );
     assert_eq!(json["state"].as_str(), Some("done"), "state should be done");
-    assert_eq!(json["advanced"], false, "advanced should be false (no event appended)");
+    assert_eq!(
+        json["advanced"], false,
+        "advanced should be false (no event appended)"
+    );
     assert!(json["error"].is_null(), "error should be null");
 }
 
@@ -1142,9 +1160,20 @@ fn next_with_failing_gate_returns_gate_blocked() {
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
 
-    assert_eq!(json["action"].as_str(), Some("execute"), "action should be execute");
-    assert_eq!(json["state"].as_str(), Some("start"), "state should be start");
-    assert!(json["error"].is_null(), "error should be null for gate_blocked");
+    assert_eq!(
+        json["action"].as_str(),
+        Some("execute"),
+        "action should be execute"
+    );
+    assert_eq!(
+        json["state"].as_str(),
+        Some("start"),
+        "state should be start"
+    );
+    assert!(
+        json["error"].is_null(),
+        "error should be null for gate_blocked"
+    );
 
     let conditions = json["blocking_conditions"]
         .as_array()
@@ -1198,8 +1227,15 @@ fn next_with_valid_evidence_advances_state() {
     );
 
     let json: serde_json::Value = serde_json::from_slice(&submit.stdout).unwrap();
-    assert_eq!(json["state"].as_str(), Some("start"), "state should still be start (evidence appended, not yet advanced)");
-    assert_eq!(json["advanced"], true, "advanced should be true after evidence submission");
+    assert_eq!(
+        json["state"].as_str(),
+        Some("start"),
+        "state should still be start (evidence appended, not yet advanced)"
+    );
+    assert_eq!(
+        json["advanced"], true,
+        "advanced should be true after evidence submission"
+    );
     assert!(json["error"].is_null(), "error should be null");
 
     // Verify the state file has an evidence_submitted event.
@@ -1263,10 +1299,7 @@ fn next_with_invalid_evidence_returns_structured_error() {
     );
 
     // Should have errors for: unknown field, wrong type for decision (enum expects string).
-    let fields: Vec<&str> = details
-        .iter()
-        .filter_map(|d| d["field"].as_str())
-        .collect();
+    let fields: Vec<&str> = details.iter().filter_map(|d| d["field"].as_str()).collect();
     assert!(
         fields.contains(&"decision") || fields.contains(&"unknown_field"),
         "details should reference problematic fields, got: {:?}",
@@ -1394,11 +1427,7 @@ fn agent_driven_workflow_loop() {
 fn gate_timeout_returns_gate_blocked() {
     let dir = TempDir::new().unwrap();
     // Use a gate command that sleeps longer than the 1-second timeout.
-    init_workflow(
-        dir.path(),
-        "timeout-wf",
-        &template_with_gate("sleep 60", 1),
-    );
+    init_workflow(dir.path(), "timeout-wf", &template_with_gate("sleep 60", 1));
 
     let output = koto()
         .current_dir(dir.path())
@@ -1417,14 +1446,24 @@ fn gate_timeout_returns_gate_blocked() {
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
 
-    assert_eq!(json["action"].as_str(), Some("execute"), "action should be execute");
-    assert!(json["error"].is_null(), "error should be null for gate_blocked");
+    assert_eq!(
+        json["action"].as_str(),
+        Some("execute"),
+        "action should be execute"
+    );
+    assert!(
+        json["error"].is_null(),
+        "error should be null for gate_blocked"
+    );
 
     let conditions = json["blocking_conditions"]
         .as_array()
         .expect("blocking_conditions should be an array");
     assert_eq!(conditions.len(), 1, "should have one blocking condition");
     assert_eq!(conditions[0]["name"].as_str(), Some("check"));
-    assert_eq!(conditions[0]["status"].as_str(), Some("timed_out"),
-        "gate should have timed out, not failed");
+    assert_eq!(
+        conditions[0]["status"].as_str(),
+        Some("timed_out"),
+        "gate should have timed out, not failed"
+    );
 }
