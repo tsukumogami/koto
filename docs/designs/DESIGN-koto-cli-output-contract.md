@@ -496,6 +496,20 @@ complete JSON line and calls `fsync`. Evidence submission and state transitions
 each append one event atomically. A crash between two appends leaves the log in
 a consistent state (the last complete line is the truth).
 
+### Payload Size Enforcement
+
+The `--with-data` payload must be size-limited at CLI argument parsing time,
+before validation or event appending. A 1MB limit prevents both event log bloat
+and memory exhaustion from pathologically large JSON payloads.
+
+### Environment Inheritance
+
+Gate commands inherit the full process environment. This is consistent with
+standard developer tooling (make, npm scripts) but means environment variables
+containing secrets (API keys, tokens from `.local.env` or shell profiles) are
+accessible to gate commands. Template authors should be aware that gate commands
+execute with the same environment as the `koto` process itself.
+
 ### Exit Code Information Leakage
 
 Exit codes and structured error messages reveal workflow state to the calling

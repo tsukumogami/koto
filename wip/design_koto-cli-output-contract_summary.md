@@ -41,6 +41,10 @@ Response type dispatch: NextResponse enum with five typed variants, NextError en
 - **Gate evaluation**: `wait-timeout` (already a dep) + `libc::setpgid`/`killpg` via `pre_exec`. AND semantics (all gates evaluated). New `src/gate.rs` module. Evaluates in CLI handler, dispatcher receives `BTreeMap<String, GateResult>`.
 - **Expects derivation**: Structural assembly, not computation. `accepts` -> `fields` (rename `field_type` to `type`), conditional transitions -> `options`, `event_type` = constant. Gap: policy for `options` when state has `accepts` but only unconditional transitions (omit `options`).
 
+## Security Review (Phase 5)
+**Outcome:** Option 2 (document considerations)
+**Summary:** Small security surface. Two additions: payload size limit at parse time, environment inheritance documentation for gate commands. No design changes needed.
+
 ## Current Status
-**Phase:** 4 - Architecture
+**Phase:** 5 - Security
 **Last Updated:** 2026-03-16
