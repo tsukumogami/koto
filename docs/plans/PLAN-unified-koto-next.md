@@ -71,7 +71,7 @@ graph TD
     classDef tracksPlan fill:#FFE0B2,stroke:#F57C00,color:#000
 
     class I45,I46,I47 done
-    class I48 tracksDesign
+    class I48 tracksPlan
     class I49 blocked
 ```
 

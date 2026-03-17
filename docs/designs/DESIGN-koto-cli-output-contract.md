@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 spawned_from:
   issue: 48
   repo: tsukumogami/koto
@@ -32,7 +32,7 @@ rationale: |
 
 ## Status
 
-Proposed
+Planned
 
 ## Upstream Design Reference
 
