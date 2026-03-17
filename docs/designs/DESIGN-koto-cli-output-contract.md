@@ -138,3 +138,417 @@ Key properties:
 - Dispatcher testable without spawning processes or setting up state files
 - Gate evaluation and evidence validation are helper functions called before dispatch
 - Exit codes derived from response/error variant, not computed separately
+
+## Solution Architecture
+
+### Overview
+
+`koto next` becomes a three-phase operation: load state + evaluate environment
+(I/O), classify the result (pure), serialize and exit (I/O). The pure classifier
+(dispatcher) is the core -- it takes pre-computed inputs and returns a typed response
+enum that serializes to the correct JSON shape.
+
+### Components
+
+**1. CLI flag extensions** (`src/cli/mod.rs`)
+
+Add two optional flags to the `Next` command variant:
+
+```
+--with-data <json>   Submit evidence as JSON (validated against accepts schema)
+--to <target>        Directed transition to a named state
+```
+
+These are mutually exclusive. Using both is a caller error (exit code 2).
+
+**2. Response types** (`src/cli/next_types.rs`)
+
+```rust
+pub enum NextResponse {
+    EvidenceRequired {
+        state: String,
+        directive: String,
+        advanced: bool,
+        expects: ExpectsSchema,
+    },
+    GateBlocked {
+        state: String,
+        directive: String,
+        advanced: bool,
+        blocking_conditions: Vec<BlockingCondition>,
+    },
+    Integration {
+        state: String,
+        directive: String,
+        advanced: bool,
+        expects: Option<ExpectsSchema>,
+        integration: IntegrationOutput,
+    },
+    IntegrationUnavailable {
+        state: String,
+        directive: String,
+        advanced: bool,
+        expects: Option<ExpectsSchema>,
+        integration: IntegrationUnavailableMarker,
+    },
+    Terminal {
+        state: String,
+        advanced: bool,
+    },
+}
+```
+
+Custom `impl Serialize` using `serialize_map` (same pattern as `Event` in
+`engine/types.rs`). Each variant writes its specific fields plus `"action"`
+(`"execute"` or `"done"`) and `"error": null`. No `Deserialize` needed -- this
+is output-only.
+
+```rust
+pub struct NextError {
+    pub code: NextErrorCode,
+    pub message: String,
+    pub details: Vec<ErrorDetail>,
+}
+
+pub enum NextErrorCode {
+    GateBlocked,
+    InvalidSubmission,
+    PreconditionFailed,
+    IntegrationUnavailable,
+    TerminalState,
+    WorkflowNotInitialized,
+}
+```
+
+Error serialization: `#[derive(Serialize)]` with `#[serde(rename_all = "snake_case")]`
+on `NextErrorCode`. The CLI handler wraps errors in `{"error": {...}}`.
+
+Exit code mapping:
+
+| Error code | Exit code | Meaning |
+|-----------|-----------|---------|
+| `gate_blocked` | 1 | Transient -- gates may pass on retry |
+| `invalid_submission` | 2 | Caller error -- bad evidence payload |
+| `precondition_failed` | 2 | Caller error -- state doesn't accept evidence |
+| `integration_unavailable` | 1 | Transient -- tool not accessible |
+| `terminal_state` | 2 | Caller error -- workflow already done |
+| `workflow_not_initialized` | 2 | Caller error -- no state file |
+| _(success)_ | 0 | Normal response |
+| _(config error)_ | 3 | Template missing, hash mismatch, corrupt state |
+
+**3. Supporting types** (`src/cli/next_types.rs`)
+
+```rust
+pub struct ExpectsSchema {
+    pub event_type: String,                            // always "evidence_submitted"
+    pub fields: BTreeMap<String, ExpectsFieldSchema>,
+    pub options: Vec<TransitionOption>,                 // omitted when empty
+}
+
+pub struct ExpectsFieldSchema {
+    pub field_type: String,     // serializes as "type"
+    pub required: bool,
+    pub values: Vec<String>,    // omitted when empty
+}
+
+pub struct TransitionOption {
+    pub target: String,
+    pub when: BTreeMap<String, serde_json::Value>,
+}
+
+pub struct BlockingCondition {
+    pub name: String,
+    pub condition_type: String,  // serializes as "type", always "command"
+    pub status: String,          // "failed", "timed_out", or "error"
+    pub agent_actionable: bool,  // always false for command gates
+}
+
+pub struct IntegrationOutput {
+    pub name: String,
+    pub output: serde_json::Value,
+}
+
+pub struct IntegrationUnavailableMarker {
+    pub name: String,
+    pub available: bool,  // always false
+}
+
+pub struct ErrorDetail {
+    pub field: String,
+    pub reason: String,
+}
+```
+
+**4. Gate evaluator** (`src/gate.rs`)
+
+Evaluates command gates by spawning `sh -c "<command>"` in a new process group
+with a configurable timeout (default 30s). Uses `wait-timeout` (already a
+dependency) for timeout and `libc::setpgid`/`killpg` via `pre_exec` for process
+group isolation.
+
+```rust
+pub enum GateResult {
+    Passed,
+    Failed { exit_code: i32 },
+    TimedOut,
+    Error { message: String },
+}
+
+pub fn evaluate_gates(
+    gates: &BTreeMap<String, Gate>,
+    working_dir: &Path,
+) -> BTreeMap<String, GateResult>;
+```
+
+All gates are evaluated (AND semantics) -- no short-circuit on first failure,
+because the output must list all blocking conditions. Gate `timeout` field of 0
+means use the default (30 seconds).
+
+**5. Evidence validator** (`src/engine/evidence.rs` or inline)
+
+Validates a `--with-data` JSON payload against the current state's `accepts`
+schema:
+
+- All required fields present
+- Field types match (`string`, `number`, `boolean`, `enum`)
+- Enum values are in the allowed set
+- No unknown fields (strict validation)
+
+Returns `Ok(())` or `Err(NextError)` with `InvalidSubmission` code and per-field
+`ErrorDetail` entries.
+
+**6. Expects derivation** (`src/cli/next_types.rs`)
+
+Structural assembly from template data:
+
+1. If state has no `accepts` block: `expects = None` (serializes as `null`)
+2. If state has `accepts`:
+   - `event_type` = `"evidence_submitted"` (constant)
+   - `fields` = map each `FieldSchema` to `ExpectsFieldSchema` (rename
+     `field_type` to `type`, carry `required` and `values`)
+   - `options` = filter transitions to those with `when` conditions, serialize
+     target + when map. Omit `options` entirely if no transitions have `when`.
+
+**7. Dispatcher** (`src/cli/next.rs`)
+
+Pure function that classifies the current state into a response variant:
+
+```rust
+pub fn dispatch_next(
+    state: &str,
+    template_state: &TemplateState,
+    advanced: bool,
+    gate_results: &BTreeMap<String, GateResult>,
+    flags: &NextFlags,
+) -> Result<NextResponse, NextError>;
+```
+
+Classification logic:
+1. If terminal: return `Terminal`
+2. If any gate failed: return `GateBlocked` with all failing conditions
+3. If integration declared and available: return `Integration`
+4. If integration declared and unavailable: return `IntegrationUnavailable`
+5. If `accepts` block exists: return `EvidenceRequired` with derived `expects`
+6. Otherwise: state auto-advances (handled by caller loop in #49)
+
+### Key Interfaces
+
+**CLI -> Dispatcher**: The handler loads state, evaluates gates, validates
+evidence (if `--with-data`), appends events, then calls the dispatcher with
+pre-computed results. The dispatcher never does I/O.
+
+**Dispatcher -> Response types**: Returns `Result<NextResponse, NextError>`.
+The CLI handler serializes whichever variant it gets and derives the exit code.
+
+**Template -> Expects**: `derive_expects(&TemplateState) -> Option<ExpectsSchema>`
+converts template declarations into the agent-facing schema.
+
+**Gate evaluator -> Dispatcher**: `BTreeMap<String, GateResult>` passes
+pre-evaluated gate outcomes. The dispatcher converts non-passing results into
+`BlockingCondition` entries.
+
+### Data Flow
+
+```
+Agent calls: koto next [--with-data <json>] [--to <target>] <name>
+                                    |
+                        +-----------+-----------+
+                        |                       |
+                  --with-data                 --to
+                        |                       |
+              validate against            validate target
+              accepts schema              against transitions
+                        |                       |
+              append evidence_          append directed_
+              submitted event           transition event
+                        |                       |
+                        +-------+-------+-------+
+                                |
+                   evaluate command gates
+                                |
+                   call dispatcher(state, template,
+                        gates, flags)
+                                |
+                   serialize NextResponse/NextError
+                                |
+                   exit with derived code
+```
+
+For this issue (#48), the flow is single-step: evaluate current state and return.
+The auto-advancement loop (repeatedly advancing through states until a stopping
+condition) is added in #49.
+
+### Field Presence by Variant
+
+| Field | EvidenceRequired | GateBlocked | Integration | IntegrationUnavail. | Terminal |
+|-------|-----------------|-------------|-------------|---------------------|----------|
+| action | "execute" | "execute" | "execute" | "execute" | "done" |
+| state | yes | yes | yes | yes | yes |
+| directive | yes | yes | yes | yes | no |
+| advanced | yes | yes | yes | yes | yes |
+| expects | object | null | object/null | object/null | null |
+| blocking_conditions | no | array | no | no | no |
+| integration | no | no | object | object | no |
+| error | null | null | null | null | null |
+
+"no" = field absent from JSON. "null" = field present with value `null`.
+
+## Implementation Approach
+
+### Phase 1: Response types and serialization
+
+Define `NextResponse`, `NextError`, `ExpectsSchema`, and all supporting types in
+`src/cli/next_types.rs`. Implement custom `Serialize` for `NextResponse`. Write
+unit tests that assert serialized JSON matches the strategic design's examples
+exactly.
+
+Deliverables:
+- `src/cli/next_types.rs` -- all response/error types with serde impls
+- Unit tests for every variant's JSON output
+
+### Phase 2: Evidence validation and expects derivation
+
+Implement `validate_evidence()` and `derive_expects()`. Evidence validation checks
+required fields, type matching, and enum value constraints against the template's
+`accepts` schema. Expects derivation assembles the `ExpectsSchema` from template
+data.
+
+Deliverables:
+- `validate_evidence()` function
+- `derive_expects()` function
+- Unit tests for validation edge cases (missing required, wrong type, unknown field)
+
+### Phase 3: Gate evaluator
+
+Implement `src/gate.rs` with process group spawning, timeout, and kill logic.
+The evaluator takes a gate map and working directory, returns per-gate results.
+Unix-only via `#[cfg(unix)]` and `libc` dependency.
+
+Deliverables:
+- `src/gate.rs` -- `GateResult` enum, `evaluate_gates()` function
+- `libc` added to `Cargo.toml` as `[target.'cfg(unix)'.dependencies]`
+- Integration tests with real shell commands (echo, sleep, false)
+
+### Phase 4: Dispatcher and CLI integration
+
+Implement the dispatcher in `src/cli/next.rs` and wire everything into the
+`Command::Next` handler. Replace the current stub handler. Add `--with-data`
+and `--to` flags via clap. The handler: loads state, validates evidence (if
+submitted), appends events, evaluates gates, calls dispatcher, serializes, exits.
+
+Deliverables:
+- `src/cli/next.rs` -- dispatcher function
+- Updated `Command::Next` in `src/cli/mod.rs` with new flags and handler
+- Integration tests for the full `koto next` flow with all flag combinations
+
+## Security Considerations
+
+### Command Gate Execution
+
+Gate evaluation executes arbitrary shell commands from templates. This is safe by
+design when template sources are trusted (plugin-installed or committed to the
+project repo via PR). The commands run with the user's full environment and
+permissions -- no sandboxing.
+
+Process group isolation (`setpgid`/`killpg`) ensures timeout kills reach child
+processes, preventing zombie process accumulation. The 30-second default timeout
+bounds resource consumption from hung commands.
+
+If koto is extended to load templates from untrusted sources, gate commands would
+need additional validation. This is out of scope for the current trusted-source
+model.
+
+### Evidence Validation
+
+Strict validation against the `accepts` schema rejects unknown fields and
+type mismatches. This prevents agents from injecting unexpected data into the
+event log. Evidence payloads are persisted as-is in the JSONL state file after
+validation.
+
+Size limits on `--with-data` payloads are not specified in this design. Large
+payloads could bloat the event log. A reasonable limit (e.g., 1MB) should be
+enforced at the CLI level.
+
+### State File Atomicity
+
+Event appending uses the existing `append_event()` function which writes a
+complete JSON line and calls `fsync`. Evidence submission and state transitions
+each append one event atomically. A crash between two appends leaves the log in
+a consistent state (the last complete line is the truth).
+
+### Exit Code Information Leakage
+
+Exit codes and structured error messages reveal workflow state to the calling
+process. This is intentional -- agents need this information to operate. In
+environments where workflow state is sensitive, state files should be
+file-permission protected (which they already are, inheriting the user's umask).
+
+## Consequences
+
+### Positive
+
+- **Compile-time output contract enforcement.** Adding a sixth output variant or
+  changing a field on an existing variant produces compiler errors at every use
+  site. The current ad-hoc JSON approach has no such guarantee.
+
+- **Testable without I/O.** The dispatcher is a pure function. Unit tests can
+  cover all five variants and six error codes without state files, templates, or
+  shell commands.
+
+- **Self-describing agent interface.** Agents get structured `expects` telling
+  them exactly what to submit, including field types, required flags, and routing
+  options. No template reading needed.
+
+- **Gate evaluation isolated from logic.** Process spawning code lives in
+  `src/gate.rs`, separate from the pure classification logic. Testing gates
+  doesn't require testing the dispatcher and vice versa.
+
+### Negative
+
+- **Custom serialization overhead.** The `impl Serialize for NextResponse` is
+  ~80 lines of manual `serialize_map` calls, one block per variant. Changes to
+  the JSON output require editing both the enum definition and the serializer.
+
+- **More types than the monolithic alternative.** Six supporting types
+  (`ExpectsSchema`, `ExpectsFieldSchema`, `TransitionOption`, `BlockingCondition`,
+  `IntegrationOutput`, `IntegrationUnavailableMarker`) plus two enums and two
+  error types. This is more code than building JSON inline.
+
+- **Unix-only gate evaluation.** Process group management via `libc` is
+  Unix-specific. Non-Unix platforms get a compile error, not degraded behavior.
+  This matches koto's current Unix-only target but limits future portability.
+
+### Mitigations
+
+- **Serialization overhead**: The custom serializer follows the established
+  `Event` pattern. Developers familiar with that code can maintain this one.
+  Serialization tests for every variant catch drift between types and output.
+
+- **Type count**: All supporting types are in one file (`next_types.rs`).
+  Each type is small (2-4 fields). The alternative -- remembering to include
+  the right fields in scattered `json!()` calls -- is harder to maintain.
+
+- **Unix-only gates**: `#[cfg(unix)]` on the gate module with a compile error
+  on other platforms makes the constraint explicit. If portability becomes a
+  requirement, the gate evaluator is isolated enough to add a platform
+  abstraction without touching the dispatcher or response types.

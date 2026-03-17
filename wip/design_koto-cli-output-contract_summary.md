@@ -42,5 +42,5 @@ Response type dispatch: NextResponse enum with five typed variants, NextError en
 - **Expects derivation**: Structural assembly, not computation. `accepts` -> `fields` (rename `field_type` to `type`), conditional transitions -> `options`, `event_type` = constant. Gap: policy for `options` when state has `accepts` but only unconditional transitions (omit `options`).
 
 ## Current Status
-**Phase:** 3 - Deep Investigation
+**Phase:** 4 - Architecture
 **Last Updated:** 2026-03-16
