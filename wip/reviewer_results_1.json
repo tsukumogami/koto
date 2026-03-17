@@ -1,8 +1,0 @@
-{
-  "issue": 1,
-  "reviews": [
-    {"focus": "pragmatic", "blocking_count": 0, "advisory_count": 0},
-    {"focus": "architect", "blocking_count": 0, "advisory_count": 0},
-    {"focus": "maintainer", "blocking_count": 0, "advisory_count": 2}
-  ]
-}
