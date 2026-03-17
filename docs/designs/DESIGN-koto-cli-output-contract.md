@@ -304,7 +304,7 @@ All gates are evaluated (AND semantics) -- no short-circuit on first failure,
 because the output must list all blocking conditions. Gate `timeout` field of 0
 means use the default (30 seconds).
 
-**5. Evidence validator** (`src/engine/evidence.rs` or inline)
+**5. Evidence validator** (`src/engine/evidence.rs`)
 
 Validates a `--with-data` JSON payload against the current state's `accepts`
 schema:
@@ -382,8 +382,9 @@ Agent calls: koto next [--with-data <json>] [--to <target>] <name>
               append evidence_          append directed_
               submitted event           transition event
                         |                       |
-                        +-------+-------+-------+
-                                |
+                        |                  return immediately
+                        |                  (no gate evaluation)
+                        |
                    evaluate command gates
                                 |
                    call dispatcher(state, template,
@@ -394,9 +395,30 @@ Agent calls: koto next [--with-data <json>] [--to <target>] <name>
                    exit with derived code
 ```
 
+`--to` directed transitions return immediately after appending the event. They do
+not evaluate gates on the target state -- gate evaluation applies to the current
+state during read-only or evidence submission calls. The `--to` path emits a
+`directed_transition` event and reports the new state.
+
 For this issue (#48), the flow is single-step: evaluate current state and return.
 The auto-advancement loop (repeatedly advancing through states until a stopping
 condition) is added in #49.
+
+### Error handling layers
+
+Two error paths coexist intentionally:
+
+1. **Pre-dispatch I/O errors** (template load failure, hash mismatch, corrupt
+   state file) use the existing `exit_with_error_code` / `anyhow` pattern with
+   exit codes 1 or 3. These fire before the dispatcher is called.
+
+2. **Domain errors** from the dispatcher use `NextError` with the six error codes
+   and exit codes 1 or 2. These represent semantic failures (bad evidence, terminal
+   state, gates blocked).
+
+Both produce JSON on stdout. Pre-dispatch errors use the existing
+`{"error": "<message>", "command": "next"}` shape. Domain errors use the new
+structured `{"error": {"code": "...", "message": "...", "details": [...]}}` shape.
 
 ### Field Presence by Variant
 
@@ -495,6 +517,23 @@ Event appending uses the existing `append_event()` function which writes a
 complete JSON line and calls `fsync`. Evidence submission and state transitions
 each append one event atomically. A crash between two appends leaves the log in
 a consistent state (the last complete line is the truth).
+
+### Gate Command Literal Execution
+
+Gate commands are literal strings from the template, never interpolated with
+runtime values. Although the `variables` mechanism exists in templates (stored
+in `workflow_initialized` events), variable values are not substituted into gate
+command strings. If interpolation is added later, shell escaping must be applied
+to prevent injection. This design does not introduce interpolation.
+
+### Concurrent Access
+
+The event log assumes single-writer semantics. `append_event` calls `fsync` but
+does not acquire a file lock. Two simultaneous `koto next --with-data` calls
+could both validate against the same state and both append events. This is
+acceptable for the current single-agent model where one agent drives one
+workflow. Multi-agent coordination would require file locking or an external
+synchronization mechanism.
 
 ### Payload Size Enforcement
 
