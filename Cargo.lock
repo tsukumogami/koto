@@ -398,6 +398,7 @@ dependencies = [
  "assert_fs",
  "clap",
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "serde_yml",
