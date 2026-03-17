@@ -6,31 +6,20 @@
 use std::collections::BTreeMap;
 
 use crate::cli::next_types::{
-    BlockingCondition, ExpectsSchema, IntegrationOutput, IntegrationUnavailableMarker, NextError,
-    NextResponse,
+    BlockingCondition, ExpectsSchema, IntegrationUnavailableMarker, NextError, NextResponse,
 };
 #[cfg(unix)]
 use crate::gate::GateResult;
 use crate::template::types::TemplateState;
-
-/// Flags parsed from the CLI that affect dispatch behavior.
-#[derive(Debug, Clone, Default)]
-pub struct NextFlags {
-    /// True when `--with-data` was provided (evidence was submitted).
-    pub with_data: bool,
-    /// True when `--to` was provided (directed transition).
-    pub to: bool,
-}
 
 /// Classify the current workflow state into a response or error.
 ///
 /// Classification order:
 /// 1. Terminal state -> `Terminal`
 /// 2. Any gate failed/timed_out/errored -> `GateBlocked`
-/// 3. Integration declared and available -> `Integration`
-/// 4. Integration declared but unavailable -> `IntegrationUnavailable`
-/// 5. Accepts block exists -> `EvidenceRequired`
-/// 6. Fallback: `EvidenceRequired` with empty expects (auto-advance candidate)
+/// 3. Integration declared -> `IntegrationUnavailable` (runner deferred to #49)
+/// 4. Accepts block exists -> `EvidenceRequired`
+/// 5. Fallback: `EvidenceRequired` with empty expects (auto-advance candidate)
 ///
 /// The `advanced` flag is set by the caller (true when an event was appended
 /// before dispatching). This function never does I/O.
@@ -40,7 +29,6 @@ pub fn dispatch_next(
     template_state: &TemplateState,
     advanced: bool,
     gate_results: &BTreeMap<String, GateResult>,
-    _flags: &NextFlags,
 ) -> Result<NextResponse, NextError> {
     // 1. Terminal
     if template_state.terminal {
@@ -81,31 +69,10 @@ pub fn dispatch_next(
     // Derive expects for use in integration and evidence branches.
     let expects = crate::cli::next_types::derive_expects(template_state);
 
-    // 3. Integration declared and available
-    // For now, integrations are always considered "unavailable" since
-    // the integration runner is deferred to #49. The integration field
-    // in the template is just a name string.
+    // 3. Integration declared -> unavailable (runner deferred to #49).
+    // TODO(#49): Add availability check and `Integration` branch when the
+    // integration runner is implemented.
     if let Some(integration_name) = &template_state.integration {
-        // TODO(#49): Check if integration is actually available and run it.
-        // For now, all declared integrations are unavailable.
-        let available = false;
-
-        if available {
-            // This branch is unreachable until #49, but the classification
-            // logic is correct for when it's implemented.
-            return Ok(NextResponse::Integration {
-                state: state.to_string(),
-                directive: template_state.directive.clone(),
-                advanced,
-                expects,
-                integration: IntegrationOutput {
-                    name: integration_name.clone(),
-                    output: serde_json::Value::Null,
-                },
-            });
-        }
-
-        // 4. Integration unavailable
         return Ok(NextResponse::IntegrationUnavailable {
             state: state.to_string(),
             directive: template_state.directive.clone(),
@@ -152,13 +119,6 @@ mod tests {
     use crate::template::types::{FieldSchema, Gate, TemplateState, Transition};
     use std::collections::BTreeMap;
 
-    fn default_flags() -> NextFlags {
-        NextFlags {
-            with_data: false,
-            to: false,
-        }
-    }
-
     fn make_state(
         directive: &str,
         terminal: bool,
@@ -184,7 +144,7 @@ mod tests {
     #[test]
     fn terminal_state_returns_terminal() {
         let ts = make_state("Done.", true, vec![], BTreeMap::new(), None, None);
-        let result = dispatch_next("done", &ts, false, &BTreeMap::new(), &default_flags());
+        let result = dispatch_next("done", &ts, false, &BTreeMap::new());
         let resp = result.unwrap();
         assert_eq!(
             resp,
@@ -198,7 +158,7 @@ mod tests {
     #[test]
     fn terminal_state_with_advanced_true() {
         let ts = make_state("Done.", true, vec![], BTreeMap::new(), None, None);
-        let result = dispatch_next("done", &ts, true, &BTreeMap::new(), &default_flags());
+        let result = dispatch_next("done", &ts, true, &BTreeMap::new());
         let resp = result.unwrap();
         match resp {
             NextResponse::Terminal { advanced, .. } => assert!(advanced),
@@ -216,7 +176,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("ci".to_string(), GateResult::Failed { exit_code: 1 });
 
-        let result = dispatch_next("deploy", &ts, false, &gates, &default_flags());
+        let result = dispatch_next("deploy", &ts, false, &gates);
         let resp = result.unwrap();
         match resp {
             NextResponse::GateBlocked {
@@ -241,7 +201,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("slow_check".to_string(), GateResult::TimedOut);
 
-        let result = dispatch_next("deploy", &ts, false, &gates, &default_flags());
+        let result = dispatch_next("deploy", &ts, false, &gates);
         let resp = result.unwrap();
         match resp {
             NextResponse::GateBlocked {
@@ -265,7 +225,7 @@ mod tests {
             },
         );
 
-        let result = dispatch_next("deploy", &ts, false, &gates, &default_flags());
+        let result = dispatch_next("deploy", &ts, false, &gates);
         let resp = result.unwrap();
         match resp {
             NextResponse::GateBlocked {
@@ -286,7 +246,7 @@ mod tests {
         gates.insert("lint".to_string(), GateResult::TimedOut);
         gates.insert("ok".to_string(), GateResult::Passed);
 
-        let result = dispatch_next("deploy", &ts, false, &gates, &default_flags());
+        let result = dispatch_next("deploy", &ts, false, &gates);
         let resp = result.unwrap();
         match resp {
             NextResponse::GateBlocked {
@@ -313,7 +273,7 @@ mod tests {
         gates.insert("ci".to_string(), GateResult::Passed);
         gates.insert("lint".to_string(), GateResult::Passed);
 
-        let result = dispatch_next("deploy", &ts, false, &gates, &default_flags());
+        let result = dispatch_next("deploy", &ts, false, &gates);
         let resp = result.unwrap();
         // Should not be GateBlocked since all gates passed
         match resp {
@@ -334,7 +294,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("ci".to_string(), GateResult::Failed { exit_code: 1 });
 
-        let result = dispatch_next("done", &ts, false, &gates, &default_flags());
+        let result = dispatch_next("done", &ts, false, &gates);
         let resp = result.unwrap();
         match resp {
             NextResponse::Terminal { .. } => {}
@@ -357,7 +317,7 @@ mod tests {
             Some("code_review".to_string()),
         );
 
-        let result = dispatch_next("delegate", &ts, false, &BTreeMap::new(), &default_flags());
+        let result = dispatch_next("delegate", &ts, false, &BTreeMap::new());
         let resp = result.unwrap();
         match resp {
             NextResponse::IntegrationUnavailable {
@@ -397,7 +357,7 @@ mod tests {
             Some("code_review".to_string()),
         );
 
-        let result = dispatch_next("delegate", &ts, false, &BTreeMap::new(), &default_flags());
+        let result = dispatch_next("delegate", &ts, false, &BTreeMap::new());
         let resp = result.unwrap();
         match resp {
             NextResponse::IntegrationUnavailable { expects, .. } => {
@@ -422,7 +382,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("ci".to_string(), GateResult::Failed { exit_code: 1 });
 
-        let result = dispatch_next("delegate", &ts, false, &gates, &default_flags());
+        let result = dispatch_next("delegate", &ts, false, &gates);
         let resp = result.unwrap();
         match resp {
             NextResponse::GateBlocked { .. } => {}
@@ -465,7 +425,7 @@ mod tests {
             None,
         );
 
-        let result = dispatch_next("review", &ts, false, &BTreeMap::new(), &default_flags());
+        let result = dispatch_next("review", &ts, false, &BTreeMap::new());
         let resp = result.unwrap();
         match resp {
             NextResponse::EvidenceRequired {
@@ -506,7 +466,7 @@ mod tests {
             None,
         );
 
-        let result = dispatch_next("gather", &ts, true, &BTreeMap::new(), &default_flags());
+        let result = dispatch_next("gather", &ts, true, &BTreeMap::new());
         let resp = result.unwrap();
         match resp {
             NextResponse::EvidenceRequired { advanced, .. } => assert!(advanced),
@@ -532,7 +492,7 @@ mod tests {
             None,
         );
 
-        let result = dispatch_next("step", &ts, false, &BTreeMap::new(), &default_flags());
+        let result = dispatch_next("step", &ts, false, &BTreeMap::new());
         let resp = result.unwrap();
         match resp {
             NextResponse::EvidenceRequired { expects, .. } => {
@@ -560,7 +520,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("check".to_string(), GateResult::Failed { exit_code: 1 });
 
-        let result = dispatch_next("step", &ts, false, &gates, &default_flags());
+        let result = dispatch_next("step", &ts, false, &gates);
         match result.unwrap() {
             NextResponse::GateBlocked { .. } => {}
             other => panic!("expected GateBlocked, got {:?}", other),
@@ -593,7 +553,7 @@ mod tests {
             Some("tool".to_string()),
         );
 
-        let result = dispatch_next("step", &ts, false, &BTreeMap::new(), &default_flags());
+        let result = dispatch_next("step", &ts, false, &BTreeMap::new());
         match result.unwrap() {
             NextResponse::IntegrationUnavailable { expects, .. } => {
                 // Expects should be populated even though integration is unavailable

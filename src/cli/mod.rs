@@ -20,6 +20,16 @@ use crate::template::types::CompiledTemplate;
 /// Maximum payload size for --with-data (1 MB).
 const MAX_WITH_DATA_BYTES: usize = 1_048_576;
 
+/// Exit code space:
+/// - 0: success
+/// - 1: transient / retryable errors (gate_blocked, integration_unavailable, engine errors)
+/// - 2: caller errors (invalid_submission, precondition_failed, terminal_state, etc.)
+/// - 3: infrastructure / config errors (corrupted state, template hash mismatch, parse failures)
+///
+/// `NextErrorCode::exit_code()` handles codes 1 and 2 for domain errors.
+/// `exit_code_for_engine_error()` and this constant handle code 3.
+const EXIT_INFRASTRUCTURE: i32 = 3;
+
 #[derive(Parser)]
 #[command(
     name = "koto",
@@ -124,7 +134,7 @@ fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
 /// other errors.
 fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
     match err.downcast_ref::<EngineError>() {
-        Some(EngineError::StateFileCorrupted(_)) => 3,
+        Some(EngineError::StateFileCorrupted(_)) => EXIT_INFRASTRUCTURE,
         _ => 1,
     }
 }
@@ -357,9 +367,13 @@ pub fn run(app: App) -> Result<()> {
 /// 6. Evaluate command gates (unless --to)
 /// 7. Call dispatcher with pre-computed inputs
 /// 8. Serialize response and exit with correct code
+///
+/// NOTE: This handler uses structured `NextError` for domain errors (per the
+/// output contract). Other commands (init, rewind, etc.) use a flat
+/// `{"error": "string", "command": "..."}` format. Do not mix the two styles.
 #[cfg(unix)]
 fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> Result<()> {
-    use crate::cli::next::{dispatch_next, NextFlags};
+    use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{ErrorDetail, NextError, NextErrorCode};
     use crate::engine::evidence::validate_evidence;
     use crate::gate::evaluate_gates;
@@ -543,19 +557,9 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
 
         // Dispatch on the new (target) state, skip gate evaluation.
         let target_template_state = compiled.states.get(target).unwrap();
-        let flags = NextFlags {
-            with_data: false,
-            to: true,
-        };
         let gate_results = std::collections::BTreeMap::new();
 
-        match dispatch_next(
-            target,
-            target_template_state,
-            advanced,
-            &gate_results,
-            &flags,
-        ) {
+        match dispatch_next(target, target_template_state, advanced, &gate_results) {
             Ok(resp) => {
                 println!("{}", serde_json::to_string(&resp)?);
                 std::process::exit(0);
@@ -652,7 +656,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
         // Append evidence_submitted event.
         let fields: HashMap<String, serde_json::Value> = data
             .as_object()
-            .unwrap()
+            .expect("validate_evidence guarantees object input")
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -678,18 +682,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
     };
 
     // 7. Call dispatcher
-    let flags = NextFlags {
-        with_data: with_data.is_some(),
-        to: false,
-    };
-
-    match dispatch_next(
-        current_state,
-        template_state,
-        advanced,
-        &gate_results,
-        &flags,
-    ) {
+    match dispatch_next(current_state, template_state, advanced, &gate_results) {
         Ok(resp) => {
             println!("{}", serde_json::to_string(&resp)?);
             std::process::exit(0);
