@@ -21,8 +21,8 @@
     {
       "number": 2,
       "title": "feat(engine): add advancement loop",
-      "status": "implemented",
-      "ci_status": "pending",
+      "status": "completed",
+      "ci_status": "passed",
       "ci_fix_attempts": 0,
       "issue_type": "",
       "dependencies": [],
@@ -34,12 +34,12 @@
     {
       "number": 3,
       "title": "feat(koto): integrate advancement loop into handle_next",
-      "status": "pending",
+      "status": "implemented",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
       "issue_type": "",
       "dependencies": [],
-      "commits": [],
+      "commits": ["966f17d"],
       "agent_type": "",
       "summary": null,
       "testable_scenarios": []
