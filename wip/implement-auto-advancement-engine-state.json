@@ -1,0 +1,79 @@
+{
+  "pr_status": "implementing",
+  "design_doc": "docs/plans/PLAN-auto-advancement-engine.md",
+  "branch": "docs/auto-advancement-engine",
+  "pr_number": 58,
+  "integrity_hash": "sha256:1ef6d3e84afadae34f27385fed4cafe1169d4e180bfcba9683c683278daee285",
+  "issues": [
+    {
+      "number": 1,
+      "title": "feat(engine): add transition resolution types and function",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": []
+    },
+    {
+      "number": 2,
+      "title": "feat(engine): add advancement loop",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": []
+    },
+    {
+      "number": 3,
+      "title": "feat(koto): integrate advancement loop into handle_next",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": []
+    },
+    {
+      "number": 4,
+      "title": "feat(koto): add signal handling and file locking",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": []
+    },
+    {
+      "number": 5,
+      "title": "feat(koto): add koto cancel subcommand",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": []
+    }
+  ],
+  "skipped_issues": null,
+  "test_plan_file": null,
+  "source_doc_type": "plan",
+  "execution_mode": "single-pr",
+  "deliverable_type": "code"
+}
