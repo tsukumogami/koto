@@ -209,21 +209,20 @@ fn next_returns_state_directive_transitions() {
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("next output should be valid JSON");
 
-    assert!(
-        json["state"].as_str().is_some(),
-        "state field should be present"
+    // With auto-advancement, start -> done is auto-advanced (unconditional transition).
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "auto-advancement should reach terminal state"
     );
-    assert!(
-        json["directive"].as_str().is_some(),
-        "directive field should be present"
+    assert_eq!(
+        json["action"].as_str(),
+        Some("done"),
+        "terminal state should have action=done"
     );
-    assert!(
-        json["action"].as_str().is_some(),
-        "action field should be present"
-    );
-    assert!(
-        json["advanced"].is_boolean(),
-        "advanced field should be a boolean"
+    assert_eq!(
+        json["advanced"], true,
+        "advanced should be true after auto-advancing"
     );
     assert!(
         json["error"].is_null(),
@@ -574,24 +573,10 @@ fn template_validate_fails_for_missing_required_fields() {
 #[test]
 fn init_next_rewind_sequence() {
     let dir = TempDir::new().unwrap();
-    let src = write_template_source(dir.path());
+    // Use accepts-based template so auto-advancement doesn't skip past states.
+    init_workflow(dir.path(), "seq-wf", &template_with_accepts());
 
-    // init
-    let init_out = koto()
-        .current_dir(dir.path())
-        .args(["init", "seq-wf", "--template", src.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        init_out.status.success(),
-        "init should succeed: stdout={} stderr={}",
-        String::from_utf8_lossy(&init_out.stdout),
-        String::from_utf8_lossy(&init_out.stderr)
-    );
-    let init_json: serde_json::Value = serde_json::from_slice(&init_out.stdout).unwrap();
-    assert_eq!(init_json["name"], "seq-wf");
-
-    // next
+    // next: initial state has accepts, so it stops at start with EvidenceRequired.
     let next_out = koto()
         .current_dir(dir.path())
         .args(["next", "seq-wf"])
@@ -599,22 +584,17 @@ fn init_next_rewind_sequence() {
         .unwrap();
     assert!(next_out.status.success(), "next should succeed");
     let next_json: serde_json::Value = serde_json::from_slice(&next_out.stdout).unwrap();
-    assert!(next_json["state"].as_str().is_some());
+    assert_eq!(next_json["state"].as_str(), Some("start"));
     assert!(next_json["directive"].as_str().is_some());
     assert!(next_json["action"].as_str().is_some());
 
-    // Append a transitioned event to enable rewind (init writes 3 lines:
-    // header + workflow_initialized + transitioned, so we need a second transition).
-    let state_path = dir.path().join("koto-seq-wf.state.jsonl");
-    let extra = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
-    {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&state_path)
-            .unwrap();
-        writeln!(f, "{}", extra).unwrap();
-    }
+    // Use --to to advance to implement, enabling rewind.
+    let advance = koto()
+        .current_dir(dir.path())
+        .args(["next", "seq-wf", "--to", "implement"])
+        .output()
+        .unwrap();
+    assert!(advance.status.success(), "--to should succeed");
 
     // rewind
     let rewind_out = koto()
@@ -625,11 +605,13 @@ fn init_next_rewind_sequence() {
     assert!(rewind_out.status.success(), "rewind should succeed");
     let rewind_json: serde_json::Value = serde_json::from_slice(&rewind_out.stdout).unwrap();
     assert_eq!(rewind_json["name"], "seq-wf");
-    let rewound_state = rewind_json["state"]
-        .as_str()
-        .expect("state field should be present");
+    assert_eq!(
+        rewind_json["state"].as_str(),
+        Some("start"),
+        "rewind should go back to start"
+    );
 
-    // next after rewind — state should match the rewound state
+    // next after rewind: back at start, which has accepts -> EvidenceRequired.
     let next_after = koto()
         .current_dir(dir.path())
         .args(["next", "seq-wf"])
@@ -642,8 +624,8 @@ fn init_next_rewind_sequence() {
     let next_after_json: serde_json::Value = serde_json::from_slice(&next_after.stdout).unwrap();
     assert_eq!(
         next_after_json["state"].as_str(),
-        Some(rewound_state),
-        "state after rewind should match the rewound state"
+        Some("start"),
+        "state after rewind should be start (evidence required)"
     );
     assert!(
         next_after_json["directive"].as_str().is_some(),
@@ -651,6 +633,7 @@ fn init_next_rewind_sequence() {
     );
 
     // Verify the last event in the state file is a rewound event.
+    let state_path = dir.path().join("koto-seq-wf.state.jsonl");
     let state_content = std::fs::read_to_string(&state_path).unwrap();
     let last_line = state_content.lines().last().unwrap().to_string();
     let last_event: serde_json::Value =
@@ -1227,14 +1210,21 @@ fn next_with_valid_evidence_advances_state() {
     );
 
     let json: serde_json::Value = serde_json::from_slice(&submit.stdout).unwrap();
+    // After submitting decision=proceed, auto-advancement chains:
+    // start -> implement (unconditional) -> done (terminal).
     assert_eq!(
         json["state"].as_str(),
-        Some("start"),
-        "state should still be start (evidence appended, not yet advanced)"
+        Some("done"),
+        "auto-advancement should reach terminal state after evidence"
     );
     assert_eq!(
         json["advanced"], true,
-        "advanced should be true after evidence submission"
+        "advanced should be true after evidence + auto-advance"
+    );
+    assert_eq!(
+        json["action"].as_str(),
+        Some("done"),
+        "action should be done at terminal state"
     );
     assert!(json["error"].is_null(), "error should be null");
 
@@ -1353,7 +1343,8 @@ fn next_with_to_performs_directed_transition() {
         "state file should contain directed_transition event"
     );
 
-    // Verify next on the new state works.
+    // Verify next on the new state works. Auto-advancement chains
+    // implement -> done (unconditional transition).
     let next_output = koto()
         .current_dir(dir.path())
         .args(["next", "directed-wf"])
@@ -1361,7 +1352,12 @@ fn next_with_to_performs_directed_transition() {
         .unwrap();
     assert!(next_output.status.success());
     let next_json: serde_json::Value = serde_json::from_slice(&next_output.stdout).unwrap();
-    assert_eq!(next_json["state"].as_str(), Some("implement"));
+    assert_eq!(
+        next_json["state"].as_str(),
+        Some("done"),
+        "auto-advancement from implement should reach done"
+    );
+    assert_eq!(next_json["advanced"], true);
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,50 +1369,390 @@ fn agent_driven_workflow_loop() {
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "loop-wf", &template_multi_state());
 
-    // Simulate an agent loop: call next, read state, use --to to advance.
-    let states_to_visit = ["plan", "implement", "verify", "done"];
+    // With auto-advancement, a single koto next chains through all
+    // unconditional transitions: plan -> implement -> verify -> done.
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "loop-wf"])
+        .output()
+        .unwrap();
 
-    for (i, expected_state) in states_to_visit.iter().enumerate() {
-        let output = koto()
-            .current_dir(dir.path())
-            .args(["next", "loop-wf"])
-            .output()
-            .unwrap();
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(
-            json["state"].as_str(),
-            Some(*expected_state),
-            "step {}: state should be {}",
-            i,
-            expected_state
-        );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "auto-advancement should reach terminal state"
+    );
+    assert_eq!(
+        json["action"].as_str(),
+        Some("done"),
+        "action should be done"
+    );
+    assert_eq!(
+        json["advanced"], true,
+        "advanced should be true after auto-advancing"
+    );
+}
 
-        if json["action"].as_str() == Some("done") {
-            // Terminal state reached. Verify this is the last one.
-            assert_eq!(
-                *expected_state, "done",
-                "done action should only appear at done state"
-            );
-            break;
-        }
+// ---------------------------------------------------------------------------
+// Auto-advancement: 4-state workflow reaches verify via single koto next
+// ---------------------------------------------------------------------------
 
-        // Agent decides to advance to the next state via --to.
-        if i + 1 < states_to_visit.len() {
-            let next_target = states_to_visit[i + 1];
-            let advance = koto()
-                .current_dir(dir.path())
-                .args(["next", "loop-wf", "--to", next_target])
-                .output()
-                .unwrap();
-            assert!(
-                advance.status.success(),
-                "advance to {} should succeed: {}",
-                next_target,
-                String::from_utf8_lossy(&advance.stdout)
-            );
-        }
-    }
+/// Template with 4 states: plan -> implement -> verify (needs evidence) -> done.
+/// Plan and implement have unconditional transitions, verify has conditional.
+fn template_auto_advance_4state() -> String {
+    r#"---
+name: auto-advance-workflow
+version: "1.0"
+initial_state: plan
+states:
+  plan:
+    transitions:
+      - target: implement
+  implement:
+    transitions:
+      - target: verify
+  verify:
+    accepts:
+      decision:
+        type: enum
+        required: true
+        values: [approve, reject]
+    transitions:
+      - target: done
+        when:
+          decision: approve
+      - target: implement
+        when:
+          decision: reject
+  done:
+    terminal: true
+---
+
+## plan
+
+Create the implementation plan.
+
+## implement
+
+Write the code.
+
+## verify
+
+Review and approve or reject the changes.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn auto_advance_reaches_verify_from_plan() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "auto-wf", &template_auto_advance_4state());
+
+    // Single koto next should auto-advance: plan -> implement -> verify (stops: evidence required).
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "auto-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["state"].as_str(),
+        Some("verify"),
+        "auto-advancement should stop at verify (evidence required)"
+    );
+    assert_eq!(
+        json["advanced"], true,
+        "advanced should be true (plan -> implement -> verify)"
+    );
+    assert_eq!(
+        json["action"].as_str(),
+        Some("execute"),
+        "action should be execute at non-terminal state"
+    );
+    assert!(
+        json["expects"].is_object(),
+        "expects should be present for evidence_required"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Auto-advancement: evidence submission triggers auto-advance chain
+// ---------------------------------------------------------------------------
+
+#[test]
+fn evidence_triggers_auto_advance_chain() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "chain-wf", &template_auto_advance_4state());
+
+    // Auto-advance to verify first.
+    let first = koto()
+        .current_dir(dir.path())
+        .args(["next", "chain-wf"])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first_json: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_json["state"].as_str(), Some("verify"));
+
+    // Submit reject evidence -> should auto-advance: verify -> implement -> verify (stops again).
+    let reject = koto()
+        .current_dir(dir.path())
+        .args([
+            "next",
+            "chain-wf",
+            "--with-data",
+            r#"{"decision":"reject"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        reject.status.success(),
+        "reject should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&reject.stdout),
+        String::from_utf8_lossy(&reject.stderr)
+    );
+
+    let reject_json: serde_json::Value = serde_json::from_slice(&reject.stdout).unwrap();
+    assert_eq!(
+        reject_json["state"].as_str(),
+        Some("verify"),
+        "reject -> implement -> verify (auto-advance chain)"
+    );
+    assert_eq!(
+        reject_json["advanced"], true,
+        "advanced should be true after auto-advance chain"
+    );
+
+    // Now approve -> should auto-advance: verify -> done (terminal).
+    let approve = koto()
+        .current_dir(dir.path())
+        .args([
+            "next",
+            "chain-wf",
+            "--with-data",
+            r#"{"decision":"approve"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(approve.status.success());
+    let approve_json: serde_json::Value = serde_json::from_slice(&approve.stdout).unwrap();
+    assert_eq!(
+        approve_json["state"].as_str(),
+        Some("done"),
+        "approve should reach terminal state"
+    );
+    assert_eq!(approve_json["action"].as_str(), Some("done"));
+    assert_eq!(approve_json["advanced"], true);
+}
+
+// ---------------------------------------------------------------------------
+// scenario-37: Concurrent koto next fails with flock contention
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn concurrent_next_fails_with_lock_contention() {
+    use std::os::unix::io::AsRawFd;
+
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "lock-wf", &template_with_accepts());
+
+    // The state file is named koto-<name>.state.jsonl.
+    let state_path = dir.path().join("koto-lock-wf.state.jsonl");
+    assert!(state_path.exists(), "state file should exist after init");
+
+    // Hold an exclusive flock on the state file, simulating a concurrent koto next.
+    let lock_file = std::fs::File::open(&state_path).unwrap();
+    let fd = lock_file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(ret, 0, "test should acquire flock successfully");
+
+    // Now run koto next -- it should fail because it can't acquire the lock.
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "lock-wf"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "concurrent next should fail with exit 2, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("precondition_failed"),
+        "error code should be precondition_failed"
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already running"),
+        "error message should mention already running"
+    );
+
+    // Release the lock explicitly.
+    unsafe { libc::flock(fd, libc::LOCK_UN) };
+}
+
+// ---------------------------------------------------------------------------
+// scenario-38: koto cancel prevents further advancement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cancel_then_next_returns_terminal_state_error() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "cancel-wf", &template_with_accepts());
+
+    // Cancel the workflow.
+    let cancel = koto()
+        .current_dir(dir.path())
+        .args(["cancel", "cancel-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        cancel.status.success(),
+        "cancel should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&cancel.stdout),
+        String::from_utf8_lossy(&cancel.stderr)
+    );
+
+    let cancel_json: serde_json::Value = serde_json::from_slice(&cancel.stdout).unwrap();
+    assert_eq!(cancel_json["cancelled"], true);
+    assert_eq!(cancel_json["name"].as_str(), Some("cancel-wf"));
+
+    // Now koto next should fail with terminal_state error.
+    let next = koto()
+        .current_dir(dir.path())
+        .args(["next", "cancel-wf"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        next.status.code(),
+        Some(2),
+        "next after cancel should fail with exit 2"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&next.stdout).unwrap();
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("terminal_state"),
+        "error code should be terminal_state"
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled"),
+        "error message should mention cancelled"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-39: double-cancel returns error
+// ---------------------------------------------------------------------------
+
+#[test]
+fn double_cancel_returns_error() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "dbl-cancel-wf", &template_with_accepts());
+
+    // First cancel succeeds.
+    let first = koto()
+        .current_dir(dir.path())
+        .args(["cancel", "dbl-cancel-wf"])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+
+    // Second cancel fails.
+    let second = koto()
+        .current_dir(dir.path())
+        .args(["cancel", "dbl-cancel-wf"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        second.status.code(),
+        Some(2),
+        "double cancel should fail with exit 2"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("already cancelled"),
+        "error should mention already cancelled"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-40: cancel already-terminal workflow returns error
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cancel_terminal_workflow_returns_error() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "term-cancel-wf", minimal_template());
+
+    // Auto-advance to terminal state.
+    let advance = koto()
+        .current_dir(dir.path())
+        .args(["next", "term-cancel-wf", "--to", "done"])
+        .output()
+        .unwrap();
+    assert!(advance.status.success());
+
+    // Cancel should fail because workflow is already terminal.
+    let cancel = koto()
+        .current_dir(dir.path())
+        .args(["cancel", "term-cancel-wf"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        cancel.status.code(),
+        Some(2),
+        "cancel on terminal should fail with exit 2"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&cancel.stdout).unwrap();
+    assert!(
+        json["error"].as_str().unwrap().contains("terminal state"),
+        "error should mention terminal state"
+    );
 }
 
 // ---------------------------------------------------------------------------
