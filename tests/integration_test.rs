@@ -1568,6 +1568,62 @@ fn evidence_triggers_auto_advance_chain() {
 }
 
 // ---------------------------------------------------------------------------
+// scenario-37: Concurrent koto next fails with flock contention
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn concurrent_next_fails_with_lock_contention() {
+    use std::os::unix::io::AsRawFd;
+
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "lock-wf", &template_with_accepts());
+
+    // The state file is named koto-<name>.state.jsonl.
+    let state_path = dir.path().join("koto-lock-wf.state.jsonl");
+    assert!(state_path.exists(), "state file should exist after init");
+
+    // Hold an exclusive flock on the state file, simulating a concurrent koto next.
+    let lock_file = std::fs::File::open(&state_path).unwrap();
+    let fd = lock_file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(ret, 0, "test should acquire flock successfully");
+
+    // Now run koto next -- it should fail because it can't acquire the lock.
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "lock-wf"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "concurrent next should fail with exit 2, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("precondition_failed"),
+        "error code should be precondition_failed"
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already running"),
+        "error message should mention already running"
+    );
+
+    // Release the lock explicitly.
+    unsafe { libc::flock(fd, libc::LOCK_UN) };
+}
+
+// ---------------------------------------------------------------------------
 // scenario-36: Gate timeout kills entire process group
 // ---------------------------------------------------------------------------
 

@@ -364,9 +364,11 @@ pub fn run(app: App) -> Result<()> {
 ///    state, dispatch on new state (single-shot, no advancement loop)
 /// 5. If --with-data: validate evidence against accepts schema, append
 ///    evidence_submitted event
-/// 6. Merge evidence from current epoch
-/// 7. Run advancement loop (advance_until_stop)
-/// 8. Map StopReason to NextResponse, serialize and exit
+/// 6. Acquire advisory flock on state file (non-blocking)
+/// 7. Register SIGTERM/SIGINT signal handlers
+/// 8. Merge evidence from current epoch
+/// 9. Run advancement loop (advance_until_stop)
+/// 10. Map StopReason to NextResponse, serialize and exit
 ///
 /// NOTE: This handler uses structured `NextError` for domain errors (per the
 /// output contract). Other commands (init, rewind, etc.) use a flat
@@ -385,6 +387,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
     use crate::engine::persistence::derive_evidence;
     use crate::gate::{evaluate_gates, GateResult};
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     // 1. Mutual exclusivity check
     if with_data.is_some() && to.is_some() {
@@ -677,7 +680,44 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
         }
     }
 
-    // 6. Merge evidence from current epoch.
+    // 6. Acquire advisory flock on state file (non-blocking).
+    // Prevents concurrent koto next calls from interleaving writes.
+    let lock_file = match std::fs::File::open(&state_path) {
+        Ok(f) => f,
+        Err(e) => {
+            exit_with_error(serde_json::json!({
+                "error": format!("failed to open state file for locking: {}", e),
+                "command": "next"
+            }));
+        }
+    };
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = lock_file.as_raw_fd();
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            let err = NextError {
+                code: NextErrorCode::PreconditionFailed,
+                message: "another koto next is already running for this workflow".to_string(),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code());
+        }
+    }
+
+    // 7. Register signal handlers for clean shutdown.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))
+    {
+        eprintln!("warning: failed to register SIGTERM handler: {}", e);
+    }
+    if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))
+    {
+        eprintln!("warning: failed to register SIGINT handler: {}", e);
+    }
+
+    // 8. Merge evidence from current epoch.
     // Re-read events to include the evidence_submitted we may have just appended.
     let (_, current_events) = match read_events(&state_path) {
         Ok(result) => result,
@@ -695,7 +735,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
     let epoch_events = derive_evidence(&current_events);
     let evidence = merge_epoch_evidence(&epoch_events.into_iter().cloned().collect::<Vec<_>>());
 
-    // 7. Set up I/O closures and run advancement loop.
+    // 9. Set up I/O closures and run advancement loop.
     let state_path_clone = state_path.clone();
     let mut append_closure = |payload: &EventPayload| -> Result<(), String> {
         append_event(&state_path_clone, payload, &now_iso8601())
@@ -711,8 +751,6 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
     let integration_closure = |_name: &str| -> Result<serde_json::Value, IntegrationError> {
         Err(IntegrationError::Unavailable)
     };
-
-    let shutdown = AtomicBool::new(false);
 
     let result = advance_until_stop(
         current_state,
