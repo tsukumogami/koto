@@ -43,3 +43,64 @@ that ties them together.
   integration returns `IntegrationUnavailable`, not a crash
 - **Cycle detection must be simple**: visited-state set per invocation; no need
   for graph analysis
+
+## Considered Options
+
+### Decision: Where does the advancement loop live?
+
+**Context:** The advancement loop chains through auto-advanceable states, calling
+existing I/O functions (gate evaluation, event appending, integration invocation)
+between iterations. The question is where to place the loop relative to the existing
+`dispatch_next` (pure classifier) and `handle_next` (I/O handler) split.
+
+**Chosen: Engine-Layer Advancement.**
+
+A new `src/engine/advance.rs` module exposes `advance_until_stop()`, which takes
+the current state, compiled template, and closures for I/O operations. The engine
+owns cycle detection (visited-state `HashSet`), transition resolution (matching
+evidence against `when` conditions), and stopping condition evaluation. The handler
+sets up the I/O closures and calls the engine, then translates the `StopReason`
+result into a `NextResponse` for serialization.
+
+This approach fits the codebase's existing architecture: `src/engine/` already owns
+persistence, evidence validation, and type definitions. The advancement loop is
+workflow logic, not CLI logic, and belongs alongside those modules. It preserves
+`dispatch_next` as a pure function (called within the engine's loop body), makes
+the loop testable through injected I/O callbacks without touching the filesystem,
+and maps 1:1 to the upstream design's pseudocode.
+
+*Alternative rejected: Handler-Layer Loop.* Adding the loop directly into
+`handle_next` is the simplest change (~300-400 lines vs ~600-800) and requires no
+new abstractions. It was rejected because `handle_next` is already 340 lines of
+inline logic and adding the loop would push it further without structural
+improvement. The loop logic isn't testable in isolation -- it requires integration
+tests that set up state files and spawn processes. For a correctness-critical loop
+that must handle cycle detection, signal interruption, and five stopping conditions,
+unit-testable engine logic is worth the extra abstraction.
+
+*Alternative rejected: Action-Yielding State Machine.* An iterator yielding typed
+directives (`EvaluateGates`, `AppendTransitioned`, etc.) that the handler executes
+in a ping-pong protocol. This maximizes testability -- every step is observable and
+assertable. It was rejected because Rust lacks native generators, requiring manual
+coroutine state encoding that adds boilerplate and a new class of protocol bugs
+(calling the wrong `feed_*` method). The loop has five stopping conditions and
+three I/O operations; this level of machinery is more than the problem warrants.
+The engine-layer approach captures most of the testability benefit through injected
+closures without the protocol complexity.
+
+## Decision Outcome
+
+The auto-advancement engine lives in `src/engine/advance.rs` as a function that
+takes I/O callbacks, iterates through states using the existing `dispatch_next`
+classifier, and returns a structured `StopReason` when it hits a stopping condition.
+
+Key properties:
+- `dispatch_next` stays pure; the engine calls it per-iteration for classification
+- I/O operations (gate evaluation, event appending, integration invocation) are
+  injected as closures, making the loop unit-testable with mocks
+- Cycle detection uses a `HashSet<String>` scoped to the invocation
+- Signal handling checks an `AtomicBool` between iterations; the last fsync'd event
+  is always durable before the check
+- `StopReason` maps to `NextResponse` in the handler, keeping CLI serialization
+  concerns out of the engine
+- `koto cancel` is a new subcommand that appends a `workflow_cancelled` event

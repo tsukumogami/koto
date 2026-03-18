@@ -12,6 +12,11 @@ layer. Event types already defined. Public repo, tactical scope.
 - **Engine-Layer Advancement**: Extracted advance_until_stop() in src/engine/advance.rs with injected I/O callbacks; clean separation, testable loop, cost is closure ergonomics
 - **Action-Yielding State Machine**: Iterator yielding action directives (EvaluateGates, AppendEvent, etc.); maximum testability, cost is manual coroutine encoding and protocol complexity
 
+## Selected Approach (Phase 2)
+Engine-Layer Advancement: advance_until_stop() in src/engine/advance.rs with injected
+I/O closures. Chosen for testability, reuse potential, and clean separation of workflow
+logic from CLI concerns.
+
 ## Current Status
-**Phase:** 1 - Approach Discovery
+**Phase:** 2 - Present Approaches
 **Last Updated:** 2026-03-17
