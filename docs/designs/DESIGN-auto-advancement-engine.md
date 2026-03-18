@@ -407,6 +407,102 @@ koto cancel <workflow-name>
   └─ Print confirmation JSON
 ```
 
+### Functional Test Scenario
+
+A workflow template with four states: `plan`, `implement`, `verify`, `done`.
+`plan` and `implement` are auto-advance states (no `accepts` block, unconditional
+transitions, no gates). `verify` has an `accepts` block requiring a decision field.
+`done` is terminal.
+
+```yaml
+states:
+  plan:
+    directive: "Create implementation plan."
+    transitions:
+      - target: implement
+  implement:
+    directive: "Write the code."
+    transitions:
+      - target: verify
+  verify:
+    directive: "Review the implementation."
+    accepts:
+      decision:
+        type: enum
+        values: [approve, reject]
+        required: true
+    transitions:
+      - target: done
+        when:
+          decision: approve
+      - target: implement
+        when:
+          decision: reject
+  done:
+    directive: "Work complete."
+    terminal: true
+```
+
+**Before this design (current behavior):**
+
+```
+$ koto next my-workflow
+{"action":"execute","state":"plan","directive":"Create implementation plan.",
+ "expects":{"event_type":"evidence_submitted","fields":{},"options":[]}, ...}
+
+# Agent sees empty expects, knows it should auto-advance, but koto didn't.
+# Agent must manually call:
+$ koto next my-workflow --to implement
+$ koto next my-workflow
+# Again empty expects, agent must call:
+$ koto next my-workflow --to verify
+$ koto next my-workflow
+# Finally sees the accepts block with decision field.
+```
+
+Total: 5 CLI calls to reach the first state that needs agent input.
+
+**After this design (expected behavior):**
+
+```
+$ koto next my-workflow
+{"action":"execute","state":"verify","directive":"Review the implementation.",
+ "advanced":true,
+ "expects":{"event_type":"evidence_submitted",
+   "fields":{"decision":{"type":"enum","values":["approve","reject"],"required":true}},
+   "options":[
+     {"target":"done","when":{"decision":"approve"}},
+     {"target":"implement","when":{"decision":"reject"}}
+   ]},
+ "error":null}
+```
+
+Total: 1 CLI call. The engine auto-advanced through `plan` and `implement`,
+appending `transitioned` events for each, and stopped at `verify` where agent
+input is required. The event log contains:
+
+```jsonl
+{"seq":2,"type":"transitioned","payload":{"from":"plan","to":"implement","condition_type":"auto"}}
+{"seq":3,"type":"transitioned","payload":{"from":"implement","to":"verify","condition_type":"auto"}}
+```
+
+**Evidence submission then triggers another auto-advance chain:**
+
+```
+$ koto next my-workflow --with-data '{"decision":"reject"}'
+{"action":"execute","state":"verify","directive":"Review the implementation.",
+ "advanced":true, "expects":{...}, "error":null}
+```
+
+The engine matched `decision: reject` to the `implement` transition, advanced to
+`implement`, then auto-advanced back to `verify` (which needs evidence again).
+The event log gained three new entries: `evidence_submitted`, `transitioned`
+(implement), `transitioned` (verify).
+
+This scenario is the definition of done: a single `koto next` call chains through
+auto-advanceable states and stops at the first state requiring agent input,
+evidence submission, or an external gate.
+
 ## Implementation Approach
 
 ### Phase 1: Transition resolution and advance engine
