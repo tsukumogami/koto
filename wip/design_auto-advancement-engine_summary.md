@@ -22,6 +22,10 @@ logic from CLI concerns.
 - **Integration runner**: Types scaffolded but unimplemented. Config system deferred; engine takes a closure. Re-invocation prevention needed (check for existing integration_invoked event in current epoch).
 - **Signal handling**: append_event crash safety sufficient (truncated-line recovery). signal-hook crate for AtomicBool. Advisory flock for concurrent access protection. Gate timeout can delay shutdown up to 30s.
 
+## Security Review (Phase 5)
+**Outcome:** Option 2 - Document considerations
+**Summary:** Gate evaluation amplification and directive interpolation escaping documented. No design changes needed.
+
 ## Current Status
-**Phase:** 3 - Deep Investigation
+**Phase:** 5 - Security
 **Last Updated:** 2026-03-17

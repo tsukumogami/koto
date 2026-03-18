@@ -441,3 +441,44 @@ Deliverables:
 - The `append_event` performance concern can be addressed by passing the expected
   next sequence number as a parameter, avoiding the file read. This is a targeted
   optimization for a later issue.
+
+## Security Considerations
+
+### Gate evaluation amplification
+
+Auto-advancement can trigger multiple gate evaluations per `koto next` invocation.
+Previously, each gate evaluation required a separate CLI call. This doesn't change
+the trust boundary -- the same template author controls which shell commands run in
+gates -- but it widens the blast radius per invocation.
+
+Gate commands run with the user's full privileges, isolated only by process group
+separation and timeout. This is an existing constraint, not introduced by this
+design. If koto ever loads templates from untrusted sources, gate command sandboxing
+must be implemented before auto-advancement is enabled for those templates.
+
+### Directive interpolation escaping
+
+The upstream design requested that this sub-design specify escaping rules for
+directive rendering. The engine layer (`advance_until_stop`) does not perform
+interpolation -- it returns typed `StopReason` variants with raw field values. The
+handler maps these to `NextResponse` JSON, which the agent consumes directly.
+
+The escaping boundary: `StopReason` fields contain raw, unescaped data. Any layer
+that interpolates evidence values or integration output into rendered text (such as
+directive template rendering in the controller layer) must treat those values as
+untrusted strings and escape them appropriately. The engine's contract is to return
+structured data, not rendered text.
+
+### Download verification
+
+Not applicable. The auto-advancement engine operates on local state files and
+compiled templates. It does not download external artifacts. The future integration
+runner config system (deferred) will need its own download verification review.
+
+### User data exposure
+
+Evidence and integration output are persisted as plaintext JSON in the event log.
+The existing `append_event` function applies 0600 file permissions on creation,
+limiting access to the file owner. The auto-advancement engine uses the same
+persistence path via injected closures and does not introduce new file access
+patterns.
