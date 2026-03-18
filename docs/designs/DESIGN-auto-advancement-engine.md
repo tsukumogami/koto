@@ -1,3 +1,29 @@
+---
+status: Proposed
+problem: |
+  koto next evaluates one state and returns. States with no accepts block, passing
+  gates, and unconditional transitions require the agent to manually chain through
+  each intermediate state via koto next --to, turning automatic advancement into
+  tedious back-and-forth. The missing pieces are the advancement loop, integration
+  runner interface, signal handling for clean shutdown, and koto cancel for workflow
+  abandonment.
+decision: |
+  An engine-layer advancement function in src/engine/advance.rs takes I/O closures
+  for gate evaluation, event appending, and integration invocation. It loops through
+  states using a visited-set for cycle detection, resolves transitions by matching
+  evidence against when conditions, and returns a StopReason enum. Advisory flock
+  prevents concurrent access. Signal handling checks an AtomicBool between iterations.
+  Integration runner is a closure interface with config system deferred.
+rationale: |
+  The engine-layer approach balances testability and simplicity. Injected closures
+  make the loop unit-testable without filesystem or process spawning, while avoiding
+  the protocol complexity of an action-yielding state machine. Placing the loop in
+  src/engine/ matches the codebase's existing architecture where the engine module
+  owns workflow logic and the CLI handler does I/O setup. The handler-layer
+  alternative was rejected because it would grow an already 340-line function without
+  structural improvement.
+---
+
 # DESIGN: Auto-Advancement Engine
 
 ## Status
@@ -175,10 +201,13 @@ through workflow states until hitting a stopping condition. It sits between the
 existing pure classifier (`dispatch_next`) and the CLI handler (`handle_next`),
 owning the iteration logic while delegating all I/O to injected closures.
 
-The handler acquires an advisory flock on the state file, sets up I/O closures,
-registers a signal handler, and calls `advance_until_stop()`. The engine returns
-a `StopReason` that the handler translates into a `NextResponse` for JSON
-serialization.
+The handler acquires an advisory flock on the state file, sets up I/O closures
+(closing over the working directory for gate evaluation), registers a signal
+handler, and calls `advance_until_stop()`. The engine does its own classification
+per iteration (terminal check, integration check, gate evaluation, transition
+resolution) rather than calling `dispatch_next` -- because `dispatch_next`
+classifies stopping conditions but doesn't resolve transitions. The engine returns
+a `StopReason` that the handler maps to a `NextResponse` for JSON serialization.
 
 ### Components
 
@@ -239,7 +268,7 @@ pub fn advance_until_stop<F, G, I>(
 ) -> Result<AdvanceResult, AdvanceError>
 where
     F: FnMut(&EventPayload) -> Result<(), PersistenceError>,
-    G: Fn(&BTreeMap<String, Gate>, &Path) -> BTreeMap<String, GateResult>,
+    G: Fn(&BTreeMap<String, Gate>) -> BTreeMap<String, GateResult>,
     I: Fn(&str) -> Result<serde_json::Value, IntegrationError>,
 ```
 
@@ -259,6 +288,7 @@ pub enum StopReason {
     Integration { name: String, output: serde_json::Value },
     IntegrationUnavailable { name: String },
     CycleDetected { state: String },
+    ChainLimitReached,
     SignalReceived,
 }
 ```
@@ -345,13 +375,34 @@ koto next [--with-data JSON] [--to target]
   └─ Print JSON, exit
 ```
 
+**Maximum chain length:** The engine enforces a maximum of 100 transitions per
+invocation as a safety bound against template bugs (e.g., a template with
+hundreds of linearly chaining states). If the limit is reached, the engine
+returns `StopReason::ChainLimitReached`. This is defense-in-depth; well-formed
+templates shouldn't hit it.
+
+**Cancellation detection:** `handle_next` checks for a `WorkflowCancelled` event
+in the event log before entering the advancement loop. If found, it returns an
+error (`NextErrorCode::TerminalState`) with the message "workflow has been
+cancelled." The engine itself does not check for cancellation -- the pre-loop
+check in the handler prevents the engine from running on a cancelled workflow.
+`koto cancel` also checks before appending, to prevent double-cancellation.
+
+**Signal check granularity:** The shutdown flag is checked between loop
+iterations (between states), not between individual gate evaluations within a
+state. A state with multiple gates each timing out at 30 seconds could delay
+shutdown by `gate_count * 30s`. This is acceptable because gates within a state
+are part of one atomic classification step. If faster shutdown is needed, a
+future enhancement can add a shutdown flag parameter to the gate evaluator.
+
 **`koto cancel` data flow:**
 
 ```
 koto cancel <workflow-name>
   │
   ├─ Load state file
-  ├─ Verify workflow is not already terminal or cancelled
+  ├─ Check for existing WorkflowCancelled event (reject double-cancel)
+  ├─ Verify workflow is not already terminal
   ├─ Append WorkflowCancelled event
   └─ Print confirmation JSON
 ```
@@ -468,6 +519,13 @@ that interpolates evidence values or integration output into rendered text (such
 directive template rendering in the controller layer) must treat those values as
 untrusted strings and escape them appropriately. The engine's contract is to return
 structured data, not rendered text.
+
+The current CLI handler serializes `NextResponse` to JSON, which inherently escapes
+strings. The escaping gap only opens if a future rendering layer interpolates
+evidence or integration output into non-JSON contexts (Markdown, shell). A follow-up
+issue should specify escaping rules in the controller/template rendering layer before
+the integration runner is implemented, since integration output comes from arbitrary
+subprocesses and compounds the injection risk.
 
 ### Download verification
 
