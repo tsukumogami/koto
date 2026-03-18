@@ -148,7 +148,10 @@ where
     // Evidence is only used for the initial state; auto-advanced states start fresh.
     let mut current_evidence = evidence.clone();
 
-    visited.insert(state.clone());
+    // The starting state is NOT added to visited. The visited set tracks states
+    // we've auto-advanced THROUGH during this invocation. The starting state was
+    // already arrived at before this invocation, so re-visiting it (e.g., in a
+    // review -> implement -> review loop) is legitimate.
 
     loop {
         // 1. Check shutdown flag
@@ -806,7 +809,9 @@ mod tests {
 
     #[test]
     fn cycle_detection() {
-        // a -> b -> a (cycle)
+        // a -> b -> a -> b (cycle detected on second visit to b)
+        // Starting state (a) is not in the visited set, so a -> b -> a is allowed.
+        // The cycle is detected when trying to visit b a second time.
         let template = make_template(vec![
             (
                 "a",
@@ -846,12 +851,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.final_state, "b");
-        assert!(result.advanced); // a -> b happened
+        // a -> b (b added to visited), b -> a (a added to visited),
+        // a -> b (b already visited: cycle detected)
+        assert_eq!(result.final_state, "a");
+        assert!(result.advanced); // a -> b -> a happened
         assert_eq!(
             result.stop_reason,
             StopReason::CycleDetected {
-                state: "a".to_string()
+                state: "b".to_string()
             }
         );
     }
