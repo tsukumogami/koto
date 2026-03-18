@@ -69,6 +69,12 @@ pub enum Command {
         to: Option<String>,
     },
 
+    /// Cancel a workflow, preventing further advancement
+    Cancel {
+        /// Workflow name
+        name: String,
+    },
+
     /// Roll back the workflow to the previous state
     Rewind {
         /// Workflow name
@@ -234,6 +240,7 @@ pub fn run(app: App) -> Result<()> {
             with_data,
             to,
         } => handle_next(name, with_data, to),
+        Command::Cancel { name } => handle_cancel(name),
         Command::Rewind { name } => {
             let current_dir = std::env::current_dir()?;
             let state_path = workflow_state_path(&current_dir, &name);
@@ -449,6 +456,20 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
             "error": "state file has no events",
             "command": "next"
         }));
+    }
+
+    // Check for cancelled workflow before any processing.
+    let is_cancelled = events
+        .iter()
+        .any(|e| matches!(e.payload, EventPayload::WorkflowCancelled { .. }));
+    if is_cancelled {
+        let err = NextError {
+            code: NextErrorCode::TerminalState,
+            message: "workflow has been cancelled".to_string(),
+            details: vec![],
+        };
+        let json = serde_json::json!({"error": err});
+        exit_with_error_code(json, err.code.exit_code());
     }
 
     let machine_state = match derive_machine_state(&header, &events) {
@@ -931,4 +952,120 @@ fn handle_next(name: String, _with_data: Option<String>, _to: Option<String>) ->
         }),
         3,
     );
+}
+
+/// Handle the `koto cancel` command.
+///
+/// Appends a `WorkflowCancelled` event to the event log. Rejects double-cancel
+/// and cancel of already-terminal workflows.
+fn handle_cancel(name: String) -> Result<()> {
+    let current_dir = std::env::current_dir()?;
+    let state_path = workflow_state_path(&current_dir, &name);
+
+    if !state_path.exists() {
+        exit_with_error(serde_json::json!({
+            "error": format!("workflow '{}' not found", name),
+            "command": "cancel"
+        }));
+    }
+
+    let (header, events) = match read_events(&state_path) {
+        Ok(result) => result,
+        Err(err) => {
+            let code = exit_code_for_engine_error(&err);
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": err.to_string(),
+                    "command": "cancel"
+                }),
+                code,
+            );
+        }
+    };
+
+    // Check for double-cancel.
+    let already_cancelled = events
+        .iter()
+        .any(|e| matches!(e.payload, EventPayload::WorkflowCancelled { .. }));
+    if already_cancelled {
+        exit_with_error_code(
+            serde_json::json!({
+                "error": format!("workflow '{}' is already cancelled", name),
+                "command": "cancel"
+            }),
+            2,
+        );
+    }
+
+    // Derive current state and check if terminal.
+    let machine_state = match derive_machine_state(&header, &events) {
+        Some(ms) => ms,
+        None => {
+            exit_with_error(serde_json::json!({
+                "error": "corrupt state file: cannot derive current state",
+                "command": "cancel"
+            }));
+        }
+    };
+
+    // Load template to check terminal status.
+    let template_bytes = match std::fs::read(&machine_state.template_path) {
+        Ok(b) => b,
+        Err(e) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!("failed to read template: {}", e),
+                    "command": "cancel"
+                }),
+                3,
+            );
+        }
+    };
+    let compiled: CompiledTemplate = match serde_json::from_slice(&template_bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!("failed to parse template: {}", e),
+                    "command": "cancel"
+                }),
+                3,
+            );
+        }
+    };
+
+    let current_state = &machine_state.current_state;
+    if let Some(template_state) = compiled.states.get(current_state) {
+        if template_state.terminal {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!("workflow '{}' is already in terminal state '{}'", name, current_state),
+                    "command": "cancel"
+                }),
+                2,
+            );
+        }
+    }
+
+    // Append the WorkflowCancelled event.
+    let payload = EventPayload::WorkflowCancelled {
+        state: current_state.clone(),
+        reason: "cancelled by user".to_string(),
+    };
+    if let Err(e) = append_event(&state_path, &payload, &now_iso8601()) {
+        exit_with_error(serde_json::json!({
+            "error": e.to_string(),
+            "command": "cancel"
+        }));
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "name": name,
+            "state": current_state,
+            "cancelled": true
+        }))?
+    );
+    Ok(())
 }

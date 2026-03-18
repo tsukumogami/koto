@@ -1624,6 +1624,138 @@ fn concurrent_next_fails_with_lock_contention() {
 }
 
 // ---------------------------------------------------------------------------
+// scenario-38: koto cancel prevents further advancement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cancel_then_next_returns_terminal_state_error() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "cancel-wf", &template_with_accepts());
+
+    // Cancel the workflow.
+    let cancel = koto()
+        .current_dir(dir.path())
+        .args(["cancel", "cancel-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        cancel.status.success(),
+        "cancel should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&cancel.stdout),
+        String::from_utf8_lossy(&cancel.stderr)
+    );
+
+    let cancel_json: serde_json::Value = serde_json::from_slice(&cancel.stdout).unwrap();
+    assert_eq!(cancel_json["cancelled"], true);
+    assert_eq!(cancel_json["name"].as_str(), Some("cancel-wf"));
+
+    // Now koto next should fail with terminal_state error.
+    let next = koto()
+        .current_dir(dir.path())
+        .args(["next", "cancel-wf"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        next.status.code(),
+        Some(2),
+        "next after cancel should fail with exit 2"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&next.stdout).unwrap();
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("terminal_state"),
+        "error code should be terminal_state"
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled"),
+        "error message should mention cancelled"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-39: double-cancel returns error
+// ---------------------------------------------------------------------------
+
+#[test]
+fn double_cancel_returns_error() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "dbl-cancel-wf", &template_with_accepts());
+
+    // First cancel succeeds.
+    let first = koto()
+        .current_dir(dir.path())
+        .args(["cancel", "dbl-cancel-wf"])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+
+    // Second cancel fails.
+    let second = koto()
+        .current_dir(dir.path())
+        .args(["cancel", "dbl-cancel-wf"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        second.status.code(),
+        Some(2),
+        "double cancel should fail with exit 2"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("already cancelled"),
+        "error should mention already cancelled"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-40: cancel already-terminal workflow returns error
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cancel_terminal_workflow_returns_error() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "term-cancel-wf", minimal_template());
+
+    // Auto-advance to terminal state.
+    let advance = koto()
+        .current_dir(dir.path())
+        .args(["next", "term-cancel-wf", "--to", "done"])
+        .output()
+        .unwrap();
+    assert!(advance.status.success());
+
+    // Cancel should fail because workflow is already terminal.
+    let cancel = koto()
+        .current_dir(dir.path())
+        .args(["cancel", "term-cancel-wf"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        cancel.status.code(),
+        Some(2),
+        "cancel on terminal should fail with exit 2"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&cancel.stdout).unwrap();
+    assert!(
+        json["error"].as_str().unwrap().contains("terminal state"),
+        "error should mention terminal state"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // scenario-36: Gate timeout kills entire process group
 // ---------------------------------------------------------------------------
 

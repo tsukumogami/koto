@@ -55,6 +55,10 @@ pub enum EventPayload {
         from: String,
         to: String,
     },
+    WorkflowCancelled {
+        state: String,
+        reason: String,
+    },
 }
 
 impl EventPayload {
@@ -67,6 +71,7 @@ impl EventPayload {
             EventPayload::DirectedTransition { .. } => "directed_transition",
             EventPayload::IntegrationInvoked { .. } => "integration_invoked",
             EventPayload::Rewound { .. } => "rewound",
+            EventPayload::WorkflowCancelled { .. } => "workflow_cancelled",
         }
     }
 }
@@ -186,6 +191,14 @@ impl<'de> Deserialize<'de> for Event {
                     to: p.to,
                 }
             }
+            "workflow_cancelled" => {
+                let p: WorkflowCancelledPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::WorkflowCancelled {
+                    state: p.state,
+                    reason: p.reason,
+                }
+            }
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown event type: {}",
@@ -241,6 +254,12 @@ struct IntegrationInvokedPayload {
 struct RewoundPayload {
     from: String,
     to: String,
+}
+
+#[derive(Deserialize)]
+struct WorkflowCancelledPayload {
+    state: String,
+    reason: String,
 }
 
 /// Metadata about a workflow, derived from the state file header.
