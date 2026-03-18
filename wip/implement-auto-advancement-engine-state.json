@@ -8,12 +8,12 @@
     {
       "number": 1,
       "title": "feat(engine): add transition resolution types and function",
-      "status": "pending",
-      "ci_status": "pending",
+      "status": "completed",
+      "ci_status": "passed",
       "ci_fix_attempts": 0,
       "issue_type": "",
       "dependencies": [],
-      "commits": [],
+      "commits": ["cabf713"],
       "agent_type": "",
       "summary": null,
       "testable_scenarios": []
@@ -21,12 +21,12 @@
     {
       "number": 2,
       "title": "feat(engine): add advancement loop",
-      "status": "pending",
+      "status": "implemented",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
       "issue_type": "",
       "dependencies": [],
-      "commits": [],
+      "commits": ["cabf713"],
       "agent_type": "",
       "summary": null,
       "testable_scenarios": []
