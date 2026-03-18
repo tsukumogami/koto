@@ -17,6 +17,11 @@ Engine-Layer Advancement: advance_until_stop() in src/engine/advance.rs with inj
 I/O closures. Chosen for testability, reuse potential, and clean separation of workflow
 logic from CLI concerns.
 
+## Investigation Findings (Phase 3)
+- **Transition resolution**: Evidence matching uses exact JSON equality with conjunction semantics. Evidence from multiple events merged last-write-wins. Unconditional transitions serve as fallback. Compiler doesn't validate unconditional count -- engine must handle defensively.
+- **Integration runner**: Types scaffolded but unimplemented. Config system deferred; engine takes a closure. Re-invocation prevention needed (check for existing integration_invoked event in current epoch).
+- **Signal handling**: append_event crash safety sufficient (truncated-line recovery). signal-hook crate for AtomicBool. Advisory flock for concurrent access protection. Gate timeout can delay shutdown up to 30s.
+
 ## Current Status
-**Phase:** 2 - Present Approaches
+**Phase:** 3 - Deep Investigation
 **Last Updated:** 2026-03-17

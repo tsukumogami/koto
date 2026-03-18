@@ -88,6 +88,47 @@ three I/O operations; this level of machinery is more than the problem warrants.
 The engine-layer approach captures most of the testability benefit through injected
 closures without the protocol complexity.
 
+### Decision 2: Concurrent access protection
+
+**Context:** The advancement loop holds the state file logically open for the
+duration of the chain, which could span multiple gate evaluations and event appends.
+Without protection, a concurrent `koto next` call could interleave writes and
+produce duplicate sequence numbers. The existing `read_events` catches sequence
+gaps on the next read, but the corruption has already happened.
+
+**Chosen: Advisory flock around the loop.**
+
+Acquire an exclusive advisory lock (`flock`) on the state file at the start of the
+advancement loop, release on exit. A second `koto next` call gets an immediate error
+(non-blocking lock attempt) rather than waiting or silently corrupting the log.
+
+*Alternative rejected: Defer to a future issue.* The sequence gap detection provides
+post-hoc detection, but the advancement loop's longer execution window makes
+concurrent access more likely than with single-shot dispatch. Fixing it later means
+debugging corrupted state files in the interim.
+
+*Alternative rejected: PID file approach.* More complex to implement correctly
+(stale PID cleanup, race conditions) and doesn't provide the same file-level
+guarantee as flock.
+
+### Decision 3: Integration runner scope
+
+**Context:** The upstream design specifies an integration configuration system
+(project config or plugin manifest) for resolving integration names to executable
+runners. This is the biggest open question for the integration runner.
+
+**Chosen: Defer config, design the closure interface only.**
+
+The engine takes an integration closure (`Fn(&str) -> Result<Value, IntegrationError>`).
+The CLI handler passes a stub that always returns `IntegrationUnavailable`. The
+config system becomes a separate issue. The engine is ready for a real runner when
+it arrives -- the closure signature is the contract.
+
+*Alternative rejected: Include minimal config system.* Designing a config format
+(e.g., `.koto/integrations.toml`) and subprocess runner adds scope that isn't needed
+for the advancement loop itself. The closure interface means the config system can
+be built independently without changing the engine.
+
 ## Decision Outcome
 
 The auto-advancement engine lives in `src/engine/advance.rs` as a function that
@@ -103,4 +144,6 @@ Key properties:
   is always durable before the check
 - `StopReason` maps to `NextResponse` in the handler, keeping CLI serialization
   concerns out of the engine
+- Advisory flock on the state file prevents concurrent advancement loops
+- Integration runner is a closure interface; config system deferred to a separate issue
 - `koto cancel` is a new subcommand that appends a `workflow_cancelled` event
