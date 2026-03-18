@@ -124,11 +124,9 @@ pub fn resolve_transition(
         match &transition.when {
             Some(conditions) => {
                 has_conditional = true;
-                let all_match = conditions.iter().all(|(field, expected)| {
-                    evidence
-                        .get(field)
-                        .map_or(false, |actual| actual == expected)
-                });
+                let all_match = conditions
+                    .iter()
+                    .all(|(field, expected)| evidence.get(field) == Some(expected));
                 if all_match {
                     conditional_matches.push(transition.target.clone());
                 }
