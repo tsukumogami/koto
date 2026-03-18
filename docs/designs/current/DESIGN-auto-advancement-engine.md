@@ -1,5 +1,5 @@
 ---
-status: Planned
+status: Current
 problem: |
   koto next evaluates one state and returns. States with no accepts block, passing
   gates, and unconditional transitions require the agent to manually chain through
@@ -28,7 +28,7 @@ rationale: |
 
 ## Status
 
-Planned
+Current
 
 ## Upstream Design Reference
 
