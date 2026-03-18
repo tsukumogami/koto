@@ -111,7 +111,25 @@ debugging corrupted state files in the interim.
 (stale PID cleanup, race conditions) and doesn't provide the same file-level
 guarantee as flock.
 
-### Decision 3: Integration runner scope
+### Decision 3: Flock behavior on contention
+
+**Context:** When a second `koto next` call tries to acquire the flock while the
+advancement loop is running, it could either wait (blocking) or fail immediately
+(non-blocking).
+
+**Chosen: Non-blocking with immediate error.**
+
+A second caller gets an error exit (code 1, transient) telling it the workflow is
+currently being advanced. The agent can retry later. This prevents accidental
+deadlocks if a crashed process leaves a stale lock (advisory locks are released on
+process exit, but blocking waits are harder to reason about in signal-heavy code).
+
+*Alternative rejected: Blocking wait.* Simpler for the caller (just waits), but
+creates hidden latency. The agent doesn't know why the call is slow, and if the
+first process is killed without releasing the lock (shouldn't happen with advisory
+locks, but defense in depth), the second process hangs.
+
+### Decision 4: Integration runner scope
 
 **Context:** The upstream design specifies an integration configuration system
 (project config or plugin manifest) for resolving integration names to executable
@@ -147,3 +165,279 @@ Key properties:
 - Advisory flock on the state file prevents concurrent advancement loops
 - Integration runner is a closure interface; config system deferred to a separate issue
 - `koto cancel` is a new subcommand that appends a `workflow_cancelled` event
+
+## Solution Architecture
+
+### Overview
+
+The advancement engine is a loop function in `src/engine/advance.rs` that chains
+through workflow states until hitting a stopping condition. It sits between the
+existing pure classifier (`dispatch_next`) and the CLI handler (`handle_next`),
+owning the iteration logic while delegating all I/O to injected closures.
+
+The handler acquires an advisory flock on the state file, sets up I/O closures,
+registers a signal handler, and calls `advance_until_stop()`. The engine returns
+a `StopReason` that the handler translates into a `NextResponse` for JSON
+serialization.
+
+### Components
+
+```
+handle_next (src/cli/mod.rs)
+  │
+  ├─ Acquires flock on state file
+  ├─ Registers SIGTERM/SIGINT → AtomicBool via signal-hook
+  ├─ Sets up I/O closures:
+  │   ├─ append_event closure (wraps existing append_event + in-memory event list)
+  │   ├─ evaluate_gates closure (wraps existing evaluate_gates)
+  │   └─ invoke_integration closure (stub returning IntegrationUnavailable)
+  │
+  ├─ Calls advance_until_stop()
+  │       │
+  │       ├─ advance_until_stop (src/engine/advance.rs)
+  │       │   ├─ Maintains visited: HashSet<String>
+  │       │   ├─ Maintains current_state: String
+  │       │   ├─ Per iteration:
+  │       │   │   ├─ Check shutdown flag
+  │       │   │   ├─ Check visited set (cycle detection)
+  │       │   │   ├─ Check terminal
+  │       │   │   ├─ Check integration (invoke runner, stop)
+  │       │   │   ├─ Evaluate gates (via closure)
+  │       │   │   ├─ Resolve transition (via resolve_transition)
+  │       │   │   ├─ Append transitioned event (via closure)
+  │       │   │   └─ Continue loop
+  │       │   └─ Returns AdvanceResult { final_state, stop_reason }
+  │       │
+  │       └─ resolve_transition (src/engine/advance.rs)
+  │           ├─ Pure function
+  │           ├─ Merges evidence (last-write-wins per field)
+  │           ├─ Matches against when conditions (exact JSON equality)
+  │           └─ Returns TransitionResolution enum
+  │
+  ├─ Maps StopReason → NextResponse
+  └─ Serializes and exits
+
+handle_cancel (src/cli/mod.rs)
+  ├─ Loads state file
+  ├─ Appends WorkflowCancelled event
+  └─ Prints confirmation
+```
+
+### Key Interfaces
+
+**advance_until_stop signature:**
+
+```rust
+pub fn advance_until_stop<F, G, I>(
+    current_state: &str,
+    template: &CompiledTemplate,
+    evidence: &BTreeMap<String, serde_json::Value>,
+    append_event: &mut F,
+    evaluate_gates: &G,
+    invoke_integration: &I,
+    shutdown: &AtomicBool,
+) -> Result<AdvanceResult, AdvanceError>
+where
+    F: FnMut(&EventPayload) -> Result<(), PersistenceError>,
+    G: Fn(&BTreeMap<String, Gate>, &Path) -> BTreeMap<String, GateResult>,
+    I: Fn(&str) -> Result<serde_json::Value, IntegrationError>,
+```
+
+**AdvanceResult and StopReason:**
+
+```rust
+pub struct AdvanceResult {
+    pub final_state: String,
+    pub advanced: bool,  // true if any transitions were made
+    pub stop_reason: StopReason,
+}
+
+pub enum StopReason {
+    Terminal,
+    GateBlocked(BTreeMap<String, GateResult>),
+    EvidenceRequired,
+    Integration { name: String, output: serde_json::Value },
+    IntegrationUnavailable { name: String },
+    CycleDetected { state: String },
+    SignalReceived,
+}
+```
+
+**TransitionResolution:**
+
+```rust
+pub enum TransitionResolution {
+    Resolved(String),           // target state name
+    NeedsEvidence,              // conditional transitions exist but none match
+    Ambiguous(Vec<String>),     // multiple matches (runtime error)
+    NoTransitions,              // dead-end state (runtime error)
+}
+```
+
+**resolve_transition signature:**
+
+```rust
+pub fn resolve_transition(
+    template_state: &TemplateState,
+    evidence: &BTreeMap<String, serde_json::Value>,
+) -> TransitionResolution
+```
+
+Resolution logic:
+1. Collect conditional transitions (those with `when: Some(...)`)
+2. For each, check if all `when` fields match the evidence (exact JSON equality)
+3. If exactly one matches, return `Resolved(target)`
+4. If multiple match, return `Ambiguous` (runtime error for multi-field overlap)
+5. If none match and an unconditional transition exists, return `Resolved(fallback)`
+6. If none match and no unconditional fallback, return `NeedsEvidence`
+7. If no transitions at all, return `NoTransitions`
+
+**Evidence merging:**
+
+Before calling `resolve_transition`, evidence from the current epoch's
+`evidence_submitted` events is merged into a single `BTreeMap`. Later submissions
+for the same field override earlier ones (last-write-wins within the epoch).
+
+**Re-invocation prevention for integrations:**
+
+Before invoking the integration runner, the engine checks whether an
+`integration_invoked` event already exists in the current epoch for the current
+state. If so, it skips re-invocation and returns `Integration` with the stored
+output from the existing event.
+
+### Data Flow
+
+```
+koto next [--with-data JSON] [--to target]
+  │
+  ├─ Load state file, derive machine state
+  ├─ Load compiled template, verify hash
+  ├─ Acquire flock (non-blocking; fail if locked)
+  ├─ Register signal handler → AtomicBool
+  │
+  ├─ If --to: directed transition (existing behavior, no loop)
+  │
+  ├─ If --with-data: validate + append evidence_submitted
+  │
+  ├─ Merge evidence from current epoch events
+  │
+  ├─ advance_until_stop(current_state, template, evidence, closures, flag):
+  │   ├─ visited := {current_state}
+  │   └─ loop:
+  │       ├─ if shutdown flag set: return SignalReceived
+  │       ├─ if terminal: return Terminal
+  │       ├─ if integration_invoked exists in epoch: return Integration(stored)
+  │       ├─ if integration configured: invoke runner
+  │       │   ├─ success: append integration_invoked, return Integration
+  │       │   └─ error: return IntegrationUnavailable
+  │       ├─ evaluate gates: if any fail → return GateBlocked
+  │       ├─ resolve_transition(template_state, evidence):
+  │       │   ├─ Resolved(target): append transitioned, update current, continue
+  │       │   ├─ NeedsEvidence: return EvidenceRequired
+  │       │   ├─ Ambiguous: return error
+  │       │   └─ NoTransitions: return error
+  │       ├─ if visited[target]: return CycleDetected
+  │       ├─ visited.insert(target)
+  │       └─ current_state = target
+  │
+  ├─ Map StopReason → NextResponse
+  ├─ Release flock
+  └─ Print JSON, exit
+```
+
+**`koto cancel` data flow:**
+
+```
+koto cancel <workflow-name>
+  │
+  ├─ Load state file
+  ├─ Verify workflow is not already terminal or cancelled
+  ├─ Append WorkflowCancelled event
+  └─ Print confirmation JSON
+```
+
+## Implementation Approach
+
+### Phase 1: Transition resolution and advance engine
+
+Build the core engine without signal handling or file locking.
+
+Deliverables:
+- `src/engine/advance.rs`: `resolve_transition()`, `advance_until_stop()`,
+  `AdvanceResult`, `StopReason`, `TransitionResolution` types
+- Unit tests for transition resolution (unconditional, conditional, fallback,
+  ambiguous, no-transitions cases)
+- Unit tests for the advancement loop using mock closures (auto-advance chain,
+  gate-blocked stop, evidence-required stop, cycle detection, integration stop)
+
+### Phase 2: Handler integration
+
+Wire `advance_until_stop()` into `handle_next`, replacing the single-shot dispatch.
+
+Deliverables:
+- Refactor `handle_next` to call `advance_until_stop()` with I/O closures
+- `StopReason` → `NextResponse` mapping in the handler
+- Evidence merging from epoch events before calling the engine
+- Integration tests verifying multi-state auto-advancement via CLI
+
+### Phase 3: Signal handling and file locking
+
+Add signal-based shutdown and concurrent access protection.
+
+Deliverables:
+- `signal-hook` dependency in `Cargo.toml`
+- `AtomicBool` registration for SIGTERM/SIGINT in `handle_next`
+- Advisory flock acquisition/release around the advancement loop
+- Tests for signal-interrupted advancement and concurrent access rejection
+
+### Phase 4: koto cancel
+
+Add the workflow cancellation subcommand.
+
+Deliverables:
+- `WorkflowCancelled` variant in `EventPayload`
+- `Command::Cancel` variant and handler
+- `dispatch_next` / engine recognizes cancelled state as terminal
+- Integration tests for cancel behavior
+
+## Consequences
+
+### Positive
+
+- Auto-advancement removes the tedious agent back-and-forth for intermediate
+  states. A 5-state workflow with 3 auto-advance states goes from 7 CLI calls
+  to 1.
+- The engine is unit-testable without filesystem or process spawning, catching
+  loop logic bugs before they reach integration tests.
+- Advisory flock prevents a class of corruption bugs that would be painful to
+  debug in production.
+- The closure interface means the integration runner can be built independently
+  without modifying the engine.
+
+### Negative
+
+- `handle_next` refactor is nontrivial. The 340-line function needs restructuring
+  to set up closures and call the engine, which touches the most complex code path
+  in the CLI.
+- Two classification systems coexist: `dispatch_next` returns `NextResponse`,
+  the engine returns `StopReason`. The mapping between them is straightforward
+  but adds a translation layer.
+- Gate evaluation can delay signal-based shutdown by up to 30 seconds (the default
+  gate timeout). Fast shutdown would require killing the child process group from
+  the signal handler.
+- `append_event` re-reads the entire file on every call to determine the next
+  sequence number. The advancement loop calls it multiple times per invocation,
+  making this progressively slower for long workflows.
+
+### Mitigations
+
+- The `handle_next` refactor is isolated to one function. The engine is new code
+  with clean interfaces. Risk is contained.
+- The `StopReason` → `NextResponse` mapping is a single match expression. The
+  types are aligned by design.
+- Gate timeout delay is acceptable per the upstream design ("complete the
+  in-progress atomic append before exiting"). Workflows sensitive to shutdown
+  latency can use shorter gate timeouts.
+- The `append_event` performance concern can be addressed by passing the expected
+  next sequence number as a parameter, avoiding the file read. This is a targeted
+  optimization for a later issue.
