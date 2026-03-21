@@ -29,29 +29,29 @@ workflow-tool implementation.
 
 ## Out of Scope
 
-- `/work-on`, `/just-do-it`, and other commands (unless they share core requirements)
+- `/implement` multi-issue orchestration (deferred — requires orchestrator layer above koto)
 - Cross-agent delegation (tracked as koto issue #41)
-- Shirabe skill extraction
 - Adding new koto subcommands (not the direction)
 
-## Research Leads
+## Round 1 Decisions
 
-1. **What external actions and checks does `/implement` need at each phase?**
-   Read the implement skill, phase files, and state-management schema to catalog every
-   non-agent action: CI checks, PR creation, issue status queries, approval gates.
+- `/implement` requires a multi-workflow orchestrator layer above koto — not the first target
+- Integration runner config system is deferred; phase 1 may not need it
+- Focus shifted to merged work-on/just-do-it as the first koto-backed shirabe skill
+- shirabe already has /work-on; /just-do-it could merge into it cleanly
 
-2. **How does koto's integration system work today, and what can it already drive?**
-   Read the template format and integration field docs to understand invocation model,
-   response handling, and config structure.
+## Round 2 Research Leads
 
-3. **Which of /implement's external actions map cleanly to koto integrations, and which don't?**
-   Cross-reference leads 1 and 2 — look for shape mismatches, especially around
-   polling/query patterns vs fire-and-forget.
+1. **What is the actual overlap between work-on and just-do-it, and what's the merge cost?**
+   Read both skill structures in the tools repo. Map where they share phases vs. diverge.
+   Identify whether the difference is structural or just a template parameter (e.g. optional issue).
 
-4. **What does `DESIGN-workflow-tool-oss.md` say about the extraction path and anticipated integrations?**
-   This strategic design in the vision project likely enumerates what koto needs to
-   support workflow-tool replacement.
+2. **What would a koto template for the merged work-on/just-do-it skill look like?**
+   Map the phases to koto states, identify evidence gates at each transition, figure out
+   where branching happens (e.g. "does this need a design doc?"), and assess whether the
+   result is a clean linear state machine or requires complex branching.
 
-5. **Can /implement's multi-issue state model be expressed as koto template state + event log?**
-   Focus on the wip/ state file schema, the controller loop, and dependency graph
-   sequencing — these are structurally most different from a single-workflow koto session.
+3. **Does the merged skill need any koto integrations, or is the agent the integration?**
+   Specifically: does CI checking need to be a koto gate/integration, or is "wait for CI
+   and report back" something the agent directive can handle? What about PR creation — does
+   koto need to know about it, or is it just an action the agent takes within a state?
