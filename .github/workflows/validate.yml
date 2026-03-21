@@ -113,6 +113,8 @@ jobs:
     name: Distributed Install (tsuku)
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Install tsuku
         env:
           GH_TOKEN: ${{ github.token }}
