@@ -120,16 +120,24 @@ jobs:
           curl -fsSL https://get.tsuku.dev/now | bash
           echo "$HOME/.tsuku/bin" >> $GITHUB_PATH
 
-      - name: Validate recipe file
-        run: tsuku validate .tsuku-recipes/koto.toml
+      - name: Install koto from local recipe (PR)
+        if: github.event_name == 'pull_request'
+        env:
+          TSUKU_TELEMETRY: "0"
+        run: |
+          export TSUKU_HOME=/tmp/tsuku-test
+          mkdir -p $TSUKU_HOME/recipes
+          cp .tsuku-recipes/koto.toml $TSUKU_HOME/recipes/koto.toml
+          tsuku install koto -y
+          $TSUKU_HOME/bin/koto version
 
-      - name: Install koto via distributed recipe
+      - name: Install koto via distributed recipe (push)
         if: github.event_name == 'push'
         env:
           TSUKU_TELEMETRY: "0"
         run: tsuku install tsukumogami/koto -y
 
-      - name: Verify installed koto
+      - name: Verify installed koto (push)
         if: github.event_name == 'push'
         run: koto version
 
