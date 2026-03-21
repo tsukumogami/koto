@@ -10,7 +10,7 @@ on:
 jobs:
   prompt-eval:
     name: Prompt Regression Eval
-    if: ${{ github.event.pull_request.draft != true && secrets.ANTHROPIC_API_KEY != '' }}
+    if: ${{ github.event.pull_request.draft != true }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +26,10 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "ANTHROPIC_API_KEY not configured, skipping prompt evals"
+            exit 0
+          fi
           export PATH="$PWD/target/release:$PATH"
           bash plugins/koto-skills/eval.sh
 
