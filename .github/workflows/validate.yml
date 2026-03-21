@@ -116,12 +116,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install tsuku
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download --repo tsukumogami/tsuku --pattern 'tsuku-linux-amd64' --output tsuku
-          chmod +x tsuku
-          echo "$PWD" >> $GITHUB_PATH
+          curl -fsSL https://get.tsuku.dev/now | bash
           echo "$HOME/.tsuku/bin" >> $GITHUB_PATH
 
       - name: Validate recipe file
