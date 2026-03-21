@@ -129,7 +129,7 @@ jobs:
           mkdir -p $TSUKU_HOME/recipes
           cp .tsuku-recipes/koto.toml $TSUKU_HOME/recipes/koto.toml
           tsuku install koto -y
-          $TSUKU_HOME/bin/koto version
+          $TSUKU_HOME/tools/current/koto version
 
       - name: Install koto via distributed recipe (push)
         if: github.event_name == 'push'
