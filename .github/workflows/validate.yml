@@ -114,6 +114,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install tsuku
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh release download --repo tsukumogami/tsuku --pattern 'tsuku-linux-amd64' --output tsuku
           chmod +x tsuku
