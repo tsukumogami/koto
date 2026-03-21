@@ -122,12 +122,17 @@ jobs:
           echo "$PWD" >> $GITHUB_PATH
           echo "$HOME/.tsuku/bin" >> $GITHUB_PATH
 
+      - name: Validate recipe file
+        run: tsuku validate .tsuku-recipes/koto.toml
+
       - name: Install koto via distributed recipe
+        if: github.event_name == 'push'
         env:
           TSUKU_TELEMETRY: "0"
         run: tsuku install tsukumogami/koto -y
 
       - name: Verify installed koto
+        if: github.event_name == 'push'
         run: koto version
 
   validate:
