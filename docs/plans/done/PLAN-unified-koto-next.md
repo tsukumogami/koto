@@ -1,6 +1,6 @@
 ---
 schema: plan/v1
-status: Active
+status: Done
 execution_mode: multi-pr
 upstream: docs/designs/DESIGN-unified-koto-next.md
 milestone: "Unified koto next Command"
