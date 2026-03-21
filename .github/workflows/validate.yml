@@ -109,9 +109,28 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false
 
+  tsuku-distributed-install:
+    name: Distributed Install (tsuku)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install tsuku
+        run: |
+          gh release download --repo tsukumogami/tsuku --pattern 'tsuku-linux-amd64' --output tsuku
+          chmod +x tsuku
+          echo "$PWD" >> $GITHUB_PATH
+          echo "$HOME/.tsuku/bin" >> $GITHUB_PATH
+
+      - name: Install koto via distributed recipe
+        env:
+          TSUKU_TELEMETRY: "0"
+        run: tsuku install tsukumogami/koto -y
+
+      - name: Verify installed koto
+        run: koto version
+
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, fmt, clippy, audit]
+    needs: [check-artifacts, unit-tests, fmt, clippy, audit, tsuku-distributed-install]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -121,6 +140,7 @@ jobs:
              [ "${{ needs.unit-tests.result }}" = "failure" ] || \
              [ "${{ needs.fmt.result }}" = "failure" ] || \
              [ "${{ needs.clippy.result }}" = "failure" ] || \
-             [ "${{ needs.audit.result }}" = "failure" ]; then
+             [ "${{ needs.audit.result }}" = "failure" ] || \
+             [ "${{ needs.tsuku-distributed-install.result }}" = "failure" ]; then
             exit 1
           fi
