@@ -20,6 +20,29 @@ without adding surface to koto.
 - Open design questions: full state list + evidence schema, skip pattern mechanics,
   shirabe invocation (SessionStart hook, koto init, directive loop), session resume behavior
 
+## Approaches Investigated (Phase 1)
+
+- fine-grained: Maximum enforcement (9 states, evidence at every boundary) but 500+ line
+  template with ceremony-heavy evidence fields that don't affect routing. Jury routing
+  and iterative implementation don't map cleanly to state transitions.
+- coarse-grained: Simple 3-4 checkpoint template but loses enforcement at the transitions
+  that matter (staleness detection invisible to koto). Audit trail fragments.
+- auto-advancing: ~8 states, auto-advances through execution phases, evidence gates only
+  at 3 decision points (staleness, plan approval, CI). Right level of abstraction.
+
+## Phase 2 Status: Recommendation pending user confirmation
+
+**Recommendation:** auto-advancing with minimal evidence gates.
+
+Rationale: evidence gates belong where routing branches, not where the agent is just
+confirming it did what the directive said. Fine-grained over-specifies. Coarse-grained
+under-enforces at the staleness branch. Auto-advancing captures the enforcement value
+with minimal overhead and a ~150 line template.
+
+**Pending:** User confirmation of approach. Once confirmed, proceed to Phase 3 (deep
+investigation of the chosen approach) covering: full state list, directive text, evidence
+schema design, shirabe invocation mechanics, session resume behavior.
+
 ## Current Status
-**Phase:** 0 - Setup (Explore Handoff)
+**Phase:** 2 - Present Approaches (awaiting user confirmation)
 **Last Updated:** 2026-03-21
