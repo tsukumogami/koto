@@ -28,8 +28,9 @@ rationale: |
   by the reversibility constraint — only undoable actions auto-execute. Two needs-design
   prerequisites (--var substitution and default action execution) provide the engine
   capabilities. The SKILL.md orchestration wrapper (~55 lines) is eliminated because
-  koto tracks state directly. The agent instruction reduction (~42% of 995 lines) is
-  the primary measurable outcome.
+  koto tracks state directly. Structured enforcement alone yields ~15-20% instruction
+  reduction; with default action execution (Phase 0b), the reduction reaches ~42% of
+  995 lines.
 ---
 
 # DESIGN: shirabe work-on koto template
@@ -195,9 +196,12 @@ Two validation states in the free-form path:
 2. `post_research_validation` (after research, before setup) — ternary routing decision
    informed by codebase findings: `verdict: enum[ready, needs_design, exit]` with
    `rationale: string` and optional `revised_scope: string`. Catches tasks that research
-   reveals to be misconceived relative to current codebase state.
+   reveals to be misconceived relative to current codebase state. `needs_design` routes
+   to `validation_exit` (same as `exit`, but the rationale captures that a design doc is
+   needed before implementation can proceed).
 
-Both states route to `validation_exit` (terminal). The free-form path becomes:
+Both `exit` and `needs_design` route to `validation_exit` (terminal). The free-form path
+becomes:
 `task_validation` → `research` → `post_research_validation` → `setup_free_form`. This
 matches just-do-it's jury → research → validation-jury → setup structure without requiring
 multi-agent jury mechanics.
@@ -356,53 +360,38 @@ Transitions use `when` conditions on `status`:
 - `override` → next state (override applied, default skipped)
 - `blocked` → recovery state or `done_blocked`
 
+This standard pattern applies to truly deterministic states (`context_injection`,
+`setup_issue_backed`, `setup_free_form`, `staleness_check`, `ci_monitor`). Judgment
+and judgment-with-verification states use domain-specific evidence schemas tailored
+to their routing needs (e.g., `plan_outcome`, `introspection_outcome`).
+
 **Safety constraint: reversibility determines execution policy.** Only reversible actions
-execute by default. If the agent misses a user override, koto runs the default — so the
-default must be undoable.
+execute by default; irreversible or externally-visible actions (PR creation) require
+agent confirmation. All current deterministic states are reversible:
 
-- **Reversible** (local file creation, branch creation, read-only checks): execute by
-  default. If an override was missed, the result can be undone.
-- **Irreversible or externally-visible** (PR creation, posting comments): require agent
-  confirmation. These remain judgment states.
-
-All current deterministic states are reversible:
-
-| State | Default action | Reversibility |
-|---|---|---|
-| `context_injection` | Run extract-context.sh, create wip file | File can be overwritten |
-| `setup_issue_backed` | Create feature branch, run baseline | Branch can be deleted |
-| `setup_free_form` | Create feature branch, run baseline | Branch can be deleted |
-| `staleness_check` | Run check-staleness.sh, evaluate output | Read-only |
-| `finalization` | Verify tests, create summary | File can be overwritten |
-| `ci_monitor` | Poll CI status | Read-only |
-
-PR creation is already classified as a judgment state — correctly, since it creates an
-externally-visible artifact.
-
-**Per-state behavior under the three-path model:**
-
-| State | Default action | Known overrides | Common failures |
-|---|---|---|---|
-| `context_injection` | Run extract-context.sh | User provides additional context | Script fails, issue inaccessible |
-| `setup_issue_backed` | Create branch, run baseline | User specifies existing branch | Branch name conflict, build broken |
-| `setup_free_form` | Create branch, run baseline | User specifies existing branch | Branch name conflict, build broken |
-| `staleness_check` | Run check-staleness.sh | User says "skip, issue is current" | Script fails, network error |
-| `finalization` | Verify tests, create summary | User provides custom summary | Tests regressed |
-| `ci_monitor` | Poll gh pr checks | User says "CI acceptable" | CI flaky, unresolvable failures |
+| State | Default action | Reversibility | Known overrides | Common failures |
+|---|---|---|---|---|
+| `context_injection` | Run extract-context.sh, create wip file | File can be overwritten | User provides additional context | Script fails, issue inaccessible |
+| `setup_issue_backed` | Create feature branch, run baseline | Branch can be deleted | User specifies existing branch | Branch name conflict, build broken |
+| `setup_free_form` | Create feature branch, run baseline | Branch can be deleted | User specifies existing branch | Branch name conflict, build broken |
+| `staleness_check` | Run check-staleness.sh, evaluate output | Read-only | User says "skip, issue is current" | Script fails, network error |
+| `ci_monitor` | Poll CI status | Read-only | User says "CI acceptable" | CI flaky, unresolvable failures |
 
 **Directive content model (follows from three-path model).** Two directive tiers matching
 the agent's interaction pattern:
 
-**Tier 1 — judgment states** (`entry`, `task_validation`, `post_research_validation`,
-`introspection`, `analysis`, `pr_creation`, `validation_exit`, `done_blocked`):
+**Tier 1 — judgment and judgment-with-verification states** (`entry`, `task_validation`,
+`post_research_validation`, `introspection`, `analysis`, `implementation`, `finalization`,
+`pr_creation`, `validation_exit`, `done_blocked`):
 Full directive (10-25 lines) covering what to accomplish, artifact paths, evidence
-schema, and resume guidance. These states always involve agent judgment.
+schema, and resume guidance. These states always involve agent work — either pure judgment
+or judgment with a verification gate that enables resume.
 
 **Tier 2 — deterministic states (exception path only)** (`context_injection`,
-`setup_issue_backed`, `setup_free_form`, `staleness_check`, `implementation`,
-`finalization`, `ci_monitor`): Override and failure guidance (3-8 lines). Only displayed
-when the default didn't execute or failed. Covers: recognized overrides, common failure
-recovery, evidence schema. On the happy path, the agent never sees these directives.
+`setup_issue_backed`, `setup_free_form`, `staleness_check`, `ci_monitor`): Override and
+failure guidance (3-8 lines). Only displayed when the default didn't execute or failed.
+Covers: recognized overrides, common failure recovery, evidence schema. On the happy
+path, the agent never sees these directives.
 
 The SKILL.md orchestration wrapper (~55 lines of resume detection and phase dispatch) is
 eliminated. koto tracks state; the skill calls `koto next` in a loop and injects full
@@ -481,7 +470,8 @@ plan issue vs. a GitHub issue.
 
 ---
 
-*Decision 8 (automation ceiling) has been merged into Decision 6+8 above.*
+*Decision 8 (automation ceiling: which states auto-execute and the reversibility
+constraint) has been merged into Decision 6+8 above.*
 
 ---
 
@@ -508,34 +498,41 @@ transitions — no epoch-scoped mode re-submission required.
 
 **State classification:**
 
-| State | Type | Default path | Override/failure path |
+| State | Type | Behavior | Agent involvement |
 |---|---|---|---|
-| `context_injection` | deterministic | koto runs extract-context.sh, verifies artifact | Agent submits override or failure evidence |
-| `setup_issue_backed` | deterministic | koto creates branch, runs baseline, verifies | Agent submits existing-branch override or failure |
-| `setup_free_form` | deterministic | koto creates branch, runs baseline, verifies | Agent submits existing-branch override or failure |
-| `staleness_check` | deterministic | koto runs check-staleness.sh, evaluates via piped gate | Agent submits skip override or failure |
-| `introspection` | deterministic | koto checks introspection artifact exists | Agent submits evidence on gate failure |
-| `analysis` | deterministic | koto checks plan file exists | Agent submits evidence on gate failure |
-| `implementation` | deterministic | koto checks branch, commits, tests pass | Agent submits evidence on gate failure |
-| `finalization` | deterministic | koto checks summary exists, tests pass | Agent submits evidence on gate failure |
-| `ci_monitor` | deterministic | koto polls CI status, verifies all pass | Agent submits CI-acceptable override or failure |
-| `entry` | judgment | — | Agent submits mode evidence |
-| `task_validation` | judgment | — | Agent assesses task, submits verdict |
-| `post_research_validation` | judgment | — | Agent reassesses after research |
-| `pr_creation` | judgment (irreversible) | — | Agent creates PR, submits evidence |
-| `research` | judgment | — | Unconditional transition |
+| `context_injection` | deterministic | koto runs extract-context.sh, verifies artifact | Override or failure only |
+| `setup_issue_backed` | deterministic | koto creates branch, runs baseline, verifies | Override or failure only |
+| `setup_free_form` | deterministic | koto creates branch, runs baseline, verifies | Override or failure only |
+| `staleness_check` | deterministic | koto runs check-staleness.sh, evaluates via piped gate | Override or failure only |
+| `ci_monitor` | deterministic | koto polls CI status, verifies all pass | Override or failure only |
+| `introspection` | judgment w/ verification gate | Agent re-reads issue against codebase; gate checks artifact exists on resume | Always (gate enables skip on resume) |
+| `analysis` | judgment w/ verification gate | Agent creates implementation plan; gate checks plan file exists on resume | Always (gate enables skip on resume) |
+| `implementation` | judgment w/ verification gate | Agent writes code and commits; gate checks branch state on resume | Always (gate enables skip on resume) |
+| `finalization` | judgment w/ verification gate | Agent creates summary and verifies; gate checks summary exists on resume | Always (gate enables skip on resume) |
+| `entry` | judgment | Agent submits mode evidence | Always |
+| `task_validation` | judgment | Agent assesses task, submits verdict | Always |
+| `post_research_validation` | judgment | Agent reassesses after research | Always |
+| `pr_creation` | judgment (irreversible) | Agent creates PR, submits evidence | Always |
+| `research` | judgment | Unconditional transition | Always |
 
-On the default path, deterministic states advance without agent involvement — koto
-executes the action and verifies the outcome. When the default doesn't apply (override)
-or fails, koto surfaces the evidence schema and the agent submits structured evidence
-(see Decision 6+8 for the standard `status: completed|override|blocked` pattern).
-Deterministic states carry Tier 2 directives (3-8 lines, override and failure guidance).
-Judgment states carry Tier 1 directives (10-25 lines, full orientation).
+Three state categories:
+
+- **Deterministic**: koto executes a default action and verifies the outcome. The
+  three-path model (default/override/failure) applies. Agents interact only on override
+  or failure. Tier 2 directives (3-8 lines). The standard `status: completed|override|blocked`
+  evidence pattern applies to these states.
+- **Judgment with verification gate**: the agent does the primary work, but koto has a
+  gate that checks for completion artifacts. On first execution, the agent always acts.
+  On resume, the gate auto-advances past completed work. The three-path model does not
+  apply — there is no default action. Tier 1 directives (10-25 lines). Evidence schemas
+  are domain-specific.
+- **Judgment**: the agent always acts, no gate. Tier 1 directives (10-25 lines). Evidence
+  schemas are domain-specific.
 
 The SKILL.md orchestration wrapper (~55 lines of resume detection and phase dispatch) is
 eliminated. koto tracks state; the skill calls `koto next` in a loop.
 
-Four engine capabilities are prerequisites, two of which are `needs-design`:
+Three engine capabilities are prerequisites, two of which are `needs-design`:
 
 1. **Gate-with-evidence-fallback**: the advancement loop must fall through to
    `NeedsEvidence` when a gate fails on a state with an `accepts` block, rather than
@@ -556,25 +553,10 @@ Four engine capabilities are prerequisites, two of which are `needs-design`:
 
 ### Rationale
 
-The automation-first principle — koto does deterministic work, agents do judgment work —
-requires three engine prerequisites: gate-with-evidence-fallback, `--var` substitution,
-and default action execution. The first is a targeted engine change; the latter two are
-`needs-design` issues with their own design scope.
-
-The three-path model (default/override/failure) makes the automation-first principle
-concrete for each deterministic step. The reversibility-based safety constraint addresses
-the opt-in/opt-out inversion: only reversible actions execute by default, so a missed
-override has recoverable consequences. All current deterministic states are reversible;
-PR creation (the only irreversible step) is already a judgment state.
-
-The ~42% agent instruction reduction (420 of 995 lines) remains the primary measurable
-outcome: the SKILL.md orchestration wrapper is eliminated, deterministic steps execute
-without agent involvement on the happy path, and agents interact with deterministic
-states only on override or failure.
-
-The split topology avoids requiring agents to re-submit mode at setup despite having
-already submitted it at entry. Two separate setup states make routing self-documenting. Retry/escalate variants in
-self-looping states give agents a structured escalation path with a clear audit record.
+Structured enforcement alone (orchestration wrapper eliminated, structured evidence,
+koto-managed sequencing) yields ~15-20% agent instruction reduction. With default action
+execution (Phase 0b), the reduction reaches ~42% (420 of 995 lines). See Decisions 1-7
+for the reasoning behind each design choice.
 
 ## Solution Architecture
 
@@ -681,8 +663,10 @@ research notes or codebase observations already made in the session.
 **`post_research_validation`** — reassesses the task against what research revealed
 about the current codebase. Always evidence-gated. Evidence: `verdict: enum[ready,
 needs_design, exit]`, `rationale: string`, `revised_scope: string` (optional, when
-task can proceed with a narrowed scope). `exit` routes to `validation_exit`.
-On resume: re-read the research context summary before assessing.
+task can proceed with a narrowed scope). Both `exit` and `needs_design` route to
+`validation_exit` — the rationale distinguishes them (e.g., "task needs a design doc
+before implementation"). On resume: re-read the research context summary before
+assessing.
 
 **`setup_issue_backed`** — creates feature branch and baseline file for issue-backed
 workflows. Gate: branch is not main/master, baseline file exists. Evidence fallback:
@@ -713,8 +697,9 @@ Gate: `test -f wip/issue_{{ISSUE_NUMBER}}_introspection.md`. Evidence fallback:
 Clarify and Amend outcomes from the sub-agent's internal loop.
 
 **`analysis`** — researches and creates implementation plan. Gate:
-`test -f wip/issue_{{ISSUE_NUMBER}}_plan.md` (issue-backed) or
-`ls wip/task_*_plan.md 2>/dev/null | grep -q .` (free-form, uses shell expansion).
+`test -f wip/{{ARTIFACT_PREFIX}}_plan.md`. The `{{ARTIFACT_PREFIX}}` variable is set at
+`koto init` time: `issue_71` for issue-backed, `task_add-retry-logic` for free-form
+(see Key Interfaces).
 Evidence fallback: `plan_outcome: enum[plan_ready, blocked_missing_context,
 scope_changed_retry, scope_changed_escalate]`, `approach_summary: string`.
 `scope_changed_retry` self-loops (up to 3 iterations). `scope_changed_escalate` and
@@ -730,10 +715,11 @@ self-loops (up to 3 iterations). `partial_tests_failing_escalate` and `blocked` 
 `_escalate` after 3 failed submissions. On resume: re-read the plan file, check git log
 and git status to identify what was already committed.
 
-**`finalization`** — cleanup, summary file, final verification. Gates: summary file
-exists, tests pass. Evidence fallback: `finalization_status: enum[ready_for_pr,
-deferred_items_noted, issues_found]`. `issues_found` routes to `implementation`
-to address blocking issues. On resume: check for existing summary file and test results.
+**`finalization`** — cleanup, summary file, final verification. Gates:
+`test -f wip/{{ARTIFACT_PREFIX}}_summary.md` and tests pass. Evidence fallback:
+`finalization_status: enum[ready_for_pr, deferred_items_noted, issues_found]`.
+`issues_found` routes to `implementation` to address blocking issues. On resume: check
+for existing summary file and test results.
 
 **`pr_creation`** — creates the pull request. Always evidence-gated (no gate can verify
 a PR was created before the action happens). Evidence: `pr_status: enum[created,
@@ -765,18 +751,22 @@ Reachable from multiple states via explicit escalation paths.
 
 **Initialize a workflow (issue-backed):**
 ```
-koto init work-on-71 --template .koto/templates/work-on.md --var ISSUE_NUMBER=71
+koto init work-on-71 --template .koto/templates/work-on.md \
+  --var ISSUE_NUMBER=71 --var ARTIFACT_PREFIX=issue_71
 ```
 Creates `koto-work-on-71.state.jsonl` in the current directory. Returns
 `{"name": "work-on-71", "state": "entry"}`. The `--var` flag stores the variable in
-the workflow's `WorkflowInitialized` event; `{{ISSUE_NUMBER}}` is substituted into
-gate commands at evaluation time.
+the workflow's `WorkflowInitialized` event; `{{ISSUE_NUMBER}}` and `{{ARTIFACT_PREFIX}}`
+are substituted into gate commands at evaluation time.
 
 **Initialize a workflow (free-form):**
 ```
-koto init work-on-add-retry-logic --template .koto/templates/work-on.md
+koto init work-on-add-retry-logic --template .koto/templates/work-on.md \
+  --var ARTIFACT_PREFIX=task_add-retry-logic
 ```
-No `--var` needed for free-form mode — no issue-specific gate commands apply.
+The `ARTIFACT_PREFIX` variable enables shared gates across both modes. No `ISSUE_NUMBER`
+is set — issue-specific gates (`staleness_check`, `introspection`) are only reachable
+in issue-backed mode.
 
 **Get directive and advance:**
 ```
@@ -809,35 +799,26 @@ koto next work-on-71    # get current directive
 
 ### Data Flow
 
-On session start, the skill checks `koto workflows` for an active `work-on-*` workflow.
-If found, it calls `koto next <name>` to resume at the current state, and re-reads any
-existing wip/ artifacts and git log before acting on the directive. If not found, it
-copies the template to `.koto/templates/work-on.md` (from the plugin directory) if it
-doesn't exist, calls `koto init` to start fresh, then `koto next <name>` to enter `entry`.
+**Session start:** the skill checks `koto workflows` for an active `work-on-*` workflow.
+If found, it calls `koto next <name>` to resume, re-reading wip/ artifacts and git log
+first. If not found, it copies the template to `.koto/templates/work-on.md` (from the
+plugin directory) if needed, calls `koto init`, then `koto next <name>` to enter `entry`.
 
-The agent loops: read directive from `koto next`, do the work, call `koto next` (bare or
-with `--with-data`) to advance. koto's evidence is epoch-scoped: each state transition
-clears the current evidence, so only evidence submitted in the current state is accessible
-for routing. `mode` is captured at `entry` for routing to the mode-specific first state
-(`context_injection` or `task_validation`). The two setup states route unconditionally to
-their respective post-setup states, so no mode re-submission is needed.
+**Session loop:** read directive from `koto next`, do the work, call `koto next` (bare or
+with `--with-data`) to advance. The koto state file (`koto-<name>.state.jsonl`) is
+committed to the feature branch alongside wip/ artifacts, enabling resume across sessions.
 
-Judgment states carry full Tier 1 directives (10-25 lines). Deterministic states carry
-Tier 2 directives (3-8 lines, override and failure guidance) — agents only see these
-when the default path didn't apply or failed. For `analysis` and `implementation`, the
-skill wrapper additionally injects the full phase procedure file before the agent begins
-work.
-
-wip/ artifact files created during the workflow:
-- `wip/issue_<N>_context.md` (issue-backed, created by extract-context.sh --issue <N>)
-- `wip/issue_<N>_baseline.md` (issue-backed) or `wip/task_<slug>_baseline.md` (free-form)
+**Artifact files** created during the workflow (naming uses `ARTIFACT_PREFIX` — see Key
+Interfaces):
+- `wip/issue_<N>_context.md` (issue-backed only, created by extract-context.sh)
+- `wip/<prefix>_baseline.md`
 - `wip/issue_<N>_introspection.md` (issue-backed, stale path only)
-- `wip/issue_<N>_plan.md` (issue-backed) or `wip/task_<slug>_plan.md` (free-form)
-- `wip/issue_<N>_summary.md` (issue-backed) or `wip/task_<slug>_summary.md` (free-form)
+- `wip/<prefix>_plan.md`
+- `wip/<prefix>_summary.md`
 
-The koto state file (`koto-<name>.state.jsonl`) is committed to the feature branch
-alongside wip/ artifacts, enabling resume in a new session by checking out the branch
-and calling `koto next`.
+For free-form workflows, the artifact slug is derived from the workflow name passed to
+`koto init` (e.g., `work-on-add-retry-logic` produces `task_add-retry-logic_plan.md`).
+The skill layer sets `ARTIFACT_PREFIX=task_<slug>` at init time.
 
 ## Implementation Approach
 
@@ -879,8 +860,8 @@ Scope for the child design:
 - Interaction with `--var` substitution (default action commands may reference
   `{{ISSUE_NUMBER}}`).
 
-Both Phase 0a and 0b block Phase 1 and all subsequent phases. They can be designed
-and implemented in parallel.
+Phase 0a, Phase 0b, and Phase 1 are all prerequisites for Phase 2 (the template) and
+can be designed and implemented in parallel with each other.
 
 ### Phase 1: Engine changes
 
@@ -909,7 +890,7 @@ Deliverables:
 - `shirabe/koto-templates/work-on.md`: the 17-state template with all directives, gate
   commands, and evidence schemas as specified in Solution Architecture. Judgment states
   get Tier 1 directives (action summary + resume preamble, 10-25 lines). Koto-gated
-  states get Tier 2 error-fallback directives (3-6 lines: "koto should have advanced
+  states get Tier 2 error-fallback directives (3-8 lines: "koto should have advanced
   past this state automatically; if you see this, [specific fallback action]"). Gate
   commands referencing `{{ISSUE_NUMBER}}` use `--var` substitution from Phase 0.
 - `koto template compile shirabe/koto-templates/work-on.md`: must pass with no errors.
@@ -932,11 +913,13 @@ Deliverables:
   if it doesn't exist, then call `koto init`. koto tracks state; the skill calls
   `koto next` in a loop.
 - The skill accepts three input forms: (1) a GitHub issue number — initializes with
-  `--var ISSUE_NUMBER=<N>` and submits `mode: issue_backed`; (2) a free-form task
-  description — initializes without `--var` and submits `mode: free_form`; (3) a plan
-  issue reference (`PLAN-<topic>#N`) — reads the PLAN doc at that sequence number,
-  extracts goal, acceptance criteria, and design doc references, constructs a
-  `task_description` from these fields, then initializes as `mode: free_form`.
+  `--var ISSUE_NUMBER=<N> --var ARTIFACT_PREFIX=issue_<N>` and submits
+  `mode: issue_backed`; (2) a free-form task description — initializes with
+  `--var ARTIFACT_PREFIX=task_<slug>` (slug derived from workflow name) and submits
+  `mode: free_form`; (3) a plan issue reference (`PLAN-<topic>#N`) — reads the PLAN doc
+  at that sequence number, extracts goal, acceptance criteria, and design doc references,
+  constructs a `task_description` from these fields, then initializes as `mode: free_form`
+  with `ARTIFACT_PREFIX=task_<slug>`.
 - Phase injection: before the agent begins work in `analysis` or `implementation` states,
   the skill wrapper reads and injects the corresponding phase procedure file
   (`references/phases/phase-3-analysis.md` or `phase-4-implementation.md`).
@@ -1014,12 +997,15 @@ No data is transmitted outside the local machine by koto itself.
 
 ### Positive
 
-- Agent instructions shrink ~42% (420 of 995 lines eliminable). The SKILL.md
-  orchestration wrapper (~55 lines) is removed; deterministic steps execute without
-  agent involvement on the happy path. Agent context focuses on judgment.
-- Nine deterministic states auto-advance on the happy path. Agents never see the
-  directive for `setup_issue_backed`, `setup_free_form`, `implementation`, `finalization`,
-  `ci_monitor`, and others when the default action succeeds.
+- Agent instructions shrink ~15-20% from structured enforcement alone (orchestration
+  wrapper eliminated, structured evidence, koto-managed sequencing). With default action
+  execution (Phase 0b), the reduction reaches ~42% (420 of 995 lines eliminable) as
+  deterministic steps execute without agent involvement on the happy path.
+- Five deterministic states auto-advance on the happy path (`context_injection`,
+  `setup_issue_backed`, `setup_free_form`, `staleness_check`, `ci_monitor`). Agents never
+  see their directives when the default action succeeds. Four judgment-with-verification
+  states (`introspection`, `analysis`, `implementation`, `finalization`) auto-advance on
+  resume when the agent's work from a prior session is already complete.
 - The three-path model makes override and failure handling explicit per state. The
   event log records whether a state completed via default, override, or recovery —
   useful for debugging and workflow audit.
@@ -1039,9 +1025,9 @@ No data is transmitted outside the local machine by koto itself.
 
 ### Negative
 
-- Four prerequisite engine capabilities are required, two of which are `needs-design`
+- Three prerequisite engine capabilities are required, two of which are `needs-design`
   issues (Phase 0a `--var` + Phase 0b default action execution + Phase 1 gate fallback).
-  The dependency chain is longer than the former gate-only model.
+  The dependency chain is longer than the current model where agents handle everything.
 - The default action execution prerequisite (Phase 0b) is the largest unknown. Its scope
   depends on the child design — it could be a targeted change or a significant engine
   feature.
