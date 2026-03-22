@@ -1,21 +1,23 @@
 ---
 status: Proposed
 problem: |
-  koto has no reference template demonstrating its template engine on a real,
-  multi-phase workflow. shirabe's work-on and just-do-it skills are structurally
-  the same single-session workflow — both implement one task and produce a PR —
-  but are maintained separately. Merging them into a single koto-backed template
-  proves the engine on a real workflow, eliminates duplication, and gives shirabe
-  enforcement-backed phase structure without adding surface to koto.
+  shirabe's /work-on skill requires a GitHub issue number. Agents and users often want
+  to implement a small task without first creating an issue — a branch, a PR, CI green,
+  done. Without issue-backed context, /work-on has no way to load design context or run
+  a staleness check. The skill either requires an issue or provides no structured
+  guidance at all. koto's template engine can enforce the workflow phase structure for
+  both cases in a single template, making the issue optional while preserving enforcement.
 decision: |
-  A single koto template merging work-on (GitHub issue) and just-do-it (free-form
-  task) into 15 states using the gate-with-evidence-fallback pattern: states with
-  command gates auto-advance when the gate passes, and fall back to requiring agent
-  evidence (with rationale) when it fails. Two targeted engine changes enable this —
+  A single koto template backing /work-on with 15 states and two modes: issue-backed
+  (GitHub issue number provided) and free-form (task description provided, no issue).
+  The modes share all states from analysis onward and diverge only in their context-
+  gathering phases. States use the gate-with-evidence-fallback pattern: command gates
+  auto-advance when outcomes are mechanically verifiable, and fall back to requiring
+  agent evidence (with rationale) when they fail. Two engine changes unlock this —
   gate failure on states with an accepts block routes to NeedsEvidence rather than
   hard-stopping, and the GateBlocked CLI response carries the expects schema when a
-  fallback is available. Template variables supply issue-specific values to gate
-  commands at init time via a new --var flag on koto init.
+  fallback is available. Template variables supply issue-specific values at init time
+  via a new --var flag on koto init.
 rationale: |
   Gate-with-evidence-fallback captures what the other approaches miss. Fine-grained
   evidence at every state produces ceremony-heavy templates where most evidence fields
@@ -35,19 +37,22 @@ Proposed
 
 ## Context and Problem Statement
 
-shirabe provides workflow skills for AI coding agents. Two of its skills — work-on
-(implement a GitHub issue) and just-do-it (implement a free-form task) — follow the
-same structure: gather context, plan, implement, create a PR, verify CI, done. They
-differ only in their starting point: work-on pulls context from a GitHub issue,
-just-do-it starts from a user-provided description. Today these are maintained as
-separate skills with duplicated phase logic.
+shirabe's /work-on skill implements a GitHub issue: gather context, plan, implement,
+create a PR, verify CI, done. The skill currently requires a GitHub issue number to
+load design context and run a staleness check. Agents often need to implement a small
+task without an existing issue — a config tweak, a doc fix, a quick refactor — and
+creating an issue first adds friction with no benefit.
+
+The skill needs a free-form mode: accept a task description instead of an issue number,
+skip the GitHub context and staleness phases, and run a lightweight validation step
+instead. The implementation phases are identical in both modes.
 
 koto enforces workflow phase structure through a state machine template. A koto template
-for the merged work-on skill would: enforce that the agent completes each phase before
-advancing, persist progress across sessions, and make the workflow auditable. The merged
-skill is a natural first koto template because it's linear (one workflow, one session),
-maps cleanly to koto's state machine model, and requires no external integrations — the
-agent handles all external actions (git, GitHub, CI) within state directives.
+for /work-on would: enforce that the agent completes each phase before advancing, persist
+progress across sessions, and make the workflow auditable. /work-on is a natural first
+koto template because it's linear (one workflow, one session), maps cleanly to koto's
+state machine model, and requires no external integrations — the agent handles all
+external actions (git, GitHub, CI) within state directives.
 
 ## Decision Drivers
 
@@ -55,8 +60,8 @@ agent handles all external actions (git, GitHub, CI) within state directives.
   required for this template to work
 - The agent handles all external actions; koto enforces phase order via evidence-gated
   transitions
-- The merged template must support both entry points: GitHub issue (work-on) and
-  free-form description (just-do-it)
+- The template must support both modes: issue-backed (GitHub issue number) and free-form
+  (task description, no issue)
 - Session resumability: koto's event log handles mid-session interruption without
   additional state management
 - The staleness/introspection check must be able to route directly to analysis without
@@ -92,8 +97,8 @@ event log.
 This splits states into two categories. States that represent deterministic outcomes
 (branch exists, file was created, tests pass, CI is green) get command gates; if the gate
 passes, the agent called `koto next` and koto advanced without asking for anything.
-States that represent agent judgment (staleness assessment, jury verdict) are always
-evidence-gated because there's no command that returns the right answer.
+States that represent agent judgment (staleness assessment, task scope validation) are
+always evidence-gated because there's no command that returns the right answer.
 
 The implementation requires two engine changes to koto, described in Solution Architecture.
 
@@ -157,9 +162,9 @@ access before the agent spends time loading context.
 
 #### Alternatives Considered
 
-**Static template with shell globbing in gates**: Replace `${ISSUE_NUMBER}` references
+**Static template with shell globbing in gates**: Replace `{{ISSUE_NUMBER}}` references
 with shell commands that discover the relevant path (e.g., `test -f wip/*_baseline.md`
-instead of `test -f wip/issue_${ISSUE_NUMBER}_baseline.md`). Rejected as the primary
+instead of `test -f wip/issue_{{ISSUE_NUMBER}}_baseline.md`). Rejected as the primary
 approach because it makes gate commands brittle (glob matches the first file in wip/,
 even one from a different workflow), and it doesn't solve the `gh issue view` gate which
 genuinely needs the issue number. Acceptable as a fallback for individual states but not
@@ -167,49 +172,52 @@ as the overall strategy.
 
 ---
 
-### Decision 4: Entry point architecture
+### Decision 4: How the optional issue input is handled
 
-work-on and just-do-it differ only in their first few phases. They can be implemented as
-two separate koto templates, or as a single template with an entry routing state that
-branches into path-specific states before converging.
+The two modes of /work-on — issue-backed and free-form — differ only in their first few
+phases. The question is whether to express this as a single template with mode-specific
+states, or as two separate templates that share most of their content.
 
-#### Chosen: Single template with routing entry state
+#### Chosen: Single template with a routing entry state
 
-A single `entry` state captures `workflow_type: enum [work-on, just-do-it]` plus path-
-specific parameters (issue number or task description) and routes to the appropriate
-first state. The two paths diverge through their context-gathering states, then converge
-at `setup` and from there share all remaining states. The `workflow_type` evidence
-persists across the session via koto's evidence merging model, so the `setup` state can
-route post-setup to `staleness_check` (work-on) or `analysis` (just-do-it) based on the
-evidence submitted at `entry`.
+A single `entry` state captures `mode: enum [issue-backed, free-form]` plus mode-specific
+parameters (issue number or task description) and routes to the appropriate first state.
+The two paths diverge through their context-gathering states, then converge at `setup`
+and from there share all remaining states.
+
+koto's evidence is epoch-scoped: each state transition clears the current evidence, so
+`mode` can't carry forward automatically from `entry` to `setup`. The `setup` state
+therefore includes `mode` in its own `accepts` schema, requiring the agent to re-submit
+it alongside the branch and baseline evidence. This is a general pattern for any routing
+field that spans multiple states: re-submit it at the state where the routing decision
+is made.
 
 #### Alternatives Considered
 
-**Two separate templates**: `work-on.md` and `just-do-it.md`, each with their own
-initial states, converging on identical shared states from analysis onward. The shared
-states would be duplicated or split into a third included template (which koto doesn't
-support). Rejected because it reintroduces the duplication this design is meant to
-eliminate, and koto has no template inclusion mechanism.
+**Two separate templates**: `work-on.md` (issue-backed) and `work-on-free.md`
+(free-form), each with their own initial states, converging on shared states from
+analysis onward. The shared states would need to be duplicated or split into a third
+included template, which koto doesn't support. Rejected because it reintroduces
+duplication that koto's single-template model is meant to eliminate.
 
 ## Decision Outcome
 
 **Chosen: gate-with-evidence-fallback, implicit convention, --var support, single template**
 
-The merged template has 15 states across two converging paths. The work-on path handles
-GitHub issues: `entry` → `context_injection` → `setup` → `staleness_check` → (optional)
-`introspection` → `analysis` → `implementation` → `finalization` → `pr_creation` →
-`ci_monitor` → `done`. The just-do-it path handles free-form tasks: `entry` →
-`jury_validation` → (if not ready: `jury_exit`) → `research` → `setup` → `analysis`
-(and from there, identical to work-on).
+The template has 15 states across two converging modes. The issue-backed mode:
+`entry` → `context_injection` → `setup` → `staleness_check` → (optional) `introspection`
+→ `analysis` → `implementation` → `finalization` → `pr_creation` → `ci_monitor` → `done`.
+The free-form mode: `entry` → `task_validation` → (if not ready: `validation_exit`) →
+`research` → `setup` → `analysis` (and from there, identical to issue-backed).
 
-The `entry` state is always evidence-gated: it captures `workflow_type` and path-specific
-parameters, then routes to the correct first state. Both paths reach `setup` via different
+The `entry` state is always evidence-gated: it captures `mode` and mode-specific
+parameters, then routes to the correct first state. Both modes reach `setup` via different
 routes. koto's evidence is epoch-scoped — evidence submitted in one state is only accessible
 within that state's epoch and is cleared on transition. `setup` therefore includes
-`workflow_type` in its own `accepts` schema, requiring the agent to re-submit it alongside
-the branch and baseline evidence. This makes `setup` always evidence-gated (not just
-gate-with-fallback), since the routing decision requires `workflow_type` regardless of
-whether the gates pass. From `analysis` onward, both paths are identical.
+`mode` in its own `accepts` schema, requiring the agent to re-submit it alongside the
+branch and baseline evidence. This makes `setup` always evidence-gated (not just
+gate-with-fallback), since the routing decision requires `mode` regardless of whether
+the gates pass. From `analysis` onward, both modes are identical.
 
 Five states have command gates that enable auto-advancement when the work is mechanically
 verifiable: `context_injection` (issue accessibility), `introspection` (artifact file),
@@ -218,7 +226,7 @@ checks passing). When their gates pass, `koto next` advances without asking for 
 When gates fail, koto surfaces the state's `accepts` schema and the agent submits a
 decision record with a meaningful enum field and optional rationale. Five states are always
 evidence-gated because they represent genuine branching decisions or require routing
-evidence: `entry`, `jury_validation`, `setup`, `staleness_check`, and `pr_creation`.
+evidence: `entry`, `task_validation`, `setup`, `staleness_check`, and `pr_creation`.
 
 Two engine changes are needed before the template can be used. First, the advancement
 loop in `src/engine/advance.rs` must fall through to `NeedsEvidence` when a gate fails
@@ -243,11 +251,12 @@ agents that know what they're doing.
 
 ### Overview
 
-The merged template is a koto state machine that enforces the work-on/just-do-it
-workflow structure. When an agent starts the skill, it initializes a workflow from the
-template and calls `koto next <name>` in a loop to get directives and advance state.
-koto enforces sequencing: an agent can't reach `analysis` without passing through
-`staleness_check`, and can't reach `ci_monitor` without passing through `pr_creation`.
+The template is a koto state machine that enforces the /work-on workflow structure for
+both modes. When an agent starts the skill, it initializes a workflow from the template
+and calls `koto next <name>` in a loop to get directives and advance state. koto enforces
+sequencing: an agent can't reach `analysis` without passing through `staleness_check`
+(issue-backed) or `task_validation` (free-form), and can't reach `ci_monitor` without
+passing through `pr_creation`.
 
 ### Components
 
@@ -266,16 +275,16 @@ to `.koto/templates/work-on.md` in the project on first use.
   variables map — this avoids a compiler change and keeps the compiled template
   variable-agnostic
 
-**shirabe work-on skill** (updated): calls `koto init` on first run, loops `koto next`
+**shirabe /work-on skill** (updated): calls `koto init` on first run, loops `koto next`
 for directives, submits evidence via `koto next --with-data`, and resumes via
 `koto workflows` + `koto next` on session restart.
 
 ### State Machine
 
 ```
-entry (evidence: workflow_type)
+entry (evidence: mode)
   │
-  ├─ work-on path:
+  ├─ issue-backed mode:
   │   context_injection[G] → setup* → staleness_check
   │                                        │
   │                             ┌──────────┴──────────────┐
@@ -285,26 +294,26 @@ entry (evidence: workflow_type)
   │                             │                          │
   │                             └──────────┬───────────────┘
   │                                        ▼
-  └─ just-do-it path:              analysis[G] ◄─── scope_changed (self-loop)
-      jury_validation                    │                 │
+  └─ free-form mode:               analysis[G] ◄─── scope_changed (self-loop)
+      task_validation                    │                 │
           │                     implementation[G] ◄─── partial_tests_failing
-    ┌─────┴─────────────┐              │ │
- jury_exit          research        finalization[G]    done_blocked
- (terminal)            │                │              (terminal)
-                      setup*        pr_creation ◄─── creation_failed
-                       │                │
-                       │           ci_monitor[G]
-                       │                │        \
-                       │              done      done_blocked
-                       │           (terminal)   (terminal)
-                       │
-                    (converges to analysis)
+    ┌─────┴──────────────┐             │ │
+ validation_exit      research      finalization[G]    done_blocked
+ (terminal)              │                │              (terminal)
+                        setup*        pr_creation ◄─── creation_failed
+                         │                │
+                         │           ci_monitor[G]
+                         │                │        \
+                         │              done      done_blocked
+                         │           (terminal)   (terminal)
+                         │
+                      (converges to analysis)
 ```
 
 `[G]` = has command gate (auto-advances when gate passes).
-`*` = always evidence-gated (routing requires `workflow_type` re-submission).
+`*` = always evidence-gated (routing requires `mode` re-submission).
 
-States always evidence-gated: `entry`, `jury_validation`, `setup*`, `staleness_check`,
+States always evidence-gated: `entry`, `task_validation`, `setup*`, `staleness_check`,
 `pr_creation`.
 
 `done_blocked` is reachable from three states: `analysis` (`plan_outcome:
@@ -313,17 +322,19 @@ blocked_missing_context`), `implementation` (`implementation_status: blocked`), 
 
 ### State Definitions
 
-**`entry`** — routes work-on vs just-do-it. Evidence: `workflow_type: enum[work-on,
-just-do-it]`, `issue_number: string` (work-on), `task_description: string` (just-do-it).
+**`entry`** — routes issue-backed vs free-form mode. Evidence: `mode: enum[issue-backed,
+free-form]`, `issue_number: string` (issue-backed mode), `task_description: string`
+(free-form mode).
 
-**`jury_validation`** — assesses whether a free-form task is ready for implementation.
-Evidence: `jury_verdict: enum[ready, needs_design, needs_breakdown, ambiguous]`,
-`rationale: string`.
+**`task_validation`** — assesses whether the free-form task description is clear and
+appropriately scoped for direct implementation. Evidence: `verdict: enum[ready,
+needs_design, needs_breakdown, ambiguous]`, `rationale: string`.
 
-**`jury_exit`** — terminal state for non-ready just-do-it tasks. Directive instructs
-the agent to communicate the verdict and suggest the appropriate next step.
+**`validation_exit`** — terminal state for tasks that aren't ready for direct
+implementation. Directive instructs the agent to communicate the verdict and suggest the
+appropriate next step (create an issue, write a design doc, etc.).
 
-**`research`** — lightweight context gathering for just-do-it. Evidence:
+**`research`** — lightweight context gathering for free-form tasks. Evidence:
 `context_gathered: enum[sufficient, insufficient]`, `context_summary: string`.
 
 **`context_injection`** — loads GitHub issue context. Gate: `gh issue view
@@ -331,27 +342,27 @@ the agent to communicate the verdict and suggest the appropriate next step.
 enum[loaded, issue_not_accessible, context_incomplete]`, `context_summary: string`.
 
 **`setup`** — creates feature branch and baseline file. Always evidence-gated. Gates:
-branch is not main/master, baseline file exists. Evidence: `workflow_type:
-enum[work-on, just-do-it]` (re-submitted here for epoch-local routing), `branch_created:
+branch is not main/master, baseline file exists. Evidence: `mode:
+enum[issue-backed, free-form]` (re-submitted here for epoch-local routing), `branch_created:
 enum[created, reused_existing]`, `branch_name: string`, `baseline_outcome: enum[clean,
 existing_failures, build_broken]`. Gate failure triggers evidence fallback; the routing
-to `staleness_check` (work-on) or `analysis` (just-do-it) is determined by `workflow_type`
+to `staleness_check` (issue-backed) or `analysis` (free-form) is determined by `mode`
 in this state's evidence epoch.
 
-**`staleness_check`** — assesses codebase freshness since issue was opened. Always
+**`staleness_check`** — assesses codebase freshness since the issue was opened. Always
 evidence-gated (command gates can't inspect script output). Evidence:
 `staleness_signal: enum[fresh, stale_skip_introspection, stale_requires_introspection]`,
 `staleness_details: string`.
 
-**`introspection`** — re-reads the issue against current codebase. Gate:
-`wip/issue_{{ISSUE_NUMBER}}_introspection.md` exists. Evidence fallback:
+**`introspection`** — re-reads the issue against the current codebase. Gate:
+`test -f wip/issue_{{ISSUE_NUMBER}}_introspection.md`. Evidence fallback:
 `introspection_outcome: enum[approach_unchanged, approach_updated, issue_superseded]`,
 `rationale: string`.
 
 **`analysis`** — researches and creates implementation plan. Gate:
-`test -f wip/issue_{{ISSUE_NUMBER}}_plan.md` (work-on) or `test -f wip/task_*_plan.md`
-(just-do-it). Note: glob-based gates can match artifacts from prior workflows; once
-`--var` is available, both paths should use `{{ISSUE_NUMBER}}`-anchored paths. Evidence
+`test -f wip/issue_{{ISSUE_NUMBER}}_plan.md` (issue-backed) or `test -f wip/task_*_plan.md`
+(free-form). Note: glob-based gates can match artifacts from prior workflows; once
+`--var` is available, both modes should use anchored paths. Evidence
 fallback: `plan_outcome: enum[plan_ready, blocked_missing_context, scope_changed]`,
 `approach_summary: string`. Self-loop on `scope_changed`. `blocked_missing_context`
 routes to `done_blocked`.
@@ -359,7 +370,7 @@ routes to `done_blocked`.
 **`implementation`** — writes code and commits. Gates: on feature branch, has commits
 beyond main, tests pass. Evidence fallback: `implementation_status: enum[complete,
 partial_tests_failing, blocked]`, `rationale: string`. Self-loop on
-`partial_tests_failing`.
+`partial_tests_failing`. `blocked` routes to `done_blocked`.
 
 **`finalization`** — cleanup, summary file, final verification. Gates: summary file
 exists, tests pass. Evidence fallback: `finalization_status: enum[ready_for_pr,
@@ -377,6 +388,7 @@ multiple PRs exist. Note: there is a brief window after `pr_creation` where the 
 may not yet be indexed by the GitHub API; if the gate fails immediately after PR
 creation, the evidence fallback allows the agent to wait and retry. Evidence fallback:
 `ci_outcome: enum[passing, failing_fixed, failing_unresolvable]`, `rationale: string`.
+`failing_unresolvable` routes to `done_blocked`.
 
 **`done`** — terminal. Workflow complete.
 
@@ -386,12 +398,18 @@ Reachable from `analysis` (missing context), `implementation` (blocked), and `ci
 
 ### Key Interfaces
 
-**Initialize a workflow:**
+**Initialize a workflow (issue-backed):**
 ```
 koto init work-on-71 --template .koto/templates/work-on.md --var ISSUE_NUMBER=71
 ```
 Creates `koto-work-on-71.state.jsonl` in the current directory. Returns
 `{"name": "work-on-71", "state": "entry"}`.
+
+**Initialize a workflow (free-form):**
+```
+koto init work-on-add-retry-logic --template .koto/templates/work-on.md
+```
+No `--var` needed for free-form mode since no issue-specific gate commands apply.
 
 **Get directive and advance:**
 ```
@@ -431,16 +449,16 @@ calls `koto init` to start fresh, then `koto next <name>` to enter `entry`.
 The agent loops: read directive from `koto next`, do the work, call `koto next` (bare or
 with `--with-data`) to advance. koto's evidence is epoch-scoped: each state transition
 clears the current evidence, so only evidence submitted in the current state is accessible
-for routing. `workflow_type` is captured at `entry` for routing to the first path-specific
-state, then re-submitted at `setup` for routing to the post-setup state (`staleness_check`
-or `analysis`). This re-submission is required — the `setup` evidence schema includes
-`workflow_type` as a required field.
+for routing. `mode` is captured at `entry` for routing to the first mode-specific state,
+then re-submitted at `setup` for routing to the post-setup state (`staleness_check` for
+issue-backed, `analysis` for free-form). This re-submission is required — the `setup`
+evidence schema includes `mode` as a required field.
 
 wip/ artifact files created during the workflow:
-- `wip/issue_<N>_baseline.md` (work-on) or `wip/task_<slug>_baseline.md` (just-do-it)
-- `wip/issue_<N>_introspection.md` (work-on, stale path only)
-- `wip/issue_<N>_plan.md` (work-on) or `wip/task_<slug>_plan.md` (just-do-it)
-- `wip/issue_<N>_summary.md` (work-on) or `wip/task_<slug>_summary.md` (just-do-it)
+- `wip/issue_<N>_baseline.md` (issue-backed) or `wip/task_<slug>_baseline.md` (free-form)
+- `wip/issue_<N>_introspection.md` (issue-backed, stale path only)
+- `wip/issue_<N>_plan.md` (issue-backed) or `wip/task_<slug>_plan.md` (free-form)
+- `wip/issue_<N>_summary.md` (issue-backed) or `wip/task_<slug>_summary.md` (free-form)
 
 The koto state file (`koto-<name>.state.jsonl`) is committed to the feature branch
 alongside wip/ artifacts, enabling resume in a new session by checking out the branch
@@ -490,15 +508,18 @@ Deliverables:
 
 ### Phase 3: Shirabe skill integration
 
-Update the shirabe work-on and just-do-it skills to drive koto.
+Update the /work-on skill to drive koto.
 
 Deliverables:
-- Merged work-on skill instructions: on invocation, check `koto workflows` for a
-  `work-on-*` or `just-do-it-*` workflow in cwd. If found, resume via `koto next`. If
-  not found, copy the template to `.koto/templates/work-on.md` (from the plugin directory)
-  if it doesn't exist, then call `koto init`.
+- Updated /work-on skill instructions: on invocation, check `koto workflows` for a
+  `work-on-*` workflow in cwd. If found, resume via `koto next`. If not found, copy the
+  template to `.koto/templates/work-on.md` (from the plugin directory) if it doesn't
+  exist, then call `koto init`.
+- The skill accepts an optional issue number. When provided, initializes with
+  `--var ISSUE_NUMBER=<N>` and submits `mode: issue-backed` at `entry`. When omitted,
+  initializes without `--var` and submits `mode: free-form` with a task description.
 - Evidence submission loop: when `koto next` returns `expects` with fields, the skill
-  instructions must guide the agent to submit the correct evidence schema. When `koto next`
+  instructions guide the agent to submit the correct evidence schema. When `koto next`
   returns `action: done`, the skill is complete.
 - Error handling: on `invalid_submission` (exit code 2), re-read the `details` array,
   fix the evidence, and resubmit without retrying the same payload.
@@ -522,9 +543,9 @@ local markdown file read from disk. Not applicable.
 **Execution isolation**: Command gates run shell commands in the user's working directory
 with the user's credentials. This is the same trust model as running the gate commands
 manually. The gate commands in this template are limited to: `git rev-parse`, `git log`,
-`git status`, `test -f`, `gh issue view`, `gh pr checks`, and `go test ./...`. No
-commands are constructed from untrusted input at gate evaluation time, because gate
-commands are static strings in the compiled template.
+`test -f`, `gh issue view`, `gh pr checks`, and `go test ./...`. No commands are
+constructed from untrusted input at gate evaluation time, because gate commands are
+static strings in the compiled template.
 
 The `--var` flag introduced in Phase 1 allows caller-controlled strings to be substituted
 into gate commands at evaluation time. If a variable value contains shell metacharacters
@@ -559,15 +580,16 @@ No data is transmitted outside the local machine by koto itself.
 
 ### Positive
 
-- Phase order is enforced without additional state management in the shirabe skill.
+- Phase order is enforced without additional state management in the /work-on skill.
   The agent can't reach `ci_monitor` without a PR existing, or `analysis` without
-  passing through `staleness_check` (work-on) or `jury_validation` (just-do-it).
+  passing through `staleness_check` (issue-backed) or `task_validation` (free-form).
 - Evidence fields are decision records. The event log shows not just that a phase
   completed, but what decision the agent made and why — useful for debugging and audit.
 - Session resume is free. Calling `koto next <name>` after a session interruption
   returns the current directive, regardless of how the session ended.
-- The two entry points share 9 of 15 states, eliminating the phase duplication that
-  currently exists between work-on and just-do-it.
+- The two modes share 9 of 15 states. Adding the free-form mode requires only 3 new
+  states (`task_validation`, `validation_exit`, `research`) with no changes to the
+  shared implementation path.
 - Command gates auto-advance through mechanical checks without agent overhead. When
   tests pass and artifacts exist, `koto next` advances through `analysis`,
   `implementation`, and `finalization` without a `--with-data` call.
@@ -584,11 +606,10 @@ No data is transmitted outside the local machine by koto itself.
   runs successfully. Command gates can only check exit codes, not script output content,
   so the routing decision (fresh/stale) must always be submitted by the agent.
 - koto's evidence is epoch-scoped: each state transition clears the current evidence.
-  Routing fields like `workflow_type` can't carry forward automatically from `entry` to
-  `setup`. The design handles this by requiring `workflow_type` to be re-submitted in
-  `setup`'s evidence schema. Any future state that needs routing information from an
-  earlier state must follow the same pattern: include the routing field in its own
-  `accepts` block.
+  Routing fields like `mode` can't carry forward automatically from `entry` to `setup`.
+  The design handles this by requiring `mode` to be re-submitted in `setup`'s evidence
+  schema. Any future state that needs routing information from an earlier state must
+  follow the same pattern: include the routing field in its own `accepts` block.
 - Test commands in gates are language-specific (`go test ./...`). Templates for non-Go
   projects need a different test command; ideally a `TEST_COMMAND` template variable.
 
