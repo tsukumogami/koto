@@ -14,7 +14,7 @@ decision: |
   context-gathering phases. The template uses a split topology: two separate setup
   states (setup_issue_backed and setup_free_form) eliminate the epoch-scoped mode
   re-submission that a single setup state requires. Context injection gates on the
-  existence of wip/IMPLEMENTATION_CONTEXT.md to ensure extraction happened before
+  existence of wip/issue_<N>_context.md to ensure extraction happened before
   setup. Free-form mode has two validation states — pre-research and post-research —
   to catch misconceived tasks at both the description stage and the codebase-discovery
   stage. Self-looping states use retry/escalate enum variants with explicit escalation
@@ -24,7 +24,7 @@ rationale: |
   The split topology eliminates the most confusing element of the previous design:
   requiring agents to re-submit mode at setup despite having submitted it at entry.
   Two separate setup states make routing self-documenting without requiring epoch-scoped
-  evidence knowledge. Gating context_injection on the IMPLEMENTATION_CONTEXT.md artifact
+  evidence knowledge. Gating context_injection on the issue_<N>_context.md artifact
   fixes the panel finding that the accessibility-only gate allowed skipping context
   extraction entirely. Two free-form validation states reflect the just-do-it skill's
   two-jury structure: the pre-research check catches obviously-wrong tasks cheaply, the
@@ -125,7 +125,7 @@ duplication constraint, and recreates the divergence problem that motivated this
 ### Decision 2: Context injection depth
 
 The `context_injection` state backs Phase 0 of /work-on, which runs `extract-context.sh`
-to create `wip/IMPLEMENTATION_CONTEXT.md`. This file carries design rationale forward —
+to create `wip/issue_<N>_context.md`. This file carries design rationale forward —
 Phase 4 (implementation) explicitly references it. The original design gated on issue
 accessibility (`gh issue view {{ISSUE_NUMBER}}`), which checks reachability but doesn't
 verify that context extraction happened. A panel review identified this as a core gap:
@@ -133,15 +133,16 @@ verify that context extraction happened. A panel review identified this as a cor
 
 #### Chosen: Gate on context artifact existence; extraction is the state's work
 
-The `context_injection` directive instructs the agent to run `extract-context.sh`. The
-gate is `test -f wip/IMPLEMENTATION_CONTEXT.md`. On the first `koto next` call, the gate
-fails (file doesn't exist); the agent runs the script, then calls `koto next` again — the
-gate passes and koto auto-advances to `setup_issue_backed`. The fixed path requires no
-`--var` support and matches the real skill's convention.
+The `context_injection` directive instructs the agent to run `extract-context.sh --issue <N>`.
+The gate is `test -f wip/issue_{{ISSUE_NUMBER}}_context.md`. Until `--var` ships, the gate
+fails unconditionally and `context_injection` operates as an evidence-gated state — the same
+evidence-only degradation already accepted for the introspection gate. Once `--var` ships,
+the gate auto-advances when the artifact exists.
 
-Key assumption: `extract-context.sh` creates `wip/IMPLEMENTATION_CONTEXT.md` at a fixed
-path. If the real script uses a parameterized path, the gate path and directive references
-need revision.
+Key assumption: `extract-context.sh` will be updated in Phase 3 (shirabe integration) to
+accept an issue number argument and write to `wip/issue_<N>_context.md`. The numbered path
+follows the established `wip/issue_<N>_<artifact>.md` convention used by all other /work-on
+artifacts and eliminates the concurrency risk of a fixed shared path.
 
 #### Alternatives Considered
 
@@ -333,11 +334,53 @@ Rejected as the primary approach.
 
 ---
 
+### Decision 7: Plan-backed issue support
+
+The /plan workflow creates PLAN documents with plan-only issues (no GitHub issue numbers).
+Each issue has a goal, acceptance criteria, complexity, dependencies, and an upstream
+design doc reference. Users need `/work-on PLAN-<topic>#N` to work on a single plan
+issue interactively, without running the full batch via /implement.
+
+The key structural finding: the free-form path in this template already routes correctly
+for plan-backed issues. Free-form goes `entry → task_validation → research →
+post_research_validation → setup_free_form → analysis`, skipping staleness entirely.
+Plan-backed issues should also skip staleness (they just came from /plan). The
+two validation states serve plan-backed well: task_validation verifies extracted AC is
+actionable; post_research_validation checks codebase readiness.
+
+#### Chosen: Free-form mode absorbs plan-backed; skill layer handles PLAN doc parsing
+
+No template changes. The skill layer detects `/work-on PLAN-<topic>#N` input, reads the
+PLAN doc issue at that sequence number, and populates `task_description` with the issue's
+goal, acceptance criteria, and design doc references before initializing the koto workflow
+as free-form mode. The template sees a rich task description and routes identically to
+any other free-form invocation.
+
+Key assumption: Phase 3 (shirabe integration) updates the /work-on skill to accept
+`PLAN-<topic>#N` syntax and implement PLAN doc parsing. Execution quality depends on
+the skill layer faithfully preserving AC from the PLAN doc.
+
+#### Alternatives Considered
+
+**Third template mode with dedicated states (a)**: Add `plan_context_extraction` +
+`setup_plan_backed` states (17 → 19). Provides koto-level enforcement that the PLAN doc
+was read. Rejected because PLAN docs are local files (always readable, no network risk),
+the free-form path already routes correctly, and adding a third mode adds 2 states of
+ceremony without behavioral difference. The principle: templates enforce workflow phases;
+skills translate input formats.
+
+**Delegate plan-backed to /implement (c)**: Document plan-only issues as out of scope
+for /work-on. Rejected because /implement runs a full plan batch — it doesn't serve
+single-issue interactive work. Users should not need a different skill to work on a
+plan issue vs. a GitHub issue.
+
+---
+
 ## Decision Outcome
 
 **Chosen: gate-with-evidence-fallback, split topology, artifact-gated context injection,
 two-stage free-form validation, collapsed introspection outcomes, retry/escalate
-self-loops, concise directives with resume preambles**
+self-loops, concise directives with resume preambles, plan-backed via free-form**
 
 The template has 17 states across two converging modes.
 
@@ -379,7 +422,7 @@ separate setup states make routing self-documenting — the path you're on deter
 setup state you're in, with unconditional transitions to the appropriate next state. No
 epoch-scoped evidence knowledge is required.
 
-Gating `context_injection` on the IMPLEMENTATION_CONTEXT.md artifact fixes the panel
+Gating `context_injection` on the `issue_<N>_context.md` artifact fixes the panel
 finding that the original accessibility-only gate allowed skipping context extraction
 entirely. Two free-form validation states reflect the just-do-it skill's actual two-jury
 structure. Retry/escalate variants in self-looping states give agents a structured
@@ -470,11 +513,11 @@ free_form]`, `issue_number: string` (issue-backed only), `task_description: stri
 (free-form only).
 
 **`context_injection`** — creates context artifact for issue-backed workflows. Gate:
-`test -f wip/IMPLEMENTATION_CONTEXT.md`. Directive instructs the agent to run
-`extract-context.sh`, which reads the GitHub issue and linked design docs and writes the
-context file. Gate passes once the file exists. No evidence fallback needed — the gate
-is a hard block until the artifact is produced. On resume: check if file already exists
-before re-running the script.
+`test -f wip/issue_{{ISSUE_NUMBER}}_context.md`. Directive instructs the agent to run
+`extract-context.sh --issue <N>`, which reads the GitHub issue and linked design docs
+and writes `wip/issue_<N>_context.md`. Until `--var` ships, the gate fails unconditionally
+and the state uses evidence fallback: `context_injected: enum[complete]`, `rationale: string`.
+On resume: check if file already exists before re-running the script.
 
 **`task_validation`** — assesses whether the free-form task description is clear and
 appropriately scoped for starting work. Always evidence-gated. Evidence:
@@ -639,7 +682,7 @@ Template directives carry concise action summaries and resume preambles — the 
 carry full procedural detail.
 
 wip/ artifact files created during the workflow:
-- `wip/IMPLEMENTATION_CONTEXT.md` (issue-backed, created by extract-context.sh)
+- `wip/issue_<N>_context.md` (issue-backed, created by extract-context.sh --issue <N>)
 - `wip/issue_<N>_baseline.md` (issue-backed) or `wip/task_<slug>_baseline.md` (free-form)
 - `wip/issue_<N>_introspection.md` (issue-backed, stale path only)
 - `wip/issue_<N>_plan.md` (issue-backed) or `wip/task_<slug>_plan.md` (free-form)
@@ -704,9 +747,12 @@ Deliverables:
   `work-on-*` workflow in cwd. If found, re-read existing wip/ artifacts and git log,
   then resume via `koto next`. If not found, copy the template to `.koto/templates/work-on.md`
   (from the plugin directory) if it doesn't exist, then call `koto init`.
-- The skill accepts an optional issue number. When provided, initializes with
-  `--var ISSUE_NUMBER=<N>` and submits `mode: issue_backed` at `entry`. When omitted,
-  initializes without `--var` and submits `mode: free_form` with a task description.
+- The skill accepts three input forms: (1) a GitHub issue number — initializes with
+  `--var ISSUE_NUMBER=<N>` and submits `mode: issue_backed`; (2) a free-form task
+  description — initializes without `--var` and submits `mode: free_form`; (3) a plan
+  issue reference (`PLAN-<topic>#N`) — reads the PLAN doc at that sequence number,
+  extracts goal, acceptance criteria, and design doc references, constructs a
+  `task_description` from these fields, then initializes as `mode: free_form`.
 - Phase injection: before the agent begins work in `analysis` or `implementation` states,
   the skill wrapper reads and injects the corresponding phase procedure file
   (`references/phases/phase-3-analysis.md` or `phase-4-implementation.md`).
@@ -791,7 +837,7 @@ No data is transmitted outside the local machine by koto itself.
   log records escalation decisions, distinguishing "agent gave up after N attempts" from
   "agent encountered an unrelated blocker."
 - Context injection is verified. The `context_injection` gate confirms
-  `wip/IMPLEMENTATION_CONTEXT.md` was created before setup begins, ensuring design
+  `wip/issue_<N>_context.md` was created before setup begins, ensuring design
   context reaches implementation regardless of session interruptions.
 
 ### Negative
