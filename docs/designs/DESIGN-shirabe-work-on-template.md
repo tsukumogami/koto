@@ -11,24 +11,29 @@ problem: |
   than users need.
 decision: |
   A single koto template backing /work-on that maximizes gate-based auto-advancement:
-  implementation and ci_monitor auto-advance today using existing gate capabilities;
+  implementation and ci_monitor auto-advance using existing gate capabilities;
   staleness_check auto-advances via a piped gate command (check-staleness.sh | jq -e
-  '...'). Agents are reached only on judgment states or gate-failure fallback paths.
-  The template uses split topology (two setup states), two-tier directives (full
-  directives for judgment states; error-fallback-only for koto-gated states), and
-  routes three input modes (GitHub issue, free-form description, PLAN doc issue)
-  through a unified 17-state machine. on_entry actions (koto running commands autonomously)
-  are scoped as a follow-on engine issue, not a template prerequisite.
+  '...'). Issue-specific gates use {{ISSUE_NUMBER}} substitution via --var, a
+  prerequisite engine feature (needs-design). Agents are reached only on judgment states
+  or gate-failure fallback paths. The template uses split topology (two setup states),
+  two-tier directives (full directives for judgment states; error-fallback-only for
+  koto-gated states), and routes three input modes (GitHub issue, free-form description,
+  PLAN doc issue) through a unified 17-state machine. on_entry actions (koto running
+  commands autonomously) are scoped as a follow-on engine issue, not a template
+  prerequisite.
 rationale: |
   The automation-first principle — koto does deterministic work, agents do judgment work
-  — is achievable today without new engine capabilities. The staleness_check piped gate
-  was a design oversight: check-staleness.sh output can be evaluated via jq exit code,
-  no new gate type needed. The SKILL.md orchestration wrapper (~55 lines of resume
-  detection and phase dispatch) is eliminated because koto tracks state directly. Two-tier
-  directives encode the automation principle in the template schema: koto-gated states
-  carry only failure-recovery guidance, not procedure, because agents only land there
-  when something goes wrong. The agent instruction reduction (~42% of 995 lines) is the
-  primary measurable outcome.
+  — requires the --var engine feature for issue-specific gate commands. This is scoped
+  as a needs-design prerequisite issue rather than deferred to a future release, because
+  without it, gates referencing {{ISSUE_NUMBER}} cannot evaluate and the template's
+  auto-advancement degrades to evidence-only fallback for issue-backed states. The
+  staleness_check piped gate was a design oversight: check-staleness.sh output can be
+  evaluated via jq exit code, no new gate type needed. The SKILL.md orchestration wrapper
+  (~55 lines of resume detection and phase dispatch) is eliminated because koto tracks
+  state directly. Two-tier directives encode the automation principle in the template
+  schema: koto-gated states carry only failure-recovery guidance, not procedure, because
+  agents only land there when something goes wrong. The agent instruction reduction
+  (~42% of 995 lines) is the primary measurable outcome.
 ---
 
 # DESIGN: shirabe work-on koto template
@@ -91,9 +96,12 @@ but diverge through their context-gathering phases. koto's evidence is epoch-sco
 each state transition clears the current evidence, so routing fields cannot carry
 forward automatically between states.
 
-Source code investigation confirmed that `--var` CLI support is not implemented
-(`variables: HashMap::new()` hardcoded in the init handler) and `{{VAR_NAME}}` gate
-substitution is not implemented. These findings eliminated option (c) as currently viable.
+The `--var` CLI flag and `{{VAR_NAME}}` gate substitution are prerequisites for this
+design (see Implementation Approach, Phase 0). Option (c) — init-time mode determination
+— was evaluated but requires additional engine capabilities beyond `--var` substitution
+(either `--initial-state` support or var-based transition routing). Those are separate
+concerns from gate substitution and would add scope to the prerequisite engine work
+without proportional benefit.
 
 #### Chosen: Split topology — two separate setup states
 
@@ -102,11 +110,7 @@ The template uses an entry state that accepts mode evidence and routes to diverg
 terminates in a mode-specific setup state: `setup_issue_backed` transitions
 unconditionally to `staleness_check`; `setup_free_form` transitions unconditionally to
 `analysis`. No mode re-submission is required — routing is implicit in which setup state
-the agent is in. Both paths merge at `analysis` and share all subsequent states.
-
-Key assumptions: the `--var` CLI flag and `{{VAR_NAME}}` gate substitution will be
-implemented in a future koto release; when both ship, the template should migrate toward
-init-time mode determination (option c below), reducing from ~17 to ~14 states. The two
+the agent is in. Both paths merge at `analysis` and share all subsequent states. The two
 setup states will have distinct directive content covering mode-specific preparation work.
 
 #### Alternatives Considered
@@ -118,9 +122,12 @@ understand epoch-scoped evidence — a non-obvious engine property that creates 
 maintenance cost every time someone reads or extends the template.
 
 **Init-time `--var` flag (c)**: Mode encoded at `koto init` via `--var MODE=issue-backed`,
-entry state eliminated, initial state determined at init. Rejected because both `--var`
-CLI support and `{{VAR_NAME}}` gate substitution are not implemented in the current engine.
-This is the target architecture for a future template version.
+entry state eliminated, initial state determined at init. Rejected because it requires
+either `--initial-state` CLI support (koto selects the starting state at init) or
+var-based transition routing (transitions conditioned on stored vars, not just evidence).
+Both are distinct engine features beyond `--var` gate substitution and would expand the
+prerequisite scope without clear benefit — the entry state is lightweight and the split
+topology already avoids mode re-submission.
 
 **Two separate templates (d)**: Separate `work-on-issue.md` and `work-on-freeform.md`
 files. Rejected because it duplicates approximately 12 shared states, violates the
@@ -140,10 +147,9 @@ verify that context extraction happened. A panel review identified this as a cor
 #### Chosen: Gate on context artifact existence; extraction is the state's work
 
 The `context_injection` directive instructs the agent to run `extract-context.sh --issue <N>`.
-The gate is `test -f wip/issue_{{ISSUE_NUMBER}}_context.md`. Until `--var` ships, the gate
-fails unconditionally and `context_injection` operates as an evidence-gated state — the same
-evidence-only degradation already accepted for the introspection gate. Once `--var` ships,
-the gate auto-advances when the artifact exists.
+The gate is `test -f wip/issue_{{ISSUE_NUMBER}}_context.md`. The `{{ISSUE_NUMBER}}`
+substitution uses the `--var` flag passed at `koto init` time. When the artifact exists,
+the gate auto-advances without agent involvement.
 
 Key assumption: `extract-context.sh` will be updated in Phase 3 (shirabe integration) to
 accept an issue number argument and write to `wip/issue_<N>_context.md`. The numbered path
@@ -157,9 +163,9 @@ gate auto-advances on issue existence without verifying extraction happened. An 
 skip context extraction entirely with no consequence in the state machine. Rejected.
 
 **Separate context_extraction state after accessibility check (c)**: Stronger enforcement
-but the accessibility gate requires unimplemented `--var`. Extract-context.sh fails
-naturally on inaccessible issues, making an explicit accessibility state unnecessary until
-`--var` ships. Rejected as premature.
+but adds a state. Extract-context.sh fails naturally on inaccessible issues, making an
+explicit accessibility state unnecessary — the artifact gate already catches the failure.
+Rejected as unnecessary complexity.
 
 **Fold context work into analysis directive (d)**: Removes koto enforcement entirely —
 context loading becomes a suggestion with no structural guarantee. Rejected.
@@ -230,10 +236,10 @@ interaction internally, writes the introspection artifact, and returns a macro-l
 outcome. The `rationale` string captures what happened: "Clarified with user: requirement
 changed; approach updated" or "Amended issue scope: removed stale auth section."
 
-Key assumption: the introspection gate (`test -f wip/issue_{{ISSUE_NUMBER}}_introspection.md`)
-requires `--var` to work precisely. Until `--var` ships, this gate always fails and the
-state operates as evidence-only (gate-with-evidence-fallback handles this correctly —
-the agent submits evidence directly). This is consistent with the cross-validated behavior.
+The introspection gate (`test -f wip/issue_{{ISSUE_NUMBER}}_introspection.md`) uses
+`--var` substitution to check for the issue-specific artifact. When the artifact exists,
+the gate auto-advances; when it doesn't, gate-with-evidence-fallback surfaces the
+evidence schema for the agent to submit directly.
 
 #### Alternatives Considered
 
@@ -333,8 +339,7 @@ read (happy path), and misses the opportunity to shrink SKILL.md. Rejected.
 
 **No directives for koto-autonomous states (c)**: Koto-gated states produce empty output
 when gates fail. Agents receive no guidance on how to recover. Rejected because gate
-failures will occur (especially before `--var` ships) and agents need minimal fallback
-instructions.
+failures will occur and agents need minimal fallback instructions.
 
 **Agent-visible hint flag per state (d)**: Add an `agent_visible: bool` field to the
 template schema. States flagged as not agent-visible produce no directive output. Adds
@@ -457,7 +462,7 @@ transitions — no epoch-scoped mode re-submission required.
 | `setup_issue_backed` | koto-gated | branch not main, baseline exists |
 | `setup_free_form` | koto-gated | branch not main, baseline exists |
 | `staleness_check` | koto-gated | piped gate: `check-staleness.sh \| jq -e` |
-| `introspection` | koto-gated (evidence fallback until `--var` ships) | introspection artifact exists |
+| `introspection` | koto-gated | introspection artifact exists |
 | `analysis` | koto-gated | plan file exists |
 | `implementation` | koto-gated | on branch, has commits, tests pass |
 | `finalization` | koto-gated | summary file exists, tests pass |
@@ -476,15 +481,16 @@ Judgment states carry full 10-25 line directives (Tier 1).
 The SKILL.md orchestration wrapper (~55 lines of resume detection and phase dispatch) is
 eliminated. koto tracks state; the skill calls `koto next` in a loop.
 
-Two engine changes are needed. First, the advancement loop in `src/engine/advance.rs`
-must fall through to `NeedsEvidence` when a gate fails on a state that also has an
-`accepts` block, rather than unconditionally returning `GateBlocked`. Second, the
-`GateBlocked` CLI response in `src/cli/next_types.rs` and `src/cli/mod.rs` must carry
-the `expects` schema and set `agent_actionable: true` when a fallback is available. The
-`--var` flag on `koto init` must also be implemented to support issue-specific gate
-commands — until then, gates referencing `{{ISSUE_NUMBER}}` fall through to evidence
-fallback unconditionally, which degrades auto-advancement but doesn't break the workflow.
-`on_entry` actions are scoped as a separate follow-on engine issue.
+Three engine changes are prerequisites. First, the advancement loop in
+`src/engine/advance.rs` must fall through to `NeedsEvidence` when a gate fails on a
+state that also has an `accepts` block, rather than unconditionally returning
+`GateBlocked`. Second, the `GateBlocked` CLI response in `src/cli/next_types.rs` and
+`src/cli/mod.rs` must carry the `expects` schema and set `agent_actionable: true` when
+a fallback is available. Third, the `--var` flag on `koto init` must be implemented to
+support issue-specific gate commands (`{{ISSUE_NUMBER}}` substitution in gate strings).
+The `--var` feature is a `needs-design` issue — it involves CLI flag handling, event
+storage, runtime substitution, and shell injection sanitization. `on_entry` actions are
+scoped as a separate follow-on engine issue.
 
 ### Rationale
 
@@ -588,8 +594,8 @@ free_form]`, `issue_number: string` (issue-backed only), `task_description: stri
 **`context_injection`** — creates context artifact for issue-backed workflows. Gate:
 `test -f wip/issue_{{ISSUE_NUMBER}}_context.md`. Directive instructs the agent to run
 `extract-context.sh --issue <N>`, which reads the GitHub issue and linked design docs
-and writes `wip/issue_<N>_context.md`. Until `--var` ships, the gate fails unconditionally
-and the state uses evidence fallback: `context_injected: enum[complete]`, `rationale: string`.
+and writes `wip/issue_<N>_context.md`. When the artifact exists, the gate auto-advances.
+Evidence fallback: `context_injected: enum[complete]`, `rationale: string`.
 On resume: check if file already exists before re-running the script.
 
 **`task_validation`** — assesses whether the free-form task description is clear and
@@ -626,22 +632,21 @@ transition to `analysis`.
 
 **`staleness_check`** — assesses codebase freshness since the issue was opened.
 Gate: `check-staleness.sh --issue {{ISSUE_NUMBER}} | jq -e '.introspection_recommended == false'`
-(requires `--var`; uses jq exit code: 0 = fresh → `analysis`, 1 = stale → evidence
-fallback). Evidence fallback: `staleness_signal: enum[fresh, stale_requires_introspection]`,
+(uses jq exit code: 0 = fresh → `analysis`, 1 = stale → evidence fallback). Evidence
+fallback: `staleness_signal: enum[fresh, stale_requires_introspection]`,
 `staleness_details: string`. `stale_requires_introspection` routes to `introspection`.
 Tier 2 error-fallback directive: "koto should have advanced past staleness_check
 automatically. If you see this, run check-staleness.sh and submit the result."
 
 **`introspection`** — re-reads the issue against the current codebase via a sub-agent.
-Gate: `test -f wip/issue_{{ISSUE_NUMBER}}_introspection.md` (requires `--var`; operates
-as evidence-only until `--var` ships). Evidence fallback:
+Gate: `test -f wip/issue_{{ISSUE_NUMBER}}_introspection.md`. Evidence fallback:
 `introspection_outcome: enum[approach_unchanged, approach_updated, issue_superseded]`,
 `rationale: string`. `approach_unchanged` and `approach_updated` route to `analysis`.
 `issue_superseded` routes to `done_blocked`. The `approach_updated` value covers both
 Clarify and Amend outcomes from the sub-agent's internal loop.
 
 **`analysis`** — researches and creates implementation plan. Gate:
-`test -f wip/issue_{{ISSUE_NUMBER}}_plan.md` (issue-backed, requires `--var`) or
+`test -f wip/issue_{{ISSUE_NUMBER}}_plan.md` (issue-backed) or
 `ls wip/task_*_plan.md 2>/dev/null | grep -q .` (free-form, uses shell expansion).
 Evidence fallback: `plan_outcome: enum[plan_ready, blocked_missing_context,
 scope_changed_retry, scope_changed_escalate]`, `approach_summary: string`.
@@ -696,15 +701,15 @@ Reachable from multiple states via explicit escalation paths.
 koto init work-on-71 --template .koto/templates/work-on.md --var ISSUE_NUMBER=71
 ```
 Creates `koto-work-on-71.state.jsonl` in the current directory. Returns
-`{"name": "work-on-71", "state": "entry"}`. Note: `--var` flag requires Phase 1
-engine changes; until implemented, the workflow still functions via evidence fallback
-for gates referencing `{{ISSUE_NUMBER}}`.
+`{"name": "work-on-71", "state": "entry"}`. The `--var` flag stores the variable in
+the workflow's `WorkflowInitialized` event; `{{ISSUE_NUMBER}}` is substituted into
+gate commands at evaluation time.
 
 **Initialize a workflow (free-form):**
 ```
 koto init work-on-add-retry-logic --template .koto/templates/work-on.md
 ```
-No `--var` needed for free-form mode since no issue-specific gate commands apply.
+No `--var` needed for free-form mode — no issue-specific gate commands apply.
 
 **Get directive and advance:**
 ```
@@ -769,10 +774,32 @@ and calling `koto next`.
 
 ## Implementation Approach
 
+### Phase 0: Template variables (`--var` support) — needs-design
+
+The `--var` feature is a prerequisite that enables issue-specific gate commands
+(`{{ISSUE_NUMBER}}` substitution). It spans CLI, event storage, runtime evaluation, and
+input sanitization — enough surface area to warrant its own design doc.
+
+Scope for the child design:
+- `koto init` accepts `--var KEY=VALUE` (repeatable). Values are stored in the
+  `WorkflowInitialized` event's `variables` field (already defined, currently always
+  empty).
+- At gate evaluation time, `{{KEY}}` in gate command strings is substituted from the
+  stored variables map. Substitution happens at runtime, not compile time — the compiled
+  template remains variable-agnostic.
+- Input sanitization: variable values containing shell metacharacters must be rejected or
+  safely quoted at `koto init` time to prevent command injection. The child design should
+  specify the safe character set and rejection behavior.
+- Workflow name validation: names are incorporated into state file paths
+  (`koto-<name>.state.jsonl`) and must be validated against a strict pattern to prevent
+  path traversal.
+
+This issue blocks Phase 1 and all subsequent phases.
+
 ### Phase 1: Engine changes
 
-These changes unlock the gate-with-evidence-fallback pattern and enable template
-variables in gate commands. They're prerequisites for the template.
+These changes unlock the gate-with-evidence-fallback pattern. They're prerequisites
+for the template but independent of `--var` (Phase 0).
 
 Deliverables:
 - `src/engine/advance.rs`: When evaluating gates, if any gate fails and the current state
@@ -783,16 +810,8 @@ Deliverables:
   populated via `derive_expects` when the state has an `accepts` block.
 - `src/cli/mod.rs` (GateBlocked arm): Set `agent_actionable: true` on blocking conditions
   when the state has both gates and accepts. Populate the `expects` field.
-- `src/cli/mod.rs` (init command): Add `--var KEY=VALUE` flag (repeatable). Store in the
-  `WorkflowInitialized` event's `variables` field. At gate evaluation time, substitute
-  `{{KEY}}` in gate command strings by reading from the stored variables map. Sanitize
-  variable values at `koto init` time: reject or quote values containing shell
-  metacharacters to prevent command injection.
-- `src/cli/mod.rs` (init command): Validate the workflow name against a strict pattern
-  (`^[a-zA-Z0-9][a-zA-Z0-9-]*$`) to prevent path traversal in state file paths.
-- Tests: add engine tests for gate-failure-with-fallback behavior, CLI output shape for
-  the new GateBlocked-with-fallback response, `--var` substitution, and workflow name
-  validation rejection.
+- Tests: add engine tests for gate-failure-with-fallback behavior and CLI output shape for
+  the new GateBlocked-with-fallback response.
 
 ### Phase 2: Template file
 
@@ -806,8 +825,7 @@ Deliverables:
   get Tier 1 directives (action summary + resume preamble, 10-25 lines). Koto-gated
   states get Tier 2 error-fallback directives (3-6 lines: "koto should have advanced
   past this state automatically; if you see this, [specific fallback action]"). Gate
-  commands referencing `{{ISSUE_NUMBER}}` fall through to evidence fallback until Phase 1
-  `--var` support is confirmed working.
+  commands referencing `{{ISSUE_NUMBER}}` use `--var` substitution from Phase 0.
 - `koto template compile shirabe/koto-templates/work-on.md`: must pass with no errors.
   The compiler validates mutual exclusivity of transitions and rejects non-deterministic
   routing. Write YAML front-matter and markdown headings in lockstep (state name
@@ -849,7 +867,7 @@ Deliverables:
 
 Deliverables:
 - Update `koto-skills` AGENTS.md to reflect the actual CLI signatures: positional `name`
-  argument (not `--name` flag), `--var` flag (new), accurate `koto next` response shapes.
+  argument (not `--name` flag), `--var` flag, accurate `koto next` response shapes.
 - Add a worked example to AGENTS.md showing the work-on workflow from `koto init` through
   `done`.
 - Update the hello-koto template if any API contracts changed in Phase 1.
@@ -866,17 +884,19 @@ manually. The gate commands in this template are limited to: `git rev-parse`, `g
 constructed from untrusted input at gate evaluation time, because gate commands are
 static strings in the compiled template.
 
-The `--var` flag introduced in Phase 1 allows caller-controlled strings to be substituted
-into gate commands at evaluation time. If a variable value contains shell metacharacters
-(e.g., `; rm -rf ~`), it could be injected into the gate command. Sanitization must
-happen at `koto init` time, before storing variables in the `WorkflowInitialized` event:
-reject values containing characters outside a safe set (alphanumeric, hyphens, dots,
-slashes) or quote and escape them. The compiled template remains variable-agnostic;
-substitution happens at runtime from the stored variables map.
+The `--var` flag (Phase 0 prerequisite) allows caller-controlled strings to be
+substituted into gate commands at evaluation time. If a variable value contains shell
+metacharacters (e.g., `; rm -rf ~`), it could be injected into the gate command.
+Sanitization must happen at `koto init` time, before storing variables in the
+`WorkflowInitialized` event: reject values containing characters outside a safe set
+(alphanumeric, hyphens, dots, slashes) or quote and escape them. The compiled template
+remains variable-agnostic; substitution happens at runtime from the stored variables map.
+The Phase 0 child design must specify the exact sanitization approach.
 
-Additionally, workflow names are incorporated into state file paths (`koto-<name>.state.jsonl`).
-Names must be validated at `koto init` time against a strict pattern to prevent path
-traversal (e.g., `../../../etc/koto.state.jsonl`).
+Additionally, workflow names are incorporated into state file paths
+(`koto-<name>.state.jsonl`). Names must be validated at `koto init` time against a
+strict pattern to prevent path traversal (e.g., `../../../etc/koto.state.jsonl`). This
+validation is also scoped to Phase 0.
 
 **Supply chain risks**: The template is shipped as part of the shirabe plugin. Trust
 in the template is the same as trust in the shirabe plugin itself. No external content
@@ -921,13 +941,12 @@ No data is transmitted outside the local machine by koto itself.
 
 ### Negative
 
-- Two engine changes are required before gate-with-evidence-fallback activates. The
-  template can be written and compiled, but gate failure routes to hard-stop until the
-  advancement loop is patched.
-- The `--var` flag must be implemented for issue-specific gate commands. Until then,
-  gates referencing `{{ISSUE_NUMBER}}` fall through to evidence fallback unconditionally
-  (degraded auto-advancement, but the workflow remains functional).
-- The introspection gate operates as evidence-only until `--var` ships.
+- Three prerequisite engine changes are required (Phase 0 `--var` + Phase 1 gate
+  fallback). The template can be written and compiled before these ship, but gate
+  commands won't evaluate and fallback routing won't activate until the engine work
+  lands.
+- The `--var` prerequisite (Phase 0) is a `needs-design` issue with its own design scope.
+  It adds a dependency chain before the template can ship.
 - Test commands in gates are language-specific (`go test ./...`). Non-Go projects need
   a different test command.
 - The 17-state template is authoring-heavy with no tooling support. The compiler reports
@@ -937,10 +956,11 @@ No data is transmitted outside the local machine by koto itself.
 
 ### Mitigations
 
-- The engine changes are targeted (two files, one new flag). Existing templates with
-  gate-only states continue to hard-block on gate failure — no regression.
-- Until `--var` ships, gates fail unconditionally and states use evidence fallback.
-  Once `--var` ships, gates become active without template changes.
+- The Phase 1 engine changes are targeted (two files). Existing templates with gate-only
+  states continue to hard-block on gate failure — no regression.
+- Phase 0 (`--var`) has a bounded scope: CLI flag, event storage, runtime substitution,
+  input sanitization. The child design can constrain this to the minimum needed for gate
+  substitution.
 - Add `TEST_COMMAND` as a template variable with a default of `go test ./...`, making
   it configurable without changing the template structure.
 - `koto rewind` is CLI-callable (confirmed in source). The directive for `done_blocked`
