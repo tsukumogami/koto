@@ -1,37 +1,34 @@
 ---
 status: Proposed
 problem: |
-  shirabe's /work-on skill requires a GitHub issue number. Agents and users often want
-  to implement a small task without first creating an issue — a branch, a PR, CI green,
-  done. Without issue-backed context, /work-on has no way to load design context or run
-  a staleness check. The skill either requires an issue or provides no structured
-  guidance at all. koto's template engine can enforce the workflow phase structure for
-  both cases in a single template, making the issue optional while preserving enforcement.
+  shirabe's /work-on skill is a long agent skill with instructions covering every phase
+  of implementation: context gathering, branch creation, planning, coding, PR creation,
+  CI monitoring. Most of these phases involve deterministic operations that any program
+  could execute reliably — yet agents carry them as instruction text, consume context
+  window on them, and must re-read them on resume. The skill also requires a GitHub issue
+  number, blocking free-form and plan-only tasks. The result is a skill that's too large,
+  handles too much deterministic work in the wrong layer, and supports fewer input modes
+  than users need.
 decision: |
-  A single koto template backing /work-on with 17 states and two modes: issue-backed
-  (GitHub issue number provided) and free-form (task description provided, no issue).
-  The modes share all states from analysis onward and diverge through mode-specific
-  context-gathering phases. The template uses a split topology: two separate setup
-  states (setup_issue_backed and setup_free_form) eliminate the epoch-scoped mode
-  re-submission that a single setup state requires. Context injection gates on the
-  existence of wip/issue_<N>_context.md to ensure extraction happened before
-  setup. Free-form mode has two validation states — pre-research and post-research —
-  to catch misconceived tasks at both the description stage and the codebase-discovery
-  stage. Self-looping states use retry/escalate enum variants with explicit escalation
-  paths to done_blocked. Directives are concise with resume-oriented preambles; the
-  skill wrapper supplements complex phases with full procedure.
+  A single koto template backing /work-on that maximizes gate-based auto-advancement:
+  implementation and ci_monitor auto-advance today using existing gate capabilities;
+  staleness_check auto-advances via a piped gate command (check-staleness.sh | jq -e
+  '...'). Agents are reached only on judgment states or gate-failure fallback paths.
+  The template uses split topology (two setup states), two-tier directives (full
+  directives for judgment states; error-fallback-only for koto-gated states), and
+  routes three input modes (GitHub issue, free-form description, PLAN doc issue)
+  through a unified 17-state machine. on_entry actions (koto running commands autonomously)
+  are scoped as a follow-on engine issue, not a template prerequisite.
 rationale: |
-  The split topology eliminates the most confusing element of the previous design:
-  requiring agents to re-submit mode at setup despite having submitted it at entry.
-  Two separate setup states make routing self-documenting without requiring epoch-scoped
-  evidence knowledge. Gating context_injection on the issue_<N>_context.md artifact
-  fixes the panel finding that the accessibility-only gate allowed skipping context
-  extraction entirely. Two free-form validation states reflect the just-do-it skill's
-  two-jury structure: the pre-research check catches obviously-wrong tasks cheaply, the
-  post-research check catches tasks that codebase discovery reveals to be misconceived.
-  Retry/escalate variants in self-looping states give agents a structured escalation
-  path with a clear audit record. Concise directives with resume preambles solve the
-  reorientation gap while keeping the template maintainable.
+  The automation-first principle — koto does deterministic work, agents do judgment work
+  — is achievable today without new engine capabilities. The staleness_check piped gate
+  was a design oversight: check-staleness.sh output can be evaluated via jq exit code,
+  no new gate type needed. The SKILL.md orchestration wrapper (~55 lines of resume
+  detection and phase dispatch) is eliminated because koto tracks state directly. Two-tier
+  directives encode the automation principle in the template schema: koto-gated states
+  carry only failure-recovery guidance, not procedure, because agents only land there
+  when something goes wrong. The agent instruction reduction (~42% of 995 lines) is the
+  primary measurable outcome.
 ---
 
 # DESIGN: shirabe work-on koto template
@@ -42,38 +39,47 @@ Proposed
 
 ## Context and Problem Statement
 
-shirabe's /work-on skill implements a GitHub issue: gather context, plan, implement,
-create a PR, verify CI, done. The skill currently requires a GitHub issue number to
-load design context and run a staleness check. Agents often need to implement a small
-task without an existing issue — a config tweak, a doc fix, a quick refactor — and
-creating an issue first adds friction with no benefit.
+shirabe's /work-on skill is a long agent skill with instructions covering every phase
+of implementation: context gathering, branch creation, planning, coding, PR creation,
+CI monitoring. Most of these phases involve deterministic operations — running scripts,
+creating branches, polling APIs, checking file existence — that any program could
+execute reliably. Embedding them in agent instructions keeps the agent's context
+window loaded with procedural text for work the agent should never need to do itself.
 
-The skill needs a free-form mode: accept a task description instead of an issue number,
-skip the GitHub context and staleness phases, and run a lightweight validation step
-instead. The implementation phases are identical in both modes.
+koto's template engine is built to separate this correctly: states with command gates
+auto-advance when conditions are met, executing verification without agent involvement.
+Evidence states engage the agent only when interpretation is needed. The goal of a
+/work-on koto template is not to give koto a description of what the agent currently
+does — it is to identify every deterministic step in the workflow, move it from agent
+instructions into koto's engine, and leave agents with only the states that genuinely
+require creativity or judgment.
 
-koto enforces workflow phase structure through a state machine template. A koto template
-for /work-on would: enforce that the agent completes each phase before advancing, persist
-progress across sessions, and make the workflow auditable. /work-on is a natural first
-koto template because it's linear (one workflow, one session), maps cleanly to koto's
-state machine model, and requires no external integrations — the agent handles all
-external actions (git, GitHub, CI) within state directives.
+A second problem: the skill currently requires a GitHub issue number. Agents and users
+often need to implement a small task without first creating an issue, and creating one
+adds friction. Supporting free-form input is part of the same redesign — the koto
+template defines the workflow structure, and the entry point determines which
+context-gathering states run.
+
+The measure of success is not "koto enforces the workflow" — it is "agent instructions
+are shorter because koto does more."
 
 ## Decision Drivers
 
-- koto's surface must stay minimal — no new subcommands or integration runner config
-  required for this template to work
-- The agent handles all external actions; koto enforces phase order via evidence-gated
-  transitions
-- The template must support both modes: issue-backed (GitHub issue number) and free-form
-  (task description, no issue)
-- Session resumability: koto's event log handles mid-session interruption without
-  additional state management
-- The staleness/introspection check must be able to route directly to analysis without
-  forcing introspection
-- Evidence schemas must capture agent decisions, not just confirm completion — `{done:
-  true}` evidence that can be submitted regardless of what actually happened defeats the
-  enforcement purpose
+- **Automation-first**: every step that can be executed or verified deterministically
+  by koto must be — if koto can run the command and check the result, the agent should
+  not be asked to do it
+- **Agents for judgment only**: evidence states are reserved for decisions requiring
+  interpretation, creativity, or nuance that command outputs cannot capture
+- **Agent instructions shrink as a result**: states where koto auto-advances produce
+  no agent work and need no agent-readable directives; the skill's instruction set
+  gets shorter, not longer
+- koto's CLI surface stays minimal — no new subcommands; new capabilities live inside
+  the template schema (new state fields) and the engine (new evaluation logic)
+- Both modes supported: issue-backed (GitHub issue) and free-form (task description,
+  no issue), plus plan-backed (PLAN doc issue, routed as free-form)
+- Session resumability: koto's event log handles mid-session interruption
+- Evidence schemas capture decisions, not completions — `{done: true}` evidence
+  defeats enforcement
 
 ## Considered Options
 
@@ -293,44 +299,47 @@ which produce auditable escalation records.
 
 ### Decision 6: Directive content model
 
-Template directives must carry enough instruction for agents to execute each state
-correctly, including after a session interruption. The original design specified evidence
-schemas but wrote no directive text. The real /work-on skill has 50-130 lines of procedure
-per major phase stored in `references/phases/` files.
+Under the automation-first principle, not all states need the same directive depth. States
+where koto auto-advances on the happy path (gate passes → next state, no agent action)
+need only error-fallback instructions. States where agents always do judgment work need
+full directives. Treating all states uniformly either over-specifies koto-autonomous states
+or under-specifies judgment states.
 
-#### Chosen: Concise directives with resume-oriented preambles; wrapper injection for complex phases
+#### Chosen: Two-tier directives — full for judgment states, error-fallback-only for koto-gated states
 
-Each state's directive has two parts:
+**Tier 1 — judgment states** (`entry`, `task_validation`, `post_research_validation`,
+`staleness_check`, `introspection`, `analysis`, `pr_creation`, `validation_exit`,
+`done_blocked`): Full concise directive (10-25 lines) covering what to accomplish, key
+artifact paths, evidence schema, and resume guidance. These states always invoke agent
+judgment and need orientation after session interruption.
 
-1. **Action summary** (10-25 lines): what the agent should accomplish in this state, key
-   artifact paths, and evidence schema guidance. Sufficient for a template author to
-   understand the state's purpose without reading SKILL.md.
+**Tier 2 — koto-gated states on the happy path** (`context_injection`, `setup_issue_backed`,
+`setup_free_form`, `implementation`, `finalization`, `ci_monitor`): Error-fallback-only
+directive (3-6 lines). Format: "koto should have advanced past this state automatically.
+If you see this, [specific fallback action]. Submit: [minimal evidence schema]." When the
+gate passes, agents never read these directives. They only appear on gate failure, so they
+need only enough instruction to unblock the agent and resubmit.
 
-2. **Resume preamble** (3-6 lines): explicit instructions to re-read relevant wip
-   artifacts and check git state before continuing. Included for any state where prior
-   work affects what the agent should do next.
-
-For the two most complex states (`analysis`, `implementation`), the skill wrapper
-supplements the directive with the full phase file content before the agent begins work.
-The template directive orients the agent to workflow context; the injected phase file
-provides procedural detail. Template maintenance: update SKILL.md phase files when
-procedure changes; update template directives only when workflow structure changes.
-These are different change triggers.
+The SKILL.md orchestration wrapper — currently ~55 lines of resume detection, phase
+dispatch, and session management — is eliminated. koto tracks state directly; the skill
+calls `koto next` in a loop and injects full phase files for `analysis` and
+`implementation` before the agent begins work.
 
 #### Alternatives Considered
 
-**Self-contained full procedure (a)**: Embeds all 50-130 lines of procedure per phase.
-Duplicates procedure from SKILL.md phase files, requires synchronized updates in two
-places, produces an 800+ line template difficult to author and review. Rejected.
+**Uniform concise directives for all states (a)**: Every state gets a 10-25 line
+directive regardless of automation tier. Wastes directive space on states agents never
+read (happy path), and misses the opportunity to shrink SKILL.md. Rejected.
 
-**Short directives referencing SKILL.md phase files (c)**: A directive that says "follow
-phase-4-implementation.md." Requires reading external files to understand the template
-— violates standalone readability. Rejected.
+**No directives for koto-autonomous states (c)**: Koto-gated states produce empty output
+when gates fail. Agents receive no guidance on how to recover. Rejected because gate
+failures will occur (especially before `--var` ships) and agents need minimal fallback
+instructions.
 
-**Very short trigger directives with full wrapper injection (d)**: Template becomes an
-empty scaffold. Agents running koto directly receive useless directives. Option (b) uses
-selective wrapper injection for complex phases without sacrificing template readability.
-Rejected as the primary approach.
+**Agent-visible hint flag per state (d)**: Add an `agent_visible: bool` field to the
+template schema. States flagged as not agent-visible produce no directive output. Adds
+schema complexity for the same behavioral result as tier 2's 3-6 line error-fallback
+directives. Rejected as over-engineered for this problem.
 
 ---
 
@@ -376,11 +385,55 @@ plan issue vs. a GitHub issue.
 
 ---
 
+### Decision 8: Automation ceiling — on_entry actions vs. gate-only model
+
+The automation-first principle asks how far to push koto-autonomous execution in this
+release. `on_entry` actions would let koto run scripts at state entry (branch creation,
+context extraction, staleness check) with stdout captured and injected as evidence — no
+agent needed. The alternative is the gate-only model: koto verifies outcomes via gates,
+agents run scripts per directive, and koto provides evidence-fallback when gates fail.
+
+The critical finding: staleness_check's apparent gap (command gates can't inspect script
+output content) is solvable without `on_entry` actions. A piped gate command
+(`check-staleness.sh --issue {{ISSUE_NUMBER}} | jq -e '.introspection_recommended == false'`)
+uses jq's exit code to route — no new koto capability required.
+
+#### Chosen: Gate-only model; on_entry actions scoped as a separate engine issue
+
+All deterministic work that koto can verify today (branch existence, file existence,
+test results, CI status) uses command gates. The staleness_check gap is fixed via the
+piped gate pattern. Agents run scripts via tier-2 error-fallback directives when gates
+fail. `on_entry` actions are filed as a separate koto engine issue (1-2 engineer-weeks)
+to be implemented after the template ships.
+
+Key assumptions: the piped gate pattern works today (`check-staleness.sh | jq -e`
+uses standard shell piping, not a new koto capability); the staleness check script
+produces machine-readable JSON output with an `introspection_recommended` field.
+
+#### Alternatives Considered
+
+**Full on_entry actions with stdout capture and evidence injection (a)**: 5 states
+become fully agent-free on the happy path. Requires 1-2 engineer-weeks of koto engine
+work before the template can ship. The template is blocked on an engine change that is
+not a prerequisite for the core value (enforced state machine sequencing). Rejected as
+a prerequisite.
+
+**Minimal on_entry, exit-code only (c)**: Branch creation automated, context injection
+and staleness still need agents. A partial implementation that adds engine complexity
+without completing the automation picture. Rejected as worse than either full option.
+
+**Deferred: include on_entry schema now, implement engine change separately (d)**:
+Write `on_entry:` blocks in the template today, with the engine ignoring them until
+implemented. Confuses template authors and agents who see `on_entry:` blocks that silently
+do nothing. Rejected because it obscures the automation state of the template.
+
+---
+
 ## Decision Outcome
 
-**Chosen: gate-with-evidence-fallback, split topology, artifact-gated context injection,
-two-stage free-form validation, collapsed introspection outcomes, retry/escalate
-self-loops, concise directives with resume preambles, plan-backed via free-form**
+**Chosen: automation-first gate-only model, split topology, artifact-gated context
+injection, piped staleness gate, two-stage free-form validation, collapsed introspection
+outcomes, retry/escalate self-loops, two-tier directives, plan-backed via free-form**
 
 The template has 17 states across two converging modes.
 
@@ -396,14 +449,32 @@ Both modes share 8 states from `analysis` onward. The modes diverge through thei
 context-gathering phases and each have a dedicated setup state with unconditional
 transitions — no epoch-scoped mode re-submission required.
 
-Five states have command gates enabling auto-advancement: `context_injection` (context
-artifact), `introspection` (introspection artifact, evidence-only until `--var` ships),
-`analysis` (plan file), `finalization` (summary + tests), and `ci_monitor` (CI checks).
-When gates pass, `koto next` advances without asking for anything. When gates fail on
-states with `accepts` blocks, koto surfaces the expects schema and the agent submits a
-decision record. Five states are always evidence-gated: `entry`, `task_validation`,
-`post_research_validation`, `staleness_check`, and `pr_creation`. `research` is also
-evidence-gated with an unconditional transition (no routing decision needed).
+**State automation classification:**
+
+| State | Classification | Auto-advances when |
+|---|---|---|
+| `context_injection` | koto-gated | context artifact exists |
+| `setup_issue_backed` | koto-gated | branch not main, baseline exists |
+| `setup_free_form` | koto-gated | branch not main, baseline exists |
+| `staleness_check` | koto-gated | piped gate: `check-staleness.sh \| jq -e` |
+| `introspection` | koto-gated (evidence fallback until `--var` ships) | introspection artifact exists |
+| `analysis` | koto-gated | plan file exists |
+| `implementation` | koto-gated | on branch, has commits, tests pass |
+| `finalization` | koto-gated | summary file exists, tests pass |
+| `ci_monitor` | koto-gated | all PR checks pass |
+| `entry` | judgment | always evidence-gated |
+| `task_validation` | judgment | always evidence-gated |
+| `post_research_validation` | judgment | always evidence-gated |
+| `pr_creation` | judgment | always evidence-gated |
+| `research` | evidence-gated | unconditional transition |
+
+When koto-gated states' gates pass, `koto next` advances without agent action. When gates
+fail on states with `accepts` blocks, koto surfaces the evidence schema (gate-with-evidence-
+fallback). Koto-gated states carry only 3-6 line error-fallback directives (Tier 2).
+Judgment states carry full 10-25 line directives (Tier 1).
+
+The SKILL.md orchestration wrapper (~55 lines of resume detection and phase dispatch) is
+eliminated. koto tracks state; the skill calls `koto next` in a loop.
 
 Two engine changes are needed. First, the advancement loop in `src/engine/advance.rs`
 must fall through to `NeedsEvidence` when a gate fails on a state that also has an
@@ -413,24 +484,25 @@ the `expects` schema and set `agent_actionable: true` when a fallback is availab
 `--var` flag on `koto init` must also be implemented to support issue-specific gate
 commands — until then, gates referencing `{{ISSUE_NUMBER}}` fall through to evidence
 fallback unconditionally, which degrades auto-advancement but doesn't break the workflow.
+`on_entry` actions are scoped as a separate follow-on engine issue.
 
 ### Rationale
 
+The automation-first principle — koto does deterministic work, agents do judgment work —
+is achievable today without new engine capabilities. `implementation` and `ci_monitor`
+already auto-advance using existing gate support. `staleness_check` uses a piped gate
+(`check-staleness.sh | jq -e`) rather than requiring `on_entry` actions — this was a
+design oversight that the research phase identified. The ~42% agent instruction reduction
+(420 of 995 lines) is the primary measurable outcome: the SKILL.md orchestration wrapper
+is eliminated, branch creation sequences are automated via setup state gates, and
+finalization cleanup is verified by the finalization gate.
+
 The split topology eliminates the most confusing element of the previous design: requiring
 agents to re-submit mode at setup despite having already submitted it at entry. Two
-separate setup states make routing self-documenting — the path you're on determines which
-setup state you're in, with unconditional transitions to the appropriate next state. No
-epoch-scoped evidence knowledge is required.
-
-Gating `context_injection` on the `issue_<N>_context.md` artifact fixes the panel
-finding that the original accessibility-only gate allowed skipping context extraction
-entirely. Two free-form validation states reflect the just-do-it skill's actual two-jury
-structure. Retry/escalate variants in self-looping states give agents a structured
-escalation path with a clear audit record. Concise directives with resume preambles solve
-the reorientation gap the workflow practitioner identified while keeping the template
-maintainable. The gate-with-evidence-fallback model itself remains: agents making
-reasonable judgment calls (reusing a branch, skipping introspection on a fresh codebase)
-record their decisions rather than getting blocked.
+separate setup states make routing self-documenting. Retry/escalate variants in
+self-looping states give agents a structured escalation path with a clear audit record.
+Two-tier directives match directive depth to state type — koto-gated states get
+error-fallback only, judgment states get full orientation.
 
 ## Solution Architecture
 
@@ -475,7 +547,7 @@ entry (evidence: mode)
   │        │
   │   setup_issue_backed[G/E]
   │        │
-  │   staleness_check ─── stale_requires_introspection ──► introspection[G/E]
+  │   staleness_check[G/E] ─── stale_requires_introspection ──► introspection[G/E]
   │        │                                                      │
   │        └──────────────── fresh/stale_skip ───────────────────┘
   │                                    │
@@ -495,10 +567,11 @@ entry (evidence: mode)
                        to analysis)
 ```
 
-`[G]` = has command gate (auto-advances when gate passes).
+`[G]` = has command gate (auto-advances when gate passes, unconditional transition).
 `[G/E]` = gate-with-evidence-fallback (gate fails → evidence fallback).
+`staleness_check` uses a piped gate (`check-staleness.sh | jq -e`), annotated `[G/E]`.
 States always evidence-gated (no gate): `entry`, `task_validation`,
-`post_research_validation`, `staleness_check`, `pr_creation`.
+`post_research_validation`, `pr_creation`.
 `research` is evidence-gated with unconditional transition.
 
 `done_blocked` is reachable from: `analysis` (`blocked_missing_context` and
@@ -551,12 +624,13 @@ Gate: branch is not main/master, baseline file exists. Evidence fallback:
 `baseline_outcome: enum[clean, existing_failures, build_broken]`. Unconditional
 transition to `analysis`.
 
-**`staleness_check`** — assesses codebase freshness since the issue was opened. Always
-evidence-gated (command gates can't inspect script output content). Directive instructs
-agent to run check-staleness.sh and read the `introspection_recommended` field from its
-YAML output. Evidence: `staleness_signal: enum[fresh, stale_requires_introspection]`,
-`staleness_details: string`. `fresh` or `stale_skip_introspection` routes to `analysis`;
-`stale_requires_introspection` routes to `introspection`.
+**`staleness_check`** — assesses codebase freshness since the issue was opened.
+Gate: `check-staleness.sh --issue {{ISSUE_NUMBER}} | jq -e '.introspection_recommended == false'`
+(requires `--var`; uses jq exit code: 0 = fresh → `analysis`, 1 = stale → evidence
+fallback). Evidence fallback: `staleness_signal: enum[fresh, stale_requires_introspection]`,
+`staleness_details: string`. `stale_requires_introspection` routes to `introspection`.
+Tier 2 error-fallback directive: "koto should have advanced past staleness_check
+automatically. If you see this, run check-staleness.sh and submit the result."
 
 **`introspection`** — re-reads the issue against the current codebase via a sub-agent.
 Gate: `test -f wip/issue_{{ISSUE_NUMBER}}_introspection.md` (requires `--var`; operates
@@ -676,10 +750,11 @@ for routing. `mode` is captured at `entry` for routing to the mode-specific firs
 (`context_injection` or `task_validation`). The two setup states route unconditionally to
 their respective post-setup states, so no mode re-submission is needed.
 
-For complex states (`analysis`, `implementation`), the skill wrapper injects the full
-phase procedure (from `references/phases/`) before the agent reads the directive.
-Template directives carry concise action summaries and resume preambles — the phase files
-carry full procedural detail.
+Judgment states (`analysis`, `implementation`, and others requiring agent decision-making)
+carry full Tier 1 directives (10-25 lines). Koto-gated states carry only Tier 2
+error-fallback directives (3-6 lines) — agents only see these when a gate fails. For
+`analysis` and `implementation`, the skill wrapper additionally injects the full phase
+procedure file before the agent begins work.
 
 wip/ artifact files created during the workflow:
 - `wip/issue_<N>_context.md` (issue-backed, created by extract-context.sh --issue <N>)
@@ -727,8 +802,10 @@ conditional `transitions:` with `when:` blocks are expressed in front-matter.
 
 Deliverables:
 - `shirabe/koto-templates/work-on.md`: the 17-state template with all directives, gate
-  commands, and evidence schemas as specified in Solution Architecture. Each state
-  directive follows the two-part structure: action summary + resume preamble. Gate
+  commands, and evidence schemas as specified in Solution Architecture. Judgment states
+  get Tier 1 directives (action summary + resume preamble, 10-25 lines). Koto-gated
+  states get Tier 2 error-fallback directives (3-6 lines: "koto should have advanced
+  past this state automatically; if you see this, [specific fallback action]"). Gate
   commands referencing `{{ISSUE_NUMBER}}` fall through to evidence fallback until Phase 1
   `--var` support is confirmed working.
 - `koto template compile shirabe/koto-templates/work-on.md`: must pass with no errors.
@@ -743,10 +820,13 @@ Deliverables:
 Update the /work-on skill to drive koto.
 
 Deliverables:
-- Updated /work-on skill instructions: on invocation, check `koto workflows` for a
-  `work-on-*` workflow in cwd. If found, re-read existing wip/ artifacts and git log,
-  then resume via `koto next`. If not found, copy the template to `.koto/templates/work-on.md`
-  (from the plugin directory) if it doesn't exist, then call `koto init`.
+- Updated /work-on skill instructions: remove the ~55-line orchestration wrapper
+  (resume detection logic, phase dispatch, session management). Replace with: on
+  invocation, check `koto workflows` for a `work-on-*` workflow in cwd. If found,
+  re-read existing wip/ artifacts and git log, then resume via `koto next`. If not
+  found, copy the template to `.koto/templates/work-on.md` (from the plugin directory)
+  if it doesn't exist, then call `koto init`. koto tracks state; the skill calls
+  `koto next` in a loop.
 - The skill accepts three input forms: (1) a GitHub issue number — initializes with
   `--var ISSUE_NUMBER=<N>` and submits `mode: issue_backed`; (2) a free-form task
   description — initializes without `--var` and submits `mode: free_form`; (3) a plan
@@ -819,63 +899,52 @@ No data is transmitted outside the local machine by koto itself.
 
 ### Positive
 
+- Agent instructions shrink ~42% (420 of 995 lines eliminable). The SKILL.md
+  orchestration wrapper (~55 lines) is removed; branch creation, file verification, test
+  checking, and CI monitoring move into koto gates. Agent context focuses on judgment.
+- Nine states auto-advance via koto gates on the happy path. Agents never see the
+  directive for `setup_issue_backed`, `setup_free_form`, `implementation`, `finalization`,
+  `ci_monitor`, and others when their gates pass — their context is consumed only when
+  recovery is needed.
 - Phase order is enforced without additional state management in the /work-on skill.
-  The agent can't reach `ci_monitor` without a PR existing, or `analysis` without passing
+  The agent can't reach `ci_monitor` without a PR, or `analysis` without passing
   through `staleness_check` (issue-backed) or `post_research_validation` (free-form).
 - Evidence fields are decision records. The event log shows not just that a phase
   completed, but what decision the agent made and why — useful for debugging and audit.
-- Session resume is supported. Each state's directive includes a resume preamble
-  instructing the agent to re-read relevant wip/ artifacts and git state before continuing.
-  Calling `koto next <name>` after a session interruption returns the current directive.
-- The two modes share 8 states from `analysis` onward. The split topology adds two setup
-  states but eliminates the epoch-scoped mode re-submission of the previous design,
-  which was the primary maintainability concern.
-- Command gates auto-advance through mechanical checks without agent overhead. When tests
-  pass and artifacts exist, `koto next` advances through `analysis`, `implementation`,
-  and `finalization` without a `--with-data` call.
-- Self-loop escalation paths give agents a structured exit from retry loops. The event
-  log records escalation decisions, distinguishing "agent gave up after N attempts" from
-  "agent encountered an unrelated blocker."
+- Session resume is supported. Judgment state directives include resume guidance to
+  re-read wip/ artifacts and git state. `koto next <name>` returns the current directive
+  after interruption without any orchestration wrapper.
+- The split topology eliminates epoch-scoped mode re-submission. Two setup states with
+  unconditional transitions make routing self-documenting.
 - Context injection is verified. The `context_injection` gate confirms
-  `wip/issue_<N>_context.md` was created before setup begins, ensuring design
-  context reaches implementation regardless of session interruptions.
+  `wip/issue_<N>_context.md` was created before setup begins.
 
 ### Negative
 
 - Two engine changes are required before gate-with-evidence-fallback activates. The
   template can be written and compiled, but gate failure routes to hard-stop until the
   advancement loop is patched.
-- The `--var` flag must be implemented for gate commands to reference `{{ISSUE_NUMBER}}`.
-  Until then, gates referencing the issue number fall through to evidence fallback
-  unconditionally (degraded auto-advancement, but workflow remains functional).
-- The staleness check always requires agent evidence. Command gates can only check exit
-  codes, not script output content, so the routing decision (introspect or skip) must
-  always be submitted by the agent.
-- The introspection gate operates as evidence-only until `--var` ships. Agents
-  self-report whether the introspection artifact exists rather than having koto verify it.
+- The `--var` flag must be implemented for issue-specific gate commands. Until then,
+  gates referencing `{{ISSUE_NUMBER}}` fall through to evidence fallback unconditionally
+  (degraded auto-advancement, but the workflow remains functional).
+- The introspection gate operates as evidence-only until `--var` ships.
 - Test commands in gates are language-specific (`go test ./...`). Non-Go projects need
-  a different test command; a `TEST_COMMAND` template variable (defaulting to `go test ./...`)
-  is the planned mitigation.
+  a different test command.
 - The 17-state template is authoring-heavy with no tooling support. The compiler reports
-  one error at a time, and state name mismatches between YAML front-matter and markdown
-  headings produce compile errors. Authors should write states in lockstep.
-- `koto rewind` rewinds one step per call. Recovering `done_blocked` to a non-adjacent
-  originating state requires multiple calls. The directive must make this explicit.
+  one error at a time; state name mismatches produce compile errors.
+- `koto rewind` rewinds one step per call. Recovering from `done_blocked` to a
+  non-adjacent originating state requires multiple calls.
 
 ### Mitigations
 
-- The engine changes are targeted (two files, one new flag). They don't affect existing
-  templates with gate-only states, which continue to hard-block on gate failure.
-- Until `--var` is implemented, the introspection gate fails unconditionally and the
-  state uses evidence-only path. The gate-with-evidence-fallback pattern handles this
-  correctly — agents submit evidence directly. Once `--var` ships, the gate becomes
-  active without template changes.
-- The staleness check limitation is inherent to command gates; it's documented in the
-  template directive. Future work could add an output-matching gate type
-  (e.g., `type: command_output`) to close this gap.
+- The engine changes are targeted (two files, one new flag). Existing templates with
+  gate-only states continue to hard-block on gate failure — no regression.
+- Until `--var` ships, gates fail unconditionally and states use evidence fallback.
+  Once `--var` ships, gates become active without template changes.
 - Add `TEST_COMMAND` as a template variable with a default of `go test ./...`, making
   it configurable without changing the template structure.
-- `koto rewind` is CLI-callable (confirmed in source). The one-step-per-call behavior
-  means recovery from `done_blocked` to a non-adjacent state requires N rewind calls,
-  where N is the number of states traversed. The directive lists the specific rewind
-  count for each path that reaches `done_blocked`.
+- `koto rewind` is CLI-callable (confirmed in source). The directive for `done_blocked`
+  lists the specific rewind count for each path that reaches it.
+- `on_entry` actions (which would convert the remaining koto-gated states to fully
+  agent-free) are scoped as a follow-on koto engine issue. They improve the design
+  incrementally without blocking the template release.
