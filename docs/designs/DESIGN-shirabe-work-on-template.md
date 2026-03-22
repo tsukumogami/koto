@@ -143,10 +143,10 @@ duplication constraint, and recreates the divergence problem that motivated this
 
 The `context_injection` state backs Phase 0 of /work-on, which runs `extract-context.sh`
 to create `wip/issue_<N>_context.md`. This file carries design rationale forward —
-Phase 4 (implementation) explicitly references it. The original design gated on issue
-accessibility (`gh issue view {{ISSUE_NUMBER}}`), which checks reachability but doesn't
-verify that context extraction happened. A panel review identified this as a core gap:
-"The entire context injection purpose is lost."
+Phase 4 (implementation) explicitly references it. Gating on issue accessibility alone
+(`gh issue view {{ISSUE_NUMBER}}`) checks reachability but doesn't verify that context
+extraction happened — an agent could skip extraction with no consequence in the state
+machine.
 
 #### Chosen: Gate on context artifact existence; extraction is the state's work
 
@@ -163,9 +163,9 @@ artifacts and eliminates the concurrency risk of a fixed shared path.
 
 #### Alternatives Considered
 
-**Gate on issue accessibility only (a)**: Current design. Even if `--var` shipped, the
-gate auto-advances on issue existence without verifying extraction happened. An agent can
-skip context extraction entirely with no consequence in the state machine. Rejected.
+**Gate on issue accessibility only (a)**: The gate auto-advances on issue existence
+without verifying extraction happened. An agent can skip context extraction entirely
+with no consequence in the state machine. Rejected.
 
 **Separate context_extraction state after accessibility check (c)**: Stronger enforcement
 but adds a state. Extract-context.sh fails naturally on inaccessible issues, making an
@@ -180,10 +180,9 @@ context loading becomes a suggestion with no structural guarantee. Rejected.
 ### Decision 3: Free-form validation sequence
 
 The free-form path needs a mechanism to reject tasks not ready for direct implementation.
-The original design had a single `task_validation` state before research, which assesses
-only the task description — not the codebase state that research reveals. Two independent
-panel reviewers identified the same gap: an agent that discovers a misconception during
-research had no clean exit path other than `done_blocked`.
+A single validation state before research would assess only the task description — not
+the codebase state that research reveals. An agent that discovers a misconception during
+research needs a clean exit path other than `done_blocked`.
 
 #### Chosen: Lightweight pre-research check + post-research validation
 
@@ -205,9 +204,9 @@ multi-agent jury mechanics.
 
 #### Alternatives Considered
 
-**Pre-research validation only (a)**: Current design. Provides no exit path when research
-reveals a task is misconceived. An agent in this situation can only route to `done_blocked`
-— a permanent terminal rather than a graceful "not ready" signal. Rejected.
+**Pre-research validation only (a)**: Provides no exit path when research reveals a task
+is misconceived. An agent in this situation can only route to `done_blocked` — a permanent
+terminal rather than a graceful "not ready" signal. Rejected.
 
 **Post-research validation only (b)**: Removes the early filter. Research takes real agent
 effort; a lightweight pre-research gate avoids that cost for tasks obviously wrong at the
@@ -224,8 +223,8 @@ record. Rejected.
 The `introspection` state backs Phase 2 of /work-on, where a sub-agent re-reads the issue
 against the current codebase. The real skill's Phase 2 produces four outcomes: Proceed,
 Clarify (needs user input), Amend (update issue scope), and Re-plan (issue superseded).
-The original design's three-value enum missed Clarify and Amend, and left `issue_superseded`
-without a routing target.
+A three-value enum would miss Clarify and Amend, and leave `issue_superseded` without a
+routing target.
 
 #### Chosen: Collapse Clarify/Amend into approach_updated; route issue_superseded to done_blocked
 
@@ -573,9 +572,8 @@ outcome: the SKILL.md orchestration wrapper is eliminated, deterministic steps e
 without agent involvement on the happy path, and agents interact with deterministic
 states only on override or failure.
 
-The split topology eliminates the most confusing element of the previous design: requiring
-agents to re-submit mode at setup despite having already submitted it at entry. Two
-separate setup states make routing self-documenting. Retry/escalate variants in
+The split topology avoids requiring agents to re-submit mode at setup despite having
+already submitted it at entry. Two separate setup states make routing self-documenting. Retry/escalate variants in
 self-looping states give agents a structured escalation path with a clear audit record.
 
 ## Solution Architecture
