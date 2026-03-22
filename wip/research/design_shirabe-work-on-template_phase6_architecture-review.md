@@ -1,239 +1,149 @@
 # Architecture Review: DESIGN-shirabe-work-on-template.md
 
-Date: 2026-03-21
+Date: 2026-03-22
 Reviewer: architecture-review agent
-Scope: All six questions — implementability, missing interfaces, phase sequencing,
-simpler alternatives, state machine consistency, and evidence routing correctness.
+Scope: Solution Architecture and Implementation Approach sections — implementability,
+missing components/interfaces, phase sequencing, simpler alternatives.
 
 ---
 
 ## 1. Is the architecture clear enough to implement?
 
-**Finding: Phase 1 is implementable from the doc. Phases 2–3 have one gap.**
+**Finding: Yes, with one gap in Phase 2.**
 
-A developer can start Phase 1 without asking questions. The doc names the three
-files to change (`src/engine/advance.rs`, `src/cli/next_types.rs`, `src/cli/mod.rs`),
-states the behavioral change for each ("fall through to NeedsEvidence when a gate
-fails and accepts is present"), and specifies what to add to the GateBlocked response
-(`expects` field, `agent_actionable: true`). The test categories are listed.
+Phase 1 (engine changes) is fully specified. The doc names the exact files to change
+(`src/engine/advance.rs`, `src/cli/next_types.rs`, `src/cli/mod.rs`), describes the
+behavioral change for each (fall through to `NeedsEvidence` when gate fails and
+`accepts` block is present), and calls out the security constraint (sanitize `--var`
+values at `koto init` time, reject shell metacharacters). Source code inspection
+confirms the current code at all three change points — `advance_until_stop` hard-stops
+at `GateBlocked` when any gate fails (line 233-238 of `advance.rs`), `GateBlocked`
+variant in `next_types.rs` has no `expects` field, and `variables: HashMap::new()` is
+hardcoded in the init handler (line 207 of `cli/mod.rs`). The design accurately
+describes the current state.
 
-The `--var` flag spec is adequate for the engine side. It says: add `--var KEY=VALUE`
-(repeatable), parse to `HashMap<String, String>`, substitute `{{KEY}}` in directive
-text and gate commands before compilation. That's enough to start.
+Phase 3 (shirabe skill integration) is sufficiently specified for implementation.
 
-**Gap: Phase 2 (template file) lacks template syntax.** The doc describes the 15
-states in prose, but gives no example of the template YAML format. A developer writing
-`work-on.md` needs to know the YAML front-matter structure, how `gates:` blocks are
-written, how `accepts:` with enum fields are declared, and how conditional transitions
-are expressed. The doc's "Key Interfaces" section shows koto CLI invocations but not
-the template syntax. A developer would need to read the existing `hello-koto` template
-or the template compiler source to infer the format.
-
-**Recommendation:** Add a minimal state example in the doc — two or three lines of
-YAML showing a state with a gate, an accepts block, and a conditional transition. This
-unblocks Phase 2 without requiring access to other templates.
+**Gap: Phase 2 lacks template syntax.** The doc specifies all 17 states in prose but
+gives no example of the YAML front-matter format. A developer writing `work-on.md`
+needs to know how `gates:`, `accepts:` with enum fields, and conditional transitions
+with `when:` blocks are expressed. The doc's "Key Interfaces" section shows CLI
+invocations but not template syntax. The developer must read `hello-koto.md` or the
+template compiler source to infer the format. A 3–5 line YAML snippet showing one
+gate-with-fallback state would close this gap without growing the doc materially.
 
 ---
 
 ## 2. Are there missing components or interfaces?
 
-**Finding: Three gaps between claims and definitions.**
+**Finding: Three interface details need clarification.**
 
-### 2a. Template variable substitution scope is underspecified
+### 2a. `--var` substitution timing is underspecified
 
-The doc says `--var` substitutes `{{KEY}}` in "directive text and gate commands
-before compilation." It does not specify:
-- Whether substitution happens in `accepts` field descriptions (minor)
-- Whether `{{ISSUE_NUMBER}}` in a gate command is substituted at compile time or at
-  gate evaluation time
+The doc says `{{KEY}}` in gate commands is substituted "at gate evaluation time by
+reading from the stored variables map." This is the correct approach (variables stored
+in `WorkflowInitialized`, substituted at runtime, compiled template stays
+variable-agnostic). However, the spec does not state whether `{{KEY}}` in directive
+text is also substituted at runtime, or only in gate commands. If directives are not
+substituted, states whose directives reference `{{ISSUE_NUMBER}}` for the agent's
+benefit will show the literal token until `--var` ships. This should be made explicit.
 
-This matters for security: the doc's Security section correctly says "sanitization
-must be applied during template compilation, not at gate evaluation time." But the
-phrase "before compilation" in the decision section is ambiguous — it could mean
-"before the YAML is parsed" (safe) or "after parsing, before the compiled JSON is
-written" (also safe but different). The implementation should substitute in the raw
-YAML source before parsing, so the compiled JSON never contains `{{VAR}}` tokens.
+### 2b. `koto rewind` accepts only one step back, not a named state
 
-### 2b. `workflow_type` cross-state routing: no transition syntax shown for `setup`
+The doc says `done_blocked`'s directive instructs agents to run
+`koto rewind <originating-state>`. The actual `koto rewind` implementation (CLI
+`mod.rs` lines 244–318) accepts only a workflow `name` — not a target state. It always
+rewinds exactly one step to the previous state-changing event. There is no
+`<originating-state>` argument. A workflow blocked in `done_blocked` after two or more
+transitions from the origin state cannot reach the origin in one rewind; it requires
+repeated `koto rewind` calls. The directive text must be corrected to reflect the
+actual CLI, and the recovery instructions should explain the "repeat rewind" procedure.
+This is a concrete correctness gap in the Phase 2 deliverable.
 
-The doc states that `setup`'s post-state routing uses `workflow_type` from `entry`
-evidence. But it does not show the transition definition for `setup`. The `setup`
-state description says "Routes to `staleness_check` (work-on) or `analysis`
-(just-do-it) using `workflow_type` from `entry` evidence." This implies `setup` has
-transitions like `when: {workflow_type: "work-on"}` → `staleness_check` and `when:
-{workflow_type: "just-do-it"}` → `analysis`. The doc does not make this explicit.
-This is fine for design doc purposes, but should be clear in the template itself.
+### 2c. Free-form `analysis` gate uses shell glob expansion
 
-### 2c. `done_blocked` transition sources are underspecified
-
-The state list says `done_blocked` is "reachable from `analysis` (missing context),
-`implementation` (blocked), and `ci_monitor` (unresolvable failure)." The state
-diagram does not show these edges. The diagram shows `done_blocked` as a terminal off
-`ci_monitor` but not off `analysis` or `implementation`. A developer implementing the
-template would need to add those transitions.
-
-The state diagram also shows `done_blocked` connected to `ci_monitor` with a branch
-line, but `analysis` and `implementation` each have `done_blocked` as a possible
-`plan_outcome: blocked_missing_context` / `implementation_status: blocked` target.
-These are described in the state definitions but absent from the diagram. The diagram
-should be updated or the state definitions should note "see state definition for
-full transition list."
+The `analysis` state's free-form gate is
+`ls wip/task_*_plan.md 2>/dev/null | grep -q .`. This relies on shell glob expansion
+in the gate runner. If the gate runner executes commands via `sh -c` (which koto does),
+this works. But if the free-form workflow name slug contains special shell characters
+(e.g., spaces or glob metacharacters), `task_*_plan.md` could match unintended files.
+The workflow name is validated at `koto init` time against `^[a-zA-Z0-9][a-zA-Z0-9-]*$`,
+which excludes problematic characters — so this is safe given the validation constraint.
+The gate and the validation constraint should cross-reference each other in the template
+header comment so the dependency is visible to future template authors.
 
 ---
 
 ## 3. Are the implementation phases correctly sequenced?
 
-**Finding: Sequencing is correct. One dependency clarification needed.**
+**Finding: Sequencing is correct. One clarification needed.**
 
-Phase 1 (engine changes) → Phase 2 (template) → Phase 3 (shirabe integration) →
-Phase 4 (docs) is the right order. The template can be written and `koto template
-compile` run without Phase 1 being complete, since the compiler validates structure,
-not runtime behavior. The doc acknowledges this ("can be written and compiled, but
-the gate-with-evidence-fallback behavior won't activate until the advancement loop
-is patched").
+Phase 1 (engine) → Phase 2 (template) → Phase 3 (shirabe skill) → Phase 4 (docs)
+is the right order. Phase 2 can begin before Phase 1 completes because `koto template
+compile` validates structure, not runtime behavior. Gate-with-evidence-fallback states
+will compile successfully; the fallback just won't activate until Phase 1 is deployed.
+The doc acknowledges this explicitly.
 
-The `--var` flag is called a Phase 1 prerequisite in the decision text but listed
-as part of Phase 1 deliverables — consistent.
+The `--var` flag is both a Phase 1 deliverable and described as a prerequisite for
+issue-specific gates. That's self-consistent: Phase 2 writes gate commands with
+`{{ISSUE_NUMBER}}` tokens that fall through to evidence fallback until Phase 1 ships,
+which is the documented degraded-but-functional path.
 
-**Clarification:** Phase 3 says the merged skill "copies the template to
-`.koto/templates/work-on.md` (from the plugin directory) if it doesn't exist." This
-step depends on `koto init` accepting `--template` with a path, which is already
-implemented. No new dependency, but the copy-on-first-run behavior is a skill
-responsibility, not a koto responsibility — the doc should note where in shirabe
-this logic lives (in the skill instructions, not a new koto subcommand).
-
----
-
-## 4. Are there simpler alternatives that were overlooked?
-
-**Finding: The gate-with-evidence-fallback model is well-chosen. One simplification
-is available for the `--var` implementation.**
-
-The three alternatives considered (fine-grained evidence everywhere, coarse
-checkpoints, pure auto-advancing) are correctly rejected. The gate-with-evidence-
-fallback model keeps evidence at genuine decision points and is backward-compatible.
-
-**A simpler `--var` implementation is available for Phase 1:** The doc proposes
-substituting `{{KEY}}` during template compilation, storing the compiled JSON without
-variable tokens. An alternative is to store the variable map in the
-`workflow_initialized` event (the `variables` field already exists in
-`EventPayload::WorkflowInitialized` — it is currently stored as `HashMap::new()`) and
-substitute at gate evaluation time. This avoids modifying the template compiler and
-uses an existing storage slot. The tradeoff is that gate commands in the compiled JSON
-still contain `{{KEY}}` tokens, which is less clean.
-
-The doc's chosen approach (substitute before compilation) is cleaner but requires
-touching the compiler. The event-storage approach is simpler and uses an already-
-defined field. Worth noting as an option if the compiler change proves difficult.
+**Clarification:** Phase 3 includes "Session stop hook: extend the existing koto Stop
+hook." This implies an existing stop hook in shirabe. The doc does not identify which
+file contains this hook. Phase 3 should name the file (likely in
+`plugins/koto-skills/hooks.json` or equivalent) so the implementer doesn't need to
+discover it by searching shirabe's codebase.
 
 ---
 
-## 5. Does the state machine diagram match the state definitions?
+## 4. Are there simpler alternatives we overlooked?
 
-**Finding: Two inconsistencies.**
+**Finding: The split topology is the right call. One simplification is available for
+`--var`.**
 
-### 5a. `done_blocked` edges missing from diagram
+The split topology (two separate setup states, `setup_issue_backed` and
+`setup_free_form`) directly solves the epoch-scoped evidence problem that would have
+broken the previous single-setup design. Source code confirms that evidence is cleared
+to `BTreeMap::new()` after each auto-transition (advance.rs line 267), so cross-state
+evidence does not carry forward. The split topology avoids this entirely by routing
+unconditionally from each setup state — no evidence routing required. This is the
+correct design given the engine's actual behavior.
 
-The diagram shows `done_blocked` as one of two branches off `ci_monitor`. The state
-definitions describe `done_blocked` as also reachable from `analysis`
-(`plan_outcome: blocked_missing_context`) and `implementation`
-(`implementation_status: blocked`). These edges are absent from the diagram.
+**Simpler `--var` implementation:** The doc proposes substituting `{{KEY}}` at gate
+evaluation time from the stored variables map (already-defined `variables` field in
+`WorkflowInitialized`). This is already the simpler path — it avoids modifying the
+template compiler and uses an existing storage slot. The doc calls this out correctly.
+No further simplification is available here.
 
-### 5b. `research` convergence path in diagram is ambiguous
-
-The diagram shows `research` → `setup` and then `(converges to analysis)` in a note
-below the just-do-it path. This notation is unclear: the reader has to infer that
-`setup` → `analysis` is the just-do-it path and `setup` → `staleness_check` is
-work-on. A labeled arrow from `setup` to `staleness_check` (work-on) and from
-`setup` to `analysis` (just-do-it) would make the convergence point unambiguous.
-
-State names are consistent between the diagram, state definitions, and prose. No
-typos or renamed states were found.
-
----
-
-## 6. Does `workflow_type` evidence routing actually work with koto's evidence model?
-
-**Finding: It does NOT work as described. This is a critical correctness issue.**
-
-The doc states: "The `workflow_type` evidence persists across the session via koto's
-evidence merging model, so the `setup` state can route post-setup to `staleness_check`
-(work-on) or `analysis` (just-do-it) based on the evidence submitted at `entry`."
-
-The actual engine behavior contradicts this claim.
-
-**Evidence is scoped to the current epoch.** In `src/engine/persistence.rs`,
-`derive_evidence()` returns only `evidence_submitted` events that occur after the
-most recent state-changing event (`transitioned`, `directed_transition`, or `rewound`)
-whose `to` field matches the **current** state. Evidence submitted at `entry` is in
-the `entry` epoch. When the workflow advances to `setup` (via `context_injection` for
-work-on, or via `research` for just-do-it), the `entry` epoch ends. `derive_evidence`
-called at `setup` finds the most recent state-changing event pointing to `setup` and
-returns only events after that — which contains no `entry` evidence.
-
-**In `src/engine/advance.rs`, this is reinforced by the auto-advance loop:**
-```rust
-// Fresh epoch: auto-advanced states have no evidence
-current_evidence = BTreeMap::new();
-```
-After each auto-transition, evidence is cleared to `BTreeMap::new()`. So even if the
-engine auto-advances through `context_injection` to `setup`, evidence from any prior
-state is gone.
-
-**The consequence:** When `koto next` is called at `setup`, `evidence` is derived
-from the current epoch only. The `workflow_type` field submitted at `entry` is not
-in scope. The transition resolver at `setup` evaluates conditions against empty
-evidence, finds no match for `when: {workflow_type: "work-on"}` or
-`when: {workflow_type: "just-do-it"}`, and returns `NeedsEvidence`. The agent is
-blocked at `setup` asking for evidence that the template's `accepts` block may not
-even declare.
-
-**This breaks the core routing assumption of the design.** The two paths converge
-at `setup`, and `setup`'s routing depends entirely on cross-state evidence that the
-engine does not carry forward.
-
-**How to fix it:** There are two viable options:
-
-Option A — Re-submit `workflow_type` at `setup`. Add `workflow_type` to `setup`'s
-`accepts` schema as a required field. The skill instructions submit it again when
-reaching `setup`. This is explicit and requires no engine change, but adds a
-redundant evidence submission.
-
-Option B — Engine change: cross-epoch evidence projection. When the advance loop
-loads evidence for a state, also scan the full event log for any
-`evidence_submitted` event (from any prior epoch) containing fields that appear in
-the current state's transition conditions. This would allow `setup` to see
-`workflow_type` from `entry`. This is a more powerful engine change and creates
-implicit coupling between states that is harder to reason about.
-
-Option A is simpler and safer. The design doc's "Consequences / Negative" section
-already lists this as a known fragility ("depends on evidence submitted at `entry`
-persisting across states via koto's evidence merging model. If this model changes in
-a future koto version, the routing breaks silently") — but the issue is that it
-**already** doesn't work, not that it might break in a future version.
+**`TEST_COMMAND` variable:** The doc's Consequences section mentions a `TEST_COMMAND`
+template variable as planned mitigation for the language-specific test gate. This could
+also be expressed as a Phase 1 deliverable: default `TEST_COMMAND=go test ./...` in the
+`koto init` call so the template works without requiring callers to pass it explicitly.
+This keeps the template language-agnostic without forcing every caller to specify it.
 
 ---
 
 ## Summary
 
-1. **Phase 1 is implementable as written.** Phase 2 needs a YAML syntax example.
+1. **The split topology correctly handles koto's epoch-scoped evidence model.** Two
+   unconditional setup states eliminate the cross-state evidence dependency that would
+   have broken a single-setup design. The core routing architecture is sound.
 
-2. **`workflow_type` cross-state routing is broken.** Evidence submitted at `entry`
-is not accessible at `setup`. This is the design's critical correctness gap and must
-be resolved before Phase 2 can produce a working template. The fix is either adding
-`workflow_type` to `setup`'s accepts schema (simple) or projecting cross-epoch
-evidence in the engine (complex).
+2. **`koto rewind` has no named-state argument.** The current CLI rewinds exactly one
+   step. The `done_blocked` directive must be corrected — agents need repeated calls
+   or a manual workaround, not `koto rewind <originating-state>`. Verify and fix
+   before Phase 2.
 
-3. **State diagram missing edges.** `done_blocked` is reachable from `analysis` and
-`implementation` but these edges are absent from the diagram. Low priority but should
-be corrected before the doc is marked accepted.
+3. **Phase 2 needs a YAML syntax example.** All 17 states are specified in prose but
+   the template file format is not shown. One short example of a gate-with-fallback
+   state unblocks the template author without requiring them to read other files.
 
-4. **`--var` substitution timing is underspecified.** The doc says "before
-compilation" but does not clarify whether this means pre-YAML-parse or post-parse.
-Substitute in the raw YAML string before parsing to keep compiled JSON clean.
-Alternatively, the existing `variables` field in `WorkflowInitialized` could store
-vars for runtime substitution, avoiding a compiler change.
+4. **`--var` substitution scope needs explicit statement.** Specify whether directive
+   text (not just gate commands) gets `{{KEY}}` substituted at runtime. If not, states
+   with `{{ISSUE_NUMBER}}` in directives will show literal tokens until `--var` ships.
 
-5. **The gate-with-evidence-fallback model and phase sequencing are sound.** The
-implicit convention (co-presence of gates and accepts implies fallback) is clean and
-backward-compatible. Phase ordering is correct.
+5. **Phase sequencing and gate-with-evidence-fallback model are correct.** Phases are
+   ordered with the right prerequisites. The co-presence convention (gates + accepts =
+   fallback enabled) is clean, backward-compatible, and matches the engine's current
+   structure.

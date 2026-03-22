@@ -61,6 +61,18 @@ in the event log, not completion confirmations.
   for ISSUE_NUMBER in gate commands). Stop hook exists (not SessionStart). shirabe has
   empty koto-templates/ directory. Template discovery is state-file only, not template files.
 
+## Phase 3 Decision Results (shirabe:design Phase 2-3)
+
+6 structured decisions completed and cross-validated:
+1. **Mode routing**: Split topology (setup_issue_backed / setup_free_form), no re-submission
+2. **Context injection**: Gate on IMPLEMENTATION_CONTEXT.md artifact existence
+3. **Free-form validation**: Two states — pre-research (binary) + post-research (ternary)
+4. **Introspection outcomes**: Collapse Clarify/Amend into approach_updated; issue_superseded → done_blocked
+5. **Error recovery**: retry/escalate enum variants; koto rewind for done_blocked
+6. **Directives**: Concise with resume preambles; wrapper injection for complex phases
+
+Cross-validation finding: introspection gate requires --var (unimplemented); operates as evidence-only until --var ships. Template has 17 states.
+
 ## Current Status
-**Phase:** 4/5/6 complete — design doc finalized
+**Phase:** Phases 1-3 complete (shirabe:design) — Considered Options and Decision Outcome written; proceeding to Phase 4 (Architecture)
 **Last Updated:** 2026-03-22

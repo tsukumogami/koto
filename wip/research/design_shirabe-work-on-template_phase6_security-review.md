@@ -4,193 +4,238 @@
 
 Full security review of `docs/designs/DESIGN-shirabe-work-on-template.md`, building on the
 phase 5 analysis in `wip/research/design_shirabe-work-on-template_phase5_security.md`. This
-review also examines the actual koto codebase to evaluate whether the design's mitigation
-claims are accurate given the current implementation state.
+review evaluates whether attack vectors were missed, whether mitigations are sufficient,
+whether "not applicable" calls hold up under scrutiny, and what residual risk warrants
+escalation before implementation begins.
 
 ---
 
 ## 1. Attack Vectors Not Considered in Prior Analysis
 
-### 1.1 Workflow Name as an Injection Surface (New)
+### 1.1 Workflow Name as an Injection Surface
 
 The design specifies `koto init work-on-71` where the workflow name is caller-controlled.
 The name is used to derive the state file path (`koto-work-on-71.state.jsonl`) via
-`workflow_state_path`. If the name contains path traversal sequences (e.g., `../../../etc/passwd`
-or a name with embedded newlines), it could write state files outside the working directory or
-corrupt the JSONL log format. The design does not discuss validation of the workflow name, and
-the current `Init` handler in `src/cli/mod.rs` performs no sanitization before constructing the
-path. This is low-severity in practice (the caller controls the process anyway), but warrants
-an explicit name validation rule in the Phase 1 implementation.
+`workflow_state_path`. A name containing path traversal sequences (e.g., `../../../etc/passwd`)
+or embedded newlines could write state files outside the working directory or corrupt the JSONL
+log format.
 
-### 1.2 Evidence Content Written to JSONL (New)
+The design does address this in the Implementation Approach section (Phase 1 deliverables),
+specifying a name validation rule of `^[a-zA-Z0-9][a-zA-Z0-9-]*$`. However, the Security
+Considerations section does not mention it — a reader of that section alone would miss the
+risk. The mitigations section correctly prescribes the fix; the location is just wrong.
 
-The phase 5 analysis notes that the event log is committed to the branch and visible to repo
-collaborators. It doesn't address a related risk: the `--with-data` payload is written verbatim
-into the JSONL file without content limits on individual field values. A `rationale` or
-`context_summary` field could carry a very large string (megabytes) that bloats git history.
-The design already enforces `MAX_WITH_DATA_BYTES = 1_048_576` (1 MB) for the outer payload,
-which caps the worst case, but this limit is not mentioned in the design's Security
-Considerations section and agents reading the skill instructions won't know it exists.
+### 1.2 Evidence Payload Size Not Mentioned in Security Considerations
 
-### 1.3 Template Path Traversal on Init (New)
+The design notes a `MAX_WITH_DATA_BYTES = 1_048_576` (1 MB) limit on `--with-data` payloads.
+Evidence fields like `rationale` and `context_summary` are free strings with no documented
+per-field length constraints. A single oversized field within the 1 MB envelope could bloat
+git history. The 1 MB cap is the only guard, and its existence isn't mentioned in the Security
+Considerations section. This is low-severity but should be noted there so agents reading skill
+instructions understand the boundary.
 
-The `--template` flag on `koto init` accepts an arbitrary filesystem path. A malicious or
-misconfigured invocation could point to a file outside the project (e.g.,
-`--template /etc/passwd`). The compiler would attempt to parse it as YAML and likely fail,
-but the failure mode is an error message that may leak the file's contents in the parse error
-output. This is low-severity because the caller must already have filesystem access, but the
-design's "not applicable" on supply chain risks should note that template path validation
-(restricting to project-relative paths) would reduce the attack surface.
+### 1.3 Template Path Traversal on Init
 
-### 1.4 ci_monitor Gate: No PR Number Specified
+The `--template` flag accepts an arbitrary filesystem path. Pointing it at a non-template
+file (e.g., `/etc/passwd`) causes the YAML compiler to attempt to parse it. Failure is
+expected, but the error output might echo portions of the file's content in parse diagnostics.
+This is low-severity because the caller already has filesystem access and is not operating in
+a sandboxed context, but the Security Considerations section's "not applicable" on download
+verification doesn't acknowledge that the template path itself is an input that benefits from
+path-restriction (e.g., requiring project-relative paths or an explicit allowlist).
 
-The design describes the `ci_monitor` gate as `gh pr checks` for the current branch's PR.
-The design does not specify whether the gate command includes a PR number or relies on `gh`
-to infer it from the current branch. If the command is literally `gh pr checks` (without a
-`--json` flag or explicit PR reference), it exhibits two problems:
+### 1.4 ci_monitor Gate: No PR Anchor
 
-1. **Context-dependent behavior**: `gh pr checks` without a PR number relies on the current
-   branch having exactly one open PR in the repository. If the branch has multiple PRs
-   (e.g., a draft and a ready PR), or if the git HEAD is detached, the command may check
-   the wrong PR or fail silently. A gate that fails silently routes to the evidence fallback,
-   which means the agent could mark CI as passing by submitting `ci_outcome: passing` without
-   any CI actually having run.
+This is the most significant gap. The `ci_monitor` gate is specified as:
 
-2. **Race condition on newly created PRs**: `pr_creation` is the state immediately before
-   `ci_monitor`. A PR created by `gh pr create` may not be indexed by the GitHub API for
-   a few seconds. If `koto next` is called immediately, `gh pr checks` may return an empty
-   or error response, causing the gate to fail and routing to the evidence fallback where
-   an agent could submit `ci_outcome: passing` prematurely.
+```
+gh pr checks $(gh pr list --head $(git rev-parse --abbrev-ref HEAD) --json number \
+  --jq '.[0].number // empty') --json state \
+  --jq '[.[] | select(.state != "SUCCESS")] | length == 0' | grep -q true
+```
 
-This is a meaningful enforcement gap. The gate should use the `pr_url` evidence submitted at
-`pr_creation` to anchor `gh pr checks` to a specific PR. Since the design proposes template
-variables that are fixed at init time, `pr_url` is only available at runtime as submitted
-evidence — this points to a missing capability: runtime evidence values feeding into gate
-command construction. The design doesn't address this.
+The `// empty` guard handles the case where no PR is found. However, two problems remain:
 
----
+**Problem 1 — Race condition after PR creation**: `pr_creation` immediately precedes
+`ci_monitor`. A PR created by `gh pr create` may not be indexed by the GitHub API for
+several seconds. If `koto next` is called immediately, `gh pr list --head <branch>` may
+return an empty result, `// empty` fires, `gh pr checks` receives an empty argument, and
+the command fails. Gate failure on a state with an `accepts` block routes to evidence
+fallback. The agent can then submit `ci_outcome: passing` without any CI having run.
+The design acknowledges this as "evidence fallback also serves as the retry mechanism for
+the brief indexing window" — but submitting passing evidence before CI has started is
+not retrying, it's bypassing. The wording normalizes the bypass.
 
-## 2. --var Injection Risk: Is Quoting Sufficient?
+**Problem 2 — Multiple PRs on the same branch**: If a branch has both a draft and a
+ready PR, `.[0].number` selects whichever comes first in the API response. The checked PR
+may not be the one the agent created. This is an edge case but worth noting.
 
-### 2.1 Current Implementation State
+The root issue is that `ci_monitor` lacks a PR anchor known at gate evaluation time. The
+`pr_url` submitted as evidence at `pr_creation` would provide the right anchor, but gates
+currently have no mechanism to read prior-state evidence. Until that capability exists,
+`ci_monitor` should be documented as evidence-only for the session immediately following
+PR creation, with the gate serving as a convenience poll in subsequent sessions.
 
-The `--var` flag is **not implemented**. The current `Init` command in `src/cli/mod.rs`
-accepts only `name` and `template` — there is no `--var` parameter. The `WorkflowInitialized`
-event is written with `variables: HashMap::new()` hardcoded. The compile step in
-`src/template/compile.rs` parses a `variables:` block from the template front-matter and stores
-`VariableDecl` entries in the compiled output, but performs no substitution. The test at line
-402 in `compile.rs` confirms that `{{TASK}}` in a directive is stored verbatim as the string
-`"Analyze the task: {{TASK}}"` — substitution is explicitly deferred to runtime.
+### 1.5 Stale Artifact Glob Matches (Gate False Positives)
 
-The gate evaluator in `src/gate.rs` receives a `Gate` struct with a `command: String` field
-and passes it directly to `sh -c`. There is no substitution step anywhere between template
-compilation and gate execution. The design's statement that "gate commands are static strings
-in the compiled template" is accurate for today's code, but the `--var` feature would make
-gate commands dynamic at init time, which is a new execution path that doesn't exist yet.
+The `analysis` gate uses `ls wip/task_*_plan.md 2>/dev/null | grep -q .` for free-form
+workflows. The `finalization` gate uses a summary file existence check. Both patterns match
+any file in `wip/` matching the glob, including artifacts left over from prior workflows
+in the same directory. If a previous workflow's plan or summary file is present and the
+current workflow hasn't created one yet, the gate passes incorrectly.
 
-### 2.2 Is Single-Quote Wrapping Sufficient?
-
-The design proposes: "wrap in single quotes and escape any single quotes within the value."
-This is the standard POSIX shell quoting technique and is sufficient for preventing injection
-via metacharacters (`;`, `|`, `$`, backticks, newlines) — with one important caveat.
-
-Single-quote escaping must handle embedded null bytes and newlines correctly. Most shell
-implementations treat a null byte as a command terminator regardless of quoting. If
-`ISSUE_NUMBER` is sourced from an untrusted channel (not just the CLI caller), a null byte
-in the value could truncate the command unexpectedly. In practice, `ISSUE_NUMBER` comes from
-the agent-controlled CLI invocation, so this is theoretical for the intended use case.
-
-More concretely: the design says sanitization must be applied "during template compilation,
-not at gate evaluation time." This is **wrong for the --var use case**. Template compilation
-happens before `--var` values are known — the compiled template cache is keyed by the template
-file's content hash, not by the variable values passed at init time. Variable substitution must
-happen at init time (or gate evaluation time), not at compile time. The design's own
-architecture contradicts this statement: it describes `--var` as a flag on `koto init`, and
-the `WorkflowInitialized` event already has a `variables` field intended to store them.
-
-The correct model is: substitute (with quoting) at init time when writing the resolved gate
-commands to the state file, or substitute lazily at gate evaluation time reading the variables
-from the `WorkflowInitialized` event. Either approach works, but the design's claim that it
-happens "during template compilation" is inaccurate and will mislead the Phase 1 implementer.
-
-### 2.3 Summary
-
-The quoting technique is sound in principle. The implementation timing claim in the design is
-incorrect and must be fixed before Phase 1 implementation to avoid placing sanitization in the
-wrong layer (the compile cache, which is variable-agnostic).
+The issue-backed variants would be anchored to `wip/issue_{{ISSUE_NUMBER}}_plan.md` once
+`--var` ships. The free-form variants have no such anchor — the task slug used in file
+naming is not a template variable. This means free-form gates are prone to false positives
+from prior workflow artifacts for the lifetime of the design. The design notes the `analysis`
+glob limitation in Consequences but doesn't address `finalization`. Neither glob has a
+proposed fix.
 
 ---
 
-## 3. "Not Applicable" Justifications
+## 2. Are Mitigations Sufficient for Identified Risks?
+
+### 2.1 --var Shell Injection
+
+**The proposed mitigation**: "reject values containing characters outside a safe set
+(alphanumeric, hyphens, dots, slashes) or quote and escape them."
+
+The allowlist approach (alphanumeric, hyphens, dots, slashes) is sufficient for
+`ISSUE_NUMBER`, which is the only variable the design uses in gate commands. An issue
+number like `71` or `123` trivially passes. The mitigation is adequate for the current
+template variables and for any future variables that follow the same pattern (numeric IDs,
+slugs, paths). A future variable holding a free-text description (e.g., a task title)
+would require the quoting approach instead.
+
+One inaccuracy: the design states sanitization must happen "at `koto init` time, before
+storing variables in the `WorkflowInitialized` event." This is correct for the early-reject
+path. But the design also says "during template compilation" in an adjacent sentence
+(referencing the compile cache). The compiled template cache is variable-agnostic and does
+not have access to `--var` values — they aren't known until `koto init` is called. If a
+Phase 1 implementer follows the "compile time" instruction literally and adds the check to
+`src/template/compile.rs`, it will have no effect. The sanitization must be in the
+`koto init` handler (or the gate evaluator). This is a documentation error that could
+misdirect implementation.
+
+### 2.2 Workflow Name Path Traversal
+
+The design specifies validation via `^[a-zA-Z0-9][a-zA-Z0-9-]*$`. This pattern correctly
+rejects slashes, dots, underscores, and whitespace. Adequate.
+
+### 2.3 Event Log Visibility
+
+The mitigation is "agents should not include secrets or credentials in evidence fields;
+the skill instructions should make this explicit." This is adequate for the stated risk
+(accidental exposure). It is not a defense against a deliberate attempt to exfiltrate data
+via the evidence log, but that threat model (malicious agent) is out of scope for this
+design. The mitigation is proportionate.
+
+### 2.4 Supply Chain / GitHub API Trust
+
+The design acknowledges that a compromised GitHub API could return false SUCCESS for
+`ci_monitor`. The stated mitigation is "this is a pre-existing risk, not introduced by
+this design." That's accurate but incomplete as a mitigation — it explains why the risk
+is acceptable, not what reduces it. A more precise framing: CI enforcement is only as
+strong as the GitHub API's integrity; this design doesn't weaken that property and doesn't
+need to solve it. The mitigation framing should be corrected but does not require new
+controls.
+
+---
+
+## 3. "Not Applicable" Justifications That May Actually Apply
 
 ### 3.1 Download Verification: Correctly Not Applicable
 
-The design creates a local markdown template file. No binaries are fetched. The gate commands
-call `gh` and `git`, which are already-installed system tools. The "not applicable" call is
-correct and the rationale is complete.
+koto does not download binaries or files during workflow execution. Gate commands invoke
+`gh` and `git`, which are already-installed system tools. No downloads occur at runtime.
+The "not applicable" call is correct and complete.
 
-### 3.2 Supply Chain Risks: Partially Applicable (Understated)
+### 3.2 Execution Isolation: Identified and Addressed
 
-The phase 5 analysis marks this "Marginal" and the design marks it as handled via the content
-hash cache. Both miss two residual supply chain surfaces:
+The design correctly identifies that gate commands run in the user's working directory with
+the user's credentials, and that `--var` introduces a new injection surface. The mitigation
+is specified. This dimension is correctly marked as applicable and addressed.
 
-**GitHub CLI responses in ci_monitor**: The `gh pr checks` gate passes or fails based on
-output from the GitHub API. A compromised or spoofed GitHub API response (e.g., via MITM on
-the `gh` CLI's TLS connection) could return false SUCCESS status, causing the gate to pass and
-the workflow to advance to `done` without CI actually having passed. The design notes this as
-"not a new attack surface" (correct), but doesn't acknowledge that `ci_monitor` is the specific
-state where this matters most — it's the final enforcement gate before marking work done.
+One gap: the design says gate commands are "static strings in the compiled template" as
+justification for why no injection risk exists today. This is accurate for the current
+codebase. But the design then introduces `--var` substitution as a Phase 1 deliverable.
+The "static strings" framing should not be read as a permanent property — it applies only
+until `--var` lands. The design makes this clear in context but a standalone reading of the
+Security Considerations section might suggest the injection risk is already mitigated when
+it is not yet implemented.
 
-**Template file path**: If the shirabe plugin copies the template to `.koto/templates/work-on.md`
-and that directory is writable by other processes in the environment, a template substitution
-attack is possible. The content hash cache would detect the modification (different hash = new
-cache entry), but the new cache entry would be compiled and used. This is an unlikely attack
-in practice but worth noting in environments with shared build directories.
+### 3.3 Supply Chain: Understated
 
-The "not applicable" is too strong here. "Low residual risk, pre-existing attack surface" is
-more accurate.
+The design says "low residual risk" from the GitHub API trust issue. Two additional surfaces
+are not mentioned:
+
+**Template file integrity in the project directory**: The shirabe skill copies the template
+to `.koto/templates/work-on.md`. If that directory is writable by other processes (shared
+CI environments, multi-user systems), a replacement template could be written there. The
+content hash cache would detect the modification and produce a new cache entry — but the new
+cache entry would be compiled and used, not rejected. The hash cache prevents silent staleness
+from edits to the original plugin file; it does not protect against substitution of the
+project-local copy. This is low-severity in typical single-user developer environments, but
+applies in shared build environments.
+
+**GitHub CLI TLS integrity**: `gh pr checks` trusts the GitHub API over TLS. The design
+notes a compromised GitHub API as a risk. A narrower variant — a MITM attack on the TLS
+connection between `gh` and GitHub — is the same risk class but is implicitly mitigated by
+`gh`'s TLS validation. Not a new finding, but the "supply chain risks: not applicable"
+framing obscures that this gate is the only state where the workflow's enforcement outcome
+depends on external data integrity.
 
 ---
 
-## 4. Residual Risk Assessment
+## 4. Residual Risk That Should Be Escalated
 
-### 4.1 Risks That Should Be Escalated
+### 4.1 High: ci_monitor Gate Enforcement Gap
 
-**High: ci_monitor gate ambiguity (no PR anchor)**
-The `gh pr checks` gate without an explicit PR reference creates an enforcement gap at the
-most critical state in the workflow — the final CI verification before marking work done.
-If the gate fails silently (no PR found, API lag) and the agent submits `ci_outcome: passing`
-as evidence fallback, the workflow advances to `done` without verified CI. This undermines
-the primary enforcement guarantee. The design should either:
-- Require a `PR_NUMBER` or `PR_URL` template variable (set as a side-effect of `pr_creation`
-  via a separate mechanism), or
-- Make `ci_monitor` a pure evidence state (no gate) with a directive that requires the agent
-  to fetch and submit the CI URL, or
-- Accept that the gate is best-effort and document that `ci_monitor` relies on agent evidence
-  in the first session after PR creation.
+The `ci_monitor` gate can fail silently (API lag after `pr_creation`, empty PR list result)
+and fall through to evidence fallback where an agent can submit `ci_outcome: passing`
+without verified CI. This state is the final enforcement gate before the workflow marks
+work done. The design frames this as "evidence fallback also serves as the retry mechanism
+for the brief indexing window," which normalizes a bypass as a feature.
 
-This is the one risk that affects the design's stated enforcement guarantees and should be
-resolved before the template is used in production.
+This gap undermines the primary enforcement guarantee: "an agent can't reach `ci_monitor`
+without passing through `pr_creation`" — but reaching `done` via `ci_monitor` evidence
+fallback is not the same as CI having passed. The design should choose one of:
 
-**Medium: --var substitution timing**
-The design's claim that sanitization happens "during template compilation" is architecturally
-incorrect given the compile cache is variable-agnostic. If a Phase 1 implementer follows this
-guidance literally and adds sanitization to `src/template/compile.rs`, it will have no effect
-because `--var` values are not available at compile time. Sanitization must be in the init
-handler or the gate evaluator. This should be clarified in the design before implementation.
+- Accept that `ci_monitor` is evidence-only for the first `koto next` call after PR creation,
+  document this explicitly, and require agents to verify CI status before submitting passing
+  evidence.
+- Add a short sleep to the `ci_monitor` directive instructing agents to wait before submitting
+  evidence (acknowledged workaround, not a structural fix).
+- Track the PR URL as a workflow variable to anchor the gate command to a specific PR.
 
-**Low: Workflow name validation**
-The name is used to construct a filesystem path without validation. A name validation rule
-(alphanumeric, hyphens, underscores, max 128 chars) should be added to `koto init` to prevent
-path traversal. This is straightforward to fix and has no design implications.
+This is the one finding that affects stated enforcement guarantees. It should be resolved
+before the template is used in production.
 
-### 4.2 Risks Already Adequately Addressed
+### 4.2 Medium: --var Sanitization Timing Claim
 
-- Event log visibility: correctly identified and appropriately scoped.
-- Shell injection via `--var`: the proposed mitigation (single-quote wrapping) is sound once
-  the timing issue above is corrected.
-- Gate privilege model: gate commands run with user credentials, not elevated. Correctly noted.
-- Template cache content-hash keying: prevents stale compiled templates.
+The design's Security Considerations section says sanitization happens "at `koto init` time"
+but an adjacent reference to "during template compilation" contradicts this. The compile
+cache is variable-agnostic; variables are not known at compile time. If a Phase 1 implementer
+reads the Security Considerations section in isolation and places sanitization in
+`src/template/compile.rs`, the mitigation will be a no-op. The design should be corrected
+to remove the "during template compilation" phrasing before Phase 1 starts.
+
+### 4.3 Low: Free-Form Gate Glob False Positives
+
+The `analysis` and `finalization` gates for free-form workflows use broad globs that match
+artifacts from prior workflows in the same directory. This can cause spurious auto-advancement.
+No fix is possible without a task-slug template variable for free-form workflows. The design
+should acknowledge this in Security Considerations (not just in Consequences) and note that
+free-form workflows in directories with prior workflow artifacts may need manual gate
+inspection.
+
+### 4.4 Adequately Handled (No Escalation Needed)
+
+- Workflow name path traversal: validation pattern specified in Phase 1 deliverables.
+- --var injection via metacharacters: allowlist approach adequate for the current variable set.
+- Event log visibility: proportionate mitigation; responsibility delegated to skill instructions.
+- Gate privilege model: user credentials, not elevated.
+- Template cache content-hash keying: prevents stale compiled templates from prior plugin versions.
 
 ---
 
@@ -198,83 +243,69 @@ path traversal. This is straightforward to fix and has no design implications.
 
 ### 5.1 context_injection Gate
 
-`gh issue view {{ISSUE_NUMBER}} --json number --jq .number`
+`test -f wip/IMPLEMENTATION_CONTEXT.md`
 
-Uses `--json` with `--jq` to extract a specific field. The `--jq` output is not used as input
-to any further command, so there's no secondary injection risk from the API response. The gate
-passes if the issue is accessible and the field is present. Sound.
+Simple file existence check. No injection surface (no variable substitution). Sound.
 
-### 5.2 setup Gates
+### 5.2 setup_issue_backed / setup_free_form Gates
 
-`git rev-parse --abbrev-ref HEAD | grep -v main` (branch check, inferred from design)
-`test -f wip/issue_{{ISSUE_NUMBER}}_baseline.md`
+"Branch is not main/master, baseline file exists."
 
-The file existence check is straightforward. The branch check using `grep -v` is correct for
-rejecting main/master. However, the design doesn't specify how "branch is not main/master" is
-verified — if it's `git rev-parse --abbrev-ref HEAD | grep -vE '^(main|master)$'`, that's
-fine; if it relies on a broader pattern, branches named `main-feature` would incorrectly fail.
-The exact gate command text should be specified in the design to avoid ambiguity.
+The exact gate command is not specified in the design. If implemented as
+`git rev-parse --abbrev-ref HEAD | grep -vE '^(main|master)$'`, it correctly rejects both
+branch names. If implemented as `grep -v main`, branches named `main-feature` fail
+incorrectly. The design should specify the exact command to avoid ambiguity.
 
-### 5.3 finalization Gates
+### 5.3 analysis Gates
 
-`test -f wip/*_summary.md` and `go test ./...`
+Issue-backed: `test -f wip/issue_{{ISSUE_NUMBER}}_plan.md` (requires `--var`).
+Free-form: `ls wip/task_*_plan.md 2>/dev/null | grep -q .`
 
-The glob in the file check matches any `*_summary.md` file in `wip/`, including ones from
-prior workflows. If a previous workflow left a summary file and the current workflow hasn't
-created one yet, the gate passes incorrectly. The design acknowledges this for `analysis` but
-doesn't address it for `finalization`. Using `wip/issue_{{ISSUE_NUMBER}}_summary.md` (with
-template variable substitution) would close this gap.
+The issue-backed variant is correctly anchored once `--var` ships. The free-form variant
+matches any `task_*_plan.md` file — false positive risk documented in section 1.5.
 
-`go test ./...` is language-specific. The design notes this in Consequences and proposes
-`TEST_COMMAND` as a template variable, but doesn't include it in the Phase 1 deliverables.
-If the template is used on a non-Go project before this is addressed, the gate will always
-fail and route to evidence fallback, which is functional but loses the auto-advancement benefit.
-
-### 5.4 ci_monitor Gate
-
-`gh pr checks` (no PR reference specified)
-
-As detailed in section 1.4 and 4.1, this gate is underspecified. The design should specify
-the exact command. If no PR anchor is available as a template variable, this state should be
-documented as evidence-only in the first session after PR creation.
-
-### 5.5 introspection Gate
+### 5.4 introspection Gate
 
 `test -f wip/issue_{{ISSUE_NUMBER}}_introspection.md`
 
-Sound. Uses the template variable to anchor to the specific workflow's artifact. No issues.
+Correctly anchored via template variable. Sound once `--var` is implemented. Until then,
+always fails and routes to evidence fallback — this behavior is documented and correct.
 
-### 5.6 analysis Gate
+### 5.5 finalization Gates
 
-`test -f wip/*_plan.md`
+`test -f wip/*_summary.md` and `go test ./...`
 
-Same glob issue as finalization: matches any `*_plan.md` file, including leftovers from prior
-workflows. Should use `wip/issue_{{ISSUE_NUMBER}}_plan.md` or `wip/task_<slug>_plan.md`.
+Glob issue same as analysis (section 1.5). The test command is language-specific; the design
+proposes `TEST_COMMAND` as a mitigation but places it outside Phase 1 deliverables. Non-Go
+projects will always fall to evidence fallback for this gate.
+
+### 5.6 ci_monitor Gate
+
+Detailed in section 1.4. The command structure is specified but has the race condition and
+anchor issues described there. The command itself is syntactically correct and would work
+correctly in steady-state (PR indexed, single PR on branch).
 
 ---
 
-## Recommendations Summary
+## Recommendations
 
-1. **Fix the --var substitution timing claim**: The design states sanitization happens "during
-   template compilation." This is architecturally wrong — the compile cache is variable-agnostic.
-   Sanitization and substitution must happen at `koto init` time (or at gate evaluation time
-   reading from the `WorkflowInitialized` event). Correct the design before Phase 1 starts.
+1. **Correct the --var sanitization timing claim** in Security Considerations. Remove
+   references to "during template compilation." State clearly that sanitization happens in
+   the `koto init` handler when writing variables to the `WorkflowInitialized` event, before
+   any gate evaluation.
 
-2. **Anchor ci_monitor to a specific PR**: `gh pr checks` without an explicit PR reference
-   creates an enforcement gap at the final CI gate. Either add a mechanism to pass `PR_URL` or
-   `PR_NUMBER` into gate commands (runtime evidence feeding into gates), or make `ci_monitor`
-   a pure evidence state. This is the only finding that undermines a stated enforcement guarantee.
+2. **Resolve the ci_monitor enforcement gap** before production use. The gate can silently
+   fail immediately after PR creation and route to evidence fallback. Document that agents
+   must verify CI status before submitting `ci_outcome: passing`, or make `ci_monitor`
+   evidence-only for the first invocation after `pr_creation`.
 
-3. **Replace glob-based gate commands with template-variable-anchored paths**: The `analysis`
-   and `finalization` gates use `wip/*_plan.md` and `wip/*_summary.md` globs that match
-   artifacts from prior workflows. Use `{{ISSUE_NUMBER}}`-anchored paths to prevent false
-   positives.
+3. **Specify exact gate commands for setup states**. "Branch is not main/master" is
+   ambiguous. The template should include the exact `git` command to avoid branches named
+   `main-feature` from being mishandled.
 
-4. **Add workflow name validation to koto init**: Names are used to construct filesystem paths
-   without sanitization. Add an alphanumeric-plus-hyphens validation rule to prevent path
-   traversal and JSONL corruption via embedded newlines.
+4. **Move workflow name validation into Security Considerations**. The rule is correctly
+   specified in Phase 1 deliverables but invisible to a reader of the security section alone.
 
-5. **The "not applicable" on download verification is correct; supply chain risks are
-   understated**: The design should say "low residual risk from GitHub API responses and
-   template file integrity, pre-existing attack surface not introduced by this design" rather
-   than treating it as marginal. No escalation needed, but the framing should be accurate.
+5. **Acknowledge free-form gate glob risk in Security Considerations** (not just in
+   Consequences). Free-form workflows in directories with prior workflow artifacts may
+   experience false-positive auto-advancement.

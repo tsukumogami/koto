@@ -1,0 +1,71 @@
+{
+  "topic": "shirabe-work-on-template",
+  "decisions": [
+    {
+      "id": 1,
+      "question": "How should the template determine and act on workflow mode (issue-backed vs. free-form) throughout the state machine? Options include: (a) entry state captures mode evidence, single setup state with mode re-submission; (b) split topology — two separate setup states eliminating re-submission; (c) init-time --var eliminates the entry state, first state determined at init; (d) two separate templates converging at analysis. Affects the whole template structure including whether an entry state is needed and how the setup convergence point works.",
+      "status": "complete",
+      "complexity": "critical",
+      "chosen": "Option (b) — split topology: entry state routes to diverged paths, two setup states (setup_issue_backed, setup_free_form) with unconditional transitions",
+      "confidence": "high",
+      "report_file": "wip/design_shirabe-work-on-template_decision_1_report.md"
+    },
+    {
+      "id": 2,
+      "question": "What should the context_injection state actually do for issue-backed workflows? The current design gates on issue accessibility only (gh issue view exits 0). The real /work-on skill's Phase 0 runs extract-context.sh which creates wip/IMPLEMENTATION_CONTEXT.md that agents reference through implementation. Options: (a) gate on accessibility only, extraction work in directive; (b) gate on context artifact file existence, extraction is the state's work; (c) separate context_extraction state after context_injection; (d) skip dedicated extraction state, fold context work into analysis directive.",
+      "status": "complete",
+      "complexity": "standard",
+      "chosen": "Option (b) — gate on context artifact file existence; extraction is the state's work",
+      "confidence": "high",
+      "report_file": "wip/design_shirabe-work-on-template_decision_2_report.md"
+    },
+    {
+      "id": 3,
+      "question": "In free-form mode, where does task validation fit relative to research? Current: task_validation → research → setup. The real just-do-it skill uses: validate → research → re-validate (post-research jury). Options: (a) keep current pre-research-only validation; (b) research → post_research_validation (single validation after research); (c) lightweight pre-research check + post-research jury (two validation states); (d) no validation state — agent self-assesses during research. NOTE: answer is constrained by the mode routing topology (Decision 1).",
+      "status": "complete",
+      "complexity": "standard",
+      "chosen": "Option (c) — lightweight pre-research check + post-research validation (two states)",
+      "confidence": "high",
+      "report_file": "wip/design_shirabe-work-on-template_decision_3_report.md"
+    },
+    {
+      "id": 4,
+      "question": "How should introspection outcomes be modeled? The current 3-value enum (approach_unchanged, approach_updated, issue_superseded) misses two real outcomes from the /work-on skill: Clarify (needs user input, AskUserQuestion) and Amend (update scope, then proceed). Options: (a) expand to 5-value enum with Clarify self-loop and Amend routing; (b) add separate user_interaction state reachable from introspection; (c) collapse Clarify/Amend into approach_updated with rationale capturing the nuance; (d) issue_superseded explicitly routes to done_blocked rather than analysis.",
+      "status": "complete",
+      "complexity": "standard",
+      "chosen": "Option (c) — collapse Clarify/Amend into approach_updated; route issue_superseded to done_blocked",
+      "confidence": "high",
+      "report_file": "wip/design_shirabe-work-on-template_decision_4_report.md"
+    },
+    {
+      "id": 5,
+      "question": "What is the right error recovery model for self-loops and blocked states? Current: self-loops cycle indefinitely (no loop count), done_blocked is terminal with no recovery path. Problems: agents stuck on partial_tests_failing or scope_changed loop forever; a flaky CI failure permanently terminates the workflow. Options: (a) add loop_count evidence field + escalation transition after N iterations; (b) separate retry vs. escalate evidence values in each self-looping state; (c) replace done_blocked with a resumable blocked state (non-terminal, accepting a resume evidence); (d) keep current model but document loop exit instructions explicitly in directives.",
+      "status": "complete",
+      "complexity": "critical",
+      "chosen": "Option (b) — retry/escalate enum variants in each self-looping state; done_blocked remains terminal with koto rewind instructions in directive",
+      "confidence": "high",
+      "report_file": "wip/design_shirabe-work-on-template_decision_5_report.md"
+    },
+    {
+      "id": 6,
+      "question": "How should template directives carry procedure instructions to agents, including on resume? Current: design specifies evidence schemas but writes no actual directive text. The real /work-on skill has 50-130 lines of procedure per phase in separate reference files. Options: (a) self-contained directives with full embedded procedure (template is authoritative); (b) concise directives (what to do, not how) with resume-oriented artifact-check sections; (c) directive references the skill's SKILL.md phase file (template depends on skill docs); (d) short directive triggers a skill-wrapper context injection that loads the full phase instructions. NOTE: answer is coupled with Decision 2 since context_injection's directive must instruct extraction work.",
+      "status": "complete",
+      "complexity": "standard",
+      "chosen": "Option (b) — concise action-oriented directives with resume-oriented artifact-check preambles; wrapper injection for complex phases",
+      "confidence": "high",
+      "report_file": "wip/design_shirabe-work-on-template_decision_6_report.md"
+    }
+  ],
+  "cross_validation": "passed",
+  "cross_validation_notes": [
+    "One overstated assumption: Decision 4 assumes introspection gate 'test -f wip/issue_{{ISSUE_NUMBER}}_introspection.md' enforces artifact existence, but Decision 1 confirmed --var is not implemented. Until --var ships, the gate always fails, and introspection operates as evidence-only (gate-with-evidence-fallback handles this gracefully). Recorded as high-priority assumption, not a restart.",
+    "All other assumptions are mutually consistent. Total state count updated to 17 (D1 split setup +1, D3 post_research_validation +1)."
+  ],
+  "round": 0,
+  "auto_mode_notes": [
+    "6 decisions: borderline per heuristic (6-7 = proceed, record assumption). Cross-validation must watch for coupling artifacts.",
+    "Decision 1 and 3 are coupled: free-form validation topology constrained by mode routing choice.",
+    "Decision 2 and 6 are coupled: context_injection directive content depends on overall directive model.",
+    "Decision 4 and 5 are adjacent: issue_superseded routing may be affected by recoverable-blocked-state model."
+  ]
+}
