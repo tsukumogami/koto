@@ -88,6 +88,10 @@ are shorter because koto does more."
 - Both modes supported: issue-backed (GitHub issue) and free-form (task description,
   no issue), plus plan-backed (PLAN doc issue, routed as free-form)
 - Session resumability: koto's event log handles mid-session interruption
+- **Decisions are captured, not buried**: when agents make judgment calls during
+  implementation (assumptions, tradeoffs, approach choices), those decisions must be
+  captured as structured evidence and surfaced to the user — not buried in the agent's
+  reasoning where only a diff reviewer might notice them
 - Evidence schemas capture decisions, not completions — `{done: true}` evidence
   defeats enforcement
 
@@ -532,7 +536,9 @@ Three state categories:
 The SKILL.md orchestration wrapper (~55 lines of resume detection and phase dispatch) is
 eliminated. koto tracks state; the skill calls `koto next` in a loop.
 
-Three engine capabilities are prerequisites, two of which are `needs-design`:
+Four engine capabilities are prerequisites, three of which are `needs-design`. Each
+`needs-design` item will get its own design doc during /plan; they are in scope for
+this design but their detailed designs are done separately.
 
 1. **Gate-with-evidence-fallback**: the advancement loop must fall through to
    `NeedsEvidence` when a gate fails on a state with an `accepts` block, rather than
@@ -550,6 +556,13 @@ Three engine capabilities are prerequisites, two of which are `needs-design`:
    evaluates after execution) is for the child design to determine. This is what
    enables the default path — without it, the three-path model degrades to
    agent-does-the-work on every deterministic step.
+
+4. **Mid-state decision capture** — `needs-design`: during judgment states like
+   `implementation`, agents make non-obvious choices (assumptions, tradeoffs, approach
+   pivots) that are currently buried in reasoning. koto needs a mechanism to accept
+   decision records mid-state without triggering a transition, record them in the
+   event log, and surface them to the user. This is a cross-cutting concern that
+   benefits templates beyond work-on.
 
 ### Rationale
 
@@ -709,11 +722,19 @@ it exists, check git log for any prior work in this branch.
 **`implementation`** — writes code and commits. Gates: on feature branch, has commits
 beyond main, tests pass (`go test ./...`). Evidence fallback:
 `implementation_status: enum[complete, partial_tests_failing_retry,
-partial_tests_failing_escalate, blocked]`, `rationale: string`. `partial_tests_failing_retry`
-self-loops (up to 3 iterations). `partial_tests_failing_escalate` and `blocked` route to
-`done_blocked`. Directive includes escalation threshold: switch from `_retry` to
-`_escalate` after 3 failed submissions. On resume: re-read the plan file, check git log
-and git status to identify what was already committed.
+partial_tests_failing_escalate, blocked]`, `rationale: string`,
+`decisions: array[{choice: string, rationale: string, alternatives_considered: string}]`
+(optional, submitted with each evidence). When agents make non-obvious judgment calls
+during implementation — assumptions about API behavior, tradeoff choices, approach
+pivots — those decisions must be captured in the `decisions` array rather than buried
+in the agent's reasoning. koto records them in the event log and surfaces them to the
+user deterministically. The mechanism for mid-state decision capture is a cross-cutting
+engine concern (see Phase 0c in Implementation Approach).
+`partial_tests_failing_retry` self-loops (up to 3 iterations).
+`partial_tests_failing_escalate` and `blocked` route to `done_blocked`. Directive
+includes escalation threshold: switch from `_retry` to `_escalate` after 3 failed
+submissions. On resume: re-read the plan file, check git log and git status to identify
+what was already committed.
 
 **`finalization`** — cleanup, summary file, final verification. Gates:
 `test -f wip/{{ARTIFACT_PREFIX}}_summary.md` and tests pass. Evidence fallback:
@@ -860,8 +881,31 @@ Scope for the child design:
 - Interaction with `--var` substitution (default action commands may reference
   `{{ISSUE_NUMBER}}`).
 
-Phase 0a, Phase 0b, and Phase 1 are all prerequisites for Phase 2 (the template) and
-can be designed and implemented in parallel with each other.
+### Phase 0c: Mid-state decision capture — needs-design
+
+During judgment states like `implementation` and `analysis`, agents make non-obvious
+choices — assumptions about API behavior, tradeoff decisions, approach pivots. Today
+these are buried in the agent's reasoning and only visible if a reviewer reads the diff
+and wonders "why did they do it this way?" The decision capture mechanism makes these
+choices structured evidence that koto records and surfaces to the user.
+
+Scope for the child design:
+- How decisions are submitted mid-state without triggering a state transition. The agent
+  stays in `implementation` but accumulates decision records in the event log.
+- The decision record schema: at minimum `choice`, `rationale`, and
+  `alternatives_considered`. May align with or adapt the `/decision` skill's output
+  format for consistency.
+- How koto surfaces accumulated decisions to the user — as part of `koto next` output,
+  as a separate query command, or both.
+- Whether the template can require decision capture (e.g., a minimum count before
+  completion evidence is accepted) or whether it's advisory.
+
+This is a cross-cutting engine concern — other templates beyond work-on will benefit
+from the same mechanism.
+
+Phase 0a, Phase 0b, Phase 0c, and Phase 1 are all prerequisites for Phase 2 (the
+template). All four can be designed and implemented in parallel with each other. Each
+Phase 0 item gets its own design doc.
 
 ### Phase 1: Engine changes
 
@@ -1025,12 +1069,11 @@ No data is transmitted outside the local machine by koto itself.
 
 ### Negative
 
-- Three prerequisite engine capabilities are required, two of which are `needs-design`
-  issues (Phase 0a `--var` + Phase 0b default action execution + Phase 1 gate fallback).
-  The dependency chain is longer than the current model where agents handle everything.
-- The default action execution prerequisite (Phase 0b) is the largest unknown. Its scope
-  depends on the child design — it could be a targeted change or a significant engine
-  feature.
+- Four prerequisite engine capabilities are required, three of which are `needs-design`
+  issues (Phase 0a `--var` + Phase 0b default action execution + Phase 0c decision
+  capture + Phase 1 gate fallback). Each gets its own design doc during /plan.
+- Phase 0b (default action execution) and Phase 0c (decision capture) are the largest
+  unknowns. Their scope depends on the child designs.
 - Test commands in gates are language-specific (`go test ./...`). Non-Go projects need
   a different test command.
 - The 17-state template is authoring-heavy with no tooling support. The compiler reports
@@ -1040,11 +1083,10 @@ No data is transmitted outside the local machine by koto itself.
 
 ### Mitigations
 
-- Phase 0a (`--var`) and Phase 0b (default execution) can be designed and implemented
-  in parallel. The Phase 1 engine change (gate fallback) is independent of both.
-- The child designs for Phase 0a and 0b can scope to the minimum needed for the
-  template's deterministic states — they don't need to be general-purpose engine features
-  in the first release.
+- All Phase 0 items and Phase 1 can be designed and implemented in parallel.
+- The child designs can scope to the minimum needed for this template — they don't need
+  to be general-purpose engine features in the first release. Phase 0c (decision capture)
+  is cross-cutting but can start with the work-on template's needs.
 - Add `TEST_COMMAND` as a template variable with a default of `go test ./...`, making
   it configurable without changing the template structure.
 - `koto rewind` is CLI-callable (confirmed in source). The directive for `done_blocked`
