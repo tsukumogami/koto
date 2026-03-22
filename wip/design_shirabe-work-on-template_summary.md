@@ -13,9 +13,8 @@ without adding surface to koto.
 - Skip pattern needed: staleness check must route directly to analysis, bypassing introspection
 
 ## Key Findings from Exploration
-
 - Merge cost is low: phases 0-2 differ (GitHub issue vs. free-form input), phases 4-6 are identical
-- koto template: ~7-8 states, mostly auto-advancing, one branch at staleness/introspection check
+- koto template: ~15 states, mostly auto-advancing, evidence gates at decision points
 - No integrations needed: agent-as-integration model works for all external actions
 - Open design questions: full state list + evidence schema, skip pattern mechanics,
   shirabe invocation (SessionStart hook, koto init, directive loop), session resume behavior
@@ -27,22 +26,41 @@ without adding surface to koto.
   and iterative implementation don't map cleanly to state transitions.
 - coarse-grained: Simple 3-4 checkpoint template but loses enforcement at the transitions
   that matter (staleness detection invisible to koto). Audit trail fragments.
-- auto-advancing: ~8 states, auto-advances through execution phases, evidence gates only
-  at 3 decision points (staleness, plan approval, CI). Right level of abstraction.
+- gate-with-evidence-fallback: ~15 states, command gates auto-advance through mechanically
+  verifiable phases, evidence gates at decision points and gate-failure overrides.
+  Evidence schema = decision record (meaningful enums + rationale), not {done: true}.
 
-## Phase 2 Status: Recommendation pending user confirmation
+## Phase 2 Decision
+**Chosen:** gate-with-evidence-fallback
 
-**Recommendation:** auto-advancing with minimal evidence gates.
+Rationale: Command gates handle deterministic verification (branch exists, file created,
+tests pass, CI green). When a gate fails or the work requires judgment, koto falls back
+to an evidence schema capturing the agent's decision. Evidence fields are meaningful enums
+(e.g., branch_action: created|reused_existing) plus rationale — permanent decision records
+in the event log, not completion confirmations.
 
-Rationale: evidence gates belong where routing branches, not where the agent is just
-confirming it did what the directive said. Fine-grained over-specifies. Coarse-grained
-under-enforces at the staleness branch. Auto-advancing captures the enforcement value
-with minimal overhead and a ~150 line template.
+## Investigation Findings (Phase 3)
 
-**Pending:** User confirmation of approach. Once confirmed, proceed to Phase 3 (deep
-investigation of the chosen approach) covering: full state list, directive text, evidence
-schema design, shirabe invocation mechanics, session resume behavior.
+- **gate-mechanics**: Schema + compiler already allow co-locating gates and accepts on
+  the same state. Engine hard-stops on gate failure without consulting accepts block.
+  Two targeted changes needed: (1) advancement loop falls through to NeedsEvidence when
+  gate fails + accepts block present; (2) GateBlocked CLI response carries expects schema
+  and agent_actionable: true. Evidence submission path and rationale field already wired.
+  Implicit convention (presence of both gates + accepts = fallback) preferred over explicit flag.
+
+- **state-list**: 15 states including 3 terminal. Two paths diverge at entry, converge
+  at setup (with post-setup routing via workflow_type evidence) and fully merge at analysis.
+  6 states have command gates enabling auto-advancement. 4 states always evidence-gated
+  (entry, jury_validation, staleness_check, pr_creation). Critical finding: staleness_check
+  can never auto-advance — command gates check exit codes only, not script output content.
+  workflow_type evidence from entry must be in scope at setup for routing to work.
+
+- **invocation**: koto init <name> --template <path> initializes workflow. koto next <name>
+  is unified directive + advance command. Resume: koto workflows then koto next. No koto
+  status/query command (documented but not implemented). --var flag not implemented (needed
+  for ISSUE_NUMBER in gate commands). Stop hook exists (not SessionStart). shirabe has
+  empty koto-templates/ directory. Template discovery is state-file only, not template files.
 
 ## Current Status
-**Phase:** 2 - Present Approaches (awaiting user confirmation)
-**Last Updated:** 2026-03-21
+**Phase:** 4/5/6 complete — design doc finalized
+**Last Updated:** 2026-03-22
