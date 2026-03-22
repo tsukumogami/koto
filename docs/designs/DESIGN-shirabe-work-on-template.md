@@ -1,14 +1,13 @@
 ---
 status: Proposed
 problem: |
-  shirabe's /work-on skill is a long agent skill with instructions covering every phase
-  of implementation: context gathering, branch creation, planning, coding, PR creation,
-  CI monitoring. Most of these phases involve deterministic operations that any program
-  could execute reliably — yet agents carry them as instruction text, consume context
-  window on them, and must re-read them on resume. The skill also requires a GitHub issue
-  number, blocking free-form and plan-only tasks. The result is a skill that's too large,
-  handles too much deterministic work in the wrong layer, and supports fewer input modes
-  than users need.
+  shirabe's /work-on workflow exists and works, but it runs entirely through agent
+  instructions. koto's template engine can't yet express it as a template because the
+  engine lacks several platform capabilities: template variable substitution, default
+  action execution for deterministic steps, mid-state decision capture, and
+  gate-with-evidence-fallback. This design identifies the full set of platform
+  capabilities koto needs to support the work-on workflow as a template, then designs
+  the template that uses them.
 decision: |
   A single koto template backing /work-on with a three-path model for deterministic
   steps: each step has a default action (koto executes automatically), an override path
@@ -17,17 +16,18 @@ decision: |
   handling. Safety constraint: only reversible actions execute by default; irreversible
   steps (PR creation) require agent confirmation. The template uses split topology,
   routes three input modes (GitHub issue, free-form, PLAN doc) through a 17-state
-  machine, and requires two needs-design engine prerequisites: --var (template variable
-  substitution) and default action execution.
+  machine, and requires four engine prerequisites (three needs-design): --var (template
+  variable substitution), default action execution, mid-state decision capture, and
+  gate-with-evidence-fallback.
 rationale: |
   The automation-first principle — koto does deterministic work, agents do judgment work
   — requires koto to execute default actions, not just verify outcomes. The three-path
   model makes this concrete: each deterministic step specifies what happens by default,
   what overrides are recognized, and how failures are handled. The safety inversion
   (agents must opt-out rather than opt-in when koto executes by default) is addressed
-  by the reversibility constraint — only undoable actions auto-execute. Two needs-design
-  prerequisites (--var substitution and default action execution) provide the engine
-  capabilities. The SKILL.md orchestration wrapper (~55 lines) is eliminated because
+  by the reversibility constraint — only undoable actions auto-execute. Four engine
+  prerequisites (--var substitution, default action execution, mid-state decision
+  capture, and gate-with-evidence-fallback) provide the platform capabilities. The SKILL.md orchestration wrapper (~55 lines) is eliminated because
   koto tracks state directly. Structured enforcement alone yields ~15-20% instruction
   reduction; with default action execution (Phase 0b), the reduction reaches ~42% of
   995 lines.
@@ -65,6 +65,13 @@ context-gathering states run.
 The measure of success is not "koto enforces the workflow" — it is "agent instructions
 are shorter because koto does more."
 
+This design produces two outputs. The primary output is the set of platform capabilities
+koto needs to express the work-on workflow as a template — each capability gets its own
+child design doc and blocks the template work. The secondary output is the template
+design itself: the state machine, evidence schemas, and directive model that use those
+capabilities. The template depends on the platform work; the platform capabilities are
+independently useful and will benefit other templates beyond work-on.
+
 ## Decision Drivers
 
 - **Automation-first**: every step that can be executed deterministically by koto must
@@ -94,6 +101,167 @@ are shorter because koto does more."
   reasoning where only a diff reviewer might notice them
 - Evidence schemas capture decisions, not completions — `{done: true}` evidence
   defeats enforcement
+
+## Platform Capabilities Required
+
+This is the primary output of the design: the full set of koto platform capabilities
+needed to express the work-on workflow as a template. Each capability is either a
+needs-design issue (gets its own child design doc during /plan) or a targeted engine
+change (implementable directly).
+
+### Capability Map
+
+| Workflow feature | Platform gap | Status |
+|---|---|---|
+| Issue-specific gate commands (`{{ISSUE_NUMBER}}` in `test -f`, `check-staleness.sh`) | Template variables (`--var`) | needs-design |
+| Directive text references to issue numbers and artifact paths | Variable substitution in directives (fold into `--var` scope) | needs-design |
+| Deterministic steps auto-execute (context injection, branch setup, staleness check, CI polling) | Default action execution | needs-design |
+| CI monitoring polls repeatedly until pass/timeout | Polling/retry execution model (fold into default action scope) | needs-design |
+| Default action commands reference `{{ISSUE_NUMBER}}` | Variable substitution in default actions (fold into `--var` scope) | needs-design |
+| Gate output available to agent on fallback (staleness check structured data) | Gate output capture (fold into default action scope) | needs-design |
+| Agent decisions during implementation captured as structured evidence | Mid-state decision capture | needs-design |
+| Gate failure on a state with `accepts` falls through to evidence collection | Gate-with-evidence-fallback | targeted engine change |
+| Workflow names in state file paths must be safe | Workflow name validation | targeted engine change |
+
+### Phase 0a: Template variables (`--var` support) — needs-design
+
+The `--var` feature enables issue-specific gate commands (`{{ISSUE_NUMBER}}` substitution)
+and artifact-path gates (`{{ARTIFACT_PREFIX}}`). It spans CLI, event storage, runtime
+evaluation, and input sanitization.
+
+Scope for the child design:
+- `koto init` accepts `--var KEY=VALUE` (repeatable). Values are stored in the
+  `WorkflowInitialized` event's `variables` field (already defined, currently always
+  empty).
+- At gate evaluation time, `{{KEY}}` in gate command strings is substituted from the
+  stored variables map. Substitution happens at runtime, not compile time — the compiled
+  template remains variable-agnostic.
+- Variable substitution applies to directive text too, not just gate commands. When a
+  deterministic state's gate fails and the directive is surfaced, references to
+  `{{ISSUE_NUMBER}}` or `{{ARTIFACT_PREFIX}}` in the directive text must be resolved.
+  The `done_blocked` state's directive references issue-specific recovery paths; the
+  override/failure directives on deterministic states reference issue-specific artifacts.
+- Input sanitization: variable values containing shell metacharacters must be rejected or
+  safely quoted at `koto init` time to prevent command injection. The child design should
+  specify the safe character set and rejection behavior.
+- Workflow name validation: names are incorporated into state file paths
+  (`koto-<name>.state.jsonl`) and must be validated against a strict pattern to prevent
+  path traversal. This is a targeted engine change that can be implemented alongside
+  `--var` or separately.
+
+### Phase 0b: Default action execution — needs-design
+
+The three-path model (Decision 6+8) requires koto to execute a default action for
+deterministic states — not just verify the outcome. This is the engine capability that
+makes the default path work: koto runs a command on state entry, captures the result,
+then evaluates the gate.
+
+Scope for the child design:
+- How the template specifies the default action per state (command string, working
+  directory, environment).
+- How output is captured and made available for gate evaluation. Gate output capture
+  is required for states like `staleness_check`, where the gate command produces
+  structured data the agent needs to see on fallback.
+- How override evidence prevents default execution (the agent or skill layer submits
+  override evidence before the action runs).
+- The reversibility constraint: the engine should support marking actions as
+  requiring confirmation, so irreversible actions can be flagged in the template schema.
+- Interaction with `--var` substitution (default action commands reference
+  `{{ISSUE_NUMBER}}`). Phase 0b's design should coordinate with Phase 0a on the
+  substitution interface, though implementation can proceed in parallel once the
+  interface is agreed.
+- The execution model must handle both one-shot commands (`context_injection`,
+  `setup_issue_backed`, `setup_free_form`, `staleness_check`) and repeated evaluation
+  (`ci_monitor`). The `ci_monitor` state needs polling/retry semantics — run a command
+  repeatedly until it passes or times out — which is fundamentally different from the
+  other four deterministic states that run once and check. The child design should
+  specify how the template declares polling behavior and how the engine manages
+  retry intervals and timeout.
+
+### Phase 0c: Mid-state decision capture — needs-design
+
+During judgment states like `implementation` and `analysis`, agents make non-obvious
+choices — assumptions about API behavior, tradeoff decisions, approach pivots. Today
+these are buried in the agent's reasoning and only visible if a reviewer reads the diff.
+The decision capture mechanism makes these choices structured evidence that koto records
+and surfaces to the user.
+
+The core platform capability is incremental submission: accepting evidence mid-state
+without triggering a transition. Batch submission at transition time is already possible
+(the agent includes a `decisions` array alongside the routing evidence), but incremental
+capture lets agents record decisions as they happen rather than reconstructing them at
+the end.
+
+Scope for the child design:
+- How decisions are submitted mid-state without triggering a state transition. The agent
+  stays in `implementation` but accumulates decision records in the event log.
+- The decision record schema: at minimum `choice`, `rationale`, and
+  `alternatives_considered`. May align with or adapt the `/decision` skill's output
+  format for consistency.
+- How koto surfaces accumulated decisions to the user — as part of `koto next` output,
+  as a separate query command, or both.
+- Whether the template can require decision capture (e.g., a minimum count before
+  completion evidence is accepted) or whether it's advisory.
+
+This is a cross-cutting engine concern — other templates beyond work-on will benefit
+from the same mechanism.
+
+### Phase 1: Gate-with-evidence-fallback — targeted engine change
+
+When a gate fails on a state that also has an `accepts` block, the engine should fall
+through to `NeedsEvidence` instead of returning `GateBlocked`. The CLI then handles
+`NeedsEvidence` by including the `expects` schema and setting `agent_actionable: true`.
+This provides the override and failure paths for every deterministic state and the
+resume path for judgment-with-verification states.
+
+Deliverables:
+- `src/engine/advance.rs`: When evaluating gates, if any gate fails and the current state
+  has an `accepts` block, skip the hard `GateBlocked` return and fall through to
+  `NeedsEvidence`. The existing transition resolution logic already handles this case
+  correctly once reached.
+- `src/cli/next_types.rs`: The `NeedsEvidence` response carries `expects` (populated via
+  `derive_expects` from the state's `accepts` block) and `agent_actionable: true`.
+- `src/cli/mod.rs`: No changes needed to the `GateBlocked` arm — states with both gates
+  and accepts will never reach `GateBlocked` because the engine falls through to
+  `NeedsEvidence` first.
+- Tests: add engine tests for gate-failure-with-fallback behavior and CLI output shape.
+
+### Workflow name validation — targeted engine change
+
+Workflow names are incorporated into state file paths (`koto-<name>.state.jsonl`).
+Names must be validated at `koto init` time against a strict pattern to prevent path
+traversal (e.g., `../../../etc/koto.state.jsonl`). Currently listed in Security
+Considerations but required as a prerequisite for safe operation with user-provided
+workflow names. Can be implemented alongside `--var` (Phase 0a) or independently.
+
+### Acknowledged Limitations
+
+These are known gaps that are out of scope for this design but documented so template
+authors and future designs can account for them:
+
+- **Artifact lifecycle after rewind**: koto doesn't manage artifact cleanup when
+  rewinding. If an agent rewinds from `finalization` back to `implementation`, the
+  summary artifact isn't cleaned up. Template authors should know that artifacts and
+  koto state can diverge after rewind.
+- **Progress reporting mid-state**: there is no mechanism for agents to report progress
+  without triggering a transition. An agent in `implementation` that wants to signal
+  "3 of 5 files updated" has no koto-level way to do so. Out of scope for this design.
+- **Path-specific rewind counts in `done_blocked`**: directives are static text, but
+  the rewind distance from `done_blocked` varies by originating state (1 step from
+  `ci_monitor`, up to 5+ from `analysis`). The template author must enumerate all
+  paths in the directive or use generic guidance like "rewind until you reach state X."
+  Variable substitution in directives (Phase 0a) doesn't solve this because the origin
+  isn't a template variable — it's runtime state.
+
+### Parallelism and Dependencies
+
+Phase 0a, Phase 0b, Phase 0c, and Phase 1 can all be designed in parallel. Each Phase 0
+item gets its own design doc. Phase 0b depends on Phase 0a's substitution interface
+(default action commands reference `{{VAR}}`), so Phase 0b's design should coordinate
+with Phase 0a on that interface. Implementation can still proceed in parallel once the
+interface is agreed.
+
+All platform capabilities are prerequisites for Phase 2 (the template).
 
 ## Considered Options
 
@@ -536,33 +704,10 @@ Three state categories:
 The SKILL.md orchestration wrapper (~55 lines of resume detection and phase dispatch) is
 eliminated. koto tracks state; the skill calls `koto next` in a loop.
 
-Four engine capabilities are prerequisites, three of which are `needs-design`. Each
-`needs-design` item will get its own design doc during /plan; they are in scope for
-this design but their detailed designs are done separately.
-
-1. **Gate-with-evidence-fallback**: the advancement loop must fall through to
-   `NeedsEvidence` when a gate fails on a state with an `accepts` block, rather than
-   returning hard `GateBlocked`. The CLI response must carry the `expects` schema and
-   set `agent_actionable: true`. This provides the override and failure paths.
-
-2. **Template variables (`--var`)** — `needs-design`: `koto init` accepts
-   `--var KEY=VALUE`, stores variables in the workflow event, and substitutes
-   `{{KEY}}` in gate commands at evaluation time. Involves CLI flag handling, event
-   storage, runtime substitution, and shell injection sanitization.
-
-3. **Default action execution** — `needs-design`: koto executes a specified command
-   on state entry for deterministic states and captures the result. The mechanism
-   (how the template specifies the command, how output is captured, how the gate
-   evaluates after execution) is for the child design to determine. This is what
-   enables the default path — without it, the three-path model degrades to
-   agent-does-the-work on every deterministic step.
-
-4. **Mid-state decision capture** — `needs-design`: during judgment states like
-   `implementation`, agents make non-obvious choices (assumptions, tradeoffs, approach
-   pivots) that are currently buried in reasoning. koto needs a mechanism to accept
-   decision records mid-state without triggering a transition, record them in the
-   event log, and surface them to the user. This is a cross-cutting concern that
-   benefits templates beyond work-on.
+The platform capabilities required for this template are detailed in the Platform
+Capabilities Required section above. In summary: four engine capabilities are
+prerequisites (three needs-design, one targeted change), plus workflow name validation.
+Each needs-design item gets its own child design doc during /plan.
 
 ### Rationale
 
@@ -588,10 +733,10 @@ passing through `pr_creation`.
 gate commands, and evidence schemas. Lives in shirabe's plugin directory and is copied
 to `.koto/templates/work-on.md` in the project on first use.
 
-**koto engine** (two changes to existing Rust files):
-- `src/engine/advance.rs`: gate-with-evidence-fallback logic in the advancement loop
-- `src/cli/next_types.rs` + `src/cli/mod.rs`: extend GateBlocked response to carry
-  `expects` and set `agent_actionable: true` when a fallback is available
+**koto engine** (changes to existing Rust files):
+- `src/engine/advance.rs`: gate-with-evidence-fallback logic — when a gate fails on a
+  state with an `accepts` block, fall through to `NeedsEvidence` instead of returning
+  `GateBlocked`
 - `src/cli/mod.rs` (init command): implement `--var KEY=VALUE` flag (repeatable). Store
   the resulting `HashMap<String, String>` in the `variables` field of the
   `WorkflowInitialized` event (already defined, currently always empty). Substitute
@@ -714,7 +859,10 @@ Clarify and Amend outcomes from the sub-agent's internal loop.
 `koto init` time: `issue_71` for issue-backed, `task_add-retry-logic` for free-form
 (see Key Interfaces).
 Evidence fallback: `plan_outcome: enum[plan_ready, blocked_missing_context,
-scope_changed_retry, scope_changed_escalate]`, `approach_summary: string`.
+scope_changed_retry, scope_changed_escalate]`, `approach_summary: string`,
+`decisions: array[{choice: string, rationale: string, alternatives_considered: string}]`
+(optional, same pattern as `implementation` — captures non-obvious choices made during
+analysis such as scope narrowing decisions or dependency ordering).
 `scope_changed_retry` self-loops (up to 3 iterations). `scope_changed_escalate` and
 `blocked_missing_context` route to `done_blocked`. On resume: re-read the plan file if
 it exists, check git log for any prior work in this branch.
@@ -796,7 +944,8 @@ koto next work-on-71
 Returns `{"action": "execute", "state": "<state>", "directive": "<text>", "expects": {...}}`.
 For states with command gates that pass, koto auto-advances through them and stops at
 the next evidence-required or terminal state. For gate-with-fallback states where the
-gate fails, returns `GateBlocked` with `expects` populated and `agent_actionable: true`.
+gate fails, the engine falls through to `NeedsEvidence` — returning the directive with
+`expects` populated and `agent_actionable: true`.
 
 **Submit evidence:**
 ```
@@ -845,84 +994,20 @@ The skill layer sets `ARTIFACT_PREFIX=task_<slug>` at init time.
 
 ### Phase 0a: Template variables (`--var` support) — needs-design
 
-The `--var` feature is a prerequisite that enables issue-specific gate commands
-(`{{ISSUE_NUMBER}}` substitution). It spans CLI, event storage, runtime evaluation, and
-input sanitization — enough surface area to warrant its own design doc.
-
-Scope for the child design:
-- `koto init` accepts `--var KEY=VALUE` (repeatable). Values are stored in the
-  `WorkflowInitialized` event's `variables` field (already defined, currently always
-  empty).
-- At gate evaluation time, `{{KEY}}` in gate command strings is substituted from the
-  stored variables map. Substitution happens at runtime, not compile time — the compiled
-  template remains variable-agnostic.
-- Input sanitization: variable values containing shell metacharacters must be rejected or
-  safely quoted at `koto init` time to prevent command injection. The child design should
-  specify the safe character set and rejection behavior.
-- Workflow name validation: names are incorporated into state file paths
-  (`koto-<name>.state.jsonl`) and must be validated against a strict pattern to prevent
-  path traversal.
+See Platform Capabilities Required section. Gets its own design doc during /plan.
 
 ### Phase 0b: Default action execution — needs-design
 
-The three-path model (Decision 6+8) requires koto to execute a default action for
-deterministic states — not just verify the outcome. This is the engine capability that
-makes the default path work: koto runs a command on state entry, captures the result,
-then evaluates the gate.
-
-Scope for the child design:
-- How the template specifies the default action per state (command string, working
-  directory, environment).
-- How output is captured and made available for gate evaluation.
-- How override evidence prevents default execution (the agent or skill layer submits
-  override evidence before the action runs).
-- The reversibility constraint: the engine should support marking actions as
-  requiring confirmation, so irreversible actions can be flagged in the template schema.
-- Interaction with `--var` substitution (default action commands may reference
-  `{{ISSUE_NUMBER}}`).
+See Platform Capabilities Required section. Gets its own design doc during /plan.
 
 ### Phase 0c: Mid-state decision capture — needs-design
 
-During judgment states like `implementation` and `analysis`, agents make non-obvious
-choices — assumptions about API behavior, tradeoff decisions, approach pivots. Today
-these are buried in the agent's reasoning and only visible if a reviewer reads the diff
-and wonders "why did they do it this way?" The decision capture mechanism makes these
-choices structured evidence that koto records and surfaces to the user.
+See Platform Capabilities Required section. Gets its own design doc during /plan.
 
-Scope for the child design:
-- How decisions are submitted mid-state without triggering a state transition. The agent
-  stays in `implementation` but accumulates decision records in the event log.
-- The decision record schema: at minimum `choice`, `rationale`, and
-  `alternatives_considered`. May align with or adapt the `/decision` skill's output
-  format for consistency.
-- How koto surfaces accumulated decisions to the user — as part of `koto next` output,
-  as a separate query command, or both.
-- Whether the template can require decision capture (e.g., a minimum count before
-  completion evidence is accepted) or whether it's advisory.
+### Phase 1: Gate-with-evidence-fallback engine change
 
-This is a cross-cutting engine concern — other templates beyond work-on will benefit
-from the same mechanism.
-
-Phase 0a, Phase 0b, Phase 0c, and Phase 1 are all prerequisites for Phase 2 (the
-template). All four can be designed and implemented in parallel with each other. Each
-Phase 0 item gets its own design doc.
-
-### Phase 1: Engine changes
-
-These changes unlock the gate-with-evidence-fallback pattern. They're prerequisites
-for the template but independent of `--var` (Phase 0).
-
-Deliverables:
-- `src/engine/advance.rs`: When evaluating gates, if any gate fails and the current state
-  has an `accepts` block, skip the hard `GateBlocked` return and fall through to
-  `NeedsEvidence`. The existing transition resolution logic already handles this case
-  correctly once reached.
-- `src/cli/next_types.rs`: Add an `expects` field to the `GateBlocked` response variant,
-  populated via `derive_expects` when the state has an `accepts` block.
-- `src/cli/mod.rs` (GateBlocked arm): Set `agent_actionable: true` on blocking conditions
-  when the state has both gates and accepts. Populate the `expects` field.
-- Tests: add engine tests for gate-failure-with-fallback behavior and CLI output shape for
-  the new GateBlocked-with-fallback response.
+See Platform Capabilities Required section for the full specification and deliverables.
+Independent of `--var` (Phase 0) and implementable in parallel.
 
 ### Phase 2: Template file
 
@@ -1018,7 +1103,7 @@ The Phase 0 child design must specify the exact sanitization approach.
 Additionally, workflow names are incorporated into state file paths
 (`koto-<name>.state.jsonl`). Names must be validated at `koto init` time against a
 strict pattern to prevent path traversal (e.g., `../../../etc/koto.state.jsonl`). This
-validation is also scoped to Phase 0.
+is listed as a prerequisite in Platform Capabilities Required.
 
 **Supply chain risks**: The template is shipped as part of the shirabe plugin. Trust
 in the template is the same as trust in the shirabe plugin itself. No external content
@@ -1069,9 +1154,10 @@ No data is transmitted outside the local machine by koto itself.
 
 ### Negative
 
-- Four prerequisite engine capabilities are required, three of which are `needs-design`
-  issues (Phase 0a `--var` + Phase 0b default action execution + Phase 0c decision
-  capture + Phase 1 gate fallback). Each gets its own design doc during /plan.
+- Four prerequisite engine capabilities plus workflow name validation are required. Three
+  are `needs-design` issues (Phase 0a `--var` + Phase 0b default action execution +
+  Phase 0c decision capture). Phase 1 (gate fallback) and workflow name validation are
+  targeted changes. Each needs-design item gets its own design doc during /plan.
 - Phase 0b (default action execution) and Phase 0c (decision capture) are the largest
   unknowns. Their scope depends on the child designs.
 - Test commands in gates are language-specific (`go test ./...`). Non-Go projects need
@@ -1083,11 +1169,14 @@ No data is transmitted outside the local machine by koto itself.
 
 ### Mitigations
 
-- All Phase 0 items and Phase 1 can be designed and implemented in parallel.
+- All Phase 0 items and Phase 1 can be designed and implemented in parallel (see
+  Platform Capabilities Required for the dependency between Phase 0a and 0b).
 - The child designs can scope to the minimum needed for this template — they don't need
   to be general-purpose engine features in the first release. Phase 0c (decision capture)
   is cross-cutting but can start with the work-on template's needs.
 - Add `TEST_COMMAND` as a template variable with a default of `go test ./...`, making
   it configurable without changing the template structure.
 - `koto rewind` is CLI-callable (confirmed in source). The directive for `done_blocked`
-  lists the specific rewind count for each path that reaches it.
+  enumerates recovery paths or uses generic guidance ("rewind until you reach state X").
+  See Acknowledged Limitations in Platform Capabilities Required for the static-directive
+  constraint.
