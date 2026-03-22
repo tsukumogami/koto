@@ -66,9 +66,17 @@ are shorter because koto does more."
 
 ## Decision Drivers
 
-- **Automation-first**: every step that can be executed or verified deterministically
-  by koto must be — if koto can run the command and check the result, the agent should
-  not be asked to do it
+- **Automation-first**: every step that can be executed deterministically by koto must
+  be — koto runs the command and checks the result, the agent is not asked to do it
+- **Three paths for deterministic steps**: each automated step must handle a default
+  (the action succeeds), overrides (the user changes the default), and failures (the
+  action fails and the agent recovers). Deterministic doesn't mean unconditional —
+  users provide context that changes what should happen
+- **Reversibility determines safety**: automated steps execute by default only when the
+  action is reversible. Irreversible or externally-visible actions (PR creation, posting
+  comments) require agent confirmation. This addresses the opt-in/opt-out inversion —
+  when koto acts by default, a missed override runs the default, so the default must
+  be undoable
 - **Agents for judgment only**: evidence states are reserved for decisions requiring
   interpretation, creativity, or nuance that command outputs cannot capture
 - **Agent instructions shrink as a result**: states where koto auto-advances produce
