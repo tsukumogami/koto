@@ -268,9 +268,9 @@ Each state's directive specifies the escalation threshold (default: 3 failed ret
 instructs the agent to switch from `_retry` to `_escalate` after that threshold.
 
 `done_blocked` remains terminal. Its directive gains `koto rewind` instructions: if the
-blocker has been resolved externally, run `koto rewind <originating-state>` to return the
-workflow to that state without reinitializing. Note: the `Rewound` event type is confirmed
-in `types.rs`; CLI availability should be verified before the template is used in practice.
+blocker has been resolved externally, run `koto rewind <name>` repeatedly — once per
+state to traverse back — to step back to the originating state. (`koto rewind` rewinds
+exactly one step per call; it does not accept a named target state.)
 
 #### Alternatives Considered
 
@@ -568,8 +568,9 @@ indexing window.
 
 **`done_blocked`** — terminal. Records a blocking condition requiring human intervention.
 Directive includes recovery instructions: "If the blocker has been resolved externally,
-run `koto rewind <originating-state>` to return the workflow to that state without
-reinitializing." Reachable from multiple states via explicit escalation paths.
+run `koto rewind <name>` once per step to walk back to the originating state. (`koto rewind`
+rewinds one step per call; call it repeatedly to reach a non-adjacent origin state.)"
+Reachable from multiple states via explicit escalation paths.
 
 ### Key Interfaces
 
@@ -812,8 +813,8 @@ No data is transmitted outside the local machine by koto itself.
 - The 17-state template is authoring-heavy with no tooling support. The compiler reports
   one error at a time, and state name mismatches between YAML front-matter and markdown
   headings produce compile errors. Authors should write states in lockstep.
-- `koto rewind` CLI availability is assumed but not confirmed. If not yet implemented,
-  `done_blocked` has no in-workflow recovery path until `koto rewind` ships.
+- `koto rewind` rewinds one step per call. Recovering `done_blocked` to a non-adjacent
+  originating state requires multiple calls. The directive must make this explicit.
 
 ### Mitigations
 
@@ -828,6 +829,7 @@ No data is transmitted outside the local machine by koto itself.
   (e.g., `type: command_output`) to close this gap.
 - Add `TEST_COMMAND` as a template variable with a default of `go test ./...`, making
   it configurable without changing the template structure.
-- If `koto rewind` is not yet CLI-callable, the mitigation for `done_blocked` is to
-  manually edit the state file to remove the terminal transition and re-run the workflow.
-  This is a workaround; verify koto rewind CLI availability in Phase 1.
+- `koto rewind` is CLI-callable (confirmed in source). The one-step-per-call behavior
+  means recovery from `done_blocked` to a non-adjacent state requires N rewind calls,
+  where N is the number of states traversed. The directive lists the specific rewind
+  count for each path that reaches `done_blocked`.
