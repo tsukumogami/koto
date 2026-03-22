@@ -10,30 +10,26 @@ problem: |
   handles too much deterministic work in the wrong layer, and supports fewer input modes
   than users need.
 decision: |
-  A single koto template backing /work-on that maximizes gate-based auto-advancement:
-  implementation and ci_monitor auto-advance using existing gate capabilities;
-  staleness_check auto-advances via a piped gate command (check-staleness.sh | jq -e
-  '...'). Issue-specific gates use {{ISSUE_NUMBER}} substitution via --var, a
-  prerequisite engine feature (needs-design). Agents are reached only on judgment states
-  or gate-failure fallback paths. The template uses split topology (two setup states),
-  two-tier directives (full directives for judgment states; error-fallback-only for
-  koto-gated states), and routes three input modes (GitHub issue, free-form description,
-  PLAN doc issue) through a unified 17-state machine. on_entry actions (koto running
-  commands autonomously) are scoped as a follow-on engine issue, not a template
-  prerequisite.
+  A single koto template backing /work-on with a three-path model for deterministic
+  steps: each step has a default action (koto executes automatically), an override path
+  (user input changes the default), and a failure path (agent recovers). Agents are
+  reached only on judgment states or when deterministic steps need override/failure
+  handling. Safety constraint: only reversible actions execute by default; irreversible
+  steps (PR creation) require agent confirmation. The template uses split topology,
+  routes three input modes (GitHub issue, free-form, PLAN doc) through a 17-state
+  machine, and requires two needs-design engine prerequisites: --var (template variable
+  substitution) and default action execution.
 rationale: |
   The automation-first principle — koto does deterministic work, agents do judgment work
-  — requires the --var engine feature for issue-specific gate commands. This is scoped
-  as a needs-design prerequisite issue rather than deferred to a future release, because
-  without it, gates referencing {{ISSUE_NUMBER}} cannot evaluate and the template's
-  auto-advancement degrades to evidence-only fallback for issue-backed states. The
-  staleness_check piped gate was a design oversight: check-staleness.sh output can be
-  evaluated via jq exit code, no new gate type needed. The SKILL.md orchestration wrapper
-  (~55 lines of resume detection and phase dispatch) is eliminated because koto tracks
-  state directly. Two-tier directives encode the automation principle in the template
-  schema: koto-gated states carry only failure-recovery guidance, not procedure, because
-  agents only land there when something goes wrong. The agent instruction reduction
-  (~42% of 995 lines) is the primary measurable outcome.
+  — requires koto to execute default actions, not just verify outcomes. The three-path
+  model makes this concrete: each deterministic step specifies what happens by default,
+  what overrides are recognized, and how failures are handled. The safety inversion
+  (agents must opt-out rather than opt-in when koto executes by default) is addressed
+  by the reversibility constraint — only undoable actions auto-execute. Two needs-design
+  prerequisites (--var substitution and default action execution) provide the engine
+  capabilities. The SKILL.md orchestration wrapper (~55 lines) is eliminated because
+  koto tracks state directly. The agent instruction reduction (~42% of 995 lines) is
+  the primary measurable outcome.
 ---
 
 # DESIGN: shirabe work-on koto template
@@ -146,10 +142,11 @@ verify that context extraction happened. A panel review identified this as a cor
 
 #### Chosen: Gate on context artifact existence; extraction is the state's work
 
-The `context_injection` directive instructs the agent to run `extract-context.sh --issue <N>`.
+The default action is `extract-context.sh --issue <N>` (koto executes on state entry).
 The gate is `test -f wip/issue_{{ISSUE_NUMBER}}_context.md`. The `{{ISSUE_NUMBER}}`
-substitution uses the `--var` flag passed at `koto init` time. When the artifact exists,
-the gate auto-advances without agent involvement.
+substitution uses the `--var` flag passed at `koto init` time. When the action succeeds
+and the artifact exists, the gate auto-advances without agent involvement. On override
+(user provides additional context) or failure (script fails), the agent submits evidence.
 
 Key assumption: `extract-context.sh` will be updated in Phase 3 (shirabe integration) to
 accept an issue number argument and write to `wip/issue_<N>_context.md`. The numbered path
@@ -303,48 +300,135 @@ which produce auditable escalation records.
 
 ---
 
-### Decision 6: Directive content model
+### Decision 6+8 (merged): Functional behavior model for deterministic steps
 
-Under the automation-first principle, not all states need the same directive depth. States
-where koto auto-advances on the happy path (gate passes → next state, no agent action)
-need only error-fallback instructions. States where agents always do judgment work need
-full directives. Treating all states uniformly either over-specifies koto-autonomous states
-or under-specifies judgment states.
+Each workflow step that has a deterministic default behavior must handle three scenarios:
+the default case (everything works as expected), user overrides (the user provided input
+that changes the default), and failures (the default behavior fails). Former Decision 6
+(directive tiers) and Decision 8 (automation ceiling) are coupled — the directive model
+follows directly from who is responsible for each path — so they're merged here.
 
-#### Chosen: Two-tier directives — full for judgment states, error-fallback-only for koto-gated states
+A safety concern shapes this decision: today, agents opt in to every action (worst case
+if the agent does nothing: nothing happens). If koto executes deterministic steps by
+default, the agent must opt out to prevent unwanted actions (worst case if the agent
+misses an override: koto runs something it shouldn't have). The design must address
+this inversion.
+
+#### Chosen: Three-path model with reversibility-based safety
+
+**Default path.** Each deterministic step specifies a default action and expected
+outcome. When no override is provided and the action succeeds, the workflow advances
+automatically — the agent is not involved. koto executes the action and verifies the
+outcome.
+
+**Override path.** The user provides input that changes the default (e.g., "use my
+existing branch," "skip staleness check," "here's additional context"). The skill layer
+detects the override and communicates it to koto before the default action runs. The
+workflow routes based on the override evidence rather than executing the default.
+
+**Failure path.** The default action fails or produces unexpected results. koto surfaces
+the failure to the agent with the state's evidence schema. The agent diagnoses the
+failure and either recovers (submits `completed` or `override` evidence) or escalates
+(submits `blocked` evidence routing to `done_blocked`).
+
+**Evidence schema.** Each deterministic state's `accepts` block follows a standard
+pattern:
+
+```yaml
+accepts:
+  status:
+    type: enum
+    values: [completed, override, blocked]
+  detail:
+    type: string
+    description: "Override type or failure reason"
+```
+
+Transitions use `when` conditions on `status`:
+- `completed` → next state (agent confirmed completion when automation couldn't verify)
+- `override` → next state (override applied, default skipped)
+- `blocked` → recovery state or `done_blocked`
+
+**Safety constraint: reversibility determines execution policy.** Only reversible actions
+execute by default. If the agent misses a user override, koto runs the default — so the
+default must be undoable.
+
+- **Reversible** (local file creation, branch creation, read-only checks): execute by
+  default. If an override was missed, the result can be undone.
+- **Irreversible or externally-visible** (PR creation, posting comments): require agent
+  confirmation. These remain judgment states.
+
+All current deterministic states are reversible:
+
+| State | Default action | Reversibility |
+|---|---|---|
+| `context_injection` | Run extract-context.sh, create wip file | File can be overwritten |
+| `setup_issue_backed` | Create feature branch, run baseline | Branch can be deleted |
+| `setup_free_form` | Create feature branch, run baseline | Branch can be deleted |
+| `staleness_check` | Run check-staleness.sh, evaluate output | Read-only |
+| `finalization` | Verify tests, create summary | File can be overwritten |
+| `ci_monitor` | Poll CI status | Read-only |
+
+PR creation is already classified as a judgment state — correctly, since it creates an
+externally-visible artifact.
+
+**Per-state behavior under the three-path model:**
+
+| State | Default action | Known overrides | Common failures |
+|---|---|---|---|
+| `context_injection` | Run extract-context.sh | User provides additional context | Script fails, issue inaccessible |
+| `setup_issue_backed` | Create branch, run baseline | User specifies existing branch | Branch name conflict, build broken |
+| `setup_free_form` | Create branch, run baseline | User specifies existing branch | Branch name conflict, build broken |
+| `staleness_check` | Run check-staleness.sh | User says "skip, issue is current" | Script fails, network error |
+| `finalization` | Verify tests, create summary | User provides custom summary | Tests regressed |
+| `ci_monitor` | Poll gh pr checks | User says "CI acceptable" | CI flaky, unresolvable failures |
+
+**Directive content model (follows from three-path model).** Two directive tiers matching
+the agent's interaction pattern:
 
 **Tier 1 — judgment states** (`entry`, `task_validation`, `post_research_validation`,
-`staleness_check`, `introspection`, `analysis`, `pr_creation`, `validation_exit`,
-`done_blocked`): Full concise directive (10-25 lines) covering what to accomplish, key
-artifact paths, evidence schema, and resume guidance. These states always invoke agent
-judgment and need orientation after session interruption.
+`introspection`, `analysis`, `pr_creation`, `validation_exit`, `done_blocked`):
+Full directive (10-25 lines) covering what to accomplish, artifact paths, evidence
+schema, and resume guidance. These states always involve agent judgment.
 
-**Tier 2 — koto-gated states on the happy path** (`context_injection`, `setup_issue_backed`,
-`setup_free_form`, `implementation`, `finalization`, `ci_monitor`): Error-fallback-only
-directive (3-6 lines). Format: "koto should have advanced past this state automatically.
-If you see this, [specific fallback action]. Submit: [minimal evidence schema]." When the
-gate passes, agents never read these directives. They only appear on gate failure, so they
-need only enough instruction to unblock the agent and resubmit.
+**Tier 2 — deterministic states (exception path only)** (`context_injection`,
+`setup_issue_backed`, `setup_free_form`, `staleness_check`, `implementation`,
+`finalization`, `ci_monitor`): Override and failure guidance (3-8 lines). Only displayed
+when the default didn't execute or failed. Covers: recognized overrides, common failure
+recovery, evidence schema. On the happy path, the agent never sees these directives.
 
-The SKILL.md orchestration wrapper — currently ~55 lines of resume detection, phase
-dispatch, and session management — is eliminated. koto tracks state directly; the skill
-calls `koto next` in a loop and injects full phase files for `analysis` and
-`implementation` before the agent begins work.
+The SKILL.md orchestration wrapper (~55 lines of resume detection and phase dispatch) is
+eliminated. koto tracks state; the skill calls `koto next` in a loop and injects full
+phase files for `analysis` and `implementation` before the agent begins work.
+
+**Engine requirements.** The mechanism by which koto executes default actions is a
+`needs-design` engine issue (alongside `--var` support). This design specifies WHAT
+happens at each step; the engine design specifies HOW koto executes it. The
+gate-with-evidence-fallback pattern (Phase 1 prerequisite) provides the override and
+failure paths. The default execution capability is additional prerequisite scope.
 
 #### Alternatives Considered
 
-**Uniform concise directives for all states (a)**: Every state gets a 10-25 line
-directive regardless of automation tier. Wastes directive space on states agents never
-read (happy path), and misses the opportunity to shrink SKILL.md. Rejected.
+**Verify-only / gate-only model (a)**: koto only verifies outcomes via gates; agents
+do all work per directive. Overrides handled naturally by the agent (it reads user
+context and adapts). Rejected because it contradicts the automation-first principle —
+agents perform deterministic work that koto should handle. The directive tells the agent
+to run a script, which is the wrong layer for deterministic execution.
 
-**No directives for koto-autonomous states (c)**: Koto-gated states produce empty output
-when gates fail. Agents receive no guidance on how to recover. Rejected because gate
-failures will occur and agents need minimal fallback instructions.
+**Wrapper-mediated override (b)**: The skill wrapper intercepts user input, applies
+overrides, runs default commands, then calls koto. Rejected as the primary model because
+it moves three-path logic outside the template — a different wrapper using the same
+template wouldn't know about override support. Acceptable as a convenience layer that
+translates user invocation arguments into koto evidence.
 
-**Agent-visible hint flag per state (d)**: Add an `agent_visible: bool` field to the
-template schema. States flagged as not agent-visible produce no directive output. Adds
-schema complexity for the same behavioral result as tier 2's 3-6 line error-fallback
-directives. Rejected as over-engineered for this problem.
+**State decomposition (c)**: Each deterministic step becomes a check/execute/recover
+state group. Full audit trail via state path. Rejected because it doubles the state
+count (17 to 29+) without proportional value. Only 2-3 states genuinely benefit.
+
+**Execute-all without safety constraint (d)**: koto executes all steps by default,
+including externally-visible ones. Rejected because a missed override on PR creation
+or comment posting has consequences that can't be undone quietly. The reversibility
+constraint exists precisely for this case.
 
 ---
 
@@ -390,55 +474,16 @@ plan issue vs. a GitHub issue.
 
 ---
 
-### Decision 8: Automation ceiling — on_entry actions vs. gate-only model
-
-The automation-first principle asks how far to push koto-autonomous execution in this
-release. `on_entry` actions would let koto run scripts at state entry (branch creation,
-context extraction, staleness check) with stdout captured and injected as evidence — no
-agent needed. The alternative is the gate-only model: koto verifies outcomes via gates,
-agents run scripts per directive, and koto provides evidence-fallback when gates fail.
-
-The critical finding: staleness_check's apparent gap (command gates can't inspect script
-output content) is solvable without `on_entry` actions. A piped gate command
-(`check-staleness.sh --issue {{ISSUE_NUMBER}} | jq -e '.introspection_recommended == false'`)
-uses jq's exit code to route — no new koto capability required.
-
-#### Chosen: Gate-only model; on_entry actions scoped as a separate engine issue
-
-All deterministic work that koto can verify today (branch existence, file existence,
-test results, CI status) uses command gates. The staleness_check gap is fixed via the
-piped gate pattern. Agents run scripts via tier-2 error-fallback directives when gates
-fail. `on_entry` actions are filed as a separate koto engine issue (1-2 engineer-weeks)
-to be implemented after the template ships.
-
-Key assumptions: the piped gate pattern works today (`check-staleness.sh | jq -e`
-uses standard shell piping, not a new koto capability); the staleness check script
-produces machine-readable JSON output with an `introspection_recommended` field.
-
-#### Alternatives Considered
-
-**Full on_entry actions with stdout capture and evidence injection (a)**: 5 states
-become fully agent-free on the happy path. Requires 1-2 engineer-weeks of koto engine
-work before the template can ship. The template is blocked on an engine change that is
-not a prerequisite for the core value (enforced state machine sequencing). Rejected as
-a prerequisite.
-
-**Minimal on_entry, exit-code only (c)**: Branch creation automated, context injection
-and staleness still need agents. A partial implementation that adds engine complexity
-without completing the automation picture. Rejected as worse than either full option.
-
-**Deferred: include on_entry schema now, implement engine change separately (d)**:
-Write `on_entry:` blocks in the template today, with the engine ignoring them until
-implemented. Confuses template authors and agents who see `on_entry:` blocks that silently
-do nothing. Rejected because it obscures the automation state of the template.
+*Decision 8 (automation ceiling) has been merged into Decision 6+8 above.*
 
 ---
 
 ## Decision Outcome
 
-**Chosen: automation-first gate-only model, split topology, artifact-gated context
+**Chosen: automation-first three-path model, split topology, artifact-gated context
 injection, piped staleness gate, two-stage free-form validation, collapsed introspection
-outcomes, retry/escalate self-loops, two-tier directives, plan-backed via free-form**
+outcomes, retry/escalate self-loops, reversibility-based safety, plan-backed via
+free-form**
 
 The template has 17 states across two converging modes.
 
@@ -454,61 +499,76 @@ Both modes share 8 states from `analysis` onward. The modes diverge through thei
 context-gathering phases and each have a dedicated setup state with unconditional
 transitions — no epoch-scoped mode re-submission required.
 
-**State automation classification:**
+**State classification:**
 
-| State | Classification | Auto-advances when |
-|---|---|---|
-| `context_injection` | koto-gated | context artifact exists |
-| `setup_issue_backed` | koto-gated | branch not main, baseline exists |
-| `setup_free_form` | koto-gated | branch not main, baseline exists |
-| `staleness_check` | koto-gated | piped gate: `check-staleness.sh \| jq -e` |
-| `introspection` | koto-gated | introspection artifact exists |
-| `analysis` | koto-gated | plan file exists |
-| `implementation` | koto-gated | on branch, has commits, tests pass |
-| `finalization` | koto-gated | summary file exists, tests pass |
-| `ci_monitor` | koto-gated | all PR checks pass |
-| `entry` | judgment | always evidence-gated |
-| `task_validation` | judgment | always evidence-gated |
-| `post_research_validation` | judgment | always evidence-gated |
-| `pr_creation` | judgment | always evidence-gated |
-| `research` | evidence-gated | unconditional transition |
+| State | Type | Default path | Override/failure path |
+|---|---|---|---|
+| `context_injection` | deterministic | koto runs extract-context.sh, verifies artifact | Agent submits override or failure evidence |
+| `setup_issue_backed` | deterministic | koto creates branch, runs baseline, verifies | Agent submits existing-branch override or failure |
+| `setup_free_form` | deterministic | koto creates branch, runs baseline, verifies | Agent submits existing-branch override or failure |
+| `staleness_check` | deterministic | koto runs check-staleness.sh, evaluates via piped gate | Agent submits skip override or failure |
+| `introspection` | deterministic | koto checks introspection artifact exists | Agent submits evidence on gate failure |
+| `analysis` | deterministic | koto checks plan file exists | Agent submits evidence on gate failure |
+| `implementation` | deterministic | koto checks branch, commits, tests pass | Agent submits evidence on gate failure |
+| `finalization` | deterministic | koto checks summary exists, tests pass | Agent submits evidence on gate failure |
+| `ci_monitor` | deterministic | koto polls CI status, verifies all pass | Agent submits CI-acceptable override or failure |
+| `entry` | judgment | — | Agent submits mode evidence |
+| `task_validation` | judgment | — | Agent assesses task, submits verdict |
+| `post_research_validation` | judgment | — | Agent reassesses after research |
+| `pr_creation` | judgment (irreversible) | — | Agent creates PR, submits evidence |
+| `research` | judgment | — | Unconditional transition |
 
-When koto-gated states' gates pass, `koto next` advances without agent action. When gates
-fail on states with `accepts` blocks, koto surfaces the evidence schema (gate-with-evidence-
-fallback). Koto-gated states carry only 3-6 line error-fallback directives (Tier 2).
-Judgment states carry full 10-25 line directives (Tier 1).
+On the default path, deterministic states advance without agent involvement — koto
+executes the action and verifies the outcome. When the default doesn't apply (override)
+or fails, koto surfaces the evidence schema and the agent submits structured evidence
+(see Decision 6+8 for the standard `status: completed|override|blocked` pattern).
+Deterministic states carry Tier 2 directives (3-8 lines, override and failure guidance).
+Judgment states carry Tier 1 directives (10-25 lines, full orientation).
 
 The SKILL.md orchestration wrapper (~55 lines of resume detection and phase dispatch) is
 eliminated. koto tracks state; the skill calls `koto next` in a loop.
 
-Three engine changes are prerequisites. First, the advancement loop in
-`src/engine/advance.rs` must fall through to `NeedsEvidence` when a gate fails on a
-state that also has an `accepts` block, rather than unconditionally returning
-`GateBlocked`. Second, the `GateBlocked` CLI response in `src/cli/next_types.rs` and
-`src/cli/mod.rs` must carry the `expects` schema and set `agent_actionable: true` when
-a fallback is available. Third, the `--var` flag on `koto init` must be implemented to
-support issue-specific gate commands (`{{ISSUE_NUMBER}}` substitution in gate strings).
-The `--var` feature is a `needs-design` issue — it involves CLI flag handling, event
-storage, runtime substitution, and shell injection sanitization. `on_entry` actions are
-scoped as a separate follow-on engine issue.
+Four engine capabilities are prerequisites, two of which are `needs-design`:
+
+1. **Gate-with-evidence-fallback**: the advancement loop must fall through to
+   `NeedsEvidence` when a gate fails on a state with an `accepts` block, rather than
+   returning hard `GateBlocked`. The CLI response must carry the `expects` schema and
+   set `agent_actionable: true`. This provides the override and failure paths.
+
+2. **Template variables (`--var`)** — `needs-design`: `koto init` accepts
+   `--var KEY=VALUE`, stores variables in the workflow event, and substitutes
+   `{{KEY}}` in gate commands at evaluation time. Involves CLI flag handling, event
+   storage, runtime substitution, and shell injection sanitization.
+
+3. **Default action execution** — `needs-design`: koto executes a specified command
+   on state entry for deterministic states and captures the result. The mechanism
+   (how the template specifies the command, how output is captured, how the gate
+   evaluates after execution) is for the child design to determine. This is what
+   enables the default path — without it, the three-path model degrades to
+   agent-does-the-work on every deterministic step.
 
 ### Rationale
 
 The automation-first principle — koto does deterministic work, agents do judgment work —
-is achievable today without new engine capabilities. `implementation` and `ci_monitor`
-already auto-advance using existing gate support. `staleness_check` uses a piped gate
-(`check-staleness.sh | jq -e`) rather than requiring `on_entry` actions — this was a
-design oversight that the research phase identified. The ~42% agent instruction reduction
-(420 of 995 lines) is the primary measurable outcome: the SKILL.md orchestration wrapper
-is eliminated, branch creation sequences are automated via setup state gates, and
-finalization cleanup is verified by the finalization gate.
+requires three engine prerequisites: gate-with-evidence-fallback, `--var` substitution,
+and default action execution. The first is a targeted engine change; the latter two are
+`needs-design` issues with their own design scope.
+
+The three-path model (default/override/failure) makes the automation-first principle
+concrete for each deterministic step. The reversibility-based safety constraint addresses
+the opt-in/opt-out inversion: only reversible actions execute by default, so a missed
+override has recoverable consequences. All current deterministic states are reversible;
+PR creation (the only irreversible step) is already a judgment state.
+
+The ~42% agent instruction reduction (420 of 995 lines) remains the primary measurable
+outcome: the SKILL.md orchestration wrapper is eliminated, deterministic steps execute
+without agent involvement on the happy path, and agents interact with deterministic
+states only on override or failure.
 
 The split topology eliminates the most confusing element of the previous design: requiring
 agents to re-submit mode at setup despite having already submitted it at entry. Two
 separate setup states make routing self-documenting. Retry/escalate variants in
 self-looping states give agents a structured escalation path with a clear audit record.
-Two-tier directives match directive depth to state type — koto-gated states get
-error-fallback only, judgment states get full orientation.
 
 ## Solution Architecture
 
@@ -591,12 +651,12 @@ and `introspection` (`issue_superseded`).
 free_form]`, `issue_number: string` (issue-backed only), `task_description: string`
 (free-form only).
 
-**`context_injection`** — creates context artifact for issue-backed workflows. Gate:
-`test -f wip/issue_{{ISSUE_NUMBER}}_context.md`. Directive instructs the agent to run
-`extract-context.sh --issue <N>`, which reads the GitHub issue and linked design docs
-and writes `wip/issue_<N>_context.md`. When the artifact exists, the gate auto-advances.
-Evidence fallback: `context_injected: enum[complete]`, `rationale: string`.
-On resume: check if file already exists before re-running the script.
+**`context_injection`** — creates context artifact for issue-backed workflows. Default
+action: `extract-context.sh --issue <N>` (koto executes). Gate:
+`test -f wip/issue_{{ISSUE_NUMBER}}_context.md`. On the default path, koto runs the
+script and the gate verifies the artifact — agent not involved. Evidence fallback:
+`status: enum[completed, override, blocked]`, `detail: string`. Override: user provides
+additional context alongside the issue. On resume: check if file already exists.
 
 **`task_validation`** — assesses whether the free-form task description is clear and
 appropriately scoped for starting work. Always evidence-gated. Evidence:
@@ -630,13 +690,14 @@ Gate: branch is not main/master, baseline file exists. Evidence fallback:
 `baseline_outcome: enum[clean, existing_failures, build_broken]`. Unconditional
 transition to `analysis`.
 
-**`staleness_check`** — assesses codebase freshness since the issue was opened.
-Gate: `check-staleness.sh --issue {{ISSUE_NUMBER}} | jq -e '.introspection_recommended == false'`
-(uses jq exit code: 0 = fresh → `analysis`, 1 = stale → evidence fallback). Evidence
-fallback: `staleness_signal: enum[fresh, stale_requires_introspection]`,
-`staleness_details: string`. `stale_requires_introspection` routes to `introspection`.
-Tier 2 error-fallback directive: "koto should have advanced past staleness_check
-automatically. If you see this, run check-staleness.sh and submit the result."
+**`staleness_check`** — assesses codebase freshness since the issue was opened. Default
+action: `check-staleness.sh --issue {{ISSUE_NUMBER}}` (koto executes). Gate:
+piped evaluation via `| jq -e '.introspection_recommended == false'` (jq exit code:
+0 = fresh → `analysis`, 1 = stale → evidence fallback). Evidence fallback:
+`status: enum[completed, override, blocked]`, `staleness_signal:
+enum[fresh, stale_requires_introspection]`, `detail: string`.
+`stale_requires_introspection` routes to `introspection`. Override: user says "skip
+staleness, issue is current."
 
 **`introspection`** — re-reads the issue against the current codebase via a sub-agent.
 Gate: `test -f wip/issue_{{ISSUE_NUMBER}}_introspection.md`. Evidence fallback:
@@ -755,11 +816,11 @@ for routing. `mode` is captured at `entry` for routing to the mode-specific firs
 (`context_injection` or `task_validation`). The two setup states route unconditionally to
 their respective post-setup states, so no mode re-submission is needed.
 
-Judgment states (`analysis`, `implementation`, and others requiring agent decision-making)
-carry full Tier 1 directives (10-25 lines). Koto-gated states carry only Tier 2
-error-fallback directives (3-6 lines) — agents only see these when a gate fails. For
-`analysis` and `implementation`, the skill wrapper additionally injects the full phase
-procedure file before the agent begins work.
+Judgment states carry full Tier 1 directives (10-25 lines). Deterministic states carry
+Tier 2 directives (3-8 lines, override and failure guidance) — agents only see these
+when the default path didn't apply or failed. For `analysis` and `implementation`, the
+skill wrapper additionally injects the full phase procedure file before the agent begins
+work.
 
 wip/ artifact files created during the workflow:
 - `wip/issue_<N>_context.md` (issue-backed, created by extract-context.sh --issue <N>)
@@ -774,7 +835,7 @@ and calling `koto next`.
 
 ## Implementation Approach
 
-### Phase 0: Template variables (`--var` support) — needs-design
+### Phase 0a: Template variables (`--var` support) — needs-design
 
 The `--var` feature is a prerequisite that enables issue-specific gate commands
 (`{{ISSUE_NUMBER}}` substitution). It spans CLI, event storage, runtime evaluation, and
@@ -794,7 +855,26 @@ Scope for the child design:
   (`koto-<name>.state.jsonl`) and must be validated against a strict pattern to prevent
   path traversal.
 
-This issue blocks Phase 1 and all subsequent phases.
+### Phase 0b: Default action execution — needs-design
+
+The three-path model (Decision 6+8) requires koto to execute a default action for
+deterministic states — not just verify the outcome. This is the engine capability that
+makes the default path work: koto runs a command on state entry, captures the result,
+then evaluates the gate.
+
+Scope for the child design:
+- How the template specifies the default action per state (command string, working
+  directory, environment).
+- How output is captured and made available for gate evaluation.
+- How override evidence prevents default execution (the agent or skill layer submits
+  override evidence before the action runs).
+- The reversibility constraint: the engine should support marking actions as
+  requiring confirmation, so irreversible actions can be flagged in the template schema.
+- Interaction with `--var` substitution (default action commands may reference
+  `{{ISSUE_NUMBER}}`).
+
+Both Phase 0a and 0b block Phase 1 and all subsequent phases. They can be designed
+and implemented in parallel.
 
 ### Phase 1: Engine changes
 
@@ -877,12 +957,21 @@ Deliverables:
 **Download verification**: koto does not download binaries. The template file is a
 local markdown file read from disk. Not applicable.
 
-**Execution isolation**: Command gates run shell commands in the user's working directory
-with the user's credentials. This is the same trust model as running the gate commands
-manually. The gate commands in this template are limited to: `git rev-parse`, `git log`,
-`test -f`, `ls ... | grep -q`, `gh pr checks`, and `go test ./...`. No commands are
-constructed from untrusted input at gate evaluation time, because gate commands are
-static strings in the compiled template.
+**Execution isolation**: Gate commands and default actions run shell commands in the
+user's working directory with the user's credentials. This is the same trust model as
+running the commands manually. Gate commands are limited to: `git rev-parse`, `git log`,
+`test -f`, `ls ... | grep -q`, `gh pr checks`, and `go test ./...`. Default actions
+include: `extract-context.sh`, `check-staleness.sh`, `git checkout -b`, and baseline
+scripts. All commands are static strings in the compiled template — no commands are
+constructed from untrusted input at evaluation time (with the exception of `--var`
+substitution, covered below).
+
+**Default action safety**: The three-path model inverts the failure mode from opt-in
+(agent must act) to opt-out (agent must prevent). The reversibility constraint limits
+the blast radius: all default actions in this template are reversible (file creation,
+branch creation, read-only checks). The child design for default action execution
+(Phase 0b) must enforce this constraint — irreversible actions should not be executable
+as defaults without explicit confirmation.
 
 The `--var` flag (Phase 0 prerequisite) allows caller-controlled strings to be
 substituted into gate commands at evaluation time. If a variable value contains shell
@@ -920,33 +1009,36 @@ No data is transmitted outside the local machine by koto itself.
 ### Positive
 
 - Agent instructions shrink ~42% (420 of 995 lines eliminable). The SKILL.md
-  orchestration wrapper (~55 lines) is removed; branch creation, file verification, test
-  checking, and CI monitoring move into koto gates. Agent context focuses on judgment.
-- Nine states auto-advance via koto gates on the happy path. Agents never see the
+  orchestration wrapper (~55 lines) is removed; deterministic steps execute without
+  agent involvement on the happy path. Agent context focuses on judgment.
+- Nine deterministic states auto-advance on the happy path. Agents never see the
   directive for `setup_issue_backed`, `setup_free_form`, `implementation`, `finalization`,
-  `ci_monitor`, and others when their gates pass — their context is consumed only when
-  recovery is needed.
+  `ci_monitor`, and others when the default action succeeds.
+- The three-path model makes override and failure handling explicit per state. The
+  event log records whether a state completed via default, override, or recovery —
+  useful for debugging and workflow audit.
+- User overrides are first-class: "use my existing branch" or "skip staleness" are
+  structured evidence submissions, not implicit agent behavior. Different skill wrappers
+  can support overrides using the same template.
+- The reversibility constraint provides a principled safety boundary: deterministic states
+  only auto-execute reversible actions. Irreversible steps (PR creation) require agent
+  confirmation.
 - Phase order is enforced without additional state management in the /work-on skill.
   The agent can't reach `ci_monitor` without a PR, or `analysis` without passing
   through `staleness_check` (issue-backed) or `post_research_validation` (free-form).
-- Evidence fields are decision records. The event log shows not just that a phase
-  completed, but what decision the agent made and why — useful for debugging and audit.
-- Session resume is supported. Judgment state directives include resume guidance to
-  re-read wip/ artifacts and git state. `koto next <name>` returns the current directive
-  after interruption without any orchestration wrapper.
+- Session resume is supported. `koto next <name>` returns the current directive after
+  interruption without any orchestration wrapper.
 - The split topology eliminates epoch-scoped mode re-submission. Two setup states with
   unconditional transitions make routing self-documenting.
-- Context injection is verified. The `context_injection` gate confirms
-  `wip/issue_<N>_context.md` was created before setup begins.
 
 ### Negative
 
-- Three prerequisite engine changes are required (Phase 0 `--var` + Phase 1 gate
-  fallback). The template can be written and compiled before these ship, but gate
-  commands won't evaluate and fallback routing won't activate until the engine work
-  lands.
-- The `--var` prerequisite (Phase 0) is a `needs-design` issue with its own design scope.
-  It adds a dependency chain before the template can ship.
+- Four prerequisite engine capabilities are required, two of which are `needs-design`
+  issues (Phase 0a `--var` + Phase 0b default action execution + Phase 1 gate fallback).
+  The dependency chain is longer than the former gate-only model.
+- The default action execution prerequisite (Phase 0b) is the largest unknown. Its scope
+  depends on the child design — it could be a targeted change or a significant engine
+  feature.
 - Test commands in gates are language-specific (`go test ./...`). Non-Go projects need
   a different test command.
 - The 17-state template is authoring-heavy with no tooling support. The compiler reports
@@ -956,15 +1048,12 @@ No data is transmitted outside the local machine by koto itself.
 
 ### Mitigations
 
-- The Phase 1 engine changes are targeted (two files). Existing templates with gate-only
-  states continue to hard-block on gate failure — no regression.
-- Phase 0 (`--var`) has a bounded scope: CLI flag, event storage, runtime substitution,
-  input sanitization. The child design can constrain this to the minimum needed for gate
-  substitution.
+- Phase 0a (`--var`) and Phase 0b (default execution) can be designed and implemented
+  in parallel. The Phase 1 engine change (gate fallback) is independent of both.
+- The child designs for Phase 0a and 0b can scope to the minimum needed for the
+  template's deterministic states — they don't need to be general-purpose engine features
+  in the first release.
 - Add `TEST_COMMAND` as a template variable with a default of `go test ./...`, making
   it configurable without changing the template structure.
 - `koto rewind` is CLI-callable (confirmed in source). The directive for `done_blocked`
   lists the specific rewind count for each path that reaches it.
-- `on_entry` actions (which would convert the remaining koto-gated states to fully
-  agent-free) are scoped as a follow-on koto engine issue. They improve the design
-  incrementally without blocking the template release.
