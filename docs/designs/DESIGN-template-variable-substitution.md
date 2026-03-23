@@ -30,14 +30,23 @@ against template declarations, event storage, runtime substitution in gates and
 directives, and input sanitization to prevent command injection through gate commands.
 
 Downstream, #71 (default action execution) needs the same substitution interface for
-action commands. The API must be reusable, not gate-specific.
+action commands: default action commands reference `{{ISSUE_NUMBER}}` just like gate
+commands do. The parent design notes that Phase 0b's design should coordinate with
+Phase 0a on the substitution interface. The API must be reusable across gates,
+directives, and default actions, not inlined into any one call site.
+
+The parent design also identifies specific directive scenarios that need substitution:
+the `done_blocked` state's directive references issue-specific recovery paths, and
+override/failure directives on deterministic states reference issue-specific artifacts.
+These aren't hypothetical, they're concrete requirements from the 17-state template.
 
 ## Decision drivers
 
 - **Security**: variable values are interpolated into shell commands (`sh -c`). Command
   injection is the primary risk. The sanitization approach must eliminate it.
-- **Reusability**: #71 needs the same substitution for action commands. The interface
-  can't be inlined into gate evaluation.
+- **Reusability**: #71 (default action execution) needs the same substitution for
+  action commands. The parent design explicitly requires Phase 0b to coordinate with
+  Phase 0a on the substitution interface. It can't be inlined into gate evaluation.
 - **Simplicity**: the feature is straightforward string replacement. Don't overengineer
   with traits or polymorphism.
 - **Consistency with existing types**: `VariableDecl.default` is `String`, not
@@ -65,3 +74,11 @@ These choices were settled during exploration and should be treated as constrain
 - **Undefined references**: error at runtime, not empty string. Matches parent design
   requirement.
 - **Duplicate `--var` keys**: error, not last-wins. Prevents silent override bugs.
+- **Workflow name validation**: out of scope for this design. The parent design lists
+  it as a separate targeted engine change (names in state file paths must be validated
+  against a strict pattern to prevent path traversal). Can be implemented alongside
+  `--var` or independently.
+
+Note: the parent design also suggests `TEST_COMMAND` as a template variable with a
+default of `go test ./...`, confirming that the default-value path on `VariableDecl`
+is a first-class use case, not just required variables with explicit `--var` flags.
