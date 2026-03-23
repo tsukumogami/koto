@@ -476,3 +476,28 @@ when polling is declared.
   `noop_gates` and `unavailable_integration` test helpers
 - Output truncation at 64KB prevents unbounded growth
 - Polling timeout enforcement at compile time prevents indefinite blocking
+
+## Future direction: actions vs integrations
+
+This design builds a low-level primitive: actions are "run an arbitrary shell command."
+They're template-declared, dumb, and generic. The existing `integration` field on
+TemplateState is a separate concept reserved for a higher-level abstraction: named
+capabilities with typed inputs and structured outputs.
+
+The distinction matters for cases like CI monitoring. Today, `ci_monitor` is modeled
+as an action with polling (shell command `gh pr checks` in a retry loop). A future
+GitHub CI integration would be a typed connector that calls the API directly,
+understands check statuses natively, and returns structured data — not a shell command
+whose output gets string-parsed.
+
+The migration path is clean: a template state switches from `default_action` (with
+polling) to `integration: github-ci` when the integration exists. The design enforces
+mutual exclusivity between the two fields, so there's no ambiguity about which
+mechanism runs. The integration closure's signature already returns structured
+`serde_json::Value`, which is the right shape for typed connectors.
+
+Integrations would bring domain knowledge into koto (or add-ons): how to talk to
+GitHub's API, how to parse plan/design doc formats, how to manage artifacts. Actions
+don't have this knowledge — they just run commands. Both mechanisms coexist on the
+same execution point in the advance loop (integration checks run before action checks),
+so adding integrations later doesn't require rearchitecting the action system.
