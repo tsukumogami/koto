@@ -13,17 +13,17 @@ problem: |
   decisions at the moment they're ready to leave the state. By then, the decisions
   are reconstructed from memory rather than captured as they happen.
 decision: |
-  A new koto record subcommand appends a DecisionRecorded event to the state file without
-  running the advancement loop. A --decisions flag on koto next includes accumulated
-  decisions in the response. Decision capture is advisory — no template enforcement, no
-  minimum counts.
+  A new koto decisions subcommand with record and list sub-operations appends a
+  DecisionRecorded event to the state file without running the advancement loop. A
+  koto decisions list sub-operation retrieves accumulated decisions as a standalone
+  response. Decision capture is advisory — no template enforcement, no minimum counts.
 rationale: |
   A dedicated event type keeps decisions out of the evidence merge path, preventing
-  accidental transition triggers. A dedicated subcommand (koto record) matches koto's
-  naming convention where each command describes its action (init, cancel, rewind). The
-  --decisions flag on koto next stays because retrieval is context for "what's next" while
-  recording is a distinct action. Advisory enforcement avoids stateful validation complexity
-  for a mechanism that can't distinguish meaningful decisions from trivial ones.
+  accidental transition triggers. The sub-operation pattern (koto decisions record,
+  koto decisions list) follows the precedent set by koto template compile/validate —
+  related operations grouped under one namespace. Advisory enforcement avoids stateful
+  validation complexity for a mechanism that can't distinguish meaningful decisions from
+  trivial ones.
 ---
 
 # DESIGN: mid-state decision capture
@@ -69,8 +69,8 @@ The specific requirements from the parent design:
 - **Minimal engine surface**: the change should be small and targeted — one new event type
   or CLI flag, not a new subsystem
 - **Backwards compatible**: existing templates and workflows must work unchanged
-- **Surfaceable**: accumulated decisions must be retrievable — via `koto next`,
-  `koto query`, a dedicated flag, or a new subcommand
+- **Surfaceable**: accumulated decisions must be retrievable — via a dedicated
+  subcommand, `koto query`, or similar mechanism
 - **Rewind-safe**: rewinding past a state discards its decisions, consistent with how
   evidence events work today
 
@@ -84,10 +84,10 @@ general-purpose — any template with judgment states can use it, not just the w
 template. The question is where in the CLI surface this belongs and what event format
 to use.
 
-#### Chosen: New `koto record` subcommand with a `DecisionRecorded` event type
+#### Chosen: New `koto decisions record <name> --with-data` sub-operation with a `DecisionRecorded` event type
 
-A new `koto record <name> --with-data '{...}'` subcommand records a decision without
-advancing state. The handler:
+A new `koto decisions record <name> --with-data '{...}'` sub-operation records a decision
+without advancing state. The handler (`handle_decisions_record`):
 
 1. Loads the state file and verifies the template hash (shared setup, factored into a
    common function with `handle_next`).
@@ -98,11 +98,17 @@ advancing state. The handler:
 4. Returns a confirmation with the current state name and decision count for the epoch.
 5. Does NOT run the advancement loop.
 
-The subcommand takes a positional `name` argument (same as all other commands) and a
-required `--with-data` flag. No mutual exclusivity concerns — the argument space is
-self-contained.
+The `Command` enum gets a `Decisions` variant with a `DecisionsCommand` sub-enum
+containing `Record` and `List`, following the `Template`/`TemplateCommand` pattern. The
+`Record` variant takes a positional `name` argument and a required `--with-data` flag.
+No mutual exclusivity concerns — the argument space is self-contained.
 
 #### Alternatives Considered
+
+- **Top-level `koto record` subcommand.** Shorter command, but splits related operations
+  (recording and listing) across two separate namespaces. Doesn't signal the relationship
+  between recording and retrieval to users scanning `koto --help`. Rejected for splitting
+  related operations.
 
 - **`--record` flag on `koto next`.** Keeps the CLI at six commands, but overloads
   "next" (which means "advance" or "tell me what's next") with an operation that
@@ -131,23 +137,21 @@ primarily the skill wrapper (shirabe), which already calls `koto next` in a loop
 and parses the JSON response. The parent design constrains the CLI surface: no new
 subcommands.
 
-#### Chosen: `--decisions` flag on `koto next`
+#### Chosen: `koto decisions list <name>` sub-operation
 
-Add an optional `--decisions` flag to `koto next`. When passed, the JSON response
-includes a `decisions` field alongside the existing fields. When not passed, the
-response shape is unchanged.
+A new `koto decisions list <name>` sub-operation retrieves accumulated decisions for the
+current state's epoch as a standalone JSON response. This is a separate command invocation,
+not a flag on `koto next`.
 
-The `decisions` field contains:
-- `count`: number of decision events in the current state's epoch
-- `items`: array of decision records, each with `choice` and `rationale`
+The response contains:
+- `state`: the current state name
+- `decisions.count`: number of decision events in the current state's epoch
+- `decisions.items`: array of decision records, each with `choice` and `rationale`
 
-Example response with `--decisions`:
+Example response:
 ```json
 {
-  "action": "execute",
   "state": "implementation",
-  "directive": "Implement the changes described in the plan.",
-  "advanced": false,
   "decisions": {
     "count": 2,
     "items": [
@@ -166,17 +170,19 @@ Example response with `--decisions`:
 
 #### Alternatives Considered
 
+- **`--decisions` flag on `koto next`.** Keeps retrieval on an existing command, but
+  overloads "next" with a read operation that has nothing to do with advancement. The
+  design's own Decision 1 rejected `--record` on `koto next` because recording "explicitly
+  doesn't advance" — the same argument applies to retrieval. Rejected for the same
+  semantic mismatch identified in Decision 1.
+
 - **Always include decisions in `koto next` response.** Simplest implementation, but
   permanently enlarges every response and breaks backwards compatibility. Most `koto next`
   calls during gate evaluation and auto-advance don't need decision data.
 
-- **New `koto query` command.** Clean read/advance separation, but violates the "no new
-  subcommands" constraint and requires skill wrappers to make a second CLI call with a
-  different response format. The `derive_decisions()` function built here is reusable if
-  a `koto query` command is added later.
-
-- **Dedicated `koto decisions` subcommand.** Same rejection as `koto query` — violates
-  the subcommand constraint and adds integration cost for the primary consumer.
+- **New `koto query` command.** Clean read/advance separation, but requires skill wrappers
+  to make a second CLI call with a different response format. The `derive_decisions()`
+  function built here is reusable if a `koto query` command is added later.
 
 ### Decision 3: Whether the template enforces decision capture
 
@@ -194,7 +200,7 @@ specifically, not evidence events.
 
 Decision capture is advisory. No `min_decisions` field, no `decisions_required` boolean,
 no engine validation of decision counts. The template directive instructs agents to
-capture decisions; the `koto record` command provides the tool. The engine records whatever
+capture decisions; the `koto decisions record` command provides the tool. The engine records whatever
 the agent submits without gatekeeping on count or content.
 
 Three factors converge on advisory over enforcement:
@@ -232,14 +238,14 @@ to `TemplateState` without breaking existing templates (it would default to 0).
 ## Decision Outcome
 
 The three decisions compose into a simple interaction pattern: agents record decisions
-with `koto record` during a state, and consumers retrieve them with `--decisions` on
-`koto next` when they need the trail.
+with `koto decisions record` during a state, and consumers retrieve them with
+`koto decisions list` when they need the trail.
 
 ### CLI interaction pattern
 
 **Recording a decision:**
 ```
-koto record my-workflow --with-data '{"choice": "Use retry with backoff", "rationale": "The API has no batch endpoint, rate limits at 100 req/s", "alternatives_considered": ["Parallel requests", "Queue-based processing"]}'
+koto decisions record my-workflow --with-data '{"choice": "Use retry with backoff", "rationale": "The API has no batch endpoint, rate limits at 100 req/s", "alternatives_considered": ["Parallel requests", "Queue-based processing"]}'
 ```
 
 The command appends a `DecisionRecorded` event, returns a confirmation with the current
@@ -247,11 +253,11 @@ state and decision count, and does not advance the state.
 
 **Retrieving decisions:**
 ```
-koto next my-workflow --decisions
+koto decisions list my-workflow
 ```
 
-Returns the normal `koto next` response with an additional `decisions` field containing
-the count and items for the current state's epoch.
+Returns a standalone JSON response with the current state, count, and items for the
+current state's epoch.
 
 ### Worked example
 
@@ -260,7 +266,7 @@ the target API doesn't support batch operations:
 
 ```bash
 # Agent records the decision as it happens
-koto record my-workflow --with-data '{
+koto decisions record my-workflow --with-data '{
   "choice": "Iterate with single-item API calls",
   "rationale": "Batch endpoint not available; rate limit is 100/s which is sufficient",
   "alternatives_considered": ["Wait for batch API", "Aggregate client-side"]
@@ -268,15 +274,15 @@ koto record my-workflow --with-data '{
 # Response: {"state": "implementation", "decisions_recorded": 1}
 
 # Agent continues working, makes another decision
-koto record my-workflow --with-data '{
+koto decisions record my-workflow --with-data '{
   "choice": "Use integration tests instead of mocks",
   "rationale": "Mock library does not support this HTTP client version"
 }'
 # Response: {"state": "implementation", "decisions_recorded": 2}
 
 # Later, skill wrapper retrieves decisions for PR summary
-koto next my-workflow --decisions
-# Response includes: {"decisions": {"count": 2, "items": [...]}}
+koto decisions list my-workflow
+# Response: {"state": "implementation", "decisions": {"count": 2, "items": [...]}}
 ```
 
 On rewind, decisions from the rewound epoch are discarded — the same epoch-boundary
@@ -290,8 +296,8 @@ mechanism that scopes evidence applies to `DecisionRecorded` events.
 |------|--------|
 | `src/engine/types.rs` | New `EventPayload::DecisionRecorded` variant |
 | `src/engine/persistence.rs` | New `derive_decisions()` function |
-| `src/cli/mod.rs` | New `Record` command variant, `--decisions` flag on `Next`, handler functions |
-| `src/cli/next_types.rs` | `DecisionSummary` struct, optional `decisions` field in response |
+| `src/cli/mod.rs` | New `Decisions` command variant with `DecisionsCommand` sub-enum (Record, List), handler functions |
+| `src/cli/next_types.rs` | `DecisionSummary` struct for `koto decisions list` response |
 
 ### New event type: `EventPayload::DecisionRecorded`
 
@@ -325,19 +331,30 @@ pub fn derive_decisions(events: &[Event]) -> Vec<&Event> {
 Rewind naturally discards decisions from prior epochs because the epoch boundary moves
 forward on each `Rewound` event.
 
-### CLI: `koto record` subcommand
+### CLI: `koto decisions` subcommand with Record and List sub-operations
 
-A new `Record` variant in the `Command` enum:
+A new `Decisions` variant in the `Command` enum, following the `Template`/`TemplateCommand`
+pattern:
 
 ```rust
-Record {
-    name: String,
-    #[arg(long = "with-data")]
-    with_data: String,  // required, not optional
+Decisions {
+    #[command(subcommand)]
+    subcommand: DecisionsCommand,
+}
+
+enum DecisionsCommand {
+    Record {
+        name: String,
+        #[arg(long = "with-data")]
+        with_data: String,  // required, not optional
+    },
+    List {
+        name: String,
+    },
 }
 ```
 
-The `handle_record` function:
+The `handle_decisions_record` function:
 
 1. Loads the state file and verifies the template hash (shared with `handle_next` via
    a common `load_workflow` helper).
@@ -349,19 +366,20 @@ The `handle_record` function:
 
 No advancement loop. No interaction with `handle_next`.
 
-### CLI: `--decisions` flag on `koto next`
+The `handle_decisions_list` function:
 
-The `--decisions` flag is on `koto next`, not on `koto record`. When present, the
-response-building path calls `derive_decisions()` and includes the `decisions` field
-in the JSON output. This is the retrieval path — recording and retrieval are separate
-commands because they're separate actions.
+1. Loads the state file and verifies the template hash (shared helper).
+2. Calls `derive_decisions()` to collect `DecisionRecorded` events from the current epoch.
+3. Returns `{"state": "<current>", "decisions": {"count": N, "items": [...]}}` as a
+   standalone response.
 
 ### Response shape
 
-The `decisions` field is only present when `--decisions` is passed:
+The `koto decisions list` response is a standalone JSON object:
 
 ```json
 {
+  "state": "implementation",
   "decisions": {
     "count": 2,
     "items": [
@@ -375,7 +393,7 @@ The `decisions` field is only present when `--decisions` is passed:
 }
 ```
 
-When `--decisions` is not passed, the response shape is unchanged from today.
+The `koto next` response shape is unchanged from today — no decision-related fields.
 
 ## Implementation Approach
 
@@ -389,11 +407,12 @@ Add the event type and recording path.
 - Add deserialization arm for `"decision_recorded"` in `Event`'s `Deserialize` impl.
 - Add `DecisionRecordedPayload` helper struct for typed deserialization.
 - Add `derive_decisions()` to `src/engine/persistence.rs`.
-- Add `Record { name: String, with_data: String }` command variant to `src/cli/mod.rs`.
+- Add `Decisions` command variant with `DecisionsCommand` sub-enum (Record, List) to
+  `src/cli/mod.rs`, following the `Template`/`TemplateCommand` pattern.
 - Factor state-file loading into a shared `load_workflow` helper (used by both
-  `handle_next` and `handle_record`).
-- Add `handle_record`: validate decision schema, append event, return confirmation with
-  epoch decision count.
+  `handle_next` and `handle_decisions_record`).
+- Add `handle_decisions_record`: validate decision schema, append event, return
+  confirmation with epoch decision count.
 - Unit tests: `DecisionRecorded` round-trip serialization, `derive_decisions()` epoch
   scoping, `derive_decisions()` after rewind, schema validation (missing choice, missing
   rationale, valid with and without alternatives_considered).
@@ -403,11 +422,9 @@ Add the event type and recording path.
 Add the retrieval path.
 
 - Add `DecisionSummary` struct to `src/cli/next_types.rs`.
-- Add optional `decisions` field to the response serialization path, conditional on the
-  `--decisions` flag.
-- Add `--decisions` flag to the `Next` command variant.
-- Wire `derive_decisions()` into the response-building path when `--decisions` is present.
-- Integration test: init workflow, record two decisions, call `koto next --decisions`,
+- Add `handle_decisions_list`: load workflow, call `derive_decisions()`, return standalone
+  JSON response with state, count, and items.
+- Integration test: init workflow, record two decisions, call `koto decisions list`,
   verify response includes both decisions with correct count.
 
 ## Security Considerations
@@ -417,8 +434,9 @@ model is identical to evidence submission via `--with-data`:
 
 - No network calls. All data stays on the local filesystem.
 - No untrusted input beyond what agents already submit through `--with-data`.
-- The existing 1 MB payload size limit (`MAX_WITH_DATA_BYTES`) applies to `koto record`
-  payloads, preventing unbounded file growth from a single submission.
+- The existing 1 MB payload size limit (`MAX_WITH_DATA_BYTES`) applies to
+  `koto decisions record` payloads, preventing unbounded file growth from a single
+  submission.
 - State files are created with mode 0600 (owner read/write only), same as today.
 
 No additional security measures are needed.
@@ -429,18 +447,17 @@ No additional security measures are needed.
 
 - Agents can record decisions incrementally during long-running states. The event log
   captures the full decision trail, scoped to the current epoch.
-- Template directives can instruct agents to record decisions using the same command
-  they already use for everything else (`koto next`), with a different flag.
+- The `koto decisions` namespace groups related operations (record and list) under one
+  command, following the `koto template` precedent.
 - Rewind naturally discards decisions from rewound epochs — no special cleanup logic.
 - The `derive_decisions()` function is reusable by a future `koto query` command.
-- The `--decisions` opt-in flag sets a precedent for response enrichment without
-  breaking existing consumers.
+- `koto next` stays focused on advancement — no decision-related flags or response fields.
 
 ### Negative
 
-- koto's CLI surface grows from six to seven commands. The `koto record` subcommand is
-  simple (one required flag), but it's another entry in `koto --help` and another handler
-  function in `cli/mod.rs`.
+- koto's CLI grows from six to seven top-level commands (counting `Decisions` as one
+  entry with two subcommands). `koto next` stays at three modes (bare, `--with-data`,
+  `--to`).
 - The fixed decision schema (choice + rationale + alternatives_considered) may be too
   rigid for some templates. Per-state decision schemas would require adding a `decisions`
   block to the template format.
@@ -450,8 +467,8 @@ No additional security measures are needed.
 
 ### Mitigations
 
-- The `koto record` command has a self-contained argument space (name + --with-data),
-  no mutual exclusivity concerns with other commands.
+- The `koto decisions` subcommands have self-contained argument spaces, no mutual
+  exclusivity concerns with other commands.
 - The schema can be extended later (new optional fields) without breaking existing
   decision records, since the `decision` field stores `serde_json::Value`.
 - Template authors control directive text. The work-on template's `implementation`
