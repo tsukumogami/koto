@@ -2,7 +2,20 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::substitute::extract_refs;
+use regex::Regex;
+
+/// Regex for variable references in template strings: `{{KEY}}` where KEY is
+/// uppercase letters, digits, and underscores.
+pub const VAR_REF_PATTERN: &str = r"\{\{([A-Z][A-Z0-9_]*)\}\}";
+
+/// Extract all `{{KEY}}` references from a string.
+/// Used by compile-time validation and runtime substitution.
+pub fn extract_refs(input: &str) -> Vec<String> {
+    let re = Regex::new(VAR_REF_PATTERN).expect("VAR_REF_PATTERN is a valid regex");
+    re.captures_iter(input)
+        .map(|caps| caps[1].to_string())
+        .collect()
+}
 
 /// A compiled template in FormatVersion=1 JSON format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

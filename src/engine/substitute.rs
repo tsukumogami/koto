@@ -3,12 +3,10 @@ use std::collections::HashMap;
 use regex::Regex;
 
 use crate::engine::types::{Event, EventPayload};
+use crate::template::types::VAR_REF_PATTERN;
 
 /// Allowlist regex for variable values: alphanumeric, dots, underscores, hyphens, forward slashes.
 const VALUE_PATTERN: &str = r"^[a-zA-Z0-9._/\-]+$";
-
-/// Regex for variable references in template strings.
-const REF_PATTERN: &str = r"\{\{([A-Z][A-Z0-9_]*)\}\}";
 
 /// Holds resolved variable bindings for substitution.
 #[derive(Debug)]
@@ -33,6 +31,8 @@ impl std::fmt::Display for SubstitutionError {
         )
     }
 }
+
+impl std::error::Error for SubstitutionError {}
 
 impl Variables {
     /// Extract variables from the WorkflowInitialized event in the log.
@@ -60,7 +60,7 @@ impl Variables {
     /// from happening in practice, so a panic here indicates a bug in the
     /// validation layer rather than user error.
     pub fn substitute(&self, input: &str) -> String {
-        let re = Regex::new(REF_PATTERN).expect("REF_PATTERN is a valid regex");
+        let re = Regex::new(VAR_REF_PATTERN).expect("VAR_REF_PATTERN is a valid regex");
         let mut result = String::with_capacity(input.len());
         let mut last_end = 0;
 
@@ -106,18 +106,10 @@ pub fn validate_value(key: &str, value: &str) -> Result<(), SubstitutionError> {
     Ok(())
 }
 
-/// Extract all `{{KEY}}` references from a string.
-/// Exported for reuse by compile-time validation.
-pub fn extract_refs(input: &str) -> Vec<String> {
-    let re = Regex::new(REF_PATTERN).expect("REF_PATTERN is a valid regex");
-    re.captures_iter(input)
-        .map(|caps| caps[1].to_string())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::template::types::extract_refs;
 
     // -----------------------------------------------------------------------
     // validate_value
