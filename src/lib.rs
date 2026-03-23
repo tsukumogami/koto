@@ -1,3 +1,5 @@
+#[cfg(unix)]
+pub mod action;
 pub mod buildinfo;
 pub mod cache;
 pub mod cli;

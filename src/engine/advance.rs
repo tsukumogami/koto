@@ -376,6 +376,7 @@ mod tests {
             gates: BTreeMap::new(),
             accepts: None,
             integration: None,
+            default_action: None,
         }
     }
 
@@ -654,6 +655,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -665,6 +667,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -679,6 +682,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -690,6 +694,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
         ]);
@@ -741,6 +746,7 @@ mod tests {
                 gates,
                 accepts: None,
                 integration: None,
+                default_action: None,
             },
         )]);
 
@@ -785,6 +791,7 @@ mod tests {
                 gates: BTreeMap::new(),
                 accepts: None,
                 integration: None,
+                default_action: None,
             },
         )]);
 
@@ -822,6 +829,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -833,6 +841,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
         ]);
@@ -874,6 +883,7 @@ mod tests {
                 gates: BTreeMap::new(),
                 accepts: None,
                 integration: Some("my-runner".to_string()),
+                default_action: None,
             },
         )]);
 
@@ -922,6 +932,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ));
         }
@@ -935,6 +946,7 @@ mod tests {
                 gates: BTreeMap::new(),
                 accepts: None,
                 integration: None,
+                default_action: None,
             },
         ));
 
@@ -968,6 +980,7 @@ mod tests {
                 gates: BTreeMap::new(),
                 accepts: None,
                 integration: None,
+                default_action: None,
             },
         )]);
 
@@ -1002,6 +1015,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -1013,6 +1027,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -1024,6 +1039,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
         ]);
@@ -1062,6 +1078,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -1073,6 +1090,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -1084,6 +1102,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
         ]);

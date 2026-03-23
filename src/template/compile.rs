@@ -5,7 +5,8 @@ use anyhow::{anyhow, Context};
 use serde::Deserialize;
 
 use super::types::{
-    CompiledTemplate, FieldSchema, Gate, TemplateState, Transition, VariableDecl, GATE_TYPE_COMMAND,
+    ActionDecl, CompiledTemplate, FieldSchema, Gate, PollingConfig, TemplateState, Transition,
+    VariableDecl, GATE_TYPE_COMMAND,
 };
 
 /// YAML front-matter structure of a template source file.
@@ -47,6 +48,30 @@ struct SourceState {
     accepts: HashMap<String, SourceFieldSchema>,
     #[serde(default)]
     integration: Option<String>,
+    #[serde(default)]
+    default_action: Option<SourceActionDecl>,
+}
+
+/// Action declaration in source YAML.
+#[derive(Debug, Deserialize)]
+struct SourceActionDecl {
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    working_dir: String,
+    #[serde(default)]
+    requires_confirmation: bool,
+    #[serde(default)]
+    polling: Option<SourcePollingConfig>,
+}
+
+/// Polling configuration in source YAML.
+#[derive(Debug, Deserialize)]
+struct SourcePollingConfig {
+    #[serde(default)]
+    interval_secs: u32,
+    #[serde(default)]
+    timeout_secs: u32,
 }
 
 /// A transition in source YAML: either a bare string or a structured object.
@@ -168,6 +193,17 @@ pub fn compile(source_path: &Path) -> anyhow::Result<CompiledTemplate> {
                 )
             };
 
+        // Transform source default_action to compiled ActionDecl.
+        let compiled_action = source_state.default_action.as_ref().map(|sa| ActionDecl {
+            command: sa.command.clone(),
+            working_dir: sa.working_dir.clone(),
+            requires_confirmation: sa.requires_confirmation,
+            polling: sa.polling.as_ref().map(|sp| PollingConfig {
+                interval_secs: sp.interval_secs,
+                timeout_secs: sp.timeout_secs,
+            }),
+        });
+
         compiled_states.insert(
             state_name.clone(),
             TemplateState {
@@ -177,6 +213,7 @@ pub fn compile(source_path: &Path) -> anyhow::Result<CompiledTemplate> {
                 gates: compiled_gates,
                 accepts: compiled_accepts,
                 integration: source_state.integration.clone(),
+                default_action: compiled_action,
             },
         );
     }

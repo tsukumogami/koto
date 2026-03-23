@@ -810,6 +810,7 @@ mod tests {
             gates: BTreeMap::new(),
             accepts,
             integration: None,
+            default_action: None,
         }
     }
 

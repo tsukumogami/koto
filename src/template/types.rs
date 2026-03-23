@@ -56,6 +56,8 @@ pub struct TemplateState {
     pub accepts: Option<BTreeMap<String, FieldSchema>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_action: Option<ActionDecl>,
 }
 
 /// A structured transition with an optional condition.
@@ -88,6 +90,28 @@ pub struct Gate {
     /// Timeout in seconds (0 = use default of 30s).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub timeout: u32,
+}
+
+/// A default action declaration for a template state.
+///
+/// When present on a state, the engine executes this command automatically
+/// on state entry (unless override evidence exists).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActionDecl {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub working_dir: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_confirmation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polling: Option<PollingConfig>,
+}
+
+/// Polling configuration for actions that need repeated execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PollingConfig {
+    pub interval_secs: u32,
+    pub timeout_secs: u32,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -203,6 +227,51 @@ impl CompiledTemplate {
                         return Err(format!(
                             "state '{}': variable reference '{{{{{}}}}}' is not declared in the template's variables block",
                             state_name, ref_name
+                        ));
+                    }
+                }
+            }
+
+            // Validate default_action.
+            if let Some(action) = &state.default_action {
+                // Reject states with both integration and default_action.
+                if state.integration.is_some() {
+                    return Err(format!(
+                        "state {:?}: cannot have both integration and default_action",
+                        state_name
+                    ));
+                }
+                // Reject empty action commands.
+                if action.command.is_empty() {
+                    return Err(format!(
+                        "state {:?}: default_action command must not be empty",
+                        state_name
+                    ));
+                }
+                // Validate variable references in action command.
+                for ref_name in extract_refs(&action.command) {
+                    if !self.variables.contains_key(&ref_name) {
+                        return Err(format!(
+                            "state '{}': variable reference '{{{{{}}}}}' in default_action command is not declared in the template's variables block",
+                            state_name, ref_name
+                        ));
+                    }
+                }
+                // Validate variable references in action working_dir.
+                for ref_name in extract_refs(&action.working_dir) {
+                    if !self.variables.contains_key(&ref_name) {
+                        return Err(format!(
+                            "state '{}': variable reference '{{{{{}}}}}' in default_action working_dir is not declared in the template's variables block",
+                            state_name, ref_name
+                        ));
+                    }
+                }
+                // Require polling.timeout_secs > 0 when polling is declared.
+                if let Some(polling) = &action.polling {
+                    if polling.timeout_secs == 0 {
+                        return Err(format!(
+                            "state {:?}: default_action polling.timeout_secs must be greater than 0",
+                            state_name
                         ));
                     }
                 }
@@ -343,6 +412,7 @@ mod tests {
                 gates: BTreeMap::new(),
                 accepts: None,
                 integration: None,
+                default_action: None,
             },
         );
         states.insert(
@@ -354,6 +424,7 @@ mod tests {
                 gates: BTreeMap::new(),
                 accepts: None,
                 integration: None,
+                default_action: None,
             },
         );
         CompiledTemplate {
@@ -581,6 +652,7 @@ mod tests {
                 gates: BTreeMap::new(),
                 accepts: None,
                 integration: None,
+                default_action: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -637,6 +709,7 @@ mod tests {
                 gates: BTreeMap::new(),
                 accepts: None,
                 integration: None,
+                default_action: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -684,6 +757,7 @@ mod tests {
                 gates: BTreeMap::new(),
                 accepts: None,
                 integration: None,
+                default_action: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -729,6 +803,7 @@ mod tests {
                 gates: BTreeMap::new(),
                 accepts: None,
                 integration: None,
+                default_action: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -906,5 +981,171 @@ mod tests {
         state.directive = "Use {{name}} style".to_string();
         // Lowercase is not a variable ref, should pass without declaring it
         t.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_integration_and_default_action() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.integration = Some("my-runner".to_string());
+        state.default_action = Some(ActionDecl {
+            command: "echo hi".to_string(),
+            working_dir: String::new(),
+            requires_confirmation: false,
+            polling: None,
+        });
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("cannot have both integration and default_action"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_empty_default_action_command() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.default_action = Some(ActionDecl {
+            command: String::new(),
+            working_dir: String::new(),
+            requires_confirmation: false,
+            polling: None,
+        });
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("default_action command must not be empty"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_undeclared_variable_in_action_command() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.default_action = Some(ActionDecl {
+            command: "echo {{MISSING}}".to_string(),
+            working_dir: String::new(),
+            requires_confirmation: false,
+            polling: None,
+        });
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("variable reference '{{MISSING}}'")
+                && err.contains("default_action command"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_undeclared_variable_in_action_working_dir() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.default_action = Some(ActionDecl {
+            command: "echo ok".to_string(),
+            working_dir: "/tmp/{{MISSING}}".to_string(),
+            requires_confirmation: false,
+            polling: None,
+        });
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("variable reference '{{MISSING}}'")
+                && err.contains("default_action working_dir"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_polling_with_zero_timeout() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.default_action = Some(ActionDecl {
+            command: "echo check".to_string(),
+            working_dir: String::new(),
+            requires_confirmation: false,
+            polling: Some(PollingConfig {
+                interval_secs: 10,
+                timeout_secs: 0,
+            }),
+        });
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("polling.timeout_secs must be greater than 0"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn valid_default_action_passes() {
+        let mut t = minimal_template();
+        t.variables.insert(
+            "BRANCH".to_string(),
+            VariableDecl {
+                description: String::new(),
+                required: false,
+                default: "main".to_string(),
+            },
+        );
+        let state = t.states.get_mut("start").unwrap();
+        state.default_action = Some(ActionDecl {
+            command: "git checkout {{BRANCH}}".to_string(),
+            working_dir: String::new(),
+            requires_confirmation: false,
+            polling: None,
+        });
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn valid_default_action_with_polling_passes() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.default_action = Some(ActionDecl {
+            command: "gh pr checks --watch".to_string(),
+            working_dir: String::new(),
+            requires_confirmation: false,
+            polling: Some(PollingConfig {
+                interval_secs: 30,
+                timeout_secs: 1800,
+            }),
+        });
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn action_decl_serde_round_trip() {
+        let action = ActionDecl {
+            command: "echo test".to_string(),
+            working_dir: "/tmp".to_string(),
+            requires_confirmation: true,
+            polling: Some(PollingConfig {
+                interval_secs: 10,
+                timeout_secs: 300,
+            }),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let restored: ActionDecl = serde_json::from_str(&json).unwrap();
+        assert_eq!(action, restored);
+    }
+
+    #[test]
+    fn action_decl_serde_minimal() {
+        let action = ActionDecl {
+            command: "echo test".to_string(),
+            working_dir: String::new(),
+            requires_confirmation: false,
+            polling: None,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        // Optional/empty fields should be omitted.
+        assert!(!json.contains("working_dir"));
+        assert!(!json.contains("requires_confirmation"));
+        assert!(!json.contains("polling"));
+        let restored: ActionDecl = serde_json::from_str(&json).unwrap();
+        assert_eq!(action, restored);
     }
 }
