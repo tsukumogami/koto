@@ -1,5 +1,5 @@
 ---
-status: Planned
+status: Current
 spawned_from:
   issue: 67
   repo: tsukumogami/koto
