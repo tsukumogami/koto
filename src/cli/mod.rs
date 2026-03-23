@@ -23,6 +23,9 @@ use crate::template::types::CompiledTemplate;
 /// Maximum payload size for --with-data (1 MB).
 const MAX_WITH_DATA_BYTES: usize = 1_048_576;
 
+/// Maximum size of captured stdout/stderr from action execution (64 KB).
+const MAX_ACTION_OUTPUT_BYTES: usize = 64 * 1024;
+
 /// Exit code space:
 /// - 0: success
 /// - 1: transient / retryable errors (gate_blocked, integration_unavailable, engine errors)
@@ -215,6 +218,99 @@ fn resolve_variables(
     }
 
     Ok(resolved)
+}
+
+/// Truncate a string to at most `max_bytes` bytes. If truncated, appends a note.
+/// Handles UTF-8 correctly by truncating at a char boundary.
+fn truncate_output(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    // Find the largest char boundary at or before max_bytes.
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = s[..end].to_string();
+    truncated.push_str("\n... [output truncated]");
+    truncated
+}
+
+/// Execute a command with polling: run repeatedly, evaluate gates after each
+/// execution, and return when all gates pass or the timeout expires.
+///
+/// The `gates` map and `evaluate_gates_fn` allow gate evaluation within the
+/// polling loop. For non-polling actions, gates are evaluated by the advance
+/// loop after the action closure returns. For polling actions, gates must be
+/// checked inside the loop so we know when to stop retrying.
+#[cfg(unix)]
+fn execute_with_polling<G>(
+    command: &str,
+    working_dir: &std::path::Path,
+    polling: &crate::template::types::PollingConfig,
+    gates: &std::collections::BTreeMap<String, crate::template::types::Gate>,
+    evaluate_gates_fn: &G,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> crate::action::CommandOutput
+where
+    G: Fn(
+        &std::collections::BTreeMap<String, crate::template::types::Gate>,
+    ) -> std::collections::BTreeMap<String, crate::gate::GateResult>,
+{
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(u64::from(polling.timeout_secs));
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return crate::action::CommandOutput {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: "polling interrupted by signal".to_string(),
+            };
+        }
+
+        let output = crate::action::run_shell_command(command, working_dir, 30);
+
+        // Check gates after each command execution.
+        if !gates.is_empty() {
+            let gate_results = evaluate_gates_fn(gates);
+            let all_passed = gate_results
+                .values()
+                .all(|r| matches!(r, crate::gate::GateResult::Passed));
+            if all_passed {
+                return output;
+            }
+        } else if output.exit_code == 0 {
+            // No gates: succeed on exit code 0.
+            return output;
+        }
+
+        if Instant::now() >= deadline {
+            return crate::action::CommandOutput {
+                exit_code: output.exit_code,
+                stdout: output.stdout,
+                stderr: format!(
+                    "{}\npolling timed out after {} seconds",
+                    output.stderr, polling.timeout_secs
+                ),
+            };
+        }
+
+        // Sleep for the interval, but check shutdown more frequently.
+        let sleep_end = Instant::now() + Duration::from_secs(u64::from(polling.interval_secs));
+        while Instant::now() < sleep_end {
+            if shutdown.load(Ordering::Relaxed) {
+                return crate::action::CommandOutput {
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: "polling interrupted by signal".to_string(),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 pub fn run(app: App) -> Result<()> {
@@ -889,10 +985,84 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
         Err(IntegrationError::Unavailable)
     };
 
-    let action_closure = |_state: &str,
-                          _action: &crate::template::types::ActionDecl,
-                          _has_evidence: bool|
-     -> ActionResult { ActionResult::Skipped };
+    let action_closure = |state_name: &str,
+                          action: &crate::template::types::ActionDecl,
+                          has_evidence: bool|
+     -> ActionResult {
+        // If override evidence exists, skip the action.
+        if has_evidence {
+            return ActionResult::Skipped;
+        }
+
+        // Substitute variables in command and working_dir.
+        let command = variables.substitute(&action.command);
+        let wd = if action.working_dir.is_empty() {
+            current_dir.clone()
+        } else {
+            std::path::PathBuf::from(variables.substitute(&action.working_dir))
+        };
+
+        // Execute: polling or one-shot.
+        let output = if let Some(polling) = &action.polling {
+            // For polling, we need to evaluate gates inside the loop.
+            // Look up the state's gates from the compiled template.
+            let state_gates = compiled
+                .states
+                .get(state_name)
+                .map(|s| {
+                    // Substitute variables in gate commands.
+                    s.gates
+                        .iter()
+                        .map(|(name, gate)| {
+                            let mut g = gate.clone();
+                            g.command = variables.substitute(&g.command);
+                            (name.clone(), g)
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                })
+                .unwrap_or_default();
+            execute_with_polling(
+                &command,
+                &wd,
+                polling,
+                &state_gates,
+                &|gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
+                    crate::gate::evaluate_gates(gates, &current_dir)
+                },
+                &shutdown,
+            )
+        } else {
+            crate::action::run_shell_command(&command, &wd, 30)
+        };
+
+        // Truncate output.
+        let stdout = truncate_output(&output.stdout, MAX_ACTION_OUTPUT_BYTES);
+        let stderr = truncate_output(&output.stderr, MAX_ACTION_OUTPUT_BYTES);
+
+        // Append DefaultActionExecuted event.
+        let event_payload = EventPayload::DefaultActionExecuted {
+            state: state_name.to_string(),
+            command: command.clone(),
+            exit_code: output.exit_code,
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+        };
+        let _ = append_event(&state_path, &event_payload, &now_iso8601());
+
+        if action.requires_confirmation {
+            ActionResult::RequiresConfirmation {
+                exit_code: output.exit_code,
+                stdout,
+                stderr,
+            }
+        } else {
+            ActionResult::Executed {
+                exit_code: output.exit_code,
+                stdout,
+                stderr,
+            }
+        }
+    };
 
     let result = advance_until_stop(
         current_state,
@@ -999,23 +1169,25 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
                 }
                 StopReason::ActionRequiresConfirmation {
                     state: action_state,
-                    exit_code: _,
-                    stdout: _,
-                    stderr: _,
-                } => {
-                    // Placeholder: Issue 3 will implement proper NextResponse mapping.
-                    // For now, stop and report as evidence-required so the agent can proceed.
-                    NextResponse::EvidenceRequired {
-                        state: action_state,
-                        directive: final_template_state.directive.clone(),
-                        advanced,
-                        expects: ExpectsSchema {
-                            event_type: "evidence_submitted".to_string(),
-                            fields: std::collections::BTreeMap::new(),
-                            options: vec![],
-                        },
-                    }
-                }
+                    exit_code,
+                    stdout,
+                    stderr,
+                } => NextResponse::ActionRequiresConfirmation {
+                    state: action_state,
+                    directive: final_template_state.directive.clone(),
+                    advanced,
+                    action_output: crate::cli::next_types::ActionOutput {
+                        command: final_template_state
+                            .default_action
+                            .as_ref()
+                            .map(|a| variables.substitute(&a.command))
+                            .unwrap_or_default(),
+                        exit_code,
+                        stdout,
+                        stderr,
+                    },
+                    expects,
+                },
                 StopReason::CycleDetected { state: cycle_state } => {
                     // Cycle is a template bug; report as an error.
                     let err = NextError {

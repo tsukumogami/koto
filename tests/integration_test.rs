@@ -2407,3 +2407,305 @@ fn next_var_to_directed_transition_substitutes_directive() {
         "directed transition directive should contain substituted values"
     );
 }
+
+// ---------------------------------------------------------------------------
+// default_action execution tests
+// ---------------------------------------------------------------------------
+
+fn template_with_default_action_creating_file() -> String {
+    r#"---
+name: action-workflow
+version: "1.0"
+initial_state: setup
+states:
+  setup:
+    default_action:
+      command: "touch marker.txt"
+    gates:
+      file_exists:
+        type: command
+        command: "test -f marker.txt"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## setup
+
+Run setup action.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn default_action_creates_file_and_auto_advances() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(
+        dir.path(),
+        "action-wf",
+        &template_with_default_action_creating_file(),
+    );
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "action-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+
+    // The action creates marker.txt, the gate checks it exists, and the state
+    // auto-advances to done.
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "should auto-advance to terminal state"
+    );
+    assert_eq!(json["action"].as_str(), Some("done"));
+    assert_eq!(json["advanced"], true);
+
+    // Verify the marker file was actually created.
+    assert!(
+        dir.path().join("marker.txt").exists(),
+        "action should have created marker.txt"
+    );
+
+    // Verify the state file contains a default_action_executed event.
+    let state_content =
+        std::fs::read_to_string(dir.path().join("koto-action-wf.state.jsonl")).unwrap();
+    assert!(
+        state_content.contains("default_action_executed"),
+        "state file should contain default_action_executed event"
+    );
+}
+
+#[test]
+fn default_action_skipped_when_override_evidence_exists() {
+    let dir = TempDir::new().unwrap();
+
+    // Template where setup has a default_action and an accepts block, plus a gate.
+    let template = r#"---
+name: skip-action-wf
+version: "1.0"
+initial_state: setup
+states:
+  setup:
+    default_action:
+      command: "touch should-not-exist.txt"
+    accepts:
+      status:
+        type: string
+        required: true
+    gates:
+      always_pass:
+        type: command
+        command: "true"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## setup
+
+Setup step.
+
+## done
+
+Done.
+"#;
+
+    init_workflow(dir.path(), "skip-wf", template);
+
+    // Submit evidence before calling next, which sets the override evidence.
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "skip-wf", "--with-data", r#"{"status": "manual"}"#])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next with evidence should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The action should have been skipped because evidence was submitted.
+    assert!(
+        !dir.path().join("should-not-exist.txt").exists(),
+        "action should be skipped when override evidence exists"
+    );
+}
+
+fn template_with_requires_confirmation() -> String {
+    r#"---
+name: confirm-workflow
+version: "1.0"
+initial_state: confirm_step
+states:
+  confirm_step:
+    default_action:
+      command: "echo needs-review"
+      requires_confirmation: true
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## confirm_step
+
+Confirm the action output.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn requires_confirmation_stops_and_returns_output() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(
+        dir.path(),
+        "confirm-wf",
+        &template_with_requires_confirmation(),
+    );
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "confirm-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+
+    // Should stop at confirm_step, not advance to done.
+    assert_eq!(
+        json["state"].as_str(),
+        Some("confirm_step"),
+        "should stop at state requiring confirmation"
+    );
+    assert_eq!(
+        json["action"].as_str(),
+        Some("confirm"),
+        "action should be 'confirm'"
+    );
+    assert!(
+        json["action_output"].is_object(),
+        "action_output should be present"
+    );
+    assert_eq!(json["action_output"]["exit_code"], 0);
+    assert!(
+        json["action_output"]["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("needs-review"),
+        "stdout should contain command output"
+    );
+}
+
+fn template_with_polling_action() -> String {
+    // The action creates a counter file that increments on each run.
+    // On the third run, it creates a "ready" marker.
+    // The gate checks for the "ready" marker.
+    r#"---
+name: poll-workflow
+version: "1.0"
+initial_state: wait
+states:
+  wait:
+    default_action:
+      command: |
+        count=0
+        if [ -f poll_count.txt ]; then
+          count=$(cat poll_count.txt)
+        fi
+        count=$((count + 1))
+        echo $count > poll_count.txt
+        if [ $count -ge 2 ]; then
+          touch ready.txt
+        fi
+        echo "iteration $count"
+      polling:
+        interval_secs: 1
+        timeout_secs: 10
+    gates:
+      ready:
+        type: command
+        command: "test -f ready.txt"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## wait
+
+Wait for readiness.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn polling_action_retries_until_success() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "poll-wf", &template_with_polling_action());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "poll-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+
+    // The polling should eventually succeed and auto-advance to done.
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "polling should complete and auto-advance to terminal state"
+    );
+    assert_eq!(json["advanced"], true);
+
+    // Verify the ready marker was created.
+    assert!(
+        dir.path().join("ready.txt").exists(),
+        "polling should have created ready.txt"
+    );
+}
