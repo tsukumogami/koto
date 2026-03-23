@@ -349,6 +349,18 @@ pub fn run(app: App) -> Result<()> {
             template,
             vars,
         } => {
+            // Validate workflow name before any filesystem operation.
+            if let Err(msg) = crate::discover::validate_workflow_name(&name) {
+                exit_with_error_code(
+                    serde_json::json!({
+                        "error": msg,
+                        "command": "init",
+                        "allowed_pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+                    }),
+                    2,
+                );
+            }
+
             let current_dir = std::env::current_dir()?;
             let state_path = workflow_state_path(&current_dir, &name);
 
