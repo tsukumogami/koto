@@ -3,7 +3,7 @@
   "design_doc": "docs/plans/PLAN-template-variable-substitution.md",
   "branch": "docs/template-variable-substitution",
   "pr_number": 75,
-  "integrity_hash": "sha256:96a21ff6997c4a9d0f0e22ec587132c0a3d0c421a1d4050b783e31bd2cd42183",
+  "integrity_hash": "sha256:15e455ddf36bf93c0f4833ebee2a6cfa6294403637399279e95a7bd844c48926",
   "issues": [
     {
       "number": 1,
@@ -16,7 +16,16 @@
       "commits": [],
       "agent_type": "",
       "summary": null,
-      "testable_scenarios": [],
+      "testable_scenarios": [
+        "scenario-1",
+        "scenario-2",
+        "scenario-3",
+        "scenario-4",
+        "scenario-5",
+        "scenario-6",
+        "scenario-7",
+        "scenario-20"
+      ],
       "complexity": "testable"
     },
     {
@@ -32,7 +41,15 @@
       "commits": [],
       "agent_type": "",
       "summary": null,
-      "testable_scenarios": [],
+      "testable_scenarios": [
+        "scenario-8",
+        "scenario-9",
+        "scenario-10",
+        "scenario-11",
+        "scenario-12",
+        "scenario-13",
+        "scenario-14"
+      ],
       "complexity": "testable"
     },
     {
@@ -49,12 +66,19 @@
       "commits": [],
       "agent_type": "",
       "summary": null,
-      "testable_scenarios": [],
+      "testable_scenarios": [
+        "scenario-15",
+        "scenario-16",
+        "scenario-17",
+        "scenario-18",
+        "scenario-19"
+      ],
       "complexity": "testable"
     }
   ],
   "skipped_issues": null,
-  "test_plan_file": null,
+  "test_plan_file": "wip/implement-template-variable-substitution-test_plan.md",
+  "doc_plan_file": "wip/implement-template-variable-substitution-doc_plan.md",
   "source_doc_type": "plan",
   "execution_mode": "single-pr",
   "deliverable_type": "code"
