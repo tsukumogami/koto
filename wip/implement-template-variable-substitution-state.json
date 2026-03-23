@@ -3,19 +3,33 @@
   "design_doc": "docs/plans/PLAN-template-variable-substitution.md",
   "branch": "docs/template-variable-substitution",
   "pr_number": 75,
-  "integrity_hash": "sha256:15e455ddf36bf93c0f4833ebee2a6cfa6294403637399279e95a7bd844c48926",
+  "integrity_hash": "sha256:34156188af327d0e9b30a46bd697a070197736556f37ebe543a2b15a90a00098",
   "issues": [
     {
       "number": 1,
       "title": "feat(engine): add Variables substitution module and compile-time validation",
-      "status": "pending",
+      "status": "scrutinized",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "code",
       "dependencies": [],
-      "commits": [],
-      "agent_type": "",
-      "summary": null,
+      "commits": [
+        "e980eaf"
+      ],
+      "agent_type": "coder",
+      "summary": {
+        "narrative": "",
+        "files_changed": [
+          "src/engine/substitute.rs",
+          "src/engine/types.rs",
+          "src/engine/mod.rs",
+          "src/template/types.rs",
+          "Cargo.toml",
+          "Cargo.lock"
+        ],
+        "tests_added": 23,
+        "key_decisions": "Variables newtype with from_events re-validation; compile-time ref validation in CompiledTemplate::validate; regex crate added as dependency"
+      },
       "testable_scenarios": [
         "scenario-1",
         "scenario-2",
