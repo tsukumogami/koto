@@ -28,7 +28,7 @@ needed -- components have clear, stable interfaces and the dependency chain is l
 
 ## Issue outlines
 
-### 1. feat(engine): add Variables substitution module and compile-time validation
+### Issue 1: feat(engine): add Variables substitution module and compile-time validation
 
 **Complexity:** testable
 
@@ -55,7 +55,7 @@ validation function, and `Variables::substitute()`.
 
 ---
 
-### 2. feat(cli): add --var flag to koto init with validation
+### Issue 2: feat(cli): add --var flag to koto init with validation
 
 **Complexity:** testable
 
@@ -80,7 +80,7 @@ declarations, sanitize, and store in the `WorkflowInitialized` event.
 
 ---
 
-### 3. feat(cli): wire variable substitution into koto next
+### Issue 3: feat(cli): wire variable substitution into koto next
 
 **Complexity:** testable
 

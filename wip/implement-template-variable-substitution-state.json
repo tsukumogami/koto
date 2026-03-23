@@ -1,0 +1,61 @@
+{
+  "pr_status": "implementing",
+  "design_doc": "docs/plans/PLAN-template-variable-substitution.md",
+  "branch": "docs/template-variable-substitution",
+  "pr_number": 75,
+  "integrity_hash": "sha256:96a21ff6997c4a9d0f0e22ec587132c0a3d0c421a1d4050b783e31bd2cd42183",
+  "issues": [
+    {
+      "number": 1,
+      "title": "feat(engine): add Variables substitution module and compile-time validation",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [],
+      "complexity": "testable"
+    },
+    {
+      "number": 2,
+      "title": "feat(cli): add --var flag to koto init with validation",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        1
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [],
+      "complexity": "testable"
+    },
+    {
+      "number": 3,
+      "title": "feat(cli): wire variable substitution into koto next",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        1,
+        2
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [],
+      "complexity": "testable"
+    }
+  ],
+  "skipped_issues": null,
+  "test_plan_file": null,
+  "source_doc_type": "plan",
+  "execution_mode": "single-pr",
+  "deliverable_type": "code"
+}
