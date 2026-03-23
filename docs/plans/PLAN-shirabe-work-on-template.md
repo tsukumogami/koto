@@ -36,9 +36,9 @@ exist. The three needs-design issues will spawn child design docs and milestones
 | 3 | ~~[#68: feat(engine): implement mid-state decision capture](https://github.com/tsukumogami/koto/issues/68)~~ | None | testable | ~~needs-design~~ done |
 | 4 | ~~[#69: feat(engine): implement gate-with-evidence-fallback](https://github.com/tsukumogami/koto/issues/69)~~ | None | testable | done |
 | 5 | ~~[#70: feat(engine): validate workflow names at init time](https://github.com/tsukumogami/koto/issues/70)~~ | None | critical | done |
-| 6 | [#72: feat(template): write the work-on koto template](https://github.com/tsukumogami/koto/issues/72) | [#67](https://github.com/tsukumogami/koto/issues/67), [#71](https://github.com/tsukumogami/koto/issues/71), [#68](https://github.com/tsukumogami/koto/issues/68), [#69](https://github.com/tsukumogami/koto/issues/69), [#70](https://github.com/tsukumogami/koto/issues/70) | testable | |
-| 7 | [#73: feat(shirabe): integrate /work-on skill with koto template](https://github.com/tsukumogami/koto/issues/73) | [#72](https://github.com/tsukumogami/koto/issues/72) | testable | |
-| 8 | [#74: docs(koto): update AGENTS.md and hello-koto](https://github.com/tsukumogami/koto/issues/74) | [#69](https://github.com/tsukumogami/koto/issues/69), [#72](https://github.com/tsukumogami/koto/issues/72), [#73](https://github.com/tsukumogami/koto/issues/73) | simple | |
+| 6 | ~~[#72: feat(template): write the work-on koto template](https://github.com/tsukumogami/koto/issues/72)~~ | all done | testable | done |
+| 7 | [#73: feat(shirabe): integrate /work-on skill with koto template](https://github.com/tsukumogami/koto/issues/73) | [#72](https://github.com/tsukumogami/koto/issues/72) | testable | deferred to [shirabe#18](https://github.com/tsukumogami/shirabe/issues/18) |
+| 8 | ~~[#74: docs(koto): update AGENTS.md and hello-koto](https://github.com/tsukumogami/koto/issues/74)~~ | all done | simple | done |
 
 ## Dependency Graph
 
@@ -74,9 +74,8 @@ graph TD
     classDef tracksDesign fill:#8250df,stroke:#6639ba,color:white,stroke-dasharray: 5 5
     classDef tracksPlan fill:#0969da,stroke:#0550ae,color:white,stroke-dasharray: 5 5
 
-    class I67,I68,I69,I70,I71 done
-    class I72 ready
-    class I73,I74 blocked
+    class I67,I68,I69,I70,I71,I72,I74 done
+    class I73 blocked
 ```
 
 **Legend**: Green = done, Purple = needs-design, Blue = ready, Yellow = blocked
