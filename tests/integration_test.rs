@@ -6,6 +6,39 @@ fn koto() -> Command {
     Command::cargo_bin("koto").unwrap()
 }
 
+fn template_with_variables() -> &'static str {
+    r#"---
+name: var-workflow
+version: "1.0"
+initial_state: start
+variables:
+  OWNER:
+    description: "Repository owner"
+    required: true
+  REPO:
+    description: "Repository name"
+    required: true
+  BRANCH:
+    description: "Branch name"
+    default: "main"
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Work on {{OWNER}}/{{REPO}} branch {{BRANCH}}.
+
+## done
+
+All done.
+"#
+}
+
 fn minimal_template() -> &'static str {
     r#"---
 name: test-workflow
@@ -33,6 +66,13 @@ All done.
 fn write_template_source(dir: &Path) -> std::path::PathBuf {
     let src = dir.join("test-template.md");
     std::fs::write(&src, minimal_template()).unwrap();
+    src
+}
+
+/// Write the variable template source to a file in `dir` and return its path.
+fn write_var_template_source(dir: &Path) -> std::path::PathBuf {
+    let src = dir.join("var-template.md");
+    std::fs::write(&src, template_with_variables()).unwrap();
     src
 }
 
@@ -1801,5 +1841,871 @@ fn gate_timeout_returns_gate_blocked() {
         conditions[0]["status"].as_str(),
         Some("timed_out"),
         "gate should have timed out, not failed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// init --var
+// ---------------------------------------------------------------------------
+
+#[test]
+fn init_var_valid_vars_stored_in_event() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "init with valid vars should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify the variables are stored in the workflow_initialized event.
+    let state_path = dir.path().join("koto-var-wf.state.jsonl");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    // Line 0 = header, line 1 = workflow_initialized event.
+    let init_event: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let vars = init_event["payload"]["variables"].as_object().unwrap();
+    assert_eq!(vars["OWNER"].as_str(), Some("acme"));
+    assert_eq!(vars["REPO"].as_str(), Some("widgets"));
+    // BRANCH should get its default value.
+    assert_eq!(vars["BRANCH"].as_str(), Some("main"));
+}
+
+#[test]
+fn init_var_missing_equals_fails() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+            "--var",
+            "BADFORMAT",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "missing = should fail");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("expected KEY=VALUE"),
+        "error should mention KEY=VALUE format, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_var_duplicate_key_fails() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+            "--var",
+            "OWNER=other",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "duplicate key should fail");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("duplicate"),
+        "error should mention duplicate, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_var_unknown_key_fails() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+            "--var",
+            "UNKNOWN=val",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "unknown key should fail");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("unknown variable"),
+        "error should mention unknown variable, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_var_missing_required_fails() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    // Only provide OWNER but not REPO (both required).
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "missing required variable should fail"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("missing required variable"),
+        "error should mention missing required, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_var_default_applied_for_optional() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    // Provide only the two required vars; BRANCH has a default.
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "init with defaults should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state_path = dir.path().join("koto-var-wf.state.jsonl");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    let init_event: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let vars = init_event["payload"]["variables"].as_object().unwrap();
+    assert_eq!(
+        vars["BRANCH"].as_str(),
+        Some("main"),
+        "BRANCH should use its default value"
+    );
+}
+
+#[test]
+fn init_var_forbidden_chars_fail() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme corp",
+            "--var",
+            "REPO=widgets",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "forbidden characters in value should fail"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("not allowed"),
+        "error should mention not allowed, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_no_variables_no_flags_works() {
+    // The minimal template has no variables block. Init without --var should work.
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["init", "no-var-wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "init without vars on no-variables template should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn init_no_variables_with_flags_fails() {
+    // The minimal template has no variables block. Passing --var should fail (unknown keys).
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "no-var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "FOO=bar",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "passing --var to a template with no variables should fail"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("unknown variable"),
+        "error should mention unknown variable, got: {}",
+        err
+    );
+}
+
+// ---------------------------------------------------------------------------
+// next: variable substitution
+// ---------------------------------------------------------------------------
+
+/// Helper to init a workflow with --var flags.
+fn init_workflow_with_vars(dir: &Path, name: &str, template_content: &str, vars: &[&str]) {
+    let src = dir.join(format!("{}-template.md", name));
+    std::fs::write(&src, template_content).unwrap();
+
+    let mut args = vec!["init", name, "--template", src.to_str().unwrap()];
+    for var in vars {
+        args.push("--var");
+        args.push(var);
+    }
+
+    let output = koto().current_dir(dir).args(&args).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Template with a gate whose command uses a variable reference.
+fn template_with_var_gate() -> String {
+    r#"---
+name: var-gate-workflow
+version: "1.0"
+initial_state: start
+variables:
+  TASK_ID:
+    description: "Task identifier"
+    required: true
+states:
+  start:
+    gates:
+      check:
+        type: command
+        command: "test -f /tmp/koto-test-{{TASK_ID}}"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Work on task {{TASK_ID}}.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+/// Template with variables in directive text and a direct transition path.
+fn template_with_var_directive() -> String {
+    r#"---
+name: var-directive-workflow
+version: "1.0"
+initial_state: start
+variables:
+  OWNER:
+    description: "Repository owner"
+    required: true
+  REPO:
+    description: "Repository name"
+    required: true
+states:
+  start:
+    accepts:
+      decision:
+        type: enum
+        required: true
+        values: [proceed, skip]
+    transitions:
+      - target: work
+        when:
+          decision: proceed
+      - target: done
+        when:
+          decision: skip
+  work:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Review {{OWNER}}/{{REPO}} and decide.
+
+## work
+
+Implement changes for {{OWNER}}/{{REPO}}.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn next_var_gate_evaluates_with_substituted_command() {
+    let dir = TempDir::new().unwrap();
+
+    // Create the sentinel file that the gate checks for.
+    let sentinel = "/tmp/koto-test-42";
+    std::fs::write(sentinel, "").unwrap();
+
+    init_workflow_with_vars(
+        dir.path(),
+        "var-gate-wf",
+        &template_with_var_gate(),
+        &["TASK_ID=42"],
+    );
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "var-gate-wf"])
+        .output()
+        .unwrap();
+
+    // Clean up sentinel file.
+    let _ = std::fs::remove_file(sentinel);
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("next output should be valid JSON");
+
+    // The gate should pass (file exists), so the workflow auto-advances to done.
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "gate should pass with substituted path, auto-advance to done"
+    );
+}
+
+#[test]
+fn next_var_gate_fails_when_substituted_path_missing() {
+    let dir = TempDir::new().unwrap();
+
+    // Don't create the sentinel file -- the gate should fail.
+    let sentinel = "/tmp/koto-test-99999";
+    let _ = std::fs::remove_file(sentinel); // ensure it doesn't exist
+
+    init_workflow_with_vars(
+        dir.path(),
+        "var-gate-fail-wf",
+        &template_with_var_gate(),
+        &["TASK_ID=99999"],
+    );
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "var-gate-fail-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gate_blocked exits 0, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("next output should be valid JSON");
+
+    // Should be blocked at start because the gate fails.
+    assert_eq!(json["state"].as_str(), Some("start"));
+    assert!(
+        json["blocking_conditions"].is_array(),
+        "should have blocking_conditions"
+    );
+
+    // The directive should have the substituted variable value.
+    assert_eq!(
+        json["directive"].as_str(),
+        Some("Work on task 99999."),
+        "directive should contain substituted variable"
+    );
+}
+
+#[test]
+fn next_var_directive_contains_substituted_values() {
+    let dir = TempDir::new().unwrap();
+
+    init_workflow_with_vars(
+        dir.path(),
+        "var-dir-wf",
+        &template_with_var_directive(),
+        &["OWNER=acme", "REPO=widgets"],
+    );
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "var-dir-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("next output should be valid JSON");
+
+    // State should be "start" (needs evidence, no auto-advance).
+    assert_eq!(json["state"].as_str(), Some("start"));
+    assert_eq!(
+        json["directive"].as_str(),
+        Some("Review acme/widgets and decide."),
+        "directive should contain substituted variable values"
+    );
+}
+
+#[test]
+fn next_var_to_directed_transition_substitutes_directive() {
+    let dir = TempDir::new().unwrap();
+
+    init_workflow_with_vars(
+        dir.path(),
+        "var-to-wf",
+        &template_with_var_directive(),
+        &["OWNER=acme", "REPO=widgets"],
+    );
+
+    // Use --to to direct transition from start to work.
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "var-to-wf", "--to", "work"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next --to should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("next output should be valid JSON");
+
+    assert_eq!(json["state"].as_str(), Some("work"));
+    assert_eq!(
+        json["directive"].as_str(),
+        Some("Implement changes for acme/widgets."),
+        "directed transition directive should contain substituted values"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// default_action execution tests
+// ---------------------------------------------------------------------------
+
+fn template_with_default_action_creating_file() -> String {
+    r#"---
+name: action-workflow
+version: "1.0"
+initial_state: setup
+states:
+  setup:
+    default_action:
+      command: "touch marker.txt"
+    gates:
+      file_exists:
+        type: command
+        command: "test -f marker.txt"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## setup
+
+Run setup action.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn default_action_creates_file_and_auto_advances() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(
+        dir.path(),
+        "action-wf",
+        &template_with_default_action_creating_file(),
+    );
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "action-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+
+    // The action creates marker.txt, the gate checks it exists, and the state
+    // auto-advances to done.
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "should auto-advance to terminal state"
+    );
+    assert_eq!(json["action"].as_str(), Some("done"));
+    assert_eq!(json["advanced"], true);
+
+    // Verify the marker file was actually created.
+    assert!(
+        dir.path().join("marker.txt").exists(),
+        "action should have created marker.txt"
+    );
+
+    // Verify the state file contains a default_action_executed event.
+    let state_content =
+        std::fs::read_to_string(dir.path().join("koto-action-wf.state.jsonl")).unwrap();
+    assert!(
+        state_content.contains("default_action_executed"),
+        "state file should contain default_action_executed event"
+    );
+}
+
+#[test]
+fn default_action_skipped_when_override_evidence_exists() {
+    let dir = TempDir::new().unwrap();
+
+    // Template where setup has a default_action and an accepts block, plus a gate.
+    let template = r#"---
+name: skip-action-wf
+version: "1.0"
+initial_state: setup
+states:
+  setup:
+    default_action:
+      command: "touch should-not-exist.txt"
+    accepts:
+      status:
+        type: string
+        required: true
+    gates:
+      always_pass:
+        type: command
+        command: "true"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## setup
+
+Setup step.
+
+## done
+
+Done.
+"#;
+
+    init_workflow(dir.path(), "skip-wf", template);
+
+    // Submit evidence before calling next, which sets the override evidence.
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "skip-wf", "--with-data", r#"{"status": "manual"}"#])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next with evidence should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The action should have been skipped because evidence was submitted.
+    assert!(
+        !dir.path().join("should-not-exist.txt").exists(),
+        "action should be skipped when override evidence exists"
+    );
+}
+
+fn template_with_requires_confirmation() -> String {
+    r#"---
+name: confirm-workflow
+version: "1.0"
+initial_state: confirm_step
+states:
+  confirm_step:
+    default_action:
+      command: "echo needs-review"
+      requires_confirmation: true
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## confirm_step
+
+Confirm the action output.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn requires_confirmation_stops_and_returns_output() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(
+        dir.path(),
+        "confirm-wf",
+        &template_with_requires_confirmation(),
+    );
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "confirm-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+
+    // Should stop at confirm_step, not advance to done.
+    assert_eq!(
+        json["state"].as_str(),
+        Some("confirm_step"),
+        "should stop at state requiring confirmation"
+    );
+    assert_eq!(
+        json["action"].as_str(),
+        Some("confirm"),
+        "action should be 'confirm'"
+    );
+    assert!(
+        json["action_output"].is_object(),
+        "action_output should be present"
+    );
+    assert_eq!(json["action_output"]["exit_code"], 0);
+    assert!(
+        json["action_output"]["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("needs-review"),
+        "stdout should contain command output"
+    );
+}
+
+fn template_with_polling_action() -> String {
+    // The action creates a counter file that increments on each run.
+    // On the third run, it creates a "ready" marker.
+    // The gate checks for the "ready" marker.
+    r#"---
+name: poll-workflow
+version: "1.0"
+initial_state: wait
+states:
+  wait:
+    default_action:
+      command: |
+        count=0
+        if [ -f poll_count.txt ]; then
+          count=$(cat poll_count.txt)
+        fi
+        count=$((count + 1))
+        echo $count > poll_count.txt
+        if [ $count -ge 2 ]; then
+          touch ready.txt
+        fi
+        echo "iteration $count"
+      polling:
+        interval_secs: 1
+        timeout_secs: 10
+    gates:
+      ready:
+        type: command
+        command: "test -f ready.txt"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## wait
+
+Wait for readiness.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn polling_action_retries_until_success() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "poll-wf", &template_with_polling_action());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "poll-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+
+    // The polling should eventually succeed and auto-advance to done.
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "polling should complete and auto-advance to terminal state"
+    );
+    assert_eq!(json["advanced"], true);
+
+    // Verify the ready marker was created.
+    assert!(
+        dir.path().join("ready.txt").exists(),
+        "polling should have created ready.txt"
     );
 }

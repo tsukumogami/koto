@@ -134,6 +134,7 @@ mod tests {
             gates,
             accepts,
             integration,
+            default_action: None,
         }
     }
 

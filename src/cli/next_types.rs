@@ -43,6 +43,87 @@ pub enum NextResponse {
         state: String,
         advanced: bool,
     },
+    ActionRequiresConfirmation {
+        state: String,
+        directive: String,
+        advanced: bool,
+        action_output: ActionOutput,
+        expects: Option<ExpectsSchema>,
+    },
+}
+
+impl NextResponse {
+    /// Return a new `NextResponse` with the directive field substituted using the
+    /// given function. Terminal variants have no directive and are returned unchanged.
+    pub fn with_substituted_directive<F>(self, f: F) -> Self
+    where
+        F: Fn(&str) -> String,
+    {
+        match self {
+            NextResponse::EvidenceRequired {
+                state,
+                directive,
+                advanced,
+                expects,
+            } => NextResponse::EvidenceRequired {
+                state,
+                directive: f(&directive),
+                advanced,
+                expects,
+            },
+            NextResponse::GateBlocked {
+                state,
+                directive,
+                advanced,
+                blocking_conditions,
+            } => NextResponse::GateBlocked {
+                state,
+                directive: f(&directive),
+                advanced,
+                blocking_conditions,
+            },
+            NextResponse::Integration {
+                state,
+                directive,
+                advanced,
+                expects,
+                integration,
+            } => NextResponse::Integration {
+                state,
+                directive: f(&directive),
+                advanced,
+                expects,
+                integration,
+            },
+            NextResponse::IntegrationUnavailable {
+                state,
+                directive,
+                advanced,
+                expects,
+                integration,
+            } => NextResponse::IntegrationUnavailable {
+                state,
+                directive: f(&directive),
+                advanced,
+                expects,
+                integration,
+            },
+            terminal @ NextResponse::Terminal { .. } => terminal,
+            NextResponse::ActionRequiresConfirmation {
+                state,
+                directive,
+                advanced,
+                action_output,
+                expects,
+            } => NextResponse::ActionRequiresConfirmation {
+                state,
+                directive: f(&directive),
+                advanced,
+                action_output,
+                expects,
+            },
+        }
+    }
 }
 
 impl Serialize for NextResponse {
@@ -122,6 +203,23 @@ impl Serialize for NextResponse {
                 map.serialize_entry("error", &None::<()>)?;
                 map.end()
             }
+            NextResponse::ActionRequiresConfirmation {
+                state,
+                directive,
+                advanced,
+                action_output,
+                expects,
+            } => {
+                let mut map = serializer.serialize_map(Some(7))?;
+                map.serialize_entry("action", "confirm")?;
+                map.serialize_entry("state", state)?;
+                map.serialize_entry("directive", directive)?;
+                map.serialize_entry("advanced", advanced)?;
+                map.serialize_entry("action_output", action_output)?;
+                map.serialize_entry("expects", expects)?;
+                map.serialize_entry("error", &None::<()>)?;
+                map.end()
+            }
         }
     }
 }
@@ -197,6 +295,15 @@ pub struct BlockingCondition {
     pub condition_type: String,
     pub status: String,
     pub agent_actionable: bool,
+}
+
+/// Output from a default action that requires confirmation.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ActionOutput {
+    pub command: String,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 /// Output from an integration that ran successfully.
@@ -749,6 +856,7 @@ mod tests {
             gates: BTreeMap::new(),
             accepts,
             integration: None,
+            default_action: None,
         }
     }
 
