@@ -1,0 +1,61 @@
+{
+  "pr_status": "implementing",
+  "design_doc": "docs/plans/PLAN-default-action-execution.md",
+  "branch": "docs/template-variable-substitution",
+  "pr_number": 75,
+  "integrity_hash": "sha256:8557bf627e4b951264f02eea003128d33d01be983289f531bf5d8bdf1392603e",
+  "issues": [
+    {
+      "number": 1,
+      "title": "feat(engine): add ActionDecl schema, shared command execution, and DefaultActionExecuted event",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [],
+      "complexity": "testable"
+    },
+    {
+      "number": 2,
+      "title": "feat(engine): add action closure to advance_until_stop",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        1
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [],
+      "complexity": "testable"
+    },
+    {
+      "number": 3,
+      "title": "feat(cli): wire action execution into handle_next with polling",
+      "status": "pending",
+      "ci_status": "pending",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        1,
+        2
+      ],
+      "commits": [],
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": [],
+      "complexity": "testable"
+    }
+  ],
+  "skipped_issues": null,
+  "test_plan_file": null,
+  "source_doc_type": "plan",
+  "execution_mode": "single-pr",
+  "deliverable_type": "code"
+}
