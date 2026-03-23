@@ -576,14 +576,15 @@ mod tests {
         );
 
         let mut gates = BTreeMap::new();
-        gates.insert("branch_check".to_string(), GateResult::Failed { exit_code: 1 });
+        gates.insert(
+            "branch_check".to_string(),
+            GateResult::Failed { exit_code: 1 },
+        );
 
         let result = dispatch_next("setup", &ts, false, &gates);
         let resp = result.unwrap();
         match resp {
-            NextResponse::EvidenceRequired {
-                state, expects, ..
-            } => {
+            NextResponse::EvidenceRequired { state, expects, .. } => {
                 assert_eq!(state, "setup");
                 assert!(expects.fields.contains_key("status"));
             }
@@ -637,7 +638,10 @@ mod tests {
         let resp = result.unwrap();
         match resp {
             NextResponse::EvidenceRequired { .. } => {}
-            other => panic!("expected EvidenceRequired (gates passed, has accepts), got {:?}", other),
+            other => panic!(
+                "expected EvidenceRequired (gates passed, has accepts), got {:?}",
+                other
+            ),
         }
     }
 

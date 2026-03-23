@@ -40,16 +40,13 @@ pub fn validate_workflow_name(name: &str) -> Result<(), String> {
 
     // Validate against strict pattern: starts with alphanumeric, then
     // alphanumeric, hyphens, dots, or underscores.
-    let valid = name
-        .chars()
-        .enumerate()
-        .all(|(i, c)| {
-            if i == 0 {
-                c.is_ascii_alphanumeric()
-            } else {
-                c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_'
-            }
-        });
+    let valid = name.chars().enumerate().all(|(i, c)| {
+        if i == 0 {
+            c.is_ascii_alphanumeric()
+        } else {
+            c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_'
+        }
+    });
 
     if !valid {
         return Err(format!(
