@@ -15,7 +15,8 @@ use crate::cache::{compile_cached, sha256_hex};
 use crate::discover::{find_workflows_with_metadata, workflow_state_path};
 use crate::engine::errors::EngineError;
 use crate::engine::persistence::{
-    append_event, append_header, derive_machine_state, derive_state_from_log, read_events,
+    append_event, append_header, derive_decisions, derive_machine_state, derive_state_from_log,
+    read_events,
 };
 use crate::engine::types::{now_iso8601, EventPayload, StateFileHeader};
 use crate::template::types::CompiledTemplate;
@@ -99,6 +100,12 @@ pub enum Command {
         #[command(subcommand)]
         subcommand: TemplateSubcommand,
     },
+
+    /// Decision recording and retrieval
+    Decisions {
+        #[command(subcommand)]
+        subcommand: DecisionsSubcommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -113,6 +120,23 @@ pub enum TemplateSubcommand {
     Validate {
         /// Path to the compiled template JSON
         path: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DecisionsSubcommand {
+    /// Record a structured decision without advancing state
+    Record {
+        /// Workflow name
+        name: String,
+        /// Decision data as JSON (must include "choice" and "rationale" fields)
+        #[arg(long = "with-data")]
+        with_data: String,
+    },
+    /// List accumulated decisions for the current state
+    List {
+        /// Workflow name
+        name: String,
     },
 }
 
@@ -543,6 +567,13 @@ pub fn run(app: App) -> Result<()> {
                 }
                 Ok(())
             }
+        },
+        Command::Decisions { subcommand } => match subcommand {
+            DecisionsSubcommand::Record {
+                name,
+                with_data,
+            } => handle_decisions_record(name, with_data),
+            DecisionsSubcommand::List { name } => handle_decisions_list(name),
         },
     }
 }
@@ -1265,6 +1296,241 @@ fn handle_next(name: String, _with_data: Option<String>, _to: Option<String>) ->
             "command": "next"
         }),
         3,
+    );
+}
+
+/// Handle the `koto decisions record` command.
+///
+/// Appends a `DecisionRecorded` event to the state file without running
+/// the advancement loop. Validates the payload against a fixed schema:
+/// - "choice" (string, required)
+/// - "rationale" (string, required)
+/// - "alternatives_considered" (array of strings, optional)
+fn handle_decisions_record(name: String, with_data: String) -> Result<()> {
+    // 1. Payload size limit
+    if with_data.len() > MAX_WITH_DATA_BYTES {
+        exit_with_error_code(
+            serde_json::json!({
+                "error": format!("--with-data payload exceeds maximum size of {} bytes", MAX_WITH_DATA_BYTES),
+                "command": "decisions record"
+            }),
+            2,
+        );
+    }
+
+    // 2. Load state file
+    let current_dir = std::env::current_dir()?;
+    let state_path = workflow_state_path(&current_dir, &name);
+
+    if !state_path.exists() {
+        exit_with_error(serde_json::json!({
+            "error": format!("workflow '{}' not found", name),
+            "command": "decisions record"
+        }));
+    }
+
+    let (header, events) = match read_events(&state_path) {
+        Ok(result) => result,
+        Err(err) => {
+            let code = exit_code_for_engine_error(&err);
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": err.to_string(),
+                    "command": "decisions record"
+                }),
+                code,
+            );
+        }
+    };
+
+    // Derive current state
+    let machine_state = match derive_machine_state(&header, &events) {
+        Some(ms) => ms,
+        None => {
+            exit_with_error(serde_json::json!({
+                "error": "corrupt state file: cannot derive current state",
+                "command": "decisions record"
+            }));
+        }
+    };
+
+    // Verify template hash
+    let template_bytes = match std::fs::read(&machine_state.template_path) {
+        Ok(b) => b,
+        Err(e) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!("failed to read template {}: {}", machine_state.template_path, e),
+                    "command": "decisions record"
+                }),
+                3,
+            );
+        }
+    };
+    let actual_hash = sha256_hex(&template_bytes);
+    if actual_hash != machine_state.template_hash {
+        exit_with_error_code(
+            serde_json::json!({
+                "error": format!(
+                    "template hash mismatch: header says {} but cached template hashes to {}",
+                    machine_state.template_hash, actual_hash
+                ),
+                "command": "decisions record"
+            }),
+            3,
+        );
+    }
+
+    // 3. Parse the JSON payload
+    let data: serde_json::Value = match serde_json::from_str(&with_data) {
+        Ok(v) => v,
+        Err(e) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!("invalid JSON in --with-data: {}", e),
+                    "command": "decisions record"
+                }),
+                2,
+            );
+        }
+    };
+
+    // 4. Validate the fixed decision schema
+    let obj = match data.as_object() {
+        Some(o) => o,
+        None => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": "decision payload must be a JSON object",
+                    "command": "decisions record"
+                }),
+                2,
+            );
+        }
+    };
+
+    // Validate "choice" (string, required)
+    match obj.get("choice") {
+        Some(v) if v.is_string() => {}
+        Some(_) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": "field \"choice\" must be a string",
+                    "command": "decisions record"
+                }),
+                2,
+            );
+        }
+        None => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": "missing required field \"choice\"",
+                    "command": "decisions record"
+                }),
+                2,
+            );
+        }
+    }
+
+    // Validate "rationale" (string, required)
+    match obj.get("rationale") {
+        Some(v) if v.is_string() => {}
+        Some(_) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": "field \"rationale\" must be a string",
+                    "command": "decisions record"
+                }),
+                2,
+            );
+        }
+        None => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": "missing required field \"rationale\"",
+                    "command": "decisions record"
+                }),
+                2,
+            );
+        }
+    }
+
+    // Validate "alternatives_considered" (array of strings, optional)
+    if let Some(alt) = obj.get("alternatives_considered") {
+        match alt.as_array() {
+            Some(arr) => {
+                for (i, item) in arr.iter().enumerate() {
+                    if !item.is_string() {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": format!("alternatives_considered[{}] must be a string", i),
+                                "command": "decisions record"
+                            }),
+                            2,
+                        );
+                    }
+                }
+            }
+            None => {
+                exit_with_error_code(
+                    serde_json::json!({
+                        "error": "field \"alternatives_considered\" must be an array of strings",
+                        "command": "decisions record"
+                    }),
+                    2,
+                );
+            }
+        }
+    }
+
+    // 5. Append DecisionRecorded event
+    let current_state = machine_state.current_state.clone();
+    let payload = EventPayload::DecisionRecorded {
+        state: current_state.clone(),
+        decision: data,
+    };
+    if let Err(e) = append_event(&state_path, &payload, &now_iso8601()) {
+        exit_with_error(serde_json::json!({
+            "error": e.to_string(),
+            "command": "decisions record"
+        }));
+    }
+
+    // 6. Count decisions in current epoch
+    let (_, updated_events) = match read_events(&state_path) {
+        Ok(result) => result,
+        Err(err) => {
+            let code = exit_code_for_engine_error(&err);
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": err.to_string(),
+                    "command": "decisions record"
+                }),
+                code,
+            );
+        }
+    };
+    let decision_count = derive_decisions(&updated_events).len();
+
+    // 7. Print confirmation
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "state": current_state,
+            "decisions_recorded": decision_count
+        }))?
+    );
+    Ok(())
+}
+
+/// Handle the `koto decisions list` command (stub).
+fn handle_decisions_list(_name: String) -> Result<()> {
+    exit_with_error_code(
+        serde_json::json!({
+            "error": "decisions list is not yet implemented",
+            "command": "decisions list"
+        }),
+        1,
     );
 }
 
