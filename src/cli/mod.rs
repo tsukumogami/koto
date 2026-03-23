@@ -478,7 +478,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
         IntegrationUnavailableMarker, NextError, NextErrorCode, NextResponse,
     };
     use crate::engine::advance::{
-        advance_until_stop, merge_epoch_evidence, IntegrationError, StopReason,
+        advance_until_stop, merge_epoch_evidence, ActionResult, IntegrationError, StopReason,
     };
     use crate::engine::evidence::validate_evidence;
     use crate::engine::persistence::derive_evidence;
@@ -889,6 +889,11 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
         Err(IntegrationError::Unavailable)
     };
 
+    let action_closure = |_state: &str,
+                          _action: &crate::template::types::ActionDecl,
+                          _has_evidence: bool|
+     -> ActionResult { ActionResult::Skipped };
+
     let result = advance_until_stop(
         current_state,
         &compiled,
@@ -896,6 +901,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
         &mut append_closure,
         &gate_closure,
         &integration_closure,
+        &action_closure,
         &shutdown,
     );
 
@@ -988,6 +994,25 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
                         integration: IntegrationUnavailableMarker {
                             name,
                             available: false,
+                        },
+                    }
+                }
+                StopReason::ActionRequiresConfirmation {
+                    state: action_state,
+                    exit_code: _,
+                    stdout: _,
+                    stderr: _,
+                } => {
+                    // Placeholder: Issue 3 will implement proper NextResponse mapping.
+                    // For now, stop and report as evidence-required so the agent can proceed.
+                    NextResponse::EvidenceRequired {
+                        state: action_state,
+                        directive: final_template_state.directive.clone(),
+                        advanced,
+                        expects: ExpectsSchema {
+                            event_type: "evidence_submitted".to_string(),
+                            fields: std::collections::BTreeMap::new(),
+                            options: vec![],
                         },
                     }
                 }

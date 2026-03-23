@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine::types::{Event, EventPayload};
 use crate::gate::GateResult;
-use crate::template::types::{CompiledTemplate, TemplateState};
+use crate::template::types::{ActionDecl, CompiledTemplate, TemplateState};
 
 /// Maximum number of transitions per invocation. Defense-in-depth against
 /// template bugs with hundreds of linearly chaining states.
@@ -24,6 +24,25 @@ pub enum TransitionResolution {
     Ambiguous(Vec<String>),
     /// The state has no transitions at all (dead-end, not terminal).
     NoTransitions,
+}
+
+/// Result of executing a default action.
+#[derive(Debug, Clone)]
+pub enum ActionResult {
+    /// Action executed successfully.
+    Executed {
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
+    /// Action was skipped (override evidence existed).
+    Skipped,
+    /// Action executed but requires user confirmation before continuing.
+    RequiresConfirmation {
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
 }
 
 /// Why the advancement loop stopped.
@@ -46,6 +65,13 @@ pub enum StopReason {
     CycleDetected { state: String },
     /// Safety limit: exceeded 100 transitions in one invocation.
     ChainLimitReached,
+    /// Action executed but requires user confirmation before continuing.
+    ActionRequiresConfirmation {
+        state: String,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
     /// SIGTERM or SIGINT received between iterations.
     SignalReceived,
 }
@@ -116,10 +142,10 @@ pub enum IntegrationError {
 ///
 /// The loop iterates states, checking each against stopping conditions in order:
 /// 1. Signal received (shutdown flag)
-/// 2. Cycle detected (visited-state set)
+/// 2. Chain limit check
 /// 3. Terminal state
-/// 4. Integration already invoked this epoch (re-invocation prevention)
-/// 5. Integration declared (invoke runner)
+/// 4. Integration declared (invoke runner)
+/// 5. Action execution (if state has default_action)
 /// 6. Gates (evaluate all, stop if any fail)
 /// 7. Transition resolution (match evidence against conditions)
 ///
@@ -127,19 +153,23 @@ pub enum IntegrationError {
 /// - `append_event`: persist a state transition event
 /// - `evaluate_gates`: run gate commands and return results
 /// - `invoke_integration`: call an integration runner
-pub fn advance_until_stop<F, G, I>(
+/// - `execute_action`: run a default action command
+#[allow(clippy::too_many_arguments)]
+pub fn advance_until_stop<F, G, I, A>(
     current_state: &str,
     template: &CompiledTemplate,
     evidence: &BTreeMap<String, serde_json::Value>,
     append_event: &mut F,
     evaluate_gates: &G,
     invoke_integration: &I,
+    execute_action: &A,
     shutdown: &AtomicBool,
 ) -> Result<AdvanceResult, AdvanceError>
 where
     F: FnMut(&EventPayload) -> Result<(), String>,
     G: Fn(&BTreeMap<String, crate::template::types::Gate>) -> BTreeMap<String, GateResult>,
     I: Fn(&str) -> Result<serde_json::Value, IntegrationError>,
+    A: Fn(&str, &ActionDecl, bool) -> ActionResult,
 {
     let mut visited = HashSet::new();
     let mut state = current_state.to_string();
@@ -224,7 +254,37 @@ where
             }
         }
 
-        // 5. Evaluate gates
+        // 5. Action execution (if state has default_action)
+        if let Some(action) = &template_state.default_action {
+            let has_evidence = !current_evidence.is_empty();
+            let result = execute_action(&state, action, has_evidence);
+            match result {
+                ActionResult::Executed { .. } => {
+                    // Continue to gate evaluation
+                }
+                ActionResult::Skipped => {
+                    // Continue to gate evaluation
+                }
+                ActionResult::RequiresConfirmation {
+                    exit_code,
+                    stdout,
+                    stderr,
+                } => {
+                    return Ok(AdvanceResult {
+                        final_state: state.clone(),
+                        advanced,
+                        stop_reason: StopReason::ActionRequiresConfirmation {
+                            state,
+                            exit_code,
+                            stdout,
+                            stderr,
+                        },
+                    });
+                }
+            }
+        }
+
+        // 6. Evaluate gates
         if !template_state.gates.is_empty() {
             let gate_results = evaluate_gates(&template_state.gates);
             let any_failed = gate_results
@@ -426,6 +486,14 @@ mod tests {
 
     fn unavailable_integration(_name: &str) -> Result<serde_json::Value, IntegrationError> {
         Err(IntegrationError::Unavailable)
+    }
+
+    fn noop_action(
+        _state: &str,
+        _action: &crate::template::types::ActionDecl,
+        _has_evidence: bool,
+    ) -> ActionResult {
+        ActionResult::Skipped
     }
 
     // -----------------------------------------------------------------------
@@ -713,6 +781,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -768,6 +837,7 @@ mod tests {
             &mut append,
             &gate_eval,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -805,6 +875,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -856,6 +927,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -901,6 +973,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -961,6 +1034,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -994,6 +1068,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -1055,6 +1130,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -1120,6 +1196,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -1128,5 +1205,348 @@ mod tests {
         assert_eq!(result.final_state, "middle");
         assert!(result.advanced);
         assert_eq!(result.stop_reason, StopReason::EvidenceRequired);
+    }
+
+    // -----------------------------------------------------------------------
+    // action closure tests
+    // -----------------------------------------------------------------------
+
+    fn make_action_decl(command: &str) -> ActionDecl {
+        ActionDecl {
+            command: command.to_string(),
+            working_dir: String::new(),
+            requires_confirmation: false,
+            polling: None,
+        }
+    }
+
+    #[test]
+    fn action_closure_called_when_state_has_default_action() {
+        use std::sync::atomic::AtomicUsize;
+
+        let call_count = AtomicUsize::new(0);
+
+        let template = make_template(vec![(
+            "act",
+            TemplateState {
+                directive: "Act.".to_string(),
+                transitions: vec![conditional(
+                    "done",
+                    vec![("result", serde_json::json!("ok"))],
+                )],
+                terminal: false,
+                gates: BTreeMap::new(),
+                accepts: None,
+                integration: None,
+                default_action: Some(make_action_decl("echo hello")),
+            },
+        )]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        let action = |_state: &str, _action: &ActionDecl, _has_evidence: bool| -> ActionResult {
+            call_count.fetch_add(1, Ordering::Relaxed);
+            ActionResult::Executed {
+                exit_code: 0,
+                stdout: "hello".to_string(),
+                stderr: String::new(),
+            }
+        };
+
+        let _result = advance_until_stop(
+            "act",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn action_closure_not_called_when_no_default_action() {
+        use std::sync::atomic::AtomicUsize;
+
+        let call_count = AtomicUsize::new(0);
+
+        let template = make_template(vec![(
+            "plain",
+            TemplateState {
+                directive: "Plain.".to_string(),
+                transitions: vec![conditional(
+                    "done",
+                    vec![("result", serde_json::json!("ok"))],
+                )],
+                terminal: false,
+                gates: BTreeMap::new(),
+                accepts: None,
+                integration: None,
+                default_action: None,
+            },
+        )]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        let action = |_state: &str, _action: &ActionDecl, _has_evidence: bool| -> ActionResult {
+            call_count.fetch_add(1, Ordering::Relaxed);
+            ActionResult::Skipped
+        };
+
+        let _result = advance_until_stop(
+            "plain",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(call_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn action_requires_confirmation_stops_loop() {
+        let template = make_template(vec![(
+            "confirm",
+            TemplateState {
+                directive: "Confirm.".to_string(),
+                transitions: vec![unconditional("next")],
+                terminal: false,
+                gates: BTreeMap::new(),
+                accepts: None,
+                integration: None,
+                default_action: Some(make_action_decl("create-pr")),
+            },
+        )]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        let action = |_state: &str, _action: &ActionDecl, _has_evidence: bool| -> ActionResult {
+            ActionResult::RequiresConfirmation {
+                exit_code: 0,
+                stdout: "PR #42 created".to_string(),
+                stderr: String::new(),
+            }
+        };
+
+        let result = advance_until_stop(
+            "confirm",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(result.final_state, "confirm");
+        assert!(!result.advanced);
+        match &result.stop_reason {
+            StopReason::ActionRequiresConfirmation {
+                state,
+                exit_code,
+                stdout,
+                ..
+            } => {
+                assert_eq!(state, "confirm");
+                assert_eq!(*exit_code, 0);
+                assert_eq!(stdout, "PR #42 created");
+            }
+            other => panic!("expected ActionRequiresConfirmation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn action_skipped_continues_to_gate_evaluation() {
+        use crate::template::types::Gate;
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "false".to_string(),
+                timeout: 0,
+            },
+        );
+
+        let template = make_template(vec![(
+            "gated_action",
+            TemplateState {
+                directive: "Gated action.".to_string(),
+                transitions: vec![unconditional("next")],
+                terminal: false,
+                gates,
+                accepts: None,
+                integration: None,
+                default_action: Some(make_action_decl("echo skip-me")),
+            },
+        )]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        // Action returns Skipped; gate blocks
+        let action = |_state: &str, _action: &ActionDecl, _has_evidence: bool| -> ActionResult {
+            ActionResult::Skipped
+        };
+
+        let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(name.clone(), GateResult::Failed { exit_code: 1 });
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "gated_action",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Action was skipped, but gate blocked
+        assert_eq!(result.final_state, "gated_action");
+        assert!(!result.advanced);
+        assert!(matches!(result.stop_reason, StopReason::GateBlocked(_)));
+    }
+
+    #[test]
+    fn action_executed_continues_to_gate_evaluation() {
+        let template = make_template(vec![
+            (
+                "act",
+                TemplateState {
+                    directive: "Act.".to_string(),
+                    transitions: vec![unconditional("done")],
+                    terminal: false,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: Some(make_action_decl("echo ok")),
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        let action = |_state: &str, _action: &ActionDecl, _has_evidence: bool| -> ActionResult {
+            ActionResult::Executed {
+                exit_code: 0,
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+            }
+        };
+
+        let result = advance_until_stop(
+            "act",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Action executed, gates passed, transitioned to terminal
+        assert_eq!(result.final_state, "done");
+        assert!(result.advanced);
+        assert_eq!(result.stop_reason, StopReason::Terminal);
+    }
+
+    #[test]
+    fn action_closure_receives_true_when_evidence_exists() {
+        use std::sync::atomic::AtomicBool as AB;
+
+        let received_has_evidence = AB::new(false);
+
+        let template = make_template(vec![
+            (
+                "check",
+                TemplateState {
+                    directive: "Check.".to_string(),
+                    transitions: vec![conditional(
+                        "done",
+                        vec![("result", serde_json::json!("ok"))],
+                    )],
+                    terminal: false,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: Some(make_action_decl("echo check")),
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        let mut evidence = BTreeMap::new();
+        evidence.insert("result".to_string(), serde_json::json!("ok"));
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        let action = |_state: &str, _action: &ActionDecl, has_evidence: bool| -> ActionResult {
+            received_has_evidence.store(has_evidence, Ordering::Relaxed);
+            ActionResult::Skipped
+        };
+
+        let _result = advance_until_stop(
+            "check",
+            &template,
+            &evidence,
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &shutdown,
+        )
+        .unwrap();
+
+        assert!(received_has_evidence.load(Ordering::Relaxed));
     }
 }
