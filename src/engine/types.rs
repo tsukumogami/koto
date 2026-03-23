@@ -31,7 +31,7 @@ pub enum EventPayload {
     WorkflowInitialized {
         template_path: String,
         #[serde(default)]
-        variables: HashMap<String, serde_json::Value>,
+        variables: HashMap<String, String>,
     },
     Transitioned {
         from: Option<String>,
@@ -221,7 +221,7 @@ impl<'de> Deserialize<'de> for Event {
 struct WorkflowInitializedPayload {
     template_path: String,
     #[serde(default)]
-    variables: HashMap<String, serde_json::Value>,
+    variables: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]

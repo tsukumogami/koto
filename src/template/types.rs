@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::substitute::extract_refs;
+
 /// A compiled template in FormatVersion=1 JSON format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompiledTemplate {
@@ -170,6 +172,28 @@ impl CompiledTemplate {
             }
             // Validate evidence routing rules on transitions.
             self.validate_evidence_routing(state_name, state)?;
+
+            // Validate variable references in directives.
+            for ref_name in extract_refs(&state.directive) {
+                if !self.variables.contains_key(&ref_name) {
+                    return Err(format!(
+                        "state '{}': variable reference '{{{{{}}}}}' is not declared in the template's variables block",
+                        state_name, ref_name
+                    ));
+                }
+            }
+
+            // Validate variable references in gate commands.
+            for gate in state.gates.values() {
+                for ref_name in extract_refs(&gate.command) {
+                    if !self.variables.contains_key(&ref_name) {
+                        return Err(format!(
+                            "state '{}': variable reference '{{{{{}}}}}' is not declared in the template's variables block",
+                            state_name, ref_name
+                        ));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -785,6 +809,89 @@ mod tests {
         );
         state.accepts = Some(accepts);
         // No when condition -- unconditional transition is fine.
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_undeclared_variable_ref_in_directive() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.directive = "Do {{TASK}} now".to_string();
+        // No variable declared for TASK
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("variable reference '{{TASK}}'"),
+            "got: {}",
+            err
+        );
+        assert!(err.contains("not declared"), "got: {}", err);
+    }
+
+    #[test]
+    fn accepts_declared_variable_ref_in_directive() {
+        let mut t = minimal_template();
+        t.variables.insert(
+            "TASK".to_string(),
+            VariableDecl {
+                description: String::new(),
+                required: true,
+                default: String::new(),
+            },
+        );
+        let state = t.states.get_mut("start").unwrap();
+        state.directive = "Do {{TASK}} now".to_string();
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_undeclared_variable_ref_in_gate_command() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_COMMAND.to_string(),
+                command: "echo {{MISSING}}".to_string(),
+                timeout: 0,
+            },
+        );
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("variable reference '{{MISSING}}'"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn accepts_declared_variable_ref_in_gate_command() {
+        let mut t = minimal_template();
+        t.variables.insert(
+            "BRANCH".to_string(),
+            VariableDecl {
+                description: String::new(),
+                required: false,
+                default: "main".to_string(),
+            },
+        );
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_COMMAND.to_string(),
+                command: "git checkout {{BRANCH}}".to_string(),
+                timeout: 0,
+            },
+        );
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn lowercase_braces_not_treated_as_variable_refs() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.directive = "Use {{name}} style".to_string();
+        // Lowercase is not a variable ref, should pass without declaring it
         t.validate().unwrap();
     }
 }
