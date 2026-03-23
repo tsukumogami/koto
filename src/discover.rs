@@ -6,9 +6,66 @@ use crate::engine::types::WorkflowMetadata;
 const PREFIX: &str = "koto-";
 const SUFFIX: &str = ".state.jsonl";
 
+/// Maximum allowed workflow name length.
+const MAX_NAME_LENGTH: usize = 255;
+
+/// Validate a workflow name against a strict pattern.
+///
+/// Security: workflow names are interpolated into state file paths
+/// (`koto-<name>.state.jsonl`). An unvalidated name could write files
+/// outside the intended directory via path traversal (e.g., `../../etc/passwd`).
+/// This function rejects any name that doesn't match the safe pattern.
+///
+/// Rules:
+/// - Must start with an alphanumeric character
+/// - May contain alphanumeric characters, hyphens, dots, and underscores
+/// - Must not be empty or exceed 255 characters
+/// - Must not contain path separators, null bytes, or leading dots
+pub fn validate_workflow_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("workflow name must not be empty".to_string());
+    }
+
+    if name.len() > MAX_NAME_LENGTH {
+        return Err(format!(
+            "workflow name must not exceed {} characters",
+            MAX_NAME_LENGTH
+        ));
+    }
+
+    // Check for null bytes (not caught by the regex)
+    if name.bytes().any(|b| b == 0) {
+        return Err("workflow name must not contain null bytes".to_string());
+    }
+
+    // Validate against strict pattern: starts with alphanumeric, then
+    // alphanumeric, hyphens, dots, or underscores.
+    let valid = name.chars().enumerate().all(|(i, c)| {
+        if i == 0 {
+            c.is_ascii_alphanumeric()
+        } else {
+            c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_'
+        }
+    });
+
+    if !valid {
+        return Err(format!(
+            "workflow name '{}' contains invalid characters; allowed pattern: \
+             starts with [a-zA-Z0-9], followed by [a-zA-Z0-9._-]",
+            // Truncate long names in error messages to avoid terminal issues
+            if name.len() > 50 { &name[..50] } else { name }
+        ));
+    }
+
+    Ok(())
+}
+
 /// Return the canonical state file path for a workflow named `name` in `dir`.
 ///
 /// Path format: `<dir>/koto-<name>.state.jsonl`
+///
+/// Callers should validate `name` with `validate_workflow_name()` before
+/// calling this function to prevent path traversal.
 pub fn workflow_state_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{}{}{}", PREFIX, name, SUFFIX))
 }
@@ -159,6 +216,77 @@ mod tests {
         let results = find_workflows_with_metadata(dir.path()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "valid");
+    }
+
+    // -------------------------------------------------------------------
+    // Workflow name validation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn valid_workflow_names() {
+        for name in &["my-workflow", "work-on-42", "a", "A1.b_c", "test.name", "Z"] {
+            assert!(
+                validate_workflow_name(name).is_ok(),
+                "'{}' should be valid",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_name() {
+        assert!(validate_workflow_name("").is_err());
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        for name in &["../etc", "foo/bar", "..\\windows", "foo\\bar"] {
+            assert!(
+                validate_workflow_name(name).is_err(),
+                "'{}' should be rejected (path traversal)",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_leading_dot() {
+        assert!(validate_workflow_name(".hidden").is_err());
+    }
+
+    #[test]
+    fn rejects_leading_dash() {
+        assert!(validate_workflow_name("-leading-dash").is_err());
+    }
+
+    #[test]
+    fn rejects_spaces() {
+        assert!(validate_workflow_name("has space").is_err());
+    }
+
+    #[test]
+    fn rejects_shell_metacharacters() {
+        for name in &["meta$char", "back`tick", "semi;colon", "pipe|char", "amp&"] {
+            assert!(
+                validate_workflow_name(name).is_err(),
+                "'{}' should be rejected (metacharacter)",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_exceeding_max_length() {
+        let long_name = "a".repeat(256);
+        assert!(validate_workflow_name(&long_name).is_err());
+        // 255 should be fine
+        let max_name = "a".repeat(255);
+        assert!(validate_workflow_name(&max_name).is_ok());
+    }
+
+    #[test]
+    fn rejects_null_bytes() {
+        assert!(validate_workflow_name("foo\0bar").is_err());
     }
 
     #[test]

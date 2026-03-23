@@ -291,11 +291,19 @@ where
                 .values()
                 .any(|r| !matches!(r, GateResult::Passed));
             if any_failed {
-                return Ok(AdvanceResult {
-                    final_state: state,
-                    advanced,
-                    stop_reason: StopReason::GateBlocked(gate_results),
-                });
+                // If the state has an accepts block, fall through to transition
+                // resolution instead of returning GateBlocked. The transition
+                // resolver will return NeedsEvidence since no evidence matches,
+                // giving the agent a chance to provide override or recovery input.
+                if template_state.accepts.is_none() {
+                    return Ok(AdvanceResult {
+                        final_state: state,
+                        advanced,
+                        stop_reason: StopReason::GateBlocked(gate_results),
+                    });
+                }
+                // Fall through to step 6 (transition resolution) for states
+                // with both gates and accepts blocks.
             }
         }
 

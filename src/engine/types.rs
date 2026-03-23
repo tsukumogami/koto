@@ -66,6 +66,10 @@ pub enum EventPayload {
         stdout: String,
         stderr: String,
     },
+    DecisionRecorded {
+        state: String,
+        decision: serde_json::Value,
+    },
 }
 
 impl EventPayload {
@@ -80,6 +84,7 @@ impl EventPayload {
             EventPayload::Rewound { .. } => "rewound",
             EventPayload::WorkflowCancelled { .. } => "workflow_cancelled",
             EventPayload::DefaultActionExecuted { .. } => "default_action_executed",
+            EventPayload::DecisionRecorded { .. } => "decision_recorded",
         }
     }
 }
@@ -218,6 +223,14 @@ impl<'de> Deserialize<'de> for Event {
                     stderr: p.stderr,
                 }
             }
+            "decision_recorded" => {
+                let p: DecisionRecordedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::DecisionRecorded {
+                    state: p.state,
+                    decision: p.decision,
+                }
+            }
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown event type: {}",
@@ -288,6 +301,12 @@ struct DefaultActionExecutedPayload {
     exit_code: i32,
     stdout: String,
     stderr: String,
+}
+
+#[derive(Deserialize)]
+struct DecisionRecordedPayload {
+    state: String,
+    decision: serde_json::Value,
 }
 
 /// Metadata about a workflow, derived from the state file header.
@@ -486,6 +505,28 @@ mod tests {
         let ms2: MachineState = serde_json::from_str(&json).unwrap();
         assert_eq!(ms2.current_state, "plan");
         assert_eq!(ms2.template_hash, "abc123");
+    }
+
+    #[test]
+    fn event_decision_recorded_round_trip() {
+        let e = Event {
+            seq: 5,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "decision_recorded".to_string(),
+            payload: EventPayload::DecisionRecorded {
+                state: "implementation".to_string(),
+                decision: serde_json::json!({
+                    "choice": "Use retry with backoff",
+                    "rationale": "The API has no batch endpoint",
+                    "alternatives_considered": ["Parallel requests", "Queue-based processing"]
+                }),
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"type\":\"decision_recorded\""));
+        assert!(json.contains("\"choice\":\"Use retry with backoff\""));
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
     }
 
     #[test]

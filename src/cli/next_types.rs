@@ -5,6 +5,15 @@ use serde::Serialize;
 
 use crate::template::types::TemplateState;
 
+/// Summary of a recorded decision, used in `koto decisions list` responses.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DecisionSummary {
+    pub choice: String,
+    pub rationale: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alternatives_considered: Option<Vec<String>>,
+}
+
 /// The five possible responses from `koto next`.
 ///
 /// Each variant maps 1:1 to a JSON output shape. Custom `Serialize`
