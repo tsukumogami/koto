@@ -2140,3 +2140,270 @@ fn init_no_variables_with_flags_fails() {
         err
     );
 }
+
+// ---------------------------------------------------------------------------
+// next: variable substitution
+// ---------------------------------------------------------------------------
+
+/// Helper to init a workflow with --var flags.
+fn init_workflow_with_vars(dir: &Path, name: &str, template_content: &str, vars: &[&str]) {
+    let src = dir.join(format!("{}-template.md", name));
+    std::fs::write(&src, template_content).unwrap();
+
+    let mut args = vec!["init", name, "--template", src.to_str().unwrap()];
+    for var in vars {
+        args.push("--var");
+        args.push(var);
+    }
+
+    let output = koto().current_dir(dir).args(&args).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Template with a gate whose command uses a variable reference.
+fn template_with_var_gate() -> String {
+    r#"---
+name: var-gate-workflow
+version: "1.0"
+initial_state: start
+variables:
+  TASK_ID:
+    description: "Task identifier"
+    required: true
+states:
+  start:
+    gates:
+      check:
+        type: command
+        command: "test -f /tmp/koto-test-{{TASK_ID}}"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Work on task {{TASK_ID}}.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+/// Template with variables in directive text and a direct transition path.
+fn template_with_var_directive() -> String {
+    r#"---
+name: var-directive-workflow
+version: "1.0"
+initial_state: start
+variables:
+  OWNER:
+    description: "Repository owner"
+    required: true
+  REPO:
+    description: "Repository name"
+    required: true
+states:
+  start:
+    accepts:
+      decision:
+        type: enum
+        required: true
+        values: [proceed, skip]
+    transitions:
+      - target: work
+        when:
+          decision: proceed
+      - target: done
+        when:
+          decision: skip
+  work:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Review {{OWNER}}/{{REPO}} and decide.
+
+## work
+
+Implement changes for {{OWNER}}/{{REPO}}.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn next_var_gate_evaluates_with_substituted_command() {
+    let dir = TempDir::new().unwrap();
+
+    // Create the sentinel file that the gate checks for.
+    let sentinel = "/tmp/koto-test-42";
+    std::fs::write(sentinel, "").unwrap();
+
+    init_workflow_with_vars(
+        dir.path(),
+        "var-gate-wf",
+        &template_with_var_gate(),
+        &["TASK_ID=42"],
+    );
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "var-gate-wf"])
+        .output()
+        .unwrap();
+
+    // Clean up sentinel file.
+    let _ = std::fs::remove_file(sentinel);
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("next output should be valid JSON");
+
+    // The gate should pass (file exists), so the workflow auto-advances to done.
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "gate should pass with substituted path, auto-advance to done"
+    );
+}
+
+#[test]
+fn next_var_gate_fails_when_substituted_path_missing() {
+    let dir = TempDir::new().unwrap();
+
+    // Don't create the sentinel file -- the gate should fail.
+    let sentinel = "/tmp/koto-test-99999";
+    let _ = std::fs::remove_file(sentinel); // ensure it doesn't exist
+
+    init_workflow_with_vars(
+        dir.path(),
+        "var-gate-fail-wf",
+        &template_with_var_gate(),
+        &["TASK_ID=99999"],
+    );
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "var-gate-fail-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gate_blocked exits 0, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("next output should be valid JSON");
+
+    // Should be blocked at start because the gate fails.
+    assert_eq!(json["state"].as_str(), Some("start"));
+    assert!(
+        json["blocking_conditions"].is_array(),
+        "should have blocking_conditions"
+    );
+
+    // The directive should have the substituted variable value.
+    assert_eq!(
+        json["directive"].as_str(),
+        Some("Work on task 99999."),
+        "directive should contain substituted variable"
+    );
+}
+
+#[test]
+fn next_var_directive_contains_substituted_values() {
+    let dir = TempDir::new().unwrap();
+
+    init_workflow_with_vars(
+        dir.path(),
+        "var-dir-wf",
+        &template_with_var_directive(),
+        &["OWNER=acme", "REPO=widgets"],
+    );
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "var-dir-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("next output should be valid JSON");
+
+    // State should be "start" (needs evidence, no auto-advance).
+    assert_eq!(json["state"].as_str(), Some("start"));
+    assert_eq!(
+        json["directive"].as_str(),
+        Some("Review acme/widgets and decide."),
+        "directive should contain substituted variable values"
+    );
+}
+
+#[test]
+fn next_var_to_directed_transition_substitutes_directive() {
+    let dir = TempDir::new().unwrap();
+
+    init_workflow_with_vars(
+        dir.path(),
+        "var-to-wf",
+        &template_with_var_directive(),
+        &["OWNER=acme", "REPO=widgets"],
+    );
+
+    // Use --to to direct transition from start to work.
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["next", "var-to-wf", "--to", "work"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next --to should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("next output should be valid JSON");
+
+    assert_eq!(json["state"].as_str(), Some("work"));
+    assert_eq!(
+        json["directive"].as_str(),
+        Some("Implement changes for acme/widgets."),
+        "directed transition directive should contain substituted values"
+    );
+}

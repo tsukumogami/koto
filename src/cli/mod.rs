@@ -482,6 +482,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
     };
     use crate::engine::evidence::validate_evidence;
     use crate::engine::persistence::derive_evidence;
+    use crate::engine::substitute::Variables;
     use crate::gate::{evaluate_gates, GateResult};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -561,6 +562,21 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
         let json = serde_json::json!({"error": err});
         exit_with_error_code(json, err.code.exit_code());
     }
+
+    // Construct variable bindings from the WorkflowInitialized event.
+    // Re-validates values as defense in depth; exits with infrastructure error on failure.
+    let variables = match Variables::from_events(&events) {
+        Ok(v) => v,
+        Err(e) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!("variable re-validation failed: {}", e),
+                    "command": "next"
+                }),
+                EXIT_INFRASTRUCTURE,
+            );
+        }
+    };
 
     let machine_state = match derive_machine_state(&header, &events) {
         Some(ms) => ms,
@@ -679,6 +695,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
 
         match dispatch_next(target, target_template_state, true, &gate_results) {
             Ok(resp) => {
+                let resp = resp.with_substituted_directive(|d| variables.substitute(d));
                 println!("{}", serde_json::to_string(&resp)?);
                 std::process::exit(0);
             }
@@ -854,10 +871,19 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
             .map_err(|e| e.to_string())
     };
 
-    let gate_closure = |gates: &std::collections::BTreeMap<
-        String,
-        crate::template::types::Gate,
-    >| { evaluate_gates(gates, &current_dir) };
+    let gate_closure =
+        |gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
+            let substituted: std::collections::BTreeMap<String, crate::template::types::Gate> =
+                gates
+                    .iter()
+                    .map(|(name, gate)| {
+                        let mut g = gate.clone();
+                        g.command = variables.substitute(&g.command);
+                        (name.clone(), g)
+                    })
+                    .collect();
+            evaluate_gates(&substituted, &current_dir)
+        };
 
     let integration_closure = |_name: &str| -> Result<serde_json::Value, IntegrationError> {
         Err(IntegrationError::Unavailable)
@@ -1017,6 +1043,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
                 }
             };
 
+            let resp = resp.with_substituted_directive(|d| variables.substitute(d));
             println!("{}", serde_json::to_string(&resp)?);
             std::process::exit(0);
         }

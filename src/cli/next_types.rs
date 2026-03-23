@@ -45,6 +45,67 @@ pub enum NextResponse {
     },
 }
 
+impl NextResponse {
+    /// Return a new `NextResponse` with the directive field substituted using the
+    /// given function. Terminal variants have no directive and are returned unchanged.
+    pub fn with_substituted_directive<F>(self, f: F) -> Self
+    where
+        F: Fn(&str) -> String,
+    {
+        match self {
+            NextResponse::EvidenceRequired {
+                state,
+                directive,
+                advanced,
+                expects,
+            } => NextResponse::EvidenceRequired {
+                state,
+                directive: f(&directive),
+                advanced,
+                expects,
+            },
+            NextResponse::GateBlocked {
+                state,
+                directive,
+                advanced,
+                blocking_conditions,
+            } => NextResponse::GateBlocked {
+                state,
+                directive: f(&directive),
+                advanced,
+                blocking_conditions,
+            },
+            NextResponse::Integration {
+                state,
+                directive,
+                advanced,
+                expects,
+                integration,
+            } => NextResponse::Integration {
+                state,
+                directive: f(&directive),
+                advanced,
+                expects,
+                integration,
+            },
+            NextResponse::IntegrationUnavailable {
+                state,
+                directive,
+                advanced,
+                expects,
+                integration,
+            } => NextResponse::IntegrationUnavailable {
+                state,
+                directive: f(&directive),
+                advanced,
+                expects,
+                integration,
+            },
+            terminal @ NextResponse::Terminal { .. } => terminal,
+        }
+    }
+}
+
 impl Serialize for NextResponse {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
