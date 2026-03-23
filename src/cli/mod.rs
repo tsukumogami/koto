@@ -1523,15 +1523,60 @@ fn handle_decisions_record(name: String, with_data: String) -> Result<()> {
     Ok(())
 }
 
-/// Handle the `koto decisions list` command (stub).
-fn handle_decisions_list(_name: String) -> Result<()> {
-    exit_with_error_code(
-        serde_json::json!({
-            "error": "decisions list is not yet implemented",
-            "command": "decisions list"
-        }),
-        1,
+/// Handle the `koto decisions list` command.
+///
+/// Returns accumulated decisions for the current state's epoch as a
+/// standalone JSON response.
+fn handle_decisions_list(name: String) -> Result<()> {
+    let current_dir = std::env::current_dir()?;
+    let state_path = workflow_state_path(&current_dir, &name);
+
+    if !state_path.exists() {
+        exit_with_error_code(
+            serde_json::json!({
+                "error": format!("no state file found for workflow '{}'", name),
+                "command": "decisions list"
+            }),
+            2,
+        );
+    }
+
+    let (_, events) = match read_events(&state_path) {
+        Ok(result) => result,
+        Err(err) => {
+            let code = exit_code_for_engine_error(&err);
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": err.to_string(),
+                    "command": "decisions list"
+                }),
+                code,
+            );
+        }
+    };
+
+    let current_state = derive_state_from_log(&events).unwrap_or_default();
+    let decision_events = derive_decisions(&events);
+
+    let items: Vec<serde_json::Value> = decision_events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::DecisionRecorded { decision, .. } => Some(decision.clone()),
+            _ => None,
+        })
+        .collect();
+
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "state": current_state,
+            "decisions": {
+                "count": items.len(),
+                "items": items
+            }
+        }))?
     );
+    Ok(())
 }
 
 /// Handle the `koto cancel` command.
