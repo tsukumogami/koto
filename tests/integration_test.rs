@@ -6,6 +6,39 @@ fn koto() -> Command {
     Command::cargo_bin("koto").unwrap()
 }
 
+fn template_with_variables() -> &'static str {
+    r#"---
+name: var-workflow
+version: "1.0"
+initial_state: start
+variables:
+  OWNER:
+    description: "Repository owner"
+    required: true
+  REPO:
+    description: "Repository name"
+    required: true
+  BRANCH:
+    description: "Branch name"
+    default: "main"
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Work on {{OWNER}}/{{REPO}} branch {{BRANCH}}.
+
+## done
+
+All done.
+"#
+}
+
 fn minimal_template() -> &'static str {
     r#"---
 name: test-workflow
@@ -33,6 +66,13 @@ All done.
 fn write_template_source(dir: &Path) -> std::path::PathBuf {
     let src = dir.join("test-template.md");
     std::fs::write(&src, minimal_template()).unwrap();
+    src
+}
+
+/// Write the variable template source to a file in `dir` and return its path.
+fn write_var_template_source(dir: &Path) -> std::path::PathBuf {
+    let src = dir.join("var-template.md");
+    std::fs::write(&src, template_with_variables()).unwrap();
     src
 }
 
@@ -1801,5 +1841,302 @@ fn gate_timeout_returns_gate_blocked() {
         conditions[0]["status"].as_str(),
         Some("timed_out"),
         "gate should have timed out, not failed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// init --var
+// ---------------------------------------------------------------------------
+
+#[test]
+fn init_var_valid_vars_stored_in_event() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "init with valid vars should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify the variables are stored in the workflow_initialized event.
+    let state_path = dir.path().join("koto-var-wf.state.jsonl");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    // Line 0 = header, line 1 = workflow_initialized event.
+    let init_event: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let vars = init_event["payload"]["variables"].as_object().unwrap();
+    assert_eq!(vars["OWNER"].as_str(), Some("acme"));
+    assert_eq!(vars["REPO"].as_str(), Some("widgets"));
+    // BRANCH should get its default value.
+    assert_eq!(vars["BRANCH"].as_str(), Some("main"));
+}
+
+#[test]
+fn init_var_missing_equals_fails() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+            "--var",
+            "BADFORMAT",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "missing = should fail");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("expected KEY=VALUE"),
+        "error should mention KEY=VALUE format, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_var_duplicate_key_fails() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+            "--var",
+            "OWNER=other",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "duplicate key should fail");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("duplicate"),
+        "error should mention duplicate, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_var_unknown_key_fails() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+            "--var",
+            "UNKNOWN=val",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "unknown key should fail");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("unknown variable"),
+        "error should mention unknown variable, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_var_missing_required_fails() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    // Only provide OWNER but not REPO (both required).
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "missing required variable should fail"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("missing required variable"),
+        "error should mention missing required, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_var_default_applied_for_optional() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    // Provide only the two required vars; BRANCH has a default.
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "init with defaults should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state_path = dir.path().join("koto-var-wf.state.jsonl");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    let init_event: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let vars = init_event["payload"]["variables"].as_object().unwrap();
+    assert_eq!(
+        vars["BRANCH"].as_str(),
+        Some("main"),
+        "BRANCH should use its default value"
+    );
+}
+
+#[test]
+fn init_var_forbidden_chars_fail() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme corp",
+            "--var",
+            "REPO=widgets",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "forbidden characters in value should fail"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("not allowed"),
+        "error should mention not allowed, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_no_variables_no_flags_works() {
+    // The minimal template has no variables block. Init without --var should work.
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args(["init", "no-var-wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "init without vars on no-variables template should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn init_no_variables_with_flags_fails() {
+    // The minimal template has no variables block. Passing --var should fail (unknown keys).
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "no-var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "FOO=bar",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "passing --var to a template with no variables should fail"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("unknown variable"),
+        "error should mention unknown variable, got: {}",
+        err
     );
 }

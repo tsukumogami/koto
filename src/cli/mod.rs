@@ -1,11 +1,14 @@
 pub mod next;
 pub mod next_types;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+
+use crate::engine::substitute::validate_value;
+use crate::template::types::VariableDecl;
 
 use crate::buildinfo;
 use crate::cache::{compile_cached, sha256_hex};
@@ -53,6 +56,10 @@ pub enum Command {
         /// Path to template file
         #[arg(long)]
         template: String,
+
+        /// Set a template variable (repeatable)
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
     },
 
     /// Get the current state directive for a workflow
@@ -145,6 +152,71 @@ fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
     }
 }
 
+/// Validate and resolve `--var KEY=VALUE` arguments against the template's
+/// variable declarations. Returns a map of resolved variable bindings ready
+/// for storage in the WorkflowInitialized event.
+fn resolve_variables(
+    raw_vars: &[String],
+    declarations: &BTreeMap<String, VariableDecl>,
+) -> std::result::Result<HashMap<String, String>, String> {
+    let mut provided: HashMap<String, String> = HashMap::new();
+
+    // 1. Parse each --var string and reject duplicates.
+    for entry in raw_vars {
+        let eq_pos = entry
+            .find('=')
+            .ok_or_else(|| format!("invalid --var format {:?}: expected KEY=VALUE", entry))?;
+        let key = &entry[..eq_pos];
+        let value = &entry[eq_pos + 1..];
+
+        if key.is_empty() {
+            return Err(format!(
+                "invalid --var format {:?}: key must not be empty",
+                entry
+            ));
+        }
+
+        if provided.contains_key(key) {
+            return Err(format!("duplicate --var key {:?}", key));
+        }
+
+        // Reject keys not declared in the template.
+        if !declarations.contains_key(key) {
+            return Err(format!(
+                "unknown variable {:?}: not declared in template",
+                key
+            ));
+        }
+
+        provided.insert(key.to_string(), value.to_string());
+    }
+
+    // 2. Resolve all declared variables: --var value > default > error if required.
+    let mut resolved: HashMap<String, String> = HashMap::new();
+    for (key, decl) in declarations {
+        let value = if let Some(v) = provided.get(key) {
+            v.clone()
+        } else if !decl.default.is_empty() {
+            decl.default.clone()
+        } else if decl.required {
+            return Err(format!(
+                "missing required variable {:?}: provide --var {}=VALUE",
+                key, key
+            ));
+        } else {
+            // Not required, no default, not provided -- skip.
+            continue;
+        };
+
+        // 3. Validate the value against the allowlist.
+        validate_value(key, &value).map_err(|e| e.to_string())?;
+
+        resolved.insert(key.clone(), value);
+    }
+
+    Ok(resolved)
+}
+
 pub fn run(app: App) -> Result<()> {
     match app.command {
         Command::Version => {
@@ -152,7 +224,11 @@ pub fn run(app: App) -> Result<()> {
             println!("{}", serde_json::to_string(&info)?);
             Ok(())
         }
-        Command::Init { name, template } => {
+        Command::Init {
+            name,
+            template,
+            vars,
+        } => {
             let current_dir = std::env::current_dir()?;
             let state_path = workflow_state_path(&current_dir, &name);
 
@@ -184,6 +260,20 @@ pub fn run(app: App) -> Result<()> {
                 }
             };
 
+            // Resolve --var flags against template variable declarations.
+            let variables = match resolve_variables(&vars, &compiled.variables) {
+                Ok(v) => v,
+                Err(e) => {
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": e,
+                            "command": "init"
+                        }),
+                        2,
+                    );
+                }
+            };
+
             let initial_state = compiled.initial_state.clone();
             let ts = now_iso8601();
 
@@ -204,7 +294,7 @@ pub fn run(app: App) -> Result<()> {
             // Write workflow_initialized event (seq 1)
             let init_payload = EventPayload::WorkflowInitialized {
                 template_path: cache_path_str,
-                variables: HashMap::new(),
+                variables,
             };
             if let Err(e) = append_event(&state_path, &init_payload, &ts) {
                 exit_with_error(serde_json::json!({
