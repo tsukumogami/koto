@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 spawned_from:
   issue: 71
   repo: tsukumogami/koto
