@@ -32,7 +32,7 @@ exist. The three needs-design issues will spawn child design docs and milestones
 | # | Issue | Dependencies | Complexity | Labels |
 |---|-------|-------------|------------|--------|
 | ~~1~~ | ~~[#67: feat(engine): implement template variable substitution (`--var`)](https://github.com/tsukumogami/koto/issues/67)~~ | ~~None~~ | ~~testable~~ | ~~needs-design~~ |
-| | ~~^_Child: [DESIGN-template-variable-substitution.md](../designs/DESIGN-template-variable-substitution.md)_~~ | | | |
+| | ~~^_Child: [DESIGN-template-variable-substitution.md](../designs/current/DESIGN-template-variable-substitution.md)_~~ | | | |
 | 2 | [#71: feat(engine): implement default action execution](https://github.com/tsukumogami/koto/issues/71) | ~~[#67](https://github.com/tsukumogami/koto/issues/67)~~ | testable | needs-design |
 | 3 | [#68: feat(engine): implement mid-state decision capture](https://github.com/tsukumogami/koto/issues/68) | None | testable | needs-design |
 | 4 | [#69: feat(engine): implement gate-with-evidence-fallback](https://github.com/tsukumogami/koto/issues/69) | None | testable | |
