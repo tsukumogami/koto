@@ -31,8 +31,8 @@ exist. The three needs-design issues will spawn child design docs and milestones
 
 | # | Issue | Dependencies | Complexity | Labels |
 |---|-------|-------------|------------|--------|
-| 1 | [#67: feat(engine): implement template variable substitution (`--var`)](https://github.com/tsukumogami/koto/issues/67) | None | testable | needs-design |
-| 2 | [#71: feat(engine): implement default action execution](https://github.com/tsukumogami/koto/issues/71) | [#67](https://github.com/tsukumogami/koto/issues/67) | testable | needs-design |
+| 1 | ~~[#67: feat(engine): implement template variable substitution (`--var`)](https://github.com/tsukumogami/koto/issues/67)~~ | None | testable | done |
+| 2 | ~~[#71: feat(engine): implement default action execution](https://github.com/tsukumogami/koto/issues/71)~~ | ~~[#67](https://github.com/tsukumogami/koto/issues/67)~~ | testable | done |
 | 3 | ~~[#68: feat(engine): implement mid-state decision capture](https://github.com/tsukumogami/koto/issues/68)~~ | None | testable | ~~needs-design~~ done |
 | 4 | ~~[#69: feat(engine): implement gate-with-evidence-fallback](https://github.com/tsukumogami/koto/issues/69)~~ | None | testable | done |
 | 5 | ~~[#70: feat(engine): validate workflow names at init time](https://github.com/tsukumogami/koto/issues/70)~~ | None | critical | done |
@@ -74,10 +74,9 @@ graph TD
     classDef tracksDesign fill:#8250df,stroke:#6639ba,color:white,stroke-dasharray: 5 5
     classDef tracksPlan fill:#0969da,stroke:#0550ae,color:white,stroke-dasharray: 5 5
 
-    class I68,I69,I70 done
-    class I67 needsDesign
-    class I71 needsDesign
-    class I72,I73,I74 blocked
+    class I67,I68,I69,I70,I71 done
+    class I72 ready
+    class I73,I74 blocked
 ```
 
 **Legend**: Green = done, Purple = needs-design, Blue = ready, Yellow = blocked
@@ -86,14 +85,14 @@ graph TD
 
 **Critical path**: #67 (--var) → #71 (default execution) → #72 (template) → #73 (skill) → #74 (docs)
 
-**Wave 1** (parallel):
+**Wave 1** (all done):
+- ~~[#67](https://github.com/tsukumogami/koto/issues/67): --var substitution~~ -- done
 - ~~[#68](https://github.com/tsukumogami/koto/issues/68): mid-state decision capture~~ -- done (PR #76)
 - ~~[#69](https://github.com/tsukumogami/koto/issues/69): gate-with-evidence-fallback~~ -- done (PR #76)
 - ~~[#70](https://github.com/tsukumogami/koto/issues/70): workflow name validation~~ -- done (PR #76)
-- [#67](https://github.com/tsukumogami/koto/issues/67): --var substitution (needs-design — spawn child design)
 
-**Wave 2** (after #67 completes):
-- [#71](https://github.com/tsukumogami/koto/issues/71): default action execution (needs-design — depends on #67's substitution interface)
+**Wave 2** (done):
+- ~~[#71](https://github.com/tsukumogami/koto/issues/71): default action execution~~ -- done
 
 **Wave 3** (after all platform capabilities):
 - [#72](https://github.com/tsukumogami/koto/issues/72): work-on template
