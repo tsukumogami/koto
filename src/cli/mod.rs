@@ -569,10 +569,9 @@ pub fn run(app: App) -> Result<()> {
             }
         },
         Command::Decisions { subcommand } => match subcommand {
-            DecisionsSubcommand::Record {
-                name,
-                with_data,
-            } => handle_decisions_record(name, with_data),
+            DecisionsSubcommand::Record { name, with_data } => {
+                handle_decisions_record(name, with_data)
+            }
             DecisionsSubcommand::List { name } => handle_decisions_list(name),
         },
     }
