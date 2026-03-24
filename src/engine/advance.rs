@@ -285,6 +285,7 @@ where
         }
 
         // 6. Evaluate gates
+        let mut gates_failed = false;
         if !template_state.gates.is_empty() {
             let gate_results = evaluate_gates(&template_state.gates);
             let any_failed = gate_results
@@ -293,8 +294,8 @@ where
             if any_failed {
                 // If the state has an accepts block, fall through to transition
                 // resolution instead of returning GateBlocked. The transition
-                // resolver will return NeedsEvidence since no evidence matches,
-                // giving the agent a chance to provide override or recovery input.
+                // resolver will skip unconditional transitions when gate_failed
+                // is true, ensuring the agent must submit evidence.
                 if template_state.accepts.is_none() {
                     return Ok(AdvanceResult {
                         final_state: state,
@@ -302,13 +303,13 @@ where
                         stop_reason: StopReason::GateBlocked(gate_results),
                     });
                 }
-                // Fall through to step 6 (transition resolution) for states
-                // with both gates and accepts blocks.
+                gates_failed = true;
+                // Fall through to transition resolution with gate_failed=true.
             }
         }
 
-        // 6. Resolve transition
-        match resolve_transition(template_state, &current_evidence) {
+        // 7. Resolve transition
+        match resolve_transition(template_state, &current_evidence, gates_failed) {
             TransitionResolution::Resolved(target) => {
                 // Check for cycle before transitioning
                 if visited.contains(&target) {
@@ -363,12 +364,20 @@ where
 /// 2. For each, check if ALL `when` fields match the evidence (exact JSON equality)
 /// 3. If exactly one matches, return `Resolved(target)`
 /// 4. If multiple match, return `Ambiguous(targets)`
-/// 5. If none match and an unconditional transition exists, return `Resolved(fallback)`
+/// 5. If none match and an unconditional transition exists:
+///    - If `gate_failed` is false, return `Resolved(fallback)` (auto-advance)
+///    - If `gate_failed` is true, return `NeedsEvidence` (require evidence before advancing)
 /// 6. If none match and no unconditional fallback, return `NeedsEvidence`
 /// 7. If no transitions at all, return `NoTransitions`
+///
+/// The `gate_failed` parameter prevents unconditional transitions from firing when
+/// the engine fell through from a gate failure. Without this, states with both gates
+/// and accepts blocks would auto-advance via the unconditional fallback even when
+/// gates fail — defeating the evidence-fallback mechanism.
 pub fn resolve_transition(
     template_state: &TemplateState,
     evidence: &BTreeMap<String, serde_json::Value>,
+    gate_failed: bool,
 ) -> TransitionResolution {
     if template_state.transitions.is_empty() {
         return TransitionResolution::NoTransitions;
@@ -401,7 +410,14 @@ pub fn resolve_transition(
         _ => {
             // No conditional match.
             if let Some(fallback) = unconditional_target {
-                TransitionResolution::Resolved(fallback)
+                if gate_failed {
+                    // Gate failed and no evidence matches a conditional transition.
+                    // Don't auto-advance via the unconditional fallback — require
+                    // evidence so the agent can provide override or recovery input.
+                    TransitionResolution::NeedsEvidence
+                } else {
+                    TransitionResolution::Resolved(fallback)
+                }
             } else if has_conditional {
                 TransitionResolution::NeedsEvidence
             } else {
@@ -513,7 +529,7 @@ mod tests {
         let state = make_state(vec![unconditional("next")]);
         let evidence = BTreeMap::new();
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("next".to_string())
         );
     }
@@ -527,7 +543,7 @@ mod tests {
         let mut evidence = BTreeMap::new();
         evidence.insert("decision".to_string(), serde_json::json!("approve"));
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("approved".to_string())
         );
     }
@@ -541,7 +557,7 @@ mod tests {
         let mut evidence = BTreeMap::new();
         evidence.insert("decision".to_string(), serde_json::json!("approve"));
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("approved".to_string())
         );
     }
@@ -555,7 +571,7 @@ mod tests {
         let mut evidence = BTreeMap::new();
         evidence.insert("decision".to_string(), serde_json::json!("reject"));
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("fallback".to_string())
         );
     }
@@ -569,7 +585,7 @@ mod tests {
         let mut evidence = BTreeMap::new();
         evidence.insert("x".to_string(), serde_json::json!(1));
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::Ambiguous(vec!["target_a".to_string(), "target_b".to_string()])
         );
     }
@@ -579,7 +595,7 @@ mod tests {
         let state = make_state(vec![]);
         let evidence = BTreeMap::new();
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::NoTransitions
         );
     }
@@ -593,7 +609,7 @@ mod tests {
         // Empty evidence -- no match.
         let evidence = BTreeMap::new();
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::NeedsEvidence
         );
     }
@@ -609,15 +625,51 @@ mod tests {
         let mut evidence = BTreeMap::new();
         evidence.insert("a".to_string(), serde_json::json!("x"));
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::NeedsEvidence
         );
 
         // Both fields match.
         evidence.insert("b".to_string(), serde_json::json!("y"));
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("target".to_string())
+        );
+    }
+
+    #[test]
+    fn gate_failed_skips_unconditional_fallback() {
+        // State with a conditional transition and an unconditional fallback.
+        // When gate_failed=false, the unconditional fires. When gate_failed=true,
+        // it returns NeedsEvidence instead.
+        let state = make_state(vec![
+            conditional(
+                "next_state",
+                vec![("status", serde_json::json!("completed"))],
+            ),
+            unconditional("fallback_state"),
+        ]);
+
+        let evidence = BTreeMap::new(); // no evidence
+
+        // gate_failed=false: unconditional fallback fires
+        assert_eq!(
+            resolve_transition(&state, &evidence, false),
+            TransitionResolution::Resolved("fallback_state".to_string())
+        );
+
+        // gate_failed=true: unconditional fallback skipped, needs evidence
+        assert_eq!(
+            resolve_transition(&state, &evidence, true),
+            TransitionResolution::NeedsEvidence
+        );
+
+        // gate_failed=true but evidence matches conditional: resolves normally
+        let mut with_evidence = BTreeMap::new();
+        with_evidence.insert("status".to_string(), serde_json::json!("completed"));
+        assert_eq!(
+            resolve_transition(&state, &with_evidence, true),
+            TransitionResolution::Resolved("next_state".to_string())
         );
     }
 
