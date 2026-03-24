@@ -74,6 +74,55 @@ fn version_exits_0_and_produces_json() {
     assert!(!v.is_empty(), "version field should not be empty");
 }
 
+#[test]
+fn version_is_derived_from_git_not_cargo_toml() {
+    let output = koto().arg("version").output().unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let version = json["version"].as_str().unwrap();
+    let commit = json["commit"].as_str().unwrap();
+
+    // Version must follow one of the git-derived patterns:
+    // - Release tag: "X.Y.Z" (digits and dots only)
+    // - Ahead of tag: "X.Y.Z-dev+<hash>"
+    // - No tags: "dev+<hash>"
+    let valid = version
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '.')                    // exact tag
+        || version.contains("-dev+")                                  // ahead of tag
+        || version.starts_with("dev+");                               // no tags
+    assert!(
+        valid,
+        "version '{}' doesn't match any git-derived pattern (X.Y.Z, X.Y.Z-dev+hash, dev+hash)",
+        version
+    );
+
+    // The commit field should be a short hex hash (or "unknown" in non-git builds).
+    assert!(
+        commit == "unknown" || commit.chars().all(|c| c.is_ascii_hexdigit()),
+        "commit '{}' should be a hex hash or 'unknown'",
+        commit
+    );
+
+    // Version must NOT be the literal Cargo.toml version "0.1.0" when we're
+    // on a non-tag commit (which is always true in test builds).
+    // If we're on an exact v0.1.0 tag this would legitimately be "0.1.0",
+    // but test builds are ahead of the tag so it should have -dev+ suffix.
+    if version == "0.1.0" {
+        // Only acceptable if we're actually on the v0.1.0 tag.
+        let on_tag = std::process::Command::new("git")
+            .args(["describe", "--tags", "--exact-match"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(
+            on_tag,
+            "version is '0.1.0' but we're not on a release tag -- build.rs should produce '0.1.0-dev+<hash>'"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // init
 // ---------------------------------------------------------------------------
