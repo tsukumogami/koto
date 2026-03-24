@@ -91,7 +91,7 @@ fn version_is_derived_from_git_not_cargo_toml() {
         .chars()
         .all(|c| c.is_ascii_digit() || c == '.')                    // exact tag
         || version.contains("-dev+")                                  // ahead of tag
-        || version.starts_with("dev+");                               // no tags
+        || version.starts_with("dev+"); // no tags
     assert!(
         valid,
         "version '{}' doesn't match any git-derived pattern (X.Y.Z, X.Y.Z-dev+hash, dev+hash)",
