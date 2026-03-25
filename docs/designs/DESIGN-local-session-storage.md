@@ -196,46 +196,55 @@ internally, not by command handlers directly.
 
 Agents interact with session artifacts via file tools (Read/Edit/Write). These tools
 may be sandboxed to the git repo's working tree depending on the agent runtime. The
-question is whether sessions live inside or outside the repo.
+location must avoid accidental git commits without requiring users to edit their git
+configuration.
 
 Key assumptions:
-- Claude Code's file tools currently have no directory restriction (user-level sandbox)
-- Other agents (Cursor, Copilot, custom setups) may restrict to the working tree
-- The design should work with the most restrictive reasonable sandbox
-- Cloud sync (feature 5) handles cross-machine transfer regardless of local path
+- Agent sandboxes may restrict file access to the git working tree
+- Users shouldn't have to modify any git configuration for koto to work
+- `.koto/` already exists in repos for templates and config (koto-agent-integration)
 
-#### Chosen: gitignored directory inside the repo (.koto/sessions/)
+#### Chosen: .koto/sessions/ with self-managed nested .gitignore
 
-Sessions live at `<repo-root>/.koto/sessions/<name>/`. The `.koto/sessions/` path is
-added to `.gitignore`. This keeps files:
-- **Inside the repo** — accessible by any agent sandbox that allows working tree access
-- **Out of git** — gitignored, never committed, never in diffs or PRs
-- **Koto-managed** — the SessionBackend trait controls the path, agents don't hardcode it
+Sessions live at `<repo>/.koto/sessions/<name>/`. On first session creation, koto
+writes `.koto/sessions/.gitignore` containing `*`. This is the same pattern used by
+Python 3.13+ venv, JetBrains IDEs (`.idea/.gitignore`), DVC (`.dvc/.gitignore`),
+and Husky (`.husky/_/.gitignore`) — the tool creates a gitignore inside its own
+directory to self-manage what gets tracked.
+
+The `.gitignore` file itself is committed — it's a one-line file that says "ignore
+everything else in this directory." Session artifacts underneath are ignored. No root
+`.gitignore` modification needed. Fresh clones already have the ignore rule in place.
 
 ```
 <repo>/
   .koto/
     sessions/
-      my-workflow/
+      .gitignore              ← committed, contains "*"
+      my-workflow/            ← ignored by the gitignore above
         session.meta.json
         koto-my-workflow.state.jsonl
         research/
-  .gitignore  # includes .koto/sessions/
 ```
 
-The `.koto/` directory already exists in the repo for templates and config (established
-by the koto-agent-integration design). Adding `sessions/` underneath follows the
-existing convention.
+Properties:
+- **Inside the repo** — accessible by any agent sandbox
+- **Out of git** — nested gitignore handles it, no project config changes
+- **Self-managed** — koto creates the gitignore on first use
+- **Survives fresh clones** — the gitignore is committed
 
 #### Alternatives considered
 
-- **.koto/sessions/ (home directory)**: works with Claude Code today but fails with
-  agents that sandbox to the repo. Also makes sessions global rather than per-repo —
-  two repos with the same workflow name collide. The trait abstraction lets a future
-  `GlobalBackend` use this path if needed.
-- **wip/ with gitignore**: reuses the existing directory name but `.gitignore` rules
-  for `wip/` conflict with the current model where wip/ is committed. Would cause
-  confusion during the transition period.
+- **~/.koto/sessions/ (home directory)**: fails with sandboxed agents. Makes sessions
+  global — name collisions across repos.
+- **.git/koto/sessions/**: zero config, survives `git clean -fdx`. Precedent from
+  Git LFS and git-annex. But koto isn't a git extension, and `.git/` contents don't
+  survive fresh clones.
+- **Root .gitignore modification**: most common pattern (node_modules, .terraform)
+  but requires users to maintain the entry or accept auto-modification of a project
+  file.
+- **.git/info/exclude**: local-only, never committed. But `git clean -fdx` wipes
+  excluded paths, and it's still a git config change.
 
 ## Decision outcome
 
