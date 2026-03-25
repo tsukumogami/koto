@@ -133,17 +133,30 @@ same workflow without syncing.
 tree at a configurable path (default: `wip/`). Selected via configuration.
 Intended for users who want artifacts committed to branches.
 
-**R8. Backend configuration.** The storage backend is selected via configuration
-with the following precedence (highest to lowest):
+**R8. Backend configuration via `koto config`.** Configuration uses a `koto config`
+subcommand following the git/tsuku pattern:
 
-1. CLI flag: `--session-backend local|cloud|git`
-2. Project config: `.koto/config.toml` in the repo root
-3. User config: `~/.koto/config.toml`
-4. Default: `local`
+```
+koto config get session.backend
+koto config set session.backend cloud
+koto config set session.cloud.endpoint https://s3.us-east-1.amazonaws.com
+koto config set session.cloud.bucket my-koto-sessions
+```
 
-Cloud backend config requires: `endpoint`, `bucket`, `region` (optional), and
-credentials via `access_key`/`secret_key` fields or the standard `AWS_ACCESS_KEY_ID`
-/ `AWS_SECRET_ACCESS_KEY` environment variables.
+Configuration precedence (highest to lowest):
+
+1. Project config: `.koto/config.toml` in the repo root
+2. User config: `~/.koto/config.toml`
+3. Default: `local`
+
+`koto config set` writes to user config by default. `koto config set --project`
+writes to project config (committed to git, shared with team).
+
+Cloud backend config keys: `session.cloud.endpoint`, `session.cloud.bucket`,
+`session.cloud.region` (optional). Credentials via `session.cloud.access_key` /
+`session.cloud.secret_key` in config, or the standard `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` environment variables (env vars take precedence over
+config file credentials to avoid committing secrets).
 
 **R9. Session lifecycle commands.**
 
@@ -197,7 +210,8 @@ the upload on the next state-mutating command automatically.
 - [ ] On a new machine, `koto next` automatically downloads the remote session before proceeding
 - [ ] Diverged local and remote versions produce a conflict error (not silent overwrite)
 - [ ] Git backend stores artifacts in the git working tree at the configured path
-- [ ] Backend selection follows precedence: CLI flag > project config > user config > default
+- [ ] `koto config get/set` reads and writes configuration values
+- [ ] Backend selection follows precedence: project config > user config > default
 - [ ] `koto session list` shows all local sessions with names and timestamps
 - [ ] `koto session cleanup <name>` removes local and cloud artifacts
 - [ ] Workflow completion triggers automatic session cleanup
