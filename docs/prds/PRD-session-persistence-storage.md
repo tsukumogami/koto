@@ -1,5 +1,5 @@
 ---
-status: Draft
+status: Accepted
 problem: |
   koto stores workflow session state (engine state files, research artifacts, plans,
   decision reports) in a wip/ directory committed to git feature branches. This works
