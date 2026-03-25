@@ -10,11 +10,11 @@ problem: |
   hardcoded wip/.
 decision: |
   A SessionBackend trait with five methods (create, session_dir, cleanup, list, exists)
-  and a LocalBackend that stores sessions at .koto/sessions/<name>/. CLI commands get
-  the session path from the backend instead of constructing wip/ paths. koto init creates
-  sessions, koto session dir returns the path, koto session list/cleanup manage lifecycle.
-  Session metadata lives in session.meta.json inside the session directory. The trait is
-  designed for future backends (cloud, git) but this design only implements local.
+  and a LocalBackend that stores sessions at ~/.koto/sessions/<repo-id>/<name>/. The
+  repo-id is a hash of the working directory path, scoping sessions per-project.
+  Sessions live entirely outside the repo (zero repo footprint, invisible to non-users).
+  Agent file tools access ~/.koto/ without sandbox restrictions. CLI commands get the
+  session path from the backend instead of constructing wip/ paths.
 rationale: |
   The trait boundary provides a clean extension point for cloud and git backends without
   over-engineering the initial implementation. LocalBackend is zero-config and requires
@@ -41,7 +41,7 @@ cover config system (feature 2), engine-provided variables (feature 3), git back
 (feature 4), or cloud sync (feature 5). Those will get their own designs.
 
 The goal is narrow: after this ships, `koto init` creates a session directory at
-`.koto/sessions/<name>/`, state files live there instead of the working tree, and
+`~/.koto/sessions/<repo-id>/<name>/`, state files live there instead of the working tree, and
 skills that use `koto session dir` get the right path. The trait is designed so future
 backends slot in without changing command logic.
 
@@ -116,7 +116,7 @@ Key assumptions:
 - Session IDs are validated: `^[a-zA-Z0-9._-]+$` (from security review)
 - The JSONL state file currently lives at `<working-dir>/koto-<name>.state.jsonl`
 
-#### Chosen: .koto/sessions/<id>/ with state file inside
+#### Chosen: ~/.koto/sessions/<repo-id>/<id>/ with state file inside
 
 ```
 ~/.koto/
@@ -170,8 +170,8 @@ get paths instead of calling `workflow_state_path()`.
 
 ```rust
 pub fn run() -> Result<()> {
-    let repo_root = discover_repo_root()?;
-    let backend = LocalBackend::new(&repo_root)?;
+    let working_dir = std::env::current_dir()?;
+    let backend = LocalBackend::new(&working_dir)?;
     match cli.command {
         Command::Init { name, .. } => handle_init(&backend, &name, ...),
         Command::Next { name, .. } => handle_next(&backend, &name, ...),
@@ -192,68 +192,68 @@ internally, not by command handlers directly.
   two path systems (one for state files, one for session artifacts) that diverge.
   Better to unify under the backend from the start.
 
-### Decision 4: session directory location and agent sandbox compatibility
+### Decision 4: session directory location
 
-Agents interact with session artifacts via file tools (Read/Edit/Write). These tools
-may be sandboxed to the git repo's working tree depending on the agent runtime. The
-location must avoid accidental git commits without requiring users to edit their git
-configuration.
+koto must be invisible to developers who don't use it — no committed files, no
+gitignore entries, no trace in the repo. Sessions also need to work in non-git
+directories.
 
-Key assumptions:
-- Agent sandboxes may restrict file access to the git working tree
-- Users shouldn't have to modify any git configuration for koto to work
-- `.koto/` already exists in repos for templates and config (koto-agent-integration)
+Key finding from investigation: agent file tools (Read/Edit/Write) in Claude Code
+are NOT sandboxed to the repo. The sandbox only restricts Bash commands. File tools
+can access any path the OS user has permissions for. This matches the Claude Code
+precedent — `~/.claude/` stores per-project state outside repos, scoped by project
+path hash.
 
-#### Chosen: .koto/sessions/ with self-managed nested .gitignore
+#### Chosen: ~/.koto/sessions/<repo-id>/
 
-Sessions live at `<repo>/.koto/sessions/<name>/`. On first session creation, koto
-writes `.koto/sessions/.gitignore` containing `*`. This is the same pattern used by
-Python 3.13+ venv, JetBrains IDEs (`.idea/.gitignore`), DVC (`.dvc/.gitignore`),
-and Husky (`.husky/_/.gitignore`) — the tool creates a gitignore inside its own
-directory to self-manage what gets tracked.
-
-The `.gitignore` file itself is committed — it's a one-line file that says "ignore
-everything else in this directory." Session artifacts underneath are ignored. No root
-`.gitignore` modification needed. Fresh clones already have the ignore rule in place.
+Sessions live entirely outside the repo at `~/.koto/sessions/<repo-id>/<name>/`.
+The `repo-id` is derived from the working directory path (hash or slug) to scope
+sessions per-project without name collisions.
 
 ```
-<repo>/
-  .koto/
-    sessions/
-      .gitignore              ← committed, contains "*"
-      my-workflow/            ← ignored by the gitignore above
+~/.koto/
+  sessions/
+    a1b2c3d4/              ← hash of /home/user/repos/my-project
+      my-workflow/
         session.meta.json
         koto-my-workflow.state.jsonl
         research/
+    e5f6g7h8/              ← hash of /home/user/repos/other-project
+      other-workflow/
+        ...
 ```
 
 Properties:
-- **Inside the repo** — accessible by any agent sandbox
-- **Out of git** — nested gitignore handles it, no project config changes
-- **Self-managed** — koto creates the gitignore on first use
-- **Survives fresh clones** — the gitignore is committed
+- **Zero repo footprint** — nothing committed, no gitignore, invisible to non-users
+- **Works without git** — doesn't depend on .git/ or git config
+- **Agent compatible** — file tools aren't sandboxed; for Bash sandbox, users add
+  `~/.koto` to `sandbox.filesystem.allowRead`/`allowWrite` in agent settings
+- **Per-project scoping** — repo-id prevents cross-project name collisions
+- **Same pattern as Claude Code** — `~/.claude/projects/<path-hash>/` is the
+  established precedent
 
 #### Alternatives considered
 
-- **~/.koto/sessions/ (home directory)**: fails with sandboxed agents. Makes sessions
-  global — name collisions across repos.
-- **.git/koto/sessions/**: zero config, survives `git clean -fdx`. Precedent from
-  Git LFS and git-annex. But koto isn't a git extension, and `.git/` contents don't
-  survive fresh clones.
-- **Root .gitignore modification**: most common pattern (node_modules, .terraform)
-  but requires users to maintain the entry or accept auto-modification of a project
-  file.
-- **.git/info/exclude**: local-only, never committed. But `git clean -fdx` wipes
-  excluded paths, and it's still a git config change.
+- **In-repo with nested gitignore** (`~/.koto/sessions/<repo-id>/.gitignore` containing `*`):
+  follows the DVC/venv/JetBrains pattern. But commits a gitignore file — koto
+  becomes visible to non-users. Rejected because the core constraint is zero repo
+  footprint.
+- **.git/koto/sessions/**: invisible to git by definition. But fails for non-git
+  repos and ties session storage to git infrastructure. koto isn't a git extension.
+- **Symlink from repo to ~/.koto/ + .git/info/exclude**: bridges sandbox to external
+  storage. But fragile (`git clean -fdx` breaks it), Windows symlinks need developer
+  mode, and the exclude edit is a git config change.
+- **In-repo gitignored directory**: requires root .gitignore modification or
+  auto-management. Any committed artifact makes koto visible to non-users.
 
 ## Decision outcome
 
 The four decisions compose cleanly. The trait provides the abstraction boundary.
-LocalBackend implements it with `.koto/sessions/<id>/` inside the repo. The CLI constructs the
-backend once and threads it through command handlers. The state file moves into the
-session directory but keeps its name and format.
+LocalBackend implements it with `~/.koto/sessions/<repo-id>/<name>/`. The CLI
+constructs the backend once and threads it through command handlers. The state file
+moves into the session directory but keeps its name and format.
 
-After this ships, `koto init my-workflow` creates `.koto/sessions/my-workflow/`
+After this ships, `koto init my-workflow` creates `~/.koto/sessions/<repo-id>/my-workflow/`
 with `session.meta.json` and `koto-my-workflow.state.jsonl`. `koto next my-workflow`
 reads from there. `koto session dir my-workflow` prints the path. Skills that call
 `koto session dir` get the right location for their artifacts.
@@ -284,12 +284,14 @@ pub struct SessionInfo {
 
 ```rust
 pub struct LocalBackend {
-    base_dir: PathBuf,  // .koto/sessions/
+    base_dir: PathBuf,  // ~/.koto/sessions/<repo-id>/
 }
 
 impl LocalBackend {
-    pub fn new(repo_root: &Path) -> Result<Self> {
-        Ok(Self { base_dir: repo_root.join(".koto").join("sessions") })
+    pub fn new(working_dir: &Path) -> Result<Self> {
+        let home = dirs::home_dir().ok_or("no home directory")?;
+        let repo_id = hash_path(working_dir);  // short hash of the working dir path
+        Ok(Self { base_dir: home.join(".koto").join("sessions").join(repo_id) })
     }
 }
 
@@ -358,21 +360,21 @@ koto init my-wf
   → discover repo root (git rev-parse --show-toplevel)
   → LocalBackend::create("my-wf")
     → validate_session_id("my-wf")
-    → mkdir <repo>/.koto/sessions/my-wf/
-    → mkdir <repo>/.koto/sessions/my-wf/research/
+    → mkdir ~/.koto/sessions/<repo-id>/my-wf/
+    → mkdir ~/.koto/sessions/<repo-id>/my-wf/research/
     → write session.meta.json
   → write koto-my-wf.state.jsonl into session dir
   → print JSON result (same as today)
 
 koto next my-wf
   → LocalBackend::session_dir("my-wf")
-    → <repo>/.koto/sessions/my-wf/
+    → ~/.koto/sessions/<repo-id>/my-wf/
   → read koto-my-wf.state.jsonl from session dir
   → advance workflow (existing logic, unchanged)
   → print directive JSON (same as today)
 
 koto session dir my-wf
-  → print <repo>/.koto/sessions/my-wf/
+  → print ~/.koto/sessions/<repo-id>/my-wf/
 ```
 
 ## Implementation approach
@@ -380,12 +382,14 @@ koto session dir my-wf
 ### Phase 1: session module and LocalBackend
 
 Create `src/session/mod.rs`, `src/session/local.rs`, `src/session/validate.rs`.
-Implement the trait and LocalBackend. Use `git rev-parse --show-toplevel` or the
-existing repo root detection for path construction. No new dependencies needed.
-Unit tests for create, session_dir, exists, cleanup, list, and ID validation.
+Implement the trait and LocalBackend. Add `dirs` crate for home directory detection.
+Add `hash_path()` for repo-id derivation (short hash of working directory path).
+Unit tests for create, session_dir, exists, cleanup, list, ID validation, and
+path hashing.
 
 Deliverables:
 - `src/session/` module (3 files)
+- `Cargo.toml` — add `dirs` dependency
 - Unit tests
 
 ### Phase 2: CLI refactoring
@@ -415,7 +419,7 @@ Deliverables:
 **Session ID validation.** Session IDs are used in filesystem paths. The allowlist
 `^[a-zA-Z0-9._-]+$` prevents path traversal. Validated at creation time.
 
-**Home directory trust.** `.koto/sessions/` is writable by the current user. No
+**Home directory trust.** `~/.koto/sessions/<repo-id>/` is writable by the current user. No
 elevated permissions needed. Permissions follow the user's umask. If the user wants
 restricted access, they manage `~/.koto/` permissions themselves.
 
@@ -428,27 +432,30 @@ off the machine. Cloud sync (feature 5) will add exposure considerations.
 
 ### Positive
 
-- State files move out of git history. PRs no longer show wip/ artifacts (gitignored).
+- State files move out of the repo entirely. PRs never show session artifacts.
+- Zero repo footprint — koto is invisible to developers who don't use it.
 - The SessionBackend trait provides a clean extension point for cloud and git backends.
 - `koto session dir` gives skills a stable API for artifact location.
 - Auto-cleanup replaces manual `rm -rf wip/` and CI enforcement.
-- Zero new external dependencies. LocalBackend uses std::fs and repo root detection.
-- Session files stay inside the repo, so every agent sandbox that allows working tree
-  access works without permission changes.
+- Works without git — sessions are scoped by working directory path, not git repo.
+- Agent file tools (Read/Edit/Write) access `~/.koto/` without sandbox restrictions.
 
 ### Negative
 
 - Existing workflows that use hardcoded `wip/` paths break. There's no compatibility
   layer in this design — that's the git backend (feature 4).
-- Sessions are per-repo (scoped under `.koto/sessions/`). A workflow can't be shared
-  across repos without cloud sync (feature 5). This matches how workflows work today.
-- `.koto/sessions/` must be gitignored. If the gitignore entry is missing, session
-  artifacts get committed — the exact problem we're trying to solve.
+- Sessions live outside the repo. Agent Bash commands (as opposed to file tools) may
+  need sandbox configuration to access `~/.koto/`. For Claude Code:
+  `sandbox.filesystem.allowRead: ["~/.koto"]` in settings.
+- The `dirs` crate is needed for home directory detection (adds one dependency).
+- If a user moves or renames their project directory, the repo-id hash changes and
+  existing sessions become orphaned at the old hash. `koto session list` can detect
+  this by checking whether the source directory still exists.
 
 ### Mitigations
 
 - The git backend (feature 4) restores wip/ as an opt-in mode for users who want it.
-- `koto init` should verify `.koto/sessions/` is gitignored and warn if it isn't.
-  Adding the gitignore entry automatically on first use is reasonable.
-- Session ID uniqueness is the caller's responsibility (same as workflow name uniqueness
-  today).
+- Sandbox configuration for Bash commands is a one-time user setup, documented in
+  koto's installation guide.
+- `dirs` is a small, widely-used crate with no transitive dependencies.
+- Orphaned sessions from directory renames can be cleaned up with `koto session cleanup`.
