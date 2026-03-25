@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: In Progress
 problem: |
   koto stores workflow session state (engine state files, research artifacts, plans,
   decision reports) in a wip/ directory committed to git feature branches. This works
@@ -19,7 +19,7 @@ goals: |
 
 ## Status
 
-Draft
+In Progress
 
 ## Problem statement
 
