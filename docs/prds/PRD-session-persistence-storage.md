@@ -62,8 +62,8 @@ git branches, so that my PRs only contain real code changes and my teammates don
 see temporary exploration/implementation state.
 
 **As a developer switching machines**, I want to resume a koto workflow session on
-my laptop that I started on my desktop, without having to push/pull a git branch
-with temporary artifacts.
+my laptop that I started on my desktop, by running a single command that downloads
+the session state from cloud storage.
 
 **As a skill author**, I want to ask koto "where should I write this artifact?"
 instead of hardcoding `wip/` paths, so that my skill works regardless of which
@@ -73,66 +73,125 @@ storage backend the user has configured.
 artifacts in the git working tree (the current behavior), so I can inspect them with
 git tools and keep everything in one place.
 
+**As a developer with many workflows**, I want to list which sessions exist and
+clean up old ones, so my local disk doesn't fill with stale artifacts.
+
 ## Requirements
 
 ### Functional
 
-**R1. Session directory resolution.** koto provides a command or interface that
-returns a filesystem path for a given workflow session's artifact storage. Agents
-use this path with their normal file tools (Read/Edit/Write).
+**R1. Session identity.** A session is 1:1 with a koto workflow. When `koto init`
+creates a workflow, it also creates a session. The session ID is the workflow name
+(the same string passed to `koto init <name>`). The session owns all artifacts
+produced during that workflow's execution: engine state, skill artifacts, research
+output.
 
-**R2. Local filesystem backend (default).** Sessions are stored in a koto-managed
-directory outside the git working tree (e.g., `~/.koto/sessions/<session-id>/`).
-No git commits, no branch pollution. This is the default with zero configuration.
+**R2. Session directory resolution.** `koto session dir <name>` returns the
+filesystem path to the session's artifact directory. Agents use this path with
+their normal file tools (Read/Edit/Write). The directory is created automatically
+if it doesn't exist. The path varies by backend but is always a local filesystem
+directory that supports standard file operations.
 
-**R3. Cloud storage backend (S3-compatible).** Sessions can be synced to any
+**R3. Session directory structure.** The session directory has a flat layout with
+one subdirectory for research artifacts, matching the current wip/ convention:
+
+```
+<session-dir>/
+  <artifact-name>.md        (scope, findings, plans, summaries)
+  <artifact-name>.json      (state files, manifests)
+  research/
+    <artifact-name>.md      (agent research output)
+```
+
+**R4. Local filesystem backend (default).** Sessions are stored in
+`~/.koto/sessions/<session-id>/`. No git commits, no branch pollution. This is
+the default with zero configuration.
+
+**R5. Cloud storage backend (S3-compatible).** Sessions can be synced to any
 S3-compatible object store (AWS S3, Cloudflare R2, MinIO, etc.) using standard S3
-credentials (access key, secret key, endpoint URL). Sync happens at session
-boundaries (start, checkpoint, complete), not on every file write. This enables
-session transfer between machines.
+credentials. Sync happens automatically when koto writes a state transition event
+(i.e., on `koto init`, `koto transition`, `koto next --with-data`, and workflow
+completion). Between sync points, the local copy is the working copy.
 
-**R4. Git working tree backend (opt-in).** Sessions are stored in the git working
-tree (preserving the current `wip/` behavior). Selected via configuration. Intended
-for users who want artifacts committed to branches.
+**R6. Cloud session resume.** `koto session pull <name>` downloads a session's
+artifacts from the cloud backend to the local session directory. This is how a
+developer resumes work on a different machine. If local artifacts already exist
+and differ from the remote version, koto reports a conflict and asks the user to
+choose (local, remote, or abort). koto does not auto-merge.
 
-**R5. Backend configuration.** The storage backend is selected via a configuration
-file (e.g., `~/.koto/config.toml` or project-level `.koto/config.toml`) or CLI flag.
+**R7. Git working tree backend (opt-in).** Sessions are stored in the git working
+tree at a configurable path (default: `wip/`). Selected via configuration.
+Intended for users who want artifacts committed to branches.
 
-**R6. Session lifecycle management.** koto tracks which sessions exist, their
-associated workflows, and their artifacts. koto can list, inspect, and clean up
-sessions.
+**R8. Backend configuration.** The storage backend is selected via configuration
+with the following precedence (highest to lowest):
 
-**R7. Session cleanup.** koto can atomically remove all artifacts for a completed
-session. No more manual `rm -rf wip/` or reliance on CI to enforce cleanup.
+1. CLI flag: `--session-backend local|cloud|git`
+2. Project config: `.koto/config.toml` in the repo root
+3. User config: `~/.koto/config.toml`
+4. Default: `local`
 
-**R8. Agent file tool compatibility.** Agents must be able to use Read (with
-offset/limit), Edit (targeted string replacement), and Write tools on session
-artifact paths. The storage medium must support standard filesystem operations.
+Cloud backend config requires: `endpoint`, `bucket`, `region` (optional), and
+credentials via `access_key`/`secret_key` fields or the standard `AWS_ACCESS_KEY_ID`
+/ `AWS_SECRET_ACCESS_KEY` environment variables.
+
+**R9. Session lifecycle commands.**
+
+| Command | Behavior |
+|---------|----------|
+| `koto session dir <name>` | Print the session directory path |
+| `koto session list` | List all local sessions with workflow name and last-modified time |
+| `koto session cleanup <name>` | Remove all artifacts for a session (local and cloud) |
+| `koto session pull <name>` | Download session from cloud to local |
+| `koto session push <name>` | Upload local session to cloud (manual trigger) |
+
+**R10. Automatic cleanup on workflow completion.** When a workflow reaches a terminal
+state, koto removes the local session directory. Cloud artifacts are also removed
+unless the user has configured retention.
+
+**R11. Agent file tool compatibility.** Session artifact paths returned by
+`koto session dir` are standard filesystem paths. Agents can use Read (with
+offset/limit), Edit (targeted string replacement), and Write tools directly on
+these paths. koto does not proxy file I/O.
+
+**R12. Template wip/ references.** Templates that reference `wip/` in gate commands
+or directives must work with the session directory instead. `koto session dir` output
+(or an equivalent mechanism like an environment variable set by koto) replaces
+hardcoded `wip/` references. This is a koto-engine concern, not a skill concern.
 
 ### Non-functional
 
-**R9. Token efficiency.** The session management API must not degrade agent token
-efficiency. Agents should not need to transmit full file content through CLI stdout
-to read or write artifacts.
+**R13. Token efficiency.** Agents never transmit file content through koto CLI
+commands to read or write session artifacts. `koto session dir` returns a path;
+all file I/O uses agent tools directly on that path. This preserves the offset/limit
+and targeted-edit optimizations that agent tools provide.
 
-**R10. No external dependencies for local backend.** The local filesystem backend
-must work with zero configuration and no external services. A fresh koto install
-should work immediately.
+**R14. No external dependencies for local backend.** The local filesystem backend
+works with zero configuration and no external services. A fresh koto install works
+immediately.
 
-**R11. Cloud sync resilience.** Cloud sync failures must not block local workflow
-execution. The local copy is the source of truth; cloud is a sync target.
+**R15. Cloud sync resilience.** Cloud sync failures log a warning but don't block
+local workflow execution. The local copy is always the source of truth. A failed
+sync can be retried manually with `koto session push`.
 
 ## Acceptance criteria
 
-- [ ] `koto session` (or equivalent) provides a path to the session artifact directory
-- [ ] Default backend stores artifacts in a local directory outside the git working tree
-- [ ] Cloud backend syncs session artifacts to an S3-compatible object store
-- [ ] Git backend stores artifacts in the git working tree (backward compatible with wip/)
-- [ ] Backend is configurable via config file or CLI flag
-- [ ] `koto session cleanup` removes all artifacts for a session
-- [ ] Agents can use Read/Edit/Write file tools on paths returned by koto
-- [ ] Cloud sync failure doesn't block local workflow execution
-- [ ] Session state is resumable after interruption (from local storage)
+- [ ] `koto init <name>` creates a session directory alongside the workflow state
+- [ ] `koto session dir <name>` returns the correct path for the configured backend
+- [ ] Default backend stores artifacts in `~/.koto/sessions/<name>/`
+- [ ] Session directory has flat layout with `research/` subdirectory
+- [ ] Cloud backend syncs session artifacts to an S3-compatible store on state transitions
+- [ ] `koto session pull <name>` downloads a remote session to local
+- [ ] `koto session pull` reports a conflict when local and remote differ
+- [ ] Git backend stores artifacts in the git working tree at the configured path
+- [ ] Backend selection follows precedence: CLI flag > project config > user config > default
+- [ ] `koto session list` shows all local sessions with names and timestamps
+- [ ] `koto session cleanup <name>` removes local and cloud artifacts
+- [ ] Workflow completion triggers automatic session cleanup
+- [ ] Agents can Read/Edit/Write files in the session directory using standard paths
+- [ ] Cloud sync failure logs a warning and doesn't block the workflow
+- [ ] `koto session push <name>` retries a failed sync manually
+- [ ] Templates using `{{SESSION_DIR}}` or equivalent resolve to the session path
 
 ## Out of scope
 
@@ -143,29 +202,21 @@ execution. The local copy is the source of truth; cloud is a sync target.
 - **Real-time sync.** Sync happens at discrete boundaries, not continuously.
 - **Encryption at rest.** Session artifacts aren't encrypted locally. Cloud transport
   uses HTTPS.
-- **Skill migration.** Updating existing skills to use the new API is separate work.
-  This PRD covers the koto capability, not the skill updates.
-
-## Open questions
-
-- Should the session directory be flat (all artifacts in one directory) or structured
-  (subdirectories for research, state, etc.)? The current wip/ model uses a flat
-  directory with a `research/` subdirectory.
-- What S3 operations are needed? Likely just PutObject, GetObject, DeleteObject,
-  and ListObjectsV2. Should the design use a full S3 SDK or a minimal HTTP client?
-- Should koto expose an environment variable (e.g., `KOTO_SESSION_DIR`) that agents
-  can read, or require a CLI call (`koto session dir`)?
+- **Skill migration.** Updating existing skills to use the new session API is
+  separate work. This PRD covers the koto capability; skills adopt it incrementally.
+- **S3 SDK vs minimal client.** Whether to use a full S3 SDK (like `aws-sdk-s3`) or
+  implement minimal HTTP calls is a design decision.
 
 ## Known limitations
 
 - **Local sessions aren't shared.** Without cloud sync configured, sessions are
-  machine-local. This is the intended default — sharing requires explicit opt-in.
-- **Cloud sync latency.** Syncing a session directory (potentially 20+ files, up to
-  ~200KB total) adds time at session boundaries. Acceptable for the save-at-checkpoint
-  model but would be prohibitive for per-write sync.
-- **Git backend loses cleanup enforcement.** The current CI check that wip/ is empty
-  before merge doesn't apply when artifacts are stored outside git. Users on the
-  local backend rely on koto's session cleanup instead.
+  machine-local. Sharing requires explicit opt-in via cloud backend configuration.
+- **Cloud sync latency.** Syncing a session directory (up to ~20 files, ~200KB total)
+  adds time at state transitions. Acceptable for the save-at-transition model but
+  would be prohibitive for per-write sync.
+- **Git backend loses CI cleanup enforcement.** The current CI check that wip/ is
+  empty before merge doesn't apply when artifacts are stored outside git. Users on
+  the local backend rely on koto's automatic session cleanup instead.
 
 ## Decisions and trade-offs
 
@@ -185,5 +236,10 @@ The wip/ model can be replaced cleanly rather than requiring indefinite coexiste
 The git backend preserves the option for users who want the old behavior.
 
 **Bundle-level cloud sync.** Sync the session directory as a unit at state transition
-boundaries (init, transition, complete), not per-file. This keeps the cloud integration
-simple (upload/download a directory) and matches the state machine's natural pace.
+boundaries (init, transition, evidence submit, complete), not per-file. This keeps
+the cloud integration simple and matches the state machine's natural pace.
+
+**Session = workflow.** A session is 1:1 with a workflow, identified by the workflow
+name. This is the simplest model and matches the existing convention where `wip/`
+artifacts are scoped to a single workflow. If multi-session workflows are ever needed,
+the session ID can be extended without breaking the API.
