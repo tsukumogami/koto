@@ -49,8 +49,12 @@ pub struct App {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Print version information as JSON
-    Version,
+    /// Print version information
+    Version {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Initialize a new workflow from a template
     Init {
@@ -339,9 +343,13 @@ where
 
 pub fn run(app: App) -> Result<()> {
     match app.command {
-        Command::Version => {
+        Command::Version { json } => {
             let info = buildinfo::build_info();
-            println!("{}", serde_json::to_string(&info)?);
+            if json {
+                println!("{}", serde_json::to_string(&info)?);
+            } else {
+                println!("koto {} ({} {})", info.version, info.commit, info.built_at);
+            }
             Ok(())
         }
         Command::Init {
