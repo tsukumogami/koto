@@ -100,8 +100,26 @@ fn compile_template(dir: &Path) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn version_exits_0_and_produces_json() {
+fn version_outputs_human_readable_by_default() {
     let output = koto().arg("version").output().unwrap();
+    assert!(output.status.success(), "version should exit 0");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("koto "),
+        "default version output should start with 'koto ', got: {}",
+        stdout
+    );
+    // Should NOT be JSON
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stdout).is_err(),
+        "default version output should not be JSON"
+    );
+}
+
+#[test]
+fn version_exits_0_and_produces_json() {
+    let output = koto().args(["version", "--json"]).output().unwrap();
 
     assert!(output.status.success(), "version should exit 0");
 
@@ -116,7 +134,7 @@ fn version_exits_0_and_produces_json() {
 
 #[test]
 fn version_is_derived_from_git_not_cargo_toml() {
-    let output = koto().arg("version").output().unwrap();
+    let output = koto().args(["version", "--json"]).output().unwrap();
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
