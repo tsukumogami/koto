@@ -496,6 +496,23 @@ or in S3 (beyond whatever server-side encryption the S3 provider offers). The PR
 explicitly lists this as out of scope. Users with sensitive artifacts should configure
 S3 server-side encryption at the bucket level.
 
+**Session ID validation.** Session IDs are derived from workflow names and used in
+filesystem paths (`~/.koto/sessions/<id>/`) and S3 key prefixes
+(`sessions/<id>/`). A crafted name like `../../etc` would escape the session
+directory. koto must validate session IDs against an allowlist at `koto init` time:
+`^[a-zA-Z0-9._-]+$` (same pattern used for variable value sanitization). Names
+containing `/`, `\`, `..`, or other path-traversal characters are rejected with an
+error.
+
+**Cloud config restricted to user config.** Project-level `.koto/config.toml` (committed
+to git) can set `session.backend` but cannot set `session.cloud.endpoint` or
+`session.cloud.bucket`. These must come from user config (`~/.koto/config.toml`) or
+environment variables. This prevents a supply-chain attack where a malicious PR adds
+a `.koto/config.toml` that redirects cloud sync to an attacker-controlled S3 endpoint,
+exfiltrating session artifacts and potentially AWS credentials (if the S3 client
+sends auth headers to the attacker's endpoint). The restriction is enforced at config
+merge time: cloud connection parameters from project config are ignored with a warning.
+
 **Reserved variable names.** Engine-provided variables (`SESSION_DIR`) can't be
 overridden by user `--var` arguments. This prevents a template from being tricked into
 writing artifacts to an unexpected path. Validation happens at `koto init` time with
