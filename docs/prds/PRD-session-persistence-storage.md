@@ -107,17 +107,27 @@ one subdirectory for research artifacts, matching the current wip/ convention:
 `~/.koto/sessions/<session-id>/`. No git commits, no branch pollution. This is
 the default with zero configuration.
 
-**R5. Cloud storage backend (S3-compatible).** Sessions can be synced to any
-S3-compatible object store (AWS S3, Cloudflare R2, MinIO, etc.) using standard S3
-credentials. Sync happens automatically when koto writes a state transition event
-(i.e., on `koto init`, `koto transition`, `koto next --with-data`, and workflow
-completion). Between sync points, the local copy is the working copy.
+**R5. Cloud storage backend (S3-compatible) with implicit sync.** Sessions can be
+synced to any S3-compatible object store (AWS S3, Cloudflare R2, MinIO, etc.) using
+standard S3 credentials. Sync is invisible — built into existing koto commands, not
+exposed as separate push/pull operations. Skills and agents don't know cloud sync
+exists; it adds zero token cost.
 
-**R6. Cloud session resume.** `koto session pull <name>` downloads a session's
-artifacts from the cloud backend to the local session directory. This is how a
-developer resumes work on a different machine. If local artifacts already exist
-and differ from the remote version, koto reports a conflict and asks the user to
-choose (local, remote, or abort). koto does not auto-merge.
+On every state-mutating command (`koto init`, `koto transition`, `koto next
+--with-data`), koto:
+1. Checks the remote version before proceeding. If the remote is newer (another
+   machine advanced the workflow), downloads the remote state first.
+2. Performs the requested operation locally.
+3. Uploads the updated session to the remote.
+
+Between sync points, the local copy is the working copy.
+
+**R6. Conflict detection.** If both local and remote have diverged (local version
+is N, remote version is M, neither is an ancestor of the other), koto returns an
+error from the command that detected the conflict: "session conflict: local version
+N, remote version M." The agent or user resolves via `koto session resolve --keep
+local|remote`. This should be rare — it only happens if two machines advance the
+same workflow without syncing.
 
 **R7. Git working tree backend (opt-in).** Sessions are stored in the git working
 tree at a configurable path (default: `wip/`). Selected via configuration.
@@ -142,8 +152,11 @@ credentials via `access_key`/`secret_key` fields or the standard `AWS_ACCESS_KEY
 | `koto session dir <name>` | Print the session directory path |
 | `koto session list` | List all local sessions with workflow name and last-modified time |
 | `koto session cleanup <name>` | Remove all artifacts for a session (local and cloud) |
-| `koto session pull <name>` | Download session from cloud to local |
-| `koto session push <name>` | Upload local session to cloud (manual trigger) |
+| `koto session resolve --keep local\|remote` | Resolve a version conflict |
+
+No push/pull commands. Sync is implicit in existing koto commands (R5). The resolve
+command is the only sync-related operation a user would ever run, and only in the
+rare conflict case.
 
 **R10. Automatic cleanup on workflow completion.** When a workflow reaches a terminal
 state, koto removes the local session directory. Cloud artifacts are also removed
@@ -171,8 +184,8 @@ works with zero configuration and no external services. A fresh koto install wor
 immediately.
 
 **R15. Cloud sync resilience.** Cloud sync failures log a warning but don't block
-local workflow execution. The local copy is always the source of truth. A failed
-sync can be retried manually with `koto session push`.
+local workflow execution. The local copy is always the source of truth. koto retries
+the upload on the next state-mutating command automatically.
 
 ## Acceptance criteria
 
@@ -180,9 +193,9 @@ sync can be retried manually with `koto session push`.
 - [ ] `koto session dir <name>` returns the correct path for the configured backend
 - [ ] Default backend stores artifacts in `~/.koto/sessions/<name>/`
 - [ ] Session directory has flat layout with `research/` subdirectory
-- [ ] Cloud backend syncs session artifacts to an S3-compatible store on state transitions
-- [ ] `koto session pull <name>` downloads a remote session to local
-- [ ] `koto session pull` reports a conflict when local and remote differ
+- [ ] Cloud backend syncs session artifacts to an S3-compatible store on state-mutating commands
+- [ ] On a new machine, `koto next` automatically downloads the remote session before proceeding
+- [ ] Diverged local and remote versions produce a conflict error (not silent overwrite)
 - [ ] Git backend stores artifacts in the git working tree at the configured path
 - [ ] Backend selection follows precedence: CLI flag > project config > user config > default
 - [ ] `koto session list` shows all local sessions with names and timestamps
@@ -190,7 +203,8 @@ sync can be retried manually with `koto session push`.
 - [ ] Workflow completion triggers automatic session cleanup
 - [ ] Agents can Read/Edit/Write files in the session directory using standard paths
 - [ ] Cloud sync failure logs a warning and doesn't block the workflow
-- [ ] `koto session push <name>` retries a failed sync manually
+- [ ] `koto session resolve --keep local|remote` resolves version conflicts
+- [ ] Cloud sync adds zero agent-visible commands (invisible to skills)
 - [ ] Templates using `{{SESSION_DIR}}` or equivalent resolve to the session path
 
 ## Out of scope
@@ -235,9 +249,12 @@ small and avoids coupling koto to skill-specific file formats.
 The wip/ model can be replaced cleanly rather than requiring indefinite coexistence.
 The git backend preserves the option for users who want the old behavior.
 
-**Bundle-level cloud sync.** Sync the session directory as a unit at state transition
-boundaries (init, transition, evidence submit, complete), not per-file. This keeps
-the cloud integration simple and matches the state machine's natural pace.
+**Implicit sync, no push/pull.** Cloud sync is built into existing koto commands
+rather than exposed as separate operations. This means skills and agents never call
+sync commands — zero token cost for cloud support. Sync happens at state transition
+boundaries as a unit (bundle-level), not per-file. Conflict detection uses a
+monotonic version counter. This model is closer to Terraform Cloud (state is always
+remote, local is a cache) than to git (explicit push/pull).
 
 **Session = workflow.** A session is 1:1 with a workflow, identified by the workflow
 name. This is the simplest model and matches the existing convention where `wip/`
