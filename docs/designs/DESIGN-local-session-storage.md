@@ -9,7 +9,7 @@ problem: |
   CLI commands, runtime variable substitution for `{{SESSION_DIR}}` in templates, and
   the CLI refactoring needed to use backend-provided paths instead of hardcoded wip/.
 decision: |
-  A SessionBackend trait with six methods (create, session_dir, state_file_path, cleanup, list, exists)
+  A SessionBackend trait with five methods (create, session_dir, cleanup, list, exists)
   and a LocalBackend that stores sessions at ~/.koto/sessions/{repo-id}/{name}/. The
   repo-id is the first 16 hex characters of a SHA-256 hash of the canonicalized working
   directory path, scoping sessions per-project. Sessions live entirely outside the repo
@@ -55,7 +55,7 @@ in without changing command logic.
 
 - **Narrow scope**: only local filesystem, no cloud, no config system, no git backend
 - **Future-proof trait**: the trait shape must accommodate cloud sync (sync_down/sync_up)
-  when feature 5 adds it, but this design doesn't implement those methods
+  when the cloud sync feature adds it, but this design doesn't implement those methods
 - **Minimal CLI disruption**: one path-construction change, not a rewrite of command logic
 - **Zero new dependencies**: LocalBackend uses std::fs only
 - **Session = workflow**: 1:1 mapping, session ID = workflow name
@@ -87,9 +87,6 @@ pub trait SessionBackend: Send + Sync {
     /// Return the session directory path (no I/O, just path computation).
     fn session_dir(&self, id: &str) -> PathBuf;
 
-    /// Return the state file path within the session directory.
-    fn state_file_path(&self, id: &str) -> PathBuf;
-
     /// Check if a session exists.
     fn exists(&self, id: &str) -> bool;
 
@@ -101,8 +98,8 @@ pub trait SessionBackend: Send + Sync {
 }
 ```
 
-Cloud sync methods (sync_down, sync_up) are NOT in this trait yet. Feature 5 will
-add them when the cloud backend ships. Adding methods to a trait is a breaking change
+Cloud sync methods (sync_down, sync_up) are NOT in this trait yet. The cloud sync
+feature will add them when that backend ships. Adding methods to a trait is a breaking change
 in Rust, but since koto controls all implementations (no external consumers), this is
 fine.
 
@@ -131,23 +128,14 @@ Key assumptions:
 ~/.koto/
   sessions/
     my-workflow/
-      session.meta.json       (created by koto, tracks session metadata)
       koto-my-workflow.state.jsonl  (engine state, same format as today)
-      <skill artifacts>       (subdirectories and files created by skills)
+      <skill artifacts>            (subdirectories and files created by skills)
 ```
 
-The session directory starts with only `session.meta.json` and the state file. Skills
-create their own subdirectories (e.g., `research/`) as needed — the backend doesn't
-know about skill artifact conventions.
-
-`session.meta.json` contains:
-```json
-{
-  "schema_version": 1,
-  "id": "my-workflow",
-  "created_at": "2026-03-24T10:00:00Z"
-}
-```
+The session directory starts with just the state file. Skills create their own
+subdirectories (e.g., `research/`) as needed — the backend doesn't know about skill
+artifact conventions. No separate metadata file — the `StateFileHeader` in the JSONL
+state file already contains the workflow name, creation timestamp, and schema version.
 
 The state file keeps its current name (`koto-<name>.state.jsonl`) — this preserves
 compatibility with existing tooling that parses the state file format.
@@ -191,9 +179,10 @@ pub fn run(app: App) -> Result<()> {
 }
 ```
 
-Command handlers call `backend.state_file_path(name)` to locate the JSONL state file,
-replacing direct calls to `workflow_state_path()`. The state file naming convention
-(`koto-<name>.state.jsonl`) is owned by the backend, not by callers.
+Command handlers call `state_file_name(name)` (a free function) to construct the
+state file name, then join it with `backend.session_dir(name)` to get the full path.
+The naming convention (`koto-<name>.state.jsonl`) is a free function because it
+doesn't vary across backends — it's not a backend-specific behavior.
 
 #### Alternatives considered
 
@@ -227,7 +216,6 @@ working directory path (see Decision 5 for details).
   sessions/
     a1b2c3d4e5f6g7h8/     ← first 16 hex chars of SHA-256(/home/user/repos/my-project)
       my-workflow/
-        session.meta.json
         koto-my-workflow.state.jsonl
     e5f6a7b8c9d0e1f2/     ← first 16 hex chars of SHA-256(/home/user/repos/other-project)
       other-workflow/
@@ -355,8 +343,7 @@ in the git working tree, or in cloud storage, the discovery mechanism is the sam
   adds a contract that's hard to deprecate. The CLI command is strictly more capable
   (it can validate the session exists, create it if needed, etc.).
 - **Template-provided variable**: templates include `{{SESSION_DIR}}` that the engine
-  substitutes at runtime. This is Feature 3 on the roadmap (engine-provided variables)
-  and will complement `koto session dir`, but this design doesn't implement it.
+  substitutes at runtime. This complements `koto session dir` — see Decision 7.
 - **Convention-based paths**: skills assume a fixed path relative to the working
   directory (e.g., `wip/`). Couples skills to a specific backend and breaks when
   the storage location changes.
@@ -378,7 +365,9 @@ Key assumptions:
 Substitute `{{SESSION_DIR}}` at two points in the `handle_next` flow:
 
 1. **Gate commands**: replace `{{SESSION_DIR}}` in each `Gate.command` string before
-   passing to `evaluate_gates()`. This happens per-gate, just before shell execution.
+   passing to `evaluate_gates()`. The gate closure runs inside the `advance_until_stop`
+   loop and is invoked per-state, so substitution must happen inside the closure on
+   every invocation, not once before the loop.
 2. **Directives**: replace `{{SESSION_DIR}}` in the `directive` string of `NextResponse`
    before serialization to stdout.
 
@@ -397,8 +386,10 @@ pub fn substitute_vars(input: &str, vars: &HashMap<String, String>) -> String {
 ```
 
 The vars map is built once per `handle_next` call with one entry:
-`SESSION_DIR` -> `backend.session_dir(name)`. When `--var` lands (issue #67), user
-variables merge into the same map (built-ins refuse override), and the same
+`SESSION_DIR` -> `backend.session_dir(name)`. If a template declares `SESSION_DIR`
+in its `variables:` block, `handle_next` returns a runtime error — built-in variable
+names are reserved and cannot be shadowed. When `--var` lands (issue #67), user
+variables merge into the same map with the same override protection, and the same
 `substitute_vars` function handles everything.
 
 Runtime resolution is correct because `SESSION_DIR` depends on the backend, which
@@ -432,8 +423,7 @@ directory but keeps its name and format. Skills discover the session path throug
 directives, substituted at runtime by `handle_next` (D7).
 
 After this ships, `koto init my-workflow` creates
-`~/.koto/sessions/<repo-id>/my-workflow/` with `session.meta.json` and
-`koto-my-workflow.state.jsonl`. `koto next my-workflow` substitutes `{{SESSION_DIR}}`
+`~/.koto/sessions/<repo-id>/my-workflow/` with `koto-my-workflow.state.jsonl`. `koto next my-workflow` substitutes `{{SESSION_DIR}}`
 in gate commands and directives, then reads state from the session directory.
 `koto session dir my-workflow` prints the path for skill-level discovery.
 
@@ -447,7 +437,6 @@ in gate commands and directives, then reads state from the session directory.
 pub trait SessionBackend: Send + Sync {
     fn create(&self, id: &str) -> Result<PathBuf>;
     fn session_dir(&self, id: &str) -> PathBuf;
-    fn state_file_path(&self, id: &str) -> PathBuf;
     fn exists(&self, id: &str) -> bool;
     fn cleanup(&self, id: &str) -> Result<()>;
     fn list(&self) -> Result<Vec<SessionInfo>>;
@@ -485,12 +474,17 @@ fn repo_id(working_dir: &Path) -> std::io::Result<String> {
     Ok(hash[..16].to_string())
 }
 
+/// State file naming convention. Free function, not on the trait —
+/// the naming convention doesn't vary across backends.
+pub fn state_file_name(id: &str) -> String {
+    format!("koto-{}.state.jsonl", id)
+}
+
 impl SessionBackend for LocalBackend {
     fn create(&self, id: &str) -> Result<PathBuf> {
         validate_session_id(id)?;
         let dir = self.base_dir.join(id);
         fs::create_dir_all(&dir)?;
-        write_session_meta(&dir, id)?;
         Ok(dir)
     }
 
@@ -498,34 +492,30 @@ impl SessionBackend for LocalBackend {
         self.base_dir.join(id)
     }
 
-    fn state_file_path(&self, id: &str) -> PathBuf {
-        self.base_dir.join(id).join(format!("koto-{}.state.jsonl", id))
-    }
-
     fn exists(&self, id: &str) -> bool {
-        validate_session_id(id).is_ok()
-            && self.base_dir.join(id).join("session.meta.json").exists()
+        self.base_dir.join(id).join(state_file_name(id)).exists()
     }
 
     fn cleanup(&self, id: &str) -> Result<()> {
-        validate_session_id(id)?;
         let dir = self.base_dir.join(id);
         if dir.exists() { fs::remove_dir_all(&dir)?; }
         Ok(())
     }
 
     fn list(&self) -> Result<Vec<SessionInfo>> {
-        // scan base_dir, read session.meta.json from each subdirectory
-        // skip entries without session.meta.json (orphan detection)
+        // scan base_dir for subdirectories containing a state file
+        // extract metadata from StateFileHeader
     }
 }
 ```
 
 **`src/session/validate.rs` — session ID validation**
 
-Allowlist: `^[a-zA-Z][a-zA-Z0-9._-]*$`. IDs must start with an alphanumeric character,
-which rejects `.` and `..` (path traversal) without a separate check. Called by all
-public `SessionBackend` methods that accept an ID, not just `create()`.
+Allowlist: `^[a-zA-Z][a-zA-Z0-9._-]*$`. IDs must start with a letter, which rejects
+`.` and `..` (path traversal) without a separate check. Called by `create()` at the
+session creation boundary. Other methods (`session_dir`, `exists`, `cleanup`) are
+pure path computations or read-only checks that don't need validation — IDs that
+reach them were already validated at creation time.
 
 **`src/cli/mod.rs` — refactored command dispatch**
 
@@ -565,7 +555,8 @@ koto session cleanup <name> → call backend.cleanup(name)
 |-----------|----------|---------|
 | `SessionBackend` trait | `src/session/mod.rs` | all CLI commands |
 | `LocalBackend` | `src/session/local.rs` | `run()` in cli/mod.rs |
-| `validate_session_id()` | `src/session/validate.rs` | all `SessionBackend` methods |
+| `validate_session_id()` | `src/session/validate.rs` | `create()` |
+| `state_file_name()` | `src/session/mod.rs` | CLI command handlers |
 | `substitute_vars()` | `src/cli/vars.rs` | `handle_next` (gates + directives) |
 | `koto session` subcommands | `src/cli/session.rs` | agents, users |
 
@@ -577,7 +568,6 @@ koto init my-wf
   → LocalBackend::create("my-wf")
     → validate_session_id("my-wf")
     → mkdir ~/.koto/sessions/<repo-id>/my-wf/
-    → write session.meta.json
   → write koto-my-wf.state.jsonl into session dir
   → print JSON result (same as today)
 
@@ -603,8 +593,8 @@ Implement `repo_id()` using `sha256_hex()` from `src/cache.rs` with
 `std::fs::canonicalize()` and 16-character truncation (Decision 5). Unit tests for
 create, session_dir, exists, cleanup, list, ID validation, and repo-id derivation.
 
-The `list()` implementation should skip subdirectories that lack `session.meta.json`
-(orphan detection for partial/corrupt session directories).
+The `list()` implementation scans for state files (`koto-*.state.jsonl`) and extracts
+metadata from the `StateFileHeader`. Subdirectories without a state file are skipped.
 
 Deliverables:
 - `src/session/` module (3 files)
@@ -640,18 +630,23 @@ Deliverables:
 Add `koto session dir|list|cleanup` subcommands. Add automatic cleanup when a workflow
 reaches a terminal state. End-to-end tests.
 
+Update existing templates and documentation that hardcode `wip/` paths to use
+`{{SESSION_DIR}}`. This includes `hello-koto.md` (gate command and directive),
+the skill authoring guide, and test documentation.
+
 Deliverables:
 - `src/cli/session.rs` — session subcommands
 - Auto-cleanup logic in the advance path
+- Updated templates and documentation (`hello-koto.md`, `custom-skill-authoring.md`)
 - End-to-end tests
 
 ## Security considerations
 
 **Session ID validation.** Session IDs are used in filesystem paths. The allowlist
 `^[a-zA-Z][a-zA-Z0-9._-]*$` requires IDs to start with a letter, which rejects `.`
-and `..` (path traversal) without a separate check. Validation runs in all public
-`SessionBackend` methods that accept an ID, not just `create()`, preventing bypass
-through direct calls to `session_dir()` or `cleanup()`.
+and `..` (path traversal) without a separate check. Validation runs at the creation
+boundary (`create()`). Other methods receive IDs that were already validated at
+creation time.
 
 **Home directory trust.** `~/.koto/sessions/<repo-id>/` is writable by the current user.
 No elevated permissions needed. The `~/.koto/` directory should be created with mode
@@ -674,7 +669,7 @@ should log a warning if lossy conversion occurs.
 **No secrets in session artifacts.** Session directories contain workflow state and
 skill artifacts (research, plans, decisions). These aren't secrets, but they may
 contain project-specific information. The local backend doesn't transmit anything
-off the machine. Cloud sync (feature 5) will add exposure considerations.
+off the machine. The cloud sync feature will add exposure considerations.
 
 ## Consequences
 
@@ -701,8 +696,8 @@ off the machine. Cloud sync (feature 5) will add exposure considerations.
 - If a user moves or renames their project directory, the repo-id hash changes and
   existing sessions become orphaned at the old hash. `koto session list` can detect
   this by checking whether the source directory still exists.
-- Partial/corrupt session directories (directory exists but `session.meta.json` is
-  missing) are invisible to `exists()` and `list()` but still occupy disk.
+- Empty session directories (directory exists but state file is missing) are invisible
+  to `exists()` and `list()` but still occupy disk.
 
 ### Mitigations
 
@@ -710,5 +705,5 @@ off the machine. Cloud sync (feature 5) will add exposure considerations.
   koto's installation guide.
 - `dirs` is a small, widely-used crate with no transitive dependencies.
 - Orphaned sessions from directory renames can be cleaned up with `koto session cleanup`.
-- `list()` skips directories without `session.meta.json`, preventing corrupt entries
-  from appearing. A future `koto session gc` could detect and remove these orphans.
+- `list()` skips directories without a state file, preventing empty entries from
+  appearing. A future `koto session gc` could detect and remove these orphans.

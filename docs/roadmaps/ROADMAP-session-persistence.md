@@ -33,9 +33,8 @@ and cloud transferability.
 ## Features
 
 ### Feature 1: Local session storage and runtime variable substitution
-**Needs:** `needs-design` — storage abstraction trait shape and CLI integration points
 **Dependencies:** None
-**Status:** Not started
+**Status:** Not started — design proposed at `docs/designs/DESIGN-local-session-storage.md`
 
 Add `SessionBackend` trait and `LocalBackend` implementation. `koto init` creates a
 session directory at `~/.koto/sessions/<repo-id>/<name>/`. `koto session dir <name>`
