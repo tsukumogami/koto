@@ -105,116 +105,128 @@ have to write template validation logic from scratch.
 
 ### Functional
 
-**R1. Interactive HTML preview.** A command produces a self-contained HTML
-file from a compiled template. The HTML displays an interactive directed
-graph with: state nodes (color-coded by type), labeled transition edges,
-hover tooltips showing gate conditions and evidence schemas,
-click-to-highlight for tracing paths, and pan/zoom for large graphs. By
-default the command opens the file in the browser for local debugging. The
-generated HTML is also suitable for committing to a repository and serving
-on project websites (GitHub Pages or similar), giving documentation readers
-an interactive experience without installing koto.
+**R1. Single export command with format selection.** `koto template export`
+is the single command for all visual output. A `--format` flag selects
+between `mermaid` (default) and `html`. An `--output` flag writes to a
+file. For `mermaid`, output goes to stdout when `--output` is omitted.
+For `html`, `--output` is required (HTML to stdout isn't useful).
 
-**R2. Text diagram export.** `koto template export` produces a Mermaid
-`stateDiagram-v2` text representation of a compiled template. Output goes to
-stdout by default. A `--format` flag selects the output format (defaulting to
-`mermaid` when omitted). An `--output` flag writes to a specified file path.
-The diagram shows states, transitions with condition labels, and gate
-annotations.
+**R2. Mermaid format.** `--format mermaid` produces a `stateDiagram-v2`
+text representation. The diagram shows states, transitions with condition
+labels, gate annotations as notes, and `[*]` markers for initial and
+terminal states.
 
-**R3. Deterministic output.** The text diagram output must be byte-identical
+**R3. HTML format.** `--format html` produces a self-contained HTML file
+with an interactive directed graph: state nodes (color-coded by type),
+labeled transition edges, hover tooltips showing gate conditions and
+evidence schemas, click-to-highlight for tracing paths, and pan/zoom for
+large graphs. The HTML loads Cytoscape.js and dagre from CDN. The generated
+file works both as a local debugging tool and as static documentation
+served on project websites (GitHub Pages or similar).
+
+**R4. Browser open flag.** `--open` launches the generated file in the
+default browser. Only valid with `--format html`. This is a convenience
+for local debugging; deploy pipelines omit it.
+
+**R5. Deterministic output.** Both format outputs must be byte-identical
 for the same input across runs. This is a hard requirement for CI drift
 detection. No timestamps, no random ordering, no platform-dependent output.
 
-**R4. Source and compiled input.** Both the preview and diagram commands
-accept either a source template `.md` file (compiled on the fly) or a
-pre-compiled `.json` file. Users shouldn't need to run a separate compile
-step first.
+**R6. Source and compiled input.** The export command accepts either a
+source template `.md` file (compiled on the fly) or a pre-compiled `.json`
+file. Users shouldn't need to run a separate compile step first.
 
-**R5. Committed diagram artifact.** The text diagram is written to a
-`.mermaid.md` file that lives as a sibling of the source template (e.g.,
-`my-workflow.mermaid.md` next to `my-workflow.md`). This file is committed
-to version control and renders natively on GitHub.
+**R7. Committed diagram artifacts.** Mermaid diagrams are written to
+`.mermaid.md` sibling files (e.g., `my-workflow.mermaid.md` next to
+`my-workflow.md`). These render natively on GitHub. HTML files are written
+to a configurable output path for website deployment. Both are committed
+artifacts that CI can verify for freshness.
 
-**R6. Built-in freshness check.** `koto template export --output <path> --check`
-compares the generated output against the existing file without writing.
-Exits 0 if fresh, exits non-zero if stale or missing. Requires `--output`
-(comparing against stdout is meaningless). When the target file doesn't exist,
-exits non-zero with a message identifying the missing file. When content
-differs, prints a one-line message pointing to the stale file and the command
-to fix it.
+**R8. Built-in freshness check.** `--check` compares what would be
+generated against the existing file without writing. Exits 0 if fresh,
+non-zero if stale or missing. Requires `--output`. Works uniformly across
+both formats: `--format mermaid --check` verifies committed Mermaid
+diagrams, `--format html --check` verifies deployed HTML documentation.
+When stale, prints the command to fix it.
 
-**R7. CI freshness workflow.** A reusable GitHub Actions workflow that runs
-`koto template export --output <path> --check` for each template in a
-configurable path. Fails if any diagram is stale or missing. Uses a
-downloaded release binary, not a source build.
+**R9. CI freshness workflow.** A reusable GitHub Actions workflow that runs
+`koto template export --check` for each template in a configurable path,
+for each configured format. Fails if any artifact is stale or missing.
+Uses a downloaded release binary, not a source build.
 
-**R8. Reusable workflow distribution.** The GHA workflow lives in the koto
+**R10. Reusable workflow distribution.** The GHA workflow lives in the koto
 repository and is callable by other repos via `uses:` with a tag reference.
 It downloads a release binary rather than building from source, so consuming
 repos don't need a Rust toolchain.
 
-**R9. Actionable error messages.** When the freshness check fails (whether
-via `--check` or CI), the error output includes the exact command to run
-locally to fix the drift (e.g.,
-`koto template export my-workflow.md --output my-workflow.mermaid.md`).
+**R11. Actionable error messages.** When the freshness check fails, the
+error output includes the exact command to run locally to fix the drift.
 
 ### Non-functional
 
-**R10. Preview file size.** Generated HTML preview files should be under
-30 KB (excluding CDN-loaded dependencies). The HTML loads JavaScript from
-CDN rather than inlining it.
+**R12. HTML file size.** Generated HTML files should be under 30 KB
+(excluding CDN-loaded dependencies). The HTML loads JavaScript from CDN
+rather than inlining it.
 
-**R11. Compilation latency.** The compile + diagram generation path should
-complete in under 500ms for templates up to 30 states. Current compile time
-is single-digit milliseconds; diagram generation adds minimal overhead.
+**R13. Compilation latency.** The compile + export path should complete in
+under 500ms for templates up to 30 states. Current compile time is
+single-digit milliseconds; export adds minimal overhead.
 
-**R12. Offline degradation.** The interactive HTML preview requires internet
-access (CDN dependencies). The text diagram command works fully offline.
+**R14. Offline degradation.** HTML export requires internet access (CDN
+dependencies). Mermaid export works fully offline.
 
 ## Acceptance criteria
 
-- [ ] Running the preview command on a multi-state template produces an HTML
-  file that opens in a browser and displays an interactive state graph
-- [ ] Hovering over a gated state in the preview shows gate name and command
-  in a tooltip
+### Export command
+- [ ] `koto template export` with no `--format` defaults to mermaid
+- [ ] `koto template export workflow.md` prints Mermaid to stdout
+- [ ] `koto template export workflow.md --output workflow.mermaid.md` writes
+  a file that GitHub renders as a state diagram
+- [ ] `koto template export workflow.md --format html --output workflow.html`
+  produces a self-contained HTML file
+- [ ] `koto template export --format html` without `--output` produces an error
+- [ ] `--open` with `--format html` opens the file in the default browser
+- [ ] `--open` without `--format html` produces an error
+- [ ] The command accepts both `.md` source templates and `.json` compiled
+  templates
+
+### Mermaid output
+- [ ] Includes `[*]` markers for initial and terminal states
+- [ ] Transition edges show `when` conditions as labels
+- [ ] Gates appear as `note` annotations
+- [ ] Running export twice on the same template produces byte-identical output
+
+### HTML output
+- [ ] Displays an interactive directed graph in the browser
+- [ ] Hovering over a gated state shows gate name and command in a tooltip
 - [ ] Hovering over a state with an accepts block shows the evidence schema
-- [ ] Click-to-highlight traces the selected state's incoming and outgoing
-  transitions
-- [ ] Running the diagram command twice on the same template produces
-  byte-identical output
-- [ ] The diagram command with `--output` writes a `.mermaid.md` file that
-  GitHub renders as a state diagram
-- [ ] The Mermaid output includes `[*]` markers for initial and terminal states
-- [ ] Transition edges in the Mermaid output show `when` conditions as labels
-- [ ] Gates appear as `note` annotations in the Mermaid output
-- [ ] `koto template export --output fresh-file.mermaid.md --check` exits 0
-- [ ] `koto template export --output stale-file.mermaid.md --check` exits
-  non-zero and prints the command to fix it
-- [ ] `koto template export --output missing-file.mermaid.md --check` exits
-  non-zero and identifies the missing file
+- [ ] Click-to-highlight traces selected state's incoming and outgoing transitions
+- [ ] Pan/zoom works for navigating large graphs
+- [ ] Includes dark mode via `prefers-color-scheme`
+- [ ] Includes a `[*]` start marker node connected to the initial state
+- [ ] All CDN script tags include SRI integrity hashes
+- [ ] Works when served as a static page (GitHub Pages) without server-side
+  processing
+- [ ] Running export twice on the same template produces byte-identical output
+
+### Freshness check
+- [ ] `--check` with a fresh file exits 0
+- [ ] `--check` with a stale file exits non-zero and prints the fix command
+- [ ] `--check` with a missing file exits non-zero and identifies the missing file
 - [ ] `--check` without `--output` produces an error
-- [ ] The reusable GHA workflow uses `--check` to detect stale or missing
-  diagrams and fails the check
+- [ ] `--check` works for both `--format mermaid` and `--format html`
+
+### CI workflow
+- [ ] The reusable GHA workflow detects stale or missing diagrams via `--check`
 - [ ] The GHA workflow error output includes the command to fix the drift
 - [ ] The GHA workflow accepts a configurable template path input
 - [ ] The GHA workflow downloads a koto release binary, not building from source
-- [ ] The preview command accepts both `.md` source templates and `.json`
-  compiled templates
-- [ ] The diagram command accepts both `.md` source templates and `.json`
-  compiled templates
-- [ ] The HTML preview includes dark mode via `prefers-color-scheme`
-- [ ] The HTML preview includes a `[*]` start marker node connected to the
-  initial state
-- [ ] All CDN script tags in the preview HTML include SRI integrity hashes
-- [ ] The generated HTML preview file works when served as a static page
-  (e.g., via GitHub Pages) without any server-side processing
 
 ## Out of scope
 
-- **Watch mode / live reload for preview.** Compile + generate is under 100ms.
-  Re-running the command is fast enough for v1. Watch mode can be added later
-  if users request it.
+- **Watch mode / live reload.** Compile + export is under 100ms. Re-running
+  the command is fast enough for v1. Watch mode can be added later if users
+  request it.
 - **In-place diagram injection into source templates.** The koto compiler
   parses H2 headings as state boundaries. Injecting content into the source
   `.md` risks breaking compilation or being interpreted as a state directive.
@@ -227,19 +239,19 @@ access (CDN dependencies). The text diagram command works fully offline.
 - **Auto-fix in CI.** The GHA workflow fails on drift but doesn't auto-commit
   fixes. Auto-fix requires write permissions, creates noise in git history,
   and doesn't work for fork PRs.
-- **Offline interactive preview.** The HTML preview loads JS from CDN. A future
+- **Offline HTML export.** The HTML format loads JS from CDN. A future
   `--inline` flag could bundle dependencies for offline use, but both target
   use cases (local dev, GitHub Pages) are online.
 - **Alternative layout engines.** ELK.js (1.3 MB) is too heavy for default use.
   Can be revisited if dagre layout quality degrades at 30+ states.
 - **Vendored JS dependencies.** Inlining Cytoscape.js would inflate each
-  preview file to ~435 KB. CDN with SRI hashes is the right trade-off.
+  HTML file to ~435 KB. CDN with SRI hashes is the right trade-off.
 
 ## Known limitations
 
-**CDN dependency for preview.** The interactive HTML won't render without
-internet access. The Mermaid text diagram works offline, so there's always a
-fallback for basic structure inspection.
+**CDN dependency for HTML format.** The interactive HTML won't render without
+internet access. Mermaid export works offline, so there's always a fallback
+for basic structure inspection.
 
 **GitHub Mermaid rendering.** The text diagram relies on GitHub's native
 Mermaid rendering in markdown files. GitHub supports `stateDiagram-v2` but
@@ -249,11 +261,11 @@ Mermaid text.
 
 **Mermaid omits rich metadata.** The text diagram shows states, transitions,
 conditions, and gates. Evidence schemas, default actions, integration names,
-and full directive text are only available in the interactive preview. This is
-intentional: the Mermaid diagram is a structural overview, not a complete
-specification.
+and full directive text are only available in the HTML format. This is
+intentional: Mermaid is a structural overview, HTML is the detailed
+inspection tool.
 
-**CDN version maintenance.** The preview HTML pins CDN library versions with
+**CDN version maintenance.** The HTML export pins CDN library versions with
 SRI hashes. Of the three dependencies, only Cytoscape.js is actively maintained
 (dagre last released 2016, cytoscape-dagre last released 2022). Version updates
 are infrequent and manual.
@@ -273,20 +285,17 @@ enforcement via the reusable GHA workflow makes diagram freshness automatic
 rather than aspirational. This is the same pattern as `cargo fmt --check`
 or `terraform fmt -check` in CI.
 
-**Interactive preview as a separate command.** The preview generates an HTML
-file and opens a browser, which is a side effect. The text diagram outputs to
-stdout, which is composable. These are different interaction models that serve
-different moments (debugging vs. committing). Combining them into one command
-with a `--format` flag would conflate composable text output with
-side-effect-heavy browser interaction.
-
-**`export` over `diagram` for the command name.** The `--format` flag provides
-clean extensibility to DOT or PlantUML without CLI schema changes. The
-`export`/`preview` pairing communicates a meaningful pure-vs-side-effect
-distinction that `diagram`/`preview` doesn't. `diagram` has directness appeal
-but creates naming awkwardness as formats are added. `render` and `graph` were
-also evaluated and eliminated (`render` implies pixels, `graph` conflicts with
-koto's runtime state graph concept).
+**Unified `export` command over separate `export` + `preview`.** The original
+design proposed separate commands because "export is pure text, preview has
+side effects (browser launch)." The documentation reader use case changed this:
+HTML output for project websites is a pure file-write operation, same as
+Mermaid. The side effect was never about the format — it was about opening a
+browser. Making that an opt-in `--open` flag cleanly separates output
+generation from delivery. One command with `--format mermaid|html` is simpler,
+and `--check` works uniformly across both formats without duplication.
+`diagram`, `render`, and `graph` were also evaluated as command names;
+`export` with `--format` won on extensibility (DOT, PlantUML later) and
+because `graph` conflicts with koto's runtime state graph concept.
 
 **Built-in `--check` flag over `git diff` in CI.** Following `cargo fmt --check`,
 `prettier --check`, and `terraform fmt -check`, the export command includes a
