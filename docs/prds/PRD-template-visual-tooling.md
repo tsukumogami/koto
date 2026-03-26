@@ -41,11 +41,14 @@ assess the structural impact. Did this change create a dead end? Is the
 new state reachable? These questions require mentally reconstructing the
 graph from YAML, which is exactly the kind of work a tool should do.
 
-**Documentation readers** browsing templates on GitHub or GitHub Pages want
-to quickly understand the workflow a template enforces. They aren't going to
-clone the repo and run commands. If there's no rendered diagram next to the
-template source, they're left reading YAML front-matter and mentally
-constructing the graph themselves.
+**Documentation readers** want to quickly understand the workflow a template
+enforces. This plays out in two different contexts. Someone browsing the
+source on GitHub sees the raw template markdown and needs a diagram that
+renders natively in that medium — a committed Mermaid file handles this.
+Someone visiting a project website (GitHub Pages or similar) expects a
+richer experience: an interactive diagram they can click through, with
+tooltips and pan/zoom — a static Mermaid block won't cut it there. These
+are different mediums with different expectations.
 
 **Repo maintainers** have no way to enforce that visual documentation stays
 current. If a team commits workflow diagrams alongside templates, those
@@ -60,8 +63,10 @@ so stale diagrams become misleading rather than helpful.
   when the source template changes
 - Repo maintainers can add a CI check that fails when committed diagrams
   are out of sync with their source templates
-- Documentation readers can see a rendered workflow diagram when browsing
-  templates on GitHub or GitHub Pages, without cloning the repo or running tools
+- Documentation readers browsing source on GitHub see a natively rendered
+  Mermaid diagram alongside the template
+- Documentation readers on a project website see an interactive diagram
+  with the same fidelity as the local preview
 - The visual tooling fits into existing workflows (compile -> inspect -> commit -> review)
   without requiring extra manual steps that people forget
 
@@ -80,9 +85,13 @@ can see the workflow structure without running local tools.
 file diff, so that I can assess the structural impact of template changes
 (new states, changed transitions, removed paths) at a glance.
 
-**As someone browsing template documentation** on GitHub, I want to see a
-rendered state diagram alongside the template source, so that I can
-understand the workflow structure without cloning the repo or running tools.
+**As someone browsing template source on GitHub**, I want to see a rendered
+state diagram alongside the template file, so that I can understand the
+workflow structure without cloning the repo or running tools.
+
+**As someone reading template documentation on a project website**, I want
+to see an interactive diagram with hover tooltips and click-to-highlight,
+so that I can explore the workflow in detail without installing anything.
 
 **As a repo maintainer**, I want a CI check that fails when committed
 diagrams don't match the current template source, so that stale diagrams
@@ -97,10 +106,14 @@ have to write template validation logic from scratch.
 ### Functional
 
 **R1. Interactive HTML preview.** A command produces a self-contained HTML
-file from a compiled template and opens it in the default browser. The HTML
-displays an interactive directed graph with: state nodes (color-coded by type),
-labeled transition edges, hover tooltips showing gate conditions and evidence
-schemas, click-to-highlight for tracing paths, and pan/zoom for large graphs.
+file from a compiled template. The HTML displays an interactive directed
+graph with: state nodes (color-coded by type), labeled transition edges,
+hover tooltips showing gate conditions and evidence schemas,
+click-to-highlight for tracing paths, and pan/zoom for large graphs. By
+default the command opens the file in the browser for local debugging. The
+generated HTML is also suitable for committing to a repository and serving
+on project websites (GitHub Pages or similar), giving documentation readers
+an interactive experience without installing koto.
 
 **R2. Text diagram export.** `koto template export` produces a Mermaid
 `stateDiagram-v2` text representation of a compiled template. Output goes to
@@ -194,6 +207,8 @@ access (CDN dependencies). The text diagram command works fully offline.
 - [ ] The HTML preview includes a `[*]` start marker node connected to the
   initial state
 - [ ] All CDN script tags in the preview HTML include SRI integrity hashes
+- [ ] The generated HTML preview file works when served as a static page
+  (e.g., via GitHub Pages) without any server-side processing
 
 ## Out of scope
 
