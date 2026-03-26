@@ -26,7 +26,7 @@ to directed state graphs. As templates grow past 5-10 states with branching
 transitions, gate conditions, and evidence schemas, reviewing the structure
 from raw JSON or YAML becomes tedious and error-prone.
 
-Three groups of people feel this pain differently:
+Four groups of people feel this pain differently:
 
 **Template authors** iterate on workflow design by compiling templates and
 testing them with `koto init` / `koto next`. When a workflow gets stuck or
@@ -41,6 +41,12 @@ assess the structural impact. Did this change create a dead end? Is the
 new state reachable? These questions require mentally reconstructing the
 graph from YAML, which is exactly the kind of work a tool should do.
 
+**Documentation readers** browsing templates on GitHub or GitHub Pages want
+to quickly understand the workflow a template enforces. They aren't going to
+clone the repo and run commands. If there's no rendered diagram next to the
+template source, they're left reading YAML front-matter and mentally
+constructing the graph themselves.
+
 **Repo maintainers** have no way to enforce that visual documentation stays
 current. If a team commits workflow diagrams alongside templates, those
 diagrams drift as templates evolve. There's no CI check for freshness,
@@ -54,6 +60,8 @@ so stale diagrams become misleading rather than helpful.
   when the source template changes
 - Repo maintainers can add a CI check that fails when committed diagrams
   are out of sync with their source templates
+- Documentation readers can see a rendered workflow diagram when browsing
+  templates on GitHub or GitHub Pages, without cloning the repo or running tools
 - The visual tooling fits into existing workflows (compile -> inspect -> commit -> review)
   without requiring extra manual steps that people forget
 
@@ -71,6 +79,10 @@ can see the workflow structure without running local tools.
 **As a PR reviewer**, I want to see a rendered state diagram in the PR's
 file diff, so that I can assess the structural impact of template changes
 (new states, changed transitions, removed paths) at a glance.
+
+**As someone browsing template documentation** on GitHub, I want to see a
+rendered state diagram alongside the template source, so that I can
+understand the workflow structure without cloning the repo or running tools.
 
 **As a repo maintainer**, I want a CI check that fails when committed
 diagrams don't match the current template source, so that stale diagrams
