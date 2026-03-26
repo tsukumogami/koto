@@ -293,7 +293,7 @@ src/cli/mod.rs
   TemplateSubcommand::Preview { source, output }
 
 src/export/
-  mod.rs          -- format dispatch
+  mod.rs          -- re-exports mermaid and preview modules
   mermaid.rs      -- CompiledTemplate -> stateDiagram-v2 text
   preview.rs      -- CompiledTemplate -> HTML (include_str! + replace)
 
@@ -303,7 +303,23 @@ src/export/preview.html
   -- Valid HTML that renders with empty data during development
 ```
 
+Note: `src/export/mod.rs` starts as a simple re-export (`pub mod mermaid;
+pub mod preview;`). Add a format dispatch enum when a second export format
+materializes, not before.
+
 ### Key interfaces
+
+**Source resolution helper:**
+```rust
+/// Resolve a source argument to a CompiledTemplate.
+/// Accepts either a .md source (compiled via compile_cached) or
+/// a .json pre-compiled template.
+fn resolve_template(source: &str) -> anyhow::Result<CompiledTemplate>
+```
+`compile_cached()` returns `(PathBuf, String)`, not a struct. This helper
+reads and deserializes the cached file, reusing the existing
+`load_compiled_template()` logic. Shared by both `export` and `preview`
+handlers to avoid duplicating detection logic.
 
 **Mermaid export function:**
 ```rust
@@ -319,9 +335,14 @@ pub fn generate_preview(
     output_path: &Path,
 ) -> anyhow::Result<()>
 ```
-Serializes template to JSON, replaces the placeholder in the embedded HTML,
-writes the file. The caller (CLI handler) is responsible for opening the
-browser.
+Serializes template to JSON, escapes `</` as `<\/` to prevent script context
+injection, replaces the placeholder in the embedded HTML, writes the file.
+The caller (CLI handler) is responsible for opening the browser.
+
+**Error handling:** Both `export` and `preview` are developer-facing commands
+(not agent-consumed), so errors go to stderr as plain text, not JSON. This
+differs from `compile` and `validate` which use `exit_with_error()` JSON
+output for machine consumption.
 
 **CLI handler for preview:**
 ```rust
@@ -350,8 +371,9 @@ compile_cached() -> CompiledTemplate JSON (existing)
 ```
 
 Both `export` and `preview` accept either a source template path (compiled on
-the fly via `compile_cached`) or a pre-compiled JSON path. The CLI handler
-detects which based on file extension.
+the fly via `compile_cached`) or a pre-compiled JSON path. The shared
+`resolve_template()` helper detects which based on file extension (.md/.yaml
+triggers compilation, .json loads directly).
 
 ## Implementation Approach
 
@@ -415,3 +437,47 @@ Deliverables:
   and open update PRs. Low priority since pinned versions work indefinitely.
 - Mermaid completeness: the interactive HTML preview covers the detailed
   metadata inspection use case. Mermaid is intentionally a structural overview.
+
+## Security Considerations
+
+### CDN script integrity
+
+The generated HTML loads JavaScript from unpkg.com. Without verification, a
+compromised CDN could serve malicious code to anyone who opens a preview file.
+All three `<script>` tags must include Subresource Integrity (SRI) hashes:
+
+```html
+<script src="https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js"
+        integrity="sha384-<hash>" crossorigin="anonymous"></script>
+```
+
+SRI hashes are computed at development time against the pinned versions and
+embedded in `preview.html`. When CDN versions are bumped, new hashes must be
+computed and committed alongside the version update. The browser refuses to
+execute any script whose content doesn't match the hash.
+
+### Script context injection
+
+The compiled template JSON is injected into a `<script>` block via string
+replacement. `serde_json` produces valid JSON but doesn't escape `</script>`
+sequences, which would break out of the HTML script context if a state
+directive or gate command contained that string. The `generate_preview()`
+function must replace `</` with `<\/` in the serialized JSON before insertion.
+This is a required implementation detail, not optional.
+
+### Embedded template data
+
+Preview HTML files contain the full compiled template in plaintext, including
+gate commands (shell commands), default action commands, directive text with
+agent instructions, and variable declarations. Users should treat preview
+files with the same sensitivity as source templates.
+
+For sharing workflow structure (in PRs, READMEs, or public documentation),
+prefer `koto template export --format mermaid` -- it includes only state
+names, transitions, and gate names, not full commands or directives.
+
+### File write scope
+
+The preview command writes to the current directory using `Path::file_stem()`
+for filename derivation. This prevents path traversal via `../` in template
+paths. The output path is printed so users know exactly what was written.
