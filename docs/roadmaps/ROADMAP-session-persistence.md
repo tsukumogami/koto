@@ -1,5 +1,5 @@
 ---
-status: Draft
+status: Active
 theme: |
   Move koto's session state out of the git working tree and into a koto-managed
   storage layer with pluggable backends. The features build incrementally: local
@@ -17,7 +17,7 @@ scope: |
 
 ## Status
 
-Draft
+Active
 
 ## Theme
 
