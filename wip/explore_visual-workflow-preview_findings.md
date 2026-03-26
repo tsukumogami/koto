@@ -47,3 +47,5 @@ The visualization feature has two deliverables: a Mermaid export MVP (~50-100 li
 For v1 interactivity: hover tooltips (gate conditions, evidence schemas, transitions), click-to-highlight neighborhood, pan/zoom, and visual encoding by state type (initial, terminal, gated, branching). Richer features (semantic zoom, sidebar inspector, minimap) can layer on later as the graph sizes grow.
 
 Open areas: Mermaid export representation details, dark mode support, and validation that dagre handles 30+ state workflows acceptably.
+
+## Decision: Crystallize
