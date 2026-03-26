@@ -26,19 +26,13 @@ An agent filed #89 after its first experience using koto through the work-on ski
 - Redesigning the state machine model
 - Changes to the work-on skill itself (that's downstream)
 
-## Research Leads
+## Research Leads (Round 2: Semantic Question)
 
-1. **What does `advanced: true` mean in koto's engine, and what happens during an advanced phase transition?**
-   Understanding the current implementation is essential before proposing changes. Need to trace the code path for advanced phases vs normal phases.
+1. **What information does `advanced` actually carry for callers, and what happens to it after auto-advance?**
+   If auto-advance eliminates most cases where `advanced: true` is returned, does the field become vestigial? Trace every place the field is set and consumed to understand its full role.
 
-2. **Is the double-call pattern an intentional design choice or an emergent workaround?**
-   Check git history, design docs, and template definitions for evidence of whether advanced phases were designed for agent auto-consumption or for human-visible checkpoints.
+2. **Does the distinction between "I caused this transition" vs "the engine caused it" matter for any real caller scenario?**
+   The design-intent agent proposed disambiguating with `advanced_by: "agent" | "engine"`. Investigate whether any caller logic (current or foreseeable) would branch on this distinction.
 
-3. **What state machine invariants or side-effects would auto-advance need to preserve?**
-   The issue mentions "gate logic for advanced phases still executes." Need to verify what side-effects exist and whether collapsing the calls can preserve them.
-
-4. **How do existing koto templates use `advanced` phases, and are there cases where stopping matters?**
-   Survey all templates to understand usage patterns. If every consumer immediately re-calls, the pattern is purely mechanical. If any consumer inspects the advanced phase, auto-advance would change behavior.
-
-5. **Should auto-advance live in the engine, the CLI, or the caller convention?**
-   Koto separates pkg/engine from cmd/koto. The right layer for this optimization affects API stability and whether library consumers get the same behavior.
+3. **What should the `koto next` response contract look like after auto-advance is implemented?**
+   The current contract was designed pre-auto-advancement. If the behavioral fix goes in, should the response be redesigned? Look at what callers actually need: current state, whether input is required, what happened along the way.
