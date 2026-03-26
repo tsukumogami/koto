@@ -1,0 +1,11 @@
+{
+  "topic": "visual-workflow-preview",
+  "decisions": [
+    {"id": 1, "question": "CLI command structure: how do users invoke Mermaid export and HTML preview?", "status": "complete", "complexity": "standard", "chosen": "export + preview as separate subcommands"},
+    {"id": 2, "question": "Mermaid representation: how to map compiled template concepts to stateDiagram-v2 syntax?", "status": "complete", "complexity": "standard", "chosen": "minimal mapping (states, transitions, gates as notes)"},
+    {"id": 3, "question": "HTML generation architecture: template embedding, CDN pinning, data injection, output paths?", "status": "complete", "complexity": "standard", "chosen": "include_str! with single placeholder replacement"},
+    {"id": 4, "question": "Visual design: state type encoding, dark mode, edge labels, badges?", "status": "complete", "complexity": "standard", "chosen": "dark mode + start marker, skip badges/end markers"}
+  ],
+  "cross_validation": "passed",
+  "round": 0
+}
