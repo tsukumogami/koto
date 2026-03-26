@@ -33,6 +33,35 @@ Issue #89 asks koto to auto-advance past `advanced: true` phases instead of requ
 
 User wants to explore the semantic question: should `advanced` be disambiguated (agent-initiated vs engine-initiated) separately from the behavioral auto-advance fix?
 
+## Round 2
+
+### Key Insights
+
+- The agent-vs-engine distinction doesn't matter for any real caller. All consumers treat `advanced: true` as mechanical retry. The event log already provides full disambiguation. Adding `advanced_by` would expand the contract for zero behavioral gain. (agent-vs-engine)
+- `advanced` becomes redundant post-auto-advance. Response variants are self-describing: EvidenceRequired, GateBlocked, Terminal each tell callers exactly what to do. (lifecycle, response-contract)
+- The behavioral fix and response contract are independent concerns. Auto-advance can proceed without touching the response. Contract can be extended later with observability metadata. (response-contract)
+- `advanced` should be kept for backward compat but deprecated as a decision signal. 22 integration test assertions depend on it. (lifecycle)
+
+### Tensions
+
+None remaining from round 1. All three leads converge: the semantic distinction is operationally irrelevant.
+
+### Gaps
+
+- Whether `passed_through: Vec<String>` or `transition_count: usize` is the better observability extension
+
+### Decisions
+
+- The agent-vs-engine semantic distinction is not worth encoding in the CLI response (event log handles it)
+- The behavioral fix (auto-advance) and response contract evolution are independent; behavioral fix can proceed first
+- `advanced` field: keep for backward compat, deprecate as decision signal
+
+### User Focus
+
+User wants to explore observability options: `passed_through` vs `transition_count` before crystallizing.
+
 ## Accumulated Understanding
 
-Issue #89 is directionally correct but built on a misunderstanding -- there are no "advanced phases" in templates. The `advanced` flag is a CLI response field that became semantically overloaded when auto-advancement was added. The behavioral fix (keep looping until evidence is required) is safe and fits the architecture. The open question is whether the `advanced` field itself needs redesigning, and whether that's a prerequisite for, consequence of, or independent concern from the auto-advance behavior change.
+Issue #89 is directionally correct. The behavioral fix (extend `advance_until_stop()` to keep looping until evidence is required) is safe, fits the architecture, and breaks no invariants. The `advanced` field's semantic overload is a separate, independent concern -- it should be deprecated as a decision signal and kept for backward compatibility.
+
+The remaining question is how to provide observability for auto-advanced transitions in the response contract, which is needed to meet #89's acceptance criterion: "Response includes indication that advanced phase(s) were passed through."

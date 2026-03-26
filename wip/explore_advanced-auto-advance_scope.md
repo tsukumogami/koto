@@ -26,13 +26,13 @@ An agent filed #89 after its first experience using koto through the work-on ski
 - Redesigning the state machine model
 - Changes to the work-on skill itself (that's downstream)
 
-## Research Leads (Round 2: Semantic Question)
+## Research Leads (Round 3: Observability Options)
 
-1. **What information does `advanced` actually carry for callers, and what happens to it after auto-advance?**
-   If auto-advance eliminates most cases where `advanced: true` is returned, does the field become vestigial? Trace every place the field is set and consumed to understand its full role.
+1. **What would callers actually do with observability metadata from auto-advanced transitions?**
+   Before choosing between `passed_through` and `transition_count`, understand the use cases. Would callers log it, display it to users, use it for progress tracking, or use it for debugging? Does the answer differ by caller type (skill, library consumer, human debugger)?
 
-2. **Does the distinction between "I caused this transition" vs "the engine caused it" matter for any real caller scenario?**
-   The design-intent agent proposed disambiguating with `advanced_by: "agent" | "engine"`. Investigate whether any caller logic (current or foreseeable) would branch on this distinction.
+2. **How do `passed_through: Vec<String>` and `transition_count: usize` compare in terms of implementation cost, contract complexity, and future extensibility?**
+   Trace through the engine code to understand what data is available at each transition point. Consider what each option costs to produce, serialize, and consume. Consider whether `passed_through` enables future enrichment (per-state metadata, gate results, action outputs).
 
-3. **What should the `koto next` response contract look like after auto-advance is implemented?**
-   The current contract was designed pre-auto-advancement. If the behavioral fix goes in, should the response be redesigned? Look at what callers actually need: current state, whether input is required, what happened along the way.
+3. **Is response-level observability even the right mechanism, or should koto lean on its existing event log instead?**
+   The event log already records every transition with full detail. Maybe the response shouldn't try to summarize the journey -- maybe callers who want observability should query the event log via `koto query` or `koto status`. Compare the ergonomics of response metadata vs. event log queries for the actual use cases identified in lead 1.
