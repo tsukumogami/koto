@@ -113,24 +113,30 @@ For `html`, `--output` is required (HTML to stdout isn't useful).
 
 **R2. Mermaid format.** `--format mermaid` produces a `stateDiagram-v2`
 text representation. The diagram shows states, transitions with condition
-labels, gate annotations as notes, and `[*]` markers for initial and
-terminal states.
+labels, `[*]` markers for initial and terminal states, and gate
+annotations as `note` blocks containing the gate name.
 
 **R3. HTML format.** `--format html` produces a self-contained HTML file
-with an interactive directed graph: state nodes (color-coded by type),
-labeled transition edges, hover tooltips showing gate conditions and
-evidence schemas, click-to-highlight for tracing paths, and pan/zoom for
-large graphs. The HTML loads Cytoscape.js and dagre from CDN. The generated
-file works both as a local debugging tool and as static documentation
-served on project websites (GitHub Pages or similar).
+with an interactive directed graph: state nodes (color-coded by type:
+initial, terminal, gated, branching), labeled transition edges, hover
+tooltips showing gate name and command and evidence schemas,
+click-to-highlight for tracing direct incoming and outgoing edges (one
+hop), pan/zoom for large graphs, a `[*]` start marker node connected to
+the initial state, and dark mode via `prefers-color-scheme` media query.
+The HTML loads Cytoscape.js and dagre from unpkg.com with SRI integrity
+hashes. The generated file works both as a local debugging tool and as
+static documentation served on project websites (GitHub Pages or similar).
+It contains no server-side directives; all resource references are absolute
+CDN URLs or inline.
 
 **R4. Browser open flag.** `--open` launches the generated file in the
 default browser. Only valid with `--format html`. This is a convenience
 for local debugging; deploy pipelines omit it.
 
 **R5. Deterministic output.** Both format outputs must be byte-identical
-for the same input across runs. This is a hard requirement for CI drift
-detection. No timestamps, no random ordering, no platform-dependent output.
+for the same input across runs and across platforms. This is a hard
+requirement for CI drift detection. No timestamps, no random ordering, no
+platform-dependent output. All output uses LF line endings unconditionally.
 
 **R6. Source and compiled input.** The export command accepts either a
 source template `.md` file (compiled on the fly) or a pre-compiled `.json`
@@ -157,23 +163,33 @@ Uses a downloaded release binary, not a source build.
 **R10. Reusable workflow distribution.** The GHA workflow lives in the koto
 repository and is callable by other repos via `uses:` with a tag reference.
 It downloads a release binary rather than building from source, so consuming
-repos don't need a Rust toolchain.
+repos don't need a Rust toolchain. The workflow accepts a `koto-version`
+input (defaulting to `latest`) so consumers can pin a specific release.
 
 **R11. Actionable error messages.** When the freshness check fails, the
 error output includes the exact command to run locally to fix the drift.
 
 ### Non-functional
 
-**R12. HTML file size.** Generated HTML files should be under 30 KB
-(excluding CDN-loaded dependencies). The HTML loads JavaScript from CDN
-rather than inlining it.
+**R12. HTML file size.** Generated HTML files must be under 30 KB
+(excluding CDN-loaded dependencies) for templates up to 30 states. The
+HTML loads JavaScript from CDN rather than inlining it.
 
-**R13. Compilation latency.** The compile + export path should complete in
-under 500ms for templates up to 30 states. Current compile time is
-single-digit milliseconds; export adds minimal overhead.
+**R13. Compilation latency.** The compile + export path must complete in
+under 500ms for templates up to 30 states.
 
-**R14. Offline degradation.** HTML export requires internet access (CDN
-dependencies). Mermaid export works fully offline.
+**R14. Offline degradation.** Mermaid export must work without network
+access. HTML export succeeds without network access (the generated file
+requires CDN at view time, not generation time).
+
+**R15. Flag compatibility.** Invalid flag combinations produce clear errors:
+
+| Combination | Behavior |
+|-------------|----------|
+| `--format html` without `--output` | Error |
+| `--open` without `--format html` | Error |
+| `--open` with `--check` | Error |
+| `--check` without `--output` | Error |
 
 ## Acceptance criteria
 
@@ -181,46 +197,65 @@ dependencies). Mermaid export works fully offline.
 - [ ] `koto template export` with no `--format` defaults to mermaid
 - [ ] `koto template export workflow.md` prints Mermaid to stdout
 - [ ] `koto template export workflow.md --output workflow.mermaid.md` writes
-  a file that GitHub renders as a state diagram
+  valid `stateDiagram-v2` Mermaid syntax
 - [ ] `koto template export workflow.md --format html --output workflow.html`
   produces a self-contained HTML file
-- [ ] `koto template export --format html` without `--output` produces an error
-- [ ] `--open` with `--format html` opens the file in the default browser
-- [ ] `--open` without `--format html` produces an error
 - [ ] The command accepts both `.md` source templates and `.json` compiled
-  templates
+  templates, producing identical output for the same underlying template
+- [ ] Invalid input (non-existent file, malformed JSON, template that fails
+  compilation) produces a clear error message and non-zero exit code
+- [ ] All flag compatibility rules (R15) produce clear errors for invalid
+  combinations
 
 ### Mermaid output
 - [ ] Includes `[*]` markers for initial and terminal states
 - [ ] Transition edges show `when` conditions as labels
-- [ ] Gates appear as `note` annotations
+- [ ] Gates appear as `note` annotations containing the gate name
 - [ ] Running export twice on the same template produces byte-identical output
+- [ ] A single-state template with no transitions produces valid Mermaid
+- [ ] Output uses LF line endings on all platforms
 
 ### HTML output
-- [ ] Displays an interactive directed graph in the browser
+- [ ] HTML file opens in a browser and renders a visible graph with nodes
+  and edges matching the template's states and transitions
 - [ ] Hovering over a gated state shows gate name and command in a tooltip
 - [ ] Hovering over a state with an accepts block shows the evidence schema
-- [ ] Click-to-highlight traces selected state's incoming and outgoing transitions
-- [ ] Pan/zoom works for navigating large graphs
-- [ ] Includes dark mode via `prefers-color-scheme`
+- [ ] Clicking a state highlights its direct incoming and outgoing edges and
+  their connected states (one hop)
+- [ ] Pan/zoom is enabled; a template with 20+ states renders without
+  clipping or overlap that hides node labels
+- [ ] HTML contains a `prefers-color-scheme: dark` media query that sets
+  background to a dark color and text/node colors to light values
 - [ ] Includes a `[*]` start marker node connected to the initial state
 - [ ] All CDN script tags include SRI integrity hashes
-- [ ] Works when served as a static page (GitHub Pages) without server-side
-  processing
+- [ ] HTML contains no server-side directives; all resource references are
+  absolute CDN URLs or inline
 - [ ] Running export twice on the same template produces byte-identical output
+- [ ] Output uses LF line endings on all platforms
 
 ### Freshness check
 - [ ] `--check` with a fresh file exits 0
 - [ ] `--check` with a stale file exits non-zero and prints the fix command
-- [ ] `--check` with a missing file exits non-zero and identifies the missing file
+- [ ] `--check` with a missing file exits non-zero and identifies the missing
+  file
 - [ ] `--check` without `--output` produces an error
 - [ ] `--check` works for both `--format mermaid` and `--format html`
+- [ ] The printed fix command, when copy-pasted and executed, resolves the
+  drift (exits 0 on re-check)
 
 ### CI workflow
 - [ ] The reusable GHA workflow detects stale or missing diagrams via `--check`
 - [ ] The GHA workflow error output includes the command to fix the drift
-- [ ] The GHA workflow accepts a configurable template path input
+- [ ] The GHA workflow accepts a configurable template path glob pattern
+- [ ] The GHA workflow accepts a `koto-version` input
 - [ ] The GHA workflow downloads a koto release binary, not building from source
+
+### Non-functional
+- [ ] Generated HTML for a 30-state template is under 30 KB
+- [ ] Export of a 30-state template completes in under 500ms
+- [ ] Mermaid export succeeds without network access
+- [ ] HTML export succeeds without network access (CDN needed at view time
+  only)
 
 ## Out of scope
 
@@ -297,6 +332,11 @@ and `--check` works uniformly across both formats without duplication.
 `export` with `--format` won on extensibility (DOT, PlantUML later) and
 because `graph` conflicts with koto's runtime state graph concept.
 
+**LF line endings unconditionally.** All export output uses LF regardless
+of platform. This prevents false drift when Windows contributors with CRLF
+git settings run `--check`. The GHA workflow documentation should recommend
+a `.gitattributes` rule (`*.mermaid.md text eol=lf`) for consuming repos.
+
 **Built-in `--check` flag over `git diff` in CI.** Following `cargo fmt --check`,
 `prettier --check`, and `terraform fmt -check`, the export command includes a
 `--check` flag that exits non-zero when the output would differ from the
@@ -307,7 +347,4 @@ consumer.
 
 ## Open questions
 
-- **Line ending normalization**: should the diagram output always use LF?
-  Windows contributors with CRLF git settings could see false drift. A
-  `.gitattributes` rule (`*.mermaid.md text eol=lf`) in the GHA workflow
-  docs may be sufficient.
+None. All questions resolved during drafting.
