@@ -2,7 +2,7 @@
   "topic": "local-session-storage",
   "decisions": [
     {"id": 5, "question": "How should repo-id be derived? Includes hash algorithm, path canonicalization, truncation length, and collision handling.", "status": "complete", "complexity": "standard", "report_file": "wip/design_local-session-storage_decision_5_report.md"},
-    {"id": 6, "question": "What migration strategy bridges the gap between Feature 1 (local storage breaks wip/) and Feature 4 (git backend restores compat)?", "status": "complete", "complexity": "standard", "report_file": "wip/design_local-session-storage_decision_6_report.md"}
+    {"id": 6, "question": "How do skills discover the session path?", "status": "complete", "complexity": "standard", "report_file": "wip/design_local-session-storage_decision_6_report.md"}
   ],
   "cross_validation": "passed",
   "round": 0

@@ -10,13 +10,13 @@ problem: |
   hardcoded wip/.
 decision: |
   A SessionBackend trait with six methods (create, session_dir, state_file_path, cleanup, list, exists)
-  and a LocalBackend that stores sessions at ~/.koto/sessions/<repo-id>/<name>/. The
+  and a LocalBackend that stores sessions at ~/.koto/sessions/{repo-id}/{name}/. The
   repo-id is the first 16 hex characters of a SHA-256 hash of the canonicalized working
   directory path, scoping sessions per-project. Sessions live entirely outside the repo
   (zero repo footprint, invisible to non-users). Agent file tools access ~/.koto/ without
   sandbox restrictions. CLI commands get the session path from the backend instead of
-  constructing wip/ paths. Skill migration to `koto session dir` ships alongside this
-  feature as a coordinated release.
+  constructing wip/ paths. Skills use `koto session dir` as their sole path discovery
+  mechanism.
 rationale: |
   The trait boundary provides a clean extension point for cloud and git backends without
   over-engineering the initial implementation. LocalBackend is zero-config and requires
@@ -65,7 +65,7 @@ this design only implements local. The question is how much of the future interf
 define now.
 
 Key assumptions:
-- Cloud sync will need sync_down/sync_up methods (from the broader design research)
+- Cloud sync will need sync_down/sync_up methods
 - Git backend will need to know the repo root
 - All backends produce a local filesystem path that agents can use with file tools
 
@@ -106,7 +106,6 @@ fine.
 
 - **Full trait including sync methods**: defines sync_down/sync_up now with no-op
   defaults. More future-proof but designs the sync interface before we need it. The
-  broader design doc (DESIGN-session-persistence-storage.md) sketched this, but the
   sync protocol details aren't settled and shouldn't constrain the initial trait.
 - **No trait, just LocalBackend struct**: simpler but would require refactoring when
   the second backend arrives. The trait costs almost nothing (one extra file, trait
@@ -122,7 +121,7 @@ Key assumptions:
   rejecting `.`/`..` path traversal)
 - The JSONL state file currently lives at `<working-dir>/koto-<name>.state.jsonl`
 
-#### Chosen: ~/.koto/sessions/<repo-id>/<id>/ with state file inside
+#### Chosen: session directory at ~/.koto/ with state file inside
 
 ```
 ~/.koto/
@@ -147,7 +146,7 @@ know about skill artifact conventions.
 ```
 
 The state file keeps its current name (`koto-<name>.state.jsonl`) — this preserves
-compatibility with `workflow-tool` and makes the migration path clearer.
+compatibility with existing tooling that parses the state file format.
 
 #### Alternatives considered
 
@@ -167,7 +166,7 @@ question is how koto's own commands switch to using the backend.
 Key assumptions:
 - `workflow_state_path()` is the single point of path construction for engine state
 - `handle_next`, `handle_init`, and other command handlers receive the state path
-- Skills will eventually call `koto session dir` but that's feature 3 / skill migration
+- Skills call `koto session dir` to discover the session path (see Decision 6)
 
 #### Chosen: backend constructed in run(), passed to command handlers
 
@@ -213,7 +212,7 @@ can access any path the OS user has permissions for. This matches the Claude Cod
 precedent — `~/.claude/` stores per-project state outside repos, scoped by project
 path hash.
 
-#### Chosen: ~/.koto/sessions/<repo-id>/
+#### Chosen: `~/.koto/sessions/<repo-id>/`
 
 Sessions live entirely outside the repo at `~/.koto/sessions/<repo-id>/<name>/`.
 The `repo-id` is the first 16 hex characters of a SHA-256 hash of the canonicalized
@@ -256,9 +255,9 @@ Properties:
 
 ### Decision 5: repo-id derivation
 
-The design places sessions at `~/.koto/sessions/<repo-id>/<name>/` but didn't specify
-how repo-id is computed. The hash algorithm, path canonicalization, truncation length,
-and collision handling all need to be pinned down.
+Sessions live at `~/.koto/sessions/<repo-id>/<name>/`, where repo-id must uniquely
+identify a project directory. The hash algorithm, path canonicalization, truncation
+length, and collision handling need to be specified.
 
 Key assumptions:
 - sha2 and hex crates are already in Cargo.toml with a `sha256_hex()` utility in
@@ -308,7 +307,7 @@ directory that doesn't exist.
   name length limits (255 chars) for deeply nested workspaces, and expose directory
   structure. The human-readability benefit is minimal since users interact through
   `koto session dir`.
-- **SHA-256, 8 hex characters**: matches the original design doc example. 32 bits gives
+- **SHA-256, 8 hex characters**: shorter but 32 bits gives
   ~50% collision probability at ~65,000 projects. Unnecessarily risky when 16 characters
   costs nothing extra.
 - **SHA-256, full 64 hex characters**: maximum collision resistance but unwieldy in
@@ -319,51 +318,44 @@ directory that doesn't exist.
   requires heuristics and adds complexity. The hash alone is sufficient with
   `koto session dir`.
 
-### Decision 6: migration strategy for existing wip/ workflows
+### Decision 6: how skills discover the session path
 
-Feature 1 moves session state to `~/.koto/sessions/`. Skills (shirabe, tsukumogami)
-hardcode ~150 `wip/` path references. Feature 4 (git backend) restores `wip/` as
-opt-in but depends on Feature 2 (config). The question is what fills the gap.
+Skills need to write artifacts (research outputs, plans, decision reports) into the
+session directory. The question is how they discover where that directory is.
 
 Key assumptions:
-- Skills are maintained by the same team that ships Feature 1. No third-party skill
-  ecosystem exists that would break without notice.
-- `koto session dir` ships in the same release as the storage move (Feature 1 Phase 3
-  doesn't slip to a separate release).
-- The ~150 hardcoded `wip/` path references follow predictable patterns and are
-  mechanically replaceable.
+- Skills don't know (and shouldn't know) which backend is active
+- Skills run as agent workflows that invoke koto CLI commands
+- The session directory path must be available before the skill writes its first artifact
 
-#### Chosen: `koto session dir` as the sole contract, with coordinated skill migration
+#### Chosen: `koto session dir` as the sole discovery mechanism
 
-Skills call `koto session dir <name>` to get the session path. The "migration" is a
-skill-side change: replace hardcoded `wip/` path construction with calls to
-`koto session dir`. This ships alongside Feature 1, not after it.
+Skills call `koto session dir <name>` to get the session path. This is the only
+supported way to resolve a session directory — skills never construct paths themselves.
+Shell-based skills capture the output in a variable:
 
-The concrete migration:
-1. Feature 1 ships with all three implementation phases (including `koto session dir`).
-2. Before or simultaneously, shirabe and koto-skills are updated to call
-   `koto session dir` instead of hardcoding `wip/`. Skills that run shell commands use
-   `SESSION_DIR=$(koto session dir "$name")` and construct paths from that variable.
-3. The two changes (koto Feature 1 + skill migration) are released together. Neither
-   ships without the other.
+```bash
+SESSION_DIR=$(koto session dir "$name")
+```
 
-No compatibility layer, env var override, or detect-and-warn mechanism in koto itself.
-The migration problem is a coordination problem, not a technical one.
+File-tool-based skills call `koto session dir` once and use the returned path for all
+subsequent Read/Edit/Write operations.
+
+This keeps the backend fully opaque to skills. Whether sessions live at `~/.koto/`,
+in the git working tree, or in cloud storage, the discovery mechanism is the same.
 
 #### Alternatives considered
 
-- **KOTO_SESSION_DIR env var override**: skills read the env var if set, fall back to
-  `wip/`. Creates a parallel discovery mechanism that competes with `koto session dir`,
-  adds a contract that's hard to deprecate, and solves a coordination problem with
-  unnecessary technical machinery.
-- **Detect-and-warn**: koto detects `wip/` artifacts and warns the user. Reactive
-  (warns after breakage), requires koto to understand skill artifact patterns (coupling),
-  and adds transition-only code.
-- **Ship Features 1+4 together**: blocks the highest-value change behind lower-priority
-  work. Feature 4 depends on Feature 2, so this bundles three features into one release,
-  contradicting the roadmap's incremental sequencing.
-- **Skill migration as hard prerequisite**: functionally identical to the chosen approach
-  but with less accurate framing. "Coordinated release" better describes the relationship.
+- **KOTO_SESSION_DIR env var**: skills read the env var to find the session path.
+  Creates a parallel discovery mechanism that competes with `koto session dir` and
+  adds a contract that's hard to deprecate. The CLI command is strictly more capable
+  (it can validate the session exists, create it if needed, etc.).
+- **Template-provided variable**: templates include `{{SESSION_DIR}}` that the engine
+  substitutes at runtime. This is Feature 3 on the roadmap (engine-provided variables)
+  and will complement `koto session dir`, but this design doesn't implement it.
+- **Convention-based paths**: skills assume a fixed path relative to the working
+  directory (e.g., `wip/`). Couples skills to a specific backend and breaks when
+  the storage location changes.
 
 ## Decision outcome
 
@@ -372,8 +364,8 @@ LocalBackend stores sessions at `~/.koto/sessions/<repo-id>/<name>/` (D2) outsid
 repo entirely (D4). The repo-id is the first 16 hex characters of a SHA-256 hash of
 the canonicalized working directory path (D5). The CLI constructs the backend once and
 threads it through command handlers (D3). The state file moves into the session
-directory but keeps its name and format. Skill migration to `koto session dir` ships
-as a coordinated release alongside Feature 1 (D6).
+directory but keeps its name and format. Skills discover the session path exclusively
+through `koto session dir` (D6).
 
 After this ships, `koto init my-workflow` creates
 `~/.koto/sessions/<repo-id>/my-workflow/` with `session.meta.json` and
@@ -555,20 +547,10 @@ Deliverables:
 Add `koto session dir|list|cleanup` subcommands. Add automatic cleanup when a workflow
 reaches a terminal state. End-to-end tests.
 
-This phase must ship in the same release as Phases 1-2. `koto session dir` is the
-contract that skills depend on (Decision 6), so it can't slip to a follow-up release.
-
 Deliverables:
 - `src/cli/session.rs` — session subcommands
 - Auto-cleanup logic in the advance path
 - End-to-end tests
-
-### Coordinated skill migration
-
-Not part of koto's implementation, but part of Feature 1's release scope (Decision 6).
-Shirabe and koto-skills must be updated to call `koto session dir` instead of
-hardcoding `wip/` paths. This is a mechanical replacement of ~150 path references.
-The skill updates and koto Feature 1 ship together as a coordinated release.
 
 ## Security considerations
 
@@ -609,17 +591,12 @@ off the machine. Cloud sync (feature 5) will add exposure considerations.
 - Zero repo footprint — koto is invisible to developers who don't use it.
 - The SessionBackend trait provides a clean extension point for cloud and git backends.
 - `koto session dir` gives skills a stable API for artifact location.
-- Auto-cleanup replaces manual `rm -rf wip/` and CI enforcement.
+- Auto-cleanup on workflow completion prevents stale session accumulation.
 - Works without git — sessions are scoped by working directory path, not git repo.
 - Agent file tools (Read/Edit/Write) access `~/.koto/` without sandbox restrictions.
 
 ### Negative
 
-- Skills that hardcode `wip/` paths must be updated before Feature 1 ships. The
-  coordinated release (Decision 6) means Feature 1's effective scope includes the
-  skill migration (~150 path references across shirabe and koto-skills).
-- There's no backward-compatible transition period. Old skill versions and new koto
-  versions are incompatible. Acceptable because skills and koto are co-versioned.
 - Sessions live outside the repo. Agent Bash commands (as opposed to file tools) may
   need sandbox configuration to access `~/.koto/`. For Claude Code:
   `sandbox.filesystem.allowRead: ["~/.koto"]` in settings.
@@ -632,8 +609,6 @@ off the machine. Cloud sync (feature 5) will add exposure considerations.
 
 ### Mitigations
 
-- The git backend (feature 4) restores wip/ as an opt-in preference, not a
-  compatibility bridge. Users who want `wip/` in their repo can configure it later.
 - Sandbox configuration for Bash commands is a one-time user setup, documented in
   koto's installation guide.
 - `dirs` is a small, widely-used crate with no transitive dependencies.

@@ -1,5 +1,5 @@
-<!-- decision:start id="migration-strategy" status="assumed" -->
-### Decision: Migration strategy for the Feature 1 to Feature 4 gap
+<!-- decision:start id="skill-path-discovery" status="assumed" -->
+### Decision: How skills discover the session path
 
 **Context**
 
