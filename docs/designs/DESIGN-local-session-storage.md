@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 upstream: docs/prds/PRD-session-persistence-storage.md
 problem: |
   koto writes workflow state to hardcoded paths in the git working tree (wip/). There's
@@ -30,7 +30,7 @@ rationale: |
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context and problem statement
 
