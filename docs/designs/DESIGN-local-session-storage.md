@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-session-persistence-storage.md
 problem: |
   koto writes workflow state to hardcoded paths in the git working tree (wip/). There's
