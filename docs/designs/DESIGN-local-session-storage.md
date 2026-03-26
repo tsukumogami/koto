@@ -6,8 +6,8 @@ problem: |
   no abstraction over where session artifacts live, no session lifecycle management, and
   no way to change the storage location without updating every skill. This design covers
   the foundational feature: a SessionBackend trait, a local filesystem backend, session
-  CLI commands, and the CLI refactoring needed to use backend-provided paths instead of
-  hardcoded wip/.
+  CLI commands, runtime variable substitution for `{{SESSION_DIR}}` in templates, and
+  the CLI refactoring needed to use backend-provided paths instead of hardcoded wip/.
 decision: |
   A SessionBackend trait with six methods (create, session_dir, state_file_path, cleanup, list, exists)
   and a LocalBackend that stores sessions at ~/.koto/sessions/{repo-id}/{name}/. The
@@ -16,7 +16,8 @@ decision: |
   (zero repo footprint, invisible to non-users). Agent file tools access ~/.koto/ without
   sandbox restrictions. CLI commands get the session path from the backend instead of
   constructing wip/ paths. Skills use `koto session dir` as their sole path discovery
-  mechanism.
+  mechanism. Templates use `{{SESSION_DIR}}` in gate commands and directives, substituted
+  at runtime by `handle_next`.
 rationale: |
   The trait boundary provides a clean extension point for cloud and git backends without
   over-engineering the initial implementation. LocalBackend is zero-config and requires
@@ -37,15 +38,18 @@ koto's CLI constructs state file paths via `workflow_state_path()` in `src/disco
 which returns `<working-dir>/koto-<name>.state.jsonl`. Skills write artifacts to `wip/`
 in the same working directory. Both are hardcoded to the git working tree.
 
-The session persistence roadmap (ROADMAP-session-persistence.md) sequences five features.
-This design covers feature 1: the storage abstraction and local backend. It doesn't
-cover config system (feature 2), engine-provided variables (feature 3), git backend
-(feature 4), or cloud sync (feature 5). Those will get their own designs.
+The session persistence roadmap (ROADMAP-session-persistence.md) sequences the work.
+This design covers the storage abstraction, local backend, and runtime variable
+substitution for `{{SESSION_DIR}}`. Without variable substitution, templates can't
+reference the session directory in gate commands or directives, making the storage
+move useless to template authors. Config system, git backend, and cloud sync get
+their own designs.
 
-The goal is narrow: after this ships, `koto init` creates a session directory at
-`~/.koto/sessions/<repo-id>/<name>/`, state files live there instead of the working tree, and
-skills that use `koto session dir` get the right path. The trait is designed so future
-backends slot in without changing command logic.
+After this ships, `koto init` creates a session directory at
+`~/.koto/sessions/<repo-id>/<name>/`, state files live there instead of the working
+tree, templates use `{{SESSION_DIR}}` to reference the session path, and skills use
+`koto session dir` for path discovery. The trait is designed so future backends slot
+in without changing command logic.
 
 ## Decision drivers
 
@@ -357,21 +361,81 @@ in the git working tree, or in cloud storage, the discovery mechanism is the sam
   directory (e.g., `wip/`). Couples skills to a specific backend and breaks when
   the storage location changes.
 
+### Decision 7: how `{{SESSION_DIR}}` is substituted in templates
+
+Templates reference the session directory in gate commands (`test -f {{SESSION_DIR}}/plan.md`)
+and directives ("Write to `{{SESSION_DIR}}/plan.md`"). Variable substitution doesn't
+exist in the engine yet — `{{VAR}}` tokens are currently returned raw to the agent.
+The question is where to add substitution and how much infrastructure to build.
+
+Key assumptions:
+- `SESSION_DIR` is the only built-in variable needed for this feature
+- No escaping mechanism is needed yet for literal `{{SESSION_DIR}}` in templates
+- Simple sequential `str::replace` is sufficient (no recursion or ordering concerns)
+
+#### Chosen: runtime substitution at the output boundary in `handle_next`
+
+Substitute `{{SESSION_DIR}}` at two points in the `handle_next` flow:
+
+1. **Gate commands**: replace `{{SESSION_DIR}}` in each `Gate.command` string before
+   passing to `evaluate_gates()`. This happens per-gate, just before shell execution.
+2. **Directives**: replace `{{SESSION_DIR}}` in the `directive` string of `NextResponse`
+   before serialization to stdout.
+
+Both use a single utility function:
+
+```rust
+// src/cli/vars.rs
+pub fn substitute_vars(input: &str, vars: &HashMap<String, String>) -> String {
+    let mut result = input.to_string();
+    for (key, value) in vars {
+        let token = format!("{{{{{}}}}}", key);  // produces {{KEY}}
+        result = result.replace(&token, value);
+    }
+    result
+}
+```
+
+The vars map is built once per `handle_next` call with one entry:
+`SESSION_DIR` -> `backend.session_dir(name)`. When `--var` lands (issue #67), user
+variables merge into the same map (built-ins refuse override), and the same
+`substitute_vars` function handles everything.
+
+Runtime resolution is correct because `SESSION_DIR` depends on the backend, which
+could change after init (backend switch, repo relocation). The state file stores raw
+`{{SESSION_DIR}}` tokens, and each `koto next` call resolves them fresh.
+
+#### Alternatives considered
+
+- **Compile-time substitution in `koto init`**: bakes the resolved path into the state
+  file at initialization. Breaks if the session directory changes after init (backend
+  switch, `~/.koto` relocation). Runtime substitution is strictly more correct.
+- **Shell environment variable for gates only**: sets `SESSION_DIR` as an env var when
+  spawning `sh -c`. Only solves gates, not directives — forces two different
+  substitution mechanisms. Also makes gate behavior depend on implicit env state rather
+  than explicit command strings.
+- **Build the full `--var` infrastructure now**: implements `Variables::substitute()` as
+  a general-purpose system with CLI flag parsing, validation, and override protection.
+  Violates the narrow-scope constraint. `--var` needs its own design (issue #67). The
+  chosen `HashMap + substitute_vars` approach is the natural foundation that `--var`
+  will extend, so no work is wasted.
+
 ## Decision outcome
 
-The six decisions compose cleanly. The trait provides the abstraction boundary (D1).
+The seven decisions compose cleanly. The trait provides the abstraction boundary (D1).
 LocalBackend stores sessions at `~/.koto/sessions/<repo-id>/<name>/` (D2) outside the
 repo entirely (D4). The repo-id is the first 16 hex characters of a SHA-256 hash of
 the canonicalized working directory path (D5). The CLI constructs the backend once and
 threads it through command handlers (D3). The state file moves into the session
-directory but keeps its name and format. Skills discover the session path exclusively
-through `koto session dir` (D6).
+directory but keeps its name and format. Skills discover the session path through
+`koto session dir` (D6). Templates use `{{SESSION_DIR}}` in gate commands and
+directives, substituted at runtime by `handle_next` (D7).
 
 After this ships, `koto init my-workflow` creates
 `~/.koto/sessions/<repo-id>/my-workflow/` with `session.meta.json` and
-`koto-my-workflow.state.jsonl`. `koto next my-workflow` reads from there.
-`koto session dir my-workflow` prints the path. Skills that call `koto session dir`
-get the right location for their artifacts.
+`koto-my-workflow.state.jsonl`. `koto next my-workflow` substitutes `{{SESSION_DIR}}`
+in gate commands and directives, then reads state from the session directory.
+`koto session dir my-workflow` prints the path for skill-level discovery.
 
 ## Solution architecture
 
@@ -469,6 +533,24 @@ public `SessionBackend` methods that accept an ID, not just `create()`.
 `backend.create(name)` then writes the initial state file into the returned directory.
 Other handlers call `backend.session_dir(name)` to locate the state file.
 
+**`src/cli/vars.rs` — variable substitution**
+
+```rust
+pub fn substitute_vars(input: &str, vars: &HashMap<String, String>) -> String {
+    let mut result = input.to_string();
+    for (key, value) in vars {
+        let token = format!("{{{{{}}}}}", key);
+        result = result.replace(&token, value);
+    }
+    result
+}
+```
+
+Called by `handle_next` to substitute `{{SESSION_DIR}}` in gate commands before
+shell execution and in directives before JSON serialization. The vars map is built
+once per call: `{"SESSION_DIR": backend.session_dir(name)}`. Future `--var` support
+adds user entries to the same map.
+
 **`src/cli/session.rs` — session subcommands**
 
 ```
@@ -484,6 +566,7 @@ koto session cleanup <name> → call backend.cleanup(name)
 | `SessionBackend` trait | `src/session/mod.rs` | all CLI commands |
 | `LocalBackend` | `src/session/local.rs` | `run()` in cli/mod.rs |
 | `validate_session_id()` | `src/session/validate.rs` | all `SessionBackend` methods |
+| `substitute_vars()` | `src/cli/vars.rs` | `handle_next` (gates + directives) |
 | `koto session` subcommands | `src/cli/session.rs` | agents, users |
 
 ### Data flow
@@ -499,11 +582,12 @@ koto init my-wf
   → print JSON result (same as today)
 
 koto next my-wf
-  → LocalBackend::session_dir("my-wf")
-    → ~/.koto/sessions/<repo-id>/my-wf/
+  → build vars map: {SESSION_DIR: backend.session_dir("my-wf")}
   → read koto-my-wf.state.jsonl from session dir
+  → substitute {{SESSION_DIR}} in gate commands before shell execution
   → advance workflow (existing logic, unchanged)
-  → print directive JSON (same as today)
+  → substitute {{SESSION_DIR}} in directive before JSON serialization
+  → print directive JSON with resolved paths
 
 koto session dir my-wf
   → print ~/.koto/sessions/<repo-id>/my-wf/
@@ -527,20 +611,29 @@ Deliverables:
 - `Cargo.toml` — add `dirs` dependency
 - Unit tests
 
-### Phase 2: CLI refactoring
+### Phase 2: CLI refactoring and variable substitution
 
 Thread `&dyn SessionBackend` through `run()` → command handlers. Replace
 `workflow_state_path()` calls with `backend.session_dir()`. Update `handle_init` to
 call `backend.create()`. Update `find_workflows_with_metadata()` to delegate to
 `backend.list()` instead of scanning the working directory, so that `koto workflows`
-reflects the new storage location. Verify all existing tests pass with state files
-in the new location.
+reflects the new storage location.
+
+Add `src/cli/vars.rs` with `substitute_vars()`. Wire it into `handle_next`: build
+the vars map from `backend.session_dir(name)`, substitute `{{SESSION_DIR}}` in gate
+commands before shell execution and in directives before JSON serialization. This is
+~45 lines of new code.
+
+Verify all existing tests pass with state files in the new location. Add tests for
+variable substitution in gates and directives.
 
 Deliverables:
 - `src/cli/mod.rs` — refactored command dispatch
+- `src/cli/vars.rs` — variable substitution utility
 - `src/discover.rs` — `workflow_state_path()` used internally by LocalBackend only,
   `find_workflows_with_metadata()` updated to scan session directory
 - Updated integration tests
+- Variable substitution tests
 
 ### Phase 3: session subcommands and auto-cleanup
 
@@ -591,6 +684,10 @@ off the machine. Cloud sync (feature 5) will add exposure considerations.
 - Zero repo footprint — koto is invisible to developers who don't use it.
 - The SessionBackend trait provides a clean extension point for cloud and git backends.
 - `koto session dir` gives skills a stable API for artifact location.
+- `{{SESSION_DIR}}` gives template authors a way to reference the session path in gate
+  commands and directives without hardcoding paths.
+- The `substitute_vars` utility provides a clean extension point for future `--var`
+  support (issue #67) with no second substitution path needed.
 - Auto-cleanup on workflow completion prevents stale session accumulation.
 - Works without git — sessions are scoped by working directory path, not git repo.
 - Agent file tools (Read/Edit/Write) access `~/.koto/` without sandbox restrictions.
