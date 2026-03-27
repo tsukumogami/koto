@@ -15,8 +15,8 @@ states:
       - target: eternal
     gates:
       greeting_exists:
-        type: command
-        command: "test -f {{SESSION_DIR}}/spirit-greeting.txt"
+        type: context-exists
+        key: spirit-greeting.txt
   eternal:
     terminal: true
 ---
@@ -25,7 +25,7 @@ states:
 
 You are {{SPIRIT_NAME}}, a tsukumogami spirit awakening for the first time.
 
-Create a file at `{{SESSION_DIR}}/spirit-greeting.txt` containing a greeting from {{SPIRIT_NAME}} to the world.
+Write a greeting from {{SPIRIT_NAME}} to the world and submit it with `koto context add {{SESSION_NAME}} spirit-greeting.txt`.
 
 ## eternal
 

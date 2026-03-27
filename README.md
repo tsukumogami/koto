@@ -93,6 +93,8 @@ The `action` field is `"execute"` while work remains and `"done"` at the termina
 
 **Sessions** are stored at `~/.koto/sessions/<repo-id>/<name>/`, keeping state files out of your working directory. Each session holds a state file and any artifacts the workflow produces. When a workflow reaches its terminal state, `koto next` automatically cleans up the session directory (pass `--no-cleanup` to keep it). Use `koto session dir <name>` to get the path, `koto session list` to see all sessions, or `koto session cleanup <name>` to remove one manually.
 
+**Content ownership**: Agents submit workflow artifacts through `koto context add` rather than writing files directly. This gives koto full visibility into what was produced and enables content-aware gates (`context-exists`, `context-matches`) that check content state without shell commands. Use `koto context get` to retrieve content and `koto context list` to see what's been submitted.
+
 **State files** (`koto-<name>.state.jsonl`) live inside session directories and use an event log format. The first line is a header with the schema version, workflow name, template hash, and creation timestamp. Subsequent lines are typed events with monotonic sequence numbers and type-specific payloads. The current state is derived by replaying the log -- specifically, the `to` field of the last state-changing event.
 
 **Template integrity**: The template's SHA-256 hash is locked at init time and stored in the first event. If the compiled template changes, `next` will fail. To update the template, reinitialize the workflow.

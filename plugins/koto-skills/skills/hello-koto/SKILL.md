@@ -37,10 +37,9 @@ Use `.koto/templates/hello-koto.md` as the `--template` path in all koto command
 
 The user provides a `<name>` argument. The workflow has two states:
 
-1. **awakening** -- Create a greeting file at `{{SESSION_DIR}}/spirit-greeting.txt`
-   containing a greeting from the named spirit. A command gate blocks the transition
-   until the file exists. The `{{SESSION_DIR}}` token resolves to the session directory
-   at runtime.
+1. **awakening** -- Write a greeting from the named spirit and submit it via
+   `koto context add`. A `context-exists` gate blocks the transition until the
+   key `spirit-greeting.txt` exists in the content store.
 2. **eternal** -- Terminal state. The ritual is complete.
 
 ## Execution
@@ -71,11 +70,10 @@ Returns:
 
 ### 3. Execute the directive
 
-Create the greeting file in the session directory:
+Write the greeting and submit it through the content interface:
 
 ```bash
-SESSION_DIR=$(koto session dir hello)
-echo "Greetings from <name> to the world." > "$SESSION_DIR/spirit-greeting.txt"
+echo "Greetings from <name> to the world." | koto context add hello spirit-greeting.txt
 ```
 
 ### 4. Transition to the terminal state
@@ -84,9 +82,9 @@ echo "Greetings from <name> to the world." > "$SESSION_DIR/spirit-greeting.txt"
 koto transition eternal
 ```
 
-The command gate checks for the greeting file in the session directory. If the file
-exists, the transition succeeds and returns `{"state":"eternal"}`. If the file is
-missing, the transition fails with a gate error.
+The `context-exists` gate checks for the key `spirit-greeting.txt` in the content
+store. If the key exists, the transition succeeds and returns `{"state":"eternal"}`.
+If the key is missing, the transition fails with a gate error.
 
 ### 5. Confirm completion
 
@@ -103,8 +101,9 @@ Output a message to the user: `<name> has manifested. The ritual is complete.`
 - **koto not found**: Tell the user to install koto and add it to PATH.
 - **Template not found**: Check the template path. If using a plugin path that can't be
   resolved, copy the template to `.koto/templates/hello-koto.md` and re-init.
-- **Gate failure**: The greeting file doesn't exist yet. Create the file in the session
-  directory (use `koto session dir hello` to find it) before attempting the transition.
+- **Gate failure**: The greeting content hasn't been submitted yet. Run
+  `koto context add hello spirit-greeting.txt` with the greeting text before
+  attempting the transition.
 - **Session already exists**: A previous hello workflow may be active. Run
   `koto session list` to check. Clean up with `koto session cleanup hello` if needed,
   then re-init.

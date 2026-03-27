@@ -38,8 +38,8 @@ states:
     transitions: [eternal]
     gates:
       greeting_exists:
-        type: command
-        command: "test -f {{SESSION_DIR}}/spirit-greeting.txt"
+        type: context-exists
+        key: spirit-greeting.txt
   eternal:
     terminal: true
 ---
@@ -48,7 +48,7 @@ states:
 
 You are {{SPIRIT_NAME}}, a tsukumogami spirit awakening for the first time.
 
-Create a file at `{{SESSION_DIR}}/spirit-greeting.txt` containing a greeting from {{SPIRIT_NAME}} to the world.
+Write a greeting from {{SPIRIT_NAME}} to the world and submit it with `koto context add {{SESSION_NAME}} spirit-greeting.txt`.
 
 ## eternal
 
@@ -59,7 +59,7 @@ A few things to note about this template:
 
 - **Frontmatter** declares the machine structure: states, transitions, gates, variables.
 - **Body sections** (`## awakening`, `## eternal`) contain directive text. When the agent calls `koto next`, it gets the directive for the current state, with variables interpolated.
-- **Gates** are conditions that must be satisfied before a transition. The `command` type runs a shell command and checks the exit code.
+- **Gates** are conditions that must be satisfied before a transition. The `context-exists` type checks whether a key exists in the content store. The `command` type runs a shell command and checks the exit code.
 - **Variables** are interpolated at runtime using `{{VARIABLE_NAME}}` syntax. The agent supplies them via `--var KEY=VALUE` on `koto init`.
 
 For the full template format, see [docs/designs/current/DESIGN-koto-template-format.md](../designs/current/DESIGN-koto-template-format.md).
@@ -93,8 +93,8 @@ If compilation succeeds, it outputs the compiled JSON to stdout:
       "transitions": ["eternal"],
       "gates": {
         "greeting_exists": {
-          "type": "command",
-          "command": "test -f {{SESSION_DIR}}/spirit-greeting.txt"
+          "type": "context-exists",
+          "key": "spirit-greeting.txt"
         }
       }
     },
@@ -233,8 +233,8 @@ Document each gate from the template. The agent needs to know what conditions mu
 ```markdown
 The `awakening` state has one gate:
 
-- **greeting_exists** (command gate): runs `test -f {{SESSION_DIR}}/spirit-greeting.txt`. The
-  greeting file must exist in the session directory before transitioning to `eternal`.
+- **greeting_exists** (context-exists gate): checks for key `spirit-greeting.txt` in the content
+  store. The agent must submit the greeting via `koto context add` before transitioning to `eternal`.
 ```
 
 For templates with multiple gates across several states, list them per-state so the agent can look up what's needed at each transition.
@@ -348,6 +348,78 @@ Workflow templates contain directive text in their `## STATE:` sections. When th
 
 Review directive text with the same care you'd give to the SKILL.md itself. Both files directly influence what the agent does. For project-scoped skills, this means standard code review on the PR. For plugin-distributed skills, the koto maintainers review the template as part of the plugin PR.
 
+## Content ownership
+
+koto owns all workflow content through a CLI interface. Agents don't write files to the session directory directly -- they submit and retrieve content through `koto context`.
+
+### Why content goes through koto
+
+When agents write files directly to the session directory, the engine can't track what was produced or verify that work was done. The content interface gives koto visibility into agent output, which enables content-aware gates and makes the audit trail complete.
+
+### The context commands
+
+| Command | Purpose |
+|---------|---------|
+| `koto context add <session> <key> [--from-file <path>]` | Submit content. Reads from stdin by default, or from a file with `--from-file`. |
+| `koto context get <session> <key> [--to-file <path>]` | Retrieve content. Writes to stdout by default, or to a file with `--to-file`. |
+| `koto context exists <session> <key>` | Check if a key exists. Exits 0 if present, 1 if not. |
+| `koto context list <session> [--prefix <prefix>]` | List keys as a JSON array. Optionally filter by prefix. |
+
+### Submitting content from a skill
+
+The simplest pattern pipes content directly:
+
+```bash
+echo "Greetings from Hasami to the world." | koto context add hello spirit-greeting.txt
+```
+
+For larger artifacts, write to a temporary file first and use `--from-file`:
+
+```bash
+koto context add hello plan.md --from-file /tmp/plan.md
+```
+
+To read content back:
+
+```bash
+koto context get hello spirit-greeting.txt
+```
+
+Or write it to a file:
+
+```bash
+koto context get hello plan.md --to-file ./plan.md
+```
+
+### Content-aware gates
+
+Templates can gate transitions on content state instead of shell commands. Two gate types are available:
+
+**`context-exists`** -- passes when a key exists in the content store:
+
+```yaml
+gates:
+  greeting_exists:
+    type: context-exists
+    key: spirit-greeting.txt
+```
+
+**`context-matches`** -- passes when the content for a key matches a regex pattern:
+
+```yaml
+gates:
+  plan_has_steps:
+    type: context-matches
+    key: plan.md
+    pattern: "^## Step \\d+"
+```
+
+These gates are evaluated automatically when the agent calls `koto next` or `koto transition`. They replace the older pattern of using `command` gates with `test -f` checks against the session directory.
+
+### Updating your SKILL.md
+
+When your template uses content-aware gates, update the SKILL.md to instruct the agent to submit content through `koto context add` rather than writing files to `{{SESSION_DIR}}`. The evidence keys section should document the expected content keys and their purpose.
+
 ## Testing your skill
 
 ### Validate with the CI pipeline
@@ -423,7 +495,7 @@ Pulling it all together, here's how the hello-koto skill was built. Use this as 
 
 The template (`plugins/koto-skills/skills/hello-koto/hello-koto.md`) defines two states:
 
-- **awakening** -- The agent creates a greeting file. A `command` gate (`test -f {{SESSION_DIR}}/spirit-greeting.txt`) blocks the transition until the file exists in the session directory.
+- **awakening** -- The agent writes a greeting and submits it via `koto context add`. A `context-exists` gate (`key: spirit-greeting.txt`) blocks the transition until the key exists in the content store.
 - **eternal** -- Terminal state. Nothing to do.
 
 One variable, `SPIRIT_NAME`, is interpolated into the awakening directive.
@@ -440,8 +512,8 @@ $ koto template compile plugins/koto-skills/skills/hello-koto/hello-koto.md | jq
 $ koto template compile plugins/koto-skills/skills/hello-koto/hello-koto.md | jq '.states.awakening.gates'
 {
   "greeting_exists": {
-    "type": "command",
-    "command": "test -f {{SESSION_DIR}}/spirit-greeting.txt"
+    "type": "context-exists",
+    "key": "spirit-greeting.txt"
   }
 }
 ```
@@ -471,8 +543,8 @@ When a user invokes `/hello-koto Hasami`:
 2. Copies the template to `.koto/templates/hello-koto.md` if needed.
 3. Runs `koto init --template .koto/templates/hello-koto.md --name hello --var SPIRIT_NAME=Hasami`.
 4. Runs `koto next` -- gets the awakening directive.
-5. Creates `spirit-greeting.txt` in the session directory.
-6. Runs `koto transition eternal` -- the gate passes.
+5. Submits the greeting via `koto context add hello spirit-greeting.txt`.
+6. Runs `koto transition eternal` -- the `context-exists` gate passes.
 7. Runs `koto next` -- gets `{"action":"done"}`.
 8. Reports completion to the user.
 

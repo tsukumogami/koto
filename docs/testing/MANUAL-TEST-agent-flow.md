@@ -61,7 +61,7 @@ Trigger the hello-koto skill and verify the full init / next / execute / transit
    - Copy the template to `.koto/templates/hello-koto.md`
    - Run `koto init --template .koto/templates/hello-koto.md --name hello --var SPIRIT_NAME=Hasami`
    - Run `koto next` and receive the awakening directive
-   - Create `spirit-greeting.txt` in the session directory with a greeting from Hasami
+   - Submit a greeting from Hasami via `koto context add hello spirit-greeting.txt`
    - Run `koto transition eternal`
    - Run `koto next` and receive the done response
    - Output a completion message
@@ -71,8 +71,9 @@ Trigger the hello-koto skill and verify the full init / next / execute / transit
 - [ ] Template file exists at `.koto/templates/hello-koto.md` after the skill runs
 - [ ] `koto init` returns `{"state":"awakening"}` (or output containing `"awakening"`)
 - [ ] `koto next` returns a directive mentioning the spirit name "Hasami"
-- [ ] `spirit-greeting.txt` exists in the session directory (`koto session dir hello`) and contains a greeting
-- [ ] `koto transition eternal` succeeds (gate passes because the file exists)
+- [ ] Greeting content was submitted via `koto context add hello spirit-greeting.txt`
+- [ ] `koto context exists hello spirit-greeting.txt` exits 0 (content key exists)
+- [ ] `koto transition eternal` succeeds (context-exists gate passes)
 - [ ] Final `koto next` returns `{"action":"done"}` (or output containing `"done"`)
 - [ ] The agent outputs a completion message to the user
 - [ ] Session appears in `koto session list` during the workflow and is cleaned up on completion
@@ -81,7 +82,7 @@ Trigger the hello-koto skill and verify the full init / next / execute / transit
 
 - Agent doesn't copy the template to `.koto/templates/` before init
 - `koto init` fails (template not found, compilation error)
-- Gate check fails even though `spirit-greeting.txt` was created in the session directory
+- Gate check fails even though content was submitted via `koto context add`
 - Agent gets stuck in a loop or doesn't reach the terminal state
 - Agent skips the `koto transition` step and jumps ahead
 
@@ -94,7 +95,7 @@ Verify the Stop hook detects an active workflow and outputs a resume reminder.
 1. Start a workflow but stop the session before it completes:
    - Run `koto init --template .koto/templates/hello-koto.md --name hook-test --var SPIRIT_NAME=TestSpirit`
    - Confirm the session exists: `koto session list` should show `hook-test`
-   - Do NOT create `spirit-greeting.txt` in the session directory (leave the workflow mid-progress)
+   - Do NOT submit content via `koto context add` (leave the workflow mid-progress)
 2. Stop the Claude Code session (Ctrl+C or `/stop`).
 3. Watch the hook output in the terminal.
 4. Start a new Claude Code session in the same directory.

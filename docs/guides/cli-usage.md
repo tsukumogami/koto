@@ -270,6 +270,98 @@ koto session cleanup <name>
 
 Produces no output on success. This is the manual equivalent of the auto-cleanup that `koto next` performs when a workflow reaches a terminal state.
 
+### context
+
+The `context` subcommand group manages workflow content. Agents use these commands to submit artifacts, retrieve them, and check whether specific content has been produced. All content is stored opaquely by koto and keyed by session name and content key.
+
+#### context add
+
+Submits content to the store for a given session and key. Reads from stdin by default.
+
+```bash
+echo "plan contents" | koto context add <name> <key>
+```
+
+Or read from a file:
+
+```bash
+koto context add <name> <key> --from-file <path>
+```
+
+**Positional arguments:**
+- `<name>` -- Workflow/session name.
+- `<key>` -- Content key (e.g., `plan.md`, `spirit-greeting.txt`).
+
+**Optional flags:**
+- `--from-file` -- Read content from the specified file instead of stdin.
+
+Exits non-zero if the session doesn't exist or the input can't be read. Overwrites any existing content for the same key.
+
+#### context get
+
+Retrieves content from the store. Writes to stdout by default.
+
+```bash
+koto context get <name> <key>
+```
+
+Or write to a file:
+
+```bash
+koto context get <name> <key> --to-file <path>
+```
+
+**Positional arguments:**
+- `<name>` -- Workflow/session name.
+- `<key>` -- Content key.
+
+**Optional flags:**
+- `--to-file` -- Write content to the specified file instead of stdout.
+
+Exits non-zero if the session or key doesn't exist.
+
+#### context exists
+
+Checks whether a content key exists for a session. Produces no output.
+
+```bash
+koto context exists <name> <key>
+```
+
+**Positional arguments:**
+- `<name>` -- Workflow/session name.
+- `<key>` -- Content key.
+
+Exits 0 if the key exists, 1 if it doesn't. This is the CLI equivalent of the `context-exists` gate type in templates.
+
+#### context list
+
+Lists all content keys for a session as a JSON array.
+
+```bash
+koto context list <name>
+```
+
+Filter by prefix:
+
+```bash
+koto context list <name> --prefix "review/"
+```
+
+**Positional arguments:**
+- `<name>` -- Workflow/session name.
+
+**Optional flags:**
+- `--prefix` -- Only list keys that start with this string.
+
+**Output (JSON):**
+
+```json
+["plan.md", "review/feedback.md", "spirit-greeting.txt"]
+```
+
+Returns an empty array `[]` when no keys exist (or none match the prefix).
+
 ### template
 
 The `template` subcommand group contains authoring tools for template development. These commands aren't needed for running workflows -- they're for people writing and debugging templates.
