@@ -231,6 +231,60 @@ koto template validate <path>
 
 Exits 0 if the file is valid. Exits non-zero with a JSON error if the schema check fails.
 
+#### template export
+
+Generates a visual representation of a compiled template. Supports two output formats: Mermaid text diagrams and interactive HTML.
+
+```bash
+koto template export <source> [--format mermaid|html] [--output <path>] [--check] [--open]
+```
+
+**Positional argument:**
+- `<source>` -- Path to the template source file (`.md`, compiled on the fly) or pre-compiled JSON (`.json`).
+
+**Flags:**
+- `--format` -- Output format: `mermaid` (default) or `html`.
+- `--output` -- Write output to a file path. Required for `--format html`. When omitted with `--format mermaid`, output goes to stdout.
+- `--check` -- Compare what would be generated against the existing file at `--output` without writing. Exits 0 if fresh, 1 if stale or missing. Requires `--output`.
+- `--open` -- Open the generated file in the default browser. Only valid with `--format html`.
+
+**Flag compatibility rules:**
+
+| Combination | Result |
+|-------------|--------|
+| `--format html` without `--output` | Error (exit 2) |
+| `--open` without `--format html` | Error (exit 2) |
+| `--open` with `--check` | Error (exit 2) |
+| `--check` without `--output` | Error (exit 2) |
+
+**Mermaid format** produces a `stateDiagram-v2` diagram showing states, transitions with condition labels, `[*]` markers for initial and terminal states, and gate annotations. GitHub renders this natively in markdown files.
+
+```bash
+# Print Mermaid to stdout
+koto template export my-workflow.md
+
+# Write to a sibling file for committing
+koto template export my-workflow.md --output my-workflow.mermaid.md
+
+# Check if committed diagram is fresh (for CI)
+koto template export my-workflow.md --output my-workflow.mermaid.md --check
+```
+
+**HTML format** produces a self-contained interactive diagram using Cytoscape.js with dagre layout. Includes hover tooltips for gates and evidence schemas, click-to-highlight for tracing paths (one hop), pan/zoom, dark mode, and a `[*]` start marker. CDN scripts are loaded with SRI integrity hashes.
+
+```bash
+# Generate interactive HTML
+koto template export my-workflow.md --format html --output my-workflow.html
+
+# Generate and open in browser for local debugging
+koto template export my-workflow.md --format html --output my-workflow.html --open
+
+# Check if deployed HTML is fresh
+koto template export my-workflow.md --format html --output docs/my-workflow.html --check
+```
+
+Unlike other template subcommands, export errors go to stderr as plain text (not JSON), since it's a developer-facing tool rather than an agent-consumed command.
+
 ### version
 
 Prints version information as JSON.

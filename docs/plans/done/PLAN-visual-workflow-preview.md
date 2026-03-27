@@ -1,6 +1,6 @@
 ---
 schema: plan/v1
-status: Draft
+status: Done
 execution_mode: single-pr
 upstream: docs/designs/DESIGN-visual-workflow-preview.md
 milestone: Visual Workflow Preview
@@ -11,7 +11,7 @@ issue_count: 7
 
 ## Status
 
-Draft
+Done
 
 ## Scope Summary
 
