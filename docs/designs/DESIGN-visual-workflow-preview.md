@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-template-visual-tooling.md
 problem: |
   Compiled koto workflows are JSON state graphs that are difficult to review
@@ -24,7 +24,7 @@ rationale: |
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
