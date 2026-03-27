@@ -1,11 +1,14 @@
 {
   "topic": "visual-workflow-preview",
   "decisions": [
-    {"id": 1, "question": "CLI command structure: how do users invoke Mermaid export and HTML preview?", "status": "complete", "complexity": "standard", "chosen": "export + preview as separate subcommands"},
+    {"id": 1, "question": "CLI command structure: how do users invoke Mermaid export and HTML preview?", "status": "superseded", "complexity": "standard", "chosen": "export + preview as separate subcommands", "note": "Replaced by decision 5 per PRD"},
     {"id": 2, "question": "Mermaid representation: how to map compiled template concepts to stateDiagram-v2 syntax?", "status": "complete", "complexity": "standard", "chosen": "minimal mapping (states, transitions, gates as notes)"},
     {"id": 3, "question": "HTML generation architecture: template embedding, CDN pinning, data injection, output paths?", "status": "complete", "complexity": "standard", "chosen": "include_str! with single placeholder replacement"},
-    {"id": 4, "question": "Visual design: state type encoding, dark mode, edge labels, badges?", "status": "complete", "complexity": "standard", "chosen": "dark mode + start marker, skip badges/end markers"}
+    {"id": 4, "question": "Visual design: state type encoding, dark mode, edge labels, badges?", "status": "complete", "complexity": "standard", "chosen": "dark mode + start marker, skip badges/end markers"},
+    {"id": 5, "question": "Unified export command: how does clap handle format-dependent flag validation (--open only for html, --check requires --output, --format html requires --output)?", "status": "pending", "complexity": "standard"},
+    {"id": 6, "question": "How should --check freshness comparison be implemented (byte comparison, error format, missing vs stale)?", "status": "pending", "complexity": "standard"},
+    {"id": 7, "question": "How should the GHA reusable workflow be structured (template discovery, binary download, versioning)?", "status": "pending", "complexity": "standard"}
   ],
-  "cross_validation": "passed",
-  "round": 0
+  "cross_validation": "pending",
+  "round": 1
 }

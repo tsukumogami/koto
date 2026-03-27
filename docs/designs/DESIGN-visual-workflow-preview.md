@@ -1,19 +1,23 @@
 ---
 status: Proposed
+upstream: docs/prds/PRD-template-visual-tooling.md
 problem: |
   Compiled koto workflows are JSON state graphs that are difficult to review
-  visually. Developers need an interactive preview to spot structural issues
-  (unreachable states, missing transitions, dead ends) and a committable
-  artifact for template documentation on GitHub Pages.
+  visually. Four user groups need visual tooling: template authors debugging
+  stuck workflows, PR reviewers assessing structural changes, documentation
+  readers browsing templates on GitHub or project websites, and repo
+  maintainers enforcing diagram freshness via CI.
 decision: |
-  Two new koto template subcommands: export (Mermaid text to stdout) and preview
-  (interactive HTML via Cytoscape.js + dagre from CDN, opened in browser). HTML
-  generated from an embedded template with placeholder replacement.
+  A single koto template export subcommand with --format mermaid|html, --check
+  for CI freshness verification, and --open for browser convenience. HTML via
+  Cytoscape.js + dagre from CDN with include_str! embedding. A reusable GHA
+  workflow for drift detection across repos.
 rationale: |
-  Cytoscape.js + dagre via CDN provides automatic layout and rich interactivity
-  at ~15-30 KB per file (vs ~435 KB inlined). Mermaid export ships first as a
-  low-cost MVP that renders natively on GitHub. Separate subcommands keep
-  composable text export distinct from side-effect-heavy browser preview.
+  Unified export collapses the original export/preview split because the
+  documentation reader use case makes HTML a build artifact, not just a local
+  debugging tool. The --open flag isolates the browser side effect. --check
+  follows cargo fmt --check precedent for CI freshness. The GHA workflow
+  downloads a release binary so consumers don't need a Rust toolchain.
 ---
 
 # DESIGN: Visual Workflow Preview
@@ -28,111 +32,141 @@ Workflow templates compile to a directed graph of states with transitions,
 gates, evidence schemas, and variables. Reviewing this structure from raw JSON
 is tedious and error-prone, especially as workflows grow past 10-15 states.
 
-Issue #86 requested a visual representation. Exploration via /explore evaluated
-rendering technologies (Cytoscape.js, D3/dagre, server-side SVG, Mermaid),
-delivery strategies (inlined bundles, CDN-loaded, server-side layout), and
-information density patterns for graphs ranging from 2-3 to 30+ states.
+Issue #86 requested a visual representation. Exploration evaluated rendering
+technologies (Cytoscape.js, D3/dagre, server-side SVG, Mermaid), delivery
+strategies (inlined bundles, CDN-loaded, server-side layout), and information
+density patterns for graphs ranging from 2-3 to 30+ states.
 
-Three prototypes were built and compared side-by-side: server-side SVG with
-vanilla JS (15-45 KB, fully offline), Cytoscape.js with inlined libraries
-(~435 KB), and Cytoscape.js with CDN-loaded dependencies (~15-30 KB). The
-CDN approach was chosen for its automatic layout quality, small committed
-file size, and rich interactivity.
+Three prototypes were built and compared: server-side SVG with vanilla JS
+(15-45 KB, fully offline), Cytoscape.js with inlined libraries (~435 KB), and
+Cytoscape.js with CDN-loaded dependencies (~15-30 KB). The CDN approach was
+chosen for its automatic layout quality, small file size, and rich
+interactivity.
+
+The accepted PRD (`docs/prds/PRD-template-visual-tooling.md`) defines four
+personas, 15 requirements (R1-R15), and 39 acceptance criteria. This design
+addresses the technical architecture for all requirements.
 
 ## Decision Drivers
 
-- **Dual purpose**: output must work as both a local debugging tool and as
-  committable documentation viewable on GitHub Pages
-- **File size discipline**: templates may be committed across many repos;
-  per-file size should stay small
-- **Automatic layout**: manual positioning or implementing layout algorithms
-  in Rust is not worth the maintenance burden for bounded graph sizes
-- **Interactivity**: hover tooltips, click-to-highlight, and pan/zoom are
-  needed for inspecting gate conditions, evidence schemas, and transitions
-- **Incremental delivery**: a simpler Mermaid export can ship before the
-  full interactive preview
+- **Dual purpose**: HTML output serves both local debugging (with `--open`)
+  and deployed documentation on project websites (GitHub Pages)
+- **CI enforcement**: diagrams must be verifiable for freshness via a
+  built-in `--check` flag and a reusable GHA workflow
+- **File size discipline**: HTML files under 30 KB (CDN-loaded, not inlined)
+- **Automatic layout**: Cytoscape.js + dagre eliminates manual positioning
+- **Deterministic output**: byte-identical across runs and platforms for
+  reliable CI drift detection (LF line endings unconditionally)
+- **Format extensibility**: `--format` flag extends to DOT or PlantUML later
+  without CLI schema changes
+- **Minimal CLI surface**: one `export` subcommand instead of separate
+  `export` + `preview` commands
 
 ## Decisions Already Made
 
 These choices were settled during exploration and should be treated as
 constraints, not reopened:
 
-- **Cytoscape.js + dagre via CDN** over server-side Rust layout: automatic
-  layout eliminates ~300-400 lines of Rust layout code. CDN loading keeps
-  committed files at ~15-30 KB. Both target use cases (local dev, GH Pages)
-  are online.
-- **Mermaid eliminated for interactive HTML**: 2 MB bundle, buggy tooltips,
-  text DSL can't express koto's rich metadata. Retained as a separate
-  lightweight export format.
-- **Tippy.js/Popper dropped**: vanilla JS tooltips work fine, avoids two
-  extra CDN dependencies with no quality loss.
-- **D3 + dagre-d3 eliminated**: dagre-d3 rendering layer abandoned 6+ years.
-  Cytoscape.js absorbed dagre as a maintained extension.
-- **ELK.js deferred**: 1.3 MB too heavy for default. Can revisit if dagre
-  layout quality degrades at 30+ states.
-- **Browser launching via opener crate**: "write file, open with opener"
-  pattern matches cargo doc and mdBook. Graceful fallback: print the file
-  path.
-- **No local server for v1**: single-file HTML generation is sufficient.
+- **Cytoscape.js + dagre via CDN** over server-side Rust layout
+- **Mermaid eliminated for interactive HTML** (retained as separate text format)
+- **Tippy.js/Popper dropped**: vanilla JS tooltips work fine
+- **D3 + dagre-d3 eliminated**: dagre-d3 rendering layer abandoned 6+ years
+- **ELK.js deferred**: 1.3 MB too heavy for default
+- **Browser launching via opener crate**: graceful fallback prints the path
+- **No local server for v1**: single-file HTML generation is sufficient
+- **include_str! with placeholder replacement** for HTML generation
+- **Minimal Mermaid mapping**: states, transitions, gate notes, [*] markers
 
 ## Considered Options
 
-### Decision 1: CLI command structure
+### Decision 1: CLI command structure (revised)
 
-The feature adds two new capabilities to koto: text-based graph export (Mermaid)
-and interactive HTML preview. The question is where these live in the existing
-`koto template` subcommand group, which currently has `compile` and `validate`.
+The original design proposed separate `export` and `preview` subcommands. The
+PRD's documentation reader use case changed this: HTML for project websites is
+a pure file-write operation, same as Mermaid. The side effect (browser launch)
+is a convenience, not the defining characteristic. The PRD requires a unified
+command (R1).
 
-Key assumptions: `preview` accepts both source templates (compiled on the fly)
-and pre-compiled JSON. Mermaid export defaults to stdout for composability.
+#### Chosen: Unified export with post-parse flag validation
 
-#### Chosen: Separate export and preview subcommands
+A single `koto template export` subcommand with `--format mermaid|html`,
+`--output`, `--open`, and `--check` flags. Flag compatibility is enforced
+by a `validate_export_flags()` function after clap parsing.
 
-Two new verbs under `koto template`:
+```rust
+#[derive(Clone, Debug, PartialEq, clap::ValueEnum)]
+pub enum ExportFormat {
+    Mermaid,
+    Html,
+}
 
-- **`koto template export <source> --format mermaid`** produces text output to
-  stdout by default. An `--output` flag writes to a file. The `--format` flag
-  starts with `mermaid` and extends naturally to `dot` or `svg` later.
-- **`koto template preview <source>`** generates a self-contained HTML file and
-  opens it in the browser. Default output is `<template-stem>.preview.html` in
-  the current directory, with `--output` for override.
+#[derive(clap::Args)]
+pub struct ExportArgs {
+    /// Path to template source (.md) or compiled template (.json)
+    pub input: String,
 
-This follows koto's existing one-verb-per-operation pattern. Each subcommand has
-a clear purpose: `export` is pure text output (composable with pipes), `preview`
-has side effects (file write + browser launch). Users running `koto template --help`
-see four self-explanatory verbs: compile, validate, export, preview.
+    /// Output format
+    #[arg(long, default_value = "mermaid", value_enum)]
+    pub format: ExportFormat,
+
+    /// Write output to file path (required for html format)
+    #[arg(long)]
+    pub output: Option<String>,
+
+    /// Open generated file in default browser (html format only)
+    #[arg(long)]
+    pub open: bool,
+
+    /// Verify existing file matches what would be generated
+    #[arg(long)]
+    pub check: bool,
+}
+
+fn validate_export_flags(args: &ExportArgs) -> Result<(), String> {
+    if args.format == ExportFormat::Html && args.output.is_none() {
+        return Err("--format html requires --output <path>".into());
+    }
+    if args.open && args.format != ExportFormat::Html {
+        return Err("--open is only valid with --format html".into());
+    }
+    if args.open && args.check {
+        return Err("--open and --check are mutually exclusive".into());
+    }
+    if args.check && args.output.is_none() {
+        return Err("--check requires --output <path>".into());
+    }
+    Ok(())
+}
+```
+
+Post-parse validation was chosen over clap attributes because:
+- Error messages are exact domain sentences, not clap-generated phrasing
+- All four rules live in one unit-testable function
+- Matches existing koto pattern (e.g., `resolve_variables` validates post-parse)
+- clap can't cleanly express "required when another flag equals a specific value"
 
 #### Alternatives considered
 
-**Flags on compile** (`koto template compile --format mermaid`, `--preview`):
-rejected because it overloads `compile`'s contract (YAML in, JSON out) and makes
-`--preview` a surprising side effect on a pure-output command.
+**clap attribute validation**: partially feasible but can't express
+format-conditional constraints without custom validation anyway, resulting in
+split validation logic.
 
-**Single visualize subcommand** (`koto template visualize --format html|mermaid`):
-rejected because it conflates text export (pure, composable) with browser preview
-(side-effect-heavy). `--format html` misleadingly suggests HTML on stdout.
+**Format-specific subcommands** (`export mermaid` / `export html`): eliminates
+cross-flag validation but deviates from the PRD's `--format` flag design,
+creates three-level nesting, and duplicates `--check` logic across variants.
 
-**Flags on existing + new subcommand** (`compile --mermaid` + `preview`):
-rejected because it splits format selection across two commands inconsistently
-and doesn't extend well to additional formats.
+**Separate export + preview** (original design): rejected because the
+documentation reader use case makes HTML a build artifact. The side effect
+is the browser launch, not the format. `--open` isolates it.
 
 ### Decision 2: Mermaid representation
 
-Mermaid's `stateDiagram-v2` is the secondary, lightweight export. It renders
-inline on GitHub (PRs, READMEs, issues) without tooling. The question is how
-much template metadata to include.
+*(Unchanged from exploration.)*
 
-Key assumptions: directive text truncated to ~60 chars. GitHub continues to
-support `stateDiagram-v2` without `classDef`. Evidence schemas and default
-actions belong in the interactive view, not the structural overview.
-
-#### Chosen: Minimal mapping
-
-Each `TemplateState` becomes a Mermaid state with its name. `[*]` marks the
-initial and terminal states. Transitions use `when` conditions as arrow labels
-(e.g., `route: setup`). Gates appear as `note left of` annotations listing
-gate names and commands. Evidence schemas, default actions, integrations, and
-variables are omitted.
+Each `TemplateState` becomes a Mermaid state. `[*]` marks initial and terminal
+states. Transitions use `when` conditions as arrow labels. Gates appear as
+`note left of` annotations containing the gate name. Evidence schemas, default
+actions, integrations, and variables are omitted.
 
 Example for a 5-state template:
 
@@ -146,166 +180,186 @@ stateDiagram-v2
     implement --> done
     research --> evaluate
     done --> [*]
-    note left of explore : gate: check-repo (test -d .git)
+    note left of explore : gate: check-repo
 ```
 
-#### Alternatives considered
-
-**Rich mapping with notes** (gates as left-notes, evidence as right-notes):
-rejected because double-sided notes create a wall of text on 15+ state
-workflows. Mermaid's note rendering is inconsistent across renderers.
-
-**Choice nodes for branching** (`<<choice>>` pseudo-states): rejected because
-they triple visual elements (state + diamond + extra arrows) with no
-information gain over condition labels on edges.
-
-**Composite states for phases** (grouping by name prefix): rejected because
-automatic grouping is fragile and composite states have rendering bugs on
-GitHub (overlapping labels, misrouted transitions across boundaries).
+Alternatives considered: rich mapping with notes (too noisy), choice nodes
+(triple visual elements), composite states (rendering bugs on GitHub).
 
 ### Decision 3: HTML generation architecture
 
-The interactive preview is a single HTML file with Cytoscape.js + dagre loaded
-from CDN. The only dynamic content is the compiled template's JSON data. The
-question is how the Rust binary produces this file.
+*(Unchanged from exploration.)*
 
-Key assumptions: the HTML template stabilizes quickly. serde_json handles all
-escaping. If the template grows to need multiple injection points, migration
-to askama is straightforward.
-
-#### Chosen: include_str! with placeholder replacement
-
-Embed a complete HTML file via `include_str!("preview.html")` at compile time.
-The file contains a placeholder inside a script tag:
+Embed a complete HTML file via `include_str!("preview.html")`. A single
+placeholder replacement injects the compiled template's JSON data:
 
 ```javascript
 const GRAPH_DATA = /*KOTO_GRAPH_DATA*/{};
 ```
 
-At runtime, `template_str.replace("/*KOTO_GRAPH_DATA*/", &json_data)` injects
-the compiled template. The HTML file is a valid, browser-openable file during
-development (renders with empty data).
+CDN versions pinned: cytoscape@3.30.4, dagre@0.8.5, cytoscape-dagre@2.5.0.
+Updates happen via PRs that bump the template file and SRI hashes.
 
-CDN versions are hardcoded and pinned: cytoscape@3.30.4, dagre@0.8.5,
-cytoscape-dagre@2.5.0. Updates happen via PRs that bump the template file.
-
-Default output path: `<template-stem>.preview.html` in the current directory,
-overridable with `--output`.
-
-#### Alternatives considered
-
-**Split template (head/middle/tail)**: rejected because developers lose the
-ability to open the template file directly in a browser during iteration.
-
-**Rust template engine (askama/tera)**: rejected because one injection point
-doesn't justify a new proc-macro or runtime dependency. Revisit if the template
-needs conditionals or loops.
-
-**Programmatic HTML construction**: rejected because CSS and JS buried in
-`format!()` calls is painful to iterate on and eliminates browser-preview
-during development.
+Alternatives considered: split template (loses browser-preview during dev),
+Rust template engine (one injection point doesn't justify a dependency),
+programmatic HTML construction (painful CSS/JS iteration).
 
 ### Decision 4: Visual design
 
-The Cytoscape CDN prototype established the baseline visual design. The
-question is what to add, change, or leave alone for production.
+*(Unchanged from exploration.)*
 
-#### Chosen: Add dark mode and start marker; keep everything else
+Dark mode via `prefers-color-scheme`, `[*]` start marker, color-coded state
+types (blue initial, green terminal, orange dashed gated, yellow branching),
+system fonts, no badges. Click-to-highlight traces direct incoming/outgoing
+edges (one hop).
 
-**Dark mode**: yes. Port the `prefers-color-scheme: dark` media query from the
-server-side prototype. ~15 lines of CSS, automatic (no toggle needed).
+### Decision 5: --check freshness implementation
 
-**Start marker**: yes. Add a small filled circle `[*]` node with an edge to
-the initial state. The initial state isn't always obvious from color alone in
-large graphs.
+The PRD requires a `--check` flag that compares generated output against an
+existing file without writing (R8). The question is how to implement the
+comparison.
 
-**Badge annotations on nodes**: no. Gate and evidence counts are available via
-hover tooltips. Badges increase visual noise and force wider node boxes, which
-scales poorly at 30+ states.
+#### Chosen: In-memory byte comparison
 
-**Terminal end markers**: no. Green fill plus the legend is sufficient. Adding
-`[*]` end nodes creates an extra edge per terminal state with no information
-gain.
+Generate output to a `Vec<u8>`, read existing file to a `Vec<u8>`, compare
+with `==`. Three result states: Fresh, Stale, Missing.
 
-**Edge labels**: keep prototype styling (auto-rotated with opaque background).
-Dagre's `edgeSep` handles separation for typical branching. Revisit if real
-templates surface overlap problems.
+```rust
+enum CheckResult {
+    Fresh,   // File exists and matches
+    Stale,   // File exists but differs
+    Missing, // File does not exist
+}
 
-**Fonts**: keep the system font stack for labels, monospace for edge conditions
-and tooltip code. No web font loading needed.
+fn check_freshness(generated: &[u8], path: &Path) -> io::Result<CheckResult> {
+    match std::fs::read(path) {
+        Ok(existing) => {
+            if generated == existing.as_slice() {
+                Ok(CheckResult::Fresh)
+            } else {
+                Ok(CheckResult::Stale)
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(CheckResult::Missing),
+        Err(e) => Err(e),
+    }
+}
+```
+
+Error output goes to plain stderr (not JSON), since `export` is
+developer-facing. Exit code 1 for both stale and missing. The error message
+includes the fix command:
+
+```
+error: docs/workflow.mermaid.md is out of date
+run: koto template export workflow.md --format mermaid --output docs/workflow.mermaid.md
+```
+
+#### Alternatives considered
+
+**Tempfile + diff**: requires tempfile crate, subprocess, platform-dependent
+diff availability. No benefit for files under 100 KB.
+
+**Streaming hash comparison**: adds sha2 dependency for comparison, can't show
+any diff detail. Strictly less capable than byte comparison.
+
+### Decision 6: GHA reusable workflow architecture
+
+The PRD requires a reusable GHA workflow (R9, R10) that consumers add with
+minimal configuration.
+
+#### Chosen: Reusable workflow with gh release download
+
+A `on: workflow_call` workflow at
+`.github/workflows/check-template-freshness.yml` in the koto repo. Downloads
+a koto release binary via `gh release download` (pre-installed on runners, no
+secrets needed for public repos).
+
+**Inputs:**
+
+| Input | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `template-paths` | string | yes | -- | Glob pattern for template `.md` files |
+| `koto-version` | string | no | `latest` | Release tag or `latest` |
+| `check-html` | boolean | no | `false` | Also verify HTML freshness |
+| `html-output-dir` | string | no | `docs` | Directory for HTML outputs |
+
+The workflow expands the glob with `compgen -G`, loops through templates,
+runs `koto template export --check` for each, and uses `::error` annotations
+with actionable fix commands. Fails if any template is stale or missing.
+
+Callers pin `@v1` (tag or branch). Breaking input changes bump the major
+version. Non-breaking additions (new optional inputs) update `v1`.
+
+#### Alternatives considered
+
+**Composite action**: can't define its own `runs-on`, requires caller to
+handle checkout and runner, more boilerplate. The PRD says "callable via
+`uses:` with a tag reference" which maps directly to workflow_call.
 
 ## Decision Outcome
 
-**Chosen: export + preview subcommands, minimal Mermaid, include_str! HTML, dark mode + start marker**
+**Chosen: unified export, in-memory --check, reusable GHA workflow**
 
 ### Summary
 
-The feature ships as two `koto template` subcommands. `export --format mermaid`
-produces a lightweight `stateDiagram-v2` diagram to stdout, showing states,
-transitions with condition labels, and gates as notes. It renders natively on
-GitHub and ships first as an MVP. `preview` generates an interactive HTML file
-using Cytoscape.js + dagre loaded from CDN, with hover tooltips for gates and
-evidence schemas, click-to-highlight for tracing paths, and pan/zoom for large
-graphs.
+The feature ships as a single `koto template export` subcommand. `--format
+mermaid` (default) produces `stateDiagram-v2` text to stdout or file.
+`--format html` produces an interactive Cytoscape.js file. `--open` launches
+the browser for local debugging. `--check` verifies freshness without writing.
 
-The HTML is generated from a real `preview.html` file embedded in the binary via
-`include_str!`. A single placeholder replacement injects the compiled template's
-JSON data. CDN versions are pinned (cytoscape@3.30.4, dagre@0.8.5,
-cytoscape-dagre@2.5.0) for reproducibility. The output file defaults to
-`<template-stem>.preview.html` in the current directory and opens in the browser
-via the `opener` crate, with a graceful fallback that prints the file path.
+The HTML is generated from `preview.html` embedded via `include_str!`. A
+single placeholder replacement injects the compiled template's JSON data.
+CDN versions are pinned with SRI integrity hashes. Output uses LF line
+endings unconditionally for cross-platform determinism.
 
-Visual design builds on the prototype: color-coded state types (blue initial,
-green terminal, orange dashed gated, yellow branching), a `[*]` start marker
-for entry point clarity, dark mode via `prefers-color-scheme`, and system fonts
-throughout. Badges are omitted in favor of tooltip-based inspection.
+A reusable GHA workflow at `.github/workflows/check-template-freshness.yml`
+downloads a koto release binary and runs `--check` for each template matching
+a configurable glob. Consumers add 5 lines of YAML to get CI enforcement.
 
 ### Rationale
 
-The decisions reinforce each other. Separating `export` from `preview` keeps
-each command focused — text-format export is composable (pipe, redirect),
-while HTML preview is inherently side-effect-heavy (file write, browser launch).
-Minimal Mermaid mapping pairs with the rich interactive HTML: the Mermaid
-diagram shows structure at a glance, the HTML preview shows full detail on
-demand. Neither tries to do the other's job.
+The unified export command reflects the PRD's insight that HTML is a build
+artifact (documentation for project websites), not just a local debugging
+tool. Separating `--open` as an opt-in flag isolates the browser side effect
+while keeping the default behavior pure (write file, print path). `--check`
+follows the `cargo fmt --check` pattern that CI users already know.
 
-The `include_str!` approach for HTML generation preserves the development
-workflow (edit HTML, refresh browser) while keeping the build simple (no
-template engine dependency). Pinned CDN versions keep generated files
-reproducible without bundling ~435 KB of JavaScript into every output file.
-Dark mode and the start marker are the only additions to the prototype -- the
-rest was already close to production quality.
+In-memory byte comparison is the simplest correct approach for files under
+100 KB. The GHA workflow uses `gh release download` because it's pre-installed,
+handles authentication, and works with the release asset naming convention
+already established in `release.yml`.
 
 ## Solution Architecture
 
 ### Overview
 
-Two new subcommands under `koto template` produce visual representations of
-compiled workflows. `export` generates Mermaid text from the `CompiledTemplate`
-struct. `preview` generates an interactive HTML file from an embedded template
-with injected graph data, then opens it in the browser.
+One new subcommand under `koto template` produces visual representations in
+two formats. The `export` subcommand handles format dispatch, flag validation,
+freshness checking, and optional browser opening.
 
 ### Components
 
 ```
 src/cli/mod.rs
-  TemplateSubcommand::Export { source, format, output }
-  TemplateSubcommand::Preview { source, output }
+  TemplateSubcommand::Export(ExportArgs)
+  ExportFormat enum (Mermaid, Html)
+  validate_export_flags()
 
 src/export/
-  mod.rs          -- re-exports mermaid and preview modules
+  mod.rs          -- re-exports, format dispatch
   mermaid.rs      -- CompiledTemplate -> stateDiagram-v2 text
-  preview.rs      -- CompiledTemplate -> HTML (include_str! + replace)
+  html.rs         -- CompiledTemplate -> HTML (include_str! + replace)
+  check.rs        -- freshness comparison (CheckResult, check_freshness)
 
 src/export/preview.html
-  -- Self-contained HTML template with Cytoscape.js CDN refs
+  -- Self-contained HTML template with Cytoscape.js CDN refs + SRI hashes
   -- Contains /*KOTO_GRAPH_DATA*/ placeholder
   -- Valid HTML that renders with empty data during development
-```
 
-Note: `src/export/mod.rs` starts as a simple re-export (`pub mod mermaid;
-pub mod preview;`). Add a format dispatch enum when a second export format
-materializes, not before.
+.github/workflows/check-template-freshness.yml
+  -- Reusable workflow for CI freshness enforcement
+```
 
 ### Key interfaces
 
@@ -316,168 +370,237 @@ materializes, not before.
 /// a .json pre-compiled template.
 fn resolve_template(source: &str) -> anyhow::Result<CompiledTemplate>
 ```
-`compile_cached()` returns `(PathBuf, String)`, not a struct. This helper
-reads and deserializes the cached file, reusing the existing
-`load_compiled_template()` logic. Shared by both `export` and `preview`
-handlers to avoid duplicating detection logic.
 
 **Mermaid export function:**
 ```rust
+/// Generate stateDiagram-v2 Mermaid text from a compiled template.
+/// Output uses LF line endings unconditionally.
 pub fn to_mermaid(template: &CompiledTemplate) -> String
 ```
-Walks `template.states`, emits `stateDiagram-v2` syntax. Returns the complete
-Mermaid text. No dependencies beyond the `CompiledTemplate` type.
 
-**HTML preview function:**
+**HTML generation function:**
 ```rust
-pub fn generate_preview(
-    template: &CompiledTemplate,
-    output_path: &Path,
-) -> anyhow::Result<()>
+/// Generate interactive HTML from a compiled template.
+/// Returns the generated HTML as bytes. The caller writes to disk.
+/// Escapes </ as <\/ to prevent script context injection.
+/// Output uses LF line endings unconditionally.
+pub fn generate_html(template: &CompiledTemplate) -> Vec<u8>
 ```
-Serializes template to JSON, escapes `</` as `<\/` to prevent script context
-injection, replaces the placeholder in the embedded HTML, writes the file.
-The caller (CLI handler) is responsible for opening the browser.
 
-**Error handling:** Both `export` and `preview` are developer-facing commands
-(not agent-consumed), so errors go to stderr as plain text, not JSON. This
-differs from `compile` and `validate` which use `exit_with_error()` JSON
-output for machine consumption.
+Note: `generate_html` returns bytes rather than writing to a file, so
+`--check` can compare without a temp file.
 
-**CLI handler for preview:**
+**Freshness check:**
 ```rust
-// In the template preview match arm:
-let html_path = generate_preview(&compiled, &output_path)?;
-println!("{}", html_path.display());
-if let Err(e) = opener::open(&html_path) {
-    eprintln!("Could not open browser: {}", e);
-}
+/// Compare generated content against an existing file.
+pub fn check_freshness(generated: &[u8], path: &Path) -> io::Result<CheckResult>
 ```
+
+**Flag validation:**
+```rust
+/// Validate export flag combinations (R15).
+/// Returns Ok(()) or an error describing the invalid combination.
+fn validate_export_flags(args: &ExportArgs) -> Result<(), String>
+```
+
+**Error handling:** Export is developer-facing, not agent-consumed. Errors
+go to stderr as plain text (not JSON). Exit code 2 for flag validation
+errors, exit code 1 for stale/missing check results.
 
 ### Data flow
 
 ```
-Template source (.md)
+Template source (.md or .json)
   |
   v
-compile_cached() -> CompiledTemplate JSON (existing)
+resolve_template() -> CompiledTemplate
   |
-  +---> to_mermaid() -> stdout or file
+  +---> to_mermaid() -> String (bytes)
+  |                        |
+  |                        +---> --check? -> check_freshness() -> exit 0/1
+  |                        +---> --output? -> write to file
+  |                        +---> else -> stdout
   |
-  +---> generate_preview() -> .preview.html
-          |
-          v
-        opener::open() -> browser
+  +---> generate_html() -> Vec<u8>
+                             |
+                             +---> --check? -> check_freshness() -> exit 0/1
+                             +---> write to --output path
+                             +---> --open? -> opener::open()
 ```
 
-Both `export` and `preview` accept either a source template path (compiled on
-the fly via `compile_cached`) or a pre-compiled JSON path. The shared
-`resolve_template()` helper detects which based on file extension (.md/.yaml
-triggers compilation, .json loads directly).
+### CLI handler flow
+
+```rust
+// 1. Parse args (clap)
+// 2. Validate flag combinations
+validate_export_flags(&args)?;
+
+// 3. Resolve template
+let compiled = resolve_template(&args.input)?;
+
+// 4. Generate output
+let output_bytes = match args.format {
+    ExportFormat::Mermaid => to_mermaid(&compiled).into_bytes(),
+    ExportFormat::Html => generate_html(&compiled),
+};
+
+// 5. Check mode: compare and exit
+if args.check {
+    let path = Path::new(args.output.as_ref().unwrap());
+    match check_freshness(&output_bytes, path)? {
+        CheckResult::Fresh => std::process::exit(0),
+        CheckResult::Stale | CheckResult::Missing => {
+            // print error + fix command to stderr
+            std::process::exit(1);
+        }
+    }
+}
+
+// 6. Write output
+if let Some(ref output_path) = args.output {
+    std::fs::write(output_path, &output_bytes)?;
+    println!("{}", output_path);
+} else {
+    // mermaid to stdout (html always has --output)
+    io::stdout().write_all(&output_bytes)?;
+}
+
+// 7. Open browser if requested
+if args.open {
+    if let Err(e) = opener::open(args.output.as_ref().unwrap()) {
+        eprintln!("Could not open browser: {}", e);
+    }
+}
+```
 
 ## Implementation Approach
 
-### Phase 1: Mermaid export (MVP)
+### Phase 1: Export command with Mermaid format
 
-Add `koto template export <source> --format mermaid`. Implement `to_mermaid()`
-in `src/export/mermaid.rs`. Output to stdout by default, `--output` for file.
+Add `koto template export` with `--format mermaid` (default). Implement
+`to_mermaid()`, `resolve_template()`, `validate_export_flags()`, and the CLI
+handler. Output to stdout by default, `--output` for file.
 
 Deliverables:
-- `src/export/mod.rs` -- module with format enum
-- `src/export/mermaid.rs` -- Mermaid generation
-- `TemplateSubcommand::Export` variant in `src/cli/mod.rs`
-- Integration test: compile a fixture template, export as Mermaid, validate
-  the output contains expected states and transitions
+- `src/export/mod.rs`, `src/export/mermaid.rs`
+- `ExportArgs`, `ExportFormat`, `validate_export_flags()` in `src/cli/mod.rs`
+- Integration test: export fixture template as Mermaid, verify output
+- Unit tests for `validate_export_flags()` covering all R15 combinations
+- Determinism test: export same template twice, assert byte-identical output
 
-### Phase 2: HTML preview template
+### Phase 2: --check flag
+
+Implement `check_freshness()` in `src/export/check.rs`. Wire into the CLI
+handler. Verify with mermaid format first.
+
+Deliverables:
+- `src/export/check.rs` with `CheckResult` and `check_freshness()`
+- Integration tests: fresh file (exit 0), stale file (exit 1), missing file
+  (exit 1), error message includes fix command
+- Verify the fix command resolves the drift when executed
+
+### Phase 3: HTML format
 
 Create `src/export/preview.html` with Cytoscape.js + dagre CDN setup, CSS
 (including dark mode), JS for graph construction, tooltips, click-to-highlight,
-and the `[*]` start marker. Test in browser with hardcoded data.
+and the `[*]` start marker. Implement `generate_html()` in `src/export/html.rs`.
+Add `opener` to Cargo.toml for `--open`.
 
 Deliverables:
 - `src/export/preview.html` -- complete, browser-previewable HTML template
-- Manual verification: open the template with sample data in a browser
+- `src/export/html.rs` -- HTML generation with placeholder replacement
+- `opener` dependency in Cargo.toml
+- Integration tests: HTML contains template data, CDN script tags, SRI hashes
+- Determinism test: export same template as HTML twice, assert byte-identical
+- Manual verification: open in browser with sample data, test dark mode
 
-### Phase 3: Preview command
+### Phase 4: GHA reusable workflow
 
-Add `koto template preview <source>`. Implement `generate_preview()` in
-`src/export/preview.rs`. Add `opener` to Cargo.toml. Wire up CLI handler.
+Create `.github/workflows/check-template-freshness.yml` with the reusable
+workflow. Test by calling it from the koto repo's own CI against the plugin
+templates.
 
 Deliverables:
-- `src/export/preview.rs` -- HTML generation with placeholder replacement
-- `TemplateSubcommand::Preview` variant in `src/cli/mod.rs`
-- `opener` dependency in Cargo.toml
-- Integration test: generate preview HTML, verify it contains the template
-  data and CDN script tags
+- `.github/workflows/check-template-freshness.yml`
+- Caller example in documentation or README
+- Test by adding a freshness check job to `validate-plugins.yml`
 
 ## Consequences
 
 ### Positive
 
-- Developers can visually inspect workflow structure without reading JSON
-- Mermaid export renders natively in GitHub PRs, READMEs, and issues
-- Interactive HTML enables debugging large workflows (30+ states) with
-  tooltips and click-to-highlight
-- Preview files are small (~15-30 KB) and committable as documentation
-- No new heavy dependencies (only `opener` crate added)
+- Single `export` command covers all visual output (mermaid, html, future formats)
+- `--check` enables CI freshness enforcement without git-level glue
+- Reusable GHA workflow gives consumers 5-line CI setup
+- HTML files work as both local debugging tools and deployed documentation
+- Mermaid renders natively on GitHub for source-browsing readers
+- No heavy new dependencies (only `opener` crate added)
 
 ### Negative
 
-- CDN dependency: preview HTML doesn't work offline or without internet
+- CDN dependency: HTML doesn't work offline
 - Pinned CDN versions require manual updates via PRs
 - Dark mode relies on system preference only (no manual toggle)
 - Mermaid export omits evidence schemas and default actions
+- `--open` is format-conditional (only valid with `--format html`), adding a
+  flag interaction rule
 
 ### Mitigations
 
-- Offline use: a future `--inline` flag could bundle JS for offline-capable
-  output. Not needed for v1 since both use cases are online.
-- CDN staleness: CI could periodically check for new Cytoscape.js releases
-  and open update PRs. Low priority since pinned versions work indefinitely.
-- Mermaid completeness: the interactive HTML preview covers the detailed
-  metadata inspection use case. Mermaid is intentionally a structural overview.
+- Offline use: a future `--inline` flag could bundle JS. Not needed for v1.
+- CDN staleness: only Cytoscape.js is actively maintained (dagre frozen since
+  2016). Low maintenance burden.
+- Mermaid completeness: HTML covers detailed inspection. Mermaid is intentionally
+  a structural overview.
+- Flag interactions: `validate_export_flags()` catches all invalid combinations
+  with clear error messages.
 
 ## Security Considerations
 
 ### CDN script integrity
 
-The generated HTML loads JavaScript from unpkg.com. Without verification, a
-compromised CDN could serve malicious code to anyone who opens a preview file.
-All three `<script>` tags must include Subresource Integrity (SRI) hashes:
+Generated HTML loads JavaScript from unpkg.com. All `<script>` tags include
+Subresource Integrity (SRI) hashes computed against pinned versions. The
+browser refuses to execute scripts whose content doesn't match the hash.
 
 ```html
 <script src="https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js"
         integrity="sha384-<hash>" crossorigin="anonymous"></script>
 ```
 
-SRI hashes are computed at development time against the pinned versions and
-embedded in `preview.html`. When CDN versions are bumped, new hashes must be
-computed and committed alongside the version update. The browser refuses to
-execute any script whose content doesn't match the hash.
+SRI hashes are committed in `preview.html`. Version bumps require new hashes.
 
 ### Script context injection
 
 The compiled template JSON is injected into a `<script>` block via string
-replacement. `serde_json` produces valid JSON but doesn't escape `</script>`
-sequences, which would break out of the HTML script context if a state
-directive or gate command contained that string. The `generate_preview()`
-function must replace `</` with `<\/` in the serialized JSON before insertion.
-This is a required implementation detail, not optional.
+replacement. `serde_json` doesn't escape `</script>` sequences. The
+`generate_html()` function replaces `</` with `<\/` in the serialized JSON
+before insertion. This is a required implementation detail.
 
 ### Embedded template data
 
-Preview HTML files contain the full compiled template in plaintext, including
-gate commands (shell commands), default action commands, directive text with
-agent instructions, and variable declarations. Users should treat preview
-files with the same sensitivity as source templates.
+HTML files contain the full compiled template in plaintext, including gate
+commands, action commands, directive text, and variable declarations. Users
+should treat HTML export files with the same sensitivity as source templates.
 
-For sharing workflow structure (in PRs, READMEs, or public documentation),
-prefer `koto template export --format mermaid` -- it includes only state
-names, transitions, and gate names, not full commands or directives.
+For sharing structure without sensitive details, use `--format mermaid` --
+it includes only state names, transitions, and gate names.
+
+### --check mode safety
+
+`--check` never writes to disk. It reads the existing file and compares in
+memory. There's no race condition between check and write because they're
+separate invocations. The `check_freshness()` function returns `Err` for
+I/O errors other than `NotFound`, preventing silent failures.
 
 ### File write scope
 
-The preview command writes to the current directory using `Path::file_stem()`
-for filename derivation. This prevents path traversal via `../` in template
-paths. The output path is printed so users know exactly what was written.
+The `--output` flag controls the write path. No default file derivation is
+used for HTML (it requires explicit `--output`). For mermaid, output defaults
+to stdout. This prevents accidental file writes to unexpected locations.
+
+### GHA workflow permissions
+
+The reusable workflow needs only `contents: read` to check out the repo and
+download a public release. It doesn't need write permissions, secrets, or
+token elevation. The `github.token` default is sufficient.
