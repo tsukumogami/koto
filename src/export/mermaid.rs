@@ -42,13 +42,12 @@ pub fn to_mermaid(template: &CompiledTemplate) -> String {
         lines.push(format!("    {} --> [*]", state_name));
     }
 
-    // Gate annotations.
+    // Gate annotations (multi-line note syntax avoids colon parsing issues).
     for (state_name, state) in &template.states {
         for gate_name in state.gates.keys() {
-            lines.push(format!(
-                "    note left of {} : gate: {}",
-                state_name, gate_name
-            ));
+            lines.push(format!("    note left of {}", state_name));
+            lines.push(format!("        gate: {}", gate_name));
+            lines.push("    end note".to_string());
         }
     }
 
@@ -286,7 +285,7 @@ mod tests {
         );
         let output = to_mermaid(&t);
         assert!(
-            output.contains("note left of start : gate: check-repo"),
+            output.contains("note left of start\n        gate: check-repo\n    end note"),
             "got:\n{}",
             output
         );
@@ -411,6 +410,6 @@ mod tests {
         assert!(output.contains("implement --> done"));
         assert!(output.contains("research --> evaluate"));
         assert!(output.contains("done --> [*]"));
-        assert!(output.contains("note left of explore : gate: check-repo"));
+        assert!(output.contains("note left of explore\n        gate: check-repo\n    end note"));
     }
 }
