@@ -29,6 +29,74 @@ pub fn validate_session_id(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate a context key against the hierarchical key format.
+///
+/// Valid keys use `/` as a namespace separator with these rules:
+/// - Allowed characters: `[a-zA-Z0-9._-/]`
+/// - Must not start or end with `/`
+/// - No consecutive slashes (`//`)
+/// - No `.` or `..` path components
+/// - Each component must match `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`
+/// - Maximum total length: 255 characters
+/// - Empty string rejected
+pub fn validate_context_key(key: &str) -> anyhow::Result<()> {
+    if key.is_empty() {
+        anyhow::bail!("context key must not be empty");
+    }
+
+    if key.len() > 255 {
+        anyhow::bail!(
+            "context key exceeds maximum length of 255 characters (got {})",
+            key.len()
+        );
+    }
+
+    if key.starts_with('/') {
+        anyhow::bail!("context key must not start with '/'");
+    }
+
+    if key.ends_with('/') {
+        anyhow::bail!("context key must not end with '/'");
+    }
+
+    if key.contains("//") {
+        anyhow::bail!("context key must not contain consecutive slashes");
+    }
+
+    for component in key.split('/') {
+        if component == "." || component == ".." {
+            anyhow::bail!("context key must not contain '.' or '..' path components");
+        }
+
+        if component.is_empty() {
+            // Shouldn't happen given the checks above, but be defensive.
+            anyhow::bail!("context key contains empty component");
+        }
+
+        let first = component.chars().next().unwrap();
+        if !first.is_ascii_alphanumeric() {
+            anyhow::bail!(
+                "each component must start with a letter or digit, got '{}' in component '{}'",
+                first,
+                component
+            );
+        }
+
+        for ch in component.chars().skip(1) {
+            if !ch.is_ascii_alphanumeric() && ch != '.' && ch != '_' && ch != '-' {
+                anyhow::bail!(
+                    "context key contains invalid character '{}' in component '{}'; \
+                     allowed: letters, digits, '.', '_', '-'",
+                    ch,
+                    component
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +179,102 @@ mod tests {
     #[test]
     fn rejects_null_byte() {
         assert!(validate_session_id("a\0b").is_err());
+    }
+
+    // -- context key validation --
+
+    #[test]
+    fn ctx_key_accepts_flat_key() {
+        assert!(validate_context_key("scope.md").is_ok());
+    }
+
+    #[test]
+    fn ctx_key_accepts_hierarchical_key() {
+        assert!(validate_context_key("research/r1/lead-cli-ux.md").is_ok());
+    }
+
+    #[test]
+    fn ctx_key_accepts_alphanumeric_start() {
+        assert!(validate_context_key("1file.txt").is_ok());
+        assert!(validate_context_key("a").is_ok());
+    }
+
+    #[test]
+    fn ctx_key_accepts_dots_hyphens_underscores() {
+        assert!(validate_context_key("my_file.v2-final.md").is_ok());
+    }
+
+    #[test]
+    fn ctx_key_rejects_empty() {
+        assert!(validate_context_key("").is_err());
+    }
+
+    #[test]
+    fn ctx_key_rejects_leading_slash() {
+        assert!(validate_context_key("/scope.md").is_err());
+    }
+
+    #[test]
+    fn ctx_key_rejects_trailing_slash() {
+        assert!(validate_context_key("scope.md/").is_err());
+    }
+
+    #[test]
+    fn ctx_key_rejects_consecutive_slashes() {
+        assert!(validate_context_key("research//r1.md").is_err());
+    }
+
+    #[test]
+    fn ctx_key_rejects_dot_component() {
+        assert!(validate_context_key("research/./r1.md").is_err());
+    }
+
+    #[test]
+    fn ctx_key_rejects_dotdot_component() {
+        assert!(validate_context_key("research/../secret.md").is_err());
+    }
+
+    #[test]
+    fn ctx_key_rejects_dotdot_standalone() {
+        assert!(validate_context_key("..").is_err());
+    }
+
+    #[test]
+    fn ctx_key_rejects_dot_standalone() {
+        assert!(validate_context_key(".").is_err());
+    }
+
+    #[test]
+    fn ctx_key_rejects_component_starting_with_dot() {
+        assert!(validate_context_key(".hidden/file.md").is_err());
+    }
+
+    #[test]
+    fn ctx_key_rejects_component_starting_with_hyphen() {
+        assert!(validate_context_key("-flag/file.md").is_err());
+    }
+
+    #[test]
+    fn ctx_key_rejects_space() {
+        assert!(validate_context_key("my file.md").is_err());
+    }
+
+    #[test]
+    fn ctx_key_rejects_over_255_chars() {
+        let long_key = "a".repeat(256);
+        assert!(validate_context_key(&long_key).is_err());
+    }
+
+    #[test]
+    fn ctx_key_accepts_exactly_255_chars() {
+        let key = "a".repeat(255);
+        assert!(validate_context_key(&key).is_ok());
+    }
+
+    #[test]
+    fn ctx_key_rejects_special_characters() {
+        assert!(validate_context_key("file@name.md").is_err());
+        assert!(validate_context_key("file name.md").is_err());
+        assert!(validate_context_key("file\tname.md").is_err());
     }
 }
