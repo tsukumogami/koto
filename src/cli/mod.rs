@@ -1,5 +1,6 @@
 pub mod next;
 pub mod next_types;
+pub mod session;
 pub mod vars;
 
 use std::collections::HashMap;
@@ -91,6 +92,28 @@ pub enum Command {
     Template {
         #[command(subcommand)]
         subcommand: TemplateSubcommand,
+    },
+
+    /// Session management subcommands
+    Session {
+        #[command(subcommand)]
+        subcommand: SessionCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SessionCommand {
+    /// Print the absolute session directory path
+    Dir {
+        /// Session name
+        name: String,
+    },
+    /// List all sessions as JSON
+    List,
+    /// Remove a session directory (idempotent)
+    Cleanup {
+        /// Session name
+        name: String,
     },
 }
 
@@ -207,6 +230,14 @@ pub fn run(app: App) -> Result<()> {
             };
             println!("{}", serde_json::to_string(&metadata)?);
             Ok(())
+        }
+        Command::Session { subcommand } => {
+            let backend = build_backend()?;
+            match subcommand {
+                SessionCommand::Dir { name } => session::handle_dir(&backend, &name),
+                SessionCommand::List => session::handle_list(&backend),
+                SessionCommand::Cleanup { name } => session::handle_cleanup(&backend, &name),
+            }
         }
         Command::Template { subcommand } => match subcommand {
             TemplateSubcommand::Compile { source } => {

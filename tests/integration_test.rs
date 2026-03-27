@@ -1981,3 +1981,215 @@ All done.
         json["error"]["message"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Session subcommand tests (scenario-16, scenario-17, scenario-18)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_dir_prints_absolute_path() {
+    let dir = TempDir::new().unwrap();
+    let name = "my-workflow";
+
+    let output = koto_cmd(dir.path())
+        .args(["session", "dir", name])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "session dir should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let path = stdout.trim();
+    // Should be an absolute path containing the session name
+    assert!(
+        Path::new(path).is_absolute(),
+        "session dir output should be an absolute path, got: {}",
+        path
+    );
+    assert!(
+        path.contains(name),
+        "session dir output should contain the session name, got: {}",
+        path
+    );
+}
+
+#[test]
+fn session_list_outputs_json_array() {
+    let dir = TempDir::new().unwrap();
+
+    // List with no sessions should return an empty array
+    let output = koto_cmd(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "session list should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(json.is_array(), "session list should output a JSON array");
+    assert_eq!(json.as_array().unwrap().len(), 0, "should have no sessions");
+
+    // Init a workflow, then list should show it
+    let template_path = write_template_source(dir.path());
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "test-wf",
+            "--template",
+            template_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "should have one session");
+    assert_eq!(arr[0]["id"].as_str(), Some("test-wf"));
+    assert!(
+        arr[0]["created_at"].is_string(),
+        "created_at should be a string"
+    );
+}
+
+#[test]
+fn session_cleanup_removes_session() {
+    let dir = TempDir::new().unwrap();
+    let template_path = write_template_source(dir.path());
+
+    // Init a workflow
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "cleanup-wf",
+            "--template",
+            template_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Verify it exists in list
+    let output = koto_cmd(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 1);
+
+    // Cleanup
+    koto_cmd(dir.path())
+        .args(["session", "cleanup", "cleanup-wf"])
+        .assert()
+        .success();
+
+    // Verify list is now empty
+    let output = koto_cmd(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(
+        json.as_array().unwrap().len(),
+        0,
+        "session should be removed after cleanup"
+    );
+}
+
+#[test]
+fn session_cleanup_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+
+    // Cleanup a non-existent session should succeed
+    koto_cmd(dir.path())
+        .args(["session", "cleanup", "nonexistent"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn session_without_subcommand_shows_help() {
+    let dir = TempDir::new().unwrap();
+
+    let output = koto_cmd(dir.path()).args(["session"]).output().unwrap();
+
+    // clap exits with code 2 when a required subcommand is missing
+    assert!(
+        !output.status.success(),
+        "session without subcommand should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Usage") || stderr.contains("usage"),
+        "should show usage info, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn session_full_lifecycle() {
+    let dir = TempDir::new().unwrap();
+    let template_path = write_template_source(dir.path());
+
+    // Init a workflow
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "lifecycle-wf",
+            "--template",
+            template_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Verify dir path
+    let output = koto_cmd(dir.path())
+        .args(["session", "dir", "lifecycle-wf"])
+        .output()
+        .unwrap();
+    let dir_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(
+        Path::new(&dir_path).exists(),
+        "session dir should exist after init"
+    );
+
+    // Verify list shows it
+    let output = koto_cmd(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 1);
+
+    // Cleanup
+    koto_cmd(dir.path())
+        .args(["session", "cleanup", "lifecycle-wf"])
+        .assert()
+        .success();
+
+    // Verify dir is gone
+    assert!(
+        !Path::new(&dir_path).exists(),
+        "session dir should be removed after cleanup"
+    );
+
+    // Verify list is empty
+    let output = koto_cmd(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(
+        json.as_array().unwrap().len(),
+        0,
+        "list should be empty after cleanup"
+    );
+}

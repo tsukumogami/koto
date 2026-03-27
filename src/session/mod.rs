@@ -4,6 +4,7 @@ pub mod validate;
 use std::path::PathBuf;
 
 /// Information about an existing session.
+#[derive(serde::Serialize)]
 pub struct SessionInfo {
     /// Session identifier (same as the workflow name).
     pub id: String,
