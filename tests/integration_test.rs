@@ -3300,3 +3300,399 @@ fn export_check_fix_command_resolves_drift() {
         String::from_utf8_lossy(&recheck.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// export: html output validation and determinism
+// ---------------------------------------------------------------------------
+
+/// Export a fixture template to HTML via CLI and return the file contents.
+/// HTML format requires --output, so this writes to a temp file.
+fn export_html_to_file(fixture: &Path) -> (String, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let output_path = dir.path().join("preview.html");
+
+    let output = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "export --format html --output should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    (content, dir)
+}
+
+#[test]
+fn export_html_contains_template_data() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    assert!(
+        html.contains("multi-state"),
+        "HTML should contain template name, got length={}",
+        html.len()
+    );
+    assert!(html.contains("entry"), "HTML should contain state names");
+    assert!(
+        html.contains("config_exists"),
+        "HTML should contain gate names"
+    );
+}
+
+#[test]
+fn export_html_contains_cdn_script_tags_with_sri() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    // Script tags may span multiple lines, so split on "</script>" to get
+    // each complete tag block and check the ones that reference unpkg CDN.
+    let script_blocks: Vec<&str> = html.split("</script>").collect();
+    let cdn_blocks: Vec<&str> = script_blocks
+        .iter()
+        .filter(|b| b.contains("<script") && b.contains("unpkg.com"))
+        .copied()
+        .collect();
+
+    assert!(
+        !cdn_blocks.is_empty(),
+        "HTML should contain CDN script tags"
+    );
+
+    for block in &cdn_blocks {
+        assert!(
+            block.contains("integrity=\"sha384-"),
+            "CDN script tag must have SRI integrity hash: {}",
+            block.trim()
+        );
+        assert!(
+            block.contains("crossorigin=\"anonymous\""),
+            "CDN script tag must have crossorigin attribute: {}",
+            block.trim()
+        );
+    }
+}
+
+#[test]
+fn export_html_no_server_side_directives() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    assert!(
+        !html.contains("<?"),
+        "HTML should not contain PHP-style server directives"
+    );
+    assert!(
+        !html.contains("<%"),
+        "HTML should not contain ASP-style server directives"
+    );
+}
+
+#[test]
+fn export_html_determinism_via_cli() {
+    let fixture = fixture_multi_state();
+    let dir = TempDir::new().unwrap();
+    let first_path = dir.path().join("first.html");
+    let second_path = dir.path().join("second.html");
+
+    let first = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            first_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    let second = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            second_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(first.status.success());
+    assert!(second.status.success());
+
+    let first_bytes = std::fs::read(&first_path).unwrap();
+    let second_bytes = std::fs::read(&second_path).unwrap();
+
+    assert_eq!(
+        first_bytes, second_bytes,
+        "two CLI HTML export invocations must produce byte-identical output"
+    );
+}
+
+#[test]
+fn export_html_writes_to_output_file() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("preview.html");
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "export --format html --output should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        output_path.exists(),
+        "output file should be created at {:?}",
+        output_path
+    );
+
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    assert!(
+        content.contains("<!DOCTYPE html>"),
+        "output file should be valid HTML"
+    );
+    assert!(content.contains("multi-state"));
+}
+
+#[test]
+fn export_html_valid_structure() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    assert!(html.contains("<!DOCTYPE html>"), "must have DOCTYPE");
+    assert!(html.contains("<html"), "must have html tag");
+    assert!(html.contains("</html>"), "must close html tag");
+    assert!(html.contains("<head>"), "must have head tag");
+    assert!(html.contains("</head>"), "must close head tag");
+    assert!(html.contains("<body>"), "must have body tag");
+    assert!(html.contains("</body>"), "must close body tag");
+}
+
+#[test]
+fn export_html_size_under_30kb() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    let size = html.len();
+    assert!(
+        size < 30 * 1024,
+        "HTML output should be under 30 KB, got {} bytes ({:.1} KB)",
+        size,
+        size as f64 / 1024.0
+    );
+}
+
+#[test]
+fn export_html_check_fresh_exits_0() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("preview.html");
+
+    // Generate the file.
+    let gen = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        gen.status.success(),
+        "generation failed: {}",
+        String::from_utf8_lossy(&gen.stderr)
+    );
+
+    // Check: should exit 0 because the file is fresh.
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "--check on fresh HTML file should exit 0: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn export_html_check_stale_exits_1() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("preview.html");
+
+    // Write stale content.
+    std::fs::write(&output_path, b"<html>stale</html>").unwrap();
+
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !check.status.success(),
+        "--check on stale HTML file should exit 1"
+    );
+
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("is out of date"),
+        "stderr should mention 'out of date': {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("--format html"),
+        "stderr fix command should specify html format: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_html_check_missing_exits_1() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("nonexistent.html");
+
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !check.status.success(),
+        "--check on missing HTML file should exit 1"
+    );
+
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("does not exist"),
+        "stderr should mention 'does not exist': {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("--format html"),
+        "stderr fix command should specify html format: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_html_check_fix_command_resolves_drift() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("preview.html");
+
+    // Write stale content.
+    std::fs::write(&output_path, b"stale").unwrap();
+
+    // Run --check (it will fail).
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(!check.status.success());
+
+    // Apply the fix: regenerate the file.
+    let fix = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        fix.status.success(),
+        "fix command failed: {}",
+        String::from_utf8_lossy(&fix.stderr)
+    );
+
+    // Now --check should pass.
+    let recheck = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        recheck.status.success(),
+        "--check after fix should exit 0: {}",
+        String::from_utf8_lossy(&recheck.stderr)
+    );
+}
