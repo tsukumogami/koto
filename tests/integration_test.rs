@@ -2776,3 +2776,343 @@ fn polling_action_retries_until_success() {
         "polling should have created ready.txt"
     );
 }
+
+// ---------------------------------------------------------------------------
+// export: mermaid output validation and determinism
+// ---------------------------------------------------------------------------
+
+/// Path to the multi-state fixture template.
+fn fixture_multi_state() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test/functional/fixtures/templates/multi-state.md")
+}
+
+/// Path to the simple-gates fixture template.
+fn fixture_simple_gates() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test/functional/fixtures/templates/simple-gates.md")
+}
+
+/// A single-state template (initial + terminal, no transitions).
+fn single_state_template_content() -> &'static str {
+    r#"---
+name: single-state
+version: "1.0"
+initial_state: only
+states:
+  only:
+    terminal: true
+---
+
+## only
+
+This workflow has a single state that is both initial and terminal.
+"#
+}
+
+#[test]
+fn export_multi_state_fixture_contains_expected_states_and_transitions() {
+    let compiled = koto::template::compile::compile(&fixture_multi_state()).unwrap();
+    let mermaid = koto::export::to_mermaid(&compiled);
+
+    // Header
+    assert!(
+        mermaid.starts_with("stateDiagram-v2\n"),
+        "should start with stateDiagram-v2"
+    );
+
+    // Initial state marker
+    assert!(
+        mermaid.contains("[*] --> entry"),
+        "should have initial state marker for entry, got:\n{}",
+        mermaid
+    );
+
+    // Terminal state marker
+    assert!(
+        mermaid.contains("done --> [*]"),
+        "should have terminal state marker for done, got:\n{}",
+        mermaid
+    );
+
+    // Transitions
+    assert!(
+        mermaid.contains("entry --> setup"),
+        "should have entry->setup transition, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("entry --> work"),
+        "should have entry->work transition, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("setup --> work"),
+        "should have setup->work transition, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("work --> done"),
+        "should have work->done transition, got:\n{}",
+        mermaid
+    );
+
+    // Conditional transition labels
+    assert!(
+        mermaid.contains("entry --> setup : route: setup"),
+        "should have labeled transition for route: setup, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("entry --> work : route: work"),
+        "should have labeled transition for route: work, got:\n{}",
+        mermaid
+    );
+
+    // Gate annotation
+    assert!(
+        mermaid.contains("note left of setup : gate: config_exists"),
+        "should have gate annotation for config_exists, got:\n{}",
+        mermaid
+    );
+
+    // LF line endings
+    assert!(!mermaid.contains("\r\n"), "output must use LF, not CRLF");
+    assert!(!mermaid.contains('\r'), "output must not contain CR");
+
+    // Trailing newline
+    assert!(mermaid.ends_with('\n'), "output should end with newline");
+}
+
+#[test]
+fn export_simple_gates_fixture_has_gate_and_when_labels() {
+    let compiled = koto::template::compile::compile(&fixture_simple_gates()).unwrap();
+    let mermaid = koto::export::to_mermaid(&compiled);
+
+    // Gate note
+    assert!(
+        mermaid.contains("note left of start : gate: check_file"),
+        "should have gate annotation for check_file, got:\n{}",
+        mermaid
+    );
+
+    // When conditions on transitions
+    assert!(
+        mermaid.contains("start --> done : status: completed"),
+        "should have labeled transition for status: completed, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("start --> done : status: override"),
+        "should have labeled transition for status: override, got:\n{}",
+        mermaid
+    );
+
+    // Initial and terminal markers
+    assert!(mermaid.contains("[*] --> start"));
+    assert!(mermaid.contains("done --> [*]"));
+}
+
+#[test]
+fn export_determinism_byte_identical_across_calls() {
+    let compiled = koto::template::compile::compile(&fixture_multi_state()).unwrap();
+    let first = koto::export::to_mermaid(&compiled);
+    let second = koto::export::to_mermaid(&compiled);
+
+    assert_eq!(
+        first, second,
+        "two calls to to_mermaid on the same template must produce byte-identical output"
+    );
+
+    // Also verify bytes match (not just string equality).
+    assert_eq!(
+        first.as_bytes(),
+        second.as_bytes(),
+        "byte-level comparison must also match"
+    );
+}
+
+#[test]
+fn export_single_state_template_produces_valid_mermaid() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("single-state.md");
+    std::fs::write(&src, single_state_template_content()).unwrap();
+
+    let compiled = koto::template::compile::compile(&src).unwrap();
+    let mermaid = koto::export::to_mermaid(&compiled);
+
+    // Header
+    assert!(mermaid.starts_with("stateDiagram-v2\n"));
+
+    // Initial and terminal markers both point to the single state.
+    assert!(
+        mermaid.contains("[*] --> only"),
+        "should have initial state marker, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("only --> [*]"),
+        "should have terminal state marker, got:\n{}",
+        mermaid
+    );
+
+    // No inter-state transitions (no lines with --> that don't involve [*]).
+    let transition_lines: Vec<&str> = mermaid
+        .lines()
+        .filter(|l| l.contains("-->") && !l.contains("[*]"))
+        .collect();
+    assert!(
+        transition_lines.is_empty(),
+        "single-state template should have no inter-state transitions, got: {:?}",
+        transition_lines
+    );
+
+    // Trailing newline
+    assert!(mermaid.ends_with('\n'));
+}
+
+#[test]
+fn export_md_and_json_produce_identical_output() {
+    let dir = TempDir::new().unwrap();
+
+    // Write the multi-state fixture to a temp .md file and compile it via CLI
+    // to get a .json output.
+    let fixture = fixture_multi_state();
+
+    let compile_output = koto()
+        .current_dir(dir.path())
+        .args(["template", "compile", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        compile_output.status.success(),
+        "template compile should succeed: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let json_path = String::from_utf8(compile_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Export from .md source
+    let md_output = koto()
+        .current_dir(dir.path())
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        md_output.status.success(),
+        "export from .md should succeed: {}",
+        String::from_utf8_lossy(&md_output.stderr)
+    );
+
+    // Export from .json source
+    let json_output = koto()
+        .current_dir(dir.path())
+        .args(["template", "export", &json_path])
+        .output()
+        .unwrap();
+
+    assert!(
+        json_output.status.success(),
+        "export from .json should succeed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+
+    let md_mermaid = String::from_utf8(md_output.stdout).unwrap();
+    let json_mermaid = String::from_utf8(json_output.stdout).unwrap();
+
+    assert_eq!(
+        md_mermaid, json_mermaid,
+        ".md and .json inputs must produce identical Mermaid output"
+    );
+}
+
+#[test]
+fn export_cli_outputs_mermaid_to_stdout() {
+    let fixture = fixture_multi_state();
+
+    let output = koto()
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "export should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("stateDiagram-v2\n"),
+        "CLI stdout should contain mermaid diagram, got:\n{}",
+        stdout
+    );
+    assert!(stdout.contains("[*] --> entry"));
+    assert!(stdout.contains("done --> [*]"));
+}
+
+#[test]
+fn export_cli_writes_to_output_file() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("diagram.mermaid.md");
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "export with --output should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        output_path.exists(),
+        "output file should be created at {:?}",
+        output_path
+    );
+
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    assert!(
+        content.starts_with("stateDiagram-v2\n"),
+        "output file should contain mermaid diagram"
+    );
+    assert!(content.contains("[*] --> entry"));
+}
+
+#[test]
+fn export_determinism_via_cli() {
+    let fixture = fixture_multi_state();
+
+    let first = koto()
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    let second = koto()
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(first.status.success());
+    assert!(second.status.success());
+
+    assert_eq!(
+        first.stdout, second.stdout,
+        "two CLI export invocations must produce byte-identical stdout"
+    );
+}
