@@ -235,16 +235,16 @@ the upload on the next state-mutating command automatically.
 
 ## Acceptance criteria
 
-- [ ] `koto init <name>` creates a session alongside the workflow state
-- [ ] `koto context add <name> --key X` accepts content via stdin or `--from-file` and stores it
-- [ ] `koto context get <name> --key X` outputs stored content to stdout or to `--to-file`
-- [ ] `koto context exists <name> --key X` returns exit code 0 if key exists, non-zero otherwise
-- [ ] `koto context list <name>` lists all context keys in the session
-- [ ] Multiple agents can `koto context add` to different keys concurrently without corruption
-- [ ] `koto context add` does not advance workflow state
-- [ ] Content-aware gates (`koto-context-exists: X`) evaluate against koto's content store
-- [ ] Shell gates can call `koto context exists` as a fallback
-- [ ] Default backend stores context in `~/.koto/sessions/<name>/` (opaque to agents)
+- [x] `koto init <name>` creates a session alongside the workflow state
+- [x] `koto context add <name> --key X` accepts content via stdin or `--from-file` and stores it
+- [x] `koto context get <name> --key X` outputs stored content to stdout or to `--to-file`
+- [x] `koto context exists <name> --key X` returns exit code 0 if key exists, non-zero otherwise
+- [x] `koto context list <name>` lists all context keys in the session
+- [x] Multiple agents can `koto context add` to different keys concurrently without corruption
+- [x] `koto context add` does not advance workflow state
+- [x] Content-aware gates (`koto-context-exists: X`) evaluate against koto's content store
+- [x] Shell gates can call `koto context exists` as a fallback
+- [x] Default backend stores context in `~/.koto/sessions/<name>/` (opaque to agents)
 - [ ] Cloud backend syncs both state and context to S3-compatible store on state-mutating commands
 - [ ] `koto context add` triggers cloud sync when cloud backend is configured
 - [ ] On a new machine, `koto next` automatically downloads remote session (state + context)
@@ -252,13 +252,13 @@ the upload on the next state-mutating command automatically.
 - [ ] Git backend stores context as files in the git working tree at the configured path
 - [ ] `koto config get/set` reads and writes configuration values
 - [ ] Backend selection follows precedence: project config > user config > default
-- [ ] `koto session list` shows all local sessions with names and timestamps
-- [ ] `koto session cleanup <name>` removes local and cloud artifacts
-- [ ] Workflow completion triggers automatic session cleanup (content + state)
-- [ ] `--no-cleanup` flag preserves session on workflow completion
+- [x] `koto session list` shows all local sessions with names and timestamps
+- [x] `koto session cleanup <name>` removes local and cloud artifacts
+- [x] Workflow completion triggers automatic session cleanup (content + state)
+- [x] `--no-cleanup` flag preserves session on workflow completion
 - [ ] Cloud sync failure logs a warning and doesn't block the workflow
 - [ ] `koto session resolve --keep local|remote` resolves version conflicts
-- [ ] Templates using `{{SESSION_DIR}}` resolve to the session path
+- [x] Templates using `{{SESSION_DIR}}` resolve to the session path
 - [ ] Content-aware gates work with all backends (local, cloud, git)
 
 ## Out of scope

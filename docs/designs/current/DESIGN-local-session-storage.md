@@ -26,7 +26,7 @@ rationale: |
 
 ## Status
 
-Proposed
+Current
 
 ## Context and problem statement
 

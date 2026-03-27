@@ -49,7 +49,7 @@ backend-provided paths. `koto session dir|list|cleanup`, automatic cleanup on wo
 completion, `{{SESSION_DIR}}` runtime variable substitution in gate commands and
 directives. 235 tests.
 
-**Phase B (pending):** Make koto the owner of workflow context content. Agents submit
+**Phase B (done):** Make koto the owner of workflow context content. Agents submit
 and retrieve context through koto's CLI (`koto context add`, `koto context get`,
 `koto context exists`, `koto context list`) instead of reading/writing files directly
 in the session directory. Content submission is decoupled from state advancement, so
@@ -94,24 +94,21 @@ credentials from user config or env vars (not project config — supply chain ri
 
 ## Sequencing rationale
 
-Feature 1 (local storage + content ownership) is the foundation. Phase A shipped
-the session directory model and `SessionBackend` trait. Phase B completes the feature
-by making koto the content gatekeeper. This is the current priority because it
-establishes koto's control over content before other features add more backends.
+Feature 1 (local storage + content ownership) is the foundation and is complete.
+It established the `SessionBackend` and `ContextStore` traits, the content CLI,
+content-aware gates, and the local filesystem backend.
 
-Feature 2 (config) has no technical dependency on Feature 1, but Features 3 and 4
-need it for backend selection. It can be built in parallel with Feature 1 Phase B.
+Feature 2 (config) is the next priority. Features 3 and 4 both need it for backend
+selection. It has no dependency on Feature 1 beyond the traits already shipped.
 
-Feature 3 (git backend) depends on the trait (Feature 1), content CLI (Feature 1
-Phase B), and config (Feature 2). Lower priority since the default is local, but it
-enables users who want session artifacts visible in git.
+Feature 3 (git backend) depends on the trait (Feature 1) and config (Feature 2).
+Lower priority since local is the default, but it enables users who want session
+artifacts visible in git.
 
 Feature 4 (cloud sync) is the most complex feature and depends on everything else.
 Cloud sync covers both state and context. It should ship last. The S3 dependency
 (aws-sdk-s3 + tokio) is behind a feature flag so it doesn't affect users who don't
 need cloud.
-
-**Parallel opportunities:** Feature 1 Phase B and Feature 2 can be built in parallel.
 
 ## Progress
 
