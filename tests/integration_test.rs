@@ -2776,3 +2776,1190 @@ fn polling_action_retries_until_success() {
         "polling should have created ready.txt"
     );
 }
+
+// ---------------------------------------------------------------------------
+// export: mermaid output validation and determinism
+// ---------------------------------------------------------------------------
+
+/// Path to the multi-state fixture template.
+fn fixture_multi_state() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test/functional/fixtures/templates/multi-state.md")
+}
+
+/// Path to the simple-gates fixture template.
+fn fixture_simple_gates() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test/functional/fixtures/templates/simple-gates.md")
+}
+
+/// A single-state template (initial + terminal, no transitions).
+fn single_state_template_content() -> &'static str {
+    r#"---
+name: single-state
+version: "1.0"
+initial_state: only
+states:
+  only:
+    terminal: true
+---
+
+## only
+
+This workflow has a single state that is both initial and terminal.
+"#
+}
+
+#[test]
+fn export_multi_state_fixture_contains_expected_states_and_transitions() {
+    let compiled = koto::template::compile::compile(&fixture_multi_state()).unwrap();
+    let mermaid = koto::export::to_mermaid(&compiled);
+
+    // Header
+    assert!(
+        mermaid.starts_with("stateDiagram-v2\n"),
+        "should start with stateDiagram-v2"
+    );
+
+    // Initial state marker
+    assert!(
+        mermaid.contains("[*] --> entry"),
+        "should have initial state marker for entry, got:\n{}",
+        mermaid
+    );
+
+    // Terminal state marker
+    assert!(
+        mermaid.contains("done --> [*]"),
+        "should have terminal state marker for done, got:\n{}",
+        mermaid
+    );
+
+    // Transitions
+    assert!(
+        mermaid.contains("entry --> setup"),
+        "should have entry->setup transition, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("entry --> work"),
+        "should have entry->work transition, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("setup --> work"),
+        "should have setup->work transition, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("work --> done"),
+        "should have work->done transition, got:\n{}",
+        mermaid
+    );
+
+    // Conditional transition labels
+    assert!(
+        mermaid.contains("entry --> setup : route: setup"),
+        "should have labeled transition for route: setup, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("entry --> work : route: work"),
+        "should have labeled transition for route: work, got:\n{}",
+        mermaid
+    );
+
+    // Gate annotation
+    assert!(
+        mermaid.contains("note left of setup : gate: config_exists"),
+        "should have gate annotation for config_exists, got:\n{}",
+        mermaid
+    );
+
+    // LF line endings
+    assert!(!mermaid.contains("\r\n"), "output must use LF, not CRLF");
+    assert!(!mermaid.contains('\r'), "output must not contain CR");
+
+    // Trailing newline
+    assert!(mermaid.ends_with('\n'), "output should end with newline");
+}
+
+#[test]
+fn export_simple_gates_fixture_has_gate_and_when_labels() {
+    let compiled = koto::template::compile::compile(&fixture_simple_gates()).unwrap();
+    let mermaid = koto::export::to_mermaid(&compiled);
+
+    // Gate note
+    assert!(
+        mermaid.contains("note left of start : gate: check_file"),
+        "should have gate annotation for check_file, got:\n{}",
+        mermaid
+    );
+
+    // When conditions on transitions
+    assert!(
+        mermaid.contains("start --> done : status: completed"),
+        "should have labeled transition for status: completed, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("start --> done : status: override"),
+        "should have labeled transition for status: override, got:\n{}",
+        mermaid
+    );
+
+    // Initial and terminal markers
+    assert!(mermaid.contains("[*] --> start"));
+    assert!(mermaid.contains("done --> [*]"));
+}
+
+#[test]
+fn export_determinism_byte_identical_across_calls() {
+    let compiled = koto::template::compile::compile(&fixture_multi_state()).unwrap();
+    let first = koto::export::to_mermaid(&compiled);
+    let second = koto::export::to_mermaid(&compiled);
+
+    assert_eq!(
+        first, second,
+        "two calls to to_mermaid on the same template must produce byte-identical output"
+    );
+
+    // Also verify bytes match (not just string equality).
+    assert_eq!(
+        first.as_bytes(),
+        second.as_bytes(),
+        "byte-level comparison must also match"
+    );
+}
+
+#[test]
+fn export_single_state_template_produces_valid_mermaid() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("single-state.md");
+    std::fs::write(&src, single_state_template_content()).unwrap();
+
+    let compiled = koto::template::compile::compile(&src).unwrap();
+    let mermaid = koto::export::to_mermaid(&compiled);
+
+    // Header
+    assert!(mermaid.starts_with("stateDiagram-v2\n"));
+
+    // Initial and terminal markers both point to the single state.
+    assert!(
+        mermaid.contains("[*] --> only"),
+        "should have initial state marker, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("only --> [*]"),
+        "should have terminal state marker, got:\n{}",
+        mermaid
+    );
+
+    // No inter-state transitions (no lines with --> that don't involve [*]).
+    let transition_lines: Vec<&str> = mermaid
+        .lines()
+        .filter(|l| l.contains("-->") && !l.contains("[*]"))
+        .collect();
+    assert!(
+        transition_lines.is_empty(),
+        "single-state template should have no inter-state transitions, got: {:?}",
+        transition_lines
+    );
+
+    // Trailing newline
+    assert!(mermaid.ends_with('\n'));
+}
+
+#[test]
+fn export_md_and_json_produce_identical_output() {
+    let dir = TempDir::new().unwrap();
+
+    // Write the multi-state fixture to a temp .md file and compile it via CLI
+    // to get a .json output.
+    let fixture = fixture_multi_state();
+
+    let compile_output = koto()
+        .current_dir(dir.path())
+        .args(["template", "compile", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        compile_output.status.success(),
+        "template compile should succeed: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let json_path = String::from_utf8(compile_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Export from .md source
+    let md_output = koto()
+        .current_dir(dir.path())
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        md_output.status.success(),
+        "export from .md should succeed: {}",
+        String::from_utf8_lossy(&md_output.stderr)
+    );
+
+    // Export from .json source
+    let json_output = koto()
+        .current_dir(dir.path())
+        .args(["template", "export", &json_path])
+        .output()
+        .unwrap();
+
+    assert!(
+        json_output.status.success(),
+        "export from .json should succeed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+
+    let md_mermaid = String::from_utf8(md_output.stdout).unwrap();
+    let json_mermaid = String::from_utf8(json_output.stdout).unwrap();
+
+    assert_eq!(
+        md_mermaid, json_mermaid,
+        ".md and .json inputs must produce identical Mermaid output"
+    );
+}
+
+#[test]
+fn export_cli_outputs_mermaid_to_stdout() {
+    let fixture = fixture_multi_state();
+
+    let output = koto()
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "export should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("stateDiagram-v2\n"),
+        "CLI stdout should contain mermaid diagram, got:\n{}",
+        stdout
+    );
+    assert!(stdout.contains("[*] --> entry"));
+    assert!(stdout.contains("done --> [*]"));
+}
+
+#[test]
+fn export_cli_writes_to_output_file() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("diagram.mermaid.md");
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "export with --output should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        output_path.exists(),
+        "output file should be created at {:?}",
+        output_path
+    );
+
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    assert!(
+        content.starts_with("stateDiagram-v2\n"),
+        "output file should contain mermaid diagram"
+    );
+    assert!(content.contains("[*] --> entry"));
+}
+
+#[test]
+fn export_determinism_via_cli() {
+    let fixture = fixture_multi_state();
+
+    let first = koto()
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    let second = koto()
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(first.status.success());
+    assert!(second.status.success());
+
+    assert_eq!(
+        first.stdout, second.stdout,
+        "two CLI export invocations must produce byte-identical stdout"
+    );
+}
+
+// export: --check freshness flag
+
+#[test]
+fn export_check_fresh_file_exits_0() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("diagram.mermaid.md");
+
+    // First, generate the file.
+    let gen = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        gen.status.success(),
+        "generation failed: {}",
+        String::from_utf8_lossy(&gen.stderr)
+    );
+
+    // Now check: should exit 0 because the file is fresh.
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "--check on fresh file should exit 0: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn export_check_stale_file_exits_1() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("diagram.mermaid.md");
+
+    // Write stale content.
+    std::fs::write(&output_path, b"stale content").unwrap();
+
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !check.status.success(),
+        "--check on stale file should exit 1"
+    );
+
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("is out of date"),
+        "stderr should mention 'out of date': {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("run: koto template export"),
+        "stderr should contain fix command: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_check_missing_file_exits_1() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("nonexistent.mermaid.md");
+
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !check.status.success(),
+        "--check on missing file should exit 1"
+    );
+
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("does not exist"),
+        "stderr should mention 'does not exist': {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("run: koto template export"),
+        "stderr should contain fix command: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_check_fix_command_resolves_drift() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("diagram.mermaid.md");
+
+    // Write stale content.
+    std::fs::write(&output_path, b"stale").unwrap();
+
+    // Run --check to get the fix command (it will fail).
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "mermaid",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(!check.status.success());
+
+    // Apply the fix: regenerate the file.
+    let fix = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "mermaid",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        fix.status.success(),
+        "fix command failed: {}",
+        String::from_utf8_lossy(&fix.stderr)
+    );
+
+    // Now --check should pass.
+    let recheck = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "mermaid",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        recheck.status.success(),
+        "--check after fix should exit 0: {}",
+        String::from_utf8_lossy(&recheck.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// export: html output validation and determinism
+// ---------------------------------------------------------------------------
+
+/// Export a fixture template to HTML via CLI and return the file contents.
+/// HTML format requires --output, so this writes to a temp file.
+fn export_html_to_file(fixture: &Path) -> (String, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let output_path = dir.path().join("preview.html");
+
+    let output = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "export --format html --output should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    (content, dir)
+}
+
+#[test]
+fn export_html_contains_template_data() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    assert!(
+        html.contains("multi-state"),
+        "HTML should contain template name, got length={}",
+        html.len()
+    );
+    assert!(html.contains("entry"), "HTML should contain state names");
+    assert!(
+        html.contains("config_exists"),
+        "HTML should contain gate names"
+    );
+}
+
+#[test]
+fn export_html_contains_cdn_script_tags_with_sri() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    // Script tags may span multiple lines, so split on "</script>" to get
+    // each complete tag block and check the ones that reference unpkg CDN.
+    let script_blocks: Vec<&str> = html.split("</script>").collect();
+    let cdn_blocks: Vec<&str> = script_blocks
+        .iter()
+        .filter(|b| b.contains("<script") && b.contains("unpkg.com"))
+        .copied()
+        .collect();
+
+    assert!(
+        !cdn_blocks.is_empty(),
+        "HTML should contain CDN script tags"
+    );
+
+    for block in &cdn_blocks {
+        assert!(
+            block.contains("integrity=\"sha384-"),
+            "CDN script tag must have SRI integrity hash: {}",
+            block.trim()
+        );
+        assert!(
+            block.contains("crossorigin=\"anonymous\""),
+            "CDN script tag must have crossorigin attribute: {}",
+            block.trim()
+        );
+    }
+}
+
+#[test]
+fn export_html_no_server_side_directives() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    assert!(
+        !html.contains("<?"),
+        "HTML should not contain PHP-style server directives"
+    );
+    assert!(
+        !html.contains("<%"),
+        "HTML should not contain ASP-style server directives"
+    );
+}
+
+#[test]
+fn export_html_determinism_via_cli() {
+    let fixture = fixture_multi_state();
+    let dir = TempDir::new().unwrap();
+    let first_path = dir.path().join("first.html");
+    let second_path = dir.path().join("second.html");
+
+    let first = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            first_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    let second = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            second_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(first.status.success());
+    assert!(second.status.success());
+
+    let first_bytes = std::fs::read(&first_path).unwrap();
+    let second_bytes = std::fs::read(&second_path).unwrap();
+
+    assert_eq!(
+        first_bytes, second_bytes,
+        "two CLI HTML export invocations must produce byte-identical output"
+    );
+}
+
+#[test]
+fn export_html_writes_to_output_file() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("preview.html");
+
+    let output = koto()
+        .current_dir(dir.path())
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "export --format html --output should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        output_path.exists(),
+        "output file should be created at {:?}",
+        output_path
+    );
+
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    assert!(
+        content.contains("<!DOCTYPE html>"),
+        "output file should be valid HTML"
+    );
+    assert!(content.contains("multi-state"));
+}
+
+#[test]
+fn export_html_valid_structure() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    assert!(html.contains("<!DOCTYPE html>"), "must have DOCTYPE");
+    assert!(html.contains("<html"), "must have html tag");
+    assert!(html.contains("</html>"), "must close html tag");
+    assert!(html.contains("<head>"), "must have head tag");
+    assert!(html.contains("</head>"), "must close head tag");
+    assert!(html.contains("<body>"), "must have body tag");
+    assert!(html.contains("</body>"), "must close body tag");
+}
+
+#[test]
+fn export_html_size_under_30kb() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    let size = html.len();
+    assert!(
+        size < 30 * 1024,
+        "HTML output should be under 30 KB, got {} bytes ({:.1} KB)",
+        size,
+        size as f64 / 1024.0
+    );
+}
+
+#[test]
+fn export_html_check_fresh_exits_0() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("preview.html");
+
+    // Generate the file.
+    let gen = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        gen.status.success(),
+        "generation failed: {}",
+        String::from_utf8_lossy(&gen.stderr)
+    );
+
+    // Check: should exit 0 because the file is fresh.
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "--check on fresh HTML file should exit 0: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn export_html_check_stale_exits_1() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("preview.html");
+
+    // Write stale content.
+    std::fs::write(&output_path, b"<html>stale</html>").unwrap();
+
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !check.status.success(),
+        "--check on stale HTML file should exit 1"
+    );
+
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("is out of date"),
+        "stderr should mention 'out of date': {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("--format html"),
+        "stderr fix command should specify html format: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_html_check_missing_exits_1() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("nonexistent.html");
+
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !check.status.success(),
+        "--check on missing HTML file should exit 1"
+    );
+
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("does not exist"),
+        "stderr should mention 'does not exist': {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("--format html"),
+        "stderr fix command should specify html format: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_html_check_fix_command_resolves_drift() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("preview.html");
+
+    // Write stale content.
+    std::fs::write(&output_path, b"stale").unwrap();
+
+    // Run --check (it will fail).
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(!check.status.success());
+
+    // Apply the fix: regenerate the file.
+    let fix = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        fix.status.success(),
+        "fix command failed: {}",
+        String::from_utf8_lossy(&fix.stderr)
+    );
+
+    // Now --check should pass.
+    let recheck = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        recheck.status.success(),
+        "--check after fix should exit 0: {}",
+        String::from_utf8_lossy(&recheck.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// export: flag compatibility and error handling (Issue #7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn export_flag_html_without_output_errors() {
+    let fixture = fixture_multi_state();
+
+    let output = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "should exit 2 for flag validation error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--format html requires --output"),
+        "should mention --output requirement, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_flag_open_without_html_errors() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("out.mermaid.md");
+
+    let output = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "mermaid",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--open",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "should exit 2 for flag validation error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--open is only valid with --format html"),
+        "should mention --open/html constraint, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_flag_open_with_check_errors() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("out.html");
+
+    let output = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--open",
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "should exit 2 for flag validation error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--open and --check are mutually exclusive"),
+        "should mention mutual exclusivity, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_flag_check_without_output_errors() {
+    let fixture = fixture_multi_state();
+
+    let output = koto()
+        .args(["template", "export", fixture.to_str().unwrap(), "--check"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "should exit 2 for flag validation error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--check requires --output"),
+        "should mention --output requirement, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_nonexistent_input_file_errors() {
+    let output = koto()
+        .args(["template", "export", "/tmp/nonexistent-template-abc123.md"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "should fail for non-existent input"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error:"),
+        "should print error to stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_malformed_json_input_errors() {
+    let dir = TempDir::new().unwrap();
+    let bad_json = dir.path().join("broken.json");
+    std::fs::write(&bad_json, "{ this is not valid json }").unwrap();
+
+    let output = koto()
+        .args(["template", "export", bad_json.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "should fail for malformed JSON input"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error:"),
+        "should print error to stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_invalid_template_errors() {
+    let dir = TempDir::new().unwrap();
+    let bad_md = dir.path().join("invalid.md");
+    std::fs::write(
+        &bad_md,
+        "---\n!!!invalid yaml: [[[broken\n---\n\n## state\n\nContent.\n",
+    )
+    .unwrap();
+
+    let output = koto()
+        .args(["template", "export", bad_md.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "should fail for invalid template");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error:"),
+        "should print error to stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_latency_under_500ms() {
+    let fixture = fixture_multi_state();
+
+    let start = std::time::Instant::now();
+    let output = koto()
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(
+        output.status.success(),
+        "export should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "export should complete in under 500ms, took {:?}",
+        elapsed
+    );
+}
+
+/// Generate a 30-state template and verify export completes in under 500ms.
+#[test]
+fn export_30_state_template_latency_under_500ms() {
+    let dir = TempDir::new().unwrap();
+
+    // Build a 30-state chain: s0 -> s1 -> ... -> s29 (terminal)
+    let mut yaml =
+        String::from("---\nname: big-workflow\nversion: \"1.0\"\ninitial_state: s0\nstates:\n");
+    for i in 0..30 {
+        yaml.push_str(&format!("  s{}:\n", i));
+        if i == 29 {
+            yaml.push_str("    terminal: true\n");
+        } else {
+            yaml.push_str(&format!("    transitions:\n      - target: s{}\n", i + 1));
+        }
+    }
+    yaml.push_str("---\n");
+    for i in 0..30 {
+        yaml.push_str(&format!("\n## s{}\n\nState {} content.\n", i, i));
+    }
+
+    let template_path = dir.path().join("big-template.md");
+    std::fs::write(&template_path, &yaml).unwrap();
+
+    let start = std::time::Instant::now();
+    let output = koto()
+        .args(["template", "export", template_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(
+        output.status.success(),
+        "30-state export should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "30-state export should complete in under 500ms, took {:?}",
+        elapsed
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("stateDiagram-v2\n"),
+        "output should be valid mermaid"
+    );
+    assert!(
+        stdout.contains("[*] --> s0"),
+        "should have initial state marker"
+    );
+    assert!(
+        stdout.contains("s29 --> [*]"),
+        "should have terminal state marker"
+    );
+}

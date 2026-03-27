@@ -1,0 +1,131 @@
+name: check-template-freshness
+
+on:
+  workflow_call:
+    inputs:
+      template-paths:
+        description: >
+          Glob pattern matching template .md files to check.
+          Example: 'templates/**/*.md'
+        required: true
+        type: string
+      koto-version:
+        description: >
+          Koto release version to download. Use 'latest' for the most
+          recent release, or pin a specific tag like 'v0.5.0'.
+        required: false
+        type: string
+        default: 'latest'
+      check-html:
+        description: >
+          Also check HTML freshness. When true, the workflow verifies
+          both .mermaid.md and .html artifacts for each template.
+        required: false
+        type: boolean
+        default: false
+      html-output-dir:
+        description: >
+          Directory for HTML output files (relative to repo root).
+          Only used when check-html is true. HTML files are named
+          <template-stem>.html within this directory.
+        required: false
+        type: string
+        default: 'docs'
+
+jobs:
+  check-freshness:
+    name: Template Freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download koto binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KOTO_VERSION: ${{ inputs.koto-version }}
+        run: |
+          if [ "$KOTO_VERSION" = "latest" ]; then
+            TAG=$(gh release view --repo tsukumogami/koto --json tagName -q '.tagName')
+          else
+            TAG="$KOTO_VERSION"
+          fi
+
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64)  ASSET="koto-linux-amd64" ;;
+            aarch64) ASSET="koto-linux-arm64" ;;
+            *)       echo "::error::Unsupported architecture: $ARCH"; exit 1 ;;
+          esac
+
+          gh release download "$TAG" \
+            --repo tsukumogami/koto \
+            --pattern "$ASSET" \
+            --output /usr/local/bin/koto \
+            --clobber
+
+          chmod +x /usr/local/bin/koto
+          echo "Downloaded koto $TAG ($ASSET)"
+          koto version
+
+      - name: Check Mermaid freshness
+        run: |
+          failed=0
+          found=0
+          while IFS= read -r template; do
+            [ -z "$template" ] && continue
+            found=1
+            stem="${template%.md}"
+            output="${stem}.mermaid.md"
+
+            echo "--- Checking: $template -> $output"
+            if koto template export "$template" \
+                --format mermaid \
+                --output "$output" \
+                --check; then
+              echo "PASS: $output is fresh"
+            else
+              echo "::error file=${output}::Mermaid diagram is stale or missing. Run: koto template export \"$template\" --format mermaid --output \"$output\""
+              failed=1
+            fi
+          done < <(compgen -G '${{ inputs.template-paths }}' || true)
+
+          if [ "$found" -eq 0 ]; then
+            echo "::warning::No templates matched the glob pattern: ${{ inputs.template-paths }}"
+          fi
+
+          if [ "$failed" -eq 1 ]; then
+            echo ""
+            echo "::error::One or more Mermaid diagrams are stale. See above for fix commands."
+            exit 1
+          fi
+          echo "All Mermaid diagrams are fresh."
+
+      - name: Check HTML freshness
+        if: inputs.check-html
+        run: |
+          failed=0
+          html_dir="${{ inputs.html-output-dir }}"
+
+          while IFS= read -r template; do
+            [ -z "$template" ] && continue
+            stem=$(basename "${template%.md}")
+            output="${html_dir}/${stem}.html"
+
+            echo "--- Checking: $template -> $output"
+            if koto template export "$template" \
+                --format html \
+                --output "$output" \
+                --check; then
+              echo "PASS: $output is fresh"
+            else
+              echo "::error file=${output}::HTML diagram is stale or missing. Run: koto template export \"$template\" --format html --output \"$output\""
+              failed=1
+            fi
+          done < <(compgen -G '${{ inputs.template-paths }}' || true)
+
+          if [ "$failed" -eq 1 ]; then
+            echo ""
+            echo "::error::One or more HTML diagrams are stale. See above for fix commands."
+            exit 1
+          fi
+          echo "All HTML diagrams are fresh."
