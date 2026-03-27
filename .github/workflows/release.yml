@@ -111,6 +111,11 @@ jobs:
     needs: [release]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Verify all artifacts present
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -135,3 +140,26 @@ jobs:
             echo "Found: $artifact"
           done
           echo "All artifacts verified"
+
+      - name: Pin koto-version default in reusable workflow
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          WORKFLOW=".github/workflows/check-template-freshness.yml"
+
+          if [ ! -f "$WORKFLOW" ]; then
+            echo "Reusable workflow not found, skipping version pin"
+            exit 0
+          fi
+
+          sed -i "/koto-version/,/default:/ s/default: '.*'/default: '${TAG}'/" "$WORKFLOW"
+
+          if git diff --quiet "$WORKFLOW"; then
+            echo "No change needed (already pinned or pattern not found)"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$WORKFLOW"
+          git commit -m "chore(release): pin koto-version default to ${TAG}"
+          git push origin main

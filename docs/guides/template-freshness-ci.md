@@ -22,8 +22,9 @@ jobs:
       template-paths: 'templates/**/*.md'
 ```
 
-That's it. The workflow downloads a koto release binary, expands the glob,
-and runs `koto template export --check` for each template. If any committed
+That's it. The workflow installs koto via the official install script
+(with checksum verification), expands the glob, and runs
+`koto template export --check` for each template. If any committed
 `.mermaid.md` file is stale or missing, the check fails with an error
 annotation showing the exact command to fix it.
 
@@ -52,13 +53,13 @@ and push.
 | Input | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `template-paths` | string | yes | -- | Glob pattern matching template `.md` files |
-| `koto-version` | string | no | `latest` | koto release tag (e.g., `v0.5.0`) or `latest` |
+| `koto-version` | string | no | `latest` | koto version to install (e.g., `v0.5.0`) or `latest` |
 | `check-html` | boolean | no | `false` | Also verify HTML diagram freshness |
 | `html-output-dir` | string | no | `docs` | Directory for HTML output files (relative to repo root) |
 
 ### Pinning the koto version
 
-By default, the workflow downloads the latest koto release. To pin a
+By default, the workflow installs the latest koto release. To pin a
 specific version for reproducibility:
 
 ```yaml
@@ -66,6 +67,9 @@ with:
   template-paths: 'templates/**/*.md'
   koto-version: 'v0.5.0'
 ```
+
+The version is passed to the install script's `--version` flag. Use
+`latest` (the default) to always get the most recent release.
 
 ## HTML freshness checks
 
@@ -112,9 +116,9 @@ add this to your repo's `.gitattributes`:
 any files. Check the path relative to the repo root. Common mistake:
 using `./templates/` instead of `templates/`.
 
-**"koto: command not found"** -- The binary download failed. Check that the
-`koto-version` input matches an existing release tag. Use `latest` to get
-the most recent release.
+**"koto: command not found"** -- The install script failed. Check the
+workflow logs for the install step. The script requires `curl` and network
+access to GitHub releases.
 
 **Stale after a clean checkout** -- If CI fails on a fresh branch, the
 diagram was never generated or was committed from a different koto version.
