@@ -1,5 +1,6 @@
 pub mod next;
 pub mod next_types;
+pub mod vars;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -573,6 +574,29 @@ fn handle_next(
         }
     };
 
+    // Check for reserved variable name collisions in the template.
+    for reserved in crate::cli::vars::RESERVED_VARIABLE_NAMES {
+        if compiled.variables.contains_key(*reserved) {
+            let err = NextError {
+                code: NextErrorCode::PreconditionFailed,
+                message: format!(
+                    "template declares reserved variable '{}'; this name is injected by the runtime and cannot be redefined",
+                    reserved
+                ),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code());
+        }
+    }
+
+    // Build the runtime variable map for {{SESSION_DIR}} substitution.
+    let mut runtime_vars = std::collections::HashMap::new();
+    runtime_vars.insert(
+        "SESSION_DIR".to_string(),
+        backend.session_dir(&name).to_string_lossy().to_string(),
+    );
+
     // 4. Handle --to (directed transition) -- single-shot, no advancement loop
     if let Some(ref target) = to {
         let current_state = &machine_state.current_state;
@@ -640,6 +664,7 @@ fn handle_next(
 
         match dispatch_next(target, target_template_state, true, &gate_results) {
             Ok(resp) => {
+                let resp = substitute_directive_in_response(resp, &runtime_vars);
                 println!("{}", serde_json::to_string(&resp)?);
                 std::process::exit(0);
             }
@@ -815,10 +840,21 @@ fn handle_next(
             .map_err(|e| e.to_string())
     };
 
-    let gate_closure = |gates: &std::collections::BTreeMap<
-        String,
-        crate::template::types::Gate,
-    >| { evaluate_gates(gates, &current_dir) };
+    let vars_for_gates = runtime_vars.clone();
+    let gate_closure =
+        |gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
+            // Substitute runtime variables in gate command strings before evaluation.
+            let substituted: std::collections::BTreeMap<String, crate::template::types::Gate> =
+                gates
+                    .iter()
+                    .map(|(name, gate)| {
+                        let mut g = gate.clone();
+                        g.command = crate::cli::vars::substitute_vars(&g.command, &vars_for_gates);
+                        (name.clone(), g)
+                    })
+                    .collect();
+            evaluate_gates(&substituted, &current_dir)
+        };
 
     let integration_closure = |_name: &str| -> Result<serde_json::Value, IntegrationError> {
         Err(IntegrationError::Unavailable)
@@ -855,6 +891,10 @@ fn handle_next(
 
             let expects = crate::cli::next_types::derive_expects(final_template_state);
 
+            // Substitute runtime variables in the directive before serialization.
+            let directive =
+                crate::cli::vars::substitute_vars(&final_template_state.directive, &runtime_vars);
+
             let resp = match advance_result.stop_reason {
                 StopReason::Terminal => NextResponse::Terminal {
                     state: final_state.clone(),
@@ -880,7 +920,7 @@ fn handle_next(
                         .collect();
                     NextResponse::GateBlocked {
                         state: final_state.clone(),
-                        directive: final_template_state.directive.clone(),
+                        directive: directive.clone(),
                         advanced,
                         blocking_conditions: blocking,
                     }
@@ -889,7 +929,7 @@ fn handle_next(
                     if let Some(ref es) = expects {
                         NextResponse::EvidenceRequired {
                             state: final_state.clone(),
-                            directive: final_template_state.directive.clone(),
+                            directive: directive.clone(),
                             advanced,
                             expects: es.clone(),
                         }
@@ -897,7 +937,7 @@ fn handle_next(
                         // No accepts block: auto-advance candidate with empty expects.
                         NextResponse::EvidenceRequired {
                             state: final_state.clone(),
-                            directive: final_template_state.directive.clone(),
+                            directive: directive.clone(),
                             advanced,
                             expects: ExpectsSchema {
                                 event_type: "evidence_submitted".to_string(),
@@ -909,7 +949,7 @@ fn handle_next(
                 }
                 StopReason::Integration { name, output } => NextResponse::Integration {
                     state: final_state.clone(),
-                    directive: final_template_state.directive.clone(),
+                    directive: directive.clone(),
                     advanced,
                     expects,
                     integration: IntegrationOutput { name, output },
@@ -917,7 +957,7 @@ fn handle_next(
                 StopReason::IntegrationUnavailable { name } => {
                     NextResponse::IntegrationUnavailable {
                         state: final_state.clone(),
-                        directive: final_template_state.directive.clone(),
+                        directive: directive.clone(),
                         advanced,
                         expects,
                         integration: IntegrationUnavailableMarker {
@@ -959,14 +999,14 @@ fn handle_next(
                     } else if let Some(ref es) = expects {
                         NextResponse::EvidenceRequired {
                             state: final_state.clone(),
-                            directive: final_template_state.directive.clone(),
+                            directive: directive.clone(),
                             advanced,
                             expects: es.clone(),
                         }
                     } else {
                         NextResponse::EvidenceRequired {
                             state: final_state.clone(),
-                            directive: final_template_state.directive.clone(),
+                            directive: directive.clone(),
                             advanced,
                             expects: ExpectsSchema {
                                 event_type: "evidence_submitted".to_string(),
@@ -1008,6 +1048,70 @@ fn handle_next(
         }),
         3,
     );
+}
+
+/// Substitute runtime variables in the directive field of a NextResponse.
+///
+/// Used by the `--to` code path, which gets its response from `dispatch_next`
+/// and needs variable substitution applied before serialization.
+#[cfg(unix)]
+fn substitute_directive_in_response(
+    resp: next_types::NextResponse,
+    vars: &std::collections::HashMap<String, String>,
+) -> next_types::NextResponse {
+    use crate::cli::next_types::NextResponse;
+    match resp {
+        NextResponse::EvidenceRequired {
+            state,
+            directive,
+            advanced,
+            expects,
+        } => NextResponse::EvidenceRequired {
+            state,
+            directive: crate::cli::vars::substitute_vars(&directive, vars),
+            advanced,
+            expects,
+        },
+        NextResponse::GateBlocked {
+            state,
+            directive,
+            advanced,
+            blocking_conditions,
+        } => NextResponse::GateBlocked {
+            state,
+            directive: crate::cli::vars::substitute_vars(&directive, vars),
+            advanced,
+            blocking_conditions,
+        },
+        NextResponse::Integration {
+            state,
+            directive,
+            advanced,
+            expects,
+            integration,
+        } => NextResponse::Integration {
+            state,
+            directive: crate::cli::vars::substitute_vars(&directive, vars),
+            advanced,
+            expects,
+            integration,
+        },
+        NextResponse::IntegrationUnavailable {
+            state,
+            directive,
+            advanced,
+            expects,
+            integration,
+        } => NextResponse::IntegrationUnavailable {
+            state,
+            directive: crate::cli::vars::substitute_vars(&directive, vars),
+            advanced,
+            expects,
+            integration,
+        },
+        // Terminal has no directive field.
+        other => other,
+    }
 }
 
 /// Handle the `koto cancel` command.

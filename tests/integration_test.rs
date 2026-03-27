@@ -1774,3 +1774,210 @@ fn gate_timeout_returns_gate_blocked() {
         "gate should have timed out, not failed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// scenario-12/14/15: {{SESSION_DIR}} substituted in gate commands and directives
+// ---------------------------------------------------------------------------
+
+/// Template with {{SESSION_DIR}} in both a gate command and a directive.
+fn template_with_session_dir_vars() -> String {
+    r#"---
+name: session-dir-workflow
+version: "1.0"
+initial_state: start
+states:
+  start:
+    gates:
+      check_session:
+        type: command
+        command: "test -d {{SESSION_DIR}}"
+        timeout: 5
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Write output to {{SESSION_DIR}}/result.txt then proceed.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn session_dir_substituted_in_gate_and_directive() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "varsub-wf", &template_with_session_dir_vars());
+
+    // The session directory should exist after init (backend.create makes it).
+    let session_dir = sessions_base(dir.path()).join("varsub-wf");
+    assert!(
+        session_dir.exists(),
+        "session directory should exist after init"
+    );
+
+    // Run koto next. The gate command `test -d {{SESSION_DIR}}` should pass
+    // because the session directory exists. Then auto-advance to done.
+    let output = koto_cmd(dir.path())
+        .args(["next", "varsub-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed when {{{{SESSION_DIR}}}} resolves: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    // Gate passed, auto-advanced to done (terminal).
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "should auto-advance to done after gate passes"
+    );
+    assert_eq!(json["action"].as_str(), Some("done"));
+}
+
+#[test]
+fn session_dir_substituted_in_directive_text() {
+    let dir = TempDir::new().unwrap();
+
+    // Template where the start state has an accepts block with a conditional
+    // transition, so the engine stops for evidence. The directive contains
+    // {{SESSION_DIR}} which should be substituted.
+    let template = r#"---
+name: directive-var-workflow
+version: "1.0"
+initial_state: start
+states:
+  start:
+    accepts:
+      data:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: done
+        when:
+          data: ok
+  done:
+    terminal: true
+---
+
+## start
+
+Save your work to {{SESSION_DIR}}/output.txt before submitting.
+
+## done
+
+All done.
+"#;
+
+    init_workflow(dir.path(), "dirvar-wf", template);
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "dirvar-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let directive = json["directive"]
+        .as_str()
+        .unwrap_or_else(|| panic!("directive missing from response: {}", json));
+
+    // The directive should NOT contain the raw {{SESSION_DIR}} token.
+    assert!(
+        !directive.contains("{{SESSION_DIR}}"),
+        "directive should have {{{{SESSION_DIR}}}} substituted, got: {}",
+        directive
+    );
+
+    // It should contain the actual session directory path.
+    let session_dir = sessions_base(dir.path()).join("dirvar-wf");
+    assert!(
+        directive.contains(&session_dir.to_string_lossy().to_string()),
+        "directive should contain the actual session dir path, got: {}",
+        directive
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-13: Reserved variable name collision rejected
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reserved_variable_name_collision_rejected() {
+    let dir = TempDir::new().unwrap();
+
+    // Template that declares SESSION_DIR in its variables block.
+    let template = r#"---
+name: collision-workflow
+version: "1.0"
+initial_state: start
+variables:
+  SESSION_DIR:
+    description: "This collides with a reserved name"
+    required: false
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Do something.
+
+## done
+
+All done.
+"#;
+
+    init_workflow(dir.path(), "collide-wf", template);
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "collide-wf"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "reserved name collision should fail with exit 2, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("precondition_failed"),
+        "error code should be precondition_failed"
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("reserved variable"),
+        "error message should mention reserved variable, got: {}",
+        json["error"]["message"]
+    );
+}
