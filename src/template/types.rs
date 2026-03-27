@@ -73,6 +73,12 @@ pub struct Gate {
     /// Timeout in seconds (0 = use default of 30s).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub timeout: u32,
+    /// Context key for context-exists and context-matches gates.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key: String,
+    /// Regex pattern for context-matches gates.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pattern: String,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -83,8 +89,12 @@ fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
-/// The only supported gate type.
+/// Gate type: shell command.
 pub const GATE_TYPE_COMMAND: &str = "command";
+/// Gate type: check whether a context key exists.
+pub const GATE_TYPE_CONTEXT_EXISTS: &str = "context-exists";
+/// Gate type: check whether context content matches a regex pattern.
+pub const GATE_TYPE_CONTEXT_MATCHES: &str = "context-matches";
 
 /// Valid field types for FieldSchema.
 const VALID_FIELD_TYPES: &[&str] = &["enum", "string", "number", "boolean"];
@@ -129,7 +139,7 @@ impl CompiledTemplate {
                     ));
                 }
             }
-            // Validate gates: only command gates are allowed.
+            // Validate gates.
             for (gate_name, gate) in &state.gates {
                 match gate.gate_type.as_str() {
                     GATE_TYPE_COMMAND => {
@@ -137,6 +147,35 @@ impl CompiledTemplate {
                             return Err(format!(
                                 "state {:?} gate {:?}: command must not be empty",
                                 state_name, gate_name
+                            ));
+                        }
+                    }
+                    GATE_TYPE_CONTEXT_EXISTS => {
+                        if gate.key.is_empty() {
+                            return Err(format!(
+                                "state {:?} gate {:?}: context-exists gate must have a non-empty key",
+                                state_name, gate_name
+                            ));
+                        }
+                    }
+                    GATE_TYPE_CONTEXT_MATCHES => {
+                        if gate.key.is_empty() {
+                            return Err(format!(
+                                "state {:?} gate {:?}: context-matches gate must have a non-empty key",
+                                state_name, gate_name
+                            ));
+                        }
+                        if gate.pattern.is_empty() {
+                            return Err(format!(
+                                "state {:?} gate {:?}: context-matches gate must have a non-empty pattern",
+                                state_name, gate_name
+                            ));
+                        }
+                        // Validate that the pattern is a valid regex.
+                        if let Err(e) = regex::Regex::new(&gate.pattern) {
+                            return Err(format!(
+                                "state {:?} gate {:?}: invalid regex pattern {:?}: {}",
+                                state_name, gate_name, gate.pattern, e
                             ));
                         }
                     }
@@ -345,6 +384,8 @@ mod tests {
                 gate_type: "field_not_empty".to_string(),
                 command: String::new(),
                 timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
             },
         );
         let err = t.validate().unwrap_err();
@@ -362,6 +403,8 @@ mod tests {
                 gate_type: "field_equals".to_string(),
                 command: String::new(),
                 timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
             },
         );
         let err = t.validate().unwrap_err();
@@ -379,6 +422,8 @@ mod tests {
                 gate_type: GATE_TYPE_COMMAND.to_string(),
                 command: "./check-ci.sh".to_string(),
                 timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
             },
         );
         t.validate().unwrap();
@@ -786,5 +831,123 @@ mod tests {
         state.accepts = Some(accepts);
         // No when condition -- unconditional transition is fine.
         t.validate().unwrap();
+    }
+
+    #[test]
+    fn context_exists_gate_validates() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            "research".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_EXISTS.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "research/r1/lead.md".to_string(),
+                pattern: String::new(),
+            },
+        );
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn context_exists_gate_rejects_empty_key() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            "research".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_EXISTS.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+            },
+        );
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("context-exists gate must have a non-empty key"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn context_matches_gate_validates() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            "review".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_MATCHES.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "review.md".to_string(),
+                pattern: "## Approved".to_string(),
+            },
+        );
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn context_matches_gate_rejects_empty_key() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            "review".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_MATCHES.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: String::new(),
+                pattern: "## Approved".to_string(),
+            },
+        );
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("context-matches gate must have a non-empty key"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn context_matches_gate_rejects_empty_pattern() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            "review".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_MATCHES.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "review.md".to_string(),
+                pattern: String::new(),
+            },
+        );
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("context-matches gate must have a non-empty pattern"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn context_matches_gate_rejects_invalid_regex() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            "review".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_MATCHES.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "review.md".to_string(),
+                pattern: "[invalid".to_string(),
+            },
+        );
+        let err = t.validate().unwrap_err();
+        assert!(err.contains("invalid regex pattern"), "got: {}", err);
     }
 }

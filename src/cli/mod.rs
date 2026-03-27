@@ -259,7 +259,8 @@ pub fn run(app: App) -> Result<()> {
             no_cleanup,
         } => {
             let backend = build_backend()?;
-            handle_next(&backend, name, with_data, to, no_cleanup)
+            let context_store: &dyn ContextStore = &backend;
+            handle_next(&backend, context_store, name, with_data, to, no_cleanup)
         }
         Command::Cancel { name } => {
             let backend = build_backend()?;
@@ -571,6 +572,7 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
 #[cfg(unix)]
 fn handle_next(
     backend: &dyn SessionBackend,
+    context_store: &dyn ContextStore,
     name: String,
     with_data: Option<String>,
     to: Option<String>,
@@ -989,6 +991,7 @@ fn handle_next(
     };
 
     let vars_for_gates = runtime_vars.clone();
+    let session_name = &name;
     let gate_closure =
         |gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
             // Substitute runtime variables in gate command strings before evaluation.
@@ -1001,7 +1004,12 @@ fn handle_next(
                         (name.clone(), g)
                     })
                     .collect();
-            evaluate_gates(&substituted, &current_dir)
+            evaluate_gates(
+                &substituted,
+                &current_dir,
+                Some(context_store),
+                Some(session_name),
+            )
         };
 
     let integration_closure = |_name: &str| -> Result<serde_json::Value, IntegrationError> {
@@ -1191,6 +1199,7 @@ fn handle_next(
 #[cfg(not(unix))]
 fn handle_next(
     _backend: &dyn SessionBackend,
+    _context_store: &dyn ContextStore,
     name: String,
     _with_data: Option<String>,
     _to: Option<String>,

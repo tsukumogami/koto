@@ -5,7 +5,8 @@ use anyhow::{anyhow, Context};
 use serde::Deserialize;
 
 use super::types::{
-    CompiledTemplate, FieldSchema, Gate, TemplateState, Transition, VariableDecl, GATE_TYPE_COMMAND,
+    CompiledTemplate, FieldSchema, Gate, TemplateState, Transition, VariableDecl,
+    GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS, GATE_TYPE_CONTEXT_MATCHES,
 };
 
 /// YAML front-matter structure of a template source file.
@@ -82,6 +83,10 @@ struct SourceGate {
     command: String,
     #[serde(default)]
     timeout: u32,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    pattern: String,
 }
 
 /// Compile a YAML/Markdown template source file to a FormatVersion=1 CompiledTemplate.
@@ -250,6 +255,47 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 gate_type: source.gate_type.clone(),
                 command: source.command.clone(),
                 timeout: source.timeout,
+                key: String::new(),
+                pattern: String::new(),
+            })
+        }
+        GATE_TYPE_CONTEXT_EXISTS => {
+            if source.key.is_empty() {
+                return Err(anyhow!(
+                    "state {:?} gate {:?}: context-exists gate must have a non-empty key",
+                    state_name,
+                    gate_name
+                ));
+            }
+            Ok(Gate {
+                gate_type: source.gate_type.clone(),
+                command: String::new(),
+                timeout: 0,
+                key: source.key.clone(),
+                pattern: String::new(),
+            })
+        }
+        GATE_TYPE_CONTEXT_MATCHES => {
+            if source.key.is_empty() {
+                return Err(anyhow!(
+                    "state {:?} gate {:?}: context-matches gate must have a non-empty key",
+                    state_name,
+                    gate_name
+                ));
+            }
+            if source.pattern.is_empty() {
+                return Err(anyhow!(
+                    "state {:?} gate {:?}: context-matches gate must have a non-empty pattern",
+                    state_name,
+                    gate_name
+                ));
+            }
+            Ok(Gate {
+                gate_type: source.gate_type.clone(),
+                command: String::new(),
+                timeout: 0,
+                key: source.key.clone(),
+                pattern: source.pattern.clone(),
             })
         }
         other => Err(anyhow!(

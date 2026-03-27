@@ -1,6 +1,7 @@
-//! Gate evaluator for command gates.
+//! Gate evaluator for command, context-exists, and context-matches gates.
 //!
-//! Spawns shell commands in isolated process groups with configurable timeouts.
+//! Command gates spawn shell commands in isolated process groups with
+//! configurable timeouts. Context gates check the session context store.
 //! Evaluates all gates without short-circuiting so callers see every blocking
 //! condition in a single response.
 
@@ -12,16 +13,19 @@ use std::time::Duration;
 
 use wait_timeout::ChildExt;
 
-use crate::template::types::Gate;
+use crate::session::context::ContextStore;
+use crate::template::types::{
+    Gate, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS, GATE_TYPE_CONTEXT_MATCHES,
+};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
-/// Result of evaluating a single gate command.
+/// Result of evaluating a single gate.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GateResult {
-    /// The command exited with status 0.
+    /// The gate condition was satisfied.
     Passed,
-    /// The command exited with a non-zero status.
+    /// The command exited with a non-zero status, or the context check failed.
     Failed { exit_code: i32 },
     /// The command did not finish within the configured timeout.
     TimedOut,
@@ -29,35 +33,98 @@ pub enum GateResult {
     Error { message: String },
 }
 
-/// Evaluate all command gates in `gates`, running each command with
-/// `working_dir` as the current directory. Every gate is evaluated regardless
-/// of individual results (no short-circuit).
+/// Evaluate all gates, running each command with `working_dir` as the current
+/// directory and using `context_store` + `session` for context-aware gates.
+/// Every gate is evaluated regardless of individual results (no short-circuit).
 ///
-/// Only gates with `gate_type == "command"` are evaluated. Gates with
-/// unrecognized types are skipped with a `GateResult::Error` explaining that
-/// the type is not supported by this evaluator.
+/// When `context_store` is `None`, context-aware gate types produce an error
+/// result indicating that context evaluation is unavailable.
 pub fn evaluate_gates(
     gates: &BTreeMap<String, Gate>,
     working_dir: &Path,
+    context_store: Option<&dyn ContextStore>,
+    session: Option<&str>,
 ) -> BTreeMap<String, GateResult> {
     let mut results = BTreeMap::new();
     for (name, gate) in gates {
-        let result = if gate.gate_type != crate::template::types::GATE_TYPE_COMMAND {
-            GateResult::Error {
-                message: format!(
-                    "unsupported gate type '{}'; only command gates are evaluated",
-                    gate.gate_type
-                ),
+        let result = match gate.gate_type.as_str() {
+            GATE_TYPE_COMMAND => evaluate_command_gate(gate, working_dir),
+            GATE_TYPE_CONTEXT_EXISTS => evaluate_context_exists_gate(gate, context_store, session),
+            GATE_TYPE_CONTEXT_MATCHES => {
+                evaluate_context_matches_gate(gate, context_store, session)
             }
-        } else {
-            evaluate_single_gate(gate, working_dir)
+            other => GateResult::Error {
+                message: format!(
+                    "unsupported gate type '{}'; only command, context-exists, \
+                     and context-matches gates are evaluated",
+                    other
+                ),
+            },
         };
         results.insert(name.clone(), result);
     }
     results
 }
 
-fn evaluate_single_gate(gate: &Gate, working_dir: &Path) -> GateResult {
+fn evaluate_context_exists_gate(
+    gate: &Gate,
+    context_store: Option<&dyn ContextStore>,
+    session: Option<&str>,
+) -> GateResult {
+    let (store, sess) = match (context_store, session) {
+        (Some(s), Some(n)) => (s, n),
+        _ => {
+            return GateResult::Error {
+                message: "context-exists gate requires a context store and session".to_string(),
+            };
+        }
+    };
+    if store.ctx_exists(sess, &gate.key) {
+        GateResult::Passed
+    } else {
+        GateResult::Failed { exit_code: 1 }
+    }
+}
+
+fn evaluate_context_matches_gate(
+    gate: &Gate,
+    context_store: Option<&dyn ContextStore>,
+    session: Option<&str>,
+) -> GateResult {
+    let (store, sess) = match (context_store, session) {
+        (Some(s), Some(n)) => (s, n),
+        _ => {
+            return GateResult::Error {
+                message: "context-matches gate requires a context store and session".to_string(),
+            };
+        }
+    };
+    let content = match store.get(sess, &gate.key) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                return GateResult::Failed { exit_code: 1 };
+            }
+        },
+        Err(_) => {
+            return GateResult::Failed { exit_code: 1 };
+        }
+    };
+    match regex::Regex::new(&gate.pattern) {
+        Ok(re) => {
+            if re.is_match(&content) {
+                GateResult::Passed
+            } else {
+                GateResult::Failed { exit_code: 1 }
+            }
+        }
+        Err(e) => GateResult::Error {
+            message: format!("invalid regex pattern: {}", e),
+        },
+    }
+}
+
+fn evaluate_command_gate(gate: &Gate, working_dir: &Path) -> GateResult {
     // timeout=0 is the serde default, meaning "no override"; use the module default.
     let timeout = if gate.timeout == 0 {
         Duration::from_secs(DEFAULT_TIMEOUT_SECS)
@@ -125,6 +192,8 @@ mod tests {
             gate_type: GATE_TYPE_COMMAND.to_string(),
             command: command.to_string(),
             timeout,
+            key: String::new(),
+            pattern: String::new(),
         }
     }
 
@@ -138,7 +207,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("check".to_string(), make_gate("exit 0", 5));
 
-        let results = evaluate_gates(&gates, dir.path());
+        let results = evaluate_gates(&gates, dir.path(), None, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results["check"], GateResult::Passed);
     }
@@ -149,7 +218,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("check".to_string(), make_gate("exit 42", 5));
 
-        let results = evaluate_gates(&gates, dir.path());
+        let results = evaluate_gates(&gates, dir.path(), None, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results["check"], GateResult::Failed { exit_code: 42 });
     }
@@ -160,7 +229,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("slow".to_string(), make_gate("sleep 60", 1));
 
-        let results = evaluate_gates(&gates, dir.path());
+        let results = evaluate_gates(&gates, dir.path(), None, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results["slow"], GateResult::TimedOut);
     }
@@ -171,7 +240,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("bad".to_string(), make_gate("nonexistent_cmd_xyz_12345", 5));
 
-        let results = evaluate_gates(&gates, dir.path());
+        let results = evaluate_gates(&gates, dir.path(), None, None);
         assert_eq!(results.len(), 1);
         match &results["bad"] {
             // The shell itself exits 127 for command-not-found.
@@ -190,7 +259,7 @@ mod tests {
         gates.insert("fail".to_string(), make_gate("exit 1", 5));
         gates.insert("timeout".to_string(), make_gate("sleep 60", 1));
 
-        let results = evaluate_gates(&gates, dir.path());
+        let results = evaluate_gates(&gates, dir.path(), None, None);
         assert_eq!(results.len(), 3);
         assert_eq!(results["pass"], GateResult::Passed);
         assert_eq!(results["fail"], GateResult::Failed { exit_code: 1 });
@@ -206,7 +275,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("check_dir".to_string(), make_gate("test -f marker.txt", 5));
 
-        let results = evaluate_gates(&gates, dir.path());
+        let results = evaluate_gates(&gates, dir.path(), None, None);
         assert_eq!(results["check_dir"], GateResult::Passed);
     }
 
@@ -218,7 +287,293 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("quick".to_string(), make_gate("exit 0", 0));
 
-        let results = evaluate_gates(&gates, dir.path());
+        let results = evaluate_gates(&gates, dir.path(), None, None);
         assert_eq!(results["quick"], GateResult::Passed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Context-aware gate tests
+    // -----------------------------------------------------------------------
+
+    /// In-memory ContextStore for testing.
+    struct MockContextStore {
+        entries: std::sync::Mutex<BTreeMap<(String, String), Vec<u8>>>,
+    }
+
+    impl MockContextStore {
+        fn new() -> Self {
+            Self {
+                entries: std::sync::Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        fn insert(&self, session: &str, key: &str, content: &[u8]) {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert((session.to_string(), key.to_string()), content.to_vec());
+        }
+    }
+
+    impl ContextStore for MockContextStore {
+        fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
+            self.insert(session, key, content);
+            Ok(())
+        }
+
+        fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+            self.entries
+                .lock()
+                .unwrap()
+                .get(&(session.to_string(), key.to_string()))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("key not found"))
+        }
+
+        fn ctx_exists(&self, session: &str, key: &str) -> bool {
+            self.entries
+                .lock()
+                .unwrap()
+                .contains_key(&(session.to_string(), key.to_string()))
+        }
+
+        fn remove(&self, session: &str, key: &str) -> anyhow::Result<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .remove(&(session.to_string(), key.to_string()));
+            Ok(())
+        }
+
+        fn list_keys(&self, session: &str, prefix: Option<&str>) -> anyhow::Result<Vec<String>> {
+            let entries = self.entries.lock().unwrap();
+            let keys: Vec<String> = entries
+                .keys()
+                .filter(|(s, k)| s == session && prefix.map_or(true, |p| k.starts_with(p)))
+                .map(|(_, k)| k.clone())
+                .collect();
+            Ok(keys)
+        }
+    }
+
+    #[test]
+    fn context_exists_gate_passes_when_key_present() {
+        let dir = tmp_dir();
+        let store = MockContextStore::new();
+        store.insert("sess1", "research/lead.md", b"some content");
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "research".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_EXISTS.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "research/lead.md".to_string(),
+                pattern: String::new(),
+            },
+        );
+
+        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
+        assert_eq!(results["research"], GateResult::Passed);
+    }
+
+    #[test]
+    fn context_exists_gate_fails_when_key_missing() {
+        let dir = tmp_dir();
+        let store = MockContextStore::new();
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "research".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_EXISTS.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "research/lead.md".to_string(),
+                pattern: String::new(),
+            },
+        );
+
+        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
+        assert_eq!(results["research"], GateResult::Failed { exit_code: 1 });
+    }
+
+    #[test]
+    fn context_exists_gate_errors_without_store() {
+        let dir = tmp_dir();
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "research".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_EXISTS.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "research/lead.md".to_string(),
+                pattern: String::new(),
+            },
+        );
+
+        let results = evaluate_gates(&gates, dir.path(), None, None);
+        assert!(matches!(&results["research"], GateResult::Error { .. }));
+    }
+
+    #[test]
+    fn context_matches_gate_passes_when_pattern_matches() {
+        let dir = tmp_dir();
+        let store = MockContextStore::new();
+        store.insert(
+            "sess1",
+            "review.md",
+            b"# Review\n\n## Approved\n\nLooks good.",
+        );
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "review".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_MATCHES.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "review.md".to_string(),
+                pattern: "## Approved".to_string(),
+            },
+        );
+
+        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
+        assert_eq!(results["review"], GateResult::Passed);
+    }
+
+    #[test]
+    fn context_matches_gate_fails_when_pattern_does_not_match() {
+        let dir = tmp_dir();
+        let store = MockContextStore::new();
+        store.insert(
+            "sess1",
+            "review.md",
+            b"# Review\n\n## Rejected\n\nNeeds work.",
+        );
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "review".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_MATCHES.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "review.md".to_string(),
+                pattern: "## Approved".to_string(),
+            },
+        );
+
+        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
+        assert_eq!(results["review"], GateResult::Failed { exit_code: 1 });
+    }
+
+    #[test]
+    fn context_matches_gate_fails_when_key_missing() {
+        let dir = tmp_dir();
+        let store = MockContextStore::new();
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "review".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_MATCHES.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "review.md".to_string(),
+                pattern: "## Approved".to_string(),
+            },
+        );
+
+        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
+        assert_eq!(results["review"], GateResult::Failed { exit_code: 1 });
+    }
+
+    #[test]
+    fn context_matches_gate_errors_without_store() {
+        let dir = tmp_dir();
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "review".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_MATCHES.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "review.md".to_string(),
+                pattern: "## Approved".to_string(),
+            },
+        );
+
+        let results = evaluate_gates(&gates, dir.path(), None, None);
+        assert!(matches!(&results["review"], GateResult::Error { .. }));
+    }
+
+    #[test]
+    fn context_matches_with_regex_pattern() {
+        let dir = tmp_dir();
+        let store = MockContextStore::new();
+        store.insert("sess1", "status.txt", b"status: PASS (3/3 checks)");
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "status".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_MATCHES.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "status.txt".to_string(),
+                pattern: r"status:\s+PASS".to_string(),
+            },
+        );
+
+        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
+        assert_eq!(results["status"], GateResult::Passed);
+    }
+
+    #[test]
+    fn mixed_gate_types_all_evaluated() {
+        let dir = tmp_dir();
+        let store = MockContextStore::new();
+        store.insert("sess1", "ready.txt", b"ready");
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "cmd".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_COMMAND.to_string(),
+                command: "exit 0".to_string(),
+                timeout: 5,
+                key: String::new(),
+                pattern: String::new(),
+            },
+        );
+        gates.insert(
+            "ctx_exists".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_EXISTS.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "ready.txt".to_string(),
+                pattern: String::new(),
+            },
+        );
+        gates.insert(
+            "ctx_matches".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_MATCHES.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "ready.txt".to_string(),
+                pattern: "ready".to_string(),
+            },
+        );
+
+        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
+        assert_eq!(results.len(), 3);
+        assert_eq!(results["cmd"], GateResult::Passed);
+        assert_eq!(results["ctx_exists"], GateResult::Passed);
+        assert_eq!(results["ctx_matches"], GateResult::Passed);
     }
 }

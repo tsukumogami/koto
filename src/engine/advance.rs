@@ -729,6 +729,8 @@ mod tests {
                 gate_type: "command".to_string(),
                 command: "false".to_string(),
                 timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
             },
         );
 
