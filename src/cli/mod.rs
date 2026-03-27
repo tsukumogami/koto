@@ -672,10 +672,7 @@ pub fn run(app: App) -> Result<()> {
 
                 let output_bytes = match args.format {
                     ExportFormat::Mermaid => crate::export::to_mermaid(&compiled).into_bytes(),
-                    ExportFormat::Html => {
-                        eprintln!("error: --format html is not yet implemented");
-                        std::process::exit(1);
-                    }
+                    ExportFormat::Html => crate::export::generate_html(&compiled),
                 };
 
                 if args.check {
@@ -717,6 +714,11 @@ pub fn run(app: App) -> Result<()> {
                     std::fs::write(output_path, &output_bytes)
                         .map_err(|e| anyhow::anyhow!("failed to write {}: {}", output_path, e))?;
                     println!("{}", output_path);
+                    if args.open {
+                        opener::open(output_path).map_err(|e| {
+                            anyhow::anyhow!("failed to open {}: {}", output_path, e)
+                        })?;
+                    }
                     Ok(())
                 } else {
                     std::io::stdout().write_all(&output_bytes)?;

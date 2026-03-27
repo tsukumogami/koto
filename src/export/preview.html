@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>koto workflow preview</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #f8f9fa;
+    color: #1a1a2e;
+  }
+
+  header {
+    padding: 12px 20px;
+    background: #fff;
+    border-bottom: 1px solid #ddd;
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+  }
+  header h1 { font-size: 16px; font-weight: 600; }
+  header .meta { font-size: 13px; color: #666; }
+
+  #cy { width: 100%; height: calc(100vh - 48px); }
+
+  .legend {
+    position: absolute;
+    bottom: 16px;
+    left: 16px;
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 12px;
+    z-index: 10;
+  }
+  .legend-item { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  .legend-swatch { width: 24px; height: 14px; border-radius: 3px; border: 1.5px solid; }
+
+  #tooltip {
+    display: none;
+    position: absolute;
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 12px 16px;
+    max-width: 360px;
+    font-size: 13px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+    z-index: 100;
+    pointer-events: none;
+  }
+  #tooltip h3 { font-size: 14px; margin-bottom: 6px; }
+  #tooltip .section { margin-top: 8px; }
+  #tooltip .section-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #888;
+    margin-bottom: 2px;
+  }
+  #tooltip code {
+    background: #f0f0f0;
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 12px;
+  }
+  #tooltip .field { display: flex; gap: 8px; font-size: 12px; padding: 2px 0; }
+  #tooltip .field-name { font-weight: 500; min-width: 60px; }
+  #tooltip .field-type { color: #888; }
+
+  @media (prefers-color-scheme: dark) {
+    body { background: #1a1a2e; color: #e0e0e0; }
+    header { background: #16213e; border-bottom-color: #333; }
+    header .meta { color: #999; }
+    .legend { background: #16213e; border-color: #333; color: #e0e0e0; }
+    #tooltip {
+      background: #16213e;
+      border-color: #333;
+      color: #e0e0e0;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    }
+    #tooltip .section-title { color: #999; }
+    #tooltip code { background: #0f3460; color: #e0e0e0; }
+    #tooltip .field-type { color: #999; }
+  }
+</style>
+<script src="https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js"
+        integrity="sha384-PLACEHOLDER_CYTOSCAPE_SRI" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"
+        integrity="sha384-PLACEHOLDER_DAGRE_SRI" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"
+        integrity="sha384-PLACEHOLDER_CYTOSCAPE_DAGRE_SRI" crossorigin="anonymous"></script>
+</head>
+<body>
+<header>
+  <h1 id="title">workflow</h1>
+  <span class="meta" id="meta"></span>
+</header>
+<div id="cy"></div>
+<div id="tooltip"></div>
+<div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="border-color:#1976d2;background:#e3f2fd;"></div> Initial</div>
+  <div class="legend-item"><div class="legend-swatch" style="border-color:#4caf50;background:#e8f5e9;"></div> Terminal</div>
+  <div class="legend-item"><div class="legend-swatch" style="border-color:#e65100;background:#fff3e0;border-style:dashed;"></div> Gated</div>
+  <div class="legend-item"><div class="legend-swatch" style="border-color:#333;background:#fff8e1;"></div> Branching</div>
+</div>
+<script>
+const GRAPH_DATA = /*KOTO_GRAPH_DATA*/{};
+
+(function() {
+  var template = GRAPH_DATA;
+  var states = template.states || {};
+  var initialState = template.initial_state || '';
+  var stateCount = Object.keys(states).length;
+
+  // Header
+  var titleEl = document.getElementById('title');
+  var metaEl = document.getElementById('meta');
+  titleEl.textContent = template.name || 'workflow';
+  var parts = [];
+  if (template.version) parts.push('v' + template.version);
+  parts.push(stateCount + ' states');
+  metaEl.textContent = parts.join(' \u00b7 ');
+
+  // Build cytoscape elements
+  var elements = [];
+
+  // [*] start marker node
+  elements.push({
+    data: { id: '__start__', label: '', nodeType: 'start' }
+  });
+  if (initialState) {
+    elements.push({
+      data: { id: '__start__->' + initialState, source: '__start__', target: initialState, label: '' }
+    });
+  }
+
+  for (var name in states) {
+    if (!states.hasOwnProperty(name)) continue;
+    var data = states[name];
+    var hasGates = data.gates && Object.keys(data.gates).length > 0;
+    var isTerminal = data.terminal === true;
+    var isInitial = name === initialState;
+    var transitions = data.transitions || [];
+    var isBranching = transitions.length > 1;
+
+    var nodeType = isTerminal ? 'terminal'
+      : isInitial ? 'initial'
+      : hasGates ? 'gated'
+      : isBranching ? 'branching'
+      : 'normal';
+
+    elements.push({
+      data: { id: name, label: name, nodeType: nodeType }
+    });
+
+    for (var i = 0; i < transitions.length; i++) {
+      var t = transitions[i];
+      var cond = '';
+      if (t.when) {
+        var whenParts = [];
+        for (var k in t.when) {
+          if (t.when.hasOwnProperty(k)) {
+            whenParts.push(k + '=' + t.when[k]);
+          }
+        }
+        cond = whenParts.join(', ');
+      }
+      elements.push({
+        data: {
+          id: name + '->' + t.target + (cond ? ':' + cond : ''),
+          source: name,
+          target: t.target,
+          label: cond
+        }
+      });
+    }
+  }
+
+  var cy = cytoscape({
+    container: document.getElementById('cy'),
+    elements: elements,
+    style: [
+      {
+        selector: 'node',
+        style: {
+          'label': 'data(label)',
+          'text-valign': 'center',
+          'text-halign': 'center',
+          'font-size': '13px',
+          'font-family': '-apple-system, BlinkMacSystemFont, Segoe UI, system-ui, sans-serif',
+          'font-weight': 600,
+          'background-color': '#fff',
+          'border-width': 1.5,
+          'border-color': '#333',
+          'shape': 'round-rectangle',
+          'width': 'label',
+          'height': 40,
+          'padding': '24px',
+          'text-wrap': 'wrap',
+          'text-max-width': '140px'
+        }
+      },
+      {
+        selector: 'node[nodeType="start"]',
+        style: {
+          'shape': 'ellipse',
+          'width': 16,
+          'height': 16,
+          'background-color': '#333',
+          'border-width': 0,
+          'label': ''
+        }
+      },
+      {
+        selector: 'node[nodeType="initial"]',
+        style: { 'border-color': '#1976d2', 'border-width': 2.5, 'background-color': '#e3f2fd' }
+      },
+      {
+        selector: 'node[nodeType="terminal"]',
+        style: { 'border-color': '#4caf50', 'background-color': '#e8f5e9' }
+      },
+      {
+        selector: 'node[nodeType="gated"]',
+        style: { 'border-color': '#e65100', 'border-style': 'dashed', 'background-color': '#fff3e0' }
+      },
+      {
+        selector: 'node[nodeType="branching"]',
+        style: { 'background-color': '#fff8e1' }
+      },
+      {
+        selector: 'edge',
+        style: {
+          'width': 1.5,
+          'line-color': '#999',
+          'target-arrow-color': '#999',
+          'target-arrow-shape': 'triangle',
+          'curve-style': 'bezier',
+          'label': 'data(label)',
+          'font-size': '11px',
+          'font-family': 'SF Mono, Fira Code, monospace',
+          'color': '#666',
+          'text-rotation': 'autorotate',
+          'text-margin-y': -10,
+          'text-background-color': '#f8f9fa',
+          'text-background-opacity': 0.9,
+          'text-background-padding': '2px'
+        }
+      },
+      {
+        selector: '.faded',
+        style: {
+          'opacity': 0.2,
+          'transition-property': 'opacity',
+          'transition-duration': '0.2s'
+        }
+      },
+      {
+        selector: '.highlighted',
+        style: {
+          'border-color': '#1976d2',
+          'border-width': 3,
+          'line-color': '#1976d2',
+          'target-arrow-color': '#1976d2'
+        }
+      }
+    ],
+    layout: {
+      name: 'dagre',
+      rankDir: 'TB',
+      nodeSep: 60,
+      rankSep: 80,
+      edgeSep: 30,
+      padding: 40
+    },
+    userZoomingEnabled: true,
+    userPanningEnabled: true
+  });
+
+  // Vanilla tooltip
+  var tooltip = document.getElementById('tooltip');
+
+  function escapeHtml(str) {
+    return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function buildTooltipHtml(name, data) {
+    var html = '<h3>' + escapeHtml(name) + '</h3>';
+    html += '<p>' + escapeHtml(data.directive || '') + '</p>';
+
+    if (data.gates && Object.keys(data.gates).length > 0) {
+      html += '<div class="section"><div class="section-title">Gates</div>';
+      for (var k in data.gates) {
+        if (!data.gates.hasOwnProperty(k)) continue;
+        var g = data.gates[k];
+        html += '<div class="field"><span class="field-name">' + escapeHtml(k) + '</span>';
+        if (g.command) html += '<code>' + escapeHtml(g.command) + '</code>';
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+
+    if (data.accepts && Object.keys(data.accepts).length > 0) {
+      html += '<div class="section"><div class="section-title">Evidence Schema</div>';
+      for (var k in data.accepts) {
+        if (!data.accepts.hasOwnProperty(k)) continue;
+        var f = data.accepts[k];
+        var vals = (f.values && f.values.length > 0) ? ' [' + f.values.join(', ') + ']' : '';
+        html += '<div class="field"><span class="field-name">' + escapeHtml(k) + '</span>';
+        html += '<span class="field-type">' + escapeHtml(f.field_type + vals) + '</span></div>';
+      }
+      html += '</div>';
+    }
+
+    return html;
+  }
+
+  cy.on('mouseover', 'node', function(evt) {
+    var node = evt.target;
+    if (node.id() === '__start__') return;
+    var data = states[node.id()];
+    if (!data) return;
+    tooltip.innerHTML = buildTooltipHtml(node.id(), data);
+    tooltip.style.display = 'block';
+  });
+
+  cy.on('mousemove', 'node', function(evt) {
+    var e = evt.originalEvent;
+    tooltip.style.left = (e.clientX + 16) + 'px';
+    tooltip.style.top = (e.clientY + 16) + 'px';
+  });
+
+  cy.on('mouseout', 'node', function() {
+    tooltip.style.display = 'none';
+  });
+
+  // Click-to-highlight: one hop (direct incoming/outgoing edges)
+  cy.on('tap', 'node', function(evt) {
+    cy.elements().removeClass('faded').removeClass('highlighted');
+    var node = evt.target;
+    var neighborhood = node.closedNeighborhood();
+    cy.elements().not(neighborhood).addClass('faded');
+    neighborhood.addClass('highlighted');
+  });
+
+  cy.on('tap', function(evt) {
+    if (evt.target === cy) {
+      cy.elements().removeClass('faded').removeClass('highlighted');
+    }
+  });
+})();
+</script>
+</body>
+</html>
