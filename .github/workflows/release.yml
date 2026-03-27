@@ -151,7 +151,7 @@ jobs:
             exit 0
           fi
 
-          sed -i "s/default: 'latest'/default: '${TAG}'/" "$WORKFLOW"
+          sed -i "/koto-version/,/default:/ s/default: '.*'/default: '${TAG}'/" "$WORKFLOW"
 
           if git diff --quiet "$WORKFLOW"; then
             echo "No change needed (already pinned or pattern not found)"
