@@ -1,0 +1,193 @@
+{
+  "pr_status": "implementing",
+  "design_doc": "docs/plans/PLAN-visual-workflow-preview.md",
+  "branch": "docs/visual-workflow-preview",
+  "pr_number": 88,
+  "integrity_hash": "sha256:8da8a72a19dbc03b0cb19fa85d7618aae40c0b63495925b467db5cd6dfb05fe2",
+  "issues": [
+    {
+      "number": 1,
+      "title": "feat(cli): add template export subcommand with mermaid format",
+      "status": "pending",
+      "ci_status": "",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [],
+      "commits": null,
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": null,
+      "complexity": "testable",
+      "acceptance_criteria": [
+        "koto template export workflow.md prints Mermaid stateDiagram-v2 to stdout",
+        "koto template export workflow.md --output workflow.mermaid.md writes to file",
+        "--format mermaid is the default when --format is omitted",
+        "resolve_template() accepts both .md and .json inputs",
+        "validate_export_flags() rejects all R15 invalid combinations with clear errors",
+        "to_mermaid() produces stateDiagram-v2 with states, transitions, [*] markers, gate notes",
+        "Output uses LF line endings on all platforms"
+      ]
+    },
+    {
+      "number": 2,
+      "title": "test(export): mermaid output validation and determinism",
+      "status": "pending",
+      "ci_status": "",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        1
+      ],
+      "commits": null,
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": null,
+      "complexity": "testable",
+      "acceptance_criteria": [
+        "Fixture template export produces expected Mermaid syntax",
+        "[*] markers present for initial and terminal states",
+        "when conditions appear as transition labels",
+        "Gate names appear as note annotations",
+        "Exporting the same template twice produces byte-identical output",
+        "Single-state template with no transitions produces valid Mermaid",
+        ".md and .json inputs produce identical output for the same template"
+      ]
+    },
+    {
+      "number": 3,
+      "title": "feat(export): add --check freshness flag",
+      "status": "pending",
+      "ci_status": "",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        1
+      ],
+      "commits": null,
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": null,
+      "complexity": "testable",
+      "acceptance_criteria": [
+        "--check with fresh file exits 0",
+        "--check with stale file exits 1, prints fix command to stderr",
+        "--check with missing file exits 1, identifies missing file",
+        "--check without --output produces error",
+        "Fix command in error message resolves the drift when executed",
+        "Error output goes to stderr as plain text, not JSON"
+      ]
+    },
+    {
+      "number": 4,
+      "title": "feat(export): add html format with interactive cytoscape.js diagram",
+      "status": "pending",
+      "ci_status": "",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        1
+      ],
+      "commits": null,
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": null,
+      "complexity": "testable",
+      "acceptance_criteria": [
+        "--format html --output workflow.html produces self-contained HTML",
+        "HTML renders an interactive graph with nodes matching template states",
+        "Hover tooltips show gate name/command and evidence schemas",
+        "Click-to-highlight traces direct incoming/outgoing edges",
+        "prefers-color-scheme: dark media query present",
+        "[*] start marker node connected to initial state",
+        "All CDN script tags have SRI integrity hashes",
+        "--open launches default browser via opener crate",
+        "--format html without --output produces error",
+        "\u003c/  escaped as \u003c\\/ in injected JSON",
+        "Output uses LF line endings"
+      ]
+    },
+    {
+      "number": 5,
+      "title": "test(export): html output validation and determinism",
+      "status": "pending",
+      "ci_status": "",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        3,
+        4
+      ],
+      "commits": null,
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": null,
+      "complexity": "testable",
+      "acceptance_criteria": [
+        "Generated HTML contains compiled template data",
+        "HTML contains CDN script tags with SRI hashes",
+        "HTML contains no server-side directives",
+        "Exporting the same template twice as HTML produces byte-identical output",
+        "--format html --check works (fresh/stale/missing cases)",
+        "Generated HTML for a 30-state template is under 30 KB",
+        "HTML works when served as a static page"
+      ]
+    },
+    {
+      "number": 6,
+      "title": "ci: add reusable GHA workflow for template freshness checks",
+      "status": "pending",
+      "ci_status": "",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        3
+      ],
+      "commits": null,
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": null,
+      "complexity": "testable",
+      "acceptance_criteria": [
+        "Workflow accepts template-paths, koto-version, check-html, html-output-dir inputs",
+        "Downloads koto release binary",
+        "Expands glob pattern and runs --check for each template",
+        "Stale/missing diagrams produce ::error annotations with fix commands",
+        "Works when called from another repo via uses: with tag reference",
+        "Caller YAML is under 10 lines for basic setup"
+      ]
+    },
+    {
+      "number": 7,
+      "title": "test(export): flag compatibility and error handling",
+      "status": "pending",
+      "ci_status": "",
+      "ci_fix_attempts": 0,
+      "issue_type": "",
+      "dependencies": [
+        1,
+        4
+      ],
+      "commits": null,
+      "agent_type": "",
+      "summary": null,
+      "testable_scenarios": null,
+      "complexity": "testable",
+      "acceptance_criteria": [
+        "--format html without --output produces clear error",
+        "--open without --format html produces clear error",
+        "--open with --check produces clear error",
+        "--check without --output produces clear error",
+        "Non-existent input file produces clear error with exit code 2",
+        "Malformed JSON input produces clear error",
+        "Template that fails compilation produces clear error",
+        "Export of a 30-state template completes in under 500ms"
+      ]
+    }
+  ],
+  "skipped_issues": [],
+  "test_plan_file": "wip/implement-visual-workflow-preview-test_plan.md",
+  "doc_plan_file": "wip/implement-visual-workflow-preview-doc_plan.md",
+  "source_doc_type": "plan",
+  "execution_mode": "single-pr",
+  "deliverable_type": "code"
+}
