@@ -3696,3 +3696,270 @@ fn export_html_check_fix_command_resolves_drift() {
         String::from_utf8_lossy(&recheck.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// export: flag compatibility and error handling (Issue #7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn export_flag_html_without_output_errors() {
+    let fixture = fixture_multi_state();
+
+    let output = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "should exit 2 for flag validation error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--format html requires --output"),
+        "should mention --output requirement, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_flag_open_without_html_errors() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("out.mermaid.md");
+
+    let output = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "mermaid",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--open",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "should exit 2 for flag validation error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--open is only valid with --format html"),
+        "should mention --open/html constraint, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_flag_open_with_check_errors() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("out.html");
+
+    let output = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--open",
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "should exit 2 for flag validation error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--open and --check are mutually exclusive"),
+        "should mention mutual exclusivity, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_flag_check_without_output_errors() {
+    let fixture = fixture_multi_state();
+
+    let output = koto()
+        .args(["template", "export", fixture.to_str().unwrap(), "--check"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "should exit 2 for flag validation error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--check requires --output"),
+        "should mention --output requirement, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_nonexistent_input_file_errors() {
+    let output = koto()
+        .args(["template", "export", "/tmp/nonexistent-template-abc123.md"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "should fail for non-existent input"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error:"),
+        "should print error to stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_malformed_json_input_errors() {
+    let dir = TempDir::new().unwrap();
+    let bad_json = dir.path().join("broken.json");
+    std::fs::write(&bad_json, "{ this is not valid json }").unwrap();
+
+    let output = koto()
+        .args(["template", "export", bad_json.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "should fail for malformed JSON input"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error:"),
+        "should print error to stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_invalid_template_errors() {
+    let dir = TempDir::new().unwrap();
+    let bad_md = dir.path().join("invalid.md");
+    std::fs::write(
+        &bad_md,
+        "---\n!!!invalid yaml: [[[broken\n---\n\n## state\n\nContent.\n",
+    )
+    .unwrap();
+
+    let output = koto()
+        .args(["template", "export", bad_md.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "should fail for invalid template");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error:"),
+        "should print error to stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_latency_under_500ms() {
+    let fixture = fixture_multi_state();
+
+    let start = std::time::Instant::now();
+    let output = koto()
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(
+        output.status.success(),
+        "export should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "export should complete in under 500ms, took {:?}",
+        elapsed
+    );
+}
+
+/// Generate a 30-state template and verify export completes in under 500ms.
+#[test]
+fn export_30_state_template_latency_under_500ms() {
+    let dir = TempDir::new().unwrap();
+
+    // Build a 30-state chain: s0 -> s1 -> ... -> s29 (terminal)
+    let mut yaml =
+        String::from("---\nname: big-workflow\nversion: \"1.0\"\ninitial_state: s0\nstates:\n");
+    for i in 0..30 {
+        yaml.push_str(&format!("  s{}:\n", i));
+        if i == 29 {
+            yaml.push_str("    terminal: true\n");
+        } else {
+            yaml.push_str(&format!("    transitions:\n      - target: s{}\n", i + 1));
+        }
+    }
+    yaml.push_str("---\n");
+    for i in 0..30 {
+        yaml.push_str(&format!("\n## s{}\n\nState {} content.\n", i, i));
+    }
+
+    let template_path = dir.path().join("big-template.md");
+    std::fs::write(&template_path, &yaml).unwrap();
+
+    let start = std::time::Instant::now();
+    let output = koto()
+        .args(["template", "export", template_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(
+        output.status.success(),
+        "30-state export should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "30-state export should complete in under 500ms, took {:?}",
+        elapsed
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("stateDiagram-v2\n"),
+        "output should be valid mermaid"
+    );
+    assert!(
+        stdout.contains("[*] --> s0"),
+        "should have initial state marker"
+    );
+    assert!(
+        stdout.contains("s29 --> [*]"),
+        "should have terminal state marker"
+    );
+}
