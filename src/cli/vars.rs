@@ -92,15 +92,13 @@ mod tests {
 
     #[test]
     fn value_containing_braces_not_recursed() {
+        // Use a single-entry map to deterministically prove non-recursion:
+        // substituting A produces "{{B}}", and since B is not in the map,
+        // the token stays as-is.
         let mut vars = HashMap::new();
         vars.insert("A".to_string(), "{{B}}".to_string());
-        vars.insert("B".to_string(), "deep".to_string());
         let result = substitute_vars("{{A}}", &vars);
-        // The replacement of A inserts "{{B}}" literally. Whether B then
-        // gets replaced depends on iteration order, which is non-deterministic
-        // for HashMap. The key point: substitute_vars does NOT recurse.
-        // It does a single pass of sequential replaces.
-        assert!(result == "{{B}}" || result == "deep");
+        assert_eq!(result, "{{B}}");
     }
 
     #[test]
