@@ -1177,26 +1177,32 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
                     }
                 }
                 StopReason::EvidenceRequired => {
-                    if let Some(ref es) = expects {
-                        NextResponse::EvidenceRequired {
-                            state: final_state.clone(),
-                            directive: final_template_state.directive.clone(),
-                            advanced,
-                            expects: es.clone(),
-                        }
-                    } else {
-                        // No accepts block: auto-advance candidate with empty expects.
-                        NextResponse::EvidenceRequired {
-                            state: final_state.clone(),
-                            directive: final_template_state.directive.clone(),
-                            advanced,
-                            expects: ExpectsSchema {
-                                event_type: "evidence_submitted".to_string(),
-                                fields: std::collections::BTreeMap::new(),
-                                options: vec![],
-                            },
-                        }
+                    // The engine only returns EvidenceRequired when accepts is Some,
+                    // so expects is always populated here.
+                    let es = expects.unwrap_or_else(|| ExpectsSchema {
+                        event_type: "evidence_submitted".to_string(),
+                        fields: std::collections::BTreeMap::new(),
+                        options: vec![],
+                    });
+                    NextResponse::EvidenceRequired {
+                        state: final_state.clone(),
+                        directive: final_template_state.directive.clone(),
+                        advanced,
+                        expects: es,
                     }
+                }
+                StopReason::UnresolvableTransition => {
+                    let err = NextError {
+                        code: NextErrorCode::PreconditionFailed,
+                        message: format!(
+                            "state '{}' has conditional transitions but no accepts block; \
+                             the agent cannot submit evidence to resolve this",
+                            final_state
+                        ),
+                        details: vec![],
+                    };
+                    let json = serde_json::json!({"error": err});
+                    exit_with_error_code(json, err.code.exit_code());
                 }
                 StopReason::Integration { name, output } => NextResponse::Integration {
                     state: final_state.clone(),
