@@ -9,6 +9,13 @@ on:
           Example: 'templates/**/*.md'
         required: true
         type: string
+      koto-version:
+        description: >
+          Koto version to install. Use 'latest' for the most recent release,
+          or pin a specific version like 'v0.5.0'. Passed to install.sh --version.
+        required: false
+        type: string
+        default: 'latest'
       check-html:
         description: >
           Also check HTML freshness. When true, the workflow verifies
@@ -33,8 +40,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install koto
+        env:
+          KOTO_VERSION: ${{ inputs.koto-version }}
         run: |
-          curl -fsSL https://raw.githubusercontent.com/tsukumogami/koto/main/install.sh | bash -s -- --no-modify-path
+          INSTALL_ARGS="--no-modify-path"
+          if [ "$KOTO_VERSION" != "latest" ]; then
+            INSTALL_ARGS="$INSTALL_ARGS --version=$KOTO_VERSION"
+          fi
+          curl -fsSL https://raw.githubusercontent.com/tsukumogami/koto/main/install.sh | bash -s -- $INSTALL_ARGS
           echo "$HOME/.koto/bin" >> "$GITHUB_PATH"
           koto version
 

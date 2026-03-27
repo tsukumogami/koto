@@ -53,12 +53,23 @@ and push.
 | Input | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `template-paths` | string | yes | -- | Glob pattern matching template `.md` files |
+| `koto-version` | string | no | `latest` | koto version to install (e.g., `v0.5.0`) or `latest` |
 | `check-html` | boolean | no | `false` | Also verify HTML diagram freshness |
 | `html-output-dir` | string | no | `docs` | Directory for HTML output files (relative to repo root) |
 
-The workflow always installs the latest koto release via the official
-install script. Version pinning isn't supported yet -- pin the workflow
-reference itself (`@v1`, `@main`, or a commit SHA) for reproducibility.
+### Pinning the koto version
+
+By default, the workflow installs the latest koto release. To pin a
+specific version for reproducibility:
+
+```yaml
+with:
+  template-paths: 'templates/**/*.md'
+  koto-version: 'v0.5.0'
+```
+
+The version is passed to the install script's `--version` flag. Use
+`latest` (the default) to always get the most recent release.
 
 ## HTML freshness checks
 
