@@ -58,6 +58,7 @@ impl SessionBackend for LocalBackend {
     }
 
     fn cleanup(&self, id: &str) -> anyhow::Result<()> {
+        validate_session_id(id)?;
         let dir = self.base_dir.join(id);
         if dir.exists() {
             fs::remove_dir_all(&dir)?;
@@ -119,7 +120,7 @@ impl SessionBackend for LocalBackend {
 /// Canonicalizes the path, hashes with SHA-256, and returns the first
 /// 16 hex characters. Two paths that resolve to the same canonical
 /// location produce the same repo-id.
-pub fn repo_id(working_dir: &Path) -> anyhow::Result<String> {
+pub(crate) fn repo_id(working_dir: &Path) -> anyhow::Result<String> {
     let canonical = fs::canonicalize(working_dir)
         .map_err(|e| anyhow::anyhow!("failed to canonicalize {}: {}", working_dir.display(), e))?;
     let hash = sha256_hex(canonical.to_string_lossy().as_bytes());
