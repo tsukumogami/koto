@@ -678,15 +678,50 @@ pub fn run(app: App) -> Result<()> {
                     }
                 };
 
-                if let Some(ref output_path) = args.output {
+                if args.check {
+                    // --check requires --output (enforced by validate_export_flags)
+                    let output_path = args.output.as_ref().unwrap();
+                    let path = std::path::Path::new(output_path);
+                    match crate::export::check_freshness(&output_bytes, path) {
+                        Ok(crate::export::CheckResult::Fresh) => Ok(()),
+                        Ok(crate::export::CheckResult::Stale) => {
+                            let format_name = match args.format {
+                                ExportFormat::Mermaid => "mermaid",
+                                ExportFormat::Html => "html",
+                            };
+                            eprintln!("error: {} is out of date", output_path);
+                            eprintln!(
+                                "run: koto template export {} --format {} --output {}",
+                                args.input, format_name, output_path
+                            );
+                            std::process::exit(1);
+                        }
+                        Ok(crate::export::CheckResult::Missing) => {
+                            let format_name = match args.format {
+                                ExportFormat::Mermaid => "mermaid",
+                                ExportFormat::Html => "html",
+                            };
+                            eprintln!("error: {} does not exist", output_path);
+                            eprintln!(
+                                "run: koto template export {} --format {} --output {}",
+                                args.input, format_name, output_path
+                            );
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("error: failed to check {}: {}", output_path, e);
+                            std::process::exit(1);
+                        }
+                    }
+                } else if let Some(ref output_path) = args.output {
                     std::fs::write(output_path, &output_bytes)
                         .map_err(|e| anyhow::anyhow!("failed to write {}: {}", output_path, e))?;
                     println!("{}", output_path);
+                    Ok(())
                 } else {
                     std::io::stdout().write_all(&output_bytes)?;
+                    Ok(())
                 }
-
-                Ok(())
             }
         },
         Command::Decisions { subcommand } => match subcommand {

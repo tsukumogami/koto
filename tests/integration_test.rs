@@ -3116,3 +3116,187 @@ fn export_determinism_via_cli() {
         "two CLI export invocations must produce byte-identical stdout"
     );
 }
+
+// export: --check freshness flag
+
+#[test]
+fn export_check_fresh_file_exits_0() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("diagram.mermaid.md");
+
+    // First, generate the file.
+    let gen = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        gen.status.success(),
+        "generation failed: {}",
+        String::from_utf8_lossy(&gen.stderr)
+    );
+
+    // Now check: should exit 0 because the file is fresh.
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "--check on fresh file should exit 0: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn export_check_stale_file_exits_1() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("diagram.mermaid.md");
+
+    // Write stale content.
+    std::fs::write(&output_path, b"stale content").unwrap();
+
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !check.status.success(),
+        "--check on stale file should exit 1"
+    );
+
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("is out of date"),
+        "stderr should mention 'out of date': {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("run: koto template export"),
+        "stderr should contain fix command: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_check_missing_file_exits_1() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("nonexistent.mermaid.md");
+
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !check.status.success(),
+        "--check on missing file should exit 1"
+    );
+
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("does not exist"),
+        "stderr should mention 'does not exist': {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("run: koto template export"),
+        "stderr should contain fix command: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_check_fix_command_resolves_drift() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("diagram.mermaid.md");
+
+    // Write stale content.
+    std::fs::write(&output_path, b"stale").unwrap();
+
+    // Run --check to get the fix command (it will fail).
+    let check = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "mermaid",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(!check.status.success());
+
+    // Apply the fix: regenerate the file.
+    let fix = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "mermaid",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        fix.status.success(),
+        "fix command failed: {}",
+        String::from_utf8_lossy(&fix.stderr)
+    );
+
+    // Now --check should pass.
+    let recheck = koto()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "mermaid",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        recheck.status.success(),
+        "--check after fix should exit 0: {}",
+        String::from_utf8_lossy(&recheck.stderr)
+    );
+}
