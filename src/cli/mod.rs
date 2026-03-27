@@ -1,3 +1,4 @@
+pub mod context;
 pub mod next;
 pub mod next_types;
 pub mod session;
@@ -17,6 +18,7 @@ use crate::engine::persistence::{
     append_event, append_header, derive_machine_state, derive_state_from_log, read_events,
 };
 use crate::engine::types::{now_iso8601, EventPayload, StateFileHeader};
+use crate::session::context::ContextStore;
 use crate::session::local::LocalBackend;
 use crate::session::{state_file_name, SessionBackend};
 use crate::template::types::CompiledTemplate;
@@ -103,6 +105,12 @@ pub enum Command {
         #[command(subcommand)]
         subcommand: SessionCommand,
     },
+
+    /// Content context management subcommands
+    Context {
+        #[command(subcommand)]
+        subcommand: ContextCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -118,6 +126,45 @@ pub enum SessionCommand {
     Cleanup {
         /// Session name
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ContextCommand {
+    /// Store content under a key (reads from stdin or --from-file)
+    Add {
+        /// Session name
+        session: String,
+        /// Context key (hierarchical, e.g. "scope.md" or "research/r1/lead.md")
+        key: String,
+        /// Read content from file instead of stdin
+        #[arg(long)]
+        from_file: Option<String>,
+    },
+    /// Retrieve stored content (writes to stdout or --to-file)
+    Get {
+        /// Session name
+        session: String,
+        /// Context key
+        key: String,
+        /// Write content to file instead of stdout
+        #[arg(long)]
+        to_file: Option<String>,
+    },
+    /// Check if a key exists (exit 0 if present, 1 if not)
+    Exists {
+        /// Session name
+        session: String,
+        /// Context key
+        key: String,
+    },
+    /// List all keys as a JSON array
+    List {
+        /// Session name
+        session: String,
+        /// Filter keys by prefix
+        #[arg(long)]
+        prefix: Option<String>,
     },
 }
 
@@ -242,6 +289,64 @@ pub fn run(app: App) -> Result<()> {
                 SessionCommand::Dir { name } => session::handle_dir(&backend, &name),
                 SessionCommand::List => session::handle_list(&backend),
                 SessionCommand::Cleanup { name } => session::handle_cleanup(&backend, &name),
+            }
+        }
+        Command::Context { subcommand } => {
+            let backend = build_backend()?;
+            let store: &dyn ContextStore = &backend;
+            match subcommand {
+                ContextCommand::Add {
+                    session,
+                    key,
+                    from_file,
+                } => {
+                    if let Err(e) = context::handle_add(store, &session, &key, from_file.as_deref())
+                    {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": e.to_string(),
+                                "command": "context add"
+                            }),
+                            EXIT_INFRASTRUCTURE,
+                        );
+                    }
+                    Ok(())
+                }
+                ContextCommand::Get {
+                    session,
+                    key,
+                    to_file,
+                } => {
+                    if let Err(e) = context::handle_get(store, &session, &key, to_file.as_deref()) {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": e.to_string(),
+                                "command": "context get"
+                            }),
+                            EXIT_INFRASTRUCTURE,
+                        );
+                    }
+                    Ok(())
+                }
+                ContextCommand::Exists { session, key } => {
+                    if context::handle_exists(store, &session, &key) {
+                        std::process::exit(0);
+                    } else {
+                        std::process::exit(1);
+                    }
+                }
+                ContextCommand::List { session, prefix } => {
+                    if let Err(e) = context::handle_list(store, &session, prefix.as_deref()) {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": e.to_string(),
+                                "command": "context list"
+                            }),
+                            EXIT_INFRASTRUCTURE,
+                        );
+                    }
+                    Ok(())
+                }
             }
         }
         Command::Template { subcommand } => match subcommand {

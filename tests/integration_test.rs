@@ -2327,3 +2327,303 @@ fn auto_cleanup_graceful_on_missing_session_dir() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["action"].as_str(), Some("done"));
 }
+
+// ---------------------------------------------------------------------------
+// Context subcommand tests
+// ---------------------------------------------------------------------------
+
+/// Helper: create a session directory (without a full workflow init) so context
+/// commands have somewhere to store files.
+fn create_session_dir(dir: &Path, name: &str) {
+    let session_dir = sessions_base(dir).join(name);
+    std::fs::create_dir_all(&session_dir).unwrap();
+}
+
+#[test]
+fn context_add_from_stdin_and_get_to_stdout() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    // Add content via stdin
+    let output = koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "scope.md"])
+        .write_stdin("hello from stdin")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "context add should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Get content to stdout
+    let output = koto_cmd(dir.path())
+        .args(["context", "get", "ctx-wf", "scope.md"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "context get should succeed");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello from stdin");
+}
+
+#[test]
+fn context_add_from_file_and_get_to_file() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    let input_file = dir.path().join("input.txt");
+    std::fs::write(&input_file, "file content here").unwrap();
+
+    // Add from file
+    let output = koto_cmd(dir.path())
+        .args([
+            "context",
+            "add",
+            "ctx-wf",
+            "data.txt",
+            "--from-file",
+            input_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "context add --from-file should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Get to file
+    let output_file = dir.path().join("output.txt");
+    let output = koto_cmd(dir.path())
+        .args([
+            "context",
+            "get",
+            "ctx-wf",
+            "data.txt",
+            "--to-file",
+            output_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "context get --to-file should succeed"
+    );
+
+    let written = std::fs::read_to_string(&output_file).unwrap();
+    assert_eq!(written, "file content here");
+}
+
+#[test]
+fn context_exists_returns_exit_0_when_present() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    // Add a key
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "scope.md"])
+        .write_stdin("data")
+        .assert()
+        .success();
+
+    // Exists should return exit 0
+    let output = koto_cmd(dir.path())
+        .args(["context", "exists", "ctx-wf", "scope.md"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "context exists should exit 0 for present key"
+    );
+    // No stdout output for exists
+    assert!(
+        output.stdout.is_empty(),
+        "context exists should produce no stdout"
+    );
+}
+
+#[test]
+fn context_exists_returns_exit_1_when_missing() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "exists", "ctx-wf", "missing.md"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "context exists should exit 1 for missing key"
+    );
+}
+
+#[test]
+fn context_list_returns_json_array() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    // Empty list
+    let output = koto_cmd(dir.path())
+        .args(["context", "list", "ctx-wf"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(json, serde_json::json!([]));
+
+    // Add some keys
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "beta.md"])
+        .write_stdin("b")
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "alpha.md"])
+        .write_stdin("a")
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "list", "ctx-wf"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(json, serde_json::json!(["alpha.md", "beta.md"]));
+}
+
+#[test]
+fn context_list_with_prefix_filter() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "scope.md"])
+        .write_stdin("s")
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "research/r1/a.md"])
+        .write_stdin("a")
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "research/r1/b.md"])
+        .write_stdin("b")
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "list", "ctx-wf", "--prefix", "research/"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!(["research/r1/a.md", "research/r1/b.md"])
+    );
+}
+
+#[test]
+fn context_add_does_not_advance_workflow_state() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "state-wf", minimal_template());
+
+    // Read state file content before context add
+    let state_path = session_state_path(dir.path(), "state-wf");
+    let before = std::fs::read_to_string(&state_path).unwrap();
+
+    // Add context
+    koto_cmd(dir.path())
+        .args(["context", "add", "state-wf", "scope.md"])
+        .write_stdin("context data")
+        .assert()
+        .success();
+
+    // State file should be unchanged (no new events appended)
+    let after = std::fs::read_to_string(&state_path).unwrap();
+    assert_eq!(
+        before, after,
+        "context add should not modify the state file"
+    );
+}
+
+#[test]
+fn context_get_missing_key_returns_error() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "get", "ctx-wf", "nonexistent.md"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "context get for missing key should exit 3"
+    );
+}
+
+#[test]
+fn context_add_rejects_invalid_key() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "../escape.md"])
+        .write_stdin("bad")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "context add with path traversal key should exit 3"
+    );
+}
+
+#[test]
+fn context_add_overwrites_existing_key() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "scope.md"])
+        .write_stdin("v1")
+        .assert()
+        .success();
+
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "scope.md"])
+        .write_stdin("v2")
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "get", "ctx-wf", "scope.md"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "v2");
+}
+
+#[test]
+fn context_hierarchical_keys_work() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "research/r1/lead-cli-ux.md"])
+        .write_stdin("deep content")
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "get", "ctx-wf", "research/r1/lead-cli-ux.md"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "deep content");
+}
