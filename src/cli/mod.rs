@@ -71,6 +71,10 @@ pub enum Command {
         /// Directed transition to a named state
         #[arg(long)]
         to: Option<String>,
+
+        /// Skip session cleanup when reaching a terminal state (useful for debugging)
+        #[arg(long)]
+        no_cleanup: bool,
     },
 
     /// Cancel a workflow, preventing further advancement
@@ -205,9 +209,10 @@ pub fn run(app: App) -> Result<()> {
             name,
             with_data,
             to,
+            no_cleanup,
         } => {
             let backend = build_backend()?;
-            handle_next(&backend, name, with_data, to)
+            handle_next(&backend, name, with_data, to, no_cleanup)
         }
         Command::Cancel { name } => {
             let backend = build_backend()?;
@@ -464,6 +469,7 @@ fn handle_next(
     name: String,
     with_data: Option<String>,
     to: Option<String>,
+    no_cleanup: bool,
 ) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
@@ -697,6 +703,12 @@ fn handle_next(
             Ok(resp) => {
                 let resp = substitute_directive_in_response(resp, &runtime_vars);
                 println!("{}", serde_json::to_string(&resp)?);
+                // Auto-cleanup after output when reaching a terminal state.
+                if matches!(resp, next_types::NextResponse::Terminal { .. }) && !no_cleanup {
+                    if let Err(e) = backend.cleanup(&name) {
+                        eprintln!("warning: session cleanup failed: {}", e);
+                    }
+                }
                 std::process::exit(0);
             }
             Err(err) => {
@@ -1050,6 +1062,12 @@ fn handle_next(
             };
 
             println!("{}", serde_json::to_string(&resp)?);
+            // Auto-cleanup after output when reaching a terminal state.
+            if matches!(resp, NextResponse::Terminal { .. }) && !no_cleanup {
+                if let Err(e) = backend.cleanup(&name) {
+                    eprintln!("warning: session cleanup failed: {}", e);
+                }
+            }
             std::process::exit(0);
         }
         Err(advance_err) => {
@@ -1071,6 +1089,7 @@ fn handle_next(
     name: String,
     _with_data: Option<String>,
     _to: Option<String>,
+    _no_cleanup: bool,
 ) -> Result<()> {
     exit_with_error_code(
         serde_json::json!({

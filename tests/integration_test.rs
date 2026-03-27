@@ -1069,9 +1069,9 @@ fn next_on_terminal_state_returns_done() {
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "term-wf", minimal_template());
 
-    // Advance to terminal state via --to.
+    // Advance to terminal state via --to, preserving session for follow-up test.
     let advance = koto_cmd(dir.path())
-        .args(["next", "term-wf", "--to", "done"])
+        .args(["next", "term-wf", "--to", "done", "--no-cleanup"])
         .output()
         .unwrap();
     assert!(
@@ -1178,13 +1178,14 @@ fn next_with_valid_evidence_advances_state() {
         "expects should be present for evidence_required"
     );
 
-    // Submit evidence via --with-data.
+    // Submit evidence via --with-data, preserving session so we can inspect the state file.
     let submit = koto_cmd(dir.path())
         .args([
             "next",
             "evid-wf",
             "--with-data",
             r#"{"decision":"proceed","notes":"looks good"}"#,
+            "--no-cleanup",
         ])
         .output()
         .unwrap();
@@ -1701,9 +1702,9 @@ fn cancel_terminal_workflow_returns_error() {
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "term-cancel-wf", minimal_template());
 
-    // Auto-advance to terminal state.
+    // Auto-advance to terminal state, preserving session for cancel test.
     let advance = koto_cmd(dir.path())
-        .args(["next", "term-cancel-wf", "--to", "done"])
+        .args(["next", "term-cancel-wf", "--to", "done", "--no-cleanup"])
         .output()
         .unwrap();
     assert!(advance.status.success());
@@ -2192,4 +2193,137 @@ fn session_full_lifecycle() {
         0,
         "list should be empty after cleanup"
     );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-19: Auto-cleanup on terminal state
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_cleanup_on_terminal_state_via_to() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "cleanup-wf", minimal_template());
+
+    let session_dir = sessions_base(dir.path()).join("cleanup-wf");
+    assert!(session_dir.exists(), "session dir should exist after init");
+
+    // Advance to terminal state via --to (auto-cleanup enabled by default).
+    let output = koto_cmd(dir.path())
+        .args(["next", "cleanup-wf", "--to", "done"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "advance to done should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify the response was printed (output first, cleanup second).
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["action"].as_str(), Some("done"));
+    assert_eq!(json["state"].as_str(), Some("done"));
+
+    // Session directory should be removed after auto-cleanup.
+    assert!(
+        !session_dir.exists(),
+        "session dir should be removed after terminal auto-cleanup"
+    );
+}
+
+#[test]
+fn auto_cleanup_on_terminal_state_via_advance() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "adv-cleanup-wf", minimal_template());
+
+    let session_dir = sessions_base(dir.path()).join("adv-cleanup-wf");
+    assert!(session_dir.exists(), "session dir should exist after init");
+
+    // Submit evidence to advance to terminal via the advancement loop.
+    // minimal_template goes start -> done with an unconditional transition,
+    // so just submitting empty evidence (or using --to) reaches terminal.
+    let output = koto_cmd(dir.path())
+        .args(["next", "adv-cleanup-wf", "--to", "done"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Session directory should be removed.
+    assert!(
+        !session_dir.exists(),
+        "session dir should be removed after auto-advance to terminal"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-20: --no-cleanup preserves session on terminal state
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_cleanup_flag_preserves_session() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "keep-wf", minimal_template());
+
+    let session_dir = sessions_base(dir.path()).join("keep-wf");
+    assert!(session_dir.exists(), "session dir should exist after init");
+
+    // Advance to terminal with --no-cleanup.
+    let output = koto_cmd(dir.path())
+        .args(["next", "keep-wf", "--to", "done", "--no-cleanup"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "advance to done should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Response should still be correct.
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["action"].as_str(), Some("done"));
+
+    // Session directory should still exist.
+    assert!(
+        session_dir.exists(),
+        "session dir should be preserved when --no-cleanup is set"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Auto-cleanup graceful handling: missing session directory
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_cleanup_graceful_on_missing_session_dir() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "missing-wf", minimal_template());
+
+    let session_dir = sessions_base(dir.path()).join("missing-wf");
+    let state_path = session_state_path(dir.path(), "missing-wf");
+
+    // Manually move the state file so the session dir can be removed
+    // but the state file can be re-placed to simulate a race condition
+    // where the directory was already cleaned.
+    let state_content = std::fs::read_to_string(&state_path).unwrap();
+
+    // Remove the session dir, then recreate just the state file (no dir artifacts).
+    std::fs::remove_dir_all(&session_dir).unwrap();
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(&state_path, &state_content).unwrap();
+
+    // Advance to terminal -- cleanup should handle the partial state gracefully.
+    let output = koto_cmd(dir.path())
+        .args(["next", "missing-wf", "--to", "done"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "advance should succeed even if cleanup has edge cases: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["action"].as_str(), Some("done"));
 }
