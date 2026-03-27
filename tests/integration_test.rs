@@ -3674,7 +3674,7 @@ fn export_multi_state_fixture_contains_expected_states_and_transitions() {
 
     // Gate annotation
     assert!(
-        mermaid.contains("note left of setup : gate: config_exists"),
+        mermaid.contains("note left of setup\n        gate: config_exists\n    end note"),
         "should have gate annotation for config_exists, got:\n{}",
         mermaid
     );
@@ -3694,7 +3694,7 @@ fn export_simple_gates_fixture_has_gate_and_when_labels() {
 
     // Gate note
     assert!(
-        mermaid.contains("note left of start : gate: check_file"),
+        mermaid.contains("note left of start\n        gate: check_file\n    end note"),
         "should have gate annotation for check_file, got:\n{}",
         mermaid
     );
