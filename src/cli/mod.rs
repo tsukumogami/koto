@@ -1,9 +1,12 @@
+pub mod context;
 pub mod next;
 pub mod next_types;
+pub mod session;
+pub mod vars;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -13,13 +16,16 @@ use crate::template::types::VariableDecl;
 
 use crate::buildinfo;
 use crate::cache::{compile_cached, sha256_hex};
-use crate::discover::{find_workflows_with_metadata, workflow_state_path};
+use crate::discover::find_workflows_with_metadata;
 use crate::engine::errors::EngineError;
 use crate::engine::persistence::{
     append_event, append_header, derive_decisions, derive_machine_state, derive_state_from_log,
     read_events,
 };
 use crate::engine::types::{now_iso8601, EventPayload, StateFileHeader};
+use crate::session::context::ContextStore;
+use crate::session::local::LocalBackend;
+use crate::session::{state_file_name, SessionBackend};
 use crate::template::types::CompiledTemplate;
 
 /// Maximum payload size for --with-data (1 MB).
@@ -83,6 +89,10 @@ pub enum Command {
         /// Directed transition to a named state
         #[arg(long)]
         to: Option<String>,
+
+        /// Skip session cleanup when reaching a terminal state (useful for debugging)
+        #[arg(long)]
+        no_cleanup: bool,
     },
 
     /// Cancel a workflow, preventing further advancement
@@ -106,10 +116,77 @@ pub enum Command {
         subcommand: TemplateSubcommand,
     },
 
+    /// Session management subcommands
+    Session {
+        #[command(subcommand)]
+        subcommand: SessionCommand,
+    },
+
+    /// Content context management subcommands
+    Context {
+        #[command(subcommand)]
+        subcommand: ContextCommand,
+    },
+
     /// Decision recording and retrieval
     Decisions {
         #[command(subcommand)]
         subcommand: DecisionsSubcommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SessionCommand {
+    /// Print the absolute session directory path
+    Dir {
+        /// Session name
+        name: String,
+    },
+    /// List all sessions as JSON
+    List,
+    /// Remove a session directory (idempotent)
+    Cleanup {
+        /// Session name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ContextCommand {
+    /// Store content under a key (reads from stdin or --from-file)
+    Add {
+        /// Session name
+        session: String,
+        /// Context key (hierarchical, e.g. "scope.md" or "research/r1/lead.md")
+        key: String,
+        /// Read content from file instead of stdin
+        #[arg(long)]
+        from_file: Option<String>,
+    },
+    /// Retrieve stored content (writes to stdout or --to-file)
+    Get {
+        /// Session name
+        session: String,
+        /// Context key
+        key: String,
+        /// Write content to file instead of stdout
+        #[arg(long)]
+        to_file: Option<String>,
+    },
+    /// Check if a key exists (exit 0 if present, 1 if not)
+    Exists {
+        /// Session name
+        session: String,
+        /// Context key
+        key: String,
+    },
+    /// List all keys as a JSON array
+    List {
+        /// Session name
+        session: String,
+        /// Filter keys by prefix
+        #[arg(long)]
+        prefix: Option<String>,
     },
 }
 
@@ -250,6 +327,25 @@ fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
         Some(EngineError::StateFileCorrupted(_)) => EXIT_INFRASTRUCTURE,
         _ => 1,
     }
+}
+
+/// Construct the session backend, honoring `KOTO_SESSIONS_BASE` for testing.
+///
+/// When `KOTO_SESSIONS_BASE` is set, sessions are stored directly under that
+/// directory (bypassing repo-id hashing). This is intended for integration
+/// tests that need to control the storage location.
+fn build_backend() -> Result<LocalBackend> {
+    if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
+        Ok(LocalBackend::with_base_dir(PathBuf::from(base)))
+    } else {
+        let working_dir = std::env::current_dir()?;
+        LocalBackend::new(&working_dir)
+    }
+}
+
+/// Compute the state file path for a session.
+fn session_state_path(backend: &dyn SessionBackend, name: &str) -> PathBuf {
+    backend.session_dir(name).join(state_file_name(name))
 }
 
 /// Validate and resolve `--var KEY=VALUE` arguments against the template's
@@ -426,200 +522,30 @@ pub fn run(app: App) -> Result<()> {
             template,
             vars,
         } => {
-            // Validate workflow name before any filesystem operation.
-            if let Err(msg) = crate::discover::validate_workflow_name(&name) {
-                exit_with_error_code(
-                    serde_json::json!({
-                        "error": msg,
-                        "command": "init",
-                        "allowed_pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
-                    }),
-                    2,
-                );
-            }
-
-            let current_dir = std::env::current_dir()?;
-            let state_path = workflow_state_path(&current_dir, &name);
-
-            if state_path.exists() {
-                exit_with_error(serde_json::json!({
-                    "error": format!("workflow '{}' already exists", name),
-                    "command": "init"
-                }));
-            }
-
-            let (cache_path, hash) = match compile_cached(Path::new(&template)) {
-                Ok(result) => result,
-                Err(e) => {
-                    exit_with_error(serde_json::json!({
-                        "error": e.to_string(),
-                        "command": "init"
-                    }));
-                }
-            };
-
-            let cache_path_str = cache_path.to_string_lossy().to_string();
-            let compiled: CompiledTemplate = match load_compiled_template(&cache_path_str) {
-                Ok(t) => t,
-                Err(e) => {
-                    exit_with_error(serde_json::json!({
-                        "error": e.to_string(),
-                        "command": "init"
-                    }));
-                }
-            };
-
-            // Resolve --var flags against template variable declarations.
-            let variables = match resolve_variables(&vars, &compiled.variables) {
-                Ok(v) => v,
-                Err(e) => {
-                    exit_with_error_code(
-                        serde_json::json!({
-                            "error": e,
-                            "command": "init"
-                        }),
-                        2,
-                    );
-                }
-            };
-
-            let initial_state = compiled.initial_state.clone();
-            let ts = now_iso8601();
-
-            // Write header line
-            let header = StateFileHeader {
-                schema_version: 1,
-                workflow: name.clone(),
-                template_hash: hash,
-                created_at: ts.clone(),
-            };
-            if let Err(e) = append_header(&state_path, &header) {
-                exit_with_error(serde_json::json!({
-                    "error": e.to_string(),
-                    "command": "init"
-                }));
-            }
-
-            // Write workflow_initialized event (seq 1)
-            let init_payload = EventPayload::WorkflowInitialized {
-                template_path: cache_path_str,
-                variables,
-            };
-            if let Err(e) = append_event(&state_path, &init_payload, &ts) {
-                exit_with_error(serde_json::json!({
-                    "error": e.to_string(),
-                    "command": "init"
-                }));
-            }
-
-            // Write initial transitioned event (seq 2, from: null)
-            let transition_payload = EventPayload::Transitioned {
-                from: None,
-                to: initial_state.clone(),
-                condition_type: "auto".to_string(),
-            };
-            if let Err(e) = append_event(&state_path, &transition_payload, &ts) {
-                exit_with_error(serde_json::json!({
-                    "error": e.to_string(),
-                    "command": "init"
-                }));
-            }
-
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "name": name,
-                    "state": initial_state
-                }))?
-            );
-            Ok(())
+            let backend = build_backend()?;
+            handle_init(&backend, &name, &template, &vars)
         }
         Command::Next {
             name,
             with_data,
             to,
-        } => handle_next(name, with_data, to),
-        Command::Cancel { name } => handle_cancel(name),
+            no_cleanup,
+        } => {
+            let backend = build_backend()?;
+            let context_store: &dyn ContextStore = &backend;
+            handle_next(&backend, context_store, name, with_data, to, no_cleanup)
+        }
+        Command::Cancel { name } => {
+            let backend = build_backend()?;
+            handle_cancel(&backend, &name)
+        }
         Command::Rewind { name } => {
-            let current_dir = std::env::current_dir()?;
-            let state_path = workflow_state_path(&current_dir, &name);
-
-            if !state_path.exists() {
-                exit_with_error(serde_json::json!({
-                    "error": format!("workflow '{}' not found", name),
-                    "command": "rewind"
-                }));
-            }
-
-            let (_header, events) = match read_events(&state_path) {
-                Ok(result) => result,
-                Err(err) => {
-                    let code = exit_code_for_engine_error(&err);
-                    exit_with_error_code(
-                        serde_json::json!({
-                            "error": err.to_string(),
-                            "command": "rewind"
-                        }),
-                        code,
-                    );
-                }
-            };
-
-            // Find the current state and the state to rewind to.
-            // The current state comes from the last state-changing event.
-            // To rewind, we need to find the second-to-last state-changing event.
-            let state_changing: Vec<&crate::engine::types::Event> = events
-                .iter()
-                .filter(|e| {
-                    matches!(
-                        e.payload,
-                        EventPayload::Transitioned { .. }
-                            | EventPayload::DirectedTransition { .. }
-                            | EventPayload::Rewound { .. }
-                    )
-                })
-                .collect();
-
-            if state_changing.len() <= 1 {
-                exit_with_error(serde_json::json!({
-                    "error": "already at initial state, cannot rewind",
-                    "command": "rewind"
-                }));
-            }
-
-            let current_state = derive_state_from_log(&events).unwrap_or_default();
-            let prev_event = state_changing[state_changing.len() - 2];
-            let prev_state = match &prev_event.payload {
-                EventPayload::Transitioned { to, .. } => to.clone(),
-                EventPayload::DirectedTransition { to, .. } => to.clone(),
-                EventPayload::Rewound { to, .. } => to.clone(),
-                _ => unreachable!(),
-            };
-
-            let rewind_payload = EventPayload::Rewound {
-                from: current_state,
-                to: prev_state.clone(),
-            };
-
-            if let Err(e) = append_event(&state_path, &rewind_payload, &now_iso8601()) {
-                exit_with_error(serde_json::json!({
-                    "error": e.to_string(),
-                    "command": "rewind"
-                }));
-            }
-
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "name": name,
-                    "state": prev_state
-                }))?
-            );
-            Ok(())
+            let backend = build_backend()?;
+            handle_rewind(&backend, &name)
         }
         Command::Workflows => {
-            let current_dir = std::env::current_dir()?;
-            let metadata = match find_workflows_with_metadata(&current_dir) {
+            let backend = build_backend()?;
+            let metadata = match find_workflows_with_metadata(&backend) {
                 Ok(m) => m,
                 Err(e) => {
                     exit_with_error(serde_json::json!({
@@ -630,6 +556,72 @@ pub fn run(app: App) -> Result<()> {
             };
             println!("{}", serde_json::to_string(&metadata)?);
             Ok(())
+        }
+        Command::Session { subcommand } => {
+            let backend = build_backend()?;
+            match subcommand {
+                SessionCommand::Dir { name } => session::handle_dir(&backend, &name),
+                SessionCommand::List => session::handle_list(&backend),
+                SessionCommand::Cleanup { name } => session::handle_cleanup(&backend, &name),
+            }
+        }
+        Command::Context { subcommand } => {
+            let backend = build_backend()?;
+            let store: &dyn ContextStore = &backend;
+            match subcommand {
+                ContextCommand::Add {
+                    session,
+                    key,
+                    from_file,
+                } => {
+                    if let Err(e) = context::handle_add(store, &session, &key, from_file.as_deref())
+                    {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": e.to_string(),
+                                "command": "context add"
+                            }),
+                            EXIT_INFRASTRUCTURE,
+                        );
+                    }
+                    Ok(())
+                }
+                ContextCommand::Get {
+                    session,
+                    key,
+                    to_file,
+                } => {
+                    if let Err(e) = context::handle_get(store, &session, &key, to_file.as_deref()) {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": e.to_string(),
+                                "command": "context get"
+                            }),
+                            EXIT_INFRASTRUCTURE,
+                        );
+                    }
+                    Ok(())
+                }
+                ContextCommand::Exists { session, key } => {
+                    if context::handle_exists(store, &session, &key) {
+                        std::process::exit(0);
+                    } else {
+                        std::process::exit(1);
+                    }
+                }
+                ContextCommand::List { session, prefix } => {
+                    if let Err(e) = context::handle_list(store, &session, prefix.as_deref()) {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": e.to_string(),
+                                "command": "context list"
+                            }),
+                            EXIT_INFRASTRUCTURE,
+                        );
+                    }
+                    Ok(())
+                }
+            }
         }
         Command::Template { subcommand } => match subcommand {
             TemplateSubcommand::Compile { source } => {
@@ -735,13 +727,218 @@ pub fn run(app: App) -> Result<()> {
                 }
             }
         },
-        Command::Decisions { subcommand } => match subcommand {
-            DecisionsSubcommand::Record { name, with_data } => {
-                handle_decisions_record(name, with_data)
+        Command::Decisions { subcommand } => {
+            let backend = build_backend()?;
+            match subcommand {
+                DecisionsSubcommand::Record { name, with_data } => {
+                    handle_decisions_record(&backend, name, with_data)
+                }
+                DecisionsSubcommand::List { name } => handle_decisions_list(&backend, name),
             }
-            DecisionsSubcommand::List { name } => handle_decisions_list(name),
-        },
+        }
     }
+}
+
+/// Handle the `koto init` command.
+fn handle_init(
+    backend: &dyn SessionBackend,
+    name: &str,
+    template: &str,
+    vars: &[String],
+) -> Result<()> {
+    // Validate workflow name before any filesystem operation.
+    if let Err(msg) = crate::discover::validate_workflow_name(name) {
+        exit_with_error_code(
+            serde_json::json!({
+                "error": msg,
+                "command": "init",
+                "allowed_pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+            }),
+            2,
+        );
+    }
+
+    // Check if session already exists (state file present).
+    if backend.exists(name) {
+        exit_with_error(serde_json::json!({
+            "error": format!("workflow '{}' already exists", name),
+            "command": "init"
+        }));
+    }
+
+    // Create the session directory.
+    let session_dir = match backend.create(name) {
+        Ok(dir) => dir,
+        Err(e) => {
+            exit_with_error(serde_json::json!({
+                "error": e.to_string(),
+                "command": "init"
+            }));
+        }
+    };
+
+    let (cache_path, hash) = match compile_cached(Path::new(template)) {
+        Ok(result) => result,
+        Err(e) => {
+            exit_with_error(serde_json::json!({
+                "error": e.to_string(),
+                "command": "init"
+            }));
+        }
+    };
+
+    let cache_path_str = cache_path.to_string_lossy().to_string();
+    let compiled: CompiledTemplate = match load_compiled_template(&cache_path_str) {
+        Ok(t) => t,
+        Err(e) => {
+            exit_with_error(serde_json::json!({
+                "error": e.to_string(),
+                "command": "init"
+            }));
+        }
+    };
+
+    // Resolve --var flags against template variable declarations.
+    let variables = match resolve_variables(vars, &compiled.variables) {
+        Ok(v) => v,
+        Err(e) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": e,
+                    "command": "init"
+                }),
+                2,
+            );
+        }
+    };
+
+    let initial_state = compiled.initial_state.clone();
+    let ts = now_iso8601();
+    let state_path = session_dir.join(state_file_name(name));
+
+    // Write header line
+    let header = StateFileHeader {
+        schema_version: 1,
+        workflow: name.to_string(),
+        template_hash: hash,
+        created_at: ts.clone(),
+    };
+    if let Err(e) = append_header(&state_path, &header) {
+        exit_with_error(serde_json::json!({
+            "error": e.to_string(),
+            "command": "init"
+        }));
+    }
+
+    // Write workflow_initialized event (seq 1)
+    let init_payload = EventPayload::WorkflowInitialized {
+        template_path: cache_path_str,
+        variables,
+    };
+    if let Err(e) = append_event(&state_path, &init_payload, &ts) {
+        exit_with_error(serde_json::json!({
+            "error": e.to_string(),
+            "command": "init"
+        }));
+    }
+
+    // Write initial transitioned event (seq 2, from: null)
+    let transition_payload = EventPayload::Transitioned {
+        from: None,
+        to: initial_state.clone(),
+        condition_type: "auto".to_string(),
+    };
+    if let Err(e) = append_event(&state_path, &transition_payload, &ts) {
+        exit_with_error(serde_json::json!({
+            "error": e.to_string(),
+            "command": "init"
+        }));
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "name": name,
+            "state": initial_state
+        }))?
+    );
+    Ok(())
+}
+
+/// Handle the `koto rewind` command.
+fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
+    let state_path = session_state_path(backend, name);
+
+    if !state_path.exists() {
+        exit_with_error(serde_json::json!({
+            "error": format!("workflow '{}' not found", name),
+            "command": "rewind"
+        }));
+    }
+
+    let (_header, events) = match read_events(&state_path) {
+        Ok(result) => result,
+        Err(err) => {
+            let code = exit_code_for_engine_error(&err);
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": err.to_string(),
+                    "command": "rewind"
+                }),
+                code,
+            );
+        }
+    };
+
+    // Find the current state and the state to rewind to.
+    let state_changing: Vec<&crate::engine::types::Event> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.payload,
+                EventPayload::Transitioned { .. }
+                    | EventPayload::DirectedTransition { .. }
+                    | EventPayload::Rewound { .. }
+            )
+        })
+        .collect();
+
+    if state_changing.len() <= 1 {
+        exit_with_error(serde_json::json!({
+            "error": "already at initial state, cannot rewind",
+            "command": "rewind"
+        }));
+    }
+
+    let current_state = derive_state_from_log(&events).unwrap_or_default();
+    let prev_event = state_changing[state_changing.len() - 2];
+    let prev_state = match &prev_event.payload {
+        EventPayload::Transitioned { to, .. } => to.clone(),
+        EventPayload::DirectedTransition { to, .. } => to.clone(),
+        EventPayload::Rewound { to, .. } => to.clone(),
+        _ => unreachable!(),
+    };
+
+    let rewind_payload = EventPayload::Rewound {
+        from: current_state,
+        to: prev_state.clone(),
+    };
+
+    if let Err(e) = append_event(&state_path, &rewind_payload, &now_iso8601()) {
+        exit_with_error(serde_json::json!({
+            "error": e.to_string(),
+            "command": "rewind"
+        }));
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "name": name,
+            "state": prev_state
+        }))?
+    );
+    Ok(())
 }
 
 /// Handle the `koto next` command with full output contract support.
@@ -764,7 +961,14 @@ pub fn run(app: App) -> Result<()> {
 /// output contract). Other commands (init, rewind, etc.) use a flat
 /// `{"error": "string", "command": "..."}` format. Do not mix the two styles.
 #[cfg(unix)]
-fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> Result<()> {
+fn handle_next(
+    backend: &dyn SessionBackend,
+    context_store: &dyn ContextStore,
+    name: String,
+    with_data: Option<String>,
+    to: Option<String>,
+    no_cleanup: bool,
+) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
         BlockingCondition, ErrorDetail, ExpectsSchema, IntegrationOutput,
@@ -809,7 +1013,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
 
     // 3. Load state file and template
     let current_dir = std::env::current_dir()?;
-    let state_path = workflow_state_path(&current_dir, &name);
+    let state_path = session_state_path(backend, &name);
 
     if !state_path.exists() {
         let err = NextError {
@@ -921,6 +1125,30 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
         }
     };
 
+    // Check for reserved variable name collisions in the template.
+    for reserved in crate::cli::vars::RESERVED_VARIABLE_NAMES {
+        if compiled.variables.contains_key(*reserved) {
+            let err = NextError {
+                code: NextErrorCode::PreconditionFailed,
+                message: format!(
+                    "template declares reserved variable '{}'; this name is injected by the runtime and cannot be redefined",
+                    reserved
+                ),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code());
+        }
+    }
+
+    // Build the runtime variable map for {{SESSION_DIR}} and {{SESSION_NAME}} substitution.
+    let mut runtime_vars = std::collections::HashMap::new();
+    runtime_vars.insert(
+        "SESSION_DIR".to_string(),
+        backend.session_dir(&name).to_string_lossy().to_string(),
+    );
+    runtime_vars.insert("SESSION_NAME".to_string(), name.clone());
+
     // 4. Handle --to (directed transition) -- single-shot, no advancement loop
     if let Some(ref target) = to {
         let current_state = &machine_state.current_state;
@@ -988,8 +1216,17 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
 
         match dispatch_next(target, target_template_state, true, &gate_results) {
             Ok(resp) => {
-                let resp = resp.with_substituted_directive(|d| variables.substitute(d));
+                let resp = resp.with_substituted_directive(|d| {
+                    let d = crate::cli::vars::substitute_vars(d, &runtime_vars);
+                    variables.substitute(&d)
+                });
                 println!("{}", serde_json::to_string(&resp)?);
+                // Auto-cleanup after output when reaching a terminal state.
+                if matches!(resp, next_types::NextResponse::Terminal { .. }) && !no_cleanup {
+                    if let Err(e) = backend.cleanup(&name) {
+                        eprintln!("warning: session cleanup failed: {}", e);
+                    }
+                }
                 std::process::exit(0);
             }
             Err(err) => {
@@ -1164,18 +1401,27 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
             .map_err(|e| e.to_string())
     };
 
+    let vars_for_gates = runtime_vars.clone();
+    let session_name = &name;
     let gate_closure =
         |gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
+            // Substitute both template and runtime variables in gate command strings.
             let substituted: std::collections::BTreeMap<String, crate::template::types::Gate> =
                 gates
                     .iter()
                     .map(|(name, gate)| {
                         let mut g = gate.clone();
-                        g.command = variables.substitute(&g.command);
+                        let cmd = crate::cli::vars::substitute_vars(&g.command, &vars_for_gates);
+                        g.command = variables.substitute(&cmd);
                         (name.clone(), g)
                     })
                     .collect();
-            evaluate_gates(&substituted, &current_dir)
+            evaluate_gates(
+                &substituted,
+                &current_dir,
+                Some(context_store),
+                Some(session_name),
+            )
         };
 
     let integration_closure = |_name: &str| -> Result<serde_json::Value, IntegrationError> {
@@ -1224,7 +1470,12 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
                 polling,
                 &state_gates,
                 &|gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
-                    crate::gate::evaluate_gates(gates, &current_dir)
+                    crate::gate::evaluate_gates(
+                        gates,
+                        &current_dir,
+                        Some(context_store),
+                        Some(&name),
+                    )
                 },
                 &shutdown,
             )
@@ -1293,6 +1544,10 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
 
             let expects = crate::cli::next_types::derive_expects(final_template_state);
 
+            // Use the raw directive here; with_substituted_directive applies both
+            // runtime and template variable substitution before serialization.
+            let directive = final_template_state.directive.clone();
+
             let resp = match advance_result.stop_reason {
                 StopReason::Terminal => NextResponse::Terminal {
                     state: final_state.clone(),
@@ -1318,7 +1573,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
                         .collect();
                     NextResponse::GateBlocked {
                         state: final_state.clone(),
-                        directive: final_template_state.directive.clone(),
+                        directive: directive.clone(),
                         advanced,
                         blocking_conditions: blocking,
                     }
@@ -1333,7 +1588,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
                     });
                     NextResponse::EvidenceRequired {
                         state: final_state.clone(),
-                        directive: final_template_state.directive.clone(),
+                        directive: directive.clone(),
                         advanced,
                         expects: es,
                     }
@@ -1353,7 +1608,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
                 }
                 StopReason::Integration { name, output } => NextResponse::Integration {
                     state: final_state.clone(),
-                    directive: final_template_state.directive.clone(),
+                    directive: directive.clone(),
                     advanced,
                     expects,
                     integration: IntegrationOutput { name, output },
@@ -1361,7 +1616,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
                 StopReason::IntegrationUnavailable { name } => {
                     NextResponse::IntegrationUnavailable {
                         state: final_state.clone(),
-                        directive: final_template_state.directive.clone(),
+                        directive: directive.clone(),
                         advanced,
                         expects,
                         integration: IntegrationUnavailableMarker {
@@ -1424,14 +1679,14 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
                     } else if let Some(ref es) = expects {
                         NextResponse::EvidenceRequired {
                             state: final_state.clone(),
-                            directive: final_template_state.directive.clone(),
+                            directive: directive.clone(),
                             advanced,
                             expects: es.clone(),
                         }
                     } else {
                         NextResponse::EvidenceRequired {
                             state: final_state.clone(),
-                            directive: final_template_state.directive.clone(),
+                            directive: directive.clone(),
                             advanced,
                             expects: ExpectsSchema {
                                 event_type: "evidence_submitted".to_string(),
@@ -1443,8 +1698,17 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
                 }
             };
 
-            let resp = resp.with_substituted_directive(|d| variables.substitute(d));
+            let resp = resp.with_substituted_directive(|d| {
+                let d = crate::cli::vars::substitute_vars(d, &runtime_vars);
+                variables.substitute(&d)
+            });
             println!("{}", serde_json::to_string(&resp)?);
+            // Auto-cleanup after output when reaching a terminal state.
+            if matches!(resp, NextResponse::Terminal { .. }) && !no_cleanup {
+                if let Err(e) = backend.cleanup(&name) {
+                    eprintln!("warning: session cleanup failed: {}", e);
+                }
+            }
             std::process::exit(0);
         }
         Err(advance_err) => {
@@ -1461,7 +1725,14 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
 
 /// Non-unix stub for handle_next.
 #[cfg(not(unix))]
-fn handle_next(name: String, _with_data: Option<String>, _to: Option<String>) -> Result<()> {
+fn handle_next(
+    _backend: &dyn SessionBackend,
+    _context_store: &dyn ContextStore,
+    name: String,
+    _with_data: Option<String>,
+    _to: Option<String>,
+    _no_cleanup: bool,
+) -> Result<()> {
     exit_with_error_code(
         serde_json::json!({
             "error": "koto next is only supported on unix platforms",
@@ -1478,7 +1749,11 @@ fn handle_next(name: String, _with_data: Option<String>, _to: Option<String>) ->
 /// - "choice" (string, required)
 /// - "rationale" (string, required)
 /// - "alternatives_considered" (array of strings, optional)
-fn handle_decisions_record(name: String, with_data: String) -> Result<()> {
+fn handle_decisions_record(
+    backend: &dyn SessionBackend,
+    name: String,
+    with_data: String,
+) -> Result<()> {
     // 1. Payload size limit
     if with_data.len() > MAX_WITH_DATA_BYTES {
         exit_with_error_code(
@@ -1491,8 +1766,7 @@ fn handle_decisions_record(name: String, with_data: String) -> Result<()> {
     }
 
     // 2. Load state file
-    let current_dir = std::env::current_dir()?;
-    let state_path = workflow_state_path(&current_dir, &name);
+    let state_path = session_state_path(backend, &name);
 
     if !state_path.exists() {
         exit_with_error(serde_json::json!({
@@ -1699,9 +1973,8 @@ fn handle_decisions_record(name: String, with_data: String) -> Result<()> {
 ///
 /// Returns accumulated decisions for the current state's epoch as a
 /// standalone JSON response.
-fn handle_decisions_list(name: String) -> Result<()> {
-    let current_dir = std::env::current_dir()?;
-    let state_path = workflow_state_path(&current_dir, &name);
+fn handle_decisions_list(backend: &dyn SessionBackend, name: String) -> Result<()> {
+    let state_path = session_state_path(backend, &name);
 
     if !state_path.exists() {
         exit_with_error_code(
@@ -1755,9 +2028,8 @@ fn handle_decisions_list(name: String) -> Result<()> {
 ///
 /// Appends a `WorkflowCancelled` event to the event log. Rejects double-cancel
 /// and cancel of already-terminal workflows.
-fn handle_cancel(name: String) -> Result<()> {
-    let current_dir = std::env::current_dir()?;
-    let state_path = workflow_state_path(&current_dir, &name);
+fn handle_cancel(backend: &dyn SessionBackend, name: &str) -> Result<()> {
+    let state_path = session_state_path(backend, name);
 
     if !state_path.exists() {
         exit_with_error(serde_json::json!({

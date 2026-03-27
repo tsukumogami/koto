@@ -1,42 +1,31 @@
 use assert_cmd::Command;
 use assert_fs::TempDir;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-fn koto() -> Command {
-    Command::cargo_bin("koto").unwrap()
+/// Return a `koto` command with `KOTO_SESSIONS_BASE` set to the sessions
+/// subdirectory of `dir`.
+///
+/// All integration tests must use this to avoid writing session data into
+/// the real `~/.koto/` directory.
+fn koto_cmd(dir: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.current_dir(dir);
+    cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
+    cmd
 }
 
-fn template_with_variables() -> &'static str {
-    r#"---
-name: var-workflow
-version: "1.0"
-initial_state: start
-variables:
-  OWNER:
-    description: "Repository owner"
-    required: true
-  REPO:
-    description: "Repository name"
-    required: true
-  BRANCH:
-    description: "Branch name"
-    default: "main"
-states:
-  start:
-    transitions:
-      - target: done
-  done:
-    terminal: true
----
+/// Return the sessions base directory for a test, creating it if needed.
+fn sessions_base(dir: &Path) -> PathBuf {
+    let base = dir.join("sessions");
+    std::fs::create_dir_all(&base).unwrap();
+    base
+}
 
-## start
-
-Work on {{OWNER}}/{{REPO}} branch {{BRANCH}}.
-
-## done
-
-All done.
-"#
+/// Return the state file path for a workflow inside the sessions base directory.
+fn session_state_path(dir: &Path, name: &str) -> PathBuf {
+    sessions_base(dir)
+        .join(name)
+        .join(format!("koto-{}.state.jsonl", name))
 }
 
 fn minimal_template() -> &'static str {
@@ -69,19 +58,11 @@ fn write_template_source(dir: &Path) -> std::path::PathBuf {
     src
 }
 
-/// Write the variable template source to a file in `dir` and return its path.
-fn write_var_template_source(dir: &Path) -> std::path::PathBuf {
-    let src = dir.join("var-template.md");
-    std::fs::write(&src, template_with_variables()).unwrap();
-    src
-}
-
 /// Compile the minimal template into the cache and return the compiled JSON path.
 fn compile_template(dir: &Path) -> String {
     let src = write_template_source(dir);
 
-    let output = koto()
-        .current_dir(dir)
+    let output = koto_cmd(dir)
         .args(["template", "compile", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -100,26 +81,12 @@ fn compile_template(dir: &Path) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn version_outputs_human_readable_by_default() {
-    let output = koto().arg("version").output().unwrap();
-    assert!(output.status.success(), "version should exit 0");
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        stdout.starts_with("koto "),
-        "default version output should start with 'koto ', got: {}",
-        stdout
-    );
-    // Should NOT be JSON
-    assert!(
-        serde_json::from_str::<serde_json::Value>(&stdout).is_err(),
-        "default version output should not be JSON"
-    );
-}
-
-#[test]
 fn version_exits_0_and_produces_json() {
-    let output = koto().args(["version", "--json"]).output().unwrap();
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args(["version", "--json"])
+        .output()
+        .unwrap();
 
     assert!(output.status.success(), "version should exit 0");
 
@@ -132,55 +99,6 @@ fn version_exits_0_and_produces_json() {
     assert!(!v.is_empty(), "version field should not be empty");
 }
 
-#[test]
-fn version_is_derived_from_git_not_cargo_toml() {
-    let output = koto().args(["version", "--json"]).output().unwrap();
-    assert!(output.status.success());
-
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let version = json["version"].as_str().unwrap();
-    let commit = json["commit"].as_str().unwrap();
-
-    // Version must follow one of the git-derived patterns:
-    // - Release tag: "X.Y.Z" (digits and dots only)
-    // - Ahead of tag: "X.Y.Z-dev+<hash>"
-    // - No tags: "dev+<hash>"
-    let valid = version
-        .chars()
-        .all(|c| c.is_ascii_digit() || c == '.')                    // exact tag
-        || version.contains("-dev+")                                  // ahead of tag
-        || version.starts_with("dev+"); // no tags
-    assert!(
-        valid,
-        "version '{}' doesn't match any git-derived pattern (X.Y.Z, X.Y.Z-dev+hash, dev+hash)",
-        version
-    );
-
-    // The commit field should be a short hex hash (or "unknown" in non-git builds).
-    assert!(
-        commit == "unknown" || commit.chars().all(|c| c.is_ascii_hexdigit()),
-        "commit '{}' should be a hex hash or 'unknown'",
-        commit
-    );
-
-    // Version must NOT be the literal Cargo.toml version "0.1.0" when we're
-    // on a non-tag commit (which is always true in test builds).
-    // If we're on an exact v0.1.0 tag this would legitimately be "0.1.0",
-    // but test builds are ahead of the tag so it should have -dev+ suffix.
-    if version == "0.1.0" {
-        // Only acceptable if we're actually on the v0.1.0 tag.
-        let on_tag = std::process::Command::new("git")
-            .args(["describe", "--tags", "--exact-match"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        assert!(
-            on_tag,
-            "version is '0.1.0' but we're not on a release tag -- build.rs should produce '0.1.0-dev+<hash>'"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // init
 // ---------------------------------------------------------------------------
@@ -190,8 +108,7 @@ fn init_creates_state_file() {
     let dir = TempDir::new().unwrap();
     let src = write_template_source(dir.path());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["init", "my-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -203,7 +120,7 @@ fn init_creates_state_file() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let state_path = dir.path().join("koto-my-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "my-wf");
     assert!(state_path.exists(), "state file should be created");
 
     // Verify the state file has exactly 3 lines: header + workflow_initialized + transitioned.
@@ -253,8 +170,7 @@ fn init_fails_if_file_exists() {
     let src = write_template_source(dir.path());
 
     // First init succeeds.
-    let first = koto()
-        .current_dir(dir.path())
+    let first = koto_cmd(dir.path())
         .args(["init", "dup-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -266,8 +182,7 @@ fn init_fails_if_file_exists() {
     );
 
     // Second init must fail.
-    let second = koto()
-        .current_dir(dir.path())
+    let second = koto_cmd(dir.path())
         .args(["init", "dup-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -294,14 +209,12 @@ fn next_returns_state_directive_transitions() {
     let dir = TempDir::new().unwrap();
     let src = write_template_source(dir.path());
 
-    koto()
-        .current_dir(dir.path())
+    koto_cmd(dir.path())
         .args(["init", "next-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "next-wf"])
         .output()
         .unwrap();
@@ -341,8 +254,7 @@ fn next_returns_state_directive_transitions() {
 fn next_fails_for_unknown_workflow() {
     let dir = TempDir::new().unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "no-such-workflow"])
         .output()
         .unwrap();
@@ -375,15 +287,14 @@ fn rewind_appends_rewind_event() {
     let dir = TempDir::new().unwrap();
     let src = write_template_source(dir.path());
 
-    koto()
-        .current_dir(dir.path())
+    koto_cmd(dir.path())
         .args(["init", "rewind-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
 
     // Append a transitioned event so there are 2+ state-changing events,
     // making rewind possible (init writes header + workflow_initialized + transitioned).
-    let state_path = dir.path().join("koto-rewind-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "rewind-wf");
     let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
@@ -398,8 +309,7 @@ fn rewind_appends_rewind_event() {
         .lines()
         .count();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["rewind", "rewind-wf"])
         .output()
         .unwrap();
@@ -462,14 +372,12 @@ fn rewind_fails_at_initial_state() {
     let src = write_template_source(dir.path());
 
     // Only init — single event in the file.
-    koto()
-        .current_dir(dir.path())
+    koto_cmd(dir.path())
         .args(["init", "at-init-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["rewind", "at-init-wf"])
         .output()
         .unwrap();
@@ -491,8 +399,7 @@ fn rewind_fails_at_initial_state() {
 fn rewind_fails_for_unknown_workflow() {
     let dir = TempDir::new().unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["rewind", "no-such-workflow"])
         .output()
         .unwrap();
@@ -519,17 +426,12 @@ fn workflows_returns_array_with_workflow() {
     let dir = TempDir::new().unwrap();
     let src = write_template_source(dir.path());
 
-    koto()
-        .current_dir(dir.path())
+    koto_cmd(dir.path())
         .args(["init", "listed-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
-        .arg("workflows")
-        .output()
-        .unwrap();
+    let output = koto_cmd(dir.path()).arg("workflows").output().unwrap();
 
     assert!(
         output.status.success(),
@@ -569,11 +471,7 @@ fn workflows_returns_array_with_workflow() {
 fn workflows_returns_empty_array_when_none() {
     let dir = TempDir::new().unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
-        .arg("workflows")
-        .output()
-        .unwrap();
+    let output = koto_cmd(dir.path()).arg("workflows").output().unwrap();
 
     assert!(
         output.status.success(),
@@ -620,8 +518,7 @@ fn template_compile_fails_for_invalid_yaml() {
     // Missing closing `---` makes frontmatter parsing fail.
     std::fs::write(&src, "---\nname: [broken yaml\nno closing delimiter\n").unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["template", "compile", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -641,8 +538,7 @@ fn template_validate_succeeds_for_valid_template() {
     let dir = TempDir::new().unwrap();
     let compiled_path = compile_template(dir.path());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["template", "validate", &compiled_path])
         .output()
         .unwrap();
@@ -661,8 +557,7 @@ fn template_validate_fails_for_missing_required_fields() {
     let bad_json = dir.path().join("bad.json");
     std::fs::write(&bad_json, r#"{"format_version":1}"#).unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["template", "validate", bad_json.to_str().unwrap()])
         .output()
         .unwrap();
@@ -684,8 +579,7 @@ fn init_next_rewind_sequence() {
     init_workflow(dir.path(), "seq-wf", &template_with_accepts());
 
     // next: initial state has accepts, so it stops at start with EvidenceRequired.
-    let next_out = koto()
-        .current_dir(dir.path())
+    let next_out = koto_cmd(dir.path())
         .args(["next", "seq-wf"])
         .output()
         .unwrap();
@@ -696,16 +590,14 @@ fn init_next_rewind_sequence() {
     assert!(next_json["action"].as_str().is_some());
 
     // Use --to to advance to implement, enabling rewind.
-    let advance = koto()
-        .current_dir(dir.path())
+    let advance = koto_cmd(dir.path())
         .args(["next", "seq-wf", "--to", "implement"])
         .output()
         .unwrap();
     assert!(advance.status.success(), "--to should succeed");
 
     // rewind
-    let rewind_out = koto()
-        .current_dir(dir.path())
+    let rewind_out = koto_cmd(dir.path())
         .args(["rewind", "seq-wf"])
         .output()
         .unwrap();
@@ -719,8 +611,7 @@ fn init_next_rewind_sequence() {
     );
 
     // next after rewind: back at start, which has accepts -> EvidenceRequired.
-    let next_after = koto()
-        .current_dir(dir.path())
+    let next_after = koto_cmd(dir.path())
         .args(["next", "seq-wf"])
         .output()
         .unwrap();
@@ -740,7 +631,7 @@ fn init_next_rewind_sequence() {
     );
 
     // Verify the last event in the state file is a rewound event.
-    let state_path = dir.path().join("koto-seq-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "seq-wf");
     let state_content = std::fs::read_to_string(&state_path).unwrap();
     let last_line = state_content.lines().last().unwrap().to_string();
     let last_event: serde_json::Value =
@@ -759,11 +650,11 @@ fn init_next_rewind_sequence() {
 #[test]
 fn corrupted_state_file_rejected_with_exit_code_3() {
     let dir = TempDir::new().unwrap();
-    let state_path = dir.path().join("koto-corrupt.state.jsonl");
+    let state_path = session_state_path(dir.path(), "corrupt");
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
     std::fs::write(&state_path, "this is not valid json at all\n").unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "corrupt"])
         .output()
         .unwrap();
@@ -791,14 +682,13 @@ fn rewind_event_has_from_and_to_in_payload() {
     let dir = TempDir::new().unwrap();
     let src = write_template_source(dir.path());
 
-    koto()
-        .current_dir(dir.path())
+    koto_cmd(dir.path())
         .args(["init", "payload-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
 
     // Append a transitioned event so rewind is possible.
-    let state_path = dir.path().join("koto-payload-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "payload-wf");
     let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
     {
         use std::io::Write;
@@ -809,8 +699,7 @@ fn rewind_event_has_from_and_to_in_payload() {
         writeln!(f, "{}", extra_event).unwrap();
     }
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["rewind", "payload-wf"])
         .output()
         .unwrap();
@@ -1015,8 +904,7 @@ fn init_workflow(dir: &Path, name: &str, template_content: &str) {
     let src = dir.join(format!("{}-template.md", name));
     std::fs::write(&src, template_content).unwrap();
 
-    let output = koto()
-        .current_dir(dir)
+    let output = koto_cmd(dir)
         .args(["init", name, "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -1038,8 +926,7 @@ fn next_integration_state_returns_integration_unavailable() {
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "integ-wf", &template_with_integration());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "integ-wf"])
         .output()
         .unwrap();
@@ -1089,8 +976,7 @@ fn next_with_data_and_to_mutually_exclusive() {
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "mutex-wf", &template_with_accepts());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args([
             "next",
             "mutex-wf",
@@ -1142,8 +1028,7 @@ fn next_with_data_rejects_oversized_payload() {
     let big_value = "x".repeat(100_000);
     let payload = format!(r#"{{"decision":"{}"}}"#, big_value);
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "size-wf", "--with-data", &payload])
         .output()
         .unwrap();
@@ -1184,10 +1069,9 @@ fn next_on_terminal_state_returns_done() {
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "term-wf", minimal_template());
 
-    // Advance to terminal state via --to.
-    let advance = koto()
-        .current_dir(dir.path())
-        .args(["next", "term-wf", "--to", "done"])
+    // Advance to terminal state via --to, preserving session for follow-up test.
+    let advance = koto_cmd(dir.path())
+        .args(["next", "term-wf", "--to", "done", "--no-cleanup"])
         .output()
         .unwrap();
     assert!(
@@ -1198,8 +1082,7 @@ fn next_on_terminal_state_returns_done() {
     );
 
     // Now call next again on the terminal state.
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "term-wf"])
         .output()
         .unwrap();
@@ -1233,8 +1116,7 @@ fn next_with_failing_gate_returns_gate_blocked() {
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "gate-wf", &template_with_gate("exit 1", 0));
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "gate-wf"])
         .output()
         .unwrap();
@@ -1284,8 +1166,7 @@ fn next_with_valid_evidence_advances_state() {
     init_workflow(dir.path(), "evid-wf", &template_with_accepts());
 
     // First, check the initial state returns evidence_required.
-    let initial = koto()
-        .current_dir(dir.path())
+    let initial = koto_cmd(dir.path())
         .args(["next", "evid-wf"])
         .output()
         .unwrap();
@@ -1297,14 +1178,14 @@ fn next_with_valid_evidence_advances_state() {
         "expects should be present for evidence_required"
     );
 
-    // Submit evidence via --with-data.
-    let submit = koto()
-        .current_dir(dir.path())
+    // Submit evidence via --with-data, preserving session so we can inspect the state file.
+    let submit = koto_cmd(dir.path())
         .args([
             "next",
             "evid-wf",
             "--with-data",
             r#"{"decision":"proceed","notes":"looks good"}"#,
+            "--no-cleanup",
         ])
         .output()
         .unwrap();
@@ -1336,7 +1217,7 @@ fn next_with_valid_evidence_advances_state() {
     assert!(json["error"].is_null(), "error should be null");
 
     // Verify the state file has an evidence_submitted event.
-    let state_path = dir.path().join("koto-evid-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "evid-wf");
     let content = std::fs::read_to_string(&state_path).unwrap();
     let has_evidence = content
         .lines()
@@ -1357,8 +1238,7 @@ fn next_with_invalid_evidence_returns_structured_error() {
     init_workflow(dir.path(), "bad-evid-wf", &template_with_accepts());
 
     // Submit evidence with wrong type and missing required field.
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args([
             "next",
             "bad-evid-wf",
@@ -1414,8 +1294,7 @@ fn next_with_to_performs_directed_transition() {
     init_workflow(dir.path(), "directed-wf", &template_with_accepts());
 
     // Use --to to advance directly to implement (skipping evidence).
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "directed-wf", "--to", "implement"])
         .output()
         .unwrap();
@@ -1440,7 +1319,7 @@ fn next_with_to_performs_directed_transition() {
     assert!(json["error"].is_null(), "error should be null");
 
     // Verify the state file has a directed_transition event.
-    let state_path = dir.path().join("koto-directed-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "directed-wf");
     let content = std::fs::read_to_string(&state_path).unwrap();
     let has_directed = content
         .lines()
@@ -1452,8 +1331,7 @@ fn next_with_to_performs_directed_transition() {
 
     // Verify next on the new state works. Auto-advancement chains
     // implement -> done (unconditional transition).
-    let next_output = koto()
-        .current_dir(dir.path())
+    let next_output = koto_cmd(dir.path())
         .args(["next", "directed-wf"])
         .output()
         .unwrap();
@@ -1478,8 +1356,7 @@ fn agent_driven_workflow_loop() {
 
     // With auto-advancement, a single koto next chains through all
     // unconditional transitions: plan -> implement -> verify -> done.
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "loop-wf"])
         .output()
         .unwrap();
@@ -1568,8 +1445,7 @@ fn auto_advance_reaches_verify_from_plan() {
     init_workflow(dir.path(), "auto-wf", &template_auto_advance_4state());
 
     // Single koto next should auto-advance: plan -> implement -> verify (stops: evidence required).
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "auto-wf"])
         .output()
         .unwrap();
@@ -1612,8 +1488,7 @@ fn evidence_triggers_auto_advance_chain() {
     init_workflow(dir.path(), "chain-wf", &template_auto_advance_4state());
 
     // Auto-advance to verify first.
-    let first = koto()
-        .current_dir(dir.path())
+    let first = koto_cmd(dir.path())
         .args(["next", "chain-wf"])
         .output()
         .unwrap();
@@ -1622,8 +1497,7 @@ fn evidence_triggers_auto_advance_chain() {
     assert_eq!(first_json["state"].as_str(), Some("verify"));
 
     // Submit reject evidence -> should auto-advance: verify -> implement -> verify (stops again).
-    let reject = koto()
-        .current_dir(dir.path())
+    let reject = koto_cmd(dir.path())
         .args([
             "next",
             "chain-wf",
@@ -1652,8 +1526,7 @@ fn evidence_triggers_auto_advance_chain() {
     );
 
     // Now approve -> should auto-advance: verify -> done (terminal).
-    let approve = koto()
-        .current_dir(dir.path())
+    let approve = koto_cmd(dir.path())
         .args([
             "next",
             "chain-wf",
@@ -1687,7 +1560,7 @@ fn concurrent_next_fails_with_lock_contention() {
     init_workflow(dir.path(), "lock-wf", &template_with_accepts());
 
     // The state file is named koto-<name>.state.jsonl.
-    let state_path = dir.path().join("koto-lock-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "lock-wf");
     assert!(state_path.exists(), "state file should exist after init");
 
     // Hold an exclusive flock on the state file, simulating a concurrent koto next.
@@ -1697,8 +1570,7 @@ fn concurrent_next_fails_with_lock_contention() {
     assert_eq!(ret, 0, "test should acquire flock successfully");
 
     // Now run koto next -- it should fail because it can't acquire the lock.
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "lock-wf"])
         .output()
         .unwrap();
@@ -1740,8 +1612,7 @@ fn cancel_then_next_returns_terminal_state_error() {
     init_workflow(dir.path(), "cancel-wf", &template_with_accepts());
 
     // Cancel the workflow.
-    let cancel = koto()
-        .current_dir(dir.path())
+    let cancel = koto_cmd(dir.path())
         .args(["cancel", "cancel-wf"])
         .output()
         .unwrap();
@@ -1758,8 +1629,7 @@ fn cancel_then_next_returns_terminal_state_error() {
     assert_eq!(cancel_json["name"].as_str(), Some("cancel-wf"));
 
     // Now koto next should fail with terminal_state error.
-    let next = koto()
-        .current_dir(dir.path())
+    let next = koto_cmd(dir.path())
         .args(["next", "cancel-wf"])
         .output()
         .unwrap();
@@ -1795,16 +1665,14 @@ fn double_cancel_returns_error() {
     init_workflow(dir.path(), "dbl-cancel-wf", &template_with_accepts());
 
     // First cancel succeeds.
-    let first = koto()
-        .current_dir(dir.path())
+    let first = koto_cmd(dir.path())
         .args(["cancel", "dbl-cancel-wf"])
         .output()
         .unwrap();
     assert!(first.status.success());
 
     // Second cancel fails.
-    let second = koto()
-        .current_dir(dir.path())
+    let second = koto_cmd(dir.path())
         .args(["cancel", "dbl-cancel-wf"])
         .output()
         .unwrap();
@@ -1834,17 +1702,15 @@ fn cancel_terminal_workflow_returns_error() {
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "term-cancel-wf", minimal_template());
 
-    // Auto-advance to terminal state.
-    let advance = koto()
-        .current_dir(dir.path())
-        .args(["next", "term-cancel-wf", "--to", "done"])
+    // Auto-advance to terminal state, preserving session for cancel test.
+    let advance = koto_cmd(dir.path())
+        .args(["next", "term-cancel-wf", "--to", "done", "--no-cleanup"])
         .output()
         .unwrap();
     assert!(advance.status.success());
 
     // Cancel should fail because workflow is already terminal.
-    let cancel = koto()
-        .current_dir(dir.path())
+    let cancel = koto_cmd(dir.path())
         .args(["cancel", "term-cancel-wf"])
         .output()
         .unwrap();
@@ -1872,8 +1738,7 @@ fn gate_timeout_returns_gate_blocked() {
     // Use a gate command that sleeps longer than the 1-second timeout.
     init_workflow(dir.path(), "timeout-wf", &template_with_gate("sleep 60", 1));
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "timeout-wf"])
         .output()
         .unwrap();
@@ -1912,16 +1777,982 @@ fn gate_timeout_returns_gate_blocked() {
 }
 
 // ---------------------------------------------------------------------------
-// init --var
+// scenario-12/14/15: {{SESSION_DIR}} substituted in gate commands and directives
 // ---------------------------------------------------------------------------
+
+/// Template with {{SESSION_DIR}} in both a gate command and a directive.
+fn template_with_session_dir_vars() -> String {
+    r#"---
+name: session-dir-workflow
+version: "1.0"
+initial_state: start
+states:
+  start:
+    gates:
+      check_session:
+        type: command
+        command: "test -d {{SESSION_DIR}}"
+        timeout: 5
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Write output to {{SESSION_DIR}}/result.txt then proceed.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn session_dir_substituted_in_gate_and_directive() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "varsub-wf", &template_with_session_dir_vars());
+
+    // The session directory should exist after init (backend.create makes it).
+    let session_dir = sessions_base(dir.path()).join("varsub-wf");
+    assert!(
+        session_dir.exists(),
+        "session directory should exist after init"
+    );
+
+    // Run koto next. The gate command `test -d {{SESSION_DIR}}` should pass
+    // because the session directory exists. Then auto-advance to done.
+    let output = koto_cmd(dir.path())
+        .args(["next", "varsub-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed when {{{{SESSION_DIR}}}} resolves: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    // Gate passed, auto-advanced to done (terminal).
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "should auto-advance to done after gate passes"
+    );
+    assert_eq!(json["action"].as_str(), Some("done"));
+}
+
+#[test]
+fn session_dir_substituted_in_directive_text() {
+    let dir = TempDir::new().unwrap();
+
+    // Template where the start state has an accepts block with a conditional
+    // transition, so the engine stops for evidence. The directive contains
+    // {{SESSION_DIR}} which should be substituted.
+    let template = r#"---
+name: directive-var-workflow
+version: "1.0"
+initial_state: start
+states:
+  start:
+    accepts:
+      data:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: done
+        when:
+          data: ok
+  done:
+    terminal: true
+---
+
+## start
+
+Save your work to {{SESSION_DIR}}/output.txt before submitting.
+
+## done
+
+All done.
+"#;
+
+    init_workflow(dir.path(), "dirvar-wf", template);
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "dirvar-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let directive = json["directive"]
+        .as_str()
+        .unwrap_or_else(|| panic!("directive missing from response: {}", json));
+
+    // The directive should NOT contain the raw {{SESSION_DIR}} token.
+    assert!(
+        !directive.contains("{{SESSION_DIR}}"),
+        "directive should have {{{{SESSION_DIR}}}} substituted, got: {}",
+        directive
+    );
+
+    // It should contain the actual session directory path.
+    let session_dir = sessions_base(dir.path()).join("dirvar-wf");
+    assert!(
+        directive.contains(&session_dir.to_string_lossy().to_string()),
+        "directive should contain the actual session dir path, got: {}",
+        directive
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-13: Reserved variable name collision rejected
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reserved_variable_name_collision_rejected() {
+    let dir = TempDir::new().unwrap();
+
+    // Template that declares SESSION_DIR in its variables block.
+    let template = r#"---
+name: collision-workflow
+version: "1.0"
+initial_state: start
+variables:
+  SESSION_DIR:
+    description: "This collides with a reserved name"
+    required: false
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Do something.
+
+## done
+
+All done.
+"#;
+
+    init_workflow(dir.path(), "collide-wf", template);
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "collide-wf"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "reserved name collision should fail with exit 2, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("precondition_failed"),
+        "error code should be precondition_failed"
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("reserved variable"),
+        "error message should mention reserved variable, got: {}",
+        json["error"]["message"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Session subcommand tests (scenario-16, scenario-17, scenario-18)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_dir_prints_absolute_path() {
+    let dir = TempDir::new().unwrap();
+    let name = "my-workflow";
+
+    let output = koto_cmd(dir.path())
+        .args(["session", "dir", name])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "session dir should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let path = stdout.trim();
+    // Should be an absolute path containing the session name
+    assert!(
+        Path::new(path).is_absolute(),
+        "session dir output should be an absolute path, got: {}",
+        path
+    );
+    assert!(
+        path.contains(name),
+        "session dir output should contain the session name, got: {}",
+        path
+    );
+}
+
+#[test]
+fn session_list_outputs_json_array() {
+    let dir = TempDir::new().unwrap();
+
+    // List with no sessions should return an empty array
+    let output = koto_cmd(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "session list should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(json.is_array(), "session list should output a JSON array");
+    assert_eq!(json.as_array().unwrap().len(), 0, "should have no sessions");
+
+    // Init a workflow, then list should show it
+    let template_path = write_template_source(dir.path());
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "test-wf",
+            "--template",
+            template_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "should have one session");
+    assert_eq!(arr[0]["id"].as_str(), Some("test-wf"));
+    assert!(
+        arr[0]["created_at"].is_string(),
+        "created_at should be a string"
+    );
+}
+
+#[test]
+fn session_cleanup_removes_session() {
+    let dir = TempDir::new().unwrap();
+    let template_path = write_template_source(dir.path());
+
+    // Init a workflow
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "cleanup-wf",
+            "--template",
+            template_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Verify it exists in list
+    let output = koto_cmd(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 1);
+
+    // Cleanup
+    koto_cmd(dir.path())
+        .args(["session", "cleanup", "cleanup-wf"])
+        .assert()
+        .success();
+
+    // Verify list is now empty
+    let output = koto_cmd(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(
+        json.as_array().unwrap().len(),
+        0,
+        "session should be removed after cleanup"
+    );
+}
+
+#[test]
+fn session_cleanup_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+
+    // Cleanup a non-existent session should succeed
+    koto_cmd(dir.path())
+        .args(["session", "cleanup", "nonexistent"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn session_without_subcommand_shows_help() {
+    let dir = TempDir::new().unwrap();
+
+    let output = koto_cmd(dir.path()).args(["session"]).output().unwrap();
+
+    // clap exits with code 2 when a required subcommand is missing
+    assert!(
+        !output.status.success(),
+        "session without subcommand should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Usage") || stderr.contains("usage"),
+        "should show usage info, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn session_full_lifecycle() {
+    let dir = TempDir::new().unwrap();
+    let template_path = write_template_source(dir.path());
+
+    // Init a workflow
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "lifecycle-wf",
+            "--template",
+            template_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Verify dir path
+    let output = koto_cmd(dir.path())
+        .args(["session", "dir", "lifecycle-wf"])
+        .output()
+        .unwrap();
+    let dir_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(
+        Path::new(&dir_path).exists(),
+        "session dir should exist after init"
+    );
+
+    // Verify list shows it
+    let output = koto_cmd(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 1);
+
+    // Cleanup
+    koto_cmd(dir.path())
+        .args(["session", "cleanup", "lifecycle-wf"])
+        .assert()
+        .success();
+
+    // Verify dir is gone
+    assert!(
+        !Path::new(&dir_path).exists(),
+        "session dir should be removed after cleanup"
+    );
+
+    // Verify list is empty
+    let output = koto_cmd(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(
+        json.as_array().unwrap().len(),
+        0,
+        "list should be empty after cleanup"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-19: Auto-cleanup on terminal state
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_cleanup_on_terminal_state_via_to() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "cleanup-wf", minimal_template());
+
+    let session_dir = sessions_base(dir.path()).join("cleanup-wf");
+    assert!(session_dir.exists(), "session dir should exist after init");
+
+    // Advance to terminal state via --to (auto-cleanup enabled by default).
+    let output = koto_cmd(dir.path())
+        .args(["next", "cleanup-wf", "--to", "done"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "advance to done should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify the response was printed (output first, cleanup second).
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["action"].as_str(), Some("done"));
+    assert_eq!(json["state"].as_str(), Some("done"));
+
+    // Session directory should be removed after auto-cleanup.
+    assert!(
+        !session_dir.exists(),
+        "session dir should be removed after terminal auto-cleanup"
+    );
+}
+
+#[test]
+fn auto_cleanup_on_terminal_state_via_advance() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "adv-cleanup-wf", minimal_template());
+
+    let session_dir = sessions_base(dir.path()).join("adv-cleanup-wf");
+    assert!(session_dir.exists(), "session dir should exist after init");
+
+    // Submit evidence to advance to terminal via the advancement loop.
+    // minimal_template goes start -> done with an unconditional transition,
+    // so just submitting empty evidence (or using --to) reaches terminal.
+    let output = koto_cmd(dir.path())
+        .args(["next", "adv-cleanup-wf", "--to", "done"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Session directory should be removed.
+    assert!(
+        !session_dir.exists(),
+        "session dir should be removed after auto-advance to terminal"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-20: --no-cleanup preserves session on terminal state
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_cleanup_flag_preserves_session() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "keep-wf", minimal_template());
+
+    let session_dir = sessions_base(dir.path()).join("keep-wf");
+    assert!(session_dir.exists(), "session dir should exist after init");
+
+    // Advance to terminal with --no-cleanup.
+    let output = koto_cmd(dir.path())
+        .args(["next", "keep-wf", "--to", "done", "--no-cleanup"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "advance to done should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Response should still be correct.
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["action"].as_str(), Some("done"));
+
+    // Session directory should still exist.
+    assert!(
+        session_dir.exists(),
+        "session dir should be preserved when --no-cleanup is set"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Auto-cleanup graceful handling: missing session directory
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_cleanup_graceful_on_missing_session_dir() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "missing-wf", minimal_template());
+
+    let session_dir = sessions_base(dir.path()).join("missing-wf");
+    let state_path = session_state_path(dir.path(), "missing-wf");
+
+    // Manually move the state file so the session dir can be removed
+    // but the state file can be re-placed to simulate a race condition
+    // where the directory was already cleaned.
+    let state_content = std::fs::read_to_string(&state_path).unwrap();
+
+    // Remove the session dir, then recreate just the state file (no dir artifacts).
+    std::fs::remove_dir_all(&session_dir).unwrap();
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(&state_path, &state_content).unwrap();
+
+    // Advance to terminal -- cleanup should handle the partial state gracefully.
+    let output = koto_cmd(dir.path())
+        .args(["next", "missing-wf", "--to", "done"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "advance should succeed even if cleanup has edge cases: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["action"].as_str(), Some("done"));
+}
+
+// ---------------------------------------------------------------------------
+// Context subcommand tests
+// ---------------------------------------------------------------------------
+
+/// Helper: create a session directory (without a full workflow init) so context
+/// commands have somewhere to store files.
+fn create_session_dir(dir: &Path, name: &str) {
+    let session_dir = sessions_base(dir).join(name);
+    std::fs::create_dir_all(&session_dir).unwrap();
+}
+
+#[test]
+fn context_add_from_stdin_and_get_to_stdout() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    // Add content via stdin
+    let output = koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "scope.md"])
+        .write_stdin("hello from stdin")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "context add should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Get content to stdout
+    let output = koto_cmd(dir.path())
+        .args(["context", "get", "ctx-wf", "scope.md"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "context get should succeed");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello from stdin");
+}
+
+#[test]
+fn context_add_from_file_and_get_to_file() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    let input_file = dir.path().join("input.txt");
+    std::fs::write(&input_file, "file content here").unwrap();
+
+    // Add from file
+    let output = koto_cmd(dir.path())
+        .args([
+            "context",
+            "add",
+            "ctx-wf",
+            "data.txt",
+            "--from-file",
+            input_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "context add --from-file should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Get to file
+    let output_file = dir.path().join("output.txt");
+    let output = koto_cmd(dir.path())
+        .args([
+            "context",
+            "get",
+            "ctx-wf",
+            "data.txt",
+            "--to-file",
+            output_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "context get --to-file should succeed"
+    );
+
+    let written = std::fs::read_to_string(&output_file).unwrap();
+    assert_eq!(written, "file content here");
+}
+
+#[test]
+fn context_exists_returns_exit_0_when_present() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    // Add a key
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "scope.md"])
+        .write_stdin("data")
+        .assert()
+        .success();
+
+    // Exists should return exit 0
+    let output = koto_cmd(dir.path())
+        .args(["context", "exists", "ctx-wf", "scope.md"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "context exists should exit 0 for present key"
+    );
+    // No stdout output for exists
+    assert!(
+        output.stdout.is_empty(),
+        "context exists should produce no stdout"
+    );
+}
+
+#[test]
+fn context_exists_returns_exit_1_when_missing() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "exists", "ctx-wf", "missing.md"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "context exists should exit 1 for missing key"
+    );
+}
+
+#[test]
+fn context_list_returns_json_array() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    // Empty list
+    let output = koto_cmd(dir.path())
+        .args(["context", "list", "ctx-wf"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(json, serde_json::json!([]));
+
+    // Add some keys
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "beta.md"])
+        .write_stdin("b")
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "alpha.md"])
+        .write_stdin("a")
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "list", "ctx-wf"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(json, serde_json::json!(["alpha.md", "beta.md"]));
+}
+
+#[test]
+fn context_list_with_prefix_filter() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "scope.md"])
+        .write_stdin("s")
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "research/r1/a.md"])
+        .write_stdin("a")
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "research/r1/b.md"])
+        .write_stdin("b")
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "list", "ctx-wf", "--prefix", "research/"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!(["research/r1/a.md", "research/r1/b.md"])
+    );
+}
+
+#[test]
+fn context_add_does_not_advance_workflow_state() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "state-wf", minimal_template());
+
+    // Read state file content before context add
+    let state_path = session_state_path(dir.path(), "state-wf");
+    let before = std::fs::read_to_string(&state_path).unwrap();
+
+    // Add context
+    koto_cmd(dir.path())
+        .args(["context", "add", "state-wf", "scope.md"])
+        .write_stdin("context data")
+        .assert()
+        .success();
+
+    // State file should be unchanged (no new events appended)
+    let after = std::fs::read_to_string(&state_path).unwrap();
+    assert_eq!(
+        before, after,
+        "context add should not modify the state file"
+    );
+}
+
+#[test]
+fn context_get_missing_key_returns_error() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "get", "ctx-wf", "nonexistent.md"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "context get for missing key should exit 3"
+    );
+}
+
+#[test]
+fn context_add_rejects_invalid_key() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "../escape.md"])
+        .write_stdin("bad")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "context add with path traversal key should exit 3"
+    );
+}
+
+#[test]
+fn context_add_overwrites_existing_key() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "scope.md"])
+        .write_stdin("v1")
+        .assert()
+        .success();
+
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "scope.md"])
+        .write_stdin("v2")
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "get", "ctx-wf", "scope.md"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "v2");
+}
+
+#[test]
+fn context_hierarchical_keys_work() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "research/r1/lead-cli-ux.md"])
+        .write_stdin("deep content")
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "get", "ctx-wf", "research/r1/lead-cli-ux.md"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "deep content");
+}
+
+// ---------------------------------------------------------------------------
+// Tests from main branch (export, variables, default_action, etc.)
+// ---------------------------------------------------------------------------
+
+fn template_with_variables() -> &'static str {
+    r#"---
+name: var-workflow
+version: "1.0"
+initial_state: start
+variables:
+  OWNER:
+    description: "Repository owner"
+    required: true
+  REPO:
+    description: "Repository name"
+    required: true
+  BRANCH:
+    description: "Branch name"
+    default: "main"
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Work on {{OWNER}}/{{REPO}} branch {{BRANCH}}.
+
+## done
+
+All done.
+"#
+}
+
+/// Write the variable template source to a file in `dir` and return its path.
+fn write_var_template_source(dir: &Path) -> std::path::PathBuf {
+    let src = dir.join("var-template.md");
+    std::fs::write(&src, template_with_variables()).unwrap();
+    src
+}
+
+#[test]
+fn version_outputs_human_readable_by_default() {
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .arg("version")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "version should exit 0");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("koto "),
+        "default version output should start with 'koto ', got: {}",
+        stdout
+    );
+    // Should NOT be JSON
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stdout).is_err(),
+        "default version output should not be JSON"
+    );
+}
+
+#[test]
+fn version_is_derived_from_git_not_cargo_toml() {
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args(["version", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let version = json["version"].as_str().unwrap();
+    let commit = json["commit"].as_str().unwrap();
+
+    // Version must follow one of the git-derived patterns:
+    // - Release tag: "X.Y.Z" (digits and dots only)
+    // - Ahead of tag: "X.Y.Z-dev+<hash>"
+    // - No tags: "dev+<hash>"
+    let valid = version
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '.')                    // exact tag
+        || version.contains("-dev+")                                  // ahead of tag
+        || version.starts_with("dev+"); // no tags
+    assert!(
+        valid,
+        "version '{}' doesn't match any git-derived pattern (X.Y.Z, X.Y.Z-dev+hash, dev+hash)",
+        version
+    );
+
+    // The commit field should be a short hex hash (or "unknown" in non-git builds).
+    assert!(
+        commit == "unknown" || commit.chars().all(|c| c.is_ascii_hexdigit()),
+        "commit '{}' should be a hex hash or 'unknown'",
+        commit
+    );
+
+    // Version must NOT be the literal Cargo.toml version "0.1.0" when we're
+    // on a non-tag commit (which is always true in test builds).
+    // If we're on an exact v0.1.0 tag this would legitimately be "0.1.0",
+    // but test builds are ahead of the tag so it should have -dev+ suffix.
+    if version == "0.1.0" {
+        // Only acceptable if we're actually on the v0.1.0 tag.
+        let on_tag = std::process::Command::new("git")
+            .args(["describe", "--tags", "--exact-match"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(
+            on_tag,
+            "version is '0.1.0' but we're not on a release tag -- build.rs should produce '0.1.0-dev+<hash>'"
+        );
+    }
+}
 
 #[test]
 fn init_var_valid_vars_stored_in_event() {
     let dir = TempDir::new().unwrap();
     let src = write_var_template_source(dir.path());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args([
             "init",
             "var-wf",
@@ -1943,7 +2774,7 @@ fn init_var_valid_vars_stored_in_event() {
     );
 
     // Verify the variables are stored in the workflow_initialized event.
-    let state_path = dir.path().join("koto-var-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "var-wf");
     let content = std::fs::read_to_string(&state_path).unwrap();
     let lines: Vec<&str> = content.lines().collect();
     // Line 0 = header, line 1 = workflow_initialized event.
@@ -1960,8 +2791,7 @@ fn init_var_missing_equals_fails() {
     let dir = TempDir::new().unwrap();
     let src = write_var_template_source(dir.path());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args([
             "init",
             "var-wf",
@@ -1992,8 +2822,7 @@ fn init_var_duplicate_key_fails() {
     let dir = TempDir::new().unwrap();
     let src = write_var_template_source(dir.path());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args([
             "init",
             "var-wf",
@@ -2024,8 +2853,7 @@ fn init_var_unknown_key_fails() {
     let dir = TempDir::new().unwrap();
     let src = write_var_template_source(dir.path());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args([
             "init",
             "var-wf",
@@ -2057,8 +2885,7 @@ fn init_var_missing_required_fails() {
     let src = write_var_template_source(dir.path());
 
     // Only provide OWNER but not REPO (both required).
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args([
             "init",
             "var-wf",
@@ -2089,8 +2916,7 @@ fn init_var_default_applied_for_optional() {
     let src = write_var_template_source(dir.path());
 
     // Provide only the two required vars; BRANCH has a default.
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args([
             "init",
             "var-wf",
@@ -2111,7 +2937,7 @@ fn init_var_default_applied_for_optional() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let state_path = dir.path().join("koto-var-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "var-wf");
     let content = std::fs::read_to_string(&state_path).unwrap();
     let lines: Vec<&str> = content.lines().collect();
     let init_event: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -2128,8 +2954,7 @@ fn init_var_forbidden_chars_fail() {
     let dir = TempDir::new().unwrap();
     let src = write_var_template_source(dir.path());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args([
             "init",
             "var-wf",
@@ -2162,8 +2987,7 @@ fn init_no_variables_no_flags_works() {
     let dir = TempDir::new().unwrap();
     let src = write_template_source(dir.path());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["init", "no-var-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -2182,8 +3006,7 @@ fn init_no_variables_with_flags_fails() {
     let dir = TempDir::new().unwrap();
     let src = write_template_source(dir.path());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args([
             "init",
             "no-var-wf",
@@ -2208,10 +3031,6 @@ fn init_no_variables_with_flags_fails() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// next: variable substitution
-// ---------------------------------------------------------------------------
-
 /// Helper to init a workflow with --var flags.
 fn init_workflow_with_vars(dir: &Path, name: &str, template_content: &str, vars: &[&str]) {
     let src = dir.join(format!("{}-template.md", name));
@@ -2223,7 +3042,7 @@ fn init_workflow_with_vars(dir: &Path, name: &str, template_content: &str, vars:
         args.push(var);
     }
 
-    let output = koto().current_dir(dir).args(&args).output().unwrap();
+    let output = koto_cmd(dir).args(&args).output().unwrap();
 
     assert!(
         output.status.success(),
@@ -2330,8 +3149,7 @@ fn next_var_gate_evaluates_with_substituted_command() {
         &["TASK_ID=42"],
     );
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "var-gate-wf"])
         .output()
         .unwrap();
@@ -2372,8 +3190,7 @@ fn next_var_gate_fails_when_substituted_path_missing() {
         &["TASK_ID=99999"],
     );
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "var-gate-fail-wf"])
         .output()
         .unwrap();
@@ -2414,8 +3231,7 @@ fn next_var_directive_contains_substituted_values() {
         &["OWNER=acme", "REPO=widgets"],
     );
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "var-dir-wf"])
         .output()
         .unwrap();
@@ -2451,8 +3267,7 @@ fn next_var_to_directed_transition_substitutes_directive() {
     );
 
     // Use --to to direct transition from start to work.
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "var-to-wf", "--to", "work"])
         .output()
         .unwrap();
@@ -2474,10 +3289,6 @@ fn next_var_to_directed_transition_substitutes_directive() {
         "directed transition directive should contain substituted values"
     );
 }
-
-// ---------------------------------------------------------------------------
-// default_action execution tests
-// ---------------------------------------------------------------------------
 
 fn template_with_default_action_creating_file() -> String {
     r#"---
@@ -2518,9 +3329,8 @@ fn default_action_creates_file_and_auto_advances() {
         &template_with_default_action_creating_file(),
     );
 
-    let output = koto()
-        .current_dir(dir.path())
-        .args(["next", "action-wf"])
+    let output = koto_cmd(dir.path())
+        .args(["next", "action-wf", "--no-cleanup"])
         .output()
         .unwrap();
 
@@ -2552,7 +3362,7 @@ fn default_action_creates_file_and_auto_advances() {
 
     // Verify the state file contains a default_action_executed event.
     let state_content =
-        std::fs::read_to_string(dir.path().join("koto-action-wf.state.jsonl")).unwrap();
+        std::fs::read_to_string(session_state_path(dir.path(), "action-wf")).unwrap();
     assert!(
         state_content.contains("default_action_executed"),
         "state file should contain default_action_executed event"
@@ -2598,8 +3408,7 @@ Done.
     init_workflow(dir.path(), "skip-wf", template);
 
     // Submit evidence before calling next, which sets the override evidence.
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "skip-wf", "--with-data", r#"{"status": "manual"}"#])
         .output()
         .unwrap();
@@ -2654,8 +3463,7 @@ fn requires_confirmation_stops_and_returns_output() {
         &template_with_requires_confirmation(),
     );
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "confirm-wf"])
         .output()
         .unwrap();
@@ -2746,8 +3554,7 @@ fn polling_action_retries_until_success() {
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "poll-wf", &template_with_polling_action());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "poll-wf"])
         .output()
         .unwrap();
@@ -2776,10 +3583,6 @@ fn polling_action_retries_until_success() {
         "polling should have created ready.txt"
     );
 }
-
-// ---------------------------------------------------------------------------
-// export: mermaid output validation and determinism
-// ---------------------------------------------------------------------------
 
 /// Path to the multi-state fixture template.
 fn fixture_multi_state() -> std::path::PathBuf {
@@ -2979,8 +3782,7 @@ fn export_md_and_json_produce_identical_output() {
     // to get a .json output.
     let fixture = fixture_multi_state();
 
-    let compile_output = koto()
-        .current_dir(dir.path())
+    let compile_output = koto_cmd(dir.path())
         .args(["template", "compile", fixture.to_str().unwrap()])
         .output()
         .unwrap();
@@ -2997,8 +3799,7 @@ fn export_md_and_json_produce_identical_output() {
         .to_string();
 
     // Export from .md source
-    let md_output = koto()
-        .current_dir(dir.path())
+    let md_output = koto_cmd(dir.path())
         .args(["template", "export", fixture.to_str().unwrap()])
         .output()
         .unwrap();
@@ -3010,8 +3811,7 @@ fn export_md_and_json_produce_identical_output() {
     );
 
     // Export from .json source
-    let json_output = koto()
-        .current_dir(dir.path())
+    let json_output = koto_cmd(dir.path())
         .args(["template", "export", &json_path])
         .output()
         .unwrap();
@@ -3035,7 +3835,8 @@ fn export_md_and_json_produce_identical_output() {
 fn export_cli_outputs_mermaid_to_stdout() {
     let fixture = fixture_multi_state();
 
-    let output = koto()
+    let output = Command::cargo_bin("koto")
+        .unwrap()
         .args(["template", "export", fixture.to_str().unwrap()])
         .output()
         .unwrap();
@@ -3062,8 +3863,7 @@ fn export_cli_writes_to_output_file() {
     let fixture = fixture_multi_state();
     let output_path = dir.path().join("diagram.mermaid.md");
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args([
             "template",
             "export",
@@ -3103,12 +3903,14 @@ fn export_cli_writes_to_output_file() {
 fn export_determinism_via_cli() {
     let fixture = fixture_multi_state();
 
-    let first = koto()
+    let first = Command::cargo_bin("koto")
+        .unwrap()
         .args(["template", "export", fixture.to_str().unwrap()])
         .output()
         .unwrap();
 
-    let second = koto()
+    let second = Command::cargo_bin("koto")
+        .unwrap()
         .args(["template", "export", fixture.to_str().unwrap()])
         .output()
         .unwrap();
@@ -3122,8 +3924,6 @@ fn export_determinism_via_cli() {
     );
 }
 
-// export: --check freshness flag
-
 #[test]
 fn export_check_fresh_file_exits_0() {
     let dir = TempDir::new().unwrap();
@@ -3131,7 +3931,8 @@ fn export_check_fresh_file_exits_0() {
     let output_path = dir.path().join("diagram.mermaid.md");
 
     // First, generate the file.
-    let gen = koto()
+    let gen = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3148,7 +3949,8 @@ fn export_check_fresh_file_exits_0() {
     );
 
     // Now check: should exit 0 because the file is fresh.
-    let check = koto()
+    let check = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3175,7 +3977,8 @@ fn export_check_stale_file_exits_1() {
     // Write stale content.
     std::fs::write(&output_path, b"stale content").unwrap();
 
-    let check = koto()
+    let check = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3211,7 +4014,8 @@ fn export_check_missing_file_exits_1() {
     let fixture = fixture_multi_state();
     let output_path = dir.path().join("nonexistent.mermaid.md");
 
-    let check = koto()
+    let check = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3251,7 +4055,8 @@ fn export_check_fix_command_resolves_drift() {
     std::fs::write(&output_path, b"stale").unwrap();
 
     // Run --check to get the fix command (it will fail).
-    let check = koto()
+    let check = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3267,7 +4072,8 @@ fn export_check_fix_command_resolves_drift() {
     assert!(!check.status.success());
 
     // Apply the fix: regenerate the file.
-    let fix = koto()
+    let fix = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3286,7 +4092,8 @@ fn export_check_fix_command_resolves_drift() {
     );
 
     // Now --check should pass.
-    let recheck = koto()
+    let recheck = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3306,17 +4113,14 @@ fn export_check_fix_command_resolves_drift() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// export: html output validation and determinism
-// ---------------------------------------------------------------------------
-
 /// Export a fixture template to HTML via CLI and return the file contents.
 /// HTML format requires --output, so this writes to a temp file.
 fn export_html_to_file(fixture: &Path) -> (String, TempDir) {
     let dir = TempDir::new().unwrap();
     let output_path = dir.path().join("preview.html");
 
-    let output = koto()
+    let output = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3408,7 +4212,8 @@ fn export_html_determinism_via_cli() {
     let first_path = dir.path().join("first.html");
     let second_path = dir.path().join("second.html");
 
-    let first = koto()
+    let first = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3421,7 +4226,8 @@ fn export_html_determinism_via_cli() {
         .output()
         .unwrap();
 
-    let second = koto()
+    let second = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3452,8 +4258,7 @@ fn export_html_writes_to_output_file() {
     let fixture = fixture_multi_state();
     let output_path = dir.path().join("preview.html");
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args([
             "template",
             "export",
@@ -3519,7 +4324,8 @@ fn export_html_check_fresh_exits_0() {
     let output_path = dir.path().join("preview.html");
 
     // Generate the file.
-    let gen = koto()
+    let gen = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3538,7 +4344,8 @@ fn export_html_check_fresh_exits_0() {
     );
 
     // Check: should exit 0 because the file is fresh.
-    let check = koto()
+    let check = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3567,7 +4374,8 @@ fn export_html_check_stale_exits_1() {
     // Write stale content.
     std::fs::write(&output_path, b"<html>stale</html>").unwrap();
 
-    let check = koto()
+    let check = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3605,7 +4413,8 @@ fn export_html_check_missing_exits_1() {
     let fixture = fixture_multi_state();
     let output_path = dir.path().join("nonexistent.html");
 
-    let check = koto()
+    let check = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3647,7 +4456,8 @@ fn export_html_check_fix_command_resolves_drift() {
     std::fs::write(&output_path, b"stale").unwrap();
 
     // Run --check (it will fail).
-    let check = koto()
+    let check = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3663,7 +4473,8 @@ fn export_html_check_fix_command_resolves_drift() {
     assert!(!check.status.success());
 
     // Apply the fix: regenerate the file.
-    let fix = koto()
+    let fix = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3682,7 +4493,8 @@ fn export_html_check_fix_command_resolves_drift() {
     );
 
     // Now --check should pass.
-    let recheck = koto()
+    let recheck = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3702,15 +4514,12 @@ fn export_html_check_fix_command_resolves_drift() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// export: flag compatibility and error handling (Issue #7)
-// ---------------------------------------------------------------------------
-
 #[test]
 fn export_flag_html_without_output_errors() {
     let fixture = fixture_multi_state();
 
-    let output = koto()
+    let output = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3740,7 +4549,8 @@ fn export_flag_open_without_html_errors() {
     let fixture = fixture_multi_state();
     let output_path = dir.path().join("out.mermaid.md");
 
-    let output = koto()
+    let output = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3773,7 +4583,8 @@ fn export_flag_open_with_check_errors() {
     let fixture = fixture_multi_state();
     let output_path = dir.path().join("out.html");
 
-    let output = koto()
+    let output = Command::cargo_bin("koto")
+        .unwrap()
         .args([
             "template",
             "export",
@@ -3805,7 +4616,8 @@ fn export_flag_open_with_check_errors() {
 fn export_flag_check_without_output_errors() {
     let fixture = fixture_multi_state();
 
-    let output = koto()
+    let output = Command::cargo_bin("koto")
+        .unwrap()
         .args(["template", "export", fixture.to_str().unwrap(), "--check"])
         .output()
         .unwrap();
@@ -3825,7 +4637,8 @@ fn export_flag_check_without_output_errors() {
 
 #[test]
 fn export_nonexistent_input_file_errors() {
-    let output = koto()
+    let output = Command::cargo_bin("koto")
+        .unwrap()
         .args(["template", "export", "/tmp/nonexistent-template-abc123.md"])
         .output()
         .unwrap();
@@ -3848,7 +4661,8 @@ fn export_malformed_json_input_errors() {
     let bad_json = dir.path().join("broken.json");
     std::fs::write(&bad_json, "{ this is not valid json }").unwrap();
 
-    let output = koto()
+    let output = Command::cargo_bin("koto")
+        .unwrap()
         .args(["template", "export", bad_json.to_str().unwrap()])
         .output()
         .unwrap();
@@ -3875,7 +4689,8 @@ fn export_invalid_template_errors() {
     )
     .unwrap();
 
-    let output = koto()
+    let output = Command::cargo_bin("koto")
+        .unwrap()
         .args(["template", "export", bad_md.to_str().unwrap()])
         .output()
         .unwrap();
@@ -3894,7 +4709,8 @@ fn export_latency_under_500ms() {
     let fixture = fixture_multi_state();
 
     let start = std::time::Instant::now();
-    let output = koto()
+    let output = Command::cargo_bin("koto")
+        .unwrap()
         .args(["template", "export", fixture.to_str().unwrap()])
         .output()
         .unwrap();
@@ -3937,7 +4753,8 @@ fn export_30_state_template_latency_under_500ms() {
     std::fs::write(&template_path, &yaml).unwrap();
 
     let start = std::time::Instant::now();
-    let output = koto()
+    let output = Command::cargo_bin("koto")
+        .unwrap()
         .args(["template", "export", template_path.to_str().unwrap()])
         .output()
         .unwrap();

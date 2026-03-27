@@ -59,15 +59,19 @@ jobs:
 
       - name: Test Stop hook with active workflow
         run: |
-          # Create a mock state file that koto workflows will discover.
-          # The discover package scans for koto-*.state.jsonl files in the current directory.
-          printf '{"schema_version":1,"workflow":"mock","template_hash":"abc123","created_at":"2025-01-01T00:00:00Z"}\n{"seq":1,"timestamp":"2025-01-01T00:00:00Z","type":"workflow_initialized","payload":{"template_path":"mock","variables":{}}}\n{"seq":2,"timestamp":"2025-01-01T00:00:00Z","type":"transitioned","payload":{"from":null,"to":"test-state","condition_type":"auto"}}\n' > koto-mock.state.jsonl
+          # Create a mock state file in a session directory.
+          # koto discovers workflows by scanning session directories under KOTO_SESSIONS_BASE.
+          SESSIONS_BASE=$(mktemp -d)
+          SESSION_DIR="$SESSIONS_BASE/mock"
+          mkdir -p "$SESSION_DIR"
+          printf '{"schema_version":1,"workflow":"mock","template_hash":"abc123","created_at":"2025-01-01T00:00:00Z"}\n{"seq":1,"timestamp":"2025-01-01T00:00:00Z","type":"workflow_initialized","payload":{"template_path":"mock","variables":{}}}\n{"seq":2,"timestamp":"2025-01-01T00:00:00Z","type":"transitioned","payload":{"from":null,"to":"test-state","condition_type":"auto"}}\n' > "$SESSION_DIR/koto-mock.state.jsonl"
 
           # Extract the hook command from hooks.json.
           HOOK_CMD=$(jq -r '.hooks.Stop[0].command' plugins/koto-skills/hooks.json)
 
           # The hook references 'koto' on PATH -- put our built binary on PATH.
           export PATH="$PWD/target/release:$PATH"
+          export KOTO_SESSIONS_BASE="$SESSIONS_BASE"
 
           # Run the hook and capture output.
           OUTPUT=$(eval "$HOOK_CMD" 2>/dev/null || true)
@@ -81,11 +85,12 @@ jobs:
 
       - name: Test Stop hook with no active workflow
         run: |
-          # Remove the mock state file so no workflows are active.
-          rm -f koto-mock.state.jsonl
+          # Use an empty sessions directory so no workflows are active.
+          SESSIONS_BASE=$(mktemp -d)
 
           HOOK_CMD=$(jq -r '.hooks.Stop[0].command' plugins/koto-skills/hooks.json)
           export PATH="$PWD/target/release:$PATH"
+          export KOTO_SESSIONS_BASE="$SESSIONS_BASE"
 
           OUTPUT=$(eval "$HOOK_CMD" 2>/dev/null || true)
           if [ -z "$OUTPUT" ]; then

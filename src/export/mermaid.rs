@@ -282,6 +282,8 @@ mod tests {
                 gate_type: GATE_TYPE_COMMAND.to_string(),
                 command: "test -d .git".to_string(),
                 timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
             },
         );
         let output = to_mermaid(&t);
@@ -313,6 +315,8 @@ mod tests {
                             gate_type: GATE_TYPE_COMMAND.to_string(),
                             command: "test -d .git".to_string(),
                             timeout: 0,
+                            key: String::new(),
+                            pattern: String::new(),
                         },
                     );
                     g

@@ -37,9 +37,9 @@ Use `.koto/templates/hello-koto.md` as the `--template` path in all koto command
 
 The user provides a `<name>` argument. The workflow has two states:
 
-1. **awakening** -- Create a greeting file at `wip/spirit-greeting.txt` containing a
-   greeting from the named spirit. A command gate (`test -f wip/spirit-greeting.txt`)
-   blocks the transition until the file exists.
+1. **awakening** -- Write a greeting from the named spirit and submit it via
+   `koto context add`. A `context-exists` gate blocks the transition until the
+   key `spirit-greeting.txt` exists in the content store.
 2. **eternal** -- Terminal state. The ritual is complete.
 
 ## Execution
@@ -64,17 +64,16 @@ Returns:
 {
   "action": "execute",
   "state": "awakening",
-  "directive": "You are <name>, a tsukumogami spirit awakening for the first time.\n\nCreate a file at `wip/spirit-greeting.txt` containing a greeting from <name> to the world."
+  "directive": "You are <name>, a tsukumogami spirit awakening for the first time.\n\nCreate a file at `<session-dir>/spirit-greeting.txt` containing a greeting from <name> to the world."
 }
 ```
 
 ### 3. Execute the directive
 
-Create the greeting file:
+Write the greeting and submit it through the content interface:
 
 ```bash
-mkdir -p wip
-echo "Greetings from <name> to the world." > wip/spirit-greeting.txt
+echo "Greetings from <name> to the world." | koto context add hello spirit-greeting.txt
 ```
 
 ### 4. Transition to the terminal state
@@ -83,9 +82,9 @@ echo "Greetings from <name> to the world." > wip/spirit-greeting.txt
 koto transition eternal
 ```
 
-The command gate runs `test -f wip/spirit-greeting.txt`. If the file exists, the
-transition succeeds and returns `{"state":"eternal"}`. If the file is missing, the
-transition fails with a gate error.
+The `context-exists` gate checks for the key `spirit-greeting.txt` in the content
+store. If the key exists, the transition succeeds and returns `{"state":"eternal"}`.
+If the key is missing, the transition fails with a gate error.
 
 ### 5. Confirm completion
 
@@ -102,17 +101,18 @@ Output a message to the user: `<name> has manifested. The ritual is complete.`
 - **koto not found**: Tell the user to install koto and add it to PATH.
 - **Template not found**: Check the template path. If using a plugin path that can't be
   resolved, copy the template to `.koto/templates/hello-koto.md` and re-init.
-- **Gate failure**: The greeting file doesn't exist yet. Create `wip/spirit-greeting.txt`
-  before attempting the transition.
-- **State file already exists**: A previous hello workflow may be active. Run
-  `koto workflows` to check. Cancel with `koto cancel --state wip/koto-hello.state.json`
-  if needed, then re-init.
+- **Gate failure**: The greeting content hasn't been submitted yet. Run
+  `koto context add hello spirit-greeting.txt` with the greeting text before
+  attempting the transition.
+- **Session already exists**: A previous hello workflow may be active. Run
+  `koto session list` to check. Clean up with `koto session cleanup hello` if needed,
+  then re-init.
 
 ## Resume
 
 If the session is interrupted mid-workflow:
 
-1. Run `koto workflows` to check for active state files.
+1. Run `koto session list` to check for active sessions.
 2. Run `koto next` to get the current directive.
 3. Continue from wherever the workflow left off.
 
