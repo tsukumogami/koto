@@ -6,9 +6,11 @@ koto's CLI manages workflow state for AI coding agents. All commands output JSON
 {"error":"workflow 'my-workflow' not found","command":"next"}
 ```
 
-## State file resolution
+## Session storage
 
-Each workflow has a state file named `koto-<name>.state.jsonl` in the current directory. The file uses an event log format:
+Each workflow's state lives in a dedicated session directory under `~/.koto/sessions/<repo-id>/<name>/`. The `<repo-id>` is derived from the current repository, so sessions from different repos don't collide.
+
+The state file inside each session directory is named `koto-<name>.state.jsonl` and uses an event log format:
 
 - **Line 1 (header):** JSON object with `schema_version`, `workflow`, `template_hash`, and `created_at`.
 - **Lines 2+:** Typed events, each with a monotonic `seq` number, `timestamp`, `type`, and a type-specific `payload`.
@@ -16,11 +18,11 @@ Each workflow has a state file named `koto-<name>.state.jsonl` in the current di
 The current state is derived by replaying the log -- it's the `to` field of the last state-changing event (`transitioned`, `directed_transition`, or `rewound`).
 
 ```
-koto-my-workflow.state.jsonl
-koto-task-42.state.jsonl
+~/.koto/sessions/a1b2c3/my-workflow/koto-my-workflow.state.jsonl
+~/.koto/sessions/a1b2c3/task-42/koto-task-42.state.jsonl
 ```
 
-There are no `--state` or `--state-dir` flags. All commands that operate on a workflow take the workflow name as a positional argument and resolve the state file automatically from the current directory.
+There are no `--state` or `--state-dir` flags. All commands take the workflow name as a positional argument and resolve the session directory automatically.
 
 ## Commands
 
@@ -33,7 +35,7 @@ koto init <name> --template <path>
 ```
 
 **Positional argument:**
-- `<name>` -- Workflow name. Used in the state file name (`koto-<name>.state.jsonl`).
+- `<name>` -- Workflow name. Used as the session directory name and in the state file name (`koto-<name>.state.jsonl`).
 
 **Required flags:**
 - `--template` -- Path to the workflow template file.
@@ -44,7 +46,7 @@ koto init <name> --template <path>
 {"name":"my-workflow","state":"assess"}
 ```
 
-The state file starts with three lines: a header, a `workflow_initialized` event (seq 1), and an initial `transitioned` event (seq 2, from: null, to: the template's initial state).
+This creates a session directory at `~/.koto/sessions/<repo-id>/<name>/` and writes a state file inside it. The state file starts with three lines: a header, a `workflow_initialized` event (seq 1), and an initial `transitioned` event (seq 2, from: null, to: the template's initial state).
 
 Exits non-zero if a workflow with that name already exists or if the template is invalid.
 
@@ -53,7 +55,7 @@ Exits non-zero if a workflow with that name already exists or if the template is
 Returns the directive for the current state. This is the main agent-facing command -- it tells the agent what to do next, what evidence to submit, and whether any gates are blocking.
 
 ```bash
-koto next <name> [--with-data <json>] [--to <target>]
+koto next <name> [--with-data <json>] [--to <target>] [--no-cleanup]
 ```
 
 **Positional argument:**
@@ -63,7 +65,23 @@ koto next <name> [--with-data <json>] [--to <target>]
 - `--with-data <json>` -- Submit evidence as a JSON object, validated against the state's `accepts` schema. On success, appends an `evidence_submitted` event and sets `advanced: true` in the response.
 - `--to <target>` -- Directed transition to a named state. The target must be a valid transition from the current state. Appends a `directed_transition` event, then dispatches on the new state (skipping gate evaluation).
 
-These flags are mutually exclusive. Passing both produces a `precondition_failed` error with exit code 2. The `--with-data` payload is capped at 1 MB.
+The `--with-data` and `--to` flags are mutually exclusive. Passing both produces a `precondition_failed` error with exit code 2. The `--with-data` payload is capped at 1 MB.
+
+- `--no-cleanup` -- Skip automatic session directory cleanup when the workflow reaches a terminal state. Useful for debugging or when you need to inspect session artifacts after completion. Without this flag, koto removes the session directory once it outputs the terminal response.
+
+**Runtime variable substitution:**
+
+Before evaluating gate commands or serializing directives, `koto next` replaces `{{SESSION_DIR}}` tokens with the absolute path to the workflow's session directory. This lets templates reference session-local files without hard-coding paths:
+
+```markdown
+## plan
+
+Write an implementation plan to {{SESSION_DIR}}/plan.md.
+
+**Gate**: cat {{SESSION_DIR}}/plan.md | head -1
+```
+
+`SESSION_DIR` is a reserved variable name and can't be overridden by template-defined variables.
 
 **Response variants:**
 
@@ -181,7 +199,7 @@ The `rewound` event payload contains `from` (the current state) and `to` (the st
 
 ### workflows
 
-Lists all active workflows in the current directory.
+Lists all active workflows for the current repository.
 
 ```bash
 koto workflows
@@ -194,6 +212,63 @@ koto workflows
 ```
 
 Each object contains the workflow name, creation timestamp, and template hash read from the state file header. Returns an empty array `[]` when no workflows are found.
+
+### session
+
+The `session` subcommand group provides direct access to session directories. These are useful for skills that need to read or write session-local artifacts, and for manual cleanup during development.
+
+#### session dir
+
+Prints the absolute path to a session's directory. This is the primary way skills discover where to store artifacts.
+
+```bash
+koto session dir <name>
+```
+
+**Output (plain text):**
+
+```
+/home/user/.koto/sessions/a1b2c3/my-workflow
+```
+
+The path is printed even if the directory doesn't exist yet (no I/O validation). This lets callers check the path before or after `koto init`.
+
+#### session list
+
+Lists all sessions for the current repository as a JSON array.
+
+```bash
+koto session list
+```
+
+**Output (JSON):**
+
+```json
+[
+  {
+    "id": "my-workflow",
+    "created_at": "2026-03-15T10:00:00Z",
+    "template_hash": "a1b2c3..."
+  },
+  {
+    "id": "task-42",
+    "created_at": "2026-03-15T11:30:00Z",
+    "template_hash": "d4e5f6..."
+  }
+]
+```
+
+Each object contains the session id (same as the workflow name), creation timestamp, and template hash read from the state file header. Returns an empty array `[]` when no sessions exist. Directories without a valid state file are skipped.
+
+#### session cleanup
+
+Removes a session directory and all its contents. Idempotent -- succeeds even if the session doesn't exist.
+
+```bash
+koto session cleanup <name>
+```
+
+Produces no output on success. This is the manual equivalent of the auto-cleanup that `koto next` performs when a workflow reaches a terminal state.
 
 ### template
 

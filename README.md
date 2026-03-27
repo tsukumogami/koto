@@ -61,7 +61,7 @@ koto init review --template review.md
 {"name":"review","state":"assess"}
 ```
 
-This creates a state file with three lines: a header (schema version, workflow name, template hash, timestamp), a `workflow_initialized` event, and an initial `transitioned` event.
+This creates a session directory at `~/.koto/sessions/<repo-id>/review/` and writes a state file inside it. The state file starts with three lines: a header (schema version, workflow name, template hash, timestamp), a `workflow_initialized` event, and an initial `transitioned` event.
 
 ### 3. Get the current directive
 
@@ -89,9 +89,11 @@ The `action` field is `"execute"` while work remains and `"done"` at the termina
 
 ## Key concepts
 
-**Templates** define the workflow: states, transitions between them, and directive text for each state. Variables (`{{KEY}}`) are interpolated into directives at runtime. Use `koto template compile` to validate templates during development and see the compiled JSON output.
+**Templates** define the workflow: states, transitions between them, and directive text for each state. Variables (`{{KEY}}`) are interpolated into directives at runtime. The runtime also injects `{{SESSION_DIR}}`, which resolves to the session's absolute path so templates can reference session-local files. Use `koto template compile` to validate templates during development and see the compiled JSON output.
 
-**State files** (`koto-<name>.state.jsonl`) use an event log format. The first line is a header with the schema version, workflow name, template hash, and creation timestamp. Subsequent lines are typed events with monotonic sequence numbers and type-specific payloads. The current state is derived by replaying the log -- specifically, the `to` field of the last state-changing event.
+**Sessions** are stored at `~/.koto/sessions/<repo-id>/<name>/`, keeping state files out of your working directory. Each session holds a state file and any artifacts the workflow produces. When a workflow reaches its terminal state, `koto next` automatically cleans up the session directory (pass `--no-cleanup` to keep it). Use `koto session dir <name>` to get the path, `koto session list` to see all sessions, or `koto session cleanup <name>` to remove one manually.
+
+**State files** (`koto-<name>.state.jsonl`) live inside session directories and use an event log format. The first line is a header with the schema version, workflow name, template hash, and creation timestamp. Subsequent lines are typed events with monotonic sequence numbers and type-specific payloads. The current state is derived by replaying the log -- specifically, the `to` field of the last state-changing event.
 
 **Template integrity**: The template's SHA-256 hash is locked at init time and stored in the first event. If the compiled template changes, `next` will fail. To update the template, reinitialize the workflow.
 
