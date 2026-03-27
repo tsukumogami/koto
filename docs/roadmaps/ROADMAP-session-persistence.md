@@ -39,7 +39,7 @@ Later features add config, git compatibility, and cloud transferability.
 
 ### Feature 1: Local session storage with content ownership
 **Dependencies:** None
-**Status:** In progress — session storage shipped (PR #84), content ownership design pending
+**Status:** Done (PR #84)
 
 Two phases of the same feature:
 
@@ -57,7 +57,7 @@ multiple agents can submit context concurrently without calling `koto next`.
 Content-aware gate types replace filesystem-based gates. Replace-only semantics for
 MVP. Skills migrate from wip/ filesystem access to koto context CLI.
 
-Exploration complete at `wip/explore_content-ownership_findings.md`. Design pending.
+Design at `docs/designs/current/DESIGN-local-session-storage.md` (status: Current).
 
 ### Feature 2: Config system
 **Needs:** `needs-design` — TOML schema, precedence rules, CLI command design
@@ -115,6 +115,5 @@ need cloud.
 
 ## Progress
 
-- Feature 1 Phase A: Done (PR #84)
-- Feature 1 Phase B: Exploration complete, PRD revised, design pending
+- Feature 1: Done (PR #84 — Phase A session storage + Phase B content ownership)
 - Features 2-4: Not started

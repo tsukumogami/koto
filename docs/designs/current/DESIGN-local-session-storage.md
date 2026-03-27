@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Current
 upstream: docs/prds/PRD-session-persistence-storage.md
 problem: |
   koto stores workflow state and context in wip/ committed to git branches. This
