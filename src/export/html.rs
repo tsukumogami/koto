@@ -5,7 +5,7 @@ const TEMPLATE_HTML: &str = include_str!("preview.html");
 
 /// The placeholder marker in the HTML template that gets replaced with
 /// serialized graph data.
-const PLACEHOLDER: &str = "/*KOTO_GRAPH_DATA*/";
+const PLACEHOLDER: &str = "/*KOTO_GRAPH_DATA*/{}";
 
 /// Generate a self-contained HTML file with an interactive Cytoscape.js
 /// diagram of the given compiled template.
