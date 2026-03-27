@@ -9,7 +9,7 @@ use std::collections::HashMap;
 /// Reserved variable names that cannot be declared in template `variables:` blocks.
 ///
 /// These are injected by the runtime and must not collide with user-defined variables.
-pub const RESERVED_VARIABLE_NAMES: &[&str] = &["SESSION_DIR"];
+pub const RESERVED_VARIABLE_NAMES: &[&str] = &["SESSION_DIR", "SESSION_NAME"];
 
 /// Replace `{{KEY}}` tokens in `input` with values from `vars`.
 ///

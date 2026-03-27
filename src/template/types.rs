@@ -141,7 +141,7 @@ const VALID_FIELD_TYPES: &[&str] = &["enum", "string", "number", "boolean"];
 /// Runtime-injected variable names that are valid in templates but not
 /// declared in the variables block. These are provided by the engine at
 /// runtime (e.g., SESSION_DIR is the session directory path).
-const RUNTIME_VARIABLE_NAMES: &[&str] = &["SESSION_DIR"];
+const RUNTIME_VARIABLE_NAMES: &[&str] = &["SESSION_DIR", "SESSION_NAME"];
 
 impl CompiledTemplate {
     /// Validate the compiled template against all schema rules.

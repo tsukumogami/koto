@@ -1132,12 +1132,13 @@ fn handle_next(
         }
     }
 
-    // Build the runtime variable map for {{SESSION_DIR}} substitution.
+    // Build the runtime variable map for {{SESSION_DIR}} and {{SESSION_NAME}} substitution.
     let mut runtime_vars = std::collections::HashMap::new();
     runtime_vars.insert(
         "SESSION_DIR".to_string(),
         backend.session_dir(&name).to_string_lossy().to_string(),
     );
+    runtime_vars.insert("SESSION_NAME".to_string(), name.clone());
 
     // 4. Handle --to (directed transition) -- single-shot, no advancement loop
     if let Some(ref target) = to {
