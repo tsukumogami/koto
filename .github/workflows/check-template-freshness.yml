@@ -58,6 +58,7 @@ jobs:
           found=0
           while IFS= read -r template; do
             [ -z "$template" ] && continue
+            case "$template" in *.mermaid.md) continue ;; esac
             found=1
             stem="${template%.md}"
             output="${stem}.mermaid.md"
@@ -93,6 +94,7 @@ jobs:
 
           while IFS= read -r template; do
             [ -z "$template" ] && continue
+            case "$template" in *.mermaid.md) continue ;; esac
             stem=$(basename "${template%.md}")
             output="${html_dir}/${stem}.html"
 
