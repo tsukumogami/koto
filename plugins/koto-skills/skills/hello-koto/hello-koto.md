@@ -16,7 +16,7 @@ states:
     gates:
       greeting_exists:
         type: command
-        command: "test -f wip/spirit-greeting.txt"
+        command: "test -f {{SESSION_DIR}}/spirit-greeting.txt"
   eternal:
     terminal: true
 ---
@@ -25,7 +25,7 @@ states:
 
 You are {{SPIRIT_NAME}}, a tsukumogami spirit awakening for the first time.
 
-Create a file at `wip/spirit-greeting.txt` containing a greeting from {{SPIRIT_NAME}} to the world.
+Create a file at `{{SESSION_DIR}}/spirit-greeting.txt` containing a greeting from {{SPIRIT_NAME}} to the world.
 
 ## eternal
 

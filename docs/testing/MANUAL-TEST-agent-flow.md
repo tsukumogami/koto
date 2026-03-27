@@ -11,7 +11,7 @@ Run this checklist before any release that changes files under `plugins/`. If yo
 - koto binary built from the branch under test (`go build -o koto ./cmd/koto`)
 - `koto` on PATH (verify with `koto version`)
 - Claude Code v1.0.33 or later (plugin support required)
-- A clean test directory with no existing `.koto/` or `wip/` subdirectories
+- A clean test directory with no existing `.koto/` subdirectory and no active koto sessions (`koto session list` returns empty)
 - No prior koto marketplace or plugin installation (or remove them first with `/plugin uninstall koto-skills@koto`)
 
 ## Test 1: Plugin Installation
@@ -61,7 +61,7 @@ Trigger the hello-koto skill and verify the full init / next / execute / transit
    - Copy the template to `.koto/templates/hello-koto.md`
    - Run `koto init --template .koto/templates/hello-koto.md --name hello --var SPIRIT_NAME=Hasami`
    - Run `koto next` and receive the awakening directive
-   - Create `wip/spirit-greeting.txt` with a greeting from Hasami
+   - Create `spirit-greeting.txt` in the session directory with a greeting from Hasami
    - Run `koto transition eternal`
    - Run `koto next` and receive the done response
    - Output a completion message
@@ -71,17 +71,17 @@ Trigger the hello-koto skill and verify the full init / next / execute / transit
 - [ ] Template file exists at `.koto/templates/hello-koto.md` after the skill runs
 - [ ] `koto init` returns `{"state":"awakening"}` (or output containing `"awakening"`)
 - [ ] `koto next` returns a directive mentioning the spirit name "Hasami"
-- [ ] `wip/spirit-greeting.txt` exists and contains a greeting
+- [ ] `spirit-greeting.txt` exists in the session directory (`koto session dir hello`) and contains a greeting
 - [ ] `koto transition eternal` succeeds (gate passes because the file exists)
 - [ ] Final `koto next` returns `{"action":"done"}` (or output containing `"done"`)
 - [ ] The agent outputs a completion message to the user
-- [ ] State file at `wip/koto-hello.state.json` exists during the workflow and is cleaned up or left in terminal state
+- [ ] Session appears in `koto session list` during the workflow and is cleaned up on completion
 
 ### Fail Criteria
 
 - Agent doesn't copy the template to `.koto/templates/` before init
 - `koto init` fails (template not found, compilation error)
-- Gate check fails even though `wip/spirit-greeting.txt` was created
+- Gate check fails even though `spirit-greeting.txt` was created in the session directory
 - Agent gets stuck in a loop or doesn't reach the terminal state
 - Agent skips the `koto transition` step and jumps ahead
 
@@ -93,8 +93,8 @@ Verify the Stop hook detects an active workflow and outputs a resume reminder.
 
 1. Start a workflow but stop the session before it completes:
    - Run `koto init --template .koto/templates/hello-koto.md --name hook-test --var SPIRIT_NAME=TestSpirit`
-   - Confirm the state file exists: `ls wip/koto-hook-test.state.json`
-   - Do NOT create `wip/spirit-greeting.txt` (leave the workflow mid-progress)
+   - Confirm the session exists: `koto session list` should show `hook-test`
+   - Do NOT create `spirit-greeting.txt` in the session directory (leave the workflow mid-progress)
 2. Stop the Claude Code session (Ctrl+C or `/stop`).
 3. Watch the hook output in the terminal.
 4. Start a new Claude Code session in the same directory.
@@ -109,15 +109,15 @@ Verify the Stop hook detects an active workflow and outputs a resume reminder.
 
 ### Fail Criteria
 
-- Hook produces no output despite an active state file in `wip/`
+- Hook produces no output despite an active session
 - Hook outputs an error message instead of the reminder
 - Hook produces output even though no workflow is active (false positive)
 
 ### Cleanup
 
-Cancel the test workflow before proceeding:
+Clean up the test session before proceeding:
 ```bash
-koto cancel --state wip/koto-hook-test.state.json
+koto session cleanup hook-test
 ```
 
 ## Test 4: Hook Silent Failure
@@ -142,9 +142,9 @@ Verify the Stop hook fails silently when koto isn't available or no workflow is 
 
 ### Scenario B: No active workflows
 
-1. Make sure no state files exist in `wip/`:
+1. Make sure no active sessions exist:
    ```bash
-   rm -f wip/koto-*.state.json
+   koto session list   # should return empty
    ```
 2. Run the hook command directly:
    ```bash
@@ -166,6 +166,6 @@ Verify the Stop hook fails silently when koto isn't available or no workflow is 
 
 ## Notes
 
-- These tests assume the default koto state file naming convention (`wip/koto-<name>.state.json`). If the convention changes, update the cleanup steps and state file paths accordingly.
-- The Stop hook relies on `koto workflows` scanning `wip/` relative to the current working directory. Run all tests from the project root.
+- These tests assume session storage at `~/.koto/sessions/<repo-id>/<name>/`. Use `koto session dir <name>` to find the exact path for a given session.
+- The Stop hook relies on `koto workflows` checking for active sessions. Run all tests from the project root.
 - If Test 1 fails, Tests 2 and 3 can still be run by copying the skill files manually into `.claude/skills/hello-koto/` and running `koto init` directly.

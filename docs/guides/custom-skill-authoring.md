@@ -39,7 +39,7 @@ states:
     gates:
       greeting_exists:
         type: command
-        command: "test -f wip/spirit-greeting.txt"
+        command: "test -f {{SESSION_DIR}}/spirit-greeting.txt"
   eternal:
     terminal: true
 ---
@@ -48,7 +48,7 @@ states:
 
 You are {{SPIRIT_NAME}}, a tsukumogami spirit awakening for the first time.
 
-Create a file at `wip/spirit-greeting.txt` containing a greeting from {{SPIRIT_NAME}} to the world.
+Create a file at `{{SESSION_DIR}}/spirit-greeting.txt` containing a greeting from {{SPIRIT_NAME}} to the world.
 
 ## eternal
 
@@ -94,7 +94,7 @@ If compilation succeeds, it outputs the compiled JSON to stdout:
       "gates": {
         "greeting_exists": {
           "type": "command",
-          "command": "test -f wip/spirit-greeting.txt"
+          "command": "test -f {{SESSION_DIR}}/spirit-greeting.txt"
         }
       }
     },
@@ -233,8 +233,8 @@ Document each gate from the template. The agent needs to know what conditions mu
 ```markdown
 The `awakening` state has one gate:
 
-- **greeting_exists** (command gate): runs `test -f wip/spirit-greeting.txt`. The
-  greeting file must exist before transitioning to `eternal`.
+- **greeting_exists** (command gate): runs `test -f {{SESSION_DIR}}/spirit-greeting.txt`. The
+  greeting file must exist in the session directory before transitioning to `eternal`.
 ```
 
 For templates with multiple gates across several states, list them per-state so the agent can look up what's needed at each transition.
@@ -423,7 +423,7 @@ Pulling it all together, here's how the hello-koto skill was built. Use this as 
 
 The template (`plugins/koto-skills/skills/hello-koto/hello-koto.md`) defines two states:
 
-- **awakening** -- The agent creates a greeting file. A `command` gate (`test -f wip/spirit-greeting.txt`) blocks the transition until the file exists.
+- **awakening** -- The agent creates a greeting file. A `command` gate (`test -f {{SESSION_DIR}}/spirit-greeting.txt`) blocks the transition until the file exists in the session directory.
 - **eternal** -- Terminal state. Nothing to do.
 
 One variable, `SPIRIT_NAME`, is interpolated into the awakening directive.
@@ -441,7 +441,7 @@ $ koto template compile plugins/koto-skills/skills/hello-koto/hello-koto.md | jq
 {
   "greeting_exists": {
     "type": "command",
-    "command": "test -f wip/spirit-greeting.txt"
+    "command": "test -f {{SESSION_DIR}}/spirit-greeting.txt"
   }
 }
 ```
@@ -471,7 +471,7 @@ When a user invokes `/hello-koto Hasami`:
 2. Copies the template to `.koto/templates/hello-koto.md` if needed.
 3. Runs `koto init --template .koto/templates/hello-koto.md --name hello --var SPIRIT_NAME=Hasami`.
 4. Runs `koto next` -- gets the awakening directive.
-5. Creates `wip/spirit-greeting.txt`.
+5. Creates `spirit-greeting.txt` in the session directory.
 6. Runs `koto transition eternal` -- the gate passes.
 7. Runs `koto next` -- gets `{"action":"done"}`.
 8. Reports completion to the user.
