@@ -1,9 +1,31 @@
 use assert_cmd::Command;
 use assert_fs::TempDir;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-fn koto() -> Command {
-    Command::cargo_bin("koto").unwrap()
+/// Return a `koto` command with `KOTO_SESSIONS_BASE` set to the sessions
+/// subdirectory of `dir`.
+///
+/// All integration tests must use this to avoid writing session data into
+/// the real `~/.koto/` directory.
+fn koto_cmd(dir: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.current_dir(dir);
+    cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
+    cmd
+}
+
+/// Return the sessions base directory for a test, creating it if needed.
+fn sessions_base(dir: &Path) -> PathBuf {
+    let base = dir.join("sessions");
+    std::fs::create_dir_all(&base).unwrap();
+    base
+}
+
+/// Return the state file path for a workflow inside the sessions base directory.
+fn session_state_path(dir: &Path, name: &str) -> PathBuf {
+    sessions_base(dir)
+        .join(name)
+        .join(format!("koto-{}.state.jsonl", name))
 }
 
 fn minimal_template() -> &'static str {
@@ -40,8 +62,7 @@ fn write_template_source(dir: &Path) -> std::path::PathBuf {
 fn compile_template(dir: &Path) -> String {
     let src = write_template_source(dir);
 
-    let output = koto()
-        .current_dir(dir)
+    let output = koto_cmd(dir)
         .args(["template", "compile", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -61,7 +82,11 @@ fn compile_template(dir: &Path) -> String {
 
 #[test]
 fn version_exits_0_and_produces_json() {
-    let output = koto().arg("version").output().unwrap();
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .arg("version")
+        .output()
+        .unwrap();
 
     assert!(output.status.success(), "version should exit 0");
 
@@ -83,8 +108,7 @@ fn init_creates_state_file() {
     let dir = TempDir::new().unwrap();
     let src = write_template_source(dir.path());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["init", "my-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -96,7 +120,7 @@ fn init_creates_state_file() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let state_path = dir.path().join("koto-my-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "my-wf");
     assert!(state_path.exists(), "state file should be created");
 
     // Verify the state file has exactly 3 lines: header + workflow_initialized + transitioned.
@@ -146,8 +170,7 @@ fn init_fails_if_file_exists() {
     let src = write_template_source(dir.path());
 
     // First init succeeds.
-    let first = koto()
-        .current_dir(dir.path())
+    let first = koto_cmd(dir.path())
         .args(["init", "dup-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -159,8 +182,7 @@ fn init_fails_if_file_exists() {
     );
 
     // Second init must fail.
-    let second = koto()
-        .current_dir(dir.path())
+    let second = koto_cmd(dir.path())
         .args(["init", "dup-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -187,14 +209,12 @@ fn next_returns_state_directive_transitions() {
     let dir = TempDir::new().unwrap();
     let src = write_template_source(dir.path());
 
-    koto()
-        .current_dir(dir.path())
+    koto_cmd(dir.path())
         .args(["init", "next-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "next-wf"])
         .output()
         .unwrap();
@@ -234,8 +254,7 @@ fn next_returns_state_directive_transitions() {
 fn next_fails_for_unknown_workflow() {
     let dir = TempDir::new().unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "no-such-workflow"])
         .output()
         .unwrap();
@@ -268,15 +287,14 @@ fn rewind_appends_rewind_event() {
     let dir = TempDir::new().unwrap();
     let src = write_template_source(dir.path());
 
-    koto()
-        .current_dir(dir.path())
+    koto_cmd(dir.path())
         .args(["init", "rewind-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
 
     // Append a transitioned event so there are 2+ state-changing events,
     // making rewind possible (init writes header + workflow_initialized + transitioned).
-    let state_path = dir.path().join("koto-rewind-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "rewind-wf");
     let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
@@ -291,8 +309,7 @@ fn rewind_appends_rewind_event() {
         .lines()
         .count();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["rewind", "rewind-wf"])
         .output()
         .unwrap();
@@ -355,14 +372,12 @@ fn rewind_fails_at_initial_state() {
     let src = write_template_source(dir.path());
 
     // Only init — single event in the file.
-    koto()
-        .current_dir(dir.path())
+    koto_cmd(dir.path())
         .args(["init", "at-init-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["rewind", "at-init-wf"])
         .output()
         .unwrap();
@@ -384,8 +399,7 @@ fn rewind_fails_at_initial_state() {
 fn rewind_fails_for_unknown_workflow() {
     let dir = TempDir::new().unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["rewind", "no-such-workflow"])
         .output()
         .unwrap();
@@ -412,17 +426,12 @@ fn workflows_returns_array_with_workflow() {
     let dir = TempDir::new().unwrap();
     let src = write_template_source(dir.path());
 
-    koto()
-        .current_dir(dir.path())
+    koto_cmd(dir.path())
         .args(["init", "listed-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
-        .arg("workflows")
-        .output()
-        .unwrap();
+    let output = koto_cmd(dir.path()).arg("workflows").output().unwrap();
 
     assert!(
         output.status.success(),
@@ -462,11 +471,7 @@ fn workflows_returns_array_with_workflow() {
 fn workflows_returns_empty_array_when_none() {
     let dir = TempDir::new().unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
-        .arg("workflows")
-        .output()
-        .unwrap();
+    let output = koto_cmd(dir.path()).arg("workflows").output().unwrap();
 
     assert!(
         output.status.success(),
@@ -513,8 +518,7 @@ fn template_compile_fails_for_invalid_yaml() {
     // Missing closing `---` makes frontmatter parsing fail.
     std::fs::write(&src, "---\nname: [broken yaml\nno closing delimiter\n").unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["template", "compile", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -534,8 +538,7 @@ fn template_validate_succeeds_for_valid_template() {
     let dir = TempDir::new().unwrap();
     let compiled_path = compile_template(dir.path());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["template", "validate", &compiled_path])
         .output()
         .unwrap();
@@ -554,8 +557,7 @@ fn template_validate_fails_for_missing_required_fields() {
     let bad_json = dir.path().join("bad.json");
     std::fs::write(&bad_json, r#"{"format_version":1}"#).unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["template", "validate", bad_json.to_str().unwrap()])
         .output()
         .unwrap();
@@ -577,8 +579,7 @@ fn init_next_rewind_sequence() {
     init_workflow(dir.path(), "seq-wf", &template_with_accepts());
 
     // next: initial state has accepts, so it stops at start with EvidenceRequired.
-    let next_out = koto()
-        .current_dir(dir.path())
+    let next_out = koto_cmd(dir.path())
         .args(["next", "seq-wf"])
         .output()
         .unwrap();
@@ -589,16 +590,14 @@ fn init_next_rewind_sequence() {
     assert!(next_json["action"].as_str().is_some());
 
     // Use --to to advance to implement, enabling rewind.
-    let advance = koto()
-        .current_dir(dir.path())
+    let advance = koto_cmd(dir.path())
         .args(["next", "seq-wf", "--to", "implement"])
         .output()
         .unwrap();
     assert!(advance.status.success(), "--to should succeed");
 
     // rewind
-    let rewind_out = koto()
-        .current_dir(dir.path())
+    let rewind_out = koto_cmd(dir.path())
         .args(["rewind", "seq-wf"])
         .output()
         .unwrap();
@@ -612,8 +611,7 @@ fn init_next_rewind_sequence() {
     );
 
     // next after rewind: back at start, which has accepts -> EvidenceRequired.
-    let next_after = koto()
-        .current_dir(dir.path())
+    let next_after = koto_cmd(dir.path())
         .args(["next", "seq-wf"])
         .output()
         .unwrap();
@@ -633,7 +631,7 @@ fn init_next_rewind_sequence() {
     );
 
     // Verify the last event in the state file is a rewound event.
-    let state_path = dir.path().join("koto-seq-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "seq-wf");
     let state_content = std::fs::read_to_string(&state_path).unwrap();
     let last_line = state_content.lines().last().unwrap().to_string();
     let last_event: serde_json::Value =
@@ -652,11 +650,11 @@ fn init_next_rewind_sequence() {
 #[test]
 fn corrupted_state_file_rejected_with_exit_code_3() {
     let dir = TempDir::new().unwrap();
-    let state_path = dir.path().join("koto-corrupt.state.jsonl");
+    let state_path = session_state_path(dir.path(), "corrupt");
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
     std::fs::write(&state_path, "this is not valid json at all\n").unwrap();
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "corrupt"])
         .output()
         .unwrap();
@@ -684,14 +682,13 @@ fn rewind_event_has_from_and_to_in_payload() {
     let dir = TempDir::new().unwrap();
     let src = write_template_source(dir.path());
 
-    koto()
-        .current_dir(dir.path())
+    koto_cmd(dir.path())
         .args(["init", "payload-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
 
     // Append a transitioned event so rewind is possible.
-    let state_path = dir.path().join("koto-payload-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "payload-wf");
     let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
     {
         use std::io::Write;
@@ -702,8 +699,7 @@ fn rewind_event_has_from_and_to_in_payload() {
         writeln!(f, "{}", extra_event).unwrap();
     }
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["rewind", "payload-wf"])
         .output()
         .unwrap();
@@ -908,8 +904,7 @@ fn init_workflow(dir: &Path, name: &str, template_content: &str) {
     let src = dir.join(format!("{}-template.md", name));
     std::fs::write(&src, template_content).unwrap();
 
-    let output = koto()
-        .current_dir(dir)
+    let output = koto_cmd(dir)
         .args(["init", name, "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -931,8 +926,7 @@ fn next_integration_state_returns_integration_unavailable() {
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "integ-wf", &template_with_integration());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "integ-wf"])
         .output()
         .unwrap();
@@ -982,8 +976,7 @@ fn next_with_data_and_to_mutually_exclusive() {
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "mutex-wf", &template_with_accepts());
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args([
             "next",
             "mutex-wf",
@@ -1035,8 +1028,7 @@ fn next_with_data_rejects_oversized_payload() {
     let big_value = "x".repeat(100_000);
     let payload = format!(r#"{{"decision":"{}"}}"#, big_value);
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "size-wf", "--with-data", &payload])
         .output()
         .unwrap();
@@ -1078,8 +1070,7 @@ fn next_on_terminal_state_returns_done() {
     init_workflow(dir.path(), "term-wf", minimal_template());
 
     // Advance to terminal state via --to.
-    let advance = koto()
-        .current_dir(dir.path())
+    let advance = koto_cmd(dir.path())
         .args(["next", "term-wf", "--to", "done"])
         .output()
         .unwrap();
@@ -1091,8 +1082,7 @@ fn next_on_terminal_state_returns_done() {
     );
 
     // Now call next again on the terminal state.
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "term-wf"])
         .output()
         .unwrap();
@@ -1126,8 +1116,7 @@ fn next_with_failing_gate_returns_gate_blocked() {
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "gate-wf", &template_with_gate("exit 1", 0));
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "gate-wf"])
         .output()
         .unwrap();
@@ -1177,8 +1166,7 @@ fn next_with_valid_evidence_advances_state() {
     init_workflow(dir.path(), "evid-wf", &template_with_accepts());
 
     // First, check the initial state returns evidence_required.
-    let initial = koto()
-        .current_dir(dir.path())
+    let initial = koto_cmd(dir.path())
         .args(["next", "evid-wf"])
         .output()
         .unwrap();
@@ -1191,8 +1179,7 @@ fn next_with_valid_evidence_advances_state() {
     );
 
     // Submit evidence via --with-data.
-    let submit = koto()
-        .current_dir(dir.path())
+    let submit = koto_cmd(dir.path())
         .args([
             "next",
             "evid-wf",
@@ -1229,7 +1216,7 @@ fn next_with_valid_evidence_advances_state() {
     assert!(json["error"].is_null(), "error should be null");
 
     // Verify the state file has an evidence_submitted event.
-    let state_path = dir.path().join("koto-evid-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "evid-wf");
     let content = std::fs::read_to_string(&state_path).unwrap();
     let has_evidence = content
         .lines()
@@ -1250,8 +1237,7 @@ fn next_with_invalid_evidence_returns_structured_error() {
     init_workflow(dir.path(), "bad-evid-wf", &template_with_accepts());
 
     // Submit evidence with wrong type and missing required field.
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args([
             "next",
             "bad-evid-wf",
@@ -1307,8 +1293,7 @@ fn next_with_to_performs_directed_transition() {
     init_workflow(dir.path(), "directed-wf", &template_with_accepts());
 
     // Use --to to advance directly to implement (skipping evidence).
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "directed-wf", "--to", "implement"])
         .output()
         .unwrap();
@@ -1333,7 +1318,7 @@ fn next_with_to_performs_directed_transition() {
     assert!(json["error"].is_null(), "error should be null");
 
     // Verify the state file has a directed_transition event.
-    let state_path = dir.path().join("koto-directed-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "directed-wf");
     let content = std::fs::read_to_string(&state_path).unwrap();
     let has_directed = content
         .lines()
@@ -1345,8 +1330,7 @@ fn next_with_to_performs_directed_transition() {
 
     // Verify next on the new state works. Auto-advancement chains
     // implement -> done (unconditional transition).
-    let next_output = koto()
-        .current_dir(dir.path())
+    let next_output = koto_cmd(dir.path())
         .args(["next", "directed-wf"])
         .output()
         .unwrap();
@@ -1371,8 +1355,7 @@ fn agent_driven_workflow_loop() {
 
     // With auto-advancement, a single koto next chains through all
     // unconditional transitions: plan -> implement -> verify -> done.
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "loop-wf"])
         .output()
         .unwrap();
@@ -1461,8 +1444,7 @@ fn auto_advance_reaches_verify_from_plan() {
     init_workflow(dir.path(), "auto-wf", &template_auto_advance_4state());
 
     // Single koto next should auto-advance: plan -> implement -> verify (stops: evidence required).
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "auto-wf"])
         .output()
         .unwrap();
@@ -1505,8 +1487,7 @@ fn evidence_triggers_auto_advance_chain() {
     init_workflow(dir.path(), "chain-wf", &template_auto_advance_4state());
 
     // Auto-advance to verify first.
-    let first = koto()
-        .current_dir(dir.path())
+    let first = koto_cmd(dir.path())
         .args(["next", "chain-wf"])
         .output()
         .unwrap();
@@ -1515,8 +1496,7 @@ fn evidence_triggers_auto_advance_chain() {
     assert_eq!(first_json["state"].as_str(), Some("verify"));
 
     // Submit reject evidence -> should auto-advance: verify -> implement -> verify (stops again).
-    let reject = koto()
-        .current_dir(dir.path())
+    let reject = koto_cmd(dir.path())
         .args([
             "next",
             "chain-wf",
@@ -1545,8 +1525,7 @@ fn evidence_triggers_auto_advance_chain() {
     );
 
     // Now approve -> should auto-advance: verify -> done (terminal).
-    let approve = koto()
-        .current_dir(dir.path())
+    let approve = koto_cmd(dir.path())
         .args([
             "next",
             "chain-wf",
@@ -1580,7 +1559,7 @@ fn concurrent_next_fails_with_lock_contention() {
     init_workflow(dir.path(), "lock-wf", &template_with_accepts());
 
     // The state file is named koto-<name>.state.jsonl.
-    let state_path = dir.path().join("koto-lock-wf.state.jsonl");
+    let state_path = session_state_path(dir.path(), "lock-wf");
     assert!(state_path.exists(), "state file should exist after init");
 
     // Hold an exclusive flock on the state file, simulating a concurrent koto next.
@@ -1590,8 +1569,7 @@ fn concurrent_next_fails_with_lock_contention() {
     assert_eq!(ret, 0, "test should acquire flock successfully");
 
     // Now run koto next -- it should fail because it can't acquire the lock.
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "lock-wf"])
         .output()
         .unwrap();
@@ -1633,8 +1611,7 @@ fn cancel_then_next_returns_terminal_state_error() {
     init_workflow(dir.path(), "cancel-wf", &template_with_accepts());
 
     // Cancel the workflow.
-    let cancel = koto()
-        .current_dir(dir.path())
+    let cancel = koto_cmd(dir.path())
         .args(["cancel", "cancel-wf"])
         .output()
         .unwrap();
@@ -1651,8 +1628,7 @@ fn cancel_then_next_returns_terminal_state_error() {
     assert_eq!(cancel_json["name"].as_str(), Some("cancel-wf"));
 
     // Now koto next should fail with terminal_state error.
-    let next = koto()
-        .current_dir(dir.path())
+    let next = koto_cmd(dir.path())
         .args(["next", "cancel-wf"])
         .output()
         .unwrap();
@@ -1688,16 +1664,14 @@ fn double_cancel_returns_error() {
     init_workflow(dir.path(), "dbl-cancel-wf", &template_with_accepts());
 
     // First cancel succeeds.
-    let first = koto()
-        .current_dir(dir.path())
+    let first = koto_cmd(dir.path())
         .args(["cancel", "dbl-cancel-wf"])
         .output()
         .unwrap();
     assert!(first.status.success());
 
     // Second cancel fails.
-    let second = koto()
-        .current_dir(dir.path())
+    let second = koto_cmd(dir.path())
         .args(["cancel", "dbl-cancel-wf"])
         .output()
         .unwrap();
@@ -1728,16 +1702,14 @@ fn cancel_terminal_workflow_returns_error() {
     init_workflow(dir.path(), "term-cancel-wf", minimal_template());
 
     // Auto-advance to terminal state.
-    let advance = koto()
-        .current_dir(dir.path())
+    let advance = koto_cmd(dir.path())
         .args(["next", "term-cancel-wf", "--to", "done"])
         .output()
         .unwrap();
     assert!(advance.status.success());
 
     // Cancel should fail because workflow is already terminal.
-    let cancel = koto()
-        .current_dir(dir.path())
+    let cancel = koto_cmd(dir.path())
         .args(["cancel", "term-cancel-wf"])
         .output()
         .unwrap();
@@ -1765,8 +1737,7 @@ fn gate_timeout_returns_gate_blocked() {
     // Use a gate command that sleeps longer than the 1-second timeout.
     init_workflow(dir.path(), "timeout-wf", &template_with_gate("sleep 60", 1));
 
-    let output = koto()
-        .current_dir(dir.path())
+    let output = koto_cmd(dir.path())
         .args(["next", "timeout-wf"])
         .output()
         .unwrap();

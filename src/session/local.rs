@@ -102,6 +102,7 @@ impl SessionBackend for LocalBackend {
                     results.push(SessionInfo {
                         id: dir_name,
                         created_at: header.created_at,
+                        template_hash: header.template_hash,
                     });
                 }
                 Err(e) => {

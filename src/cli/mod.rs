@@ -2,19 +2,21 @@ pub mod next;
 pub mod next_types;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::buildinfo;
 use crate::cache::{compile_cached, sha256_hex};
-use crate::discover::{find_workflows_with_metadata, workflow_state_path};
+use crate::discover::find_workflows_with_metadata;
 use crate::engine::errors::EngineError;
 use crate::engine::persistence::{
     append_event, append_header, derive_machine_state, derive_state_from_log, read_events,
 };
 use crate::engine::types::{now_iso8601, EventPayload, StateFileHeader};
+use crate::session::local::LocalBackend;
+use crate::session::{state_file_name, SessionBackend};
 use crate::template::types::CompiledTemplate;
 
 /// Maximum payload size for --with-data (1 MB).
@@ -145,6 +147,25 @@ fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
     }
 }
 
+/// Construct the session backend, honoring `KOTO_SESSIONS_BASE` for testing.
+///
+/// When `KOTO_SESSIONS_BASE` is set, sessions are stored directly under that
+/// directory (bypassing repo-id hashing). This is intended for integration
+/// tests that need to control the storage location.
+fn build_backend() -> Result<LocalBackend> {
+    if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
+        Ok(LocalBackend::with_base_dir(PathBuf::from(base)))
+    } else {
+        let working_dir = std::env::current_dir()?;
+        LocalBackend::new(&working_dir)
+    }
+}
+
+/// Compute the state file path for a session.
+fn session_state_path(backend: &dyn SessionBackend, name: &str) -> PathBuf {
+    backend.session_dir(name).join(state_file_name(name))
+}
+
 pub fn run(app: App) -> Result<()> {
     match app.command {
         Command::Version => {
@@ -153,174 +174,28 @@ pub fn run(app: App) -> Result<()> {
             Ok(())
         }
         Command::Init { name, template } => {
-            let current_dir = std::env::current_dir()?;
-            let state_path = workflow_state_path(&current_dir, &name);
-
-            if state_path.exists() {
-                exit_with_error(serde_json::json!({
-                    "error": format!("workflow '{}' already exists", name),
-                    "command": "init"
-                }));
-            }
-
-            let (cache_path, hash) = match compile_cached(Path::new(&template)) {
-                Ok(result) => result,
-                Err(e) => {
-                    exit_with_error(serde_json::json!({
-                        "error": e.to_string(),
-                        "command": "init"
-                    }));
-                }
-            };
-
-            let cache_path_str = cache_path.to_string_lossy().to_string();
-            let compiled: CompiledTemplate = match load_compiled_template(&cache_path_str) {
-                Ok(t) => t,
-                Err(e) => {
-                    exit_with_error(serde_json::json!({
-                        "error": e.to_string(),
-                        "command": "init"
-                    }));
-                }
-            };
-
-            let initial_state = compiled.initial_state.clone();
-            let ts = now_iso8601();
-
-            // Write header line
-            let header = StateFileHeader {
-                schema_version: 1,
-                workflow: name.clone(),
-                template_hash: hash,
-                created_at: ts.clone(),
-            };
-            if let Err(e) = append_header(&state_path, &header) {
-                exit_with_error(serde_json::json!({
-                    "error": e.to_string(),
-                    "command": "init"
-                }));
-            }
-
-            // Write workflow_initialized event (seq 1)
-            let init_payload = EventPayload::WorkflowInitialized {
-                template_path: cache_path_str,
-                variables: HashMap::new(),
-            };
-            if let Err(e) = append_event(&state_path, &init_payload, &ts) {
-                exit_with_error(serde_json::json!({
-                    "error": e.to_string(),
-                    "command": "init"
-                }));
-            }
-
-            // Write initial transitioned event (seq 2, from: null)
-            let transition_payload = EventPayload::Transitioned {
-                from: None,
-                to: initial_state.clone(),
-                condition_type: "auto".to_string(),
-            };
-            if let Err(e) = append_event(&state_path, &transition_payload, &ts) {
-                exit_with_error(serde_json::json!({
-                    "error": e.to_string(),
-                    "command": "init"
-                }));
-            }
-
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "name": name,
-                    "state": initial_state
-                }))?
-            );
-            Ok(())
+            let backend = build_backend()?;
+            handle_init(&backend, &name, &template)
         }
         Command::Next {
             name,
             with_data,
             to,
-        } => handle_next(name, with_data, to),
-        Command::Cancel { name } => handle_cancel(name),
+        } => {
+            let backend = build_backend()?;
+            handle_next(&backend, name, with_data, to)
+        }
+        Command::Cancel { name } => {
+            let backend = build_backend()?;
+            handle_cancel(&backend, &name)
+        }
         Command::Rewind { name } => {
-            let current_dir = std::env::current_dir()?;
-            let state_path = workflow_state_path(&current_dir, &name);
-
-            if !state_path.exists() {
-                exit_with_error(serde_json::json!({
-                    "error": format!("workflow '{}' not found", name),
-                    "command": "rewind"
-                }));
-            }
-
-            let (_header, events) = match read_events(&state_path) {
-                Ok(result) => result,
-                Err(err) => {
-                    let code = exit_code_for_engine_error(&err);
-                    exit_with_error_code(
-                        serde_json::json!({
-                            "error": err.to_string(),
-                            "command": "rewind"
-                        }),
-                        code,
-                    );
-                }
-            };
-
-            // Find the current state and the state to rewind to.
-            // The current state comes from the last state-changing event.
-            // To rewind, we need to find the second-to-last state-changing event.
-            let state_changing: Vec<&crate::engine::types::Event> = events
-                .iter()
-                .filter(|e| {
-                    matches!(
-                        e.payload,
-                        EventPayload::Transitioned { .. }
-                            | EventPayload::DirectedTransition { .. }
-                            | EventPayload::Rewound { .. }
-                    )
-                })
-                .collect();
-
-            if state_changing.len() <= 1 {
-                exit_with_error(serde_json::json!({
-                    "error": "already at initial state, cannot rewind",
-                    "command": "rewind"
-                }));
-            }
-
-            let current_state = derive_state_from_log(&events).unwrap_or_default();
-            let prev_event = state_changing[state_changing.len() - 2];
-            let prev_state = match &prev_event.payload {
-                EventPayload::Transitioned { to, .. } => to.clone(),
-                EventPayload::DirectedTransition { to, .. } => to.clone(),
-                EventPayload::Rewound { to, .. } => to.clone(),
-                _ => unreachable!(),
-            };
-
-            let rewind_payload = EventPayload::Rewound {
-                from: current_state,
-                to: prev_state.clone(),
-            };
-
-            if let Err(e) = append_event(&state_path, &rewind_payload, &now_iso8601()) {
-                exit_with_error(serde_json::json!({
-                    "error": e.to_string(),
-                    "command": "rewind"
-                }));
-            }
-
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "name": name,
-                    "state": prev_state
-                }))?
-            );
-            Ok(())
+            let backend = build_backend()?;
+            handle_rewind(&backend, &name)
         }
         Command::Workflows => {
-            let current_dir = std::env::current_dir()?;
-            let metadata = match find_workflows_with_metadata(&current_dir) {
+            let backend = build_backend()?;
+            let metadata = match find_workflows_with_metadata(&backend) {
                 Ok(m) => m,
                 Err(e) => {
                     exit_with_error(serde_json::json!({
@@ -361,6 +236,177 @@ pub fn run(app: App) -> Result<()> {
     }
 }
 
+/// Handle the `koto init` command.
+fn handle_init(backend: &dyn SessionBackend, name: &str, template: &str) -> Result<()> {
+    // Check if session already exists (state file present).
+    if backend.exists(name) {
+        exit_with_error(serde_json::json!({
+            "error": format!("workflow '{}' already exists", name),
+            "command": "init"
+        }));
+    }
+
+    // Create the session directory.
+    let session_dir = match backend.create(name) {
+        Ok(dir) => dir,
+        Err(e) => {
+            exit_with_error(serde_json::json!({
+                "error": e.to_string(),
+                "command": "init"
+            }));
+        }
+    };
+
+    let (cache_path, hash) = match compile_cached(Path::new(template)) {
+        Ok(result) => result,
+        Err(e) => {
+            exit_with_error(serde_json::json!({
+                "error": e.to_string(),
+                "command": "init"
+            }));
+        }
+    };
+
+    let cache_path_str = cache_path.to_string_lossy().to_string();
+    let compiled: CompiledTemplate = match load_compiled_template(&cache_path_str) {
+        Ok(t) => t,
+        Err(e) => {
+            exit_with_error(serde_json::json!({
+                "error": e.to_string(),
+                "command": "init"
+            }));
+        }
+    };
+
+    let initial_state = compiled.initial_state.clone();
+    let ts = now_iso8601();
+    let state_path = session_dir.join(state_file_name(name));
+
+    // Write header line
+    let header = StateFileHeader {
+        schema_version: 1,
+        workflow: name.to_string(),
+        template_hash: hash,
+        created_at: ts.clone(),
+    };
+    if let Err(e) = append_header(&state_path, &header) {
+        exit_with_error(serde_json::json!({
+            "error": e.to_string(),
+            "command": "init"
+        }));
+    }
+
+    // Write workflow_initialized event (seq 1)
+    let init_payload = EventPayload::WorkflowInitialized {
+        template_path: cache_path_str,
+        variables: HashMap::new(),
+    };
+    if let Err(e) = append_event(&state_path, &init_payload, &ts) {
+        exit_with_error(serde_json::json!({
+            "error": e.to_string(),
+            "command": "init"
+        }));
+    }
+
+    // Write initial transitioned event (seq 2, from: null)
+    let transition_payload = EventPayload::Transitioned {
+        from: None,
+        to: initial_state.clone(),
+        condition_type: "auto".to_string(),
+    };
+    if let Err(e) = append_event(&state_path, &transition_payload, &ts) {
+        exit_with_error(serde_json::json!({
+            "error": e.to_string(),
+            "command": "init"
+        }));
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "name": name,
+            "state": initial_state
+        }))?
+    );
+    Ok(())
+}
+
+/// Handle the `koto rewind` command.
+fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
+    let state_path = session_state_path(backend, name);
+
+    if !state_path.exists() {
+        exit_with_error(serde_json::json!({
+            "error": format!("workflow '{}' not found", name),
+            "command": "rewind"
+        }));
+    }
+
+    let (_header, events) = match read_events(&state_path) {
+        Ok(result) => result,
+        Err(err) => {
+            let code = exit_code_for_engine_error(&err);
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": err.to_string(),
+                    "command": "rewind"
+                }),
+                code,
+            );
+        }
+    };
+
+    // Find the current state and the state to rewind to.
+    let state_changing: Vec<&crate::engine::types::Event> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.payload,
+                EventPayload::Transitioned { .. }
+                    | EventPayload::DirectedTransition { .. }
+                    | EventPayload::Rewound { .. }
+            )
+        })
+        .collect();
+
+    if state_changing.len() <= 1 {
+        exit_with_error(serde_json::json!({
+            "error": "already at initial state, cannot rewind",
+            "command": "rewind"
+        }));
+    }
+
+    let current_state = derive_state_from_log(&events).unwrap_or_default();
+    let prev_event = state_changing[state_changing.len() - 2];
+    let prev_state = match &prev_event.payload {
+        EventPayload::Transitioned { to, .. } => to.clone(),
+        EventPayload::DirectedTransition { to, .. } => to.clone(),
+        EventPayload::Rewound { to, .. } => to.clone(),
+        _ => unreachable!(),
+    };
+
+    let rewind_payload = EventPayload::Rewound {
+        from: current_state,
+        to: prev_state.clone(),
+    };
+
+    if let Err(e) = append_event(&state_path, &rewind_payload, &now_iso8601()) {
+        exit_with_error(serde_json::json!({
+            "error": e.to_string(),
+            "command": "rewind"
+        }));
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "name": name,
+            "state": prev_state
+        }))?
+    );
+    Ok(())
+}
+
 /// Handle the `koto next` command with full output contract support.
 ///
 /// Flow:
@@ -381,7 +427,12 @@ pub fn run(app: App) -> Result<()> {
 /// output contract). Other commands (init, rewind, etc.) use a flat
 /// `{"error": "string", "command": "..."}` format. Do not mix the two styles.
 #[cfg(unix)]
-fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> Result<()> {
+fn handle_next(
+    backend: &dyn SessionBackend,
+    name: String,
+    with_data: Option<String>,
+    to: Option<String>,
+) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
         BlockingCondition, ErrorDetail, ExpectsSchema, IntegrationOutput,
@@ -425,7 +476,7 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
 
     // 3. Load state file and template
     let current_dir = std::env::current_dir()?;
-    let state_path = workflow_state_path(&current_dir, &name);
+    let state_path = session_state_path(backend, &name);
 
     if !state_path.exists() {
         let err = NextError {
@@ -944,7 +995,12 @@ fn handle_next(name: String, with_data: Option<String>, to: Option<String>) -> R
 
 /// Non-unix stub for handle_next.
 #[cfg(not(unix))]
-fn handle_next(name: String, _with_data: Option<String>, _to: Option<String>) -> Result<()> {
+fn handle_next(
+    _backend: &dyn SessionBackend,
+    name: String,
+    _with_data: Option<String>,
+    _to: Option<String>,
+) -> Result<()> {
     exit_with_error_code(
         serde_json::json!({
             "error": "koto next is only supported on unix platforms",
@@ -958,9 +1014,8 @@ fn handle_next(name: String, _with_data: Option<String>, _to: Option<String>) ->
 ///
 /// Appends a `WorkflowCancelled` event to the event log. Rejects double-cancel
 /// and cancel of already-terminal workflows.
-fn handle_cancel(name: String) -> Result<()> {
-    let current_dir = std::env::current_dir()?;
-    let state_path = workflow_state_path(&current_dir, &name);
+fn handle_cancel(backend: &dyn SessionBackend, name: &str) -> Result<()> {
+    let state_path = session_state_path(backend, name);
 
     if !state_path.exists() {
         exit_with_error(serde_json::json!({

@@ -10,6 +10,9 @@ pub struct SessionInfo {
 
     /// RFC 3339 UTC timestamp of session creation (from state file header).
     pub created_at: String,
+
+    /// SHA-256 hash of the compiled template (from state file header).
+    pub template_hash: String,
 }
 
 /// Return the state file name for a given session ID.
