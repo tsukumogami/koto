@@ -671,7 +671,16 @@ pub fn run(app: App) -> Result<()> {
                 };
 
                 let output_bytes = match args.format {
-                    ExportFormat::Mermaid => crate::export::to_mermaid(&compiled).into_bytes(),
+                    ExportFormat::Mermaid => {
+                        let raw = crate::export::to_mermaid(&compiled);
+                        if args.output.is_some() {
+                            // Wrap in fenced code block for GitHub rendering.
+                            format!("```mermaid\n{}```\n", raw).into_bytes()
+                        } else {
+                            // Raw mermaid text for stdout composability.
+                            raw.into_bytes()
+                        }
+                    }
                     ExportFormat::Html => crate::export::generate_html(&compiled),
                 };
 

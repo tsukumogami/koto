@@ -3088,9 +3088,14 @@ fn export_cli_writes_to_output_file() {
 
     let content = std::fs::read_to_string(&output_path).unwrap();
     assert!(
-        content.starts_with("stateDiagram-v2\n"),
-        "output file should contain mermaid diagram"
+        content.starts_with("```mermaid\n"),
+        "output file should start with mermaid fence"
     );
+    assert!(
+        content.ends_with("```\n"),
+        "output file should end with closing fence"
+    );
+    assert!(content.contains("stateDiagram-v2"));
     assert!(content.contains("[*] --> entry"));
 }
 
