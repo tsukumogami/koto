@@ -74,6 +74,9 @@ pub enum StopReason {
     },
     /// SIGTERM or SIGINT received between iterations.
     SignalReceived,
+    /// Conditional transitions exist but no evidence matches, and the state
+    /// has no accepts block so the agent can't submit evidence to resolve it.
+    UnresolvableTransition,
 }
 
 /// Result returned by `advance_until_stop`.
@@ -336,11 +339,19 @@ where
                 current_evidence = BTreeMap::new();
             }
             TransitionResolution::NeedsEvidence => {
-                return Ok(AdvanceResult {
-                    final_state: state,
-                    advanced,
-                    stop_reason: StopReason::EvidenceRequired,
-                });
+                if template_state.accepts.is_some() {
+                    return Ok(AdvanceResult {
+                        final_state: state,
+                        advanced,
+                        stop_reason: StopReason::EvidenceRequired,
+                    });
+                } else {
+                    return Ok(AdvanceResult {
+                        final_state: state,
+                        advanced,
+                        stop_reason: StopReason::UnresolvableTransition,
+                    });
+                }
             }
             TransitionResolution::Ambiguous(targets) => {
                 return Err(AdvanceError::AmbiguousTransition {
@@ -480,6 +491,24 @@ mod tests {
             target: target.to_string(),
             when: Some(when),
         }
+    }
+
+    fn make_accepts(
+        fields: Vec<&str>,
+    ) -> Option<BTreeMap<String, crate::template::types::FieldSchema>> {
+        let mut map = BTreeMap::new();
+        for field in fields {
+            map.insert(
+                field.to_string(),
+                crate::template::types::FieldSchema {
+                    field_type: "string".to_string(),
+                    required: true,
+                    values: vec![],
+                    description: String::new(),
+                },
+            );
+        }
+        Some(map)
     }
 
     fn make_template(states: Vec<(&str, TemplateState)>) -> CompiledTemplate {
@@ -808,7 +837,7 @@ mod tests {
                     ],
                     terminal: false,
                     gates: BTreeMap::new(),
-                    accepts: None,
+                    accepts: make_accepts(vec!["decision"]),
                     integration: None,
                     default_action: None,
                 },
@@ -919,7 +948,7 @@ mod tests {
                 ],
                 terminal: false,
                 gates: BTreeMap::new(),
-                accepts: None,
+                accepts: make_accepts(vec!["decision"]),
                 integration: None,
                 default_action: None,
             },
@@ -1262,9 +1291,11 @@ mod tests {
         .unwrap();
 
         // Should stop at "middle" because evidence is cleared after auto-advance.
+        // "middle" has conditionals but no accepts block, so the engine returns
+        // UnresolvableTransition (not EvidenceRequired).
         assert_eq!(result.final_state, "middle");
         assert!(result.advanced);
-        assert_eq!(result.stop_reason, StopReason::EvidenceRequired);
+        assert_eq!(result.stop_reason, StopReason::UnresolvableTransition);
     }
 
     // -----------------------------------------------------------------------
