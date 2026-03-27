@@ -84,7 +84,7 @@ fn compile_template(dir: &Path) -> String {
 fn version_exits_0_and_produces_json() {
     let output = Command::cargo_bin("koto")
         .unwrap()
-        .arg("version")
+        .args(["version", "--json"])
         .output()
         .unwrap();
 
@@ -2626,4 +2626,2157 @@ fn context_hierarchical_keys_work() {
         .unwrap();
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout), "deep content");
+}
+
+// ---------------------------------------------------------------------------
+// Tests from main branch (export, variables, default_action, etc.)
+// ---------------------------------------------------------------------------
+
+fn template_with_variables() -> &'static str {
+    r#"---
+name: var-workflow
+version: "1.0"
+initial_state: start
+variables:
+  OWNER:
+    description: "Repository owner"
+    required: true
+  REPO:
+    description: "Repository name"
+    required: true
+  BRANCH:
+    description: "Branch name"
+    default: "main"
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Work on {{OWNER}}/{{REPO}} branch {{BRANCH}}.
+
+## done
+
+All done.
+"#
+}
+
+/// Write the variable template source to a file in `dir` and return its path.
+fn write_var_template_source(dir: &Path) -> std::path::PathBuf {
+    let src = dir.join("var-template.md");
+    std::fs::write(&src, template_with_variables()).unwrap();
+    src
+}
+
+#[test]
+fn version_outputs_human_readable_by_default() {
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .arg("version")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "version should exit 0");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("koto "),
+        "default version output should start with 'koto ', got: {}",
+        stdout
+    );
+    // Should NOT be JSON
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stdout).is_err(),
+        "default version output should not be JSON"
+    );
+}
+
+#[test]
+fn version_is_derived_from_git_not_cargo_toml() {
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args(["version", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let version = json["version"].as_str().unwrap();
+    let commit = json["commit"].as_str().unwrap();
+
+    // Version must follow one of the git-derived patterns:
+    // - Release tag: "X.Y.Z" (digits and dots only)
+    // - Ahead of tag: "X.Y.Z-dev+<hash>"
+    // - No tags: "dev+<hash>"
+    let valid = version
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '.')                    // exact tag
+        || version.contains("-dev+")                                  // ahead of tag
+        || version.starts_with("dev+"); // no tags
+    assert!(
+        valid,
+        "version '{}' doesn't match any git-derived pattern (X.Y.Z, X.Y.Z-dev+hash, dev+hash)",
+        version
+    );
+
+    // The commit field should be a short hex hash (or "unknown" in non-git builds).
+    assert!(
+        commit == "unknown" || commit.chars().all(|c| c.is_ascii_hexdigit()),
+        "commit '{}' should be a hex hash or 'unknown'",
+        commit
+    );
+
+    // Version must NOT be the literal Cargo.toml version "0.1.0" when we're
+    // on a non-tag commit (which is always true in test builds).
+    // If we're on an exact v0.1.0 tag this would legitimately be "0.1.0",
+    // but test builds are ahead of the tag so it should have -dev+ suffix.
+    if version == "0.1.0" {
+        // Only acceptable if we're actually on the v0.1.0 tag.
+        let on_tag = std::process::Command::new("git")
+            .args(["describe", "--tags", "--exact-match"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(
+            on_tag,
+            "version is '0.1.0' but we're not on a release tag -- build.rs should produce '0.1.0-dev+<hash>'"
+        );
+    }
+}
+
+#[test]
+fn init_var_valid_vars_stored_in_event() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "init with valid vars should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify the variables are stored in the workflow_initialized event.
+    let state_path = session_state_path(dir.path(), "var-wf");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    // Line 0 = header, line 1 = workflow_initialized event.
+    let init_event: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let vars = init_event["payload"]["variables"].as_object().unwrap();
+    assert_eq!(vars["OWNER"].as_str(), Some("acme"));
+    assert_eq!(vars["REPO"].as_str(), Some("widgets"));
+    // BRANCH should get its default value.
+    assert_eq!(vars["BRANCH"].as_str(), Some("main"));
+}
+
+#[test]
+fn init_var_missing_equals_fails() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+            "--var",
+            "BADFORMAT",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "missing = should fail");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("expected KEY=VALUE"),
+        "error should mention KEY=VALUE format, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_var_duplicate_key_fails() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+            "--var",
+            "OWNER=other",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "duplicate key should fail");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("duplicate"),
+        "error should mention duplicate, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_var_unknown_key_fails() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+            "--var",
+            "UNKNOWN=val",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "unknown key should fail");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("unknown variable"),
+        "error should mention unknown variable, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_var_missing_required_fails() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    // Only provide OWNER but not REPO (both required).
+    let output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "missing required variable should fail"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("missing required variable"),
+        "error should mention missing required, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_var_default_applied_for_optional() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    // Provide only the two required vars; BRANCH has a default.
+    let output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme",
+            "--var",
+            "REPO=widgets",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "init with defaults should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state_path = session_state_path(dir.path(), "var-wf");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    let init_event: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let vars = init_event["payload"]["variables"].as_object().unwrap();
+    assert_eq!(
+        vars["BRANCH"].as_str(),
+        Some("main"),
+        "BRANCH should use its default value"
+    );
+}
+
+#[test]
+fn init_var_forbidden_chars_fail() {
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=acme corp",
+            "--var",
+            "REPO=widgets",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "forbidden characters in value should fail"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("not allowed"),
+        "error should mention not allowed, got: {}",
+        err
+    );
+}
+
+#[test]
+fn init_no_variables_no_flags_works() {
+    // The minimal template has no variables block. Init without --var should work.
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    let output = koto_cmd(dir.path())
+        .args(["init", "no-var-wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "init without vars on no-variables template should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn init_no_variables_with_flags_fails() {
+    // The minimal template has no variables block. Passing --var should fail (unknown keys).
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    let output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "no-var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "FOO=bar",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "passing --var to a template with no variables should fail"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.contains("unknown variable"),
+        "error should mention unknown variable, got: {}",
+        err
+    );
+}
+
+/// Helper to init a workflow with --var flags.
+fn init_workflow_with_vars(dir: &Path, name: &str, template_content: &str, vars: &[&str]) {
+    let src = dir.join(format!("{}-template.md", name));
+    std::fs::write(&src, template_content).unwrap();
+
+    let mut args = vec!["init", name, "--template", src.to_str().unwrap()];
+    for var in vars {
+        args.push("--var");
+        args.push(var);
+    }
+
+    let output = koto_cmd(dir).args(&args).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Template with a gate whose command uses a variable reference.
+fn template_with_var_gate() -> String {
+    r#"---
+name: var-gate-workflow
+version: "1.0"
+initial_state: start
+variables:
+  TASK_ID:
+    description: "Task identifier"
+    required: true
+states:
+  start:
+    gates:
+      check:
+        type: command
+        command: "test -f /tmp/koto-test-{{TASK_ID}}"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Work on task {{TASK_ID}}.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+/// Template with variables in directive text and a direct transition path.
+fn template_with_var_directive() -> String {
+    r#"---
+name: var-directive-workflow
+version: "1.0"
+initial_state: start
+variables:
+  OWNER:
+    description: "Repository owner"
+    required: true
+  REPO:
+    description: "Repository name"
+    required: true
+states:
+  start:
+    accepts:
+      decision:
+        type: enum
+        required: true
+        values: [proceed, skip]
+    transitions:
+      - target: work
+        when:
+          decision: proceed
+      - target: done
+        when:
+          decision: skip
+  work:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Review {{OWNER}}/{{REPO}} and decide.
+
+## work
+
+Implement changes for {{OWNER}}/{{REPO}}.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn next_var_gate_evaluates_with_substituted_command() {
+    let dir = TempDir::new().unwrap();
+
+    // Create the sentinel file that the gate checks for.
+    let sentinel = "/tmp/koto-test-42";
+    std::fs::write(sentinel, "").unwrap();
+
+    init_workflow_with_vars(
+        dir.path(),
+        "var-gate-wf",
+        &template_with_var_gate(),
+        &["TASK_ID=42"],
+    );
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "var-gate-wf"])
+        .output()
+        .unwrap();
+
+    // Clean up sentinel file.
+    let _ = std::fs::remove_file(sentinel);
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("next output should be valid JSON");
+
+    // The gate should pass (file exists), so the workflow auto-advances to done.
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "gate should pass with substituted path, auto-advance to done"
+    );
+}
+
+#[test]
+fn next_var_gate_fails_when_substituted_path_missing() {
+    let dir = TempDir::new().unwrap();
+
+    // Don't create the sentinel file -- the gate should fail.
+    let sentinel = "/tmp/koto-test-99999";
+    let _ = std::fs::remove_file(sentinel); // ensure it doesn't exist
+
+    init_workflow_with_vars(
+        dir.path(),
+        "var-gate-fail-wf",
+        &template_with_var_gate(),
+        &["TASK_ID=99999"],
+    );
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "var-gate-fail-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gate_blocked exits 0, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("next output should be valid JSON");
+
+    // Should be blocked at start because the gate fails.
+    assert_eq!(json["state"].as_str(), Some("start"));
+    assert!(
+        json["blocking_conditions"].is_array(),
+        "should have blocking_conditions"
+    );
+
+    // The directive should have the substituted variable value.
+    assert_eq!(
+        json["directive"].as_str(),
+        Some("Work on task 99999."),
+        "directive should contain substituted variable"
+    );
+}
+
+#[test]
+fn next_var_directive_contains_substituted_values() {
+    let dir = TempDir::new().unwrap();
+
+    init_workflow_with_vars(
+        dir.path(),
+        "var-dir-wf",
+        &template_with_var_directive(),
+        &["OWNER=acme", "REPO=widgets"],
+    );
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "var-dir-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("next output should be valid JSON");
+
+    // State should be "start" (needs evidence, no auto-advance).
+    assert_eq!(json["state"].as_str(), Some("start"));
+    assert_eq!(
+        json["directive"].as_str(),
+        Some("Review acme/widgets and decide."),
+        "directive should contain substituted variable values"
+    );
+}
+
+#[test]
+fn next_var_to_directed_transition_substitutes_directive() {
+    let dir = TempDir::new().unwrap();
+
+    init_workflow_with_vars(
+        dir.path(),
+        "var-to-wf",
+        &template_with_var_directive(),
+        &["OWNER=acme", "REPO=widgets"],
+    );
+
+    // Use --to to direct transition from start to work.
+    let output = koto_cmd(dir.path())
+        .args(["next", "var-to-wf", "--to", "work"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next --to should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("next output should be valid JSON");
+
+    assert_eq!(json["state"].as_str(), Some("work"));
+    assert_eq!(
+        json["directive"].as_str(),
+        Some("Implement changes for acme/widgets."),
+        "directed transition directive should contain substituted values"
+    );
+}
+
+fn template_with_default_action_creating_file() -> String {
+    r#"---
+name: action-workflow
+version: "1.0"
+initial_state: setup
+states:
+  setup:
+    default_action:
+      command: "touch marker.txt"
+    gates:
+      file_exists:
+        type: command
+        command: "test -f marker.txt"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## setup
+
+Run setup action.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn default_action_creates_file_and_auto_advances() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(
+        dir.path(),
+        "action-wf",
+        &template_with_default_action_creating_file(),
+    );
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "action-wf", "--no-cleanup"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+
+    // The action creates marker.txt, the gate checks it exists, and the state
+    // auto-advances to done.
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "should auto-advance to terminal state"
+    );
+    assert_eq!(json["action"].as_str(), Some("done"));
+    assert_eq!(json["advanced"], true);
+
+    // Verify the marker file was actually created.
+    assert!(
+        dir.path().join("marker.txt").exists(),
+        "action should have created marker.txt"
+    );
+
+    // Verify the state file contains a default_action_executed event.
+    let state_content =
+        std::fs::read_to_string(session_state_path(dir.path(), "action-wf")).unwrap();
+    assert!(
+        state_content.contains("default_action_executed"),
+        "state file should contain default_action_executed event"
+    );
+}
+
+#[test]
+fn default_action_skipped_when_override_evidence_exists() {
+    let dir = TempDir::new().unwrap();
+
+    // Template where setup has a default_action and an accepts block, plus a gate.
+    let template = r#"---
+name: skip-action-wf
+version: "1.0"
+initial_state: setup
+states:
+  setup:
+    default_action:
+      command: "touch should-not-exist.txt"
+    accepts:
+      status:
+        type: string
+        required: true
+    gates:
+      always_pass:
+        type: command
+        command: "true"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## setup
+
+Setup step.
+
+## done
+
+Done.
+"#;
+
+    init_workflow(dir.path(), "skip-wf", template);
+
+    // Submit evidence before calling next, which sets the override evidence.
+    let output = koto_cmd(dir.path())
+        .args(["next", "skip-wf", "--with-data", r#"{"status": "manual"}"#])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next with evidence should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The action should have been skipped because evidence was submitted.
+    assert!(
+        !dir.path().join("should-not-exist.txt").exists(),
+        "action should be skipped when override evidence exists"
+    );
+}
+
+fn template_with_requires_confirmation() -> String {
+    r#"---
+name: confirm-workflow
+version: "1.0"
+initial_state: confirm_step
+states:
+  confirm_step:
+    default_action:
+      command: "echo needs-review"
+      requires_confirmation: true
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## confirm_step
+
+Confirm the action output.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn requires_confirmation_stops_and_returns_output() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(
+        dir.path(),
+        "confirm-wf",
+        &template_with_requires_confirmation(),
+    );
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "confirm-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+
+    // Should stop at confirm_step, not advance to done.
+    assert_eq!(
+        json["state"].as_str(),
+        Some("confirm_step"),
+        "should stop at state requiring confirmation"
+    );
+    assert_eq!(
+        json["action"].as_str(),
+        Some("confirm"),
+        "action should be 'confirm'"
+    );
+    assert!(
+        json["action_output"].is_object(),
+        "action_output should be present"
+    );
+    assert_eq!(json["action_output"]["exit_code"], 0);
+    assert!(
+        json["action_output"]["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("needs-review"),
+        "stdout should contain command output"
+    );
+}
+
+fn template_with_polling_action() -> String {
+    // The action creates a counter file that increments on each run.
+    // On the third run, it creates a "ready" marker.
+    // The gate checks for the "ready" marker.
+    r#"---
+name: poll-workflow
+version: "1.0"
+initial_state: wait
+states:
+  wait:
+    default_action:
+      command: |
+        count=0
+        if [ -f poll_count.txt ]; then
+          count=$(cat poll_count.txt)
+        fi
+        count=$((count + 1))
+        echo $count > poll_count.txt
+        if [ $count -ge 2 ]; then
+          touch ready.txt
+        fi
+        echo "iteration $count"
+      polling:
+        interval_secs: 1
+        timeout_secs: 10
+    gates:
+      ready:
+        type: command
+        command: "test -f ready.txt"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## wait
+
+Wait for readiness.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+#[test]
+fn polling_action_retries_until_success() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "poll-wf", &template_with_polling_action());
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "poll-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+
+    // The polling should eventually succeed and auto-advance to done.
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "polling should complete and auto-advance to terminal state"
+    );
+    assert_eq!(json["advanced"], true);
+
+    // Verify the ready marker was created.
+    assert!(
+        dir.path().join("ready.txt").exists(),
+        "polling should have created ready.txt"
+    );
+}
+
+/// Path to the multi-state fixture template.
+fn fixture_multi_state() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test/functional/fixtures/templates/multi-state.md")
+}
+
+/// Path to the simple-gates fixture template.
+fn fixture_simple_gates() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test/functional/fixtures/templates/simple-gates.md")
+}
+
+/// A single-state template (initial + terminal, no transitions).
+fn single_state_template_content() -> &'static str {
+    r#"---
+name: single-state
+version: "1.0"
+initial_state: only
+states:
+  only:
+    terminal: true
+---
+
+## only
+
+This workflow has a single state that is both initial and terminal.
+"#
+}
+
+#[test]
+fn export_multi_state_fixture_contains_expected_states_and_transitions() {
+    let compiled = koto::template::compile::compile(&fixture_multi_state()).unwrap();
+    let mermaid = koto::export::to_mermaid(&compiled);
+
+    // Header
+    assert!(
+        mermaid.starts_with("stateDiagram-v2\n"),
+        "should start with stateDiagram-v2"
+    );
+
+    // Initial state marker
+    assert!(
+        mermaid.contains("[*] --> entry"),
+        "should have initial state marker for entry, got:\n{}",
+        mermaid
+    );
+
+    // Terminal state marker
+    assert!(
+        mermaid.contains("done --> [*]"),
+        "should have terminal state marker for done, got:\n{}",
+        mermaid
+    );
+
+    // Transitions
+    assert!(
+        mermaid.contains("entry --> setup"),
+        "should have entry->setup transition, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("entry --> work"),
+        "should have entry->work transition, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("setup --> work"),
+        "should have setup->work transition, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("work --> done"),
+        "should have work->done transition, got:\n{}",
+        mermaid
+    );
+
+    // Conditional transition labels
+    assert!(
+        mermaid.contains("entry --> setup : route: setup"),
+        "should have labeled transition for route: setup, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("entry --> work : route: work"),
+        "should have labeled transition for route: work, got:\n{}",
+        mermaid
+    );
+
+    // Gate annotation
+    assert!(
+        mermaid.contains("note left of setup : gate: config_exists"),
+        "should have gate annotation for config_exists, got:\n{}",
+        mermaid
+    );
+
+    // LF line endings
+    assert!(!mermaid.contains("\r\n"), "output must use LF, not CRLF");
+    assert!(!mermaid.contains('\r'), "output must not contain CR");
+
+    // Trailing newline
+    assert!(mermaid.ends_with('\n'), "output should end with newline");
+}
+
+#[test]
+fn export_simple_gates_fixture_has_gate_and_when_labels() {
+    let compiled = koto::template::compile::compile(&fixture_simple_gates()).unwrap();
+    let mermaid = koto::export::to_mermaid(&compiled);
+
+    // Gate note
+    assert!(
+        mermaid.contains("note left of start : gate: check_file"),
+        "should have gate annotation for check_file, got:\n{}",
+        mermaid
+    );
+
+    // When conditions on transitions
+    assert!(
+        mermaid.contains("start --> done : status: completed"),
+        "should have labeled transition for status: completed, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("start --> done : status: override"),
+        "should have labeled transition for status: override, got:\n{}",
+        mermaid
+    );
+
+    // Initial and terminal markers
+    assert!(mermaid.contains("[*] --> start"));
+    assert!(mermaid.contains("done --> [*]"));
+}
+
+#[test]
+fn export_determinism_byte_identical_across_calls() {
+    let compiled = koto::template::compile::compile(&fixture_multi_state()).unwrap();
+    let first = koto::export::to_mermaid(&compiled);
+    let second = koto::export::to_mermaid(&compiled);
+
+    assert_eq!(
+        first, second,
+        "two calls to to_mermaid on the same template must produce byte-identical output"
+    );
+
+    // Also verify bytes match (not just string equality).
+    assert_eq!(
+        first.as_bytes(),
+        second.as_bytes(),
+        "byte-level comparison must also match"
+    );
+}
+
+#[test]
+fn export_single_state_template_produces_valid_mermaid() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("single-state.md");
+    std::fs::write(&src, single_state_template_content()).unwrap();
+
+    let compiled = koto::template::compile::compile(&src).unwrap();
+    let mermaid = koto::export::to_mermaid(&compiled);
+
+    // Header
+    assert!(mermaid.starts_with("stateDiagram-v2\n"));
+
+    // Initial and terminal markers both point to the single state.
+    assert!(
+        mermaid.contains("[*] --> only"),
+        "should have initial state marker, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("only --> [*]"),
+        "should have terminal state marker, got:\n{}",
+        mermaid
+    );
+
+    // No inter-state transitions (no lines with --> that don't involve [*]).
+    let transition_lines: Vec<&str> = mermaid
+        .lines()
+        .filter(|l| l.contains("-->") && !l.contains("[*]"))
+        .collect();
+    assert!(
+        transition_lines.is_empty(),
+        "single-state template should have no inter-state transitions, got: {:?}",
+        transition_lines
+    );
+
+    // Trailing newline
+    assert!(mermaid.ends_with('\n'));
+}
+
+#[test]
+fn export_md_and_json_produce_identical_output() {
+    let dir = TempDir::new().unwrap();
+
+    // Write the multi-state fixture to a temp .md file and compile it via CLI
+    // to get a .json output.
+    let fixture = fixture_multi_state();
+
+    let compile_output = koto_cmd(dir.path())
+        .args(["template", "compile", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        compile_output.status.success(),
+        "template compile should succeed: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let json_path = String::from_utf8(compile_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Export from .md source
+    let md_output = koto_cmd(dir.path())
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        md_output.status.success(),
+        "export from .md should succeed: {}",
+        String::from_utf8_lossy(&md_output.stderr)
+    );
+
+    // Export from .json source
+    let json_output = koto_cmd(dir.path())
+        .args(["template", "export", &json_path])
+        .output()
+        .unwrap();
+
+    assert!(
+        json_output.status.success(),
+        "export from .json should succeed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+
+    let md_mermaid = String::from_utf8(md_output.stdout).unwrap();
+    let json_mermaid = String::from_utf8(json_output.stdout).unwrap();
+
+    assert_eq!(
+        md_mermaid, json_mermaid,
+        ".md and .json inputs must produce identical Mermaid output"
+    );
+}
+
+#[test]
+fn export_cli_outputs_mermaid_to_stdout() {
+    let fixture = fixture_multi_state();
+
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "export should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("stateDiagram-v2\n"),
+        "CLI stdout should contain mermaid diagram, got:\n{}",
+        stdout
+    );
+    assert!(stdout.contains("[*] --> entry"));
+    assert!(stdout.contains("done --> [*]"));
+}
+
+#[test]
+fn export_cli_writes_to_output_file() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("diagram.mermaid.md");
+
+    let output = koto_cmd(dir.path())
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "export with --output should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        output_path.exists(),
+        "output file should be created at {:?}",
+        output_path
+    );
+
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    assert!(
+        content.starts_with("stateDiagram-v2\n"),
+        "output file should contain mermaid diagram"
+    );
+    assert!(content.contains("[*] --> entry"));
+}
+
+#[test]
+fn export_determinism_via_cli() {
+    let fixture = fixture_multi_state();
+
+    let first = Command::cargo_bin("koto")
+        .unwrap()
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    let second = Command::cargo_bin("koto")
+        .unwrap()
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(first.status.success());
+    assert!(second.status.success());
+
+    assert_eq!(
+        first.stdout, second.stdout,
+        "two CLI export invocations must produce byte-identical stdout"
+    );
+}
+
+#[test]
+fn export_check_fresh_file_exits_0() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("diagram.mermaid.md");
+
+    // First, generate the file.
+    let gen = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        gen.status.success(),
+        "generation failed: {}",
+        String::from_utf8_lossy(&gen.stderr)
+    );
+
+    // Now check: should exit 0 because the file is fresh.
+    let check = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "--check on fresh file should exit 0: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn export_check_stale_file_exits_1() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("diagram.mermaid.md");
+
+    // Write stale content.
+    std::fs::write(&output_path, b"stale content").unwrap();
+
+    let check = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !check.status.success(),
+        "--check on stale file should exit 1"
+    );
+
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("is out of date"),
+        "stderr should mention 'out of date': {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("run: koto template export"),
+        "stderr should contain fix command: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_check_missing_file_exits_1() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("nonexistent.mermaid.md");
+
+    let check = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !check.status.success(),
+        "--check on missing file should exit 1"
+    );
+
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("does not exist"),
+        "stderr should mention 'does not exist': {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("run: koto template export"),
+        "stderr should contain fix command: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_check_fix_command_resolves_drift() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("diagram.mermaid.md");
+
+    // Write stale content.
+    std::fs::write(&output_path, b"stale").unwrap();
+
+    // Run --check to get the fix command (it will fail).
+    let check = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "mermaid",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(!check.status.success());
+
+    // Apply the fix: regenerate the file.
+    let fix = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "mermaid",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        fix.status.success(),
+        "fix command failed: {}",
+        String::from_utf8_lossy(&fix.stderr)
+    );
+
+    // Now --check should pass.
+    let recheck = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "mermaid",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        recheck.status.success(),
+        "--check after fix should exit 0: {}",
+        String::from_utf8_lossy(&recheck.stderr)
+    );
+}
+
+/// Export a fixture template to HTML via CLI and return the file contents.
+/// HTML format requires --output, so this writes to a temp file.
+fn export_html_to_file(fixture: &Path) -> (String, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let output_path = dir.path().join("preview.html");
+
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "export --format html --output should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    (content, dir)
+}
+
+#[test]
+fn export_html_contains_template_data() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    assert!(
+        html.contains("multi-state"),
+        "HTML should contain template name, got length={}",
+        html.len()
+    );
+    assert!(html.contains("entry"), "HTML should contain state names");
+    assert!(
+        html.contains("config_exists"),
+        "HTML should contain gate names"
+    );
+}
+
+#[test]
+fn export_html_contains_cdn_script_tags_with_sri() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    // Script tags may span multiple lines, so split on "</script>" to get
+    // each complete tag block and check the ones that reference unpkg CDN.
+    let script_blocks: Vec<&str> = html.split("</script>").collect();
+    let cdn_blocks: Vec<&str> = script_blocks
+        .iter()
+        .filter(|b| b.contains("<script") && b.contains("unpkg.com"))
+        .copied()
+        .collect();
+
+    assert!(
+        !cdn_blocks.is_empty(),
+        "HTML should contain CDN script tags"
+    );
+
+    for block in &cdn_blocks {
+        assert!(
+            block.contains("integrity=\"sha384-"),
+            "CDN script tag must have SRI integrity hash: {}",
+            block.trim()
+        );
+        assert!(
+            block.contains("crossorigin=\"anonymous\""),
+            "CDN script tag must have crossorigin attribute: {}",
+            block.trim()
+        );
+    }
+}
+
+#[test]
+fn export_html_no_server_side_directives() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    assert!(
+        !html.contains("<?"),
+        "HTML should not contain PHP-style server directives"
+    );
+    assert!(
+        !html.contains("<%"),
+        "HTML should not contain ASP-style server directives"
+    );
+}
+
+#[test]
+fn export_html_determinism_via_cli() {
+    let fixture = fixture_multi_state();
+    let dir = TempDir::new().unwrap();
+    let first_path = dir.path().join("first.html");
+    let second_path = dir.path().join("second.html");
+
+    let first = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            first_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    let second = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            second_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(first.status.success());
+    assert!(second.status.success());
+
+    let first_bytes = std::fs::read(&first_path).unwrap();
+    let second_bytes = std::fs::read(&second_path).unwrap();
+
+    assert_eq!(
+        first_bytes, second_bytes,
+        "two CLI HTML export invocations must produce byte-identical output"
+    );
+}
+
+#[test]
+fn export_html_writes_to_output_file() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("preview.html");
+
+    let output = koto_cmd(dir.path())
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "export --format html --output should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        output_path.exists(),
+        "output file should be created at {:?}",
+        output_path
+    );
+
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    assert!(
+        content.contains("<!DOCTYPE html>"),
+        "output file should be valid HTML"
+    );
+    assert!(content.contains("multi-state"));
+}
+
+#[test]
+fn export_html_valid_structure() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    assert!(html.contains("<!DOCTYPE html>"), "must have DOCTYPE");
+    assert!(html.contains("<html"), "must have html tag");
+    assert!(html.contains("</html>"), "must close html tag");
+    assert!(html.contains("<head>"), "must have head tag");
+    assert!(html.contains("</head>"), "must close head tag");
+    assert!(html.contains("<body>"), "must have body tag");
+    assert!(html.contains("</body>"), "must close body tag");
+}
+
+#[test]
+fn export_html_size_under_30kb() {
+    let (html, _dir) = export_html_to_file(&fixture_multi_state());
+
+    let size = html.len();
+    assert!(
+        size < 30 * 1024,
+        "HTML output should be under 30 KB, got {} bytes ({:.1} KB)",
+        size,
+        size as f64 / 1024.0
+    );
+}
+
+#[test]
+fn export_html_check_fresh_exits_0() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("preview.html");
+
+    // Generate the file.
+    let gen = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        gen.status.success(),
+        "generation failed: {}",
+        String::from_utf8_lossy(&gen.stderr)
+    );
+
+    // Check: should exit 0 because the file is fresh.
+    let check = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "--check on fresh HTML file should exit 0: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn export_html_check_stale_exits_1() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("preview.html");
+
+    // Write stale content.
+    std::fs::write(&output_path, b"<html>stale</html>").unwrap();
+
+    let check = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !check.status.success(),
+        "--check on stale HTML file should exit 1"
+    );
+
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("is out of date"),
+        "stderr should mention 'out of date': {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("--format html"),
+        "stderr fix command should specify html format: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_html_check_missing_exits_1() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("nonexistent.html");
+
+    let check = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !check.status.success(),
+        "--check on missing HTML file should exit 1"
+    );
+
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("does not exist"),
+        "stderr should mention 'does not exist': {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("--format html"),
+        "stderr fix command should specify html format: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_html_check_fix_command_resolves_drift() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("preview.html");
+
+    // Write stale content.
+    std::fs::write(&output_path, b"stale").unwrap();
+
+    // Run --check (it will fail).
+    let check = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(!check.status.success());
+
+    // Apply the fix: regenerate the file.
+    let fix = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        fix.status.success(),
+        "fix command failed: {}",
+        String::from_utf8_lossy(&fix.stderr)
+    );
+
+    // Now --check should pass.
+    let recheck = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        recheck.status.success(),
+        "--check after fix should exit 0: {}",
+        String::from_utf8_lossy(&recheck.stderr)
+    );
+}
+
+#[test]
+fn export_flag_html_without_output_errors() {
+    let fixture = fixture_multi_state();
+
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "should exit 2 for flag validation error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--format html requires --output"),
+        "should mention --output requirement, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_flag_open_without_html_errors() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("out.mermaid.md");
+
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "mermaid",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--open",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "should exit 2 for flag validation error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--open is only valid with --format html"),
+        "should mention --open/html constraint, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_flag_open_with_check_errors() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_multi_state();
+    let output_path = dir.path().join("out.html");
+
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args([
+            "template",
+            "export",
+            fixture.to_str().unwrap(),
+            "--format",
+            "html",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--open",
+            "--check",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "should exit 2 for flag validation error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--open and --check are mutually exclusive"),
+        "should mention mutual exclusivity, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_flag_check_without_output_errors() {
+    let fixture = fixture_multi_state();
+
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args(["template", "export", fixture.to_str().unwrap(), "--check"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "should exit 2 for flag validation error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--check requires --output"),
+        "should mention --output requirement, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_nonexistent_input_file_errors() {
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args(["template", "export", "/tmp/nonexistent-template-abc123.md"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "should fail for non-existent input"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error:"),
+        "should print error to stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_malformed_json_input_errors() {
+    let dir = TempDir::new().unwrap();
+    let bad_json = dir.path().join("broken.json");
+    std::fs::write(&bad_json, "{ this is not valid json }").unwrap();
+
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args(["template", "export", bad_json.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "should fail for malformed JSON input"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error:"),
+        "should print error to stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_invalid_template_errors() {
+    let dir = TempDir::new().unwrap();
+    let bad_md = dir.path().join("invalid.md");
+    std::fs::write(
+        &bad_md,
+        "---\n!!!invalid yaml: [[[broken\n---\n\n## state\n\nContent.\n",
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args(["template", "export", bad_md.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "should fail for invalid template");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error:"),
+        "should print error to stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn export_latency_under_500ms() {
+    let fixture = fixture_multi_state();
+
+    let start = std::time::Instant::now();
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args(["template", "export", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(
+        output.status.success(),
+        "export should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "export should complete in under 500ms, took {:?}",
+        elapsed
+    );
+}
+
+/// Generate a 30-state template and verify export completes in under 500ms.
+#[test]
+fn export_30_state_template_latency_under_500ms() {
+    let dir = TempDir::new().unwrap();
+
+    // Build a 30-state chain: s0 -> s1 -> ... -> s29 (terminal)
+    let mut yaml =
+        String::from("---\nname: big-workflow\nversion: \"1.0\"\ninitial_state: s0\nstates:\n");
+    for i in 0..30 {
+        yaml.push_str(&format!("  s{}:\n", i));
+        if i == 29 {
+            yaml.push_str("    terminal: true\n");
+        } else {
+            yaml.push_str(&format!("    transitions:\n      - target: s{}\n", i + 1));
+        }
+    }
+    yaml.push_str("---\n");
+    for i in 0..30 {
+        yaml.push_str(&format!("\n## s{}\n\nState {} content.\n", i, i));
+    }
+
+    let template_path = dir.path().join("big-template.md");
+    std::fs::write(&template_path, &yaml).unwrap();
+
+    let start = std::time::Instant::now();
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args(["template", "export", template_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(
+        output.status.success(),
+        "30-state export should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "30-state export should complete in under 500ms, took {:?}",
+        elapsed
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("stateDiagram-v2\n"),
+        "output should be valid mermaid"
+    );
+    assert!(
+        stdout.contains("[*] --> s0"),
+        "should have initial state marker"
+    );
+    assert!(
+        stdout.contains("s29 --> [*]"),
+        "should have terminal state marker"
+    );
 }

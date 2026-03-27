@@ -4,4 +4,5 @@ pub mod advance;
 pub mod errors;
 pub mod evidence;
 pub mod persistence;
+pub mod substitute;
 pub mod types;

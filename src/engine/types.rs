@@ -31,7 +31,7 @@ pub enum EventPayload {
     WorkflowInitialized {
         template_path: String,
         #[serde(default)]
-        variables: HashMap<String, serde_json::Value>,
+        variables: HashMap<String, String>,
     },
     Transitioned {
         from: Option<String>,
@@ -59,6 +59,17 @@ pub enum EventPayload {
         state: String,
         reason: String,
     },
+    DefaultActionExecuted {
+        state: String,
+        command: String,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
+    DecisionRecorded {
+        state: String,
+        decision: serde_json::Value,
+    },
 }
 
 impl EventPayload {
@@ -72,6 +83,8 @@ impl EventPayload {
             EventPayload::IntegrationInvoked { .. } => "integration_invoked",
             EventPayload::Rewound { .. } => "rewound",
             EventPayload::WorkflowCancelled { .. } => "workflow_cancelled",
+            EventPayload::DefaultActionExecuted { .. } => "default_action_executed",
+            EventPayload::DecisionRecorded { .. } => "decision_recorded",
         }
     }
 }
@@ -199,6 +212,25 @@ impl<'de> Deserialize<'de> for Event {
                     reason: p.reason,
                 }
             }
+            "default_action_executed" => {
+                let p: DefaultActionExecutedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::DefaultActionExecuted {
+                    state: p.state,
+                    command: p.command,
+                    exit_code: p.exit_code,
+                    stdout: p.stdout,
+                    stderr: p.stderr,
+                }
+            }
+            "decision_recorded" => {
+                let p: DecisionRecordedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::DecisionRecorded {
+                    state: p.state,
+                    decision: p.decision,
+                }
+            }
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown event type: {}",
@@ -221,7 +253,7 @@ impl<'de> Deserialize<'de> for Event {
 struct WorkflowInitializedPayload {
     template_path: String,
     #[serde(default)]
-    variables: HashMap<String, serde_json::Value>,
+    variables: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -260,6 +292,21 @@ struct RewoundPayload {
 struct WorkflowCancelledPayload {
     state: String,
     reason: String,
+}
+
+#[derive(Deserialize)]
+struct DefaultActionExecutedPayload {
+    state: String,
+    command: String,
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Deserialize)]
+struct DecisionRecordedPayload {
+    state: String,
+    decision: serde_json::Value,
 }
 
 /// Metadata about a workflow, derived from the state file header.
@@ -461,10 +508,65 @@ mod tests {
     }
 
     #[test]
+    fn event_decision_recorded_round_trip() {
+        let e = Event {
+            seq: 5,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "decision_recorded".to_string(),
+            payload: EventPayload::DecisionRecorded {
+                state: "implementation".to_string(),
+                decision: serde_json::json!({
+                    "choice": "Use retry with backoff",
+                    "rationale": "The API has no batch endpoint",
+                    "alternatives_considered": ["Parallel requests", "Queue-based processing"]
+                }),
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"type\":\"decision_recorded\""));
+        assert!(json.contains("\"choice\":\"Use retry with backoff\""));
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
     fn now_iso8601_format() {
         let ts = now_iso8601();
         assert_eq!(ts.len(), 20);
         assert!(ts.ends_with('Z'));
         assert!(ts.contains('T'));
+    }
+
+    #[test]
+    fn default_action_executed_round_trip() {
+        let e = Event {
+            seq: 5,
+            timestamp: "2026-03-22T10:00:00Z".to_string(),
+            event_type: "default_action_executed".to_string(),
+            payload: EventPayload::DefaultActionExecuted {
+                state: "setup".to_string(),
+                command: "git checkout -b feature".to_string(),
+                exit_code: 0,
+                stdout: "Switched to a new branch 'feature'\n".to_string(),
+                stderr: String::new(),
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"type\":\"default_action_executed\""));
+        assert!(json.contains("\"exit_code\":0"));
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn default_action_executed_type_name() {
+        let p = EventPayload::DefaultActionExecuted {
+            state: "s".to_string(),
+            command: "c".to_string(),
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "err".to_string(),
+        };
+        assert_eq!(p.type_name(), "default_action_executed");
     }
 }

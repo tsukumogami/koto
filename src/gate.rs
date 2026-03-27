@@ -6,19 +6,13 @@
 //! condition in a single response.
 
 use std::collections::BTreeMap;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
-use std::time::Duration;
 
-use wait_timeout::ChildExt;
-
+use crate::action::run_shell_command;
 use crate::session::context::ContextStore;
 use crate::template::types::{
     Gate, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS, GATE_TYPE_CONTEXT_MATCHES,
 };
-
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Result of evaluating a single gate.
 #[derive(Debug, Clone, PartialEq)]
@@ -125,58 +119,23 @@ fn evaluate_context_matches_gate(
 }
 
 fn evaluate_command_gate(gate: &Gate, working_dir: &Path) -> GateResult {
-    // timeout=0 is the serde default, meaning "no override"; use the module default.
-    let timeout = if gate.timeout == 0 {
-        Duration::from_secs(DEFAULT_TIMEOUT_SECS)
-    } else {
-        Duration::from_secs(u64::from(gate.timeout))
-    };
+    let output = run_shell_command(&gate.command, working_dir, gate.timeout);
 
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(&gate.command).current_dir(working_dir);
-
-    // SAFETY: setpgid(0, 0) puts the child into its own process group so we
-    // can kill the entire group on timeout without affecting the parent.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setpgid(0, 0);
-            Ok(())
-        });
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return GateResult::Error {
-                message: e.to_string(),
-            };
-        }
-    };
-
-    match child.wait_timeout(timeout) {
-        Ok(Some(status)) => {
-            if status.success() {
-                GateResult::Passed
-            } else {
-                GateResult::Failed {
-                    exit_code: status.code().unwrap_or(1),
-                }
-            }
-        }
-        Ok(None) => {
-            // Timed out -- kill the entire process group.
-            let pid = child.id() as i32;
-            // SAFETY: killpg sends SIGKILL to the process group we created.
-            unsafe {
-                libc::killpg(pid, libc::SIGKILL);
-            }
-            // Reap the child so we don't leave a zombie.
-            let _ = child.wait();
+    if output.exit_code == -1 {
+        // Distinguish timeout from spawn/wait errors by checking the message.
+        if output.stderr.contains("timed out") {
             GateResult::TimedOut
+        } else {
+            GateResult::Error {
+                message: output.stderr,
+            }
         }
-        Err(e) => GateResult::Error {
-            message: e.to_string(),
-        },
+    } else if output.exit_code == 0 {
+        GateResult::Passed
+    } else {
+        GateResult::Failed {
+            exit_code: output.exit_code,
+        }
     }
 }
 

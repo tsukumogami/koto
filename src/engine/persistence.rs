@@ -264,6 +264,43 @@ pub fn derive_evidence(events: &[Event]) -> Vec<&Event> {
         .collect()
 }
 
+/// Derive decisions for the current state from the event log.
+///
+/// Returns `DecisionRecorded` events occurring after the most recent
+/// state-changing event whose `to` field matches the current state.
+/// State-changing events are: `transitioned`, `directed_transition`, `rewound`.
+pub fn derive_decisions(events: &[Event]) -> Vec<&Event> {
+    let current_state = match derive_state_from_log(events) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    // Find the most recent state-changing event whose `to` matches current state.
+    let epoch_start_idx = events.iter().enumerate().rev().find_map(|(idx, e)| {
+        let to = match &e.payload {
+            EventPayload::Transitioned { to, .. } => Some(to),
+            EventPayload::DirectedTransition { to, .. } => Some(to),
+            EventPayload::Rewound { to, .. } => Some(to),
+            _ => None,
+        };
+        if to.map(|t| t == &current_state).unwrap_or(false) {
+            Some(idx)
+        } else {
+            None
+        }
+    });
+
+    let start = match epoch_start_idx {
+        Some(idx) => idx + 1,
+        None => return Vec::new(),
+    };
+
+    events[start..]
+        .iter()
+        .filter(|e| matches!(&e.payload, EventPayload::DecisionRecorded { state, .. } if state == &current_state))
+        .collect()
+}
+
 /// Derive full machine state from header and event log.
 ///
 /// Uses `derive_state_from_log` for the current state, and extracts
@@ -783,5 +820,153 @@ mod tests {
         )];
         // Only init event, no transitioned -- no current state derivable
         assert!(derive_machine_state(&header, &events).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // derive_decisions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn derive_decisions_returns_only_current_epoch() {
+        let events = vec![
+            make_event(
+                1,
+                EventPayload::WorkflowInitialized {
+                    template_path: "/cache/abc.json".to_string(),
+                    variables: HashMap::new(),
+                },
+            ),
+            make_event(
+                2,
+                EventPayload::Transitioned {
+                    from: None,
+                    to: "implementation".to_string(),
+                    condition_type: "auto".to_string(),
+                },
+            ),
+            make_event(
+                3,
+                EventPayload::DecisionRecorded {
+                    state: "implementation".to_string(),
+                    decision: serde_json::json!({
+                        "choice": "Use retry",
+                        "rationale": "No batch endpoint"
+                    }),
+                },
+            ),
+            make_event(
+                4,
+                EventPayload::DecisionRecorded {
+                    state: "implementation".to_string(),
+                    decision: serde_json::json!({
+                        "choice": "Skip migration",
+                        "rationale": "Data volume too small"
+                    }),
+                },
+            ),
+        ];
+
+        let decisions = derive_decisions(&events);
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].seq, 3);
+        assert_eq!(decisions[1].seq, 4);
+    }
+
+    #[test]
+    fn derive_decisions_empty_after_rewind() {
+        let events = vec![
+            make_event(
+                1,
+                EventPayload::WorkflowInitialized {
+                    template_path: "/cache/abc.json".to_string(),
+                    variables: HashMap::new(),
+                },
+            ),
+            make_event(
+                2,
+                EventPayload::Transitioned {
+                    from: None,
+                    to: "implementation".to_string(),
+                    condition_type: "auto".to_string(),
+                },
+            ),
+            make_event(
+                3,
+                EventPayload::DecisionRecorded {
+                    state: "implementation".to_string(),
+                    decision: serde_json::json!({
+                        "choice": "Use retry",
+                        "rationale": "No batch endpoint"
+                    }),
+                },
+            ),
+            make_event(
+                4,
+                EventPayload::Transitioned {
+                    from: Some("implementation".to_string()),
+                    to: "review".to_string(),
+                    condition_type: "gate".to_string(),
+                },
+            ),
+            make_event(
+                5,
+                EventPayload::Rewound {
+                    from: "review".to_string(),
+                    to: "implementation".to_string(),
+                },
+            ),
+        ];
+
+        let decisions = derive_decisions(&events);
+        assert!(
+            decisions.is_empty(),
+            "rewind should clear prior decisions (epoch boundary)"
+        );
+    }
+
+    #[test]
+    fn derive_decisions_ignores_other_state_decisions() {
+        let events = vec![
+            make_event(
+                1,
+                EventPayload::WorkflowInitialized {
+                    template_path: "/cache/abc.json".to_string(),
+                    variables: HashMap::new(),
+                },
+            ),
+            make_event(
+                2,
+                EventPayload::Transitioned {
+                    from: None,
+                    to: "implementation".to_string(),
+                    condition_type: "auto".to_string(),
+                },
+            ),
+            // A decision tagged with a different state name should be ignored.
+            make_event(
+                3,
+                EventPayload::DecisionRecorded {
+                    state: "analysis".to_string(),
+                    decision: serde_json::json!({
+                        "choice": "Wrong state",
+                        "rationale": "Should not appear"
+                    }),
+                },
+            ),
+            make_event(
+                4,
+                EventPayload::DecisionRecorded {
+                    state: "implementation".to_string(),
+                    decision: serde_json::json!({
+                        "choice": "Correct state",
+                        "rationale": "Should appear"
+                    }),
+                },
+            ),
+        ];
+
+        let decisions = derive_decisions(&events);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].seq, 4);
     }
 }

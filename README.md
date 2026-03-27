@@ -6,7 +6,13 @@ Agents call `koto next` to get their current directive and do the work. If somet
 
 ## Install
 
-Download the latest binary for your platform from the [GitHub Releases page](https://github.com/tsukumogami/koto/releases).
+```bash
+curl -fsSL https://raw.githubusercontent.com/tsukumogami/koto/main/install.sh | bash
+```
+
+The script detects your platform, downloads the latest release, verifies the checksum, and adds koto to your PATH. Set `KOTO_INSTALL_DIR` to change the install location (defaults to `~/.koto`).
+
+Or download a binary directly from the [GitHub Releases page](https://github.com/tsukumogami/koto/releases).
 
 Or build from source with Rust:
 

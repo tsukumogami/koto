@@ -2,14 +2,18 @@
 set -euo pipefail
 
 # koto installer
-# Downloads and installs the latest koto release
+# Downloads and installs a koto release (latest by default, or pinned with --version)
 
 # Parse arguments
 MODIFY_PATH=true
+REQUESTED_VERSION=""
 for arg in "$@"; do
     case "$arg" in
         --no-modify-path)
             MODIFY_PATH=false
+            ;;
+        --version=*)
+            REQUESTED_VERSION="${arg#--version=}"
             ;;
     esac
 done
@@ -44,26 +48,34 @@ esac
 
 echo "Detected platform: ${OS}-${ARCH}"
 
-# Get latest release version
-echo "Fetching latest release..."
-# Use GITHUB_TOKEN if available to avoid rate limiting
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-    LATEST=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" "$API_URL" | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+# Resolve version
+if [ -n "$REQUESTED_VERSION" ]; then
+    # Use the pinned version (add v prefix if missing)
+    case "$REQUESTED_VERSION" in
+        v*) VERSION="$REQUESTED_VERSION" ;;
+        *)  VERSION="v${REQUESTED_VERSION}" ;;
+    esac
+    echo "Installing koto ${VERSION} (pinned)"
 else
-    LATEST=$(curl -fsSL "$API_URL" | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
-fi
+    # Fetch latest release
+    echo "Fetching latest release..."
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        VERSION=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" "$API_URL" | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+    else
+        VERSION=$(curl -fsSL "$API_URL" | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+    fi
 
-if [ -z "$LATEST" ]; then
-    echo "Failed to determine latest version" >&2
-    exit 1
+    if [ -z "$VERSION" ]; then
+        echo "Failed to determine latest version" >&2
+        exit 1
+    fi
+    echo "Installing koto ${VERSION}"
 fi
-
-echo "Installing koto ${LATEST}"
 
 # Binary naming matches GoReleaser convention: koto-{os}-{arch}
 BINARY_NAME="koto-${OS}-${ARCH}"
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST}/${BINARY_NAME}"
-CHECKSUM_URL="https://github.com/${REPO}/releases/download/${LATEST}/checksums.txt"
+DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${BINARY_NAME}"
+CHECKSUM_URL="https://github.com/${REPO}/releases/download/${VERSION}/checksums.txt"
 
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
@@ -96,7 +108,7 @@ chmod +x "$TEMP_DIR/koto"
 mv "$TEMP_DIR/koto" "$BIN_DIR/koto"
 
 echo ""
-echo "koto ${LATEST} installed successfully!"
+echo "koto ${VERSION} installed successfully!"
 echo ""
 
 # Create env file with PATH export

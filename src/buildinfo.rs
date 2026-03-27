@@ -9,7 +9,7 @@ pub struct BuildInfo {
 
 pub fn build_info() -> BuildInfo {
     BuildInfo {
-        version: env!("CARGO_PKG_VERSION"),
+        version: env!("KOTO_VERSION"),
         commit: env!("KOTO_GIT_HASH"),
         built_at: env!("KOTO_BUILD_DATE"),
     }

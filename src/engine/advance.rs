@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine::types::{Event, EventPayload};
 use crate::gate::GateResult;
-use crate::template::types::{CompiledTemplate, TemplateState};
+use crate::template::types::{ActionDecl, CompiledTemplate, TemplateState};
 
 /// Maximum number of transitions per invocation. Defense-in-depth against
 /// template bugs with hundreds of linearly chaining states.
@@ -24,6 +24,25 @@ pub enum TransitionResolution {
     Ambiguous(Vec<String>),
     /// The state has no transitions at all (dead-end, not terminal).
     NoTransitions,
+}
+
+/// Result of executing a default action.
+#[derive(Debug, Clone)]
+pub enum ActionResult {
+    /// Action executed successfully.
+    Executed {
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
+    /// Action was skipped (override evidence existed).
+    Skipped,
+    /// Action executed but requires user confirmation before continuing.
+    RequiresConfirmation {
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
 }
 
 /// Why the advancement loop stopped.
@@ -46,8 +65,18 @@ pub enum StopReason {
     CycleDetected { state: String },
     /// Safety limit: exceeded 100 transitions in one invocation.
     ChainLimitReached,
+    /// Action executed but requires user confirmation before continuing.
+    ActionRequiresConfirmation {
+        state: String,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
     /// SIGTERM or SIGINT received between iterations.
     SignalReceived,
+    /// Conditional transitions exist but no evidence matches, and the state
+    /// has no accepts block so the agent can't submit evidence to resolve it.
+    UnresolvableTransition,
 }
 
 /// Result returned by `advance_until_stop`.
@@ -116,10 +145,10 @@ pub enum IntegrationError {
 ///
 /// The loop iterates states, checking each against stopping conditions in order:
 /// 1. Signal received (shutdown flag)
-/// 2. Cycle detected (visited-state set)
+/// 2. Chain limit check
 /// 3. Terminal state
-/// 4. Integration already invoked this epoch (re-invocation prevention)
-/// 5. Integration declared (invoke runner)
+/// 4. Integration declared (invoke runner)
+/// 5. Action execution (if state has default_action)
 /// 6. Gates (evaluate all, stop if any fail)
 /// 7. Transition resolution (match evidence against conditions)
 ///
@@ -127,19 +156,23 @@ pub enum IntegrationError {
 /// - `append_event`: persist a state transition event
 /// - `evaluate_gates`: run gate commands and return results
 /// - `invoke_integration`: call an integration runner
-pub fn advance_until_stop<F, G, I>(
+/// - `execute_action`: run a default action command
+#[allow(clippy::too_many_arguments)]
+pub fn advance_until_stop<F, G, I, A>(
     current_state: &str,
     template: &CompiledTemplate,
     evidence: &BTreeMap<String, serde_json::Value>,
     append_event: &mut F,
     evaluate_gates: &G,
     invoke_integration: &I,
+    execute_action: &A,
     shutdown: &AtomicBool,
 ) -> Result<AdvanceResult, AdvanceError>
 where
     F: FnMut(&EventPayload) -> Result<(), String>,
     G: Fn(&BTreeMap<String, crate::template::types::Gate>) -> BTreeMap<String, GateResult>,
     I: Fn(&str) -> Result<serde_json::Value, IntegrationError>,
+    A: Fn(&str, &ActionDecl, bool) -> ActionResult,
 {
     let mut visited = HashSet::new();
     let mut state = current_state.to_string();
@@ -224,23 +257,62 @@ where
             }
         }
 
-        // 5. Evaluate gates
+        // 5. Action execution (if state has default_action)
+        if let Some(action) = &template_state.default_action {
+            let has_evidence = !current_evidence.is_empty();
+            let result = execute_action(&state, action, has_evidence);
+            match result {
+                ActionResult::Executed { .. } => {
+                    // Continue to gate evaluation
+                }
+                ActionResult::Skipped => {
+                    // Continue to gate evaluation
+                }
+                ActionResult::RequiresConfirmation {
+                    exit_code,
+                    stdout,
+                    stderr,
+                } => {
+                    return Ok(AdvanceResult {
+                        final_state: state.clone(),
+                        advanced,
+                        stop_reason: StopReason::ActionRequiresConfirmation {
+                            state,
+                            exit_code,
+                            stdout,
+                            stderr,
+                        },
+                    });
+                }
+            }
+        }
+
+        // 6. Evaluate gates
+        let mut gates_failed = false;
         if !template_state.gates.is_empty() {
             let gate_results = evaluate_gates(&template_state.gates);
             let any_failed = gate_results
                 .values()
                 .any(|r| !matches!(r, GateResult::Passed));
             if any_failed {
-                return Ok(AdvanceResult {
-                    final_state: state,
-                    advanced,
-                    stop_reason: StopReason::GateBlocked(gate_results),
-                });
+                // If the state has an accepts block, fall through to transition
+                // resolution instead of returning GateBlocked. The transition
+                // resolver will skip unconditional transitions when gate_failed
+                // is true, ensuring the agent must submit evidence.
+                if template_state.accepts.is_none() {
+                    return Ok(AdvanceResult {
+                        final_state: state,
+                        advanced,
+                        stop_reason: StopReason::GateBlocked(gate_results),
+                    });
+                }
+                gates_failed = true;
+                // Fall through to transition resolution with gate_failed=true.
             }
         }
 
-        // 6. Resolve transition
-        match resolve_transition(template_state, &current_evidence) {
+        // 7. Resolve transition
+        match resolve_transition(template_state, &current_evidence, gates_failed) {
             TransitionResolution::Resolved(target) => {
                 // Check for cycle before transitioning
                 if visited.contains(&target) {
@@ -267,11 +339,19 @@ where
                 current_evidence = BTreeMap::new();
             }
             TransitionResolution::NeedsEvidence => {
-                return Ok(AdvanceResult {
-                    final_state: state,
-                    advanced,
-                    stop_reason: StopReason::EvidenceRequired,
-                });
+                if template_state.accepts.is_some() {
+                    return Ok(AdvanceResult {
+                        final_state: state,
+                        advanced,
+                        stop_reason: StopReason::EvidenceRequired,
+                    });
+                } else {
+                    return Ok(AdvanceResult {
+                        final_state: state,
+                        advanced,
+                        stop_reason: StopReason::UnresolvableTransition,
+                    });
+                }
             }
             TransitionResolution::Ambiguous(targets) => {
                 return Err(AdvanceError::AmbiguousTransition {
@@ -295,12 +375,20 @@ where
 /// 2. For each, check if ALL `when` fields match the evidence (exact JSON equality)
 /// 3. If exactly one matches, return `Resolved(target)`
 /// 4. If multiple match, return `Ambiguous(targets)`
-/// 5. If none match and an unconditional transition exists, return `Resolved(fallback)`
+/// 5. If none match and an unconditional transition exists:
+///    - If `gate_failed` is false, return `Resolved(fallback)` (auto-advance)
+///    - If `gate_failed` is true, return `NeedsEvidence` (require evidence before advancing)
 /// 6. If none match and no unconditional fallback, return `NeedsEvidence`
 /// 7. If no transitions at all, return `NoTransitions`
+///
+/// The `gate_failed` parameter prevents unconditional transitions from firing when
+/// the engine fell through from a gate failure. Without this, states with both gates
+/// and accepts blocks would auto-advance via the unconditional fallback even when
+/// gates fail — defeating the evidence-fallback mechanism.
 pub fn resolve_transition(
     template_state: &TemplateState,
     evidence: &BTreeMap<String, serde_json::Value>,
+    gate_failed: bool,
 ) -> TransitionResolution {
     if template_state.transitions.is_empty() {
         return TransitionResolution::NoTransitions;
@@ -333,7 +421,14 @@ pub fn resolve_transition(
         _ => {
             // No conditional match.
             if let Some(fallback) = unconditional_target {
-                TransitionResolution::Resolved(fallback)
+                if gate_failed {
+                    // Gate failed and no evidence matches a conditional transition.
+                    // Don't auto-advance via the unconditional fallback — require
+                    // evidence so the agent can provide override or recovery input.
+                    TransitionResolution::NeedsEvidence
+                } else {
+                    TransitionResolution::Resolved(fallback)
+                }
             } else if has_conditional {
                 TransitionResolution::NeedsEvidence
             } else {
@@ -376,6 +471,7 @@ mod tests {
             gates: BTreeMap::new(),
             accepts: None,
             integration: None,
+            default_action: None,
         }
     }
 
@@ -395,6 +491,24 @@ mod tests {
             target: target.to_string(),
             when: Some(when),
         }
+    }
+
+    fn make_accepts(
+        fields: Vec<&str>,
+    ) -> Option<BTreeMap<String, crate::template::types::FieldSchema>> {
+        let mut map = BTreeMap::new();
+        for field in fields {
+            map.insert(
+                field.to_string(),
+                crate::template::types::FieldSchema {
+                    field_type: "string".to_string(),
+                    required: true,
+                    values: vec![],
+                    description: String::new(),
+                },
+            );
+        }
+        Some(map)
     }
 
     fn make_template(states: Vec<(&str, TemplateState)>) -> CompiledTemplate {
@@ -427,6 +541,14 @@ mod tests {
         Err(IntegrationError::Unavailable)
     }
 
+    fn noop_action(
+        _state: &str,
+        _action: &crate::template::types::ActionDecl,
+        _has_evidence: bool,
+    ) -> ActionResult {
+        ActionResult::Skipped
+    }
+
     // -----------------------------------------------------------------------
     // resolve_transition tests
     // -----------------------------------------------------------------------
@@ -436,7 +558,7 @@ mod tests {
         let state = make_state(vec![unconditional("next")]);
         let evidence = BTreeMap::new();
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("next".to_string())
         );
     }
@@ -450,7 +572,7 @@ mod tests {
         let mut evidence = BTreeMap::new();
         evidence.insert("decision".to_string(), serde_json::json!("approve"));
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("approved".to_string())
         );
     }
@@ -464,7 +586,7 @@ mod tests {
         let mut evidence = BTreeMap::new();
         evidence.insert("decision".to_string(), serde_json::json!("approve"));
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("approved".to_string())
         );
     }
@@ -478,7 +600,7 @@ mod tests {
         let mut evidence = BTreeMap::new();
         evidence.insert("decision".to_string(), serde_json::json!("reject"));
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("fallback".to_string())
         );
     }
@@ -492,7 +614,7 @@ mod tests {
         let mut evidence = BTreeMap::new();
         evidence.insert("x".to_string(), serde_json::json!(1));
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::Ambiguous(vec!["target_a".to_string(), "target_b".to_string()])
         );
     }
@@ -502,7 +624,7 @@ mod tests {
         let state = make_state(vec![]);
         let evidence = BTreeMap::new();
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::NoTransitions
         );
     }
@@ -516,7 +638,7 @@ mod tests {
         // Empty evidence -- no match.
         let evidence = BTreeMap::new();
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::NeedsEvidence
         );
     }
@@ -532,15 +654,51 @@ mod tests {
         let mut evidence = BTreeMap::new();
         evidence.insert("a".to_string(), serde_json::json!("x"));
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::NeedsEvidence
         );
 
         // Both fields match.
         evidence.insert("b".to_string(), serde_json::json!("y"));
         assert_eq!(
-            resolve_transition(&state, &evidence),
+            resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("target".to_string())
+        );
+    }
+
+    #[test]
+    fn gate_failed_skips_unconditional_fallback() {
+        // State with a conditional transition and an unconditional fallback.
+        // When gate_failed=false, the unconditional fires. When gate_failed=true,
+        // it returns NeedsEvidence instead.
+        let state = make_state(vec![
+            conditional(
+                "next_state",
+                vec![("status", serde_json::json!("completed"))],
+            ),
+            unconditional("fallback_state"),
+        ]);
+
+        let evidence = BTreeMap::new(); // no evidence
+
+        // gate_failed=false: unconditional fallback fires
+        assert_eq!(
+            resolve_transition(&state, &evidence, false),
+            TransitionResolution::Resolved("fallback_state".to_string())
+        );
+
+        // gate_failed=true: unconditional fallback skipped, needs evidence
+        assert_eq!(
+            resolve_transition(&state, &evidence, true),
+            TransitionResolution::NeedsEvidence
+        );
+
+        // gate_failed=true but evidence matches conditional: resolves normally
+        let mut with_evidence = BTreeMap::new();
+        with_evidence.insert("status".to_string(), serde_json::json!("completed"));
+        assert_eq!(
+            resolve_transition(&state, &with_evidence, true),
+            TransitionResolution::Resolved("next_state".to_string())
         );
     }
 
@@ -654,6 +812,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -665,6 +824,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -677,8 +837,9 @@ mod tests {
                     ],
                     terminal: false,
                     gates: BTreeMap::new(),
-                    accepts: None,
+                    accepts: make_accepts(vec!["decision"]),
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -690,6 +851,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
         ]);
@@ -708,6 +870,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -743,6 +906,7 @@ mod tests {
                 gates,
                 accepts: None,
                 integration: None,
+                default_action: None,
             },
         )]);
 
@@ -764,6 +928,7 @@ mod tests {
             &mut append,
             &gate_eval,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -785,8 +950,9 @@ mod tests {
                 ],
                 terminal: false,
                 gates: BTreeMap::new(),
-                accepts: None,
+                accepts: make_accepts(vec!["decision"]),
                 integration: None,
+                default_action: None,
             },
         )]);
 
@@ -800,6 +966,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -824,6 +991,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -835,6 +1003,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
         ]);
@@ -849,6 +1018,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -876,6 +1046,7 @@ mod tests {
                 gates: BTreeMap::new(),
                 accepts: None,
                 integration: Some("my-runner".to_string()),
+                default_action: None,
             },
         )]);
 
@@ -893,6 +1064,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -924,6 +1096,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ));
         }
@@ -937,6 +1110,7 @@ mod tests {
                 gates: BTreeMap::new(),
                 accepts: None,
                 integration: None,
+                default_action: None,
             },
         ));
 
@@ -951,6 +1125,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -970,6 +1145,7 @@ mod tests {
                 gates: BTreeMap::new(),
                 accepts: None,
                 integration: None,
+                default_action: None,
             },
         )]);
 
@@ -983,6 +1159,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -1004,6 +1181,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -1015,6 +1193,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -1026,6 +1205,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
         ]);
@@ -1041,6 +1221,7 @@ mod tests {
             &mut append,
             &noop_gates,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
@@ -1064,6 +1245,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -1075,6 +1257,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
             (
@@ -1086,6 +1269,7 @@ mod tests {
                     gates: BTreeMap::new(),
                     accepts: None,
                     integration: None,
+                    default_action: None,
                 },
             ),
         ]);
@@ -1103,13 +1287,361 @@ mod tests {
             &mut append,
             &noop_gates,
             &unavailable_integration,
+            &noop_action,
             &shutdown,
         )
         .unwrap();
 
         // Should stop at "middle" because evidence is cleared after auto-advance.
+        // "middle" has conditionals but no accepts block, so the engine returns
+        // UnresolvableTransition (not EvidenceRequired).
         assert_eq!(result.final_state, "middle");
         assert!(result.advanced);
-        assert_eq!(result.stop_reason, StopReason::EvidenceRequired);
+        assert_eq!(result.stop_reason, StopReason::UnresolvableTransition);
+    }
+
+    // -----------------------------------------------------------------------
+    // action closure tests
+    // -----------------------------------------------------------------------
+
+    fn make_action_decl(command: &str) -> ActionDecl {
+        ActionDecl {
+            command: command.to_string(),
+            working_dir: String::new(),
+            requires_confirmation: false,
+            polling: None,
+        }
+    }
+
+    #[test]
+    fn action_closure_called_when_state_has_default_action() {
+        use std::sync::atomic::AtomicUsize;
+
+        let call_count = AtomicUsize::new(0);
+
+        let template = make_template(vec![(
+            "act",
+            TemplateState {
+                directive: "Act.".to_string(),
+                transitions: vec![conditional(
+                    "done",
+                    vec![("result", serde_json::json!("ok"))],
+                )],
+                terminal: false,
+                gates: BTreeMap::new(),
+                accepts: None,
+                integration: None,
+                default_action: Some(make_action_decl("echo hello")),
+            },
+        )]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        let action = |_state: &str, _action: &ActionDecl, _has_evidence: bool| -> ActionResult {
+            call_count.fetch_add(1, Ordering::Relaxed);
+            ActionResult::Executed {
+                exit_code: 0,
+                stdout: "hello".to_string(),
+                stderr: String::new(),
+            }
+        };
+
+        let _result = advance_until_stop(
+            "act",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn action_closure_not_called_when_no_default_action() {
+        use std::sync::atomic::AtomicUsize;
+
+        let call_count = AtomicUsize::new(0);
+
+        let template = make_template(vec![(
+            "plain",
+            TemplateState {
+                directive: "Plain.".to_string(),
+                transitions: vec![conditional(
+                    "done",
+                    vec![("result", serde_json::json!("ok"))],
+                )],
+                terminal: false,
+                gates: BTreeMap::new(),
+                accepts: None,
+                integration: None,
+                default_action: None,
+            },
+        )]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        let action = |_state: &str, _action: &ActionDecl, _has_evidence: bool| -> ActionResult {
+            call_count.fetch_add(1, Ordering::Relaxed);
+            ActionResult::Skipped
+        };
+
+        let _result = advance_until_stop(
+            "plain",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(call_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn action_requires_confirmation_stops_loop() {
+        let template = make_template(vec![(
+            "confirm",
+            TemplateState {
+                directive: "Confirm.".to_string(),
+                transitions: vec![unconditional("next")],
+                terminal: false,
+                gates: BTreeMap::new(),
+                accepts: None,
+                integration: None,
+                default_action: Some(make_action_decl("create-pr")),
+            },
+        )]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        let action = |_state: &str, _action: &ActionDecl, _has_evidence: bool| -> ActionResult {
+            ActionResult::RequiresConfirmation {
+                exit_code: 0,
+                stdout: "PR #42 created".to_string(),
+                stderr: String::new(),
+            }
+        };
+
+        let result = advance_until_stop(
+            "confirm",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(result.final_state, "confirm");
+        assert!(!result.advanced);
+        match &result.stop_reason {
+            StopReason::ActionRequiresConfirmation {
+                state,
+                exit_code,
+                stdout,
+                ..
+            } => {
+                assert_eq!(state, "confirm");
+                assert_eq!(*exit_code, 0);
+                assert_eq!(stdout, "PR #42 created");
+            }
+            other => panic!("expected ActionRequiresConfirmation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn action_skipped_continues_to_gate_evaluation() {
+        use crate::template::types::Gate;
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "false".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+            },
+        );
+
+        let template = make_template(vec![(
+            "gated_action",
+            TemplateState {
+                directive: "Gated action.".to_string(),
+                transitions: vec![unconditional("next")],
+                terminal: false,
+                gates,
+                accepts: None,
+                integration: None,
+                default_action: Some(make_action_decl("echo skip-me")),
+            },
+        )]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        // Action returns Skipped; gate blocks
+        let action = |_state: &str, _action: &ActionDecl, _has_evidence: bool| -> ActionResult {
+            ActionResult::Skipped
+        };
+
+        let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(name.clone(), GateResult::Failed { exit_code: 1 });
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "gated_action",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Action was skipped, but gate blocked
+        assert_eq!(result.final_state, "gated_action");
+        assert!(!result.advanced);
+        assert!(matches!(result.stop_reason, StopReason::GateBlocked(_)));
+    }
+
+    #[test]
+    fn action_executed_continues_to_gate_evaluation() {
+        let template = make_template(vec![
+            (
+                "act",
+                TemplateState {
+                    directive: "Act.".to_string(),
+                    transitions: vec![unconditional("done")],
+                    terminal: false,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: Some(make_action_decl("echo ok")),
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        let action = |_state: &str, _action: &ActionDecl, _has_evidence: bool| -> ActionResult {
+            ActionResult::Executed {
+                exit_code: 0,
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+            }
+        };
+
+        let result = advance_until_stop(
+            "act",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Action executed, gates passed, transitioned to terminal
+        assert_eq!(result.final_state, "done");
+        assert!(result.advanced);
+        assert_eq!(result.stop_reason, StopReason::Terminal);
+    }
+
+    #[test]
+    fn action_closure_receives_true_when_evidence_exists() {
+        use std::sync::atomic::AtomicBool as AB;
+
+        let received_has_evidence = AB::new(false);
+
+        let template = make_template(vec![
+            (
+                "check",
+                TemplateState {
+                    directive: "Check.".to_string(),
+                    transitions: vec![conditional(
+                        "done",
+                        vec![("result", serde_json::json!("ok"))],
+                    )],
+                    terminal: false,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: Some(make_action_decl("echo check")),
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        let mut evidence = BTreeMap::new();
+        evidence.insert("result".to_string(), serde_json::json!("ok"));
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        let action = |_state: &str, _action: &ActionDecl, has_evidence: bool| -> ActionResult {
+            received_has_evidence.store(has_evidence, Ordering::Relaxed);
+            ActionResult::Skipped
+        };
+
+        let _result = advance_until_stop(
+            "check",
+            &template,
+            &evidence,
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &shutdown,
+        )
+        .unwrap();
+
+        assert!(received_has_evidence.load(Ordering::Relaxed));
     }
 }

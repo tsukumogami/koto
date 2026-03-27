@@ -58,12 +58,18 @@ pub fn dispatch_next(
         .collect();
 
     if !blocking.is_empty() {
-        return Ok(NextResponse::GateBlocked {
-            state: state.to_string(),
-            directive: template_state.directive.clone(),
-            advanced,
-            blocking_conditions: blocking,
-        });
+        // If the state has an accepts block, fall through to EvidenceRequired
+        // instead of returning GateBlocked. The agent can provide override or
+        // recovery evidence when gates fail on a state that accepts evidence.
+        if template_state.accepts.is_none() {
+            return Ok(NextResponse::GateBlocked {
+                state: state.to_string(),
+                directive: template_state.directive.clone(),
+                advanced,
+                blocking_conditions: blocking,
+            });
+        }
+        // Fall through to step 5 (accepts block -> EvidenceRequired)
     }
 
     // Derive expects for use in integration and evidence branches.
@@ -134,6 +140,7 @@ mod tests {
             gates,
             accepts,
             integration,
+            default_action: None,
         }
     }
 
@@ -524,6 +531,154 @@ mod tests {
         match result.unwrap() {
             NextResponse::GateBlocked { .. } => {}
             other => panic!("expected GateBlocked, got {:?}", other),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Classification priority: integration > accepts
+    // -------------------------------------------------------------------
+
+    // -------------------------------------------------------------------
+    // Gate-with-evidence-fallback: gates fail + accepts -> EvidenceRequired
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn gate_failed_with_accepts_returns_evidence_required() {
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "status".to_string(),
+            FieldSchema {
+                field_type: "enum".to_string(),
+                required: true,
+                values: vec![
+                    "completed".to_string(),
+                    "override".to_string(),
+                    "blocked".to_string(),
+                ],
+                description: String::new(),
+            },
+        );
+
+        let ts = make_state(
+            "Setup branch.",
+            false,
+            vec![Transition {
+                target: "analysis".to_string(),
+                when: Some({
+                    let mut w = BTreeMap::new();
+                    w.insert("status".to_string(), serde_json::json!("completed"));
+                    w
+                }),
+            }],
+            BTreeMap::new(),
+            Some(accepts),
+            None,
+        );
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "branch_check".to_string(),
+            GateResult::Failed { exit_code: 1 },
+        );
+
+        let result = dispatch_next("setup", &ts, false, &gates);
+        let resp = result.unwrap();
+        match resp {
+            NextResponse::EvidenceRequired { state, expects, .. } => {
+                assert_eq!(state, "setup");
+                assert!(expects.fields.contains_key("status"));
+            }
+            other => panic!(
+                "expected EvidenceRequired (gate-with-evidence-fallback), got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn gate_failed_without_accepts_still_returns_gate_blocked() {
+        let ts = make_state("Deploy.", false, vec![], BTreeMap::new(), None, None);
+        let mut gates = BTreeMap::new();
+        gates.insert("ci".to_string(), GateResult::Failed { exit_code: 1 });
+
+        let result = dispatch_next("deploy", &ts, false, &gates);
+        let resp = result.unwrap();
+        match resp {
+            NextResponse::GateBlocked { .. } => {}
+            other => panic!("expected GateBlocked (no accepts), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn gate_passed_with_accepts_returns_evidence_required() {
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "status".to_string(),
+            FieldSchema {
+                field_type: "string".to_string(),
+                required: true,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+
+        let ts = make_state(
+            "Check.",
+            false,
+            vec![],
+            BTreeMap::new(),
+            Some(accepts),
+            None,
+        );
+
+        let mut gates = BTreeMap::new();
+        gates.insert("check".to_string(), GateResult::Passed);
+
+        let result = dispatch_next("check_state", &ts, false, &gates);
+        let resp = result.unwrap();
+        match resp {
+            NextResponse::EvidenceRequired { .. } => {}
+            other => panic!(
+                "expected EvidenceRequired (gates passed, has accepts), got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn mixed_gates_with_accepts_returns_evidence_required() {
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "status".to_string(),
+            FieldSchema {
+                field_type: "string".to_string(),
+                required: true,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+
+        let ts = make_state(
+            "Setup.",
+            false,
+            vec![],
+            BTreeMap::new(),
+            Some(accepts),
+            None,
+        );
+
+        let mut gates = BTreeMap::new();
+        gates.insert("check_a".to_string(), GateResult::Passed);
+        gates.insert("check_b".to_string(), GateResult::Failed { exit_code: 1 });
+
+        let result = dispatch_next("setup", &ts, false, &gates);
+        let resp = result.unwrap();
+        match resp {
+            NextResponse::EvidenceRequired { .. } => {}
+            other => panic!(
+                "expected EvidenceRequired (mixed gates with accepts), got {:?}",
+                other
+            ),
         }
     }
 
