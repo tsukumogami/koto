@@ -2,6 +2,7 @@ pub mod next;
 pub mod next_types;
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::Result;
@@ -112,6 +113,71 @@ pub enum Command {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, clap::ValueEnum)]
+pub enum ExportFormat {
+    Mermaid,
+    Html,
+}
+
+#[derive(clap::Args)]
+pub struct ExportArgs {
+    /// Path to template source (.md) or compiled template (.json)
+    pub input: String,
+
+    /// Output format
+    #[arg(long, default_value = "mermaid", value_enum)]
+    pub format: ExportFormat,
+
+    /// Write output to file path (required for html format)
+    #[arg(long)]
+    pub output: Option<String>,
+
+    /// Open generated file in default browser (html format only)
+    #[arg(long)]
+    pub open: bool,
+
+    /// Verify existing file matches what would be generated
+    #[arg(long)]
+    pub check: bool,
+}
+
+/// Validate export flag combinations (R15).
+///
+/// Returns `Ok(())` if flags are compatible, or an error describing the
+/// invalid combination.
+fn validate_export_flags(args: &ExportArgs) -> std::result::Result<(), String> {
+    if args.format == ExportFormat::Html && args.output.is_none() {
+        return Err("--format html requires --output <path>".into());
+    }
+    if args.open && args.format != ExportFormat::Html {
+        return Err("--open is only valid with --format html".into());
+    }
+    if args.open && args.check {
+        return Err("--open and --check are mutually exclusive".into());
+    }
+    if args.check && args.output.is_none() {
+        return Err("--check requires --output <path>".into());
+    }
+    Ok(())
+}
+
+/// Resolve a source argument to a CompiledTemplate.
+///
+/// Accepts either a `.md` source file (compiled via `compile_cached`) or a
+/// `.json` pre-compiled template (loaded directly).
+fn resolve_template(source: &str) -> anyhow::Result<CompiledTemplate> {
+    let path = Path::new(source);
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("json") => load_compiled_template(source),
+        _ => {
+            // Treat as markdown source: compile and load.
+            let (cache_path, _hash) = compile_cached(path)?;
+            let cache_path_str = cache_path.to_string_lossy().to_string();
+            load_compiled_template(&cache_path_str)
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum TemplateSubcommand {
     /// Compile a YAML template source to FormatVersion=1 JSON
@@ -125,6 +191,9 @@ pub enum TemplateSubcommand {
         /// Path to the compiled template JSON
         path: String,
     },
+
+    /// Export a template as a visual diagram
+    Export(ExportArgs),
 }
 
 #[derive(Subcommand)]
@@ -585,6 +654,38 @@ pub fn run(app: App) -> Result<()> {
                         "command": "template validate"
                     }));
                 }
+                Ok(())
+            }
+            TemplateSubcommand::Export(args) => {
+                if let Err(msg) = validate_export_flags(&args) {
+                    eprintln!("error: {}", msg);
+                    std::process::exit(2);
+                }
+
+                let compiled = match resolve_template(&args.input) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+
+                let output_bytes = match args.format {
+                    ExportFormat::Mermaid => crate::export::to_mermaid(&compiled).into_bytes(),
+                    ExportFormat::Html => {
+                        eprintln!("error: --format html is not yet implemented");
+                        std::process::exit(1);
+                    }
+                };
+
+                if let Some(ref output_path) = args.output {
+                    std::fs::write(output_path, &output_bytes)
+                        .map_err(|e| anyhow::anyhow!("failed to write {}: {}", output_path, e))?;
+                    println!("{}", output_path);
+                } else {
+                    std::io::stdout().write_all(&output_bytes)?;
+                }
+
                 Ok(())
             }
         },
@@ -1712,4 +1813,94 @@ fn handle_cancel(name: String) -> Result<()> {
         }))?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn export_args(
+        format: ExportFormat,
+        output: Option<&str>,
+        open: bool,
+        check: bool,
+    ) -> ExportArgs {
+        ExportArgs {
+            input: "template.md".to_string(),
+            format,
+            output: output.map(String::from),
+            open,
+            check,
+        }
+    }
+
+    #[test]
+    fn validate_mermaid_stdout_ok() {
+        let args = export_args(ExportFormat::Mermaid, None, false, false);
+        assert!(validate_export_flags(&args).is_ok());
+    }
+
+    #[test]
+    fn validate_mermaid_with_output_ok() {
+        let args = export_args(ExportFormat::Mermaid, Some("out.md"), false, false);
+        assert!(validate_export_flags(&args).is_ok());
+    }
+
+    #[test]
+    fn validate_html_without_output_fails() {
+        let args = export_args(ExportFormat::Html, None, false, false);
+        let err = validate_export_flags(&args).unwrap_err();
+        assert!(
+            err.contains("--format html requires --output"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_html_with_output_ok() {
+        let args = export_args(ExportFormat::Html, Some("out.html"), false, false);
+        assert!(validate_export_flags(&args).is_ok());
+    }
+
+    #[test]
+    fn validate_open_without_html_fails() {
+        let args = export_args(ExportFormat::Mermaid, Some("out.md"), true, false);
+        let err = validate_export_flags(&args).unwrap_err();
+        assert!(
+            err.contains("--open is only valid with --format html"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_open_with_html_ok() {
+        let args = export_args(ExportFormat::Html, Some("out.html"), true, false);
+        assert!(validate_export_flags(&args).is_ok());
+    }
+
+    #[test]
+    fn validate_open_and_check_fails() {
+        let args = export_args(ExportFormat::Html, Some("out.html"), true, true);
+        let err = validate_export_flags(&args).unwrap_err();
+        assert!(
+            err.contains("--open and --check are mutually exclusive"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_check_without_output_fails() {
+        let args = export_args(ExportFormat::Mermaid, None, false, true);
+        let err = validate_export_flags(&args).unwrap_err();
+        assert!(err.contains("--check requires --output"), "got: {}", err);
+    }
+
+    #[test]
+    fn validate_check_with_output_ok() {
+        let args = export_args(ExportFormat::Mermaid, Some("out.md"), false, true);
+        assert!(validate_export_flags(&args).is_ok());
+    }
 }
