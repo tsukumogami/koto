@@ -653,3 +653,36 @@ to prevent tampered templates from being silently applied to existing workflows.
   patterns (linear, branching, looping, delegation); the compiler error messages for
   invalid `when` conditions name the conflicting transitions explicitly
 
+## Post-implementation notes
+
+### `advanced` field semantic overload (#89)
+
+The `advanced: bool` field was designed to report agent-initiated changes
+("true when an event was appended before dispatching"). When the auto-
+advancement engine was added, the field was overloaded to also report
+engine-initiated transitions. This created an ambiguity: callers couldn't
+tell from `advanced: true` alone whether they were at a state needing
+input or one the engine had just passed through.
+
+In practice, callers worked around this by calling `koto next` again
+whenever `advanced: true` appeared with empty `expects`. The response
+variant (EvidenceRequired, GateBlocked, Terminal) is the authoritative
+signal for what the caller should do -- not the `advanced` field.
+
+### `StopReason::UnresolvableTransition` (#89)
+
+The engine previously returned `StopReason::EvidenceRequired` for two
+different situations: states that genuinely need agent evidence (have an
+`accepts` block) and states with conditional transitions that didn't match
+but have no `accepts` block (the agent can't submit evidence to resolve
+them). The second case produced a response with empty `expects` that
+callers couldn't act on, forcing the double-call pattern.
+
+The engine now checks `template_state.accepts.is_some()` in the
+`NeedsEvidence` handler. States with `accepts` still get
+`EvidenceRequired`. States without get `UnresolvableTransition`, which
+the CLI maps to exit code 2 (`precondition_failed`). This is consistent
+with the template validator, which already rejects `when` conditions on
+states without `accepts` blocks -- so `UnresolvableTransition` only fires
+for edge cases or templates that bypass validation
+
