@@ -1,9 +1,0 @@
-{
-  "topic": "auto-advance-response-contract",
-  "decisions": [
-    {"id": 1, "question": "How should advance_until_stop() be extended to eliminate the double-call?", "status": "complete", "complexity": "standard", "chosen": "Engine-layer accepts awareness with new StopReason variant", "report": "wip/design_auto-advance-response-contract_decision_1_report.md"},
-    {"id": 2, "question": "How should transition_count integrate into the response contract alongside the existing advanced field?", "status": "complete", "complexity": "standard", "chosen": "Add transition_count to AdvanceResult and all NextResponse variants, keep advanced unchanged", "report": "wip/design_auto-advance-response-contract_decision_2_report.md"}
-  ],
-  "cross_validation": "passed",
-  "round": 0
-}
