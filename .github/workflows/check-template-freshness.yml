@@ -9,13 +9,6 @@ on:
           Example: 'templates/**/*.md'
         required: true
         type: string
-      koto-version:
-        description: >
-          Koto release version to download. Use 'latest' for the most
-          recent release, or pin a specific tag like 'v0.5.0'.
-        required: false
-        type: string
-        default: 'latest'
       check-html:
         description: >
           Also check HTML freshness. When true, the workflow verifies
@@ -39,32 +32,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download koto binary
-        env:
-          GH_TOKEN: ${{ github.token }}
-          KOTO_VERSION: ${{ inputs.koto-version }}
+      - name: Install koto
         run: |
-          if [ "$KOTO_VERSION" = "latest" ]; then
-            TAG=$(gh release view --repo tsukumogami/koto --json tagName -q '.tagName')
-          else
-            TAG="$KOTO_VERSION"
-          fi
-
-          ARCH=$(uname -m)
-          case "$ARCH" in
-            x86_64)  ASSET="koto-linux-amd64" ;;
-            aarch64) ASSET="koto-linux-arm64" ;;
-            *)       echo "::error::Unsupported architecture: $ARCH"; exit 1 ;;
-          esac
-
-          gh release download "$TAG" \
-            --repo tsukumogami/koto \
-            --pattern "$ASSET" \
-            --output /usr/local/bin/koto \
-            --clobber
-
-          chmod +x /usr/local/bin/koto
-          echo "Downloaded koto $TAG ($ASSET)"
+          curl -fsSL https://raw.githubusercontent.com/tsukumogami/koto/main/install.sh | bash -s -- --no-modify-path
+          echo "$HOME/.koto/bin" >> "$GITHUB_PATH"
           koto version
 
       - name: Check Mermaid freshness
