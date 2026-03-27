@@ -1,0 +1,12 @@
+{
+  "topic": "local-session-storage",
+  "decisions": [
+    {"id": 8, "question": "Content storage model", "status": "complete", "complexity": "standard", "chosen": "Files in session directory with manifest", "report_file": "wip/design_local-session-storage_decision_8_report.md"},
+    {"id": 9, "question": "Content CLI interface", "status": "complete", "complexity": "standard", "chosen": "Positional key argument with subcommand group", "report_file": "wip/design_local-session-storage_decision_9_report.md"},
+    {"id": 10, "question": "Trait extension for content", "status": "complete", "complexity": "standard", "chosen": "Separate ContextStore trait", "report_file": "wip/design_local-session-storage_decision_10_report.md"},
+    {"id": 11, "question": "Content-aware gate types", "status": "complete", "complexity": "standard", "chosen": "Hybrid: built-in types + shell fallback", "report_file": "wip/design_local-session-storage_decision_11_report.md"},
+    {"id": 12, "question": "Content key design", "status": "complete", "complexity": "standard", "chosen": "Hierarchical path keys", "report_file": "wip/design_local-session-storage_decision_12_report.md"}
+  ],
+  "cross_validation": "pending",
+  "round": 0
+}
