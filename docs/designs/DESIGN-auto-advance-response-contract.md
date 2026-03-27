@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 problem: |
   When koto's engine auto-advances through states, the CLI returns a response
   with `advanced: true` that tells callers "something moved" but not whether
