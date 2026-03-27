@@ -49,6 +49,7 @@ jobs:
           fi
           curl -fsSL https://raw.githubusercontent.com/tsukumogami/koto/main/install.sh | bash -s -- $INSTALL_ARGS
           echo "$HOME/.koto/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.koto/bin:$PATH"
           koto version
 
       - name: Check Mermaid freshness
