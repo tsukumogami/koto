@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: In Progress
 problem: |
   Koto workflow templates compile to JSON state graphs that are hard to review
   visually. Template authors debug stuck workflows by reading raw JSON. PR reviewers
@@ -17,7 +17,7 @@ source_issue: 86
 
 ## Status
 
-Accepted
+In Progress
 
 ## Problem statement
 
