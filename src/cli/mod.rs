@@ -154,17 +154,17 @@ pub enum ConfigCommand {
         key: String,
         /// Value to set
         value: String,
-        /// Write to project config (.koto/config.toml) instead of user config
+        /// Write to user config (~/.koto/config.toml) instead of project config
         #[arg(long)]
-        project: bool,
+        user: bool,
     },
     /// Remove a config key
     Unset {
         /// Dotted key path (e.g., session.backend)
         key: String,
-        /// Remove from project config (.koto/config.toml) instead of user config
+        /// Remove from user config (~/.koto/config.toml) instead of project config
         #[arg(long)]
-        project: bool,
+        user: bool,
     },
     /// List resolved configuration
     List {
@@ -831,20 +831,8 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
                 }
             }
         }
-        ConfigCommand::Set {
-            key,
-            value,
-            project,
-        } => {
-            if project {
-                config::validate::validate_project_key(&key)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                let path = config::resolve::project_config_path();
-                let mut doc = config::resolve::load_toml_value(&path)?;
-                config::set_value_in_toml(&mut doc, &key, &value)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                config::resolve::write_toml_value(&path, &doc)?;
-            } else {
+        ConfigCommand::Set { key, value, user } => {
+            if user {
                 config::resolve::ensure_koto_dir()?;
                 let path = config::resolve::user_config_path()
                     .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
@@ -852,19 +840,27 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
                 config::set_value_in_toml(&mut doc, &key, &value)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 config::resolve::write_toml_value(&path, &doc)?;
+            } else {
+                config::validate::validate_project_key(&key)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let path = config::resolve::project_config_path();
+                let mut doc = config::resolve::load_toml_value(&path)?;
+                config::set_value_in_toml(&mut doc, &key, &value)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                config::resolve::write_toml_value(&path, &doc)?;
             }
             Ok(())
         }
-        ConfigCommand::Unset { key, project } => {
-            if project {
-                let path = config::resolve::project_config_path();
+        ConfigCommand::Unset { key, user } => {
+            if user {
+                let path = config::resolve::user_config_path()
+                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
                 let mut doc = config::resolve::load_toml_value(&path)?;
                 config::unset_value_in_toml(&mut doc, &key)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 config::resolve::write_toml_value(&path, &doc)?;
             } else {
-                let path = config::resolve::user_config_path()
-                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+                let path = config::resolve::project_config_path();
                 let mut doc = config::resolve::load_toml_value(&path)?;
                 config::unset_value_in_toml(&mut doc, &key)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;

@@ -48,11 +48,13 @@ export AWS_SECRET_ACCESS_KEY=<your-secret-key>
 **User config (persistent on your machine):**
 
 ```bash
-koto config set session.cloud.access_key <your-access-key>
-koto config set session.cloud.secret_key <your-secret-key>
+koto config set --user session.cloud.access_key <your-access-key>
+koto config set --user session.cloud.secret_key <your-secret-key>
 ```
 
-Env vars take precedence over user config. `koto config list` redacts credential values in output.
+The `--user` flag is required for credentials — they're blocked from project config
+to prevent accidental commits to git. Env vars take precedence over user config.
+`koto config list` redacts credential values in output.
 
 ## 4. Use koto normally
 

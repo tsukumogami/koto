@@ -289,11 +289,12 @@ fn cloud_config_list_redacts_credentials() {
     let dir = TempDir::new().unwrap();
     setup_cloud_config(dir.path(), &endpoint, &bucket);
 
-    // Set a credential in user config
+    // Set a credential in user config (--user required)
     koto_cmd(dir.path())
         .args([
             "config",
             "set",
+            "--user",
             "session.cloud.access_key",
             "secret-key-value",
         ])

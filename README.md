@@ -107,7 +107,7 @@ The `action` field is `"execute"` while work remains and `"done"` at the termina
 
 **Cloud sync**: Sessions default to local storage, but koto can sync them to any S3-compatible backend (AWS S3, Cloudflare R2, MinIO). Configure your endpoint and credentials, and existing commands handle sync transparently. See the [cloud sync setup guide](docs/guides/cloud-sync-setup.md) for step-by-step instructions.
 
-**Configuration**: koto merges config from two layers: project config (`.koto/config.toml`, shared via version control) and user config (`~/.koto/config.toml`, machine-specific). Credentials are restricted to user config and environment variables -- they can't be set in project config. Use `koto config list` to see the resolved values.
+**Configuration**: koto merges config from two layers: project config (`.koto/config.toml`, shared via version control) and user config (`~/.koto/config.toml`, machine-specific). `koto config set` writes to project config by default (like `git config`); use `--user` for machine-specific settings. Credentials are restricted to user config and environment variables -- they can't be set in project config. Use `koto config list` to see the resolved values.
 
 ## Agent integration
 

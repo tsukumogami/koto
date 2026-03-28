@@ -4840,7 +4840,7 @@ fn config_set_and_get_project_config() {
 
     // Set a value in project config.
     koto_config_cmd(tmp.path(), &home)
-        .args(["config", "set", "--project", "session.backend", "cloud"])
+        .args(["config", "set", "session.backend", "cloud"])
         .assert()
         .success();
 
@@ -4862,25 +4862,14 @@ fn config_project_rejects_credential_keys() {
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
 
+    // Default (project config) rejects credential keys.
     koto_config_cmd(tmp.path(), &home)
-        .args([
-            "config",
-            "set",
-            "--project",
-            "session.cloud.access_key",
-            "AKIAEXAMPLE",
-        ])
+        .args(["config", "set", "session.cloud.access_key", "AKIAEXAMPLE"])
         .assert()
         .failure();
 
     koto_config_cmd(tmp.path(), &home)
-        .args([
-            "config",
-            "set",
-            "--project",
-            "session.cloud.secret_key",
-            "secret123",
-        ])
+        .args(["config", "set", "session.cloud.secret_key", "secret123"])
         .assert()
         .failure();
 }
@@ -4921,20 +4910,14 @@ fn config_unset_project_key() {
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
 
-    // Set in project, then unset from project.
+    // Set then unset (both default to project config).
     koto_config_cmd(tmp.path(), &home)
-        .args([
-            "config",
-            "set",
-            "--project",
-            "session.cloud.region",
-            "us-east-1",
-        ])
+        .args(["config", "set", "session.cloud.region", "us-east-1"])
         .assert()
         .success();
 
     koto_config_cmd(tmp.path(), &home)
-        .args(["config", "unset", "--project", "session.cloud.region"])
+        .args(["config", "unset", "session.cloud.region"])
         .assert()
         .success();
 
@@ -4994,11 +4977,12 @@ fn config_list_redacts_credentials() {
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
 
-    // Set credentials in user config.
+    // Set credentials in user config (--user required, credentials blocked from project).
     koto_config_cmd(tmp.path(), &home)
         .args([
             "config",
             "set",
+            "--user",
             "session.cloud.access_key",
             "AKIAIOSFODNN7EXAMPLE",
         ])
@@ -5009,6 +4993,7 @@ fn config_list_redacts_credentials() {
         .args([
             "config",
             "set",
+            "--user",
             "session.cloud.secret_key",
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
         ])
@@ -5038,7 +5023,13 @@ fn config_env_var_overrides_config_file() {
 
     // Set a value in user config.
     koto_config_cmd(tmp.path(), &home)
-        .args(["config", "set", "session.cloud.access_key", "config-key"])
+        .args([
+            "config",
+            "set",
+            "--user",
+            "session.cloud.access_key",
+            "config-key",
+        ])
         .assert()
         .success();
 
@@ -5072,7 +5063,7 @@ fn config_project_overrides_user() {
 
     // Set project config.
     koto_config_cmd(tmp.path(), &home)
-        .args(["config", "set", "--project", "session.backend", "cloud"])
+        .args(["config", "set", "session.backend", "cloud"])
         .assert()
         .success();
 
