@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 upstream: docs/prds/PRD-session-persistence-storage.md
 problem: |
   koto sessions are machine-local. A workflow started on one machine can't be
@@ -25,7 +25,7 @@ rationale: |
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context and problem statement
 
