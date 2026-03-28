@@ -11,8 +11,7 @@ decision: |
   with project > user > default precedence. koto config get/set/unset/list CLI.
   Credentials blocked from project config, env vars override config values.
   CloudBackend wraps LocalBackend and syncs per-key to S3 via rust-s3 (sync,
-  no tokio). Monotonic version counter for conflict detection. Cloud feature
-  behind a cargo feature flag.
+  no tokio). Monotonic version counter for conflict detection.
 rationale: |
   Config and cloud sync are designed together because the config system's hardest
   consumer is cloud (credentials, env overrides, security). CloudBackend wraps
@@ -47,11 +46,10 @@ and `ContextStore` traits are implemented. `CloudBackend` needs to implement bot
 
 - Cloud sync must be invisible to agents — zero new commands, zero token cost
 - Credentials must never live in project config (committed to git = supply chain risk)
-- S3 dependency (rust-s3) must be behind a feature flag — default builds stay light
 - Config system is general-purpose, not session-specific
 - Conflict detection must handle the "two machines advanced the same workflow" case
 - Local backend must remain the zero-config default
-- koto must remain a synchronous CLI (no tokio runtime in default builds)
+- koto must remain a synchronous CLI (no tokio runtime)
 
 ## Considered options
 
@@ -179,10 +177,9 @@ hashes (can't establish ordering, would need a counter anyway). Vector clocks
 
 **Context**: How does CloudBackend implement the existing traits? What S3 crate?
 
-**Chosen: Local cache wrapping `LocalBackend` + `rust-s3` behind feature flag.**
+**Chosen: Local cache wrapping `LocalBackend` + `rust-s3`.**
 
 ```rust
-#[cfg(feature = "cloud")]
 pub struct CloudBackend {
     local: LocalBackend,
     s3: S3Client,
@@ -195,16 +192,12 @@ changes to S3 as a separate layer. This reuses all of LocalBackend's tested logi
 (flock locking, atomic manifest writes, path validation, 0700 permissions).
 
 `rust-s3` provides sync S3 operations without requiring tokio. It supports custom
-endpoints for non-AWS providers (Cloudflare R2, MinIO). The dependency is behind
-a cargo feature flag:
+endpoints for non-AWS providers (Cloudflare R2, MinIO). rust-s3 is a regular
+dependency included in all builds:
 
 ```toml
-[features]
-default = []
-cloud = ["dep:rust-s3"]
-
 [dependencies]
-rust-s3 = { version = "0.35", optional = true }
+rust-s3 = "0.35"
 ```
 
 S3 failures are non-fatal: operations succeed locally and log a warning to stderr.
@@ -227,8 +220,8 @@ to construct `LocalBackend` or `CloudBackend`.
 
 **Cloud layer**: `CloudBackend` wraps `LocalBackend`. Every operation runs locally
 first (fast, works offline), then syncs per-key to S3. Monotonic version counter
-detects conflicts. `rust-s3` keeps koto synchronous. The entire cloud feature is
-behind a cargo feature flag — default builds have zero cloud dependencies.
+detects conflicts. `rust-s3` keeps koto synchronous and is a regular dependency
+included in all builds.
 
 ## Solution architecture
 
@@ -244,9 +237,9 @@ src/cli/
   config.rs       -- koto config get/set/unset/list handlers
 
 src/session/
-  cloud.rs        -- CloudBackend (wraps LocalBackend + rust-s3) [feature = "cloud"]
-  sync.rs         -- S3 sync logic: push/pull/conflict detection [feature = "cloud"]
-  version.rs      -- version.json read/write/compare [feature = "cloud"]
+  cloud.rs        -- CloudBackend (wraps LocalBackend + rust-s3)
+  sync.rs         -- S3 sync logic: push/pull/conflict detection
+  version.rs      -- version.json read/write/compare
 ```
 
 ### Config module
@@ -289,14 +282,12 @@ Config resolution:
 
 ```rust
 // src/session/cloud.rs
-#[cfg(feature = "cloud")]
 pub struct CloudBackend {
     local: LocalBackend,
     bucket: s3::Bucket,
     prefix: String,
 }
 
-#[cfg(feature = "cloud")]
 impl CloudBackend {
     pub fn new(working_dir: &Path, config: &CloudConfig) -> Result<Self> {
         let local = LocalBackend::new(working_dir)?;
@@ -311,7 +302,6 @@ impl CloudBackend {
 filesystem operations, then call sync methods:
 
 ```rust
-#[cfg(feature = "cloud")]
 impl ContextStore for CloudBackend {
     fn add(&self, session: &str, key: &str, content: &[u8]) -> Result<()> {
         self.local.add(session, key, content)?;
@@ -379,10 +369,7 @@ fn build_backend() -> Result<Box<dyn SessionBackend>> {
 
     match config.session.backend.as_str() {
         "local" => Ok(Box::new(LocalBackend::new(&working_dir)?)),
-        #[cfg(feature = "cloud")]
         "cloud" => Ok(Box::new(CloudBackend::new(&working_dir, &config.session.cloud)?)),
-        #[cfg(not(feature = "cloud"))]
-        "cloud" => anyhow::bail!("cloud backend requires the 'cloud' feature: cargo install koto --features cloud"),
         other => anyhow::bail!("unknown backend: {}", other),
     }
 }
@@ -442,9 +429,8 @@ Deliverables:
 ### Phase 2: Backend selection
 
 Wire `load_config()` into `build_backend()`. When `session.backend = "local"`,
-construct `LocalBackend` (same as today). When `session.backend = "cloud"` and
-the cloud feature is disabled, return a helpful error. Integration tests verifying
-backend selection.
+construct `LocalBackend` (same as today). When `session.backend = "cloud"`,
+construct `CloudBackend`. Integration tests verifying backend selection.
 
 Deliverables:
 - Updated `src/cli/mod.rs`
@@ -452,14 +438,14 @@ Deliverables:
 
 ### Phase 3: CloudBackend with sync
 
-Implement `CloudBackend` wrapping `LocalBackend`. Add `rust-s3` behind feature
-flag. Implement push/pull sync with per-key incremental transfers. Implement
+Implement `CloudBackend` wrapping `LocalBackend`. Add `rust-s3` as a dependency.
+Implement push/pull sync with per-key incremental transfers. Implement
 `version.json` and conflict detection. `koto session resolve --keep local|remote`.
 Tests with mocked S3 (or localstack if available).
 
 Deliverables:
 - `src/session/cloud.rs`, `sync.rs`, `version.rs`
-- Updated `Cargo.toml` with feature flag
+- Updated `Cargo.toml`
 - Tests
 
 ### Phase 4: Documentation
@@ -526,15 +512,12 @@ IAM policies scoped to the repo-id prefix.
 - CloudBackend reuses all of LocalBackend's tested filesystem logic. Sync is a clean
   layer on top, not a parallel implementation.
 - Per-key incremental sync minimizes S3 costs during burst workloads.
-- Feature flag keeps default builds light — zero cloud dependencies for users who
-  don't need it.
 - Conflict detection prevents silent data loss from concurrent edits on different
   machines.
 
 ### Negative
 
-- `rust-s3` adds a dependency (behind feature flag). Users who `cargo install koto
-  --features cloud` get a larger binary.
+- `rust-s3` is a regular dependency, which increases binary size for all builds.
 - S3 requests add latency to every mutating command (typically 50-200ms for 2-3
   requests). Acceptable for a CLI that runs per-command, not per-keystroke.
 - Config resolution happens on every command invocation. Must be fast (read two TOML
@@ -552,5 +535,3 @@ IAM policies scoped to the repo-id prefix.
   retries. Users are never blocked by cloud outages.
 - `koto config list` shows the fully resolved config, making it easy to debug
   precedence issues.
-- The `cloud` feature flag means `cargo install koto` (no features) produces the same
-  lean binary as today.
