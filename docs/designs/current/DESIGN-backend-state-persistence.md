@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Current
 upstream: docs/designs/current/DESIGN-config-and-cloud-sync.md
 problem: |
   State file I/O (append_event, read_events) happens directly in the CLI layer via
