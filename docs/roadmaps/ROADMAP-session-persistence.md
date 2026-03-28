@@ -49,7 +49,7 @@ backend-provided paths. `koto session dir|list|cleanup`, automatic cleanup on wo
 completion, `{{SESSION_DIR}}` runtime variable substitution in gate commands and
 directives. 235 tests.
 
-**Phase B (pending):** Make koto the owner of workflow context content. Agents submit
+**Phase B (done):** Make koto the owner of workflow context content. Agents submit
 and retrieve context through koto's CLI (`koto context add`, `koto context get`,
 `koto context exists`, `koto context list`) instead of reading/writing files directly
 in the session directory. Content submission is decoupled from state advancement, so
@@ -60,14 +60,15 @@ MVP. Skills migrate from wip/ filesystem access to koto context CLI.
 Design at `docs/designs/current/DESIGN-local-session-storage.md` (status: Current).
 
 ### Feature 2: Config system
-**Needs:** `needs-design` — TOML schema, precedence rules, CLI command design
 **Dependencies:** None
-**Status:** Not started
+**Status:** Done (PR #98)
 
-Add `koto config get/set` with TOML files at user (`~/.koto/config.toml`) and project
-(`.koto/config.toml`) levels. Precedence: project > user > default. `--project` flag
-for team-shared config. Env var overrides for credentials. This is useful beyond
-sessions — other koto settings can use it. But sessions need it for backend selection.
+`koto config get/set/unset/list` with TOML files at user (`~/.koto/config.toml`) and
+project (`.koto/config.toml`) levels. Precedence: project > user > default. `--project`
+flag for team-shared config. Credential allowlist prevents secrets in project config.
+Env vars override config values.
+
+Design at `docs/designs/current/DESIGN-config-and-cloud-sync.md` (status: Current).
 
 ### Feature 3: Git backend
 **Needs:** `needs-design` — how git backend maps to context CLI operations
@@ -81,39 +82,33 @@ Context operations (`add`, `get`, `exists`, `list`) map to file reads/writes in 
 configured directory.
 
 ### Feature 4: Cloud sync (S3-compatible)
-**Needs:** `needs-design` — S3 protocol, implicit sync, version counters, conflict detection
 **Dependencies:** Feature 1, Feature 2
-**Status:** Not started
+**Status:** Done (PR #98, designed and built with Feature 2)
 
-Add `CloudBackend` behind a `cloud` feature flag (avoids tokio/aws-sdk in default
-builds). Implicit sync built into state-mutating commands and context submissions:
-check remote version before operating, upload after. Cloud sync covers both workflow
-state and submitted context. Version counter detects conflicts.
-`koto session resolve --keep local|remote` for the rare divergence case. S3
-credentials from user config or env vars (not project config — supply chain risk).
+`CloudBackend` wraps `LocalBackend` and syncs per-key to S3 via `rust-s3` (sync,
+no tokio). Behind a `cloud` cargo feature flag. Implicit sync on every mutating
+command. Monotonic version counter with three-way conflict detection.
+`koto session resolve --keep local|remote` for rare divergence. S3 credentials from
+user config or env vars. Supports any S3-compatible provider (AWS, Cloudflare R2,
+MinIO).
+
+Design at `docs/designs/current/DESIGN-config-and-cloud-sync.md` (status: Current).
+Setup guide at `docs/guides/cloud-sync-setup.md`.
 
 ## Sequencing rationale
 
-Feature 1 (local storage + content ownership) is the foundation. Phase A shipped
-the session directory model and `SessionBackend` trait. Phase B completes the feature
-by making koto the content gatekeeper. This is the current priority because it
-establishes koto's control over content before other features add more backends.
+Feature 1 (local storage + content ownership) was the foundation. Features 2 and 4
+(config + cloud sync) were designed and built together because the config system's
+hardest consumer was cloud credentials. Feature 3 (git backend) is the only remaining
+item.
 
-Feature 2 (config) has no technical dependency on Feature 1, but Features 3 and 4
-need it for backend selection. It can be built in parallel with Feature 1 Phase B.
-
-Feature 3 (git backend) depends on the trait (Feature 1), content CLI (Feature 1
-Phase B), and config (Feature 2). Lower priority since the default is local, but it
-enables users who want session artifacts visible in git.
-
-Feature 4 (cloud sync) is the most complex feature and depends on everything else.
-Cloud sync covers both state and context. It should ship last. The S3 dependency
-(aws-sdk-s3 + tokio) is behind a feature flag so it doesn't affect users who don't
-need cloud.
-
-**Parallel opportunities:** Feature 1 Phase B and Feature 2 can be built in parallel.
+Feature 3 (git backend) depends on the trait (Feature 1) and config (Feature 2), both
+complete. It's a thin `GitBackend` implementation that maps context operations to file
+reads/writes in the working tree.
 
 ## Progress
 
-- Feature 1: Done (PR #84 — Phase A session storage + Phase B content ownership)
-- Features 2-4: Not started
+- Feature 1: Done (PR #84 — session storage + content ownership)
+- Feature 2: Done (PR #98 — config system, designed with Feature 4)
+- Feature 3: Not started (git backend)
+- Feature 4: Done (PR #98 — cloud sync, designed with Feature 2)

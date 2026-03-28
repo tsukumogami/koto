@@ -25,7 +25,7 @@ use crate::engine::persistence::{
 use crate::engine::types::{now_iso8601, EventPayload, StateFileHeader};
 use crate::session::context::ContextStore;
 use crate::session::local::LocalBackend;
-use crate::session::{state_file_name, SessionBackend};
+use crate::session::{state_file_name, Backend, SessionBackend};
 use crate::template::types::CompiledTemplate;
 
 /// Maximum payload size for --with-data (1 MB).
@@ -133,6 +133,45 @@ pub enum Command {
         #[command(subcommand)]
         subcommand: DecisionsSubcommand,
     },
+
+    /// Configuration management subcommands
+    Config {
+        #[command(subcommand)]
+        subcommand: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    /// Print the value of a config key
+    Get {
+        /// Dotted key path (e.g., session.backend)
+        key: String,
+    },
+    /// Set a config key to a value
+    Set {
+        /// Dotted key path (e.g., session.backend)
+        key: String,
+        /// Value to set
+        value: String,
+        /// Write to user config (~/.koto/config.toml) instead of project config
+        #[arg(long)]
+        user: bool,
+    },
+    /// Remove a config key
+    Unset {
+        /// Dotted key path (e.g., session.backend)
+        key: String,
+        /// Remove from user config (~/.koto/config.toml) instead of project config
+        #[arg(long)]
+        user: bool,
+    },
+    /// List resolved configuration
+    List {
+        /// Output as JSON instead of TOML
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -148,6 +187,14 @@ pub enum SessionCommand {
     Cleanup {
         /// Session name
         name: String,
+    },
+    /// Resolve a session version conflict
+    Resolve {
+        /// Session name
+        name: String,
+        /// Which version to keep: "local" or "remote"
+        #[arg(long)]
+        keep: String,
     },
 }
 
@@ -329,12 +376,36 @@ fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
     }
 }
 
-/// Construct the session backend, honoring `KOTO_SESSIONS_BASE` for testing.
+/// Construct the session backend based on configuration.
 ///
-/// When `KOTO_SESSIONS_BASE` is set, sessions are stored directly under that
-/// directory (bypassing repo-id hashing). This is intended for integration
-/// tests that need to control the storage location.
-fn build_backend() -> Result<LocalBackend> {
+/// Reads `session.backend` from the merged config and dispatches:
+/// - `"local"` -> `LocalBackend` (default)
+/// - `"cloud"` without the `cloud` feature -> error with install hint
+/// - `"cloud"` with the `cloud` feature -> stub (CloudBackend not yet implemented)
+/// - anything else -> error
+///
+/// When `KOTO_SESSIONS_BASE` is set, the local backend stores sessions directly
+/// under that directory (bypassing repo-id hashing). This is intended for
+/// integration tests that need to control the storage location.
+fn build_backend() -> Result<Backend> {
+    let config = crate::config::resolve::load_config()?;
+
+    match config.session.backend.as_str() {
+        "local" => Ok(Backend::Local(build_local_backend()?)),
+        "cloud" => {
+            let working_dir = std::env::current_dir()?;
+            let cloud_backend =
+                crate::session::cloud::CloudBackend::new(&working_dir, &config.session.cloud)?;
+            Ok(Backend::Cloud(cloud_backend))
+        }
+        other => {
+            anyhow::bail!("unknown backend: {other}")
+        }
+    }
+}
+
+/// Build the local backend, honoring `KOTO_SESSIONS_BASE` for testing.
+fn build_local_backend() -> Result<LocalBackend> {
     if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
         Ok(LocalBackend::with_base_dir(PathBuf::from(base)))
     } else {
@@ -563,6 +634,9 @@ pub fn run(app: App) -> Result<()> {
                 SessionCommand::Dir { name } => session::handle_dir(&backend, &name),
                 SessionCommand::List => session::handle_list(&backend),
                 SessionCommand::Cleanup { name } => session::handle_cleanup(&backend, &name),
+                SessionCommand::Resolve { name, keep } => {
+                    session::handle_resolve(&backend, &name, &keep)
+                }
             }
         }
         Command::Context { subcommand } => {
@@ -735,6 +809,74 @@ pub fn run(app: App) -> Result<()> {
                 }
                 DecisionsSubcommand::List { name } => handle_decisions_list(&backend, name),
             }
+        }
+        Command::Config { subcommand } => handle_config(subcommand),
+    }
+}
+
+/// Handle `koto config` subcommands.
+fn handle_config(subcommand: ConfigCommand) -> Result<()> {
+    use crate::config;
+
+    match subcommand {
+        ConfigCommand::Get { key } => {
+            let resolved = config::resolve::load_config()?;
+            match config::get_value(&resolved, &key) {
+                Some(value) => {
+                    println!("{}", value);
+                    Ok(())
+                }
+                None => {
+                    std::process::exit(1);
+                }
+            }
+        }
+        ConfigCommand::Set { key, value, user } => {
+            if user {
+                config::resolve::ensure_koto_dir()?;
+                let path = config::resolve::user_config_path()
+                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+                let mut doc = config::resolve::load_toml_value(&path)?;
+                config::set_value_in_toml(&mut doc, &key, &value)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                config::resolve::write_toml_value(&path, &doc)?;
+            } else {
+                config::validate::validate_project_key(&key)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let path = config::resolve::project_config_path();
+                let mut doc = config::resolve::load_toml_value(&path)?;
+                config::set_value_in_toml(&mut doc, &key, &value)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                config::resolve::write_toml_value(&path, &doc)?;
+            }
+            Ok(())
+        }
+        ConfigCommand::Unset { key, user } => {
+            if user {
+                let path = config::resolve::user_config_path()
+                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+                let mut doc = config::resolve::load_toml_value(&path)?;
+                config::unset_value_in_toml(&mut doc, &key)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                config::resolve::write_toml_value(&path, &doc)?;
+            } else {
+                let path = config::resolve::project_config_path();
+                let mut doc = config::resolve::load_toml_value(&path)?;
+                config::unset_value_in_toml(&mut doc, &key)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                config::resolve::write_toml_value(&path, &doc)?;
+            }
+            Ok(())
+        }
+        ConfigCommand::List { json } => {
+            let resolved = config::resolve::load_config()?;
+            let redacted = config::redact(&resolved);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&redacted)?);
+            } else {
+                println!("{}", toml::to_string_pretty(&redacted)?);
+            }
+            Ok(())
         }
     }
 }

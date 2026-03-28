@@ -144,7 +144,7 @@ impl LocalBackend {
 
     /// Read the manifest, returning a default empty manifest if the file
     /// doesn't exist.
-    fn read_manifest(&self, session: &str) -> anyhow::Result<Manifest> {
+    pub(crate) fn read_manifest(&self, session: &str) -> anyhow::Result<Manifest> {
         let path = self.manifest_path(session);
         match fs::read(&path) {
             Ok(data) => serde_json::from_slice(&data)

@@ -22,8 +22,10 @@ hex = "0.4"
 regex = "1"
 opener = "0.7"
 thiserror = "1"
+toml = "0.8"
 anyhow = "1"
 tempfile = "3"
+rust-s3 = { version = "0.37", default-features = false, features = ["sync-native-tls", "fail-on-err"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -33,7 +35,11 @@ wait-timeout = "0.2"
 [dev-dependencies]
 assert_cmd = "2"
 assert_fs = "1"
+predicates = "3.1.4"
 tempfile = "3"
+
+[features]
+cloud-integration-tests = []
 
 [profile.release]
 lto = true

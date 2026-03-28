@@ -37,7 +37,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test
+        run: cargo test -- --test-threads=1
 
   fmt:
     name: Format
@@ -138,9 +138,33 @@ jobs:
         if: github.event_name == 'push'
         run: koto version
 
+  cloud-integration:
+    name: Cloud Integration Tests
+    if: ${{ github.event.pull_request.draft != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run cloud integration tests
+        env:
+          KOTO_TEST_S3_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          KOTO_TEST_S3_BUCKET: ${{ secrets.R2_TEST_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -z "$KOTO_TEST_S3_ENDPOINT" ]; then
+            echo "R2 secrets not configured, skipping cloud integration tests"
+            exit 0
+          fi
+          cargo test --features cloud-integration-tests --test cloud_integration_test -- --test-threads=1
+
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, fmt, clippy, audit, tsuku-distributed-install]
+    needs: [check-artifacts, unit-tests, fmt, clippy, audit, tsuku-distributed-install, cloud-integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -151,6 +175,7 @@ jobs:
              [ "${{ needs.fmt.result }}" = "failure" ] || \
              [ "${{ needs.clippy.result }}" = "failure" ] || \
              [ "${{ needs.audit.result }}" = "failure" ] || \
+             [ "${{ needs.cloud-integration.result }}" = "failure" ] || \
              [ "${{ needs.tsuku-distributed-install.result }}" = "failure" ]; then
             exit 1
           fi
