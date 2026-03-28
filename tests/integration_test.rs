@@ -5150,6 +5150,7 @@ fn backend_local_explicit_config_works() {
 }
 
 #[test]
+#[cfg(not(feature = "cloud"))]
 fn backend_cloud_without_feature_fails() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");

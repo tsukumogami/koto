@@ -25,7 +25,7 @@ use crate::engine::persistence::{
 use crate::engine::types::{now_iso8601, EventPayload, StateFileHeader};
 use crate::session::context::ContextStore;
 use crate::session::local::LocalBackend;
-use crate::session::{state_file_name, SessionBackend};
+use crate::session::{state_file_name, Backend, SessionBackend};
 use crate::template::types::CompiledTemplate;
 
 /// Maximum payload size for --with-data (1 MB).
@@ -379,14 +379,17 @@ fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
 /// When `KOTO_SESSIONS_BASE` is set, the local backend stores sessions directly
 /// under that directory (bypassing repo-id hashing). This is intended for
 /// integration tests that need to control the storage location.
-fn build_backend() -> Result<LocalBackend> {
+fn build_backend() -> Result<Backend> {
     let config = crate::config::resolve::load_config()?;
 
     match config.session.backend.as_str() {
-        "local" => build_local_backend(),
+        "local" => Ok(Backend::Local(build_local_backend()?)),
         #[cfg(feature = "cloud")]
         "cloud" => {
-            anyhow::bail!("cloud backend is not yet implemented")
+            let working_dir = std::env::current_dir()?;
+            let cloud_backend =
+                crate::session::cloud::CloudBackend::new(&working_dir, &config.session.cloud)?;
+            Ok(Backend::Cloud(cloud_backend))
         }
         #[cfg(not(feature = "cloud"))]
         "cloud" => {
