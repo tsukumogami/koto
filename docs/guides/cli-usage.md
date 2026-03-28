@@ -570,10 +570,12 @@ When `session.backend` is set to `"cloud"`, koto syncs session state to S3-compa
 
 Cloud sync is built into existing commands -- `init`, `next`, and `context add` all sync automatically. There's no separate sync command to run.
 
-To enable cloud sync, install koto with the `cloud` feature flag:
+Cloud sync is included in the default koto binary. To enable it, configure a backend:
 
 ```bash
-cargo install koto --features cloud
+koto config set session.backend cloud
+koto config set session.cloud.endpoint https://<account-id>.r2.cloudflarestorage.com
+koto config set session.cloud.bucket my-koto-sessions
 ```
 
 #### Conflict resolution

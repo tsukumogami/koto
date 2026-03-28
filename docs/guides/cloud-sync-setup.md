@@ -2,19 +2,19 @@
 
 koto can sync sessions to any S3-compatible backend so you can resume workflows on a different machine. Sync is invisible -- existing commands handle it automatically.
 
-## 1. Install with cloud support
+## 1. Install koto
 
 ```bash
-cargo install koto --features cloud
+curl -fsSL https://raw.githubusercontent.com/tsukumogami/koto/main/install.sh | bash
 ```
 
 Or build from source:
 
 ```bash
-cargo build --release --features cloud
+cargo install koto
 ```
 
-The default install (without `--features cloud`) has zero S3 dependencies.
+Cloud sync is included in the default binary. No feature flags needed.
 
 ## 2. Configure the backend
 
