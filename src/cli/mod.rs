@@ -188,6 +188,15 @@ pub enum SessionCommand {
         /// Session name
         name: String,
     },
+    /// Resolve a session version conflict
+    #[cfg(feature = "cloud")]
+    Resolve {
+        /// Session name
+        name: String,
+        /// Which version to keep: "local" or "remote"
+        #[arg(long)]
+        keep: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -633,6 +642,10 @@ pub fn run(app: App) -> Result<()> {
                 SessionCommand::Dir { name } => session::handle_dir(&backend, &name),
                 SessionCommand::List => session::handle_list(&backend),
                 SessionCommand::Cleanup { name } => session::handle_cleanup(&backend, &name),
+                #[cfg(feature = "cloud")]
+                SessionCommand::Resolve { name, keep } => {
+                    session::handle_resolve(&backend, &name, &keep)
+                }
             }
         }
         Command::Context { subcommand } => {

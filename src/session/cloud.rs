@@ -163,6 +163,222 @@ impl CloudBackend {
             .with_context(|| format!("S3 PUT failed for key: {}", key))?;
         Ok(())
     }
+
+    /// S3 key for a session's version.json file.
+    fn version_key(&self, id: &str) -> String {
+        format!("{}/{}/version.json", self.prefix, id)
+    }
+
+    /// Path to the local version.json for a session.
+    fn local_version_path(&self, id: &str) -> PathBuf {
+        self.local.session_dir(id).join("version.json")
+    }
+
+    /// Read the local SessionVersion, creating it if it doesn't exist.
+    fn load_or_create_local_version(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<crate::session::version::SessionVersion> {
+        use crate::session::version::{get_or_create_machine_id, SessionVersion};
+
+        let path = self.local_version_path(id);
+        if let Some(v) = SessionVersion::load(&path)? {
+            return Ok(v);
+        }
+        let machine_id = get_or_create_machine_id()?;
+        let v = SessionVersion::new(machine_id);
+        v.save(&path)?;
+        Ok(v)
+    }
+
+    /// Fetch the remote SessionVersion from S3. Returns None if not found.
+    fn fetch_remote_version(&self, id: &str) -> Option<crate::session::version::SessionVersion> {
+        let key = self.version_key(id);
+        let response = self.bucket.get_object(&key).ok()?;
+        if response.status_code() != 200 {
+            return None;
+        }
+        serde_json::from_slice(response.bytes()).ok()
+    }
+
+    /// Upload the local version.json to S3.
+    fn push_version(&self, id: &str) -> anyhow::Result<()> {
+        let path = self.local_version_path(id);
+        let data = std::fs::read(&path)
+            .with_context(|| format!("reading version file: {}", path.display()))?;
+        let key = self.version_key(id);
+        self.put_object(&key, &data)
+    }
+
+    /// Check versions before a sync push. Returns Ok(()) if safe to proceed,
+    /// or an error describing the conflict.
+    ///
+    /// On success, increments the local version counter. The caller must call
+    /// `finalize_version_after_push` after a successful S3 upload to update
+    /// `last_sync_base`.
+    pub fn check_and_increment_version(&self, id: &str) -> anyhow::Result<()> {
+        use crate::session::version::{check_sync, conflict_message, SyncCheck};
+
+        let mut local = self.load_or_create_local_version(id)?;
+        let remote = self.fetch_remote_version(id);
+
+        match check_sync(&local, remote.as_ref()) {
+            SyncCheck::Safe => {
+                local.version += 1;
+                local.save(&self.local_version_path(id))?;
+                Ok(())
+            }
+            SyncCheck::RemoteNewer => {
+                // TODO: pull remote state first, then apply local op.
+                // For now, treat as safe and proceed.
+                local.version += 1;
+                local.save(&self.local_version_path(id))?;
+                Ok(())
+            }
+            SyncCheck::Conflict {
+                local_version,
+                remote_version,
+                local_machine,
+                remote_machine,
+            } => {
+                anyhow::bail!(
+                    "{}",
+                    conflict_message(
+                        local_version,
+                        remote_version,
+                        &local_machine,
+                        &remote_machine
+                    )
+                );
+            }
+        }
+    }
+
+    /// Update `last_sync_base` to match the current version after a
+    /// successful push. Also uploads the updated version.json to S3.
+    pub fn finalize_version_after_push(&self, id: &str) {
+        let path = self.local_version_path(id);
+        if let Ok(Some(mut v)) = crate::session::version::SessionVersion::load(&path) {
+            v.last_sync_base = v.version;
+            if let Err(e) = v.save(&path) {
+                eprintln!("warning: failed to update version after sync: {}", e);
+                return;
+            }
+            if let Err(e) = self.push_version(id) {
+                eprintln!("warning: failed to push version to S3: {}", e);
+            }
+        }
+    }
+
+    /// Resolve a version conflict by keeping local or remote state.
+    pub fn resolve_conflict(&self, id: &str, keep: &str) -> anyhow::Result<()> {
+        use crate::session::version::{get_or_create_machine_id, resolved_version, SessionVersion};
+
+        let local_path = self.local_version_path(id);
+        let local = self.load_or_create_local_version(id)?;
+        let remote = self
+            .fetch_remote_version(id)
+            .unwrap_or_else(|| SessionVersion::new("unknown".to_string()));
+
+        let machine_id = get_or_create_machine_id()?;
+        let new_version = resolved_version(&local, &remote, &machine_id);
+
+        match keep {
+            "local" => {
+                // Force-upload entire local session to S3.
+                new_version.save(&local_path)?;
+                self.force_push_session(id)?;
+            }
+            "remote" => {
+                // Download entire remote session to local.
+                self.force_pull_session(id)?;
+                new_version.save(&local_path)?;
+                // Upload the new version.json to S3 so both sides agree.
+                self.push_version(id)?;
+            }
+            _ => unreachable!(), // Validated by caller.
+        }
+
+        Ok(())
+    }
+
+    /// Force-upload the entire local session directory to S3.
+    fn force_push_session(&self, id: &str) -> anyhow::Result<()> {
+        let session_dir = self.local.session_dir(id);
+        if !session_dir.exists() {
+            anyhow::bail!(
+                "session directory does not exist: {}",
+                session_dir.display()
+            );
+        }
+
+        // Upload state file.
+        self.sync_push_state(id);
+
+        // Upload version.json.
+        self.push_version(id)?;
+
+        // Upload all context files.
+        let ctx_dir = session_dir.join("ctx");
+        if ctx_dir.exists() {
+            for entry in std::fs::read_dir(&ctx_dir)? {
+                let entry = entry?;
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                let data = std::fs::read(entry.path())?;
+                let s3_key = format!("{}/{}/ctx/{}", self.prefix, id, file_name);
+                if let Err(e) = self.put_object(&s3_key, &data) {
+                    eprintln!(
+                        "warning: cloud sync: failed to upload ctx/{}: {}",
+                        file_name, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Download the entire remote session from S3 to local.
+    fn force_pull_session(&self, id: &str) -> anyhow::Result<()> {
+        let session_dir = self.local.session_dir(id);
+        std::fs::create_dir_all(&session_dir)?;
+
+        // Download state file.
+        let state_key = self.state_key(id);
+        if let Ok(response) = self.bucket.get_object(&state_key) {
+            if response.status_code() == 200 {
+                let state_path = session_dir.join(state_file_name(id));
+                std::fs::write(&state_path, response.bytes())?;
+            }
+        }
+
+        // Download all context files by listing the ctx/ prefix.
+        let ctx_prefix = format!("{}/{}/ctx/", self.prefix, id);
+        if let Ok(results) = self.bucket.list(ctx_prefix.clone(), None) {
+            let ctx_dir = session_dir.join("ctx");
+            std::fs::create_dir_all(&ctx_dir)?;
+            for list in &results {
+                for obj in &list.contents {
+                    if let Some(file_name) = obj.key.strip_prefix(&ctx_prefix) {
+                        if file_name.is_empty() {
+                            continue;
+                        }
+                        if let Ok(response) = self.bucket.get_object(&obj.key) {
+                            if response.status_code() == 200 {
+                                let local_path = ctx_dir.join(file_name);
+                                if let Some(parent) = local_path.parent() {
+                                    std::fs::create_dir_all(parent)?;
+                                }
+                                std::fs::write(&local_path, response.bytes())?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl SessionBackend for CloudBackend {
@@ -217,6 +433,18 @@ impl SessionBackend for CloudBackend {
 impl ContextStore for CloudBackend {
     fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
         self.local.add(session, key, content)?;
+
+        // Check version before pushing. Conflicts are hard errors;
+        // S3 connectivity failures are non-fatal (version check is skipped).
+        if let Err(e) = self.check_and_increment_version(session) {
+            let msg = e.to_string();
+            if msg.starts_with("session conflict:") {
+                return Err(e);
+            }
+            // S3 unreachable or version file missing -- proceed without version check.
+            eprintln!("warning: cloud sync: version check failed: {}", e);
+        }
+
         sync::push_context_key(
             &self.local,
             &self.bucket,
@@ -225,6 +453,10 @@ impl ContextStore for CloudBackend {
             key,
             &self.manifest_cache,
         );
+
+        // Update last_sync_base after successful push.
+        self.finalize_version_after_push(session);
+
         Ok(())
     }
 
@@ -258,6 +490,16 @@ impl ContextStore for CloudBackend {
 
     fn remove(&self, session: &str, key: &str) -> anyhow::Result<()> {
         self.local.remove(session, key)?;
+
+        // Check version before pushing deletion.
+        if let Err(e) = self.check_and_increment_version(session) {
+            let msg = e.to_string();
+            if msg.starts_with("session conflict:") {
+                return Err(e);
+            }
+            eprintln!("warning: cloud sync: version check failed: {}", e);
+        }
+
         sync::delete_context_key(
             &self.local,
             &self.bucket,
@@ -266,6 +508,9 @@ impl ContextStore for CloudBackend {
             key,
             &self.manifest_cache,
         );
+
+        self.finalize_version_after_push(session);
+
         Ok(())
     }
 
