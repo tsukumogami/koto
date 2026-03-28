@@ -1,11 +1,8 @@
-#[cfg(feature = "cloud")]
 pub mod cloud;
 pub mod context;
 pub mod local;
-#[cfg(feature = "cloud")]
 pub mod sync;
 pub mod validate;
-#[cfg(feature = "cloud")]
 pub mod version;
 
 use std::path::PathBuf;
@@ -64,7 +61,6 @@ pub trait SessionBackend: Send + Sync {
 /// of which backend is selected.
 pub enum Backend {
     Local(LocalBackend),
-    #[cfg(feature = "cloud")]
     Cloud(cloud::CloudBackend),
 }
 
@@ -72,7 +68,6 @@ impl SessionBackend for Backend {
     fn create(&self, id: &str) -> anyhow::Result<PathBuf> {
         match self {
             Backend::Local(b) => b.create(id),
-            #[cfg(feature = "cloud")]
             Backend::Cloud(b) => b.create(id),
         }
     }
@@ -80,7 +75,6 @@ impl SessionBackend for Backend {
     fn session_dir(&self, id: &str) -> PathBuf {
         match self {
             Backend::Local(b) => b.session_dir(id),
-            #[cfg(feature = "cloud")]
             Backend::Cloud(b) => b.session_dir(id),
         }
     }
@@ -88,7 +82,6 @@ impl SessionBackend for Backend {
     fn exists(&self, id: &str) -> bool {
         match self {
             Backend::Local(b) => b.exists(id),
-            #[cfg(feature = "cloud")]
             Backend::Cloud(b) => b.exists(id),
         }
     }
@@ -96,7 +89,6 @@ impl SessionBackend for Backend {
     fn cleanup(&self, id: &str) -> anyhow::Result<()> {
         match self {
             Backend::Local(b) => b.cleanup(id),
-            #[cfg(feature = "cloud")]
             Backend::Cloud(b) => b.cleanup(id),
         }
     }
@@ -104,7 +96,6 @@ impl SessionBackend for Backend {
     fn list(&self) -> anyhow::Result<Vec<SessionInfo>> {
         match self {
             Backend::Local(b) => b.list(),
-            #[cfg(feature = "cloud")]
             Backend::Cloud(b) => b.list(),
         }
     }
@@ -114,7 +105,6 @@ impl ContextStore for Backend {
     fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
         match self {
             Backend::Local(b) => b.add(session, key, content),
-            #[cfg(feature = "cloud")]
             Backend::Cloud(b) => b.add(session, key, content),
         }
     }
@@ -122,7 +112,6 @@ impl ContextStore for Backend {
     fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
         match self {
             Backend::Local(b) => b.get(session, key),
-            #[cfg(feature = "cloud")]
             Backend::Cloud(b) => b.get(session, key),
         }
     }
@@ -130,7 +119,6 @@ impl ContextStore for Backend {
     fn ctx_exists(&self, session: &str, key: &str) -> bool {
         match self {
             Backend::Local(b) => b.ctx_exists(session, key),
-            #[cfg(feature = "cloud")]
             Backend::Cloud(b) => b.ctx_exists(session, key),
         }
     }
@@ -138,7 +126,6 @@ impl ContextStore for Backend {
     fn remove(&self, session: &str, key: &str) -> anyhow::Result<()> {
         match self {
             Backend::Local(b) => b.remove(session, key),
-            #[cfg(feature = "cloud")]
             Backend::Cloud(b) => b.remove(session, key),
         }
     }
@@ -146,7 +133,6 @@ impl ContextStore for Backend {
     fn list_keys(&self, session: &str, prefix: Option<&str>) -> anyhow::Result<Vec<String>> {
         match self {
             Backend::Local(b) => b.list_keys(session, prefix),
-            #[cfg(feature = "cloud")]
             Backend::Cloud(b) => b.list_keys(session, prefix),
         }
     }

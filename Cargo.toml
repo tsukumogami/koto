@@ -25,7 +25,7 @@ thiserror = "1"
 toml = "0.8"
 anyhow = "1"
 tempfile = "3"
-rust-s3 = { version = "0.37", default-features = false, features = ["sync-native-tls", "fail-on-err"], optional = true }
+rust-s3 = { version = "0.37", default-features = false, features = ["sync-native-tls", "fail-on-err"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -39,8 +39,7 @@ predicates = "3.1.4"
 tempfile = "3"
 
 [features]
-cloud = ["dep:rust-s3"]
-cloud-integration-tests = ["cloud"]
+cloud-integration-tests = []
 
 [profile.release]
 lto = true

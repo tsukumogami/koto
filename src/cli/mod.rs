@@ -189,7 +189,6 @@ pub enum SessionCommand {
         name: String,
     },
     /// Resolve a session version conflict
-    #[cfg(feature = "cloud")]
     Resolve {
         /// Session name
         name: String,
@@ -393,18 +392,11 @@ fn build_backend() -> Result<Backend> {
 
     match config.session.backend.as_str() {
         "local" => Ok(Backend::Local(build_local_backend()?)),
-        #[cfg(feature = "cloud")]
         "cloud" => {
             let working_dir = std::env::current_dir()?;
             let cloud_backend =
                 crate::session::cloud::CloudBackend::new(&working_dir, &config.session.cloud)?;
             Ok(Backend::Cloud(cloud_backend))
-        }
-        #[cfg(not(feature = "cloud"))]
-        "cloud" => {
-            anyhow::bail!(
-                "cloud backend requires the 'cloud' feature: cargo install koto --features cloud"
-            )
         }
         other => {
             anyhow::bail!("unknown backend: {other}")
@@ -642,7 +634,6 @@ pub fn run(app: App) -> Result<()> {
                 SessionCommand::Dir { name } => session::handle_dir(&backend, &name),
                 SessionCommand::List => session::handle_list(&backend),
                 SessionCommand::Cleanup { name } => session::handle_cleanup(&backend, &name),
-                #[cfg(feature = "cloud")]
                 SessionCommand::Resolve { name, keep } => {
                     session::handle_resolve(&backend, &name, &keep)
                 }

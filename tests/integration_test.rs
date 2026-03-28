@@ -5150,27 +5150,6 @@ fn backend_local_explicit_config_works() {
 }
 
 #[test]
-#[cfg(not(feature = "cloud"))]
-fn backend_cloud_without_feature_fails() {
-    let tmp = TempDir::new().unwrap();
-    let home = tmp.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
-
-    write_project_config(tmp.path(), "[session]\nbackend = \"cloud\"\n");
-
-    let src = write_template_source(tmp.path());
-
-    // Without the cloud feature, init should fail with a helpful error
-    koto_backend_cmd(tmp.path(), &home)
-        .args(["init", "test-wf", "--template", src.to_str().unwrap()])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains(
-            "cloud backend requires the 'cloud' feature",
-        ));
-}
-
-#[test]
 fn backend_unknown_value_fails() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");

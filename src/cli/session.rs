@@ -1,6 +1,5 @@
 use anyhow::Result;
 
-#[cfg(feature = "cloud")]
 use crate::session::Backend;
 use crate::session::SessionBackend;
 
@@ -25,7 +24,6 @@ pub fn handle_cleanup(backend: &dyn SessionBackend, name: &str) -> Result<()> {
 }
 
 /// Resolve a session version conflict by keeping either the local or remote state.
-#[cfg(feature = "cloud")]
 pub fn handle_resolve(backend: &Backend, name: &str, keep: &str) -> Result<()> {
     match keep {
         "local" | "remote" => {}
