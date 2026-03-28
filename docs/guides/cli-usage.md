@@ -452,6 +452,147 @@ koto template export my-workflow.md --format html --output docs/my-workflow.html
 
 Unlike other template subcommands, export errors go to stderr as plain text (not JSON), since it's a developer-facing tool rather than an agent-consumed command.
 
+### config
+
+The `config` subcommand group reads and writes koto's configuration. koto looks for config in two places, merged in this order (later wins):
+
+1. **Project config** -- `.koto/config.toml` in the current repository. Checked into version control and shared with collaborators.
+2. **User config** -- `~/.koto/config.toml`. Machine-specific settings and credentials.
+
+Project config uses an allowlist. Only non-secret keys are allowed -- credential keys like `session.cloud.access_key` and `session.cloud.secret_key` are rejected with an error if you try to set them in project config.
+
+#### config get
+
+Prints the resolved value of a config key.
+
+```bash
+koto config get <key>
+```
+
+**Positional argument:**
+- `<key>` -- Dotted config key (e.g., `session.backend`).
+
+Exits 0 and prints the value if set. Exits 1 if the key is unset.
+
+#### config set
+
+Writes a value to user config (default) or project config.
+
+```bash
+koto config set <key> <value>
+koto config set --project <key> <value>
+```
+
+**Positional arguments:**
+- `<key>` -- Dotted config key.
+- `<value>` -- Value to set.
+
+**Optional flags:**
+- `--project` -- Write to `.koto/config.toml` instead of `~/.koto/config.toml`. Fails if the key isn't on the project config allowlist.
+
+#### config unset
+
+Removes a key from user config.
+
+```bash
+koto config unset <key>
+```
+
+**Positional argument:**
+- `<key>` -- Dotted config key to remove.
+
+#### config list
+
+Dumps the fully resolved config as TOML. Credential values are redacted in the output.
+
+```bash
+koto config list
+koto config list --json
+```
+
+**Optional flags:**
+- `--json` -- Output as JSON instead of TOML.
+
+#### Config keys reference
+
+| Key | Values | Default | Project config |
+|-----|--------|---------|:--------------:|
+| `session.backend` | `"local"`, `"cloud"` | `"local"` | yes |
+| `session.cloud.endpoint` | S3-compatible endpoint URL | -- | yes |
+| `session.cloud.bucket` | Bucket name | `"koto-sessions"` | yes |
+| `session.cloud.region` | AWS region | -- | yes |
+| `session.cloud.access_key` | Access key ID | -- | no |
+| `session.cloud.secret_key` | Secret access key | -- | no |
+
+Credential keys (`access_key`, `secret_key`) can also be provided through environment variables `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Environment variables take precedence over config file values.
+
+#### Example: local-only config (default)
+
+No configuration needed. Sessions are stored at `~/.koto/sessions/` and never leave the machine.
+
+#### Example: cloud sync with user config
+
+```toml
+# ~/.koto/config.toml
+[session]
+backend = "cloud"
+
+[session.cloud]
+endpoint = "https://s3.us-east-1.amazonaws.com"
+bucket = "my-koto-sessions"
+region = "us-east-1"
+access_key = "AKIAIOSFODNN7EXAMPLE"
+secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+```
+
+#### Example: shared project config with per-user credentials
+
+```toml
+# .koto/config.toml (committed to repo)
+[session]
+backend = "cloud"
+
+[session.cloud]
+endpoint = "https://my-r2-account.r2.cloudflarestorage.com"
+bucket = "team-koto-sessions"
+```
+
+Each team member sets credentials in their own user config or environment:
+
+```bash
+export AWS_ACCESS_KEY_ID="AKIAIOSFODNN7EXAMPLE"
+export AWS_SECRET_ACCESS_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+```
+
+### Cloud sync
+
+When `session.backend` is set to `"cloud"`, koto syncs session state to S3-compatible storage. This works with AWS S3, Cloudflare R2, MinIO, and any other S3-compatible provider.
+
+Cloud sync is built into existing commands -- `init`, `next`, and `context add` all sync automatically. There's no separate sync command to run.
+
+To enable cloud sync, install koto with the `cloud` feature flag:
+
+```bash
+cargo install koto --features cloud
+```
+
+#### Conflict resolution
+
+Version conflicts are rare but can happen if two machines modify the same session simultaneously. When koto detects a conflict, it pauses and asks you to choose which version to keep:
+
+```bash
+koto session resolve <name> --keep local
+koto session resolve <name> --keep remote
+```
+
+**Positional argument:**
+- `<name>` -- Workflow/session name.
+
+**Required flag:**
+- `--keep` -- Which version to keep: `local` (discard the remote version) or `remote` (discard local changes and pull the remote version).
+
+After resolving, normal operations resume.
+
 ### version
 
 Prints version information as JSON.

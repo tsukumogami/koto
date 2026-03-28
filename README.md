@@ -105,6 +105,10 @@ The `action` field is `"execute"` while work remains and `"done"` at the termina
 
 **Template integrity**: The template's SHA-256 hash is locked at init time and stored in the first event. If the compiled template changes, `next` will fail. To update the template, reinitialize the workflow.
 
+**Cloud sync**: Sessions default to local storage, but koto can sync them to any S3-compatible backend (AWS S3, Cloudflare R2, MinIO). Set `session.backend` to `"cloud"` via `koto config set`, configure your endpoint and credentials, and existing commands handle sync transparently. Install with `cargo install koto --features cloud` to enable it. See the [CLI usage guide](docs/guides/cli-usage.md) for setup details.
+
+**Configuration**: koto merges config from two layers: project config (`.koto/config.toml`, shared via version control) and user config (`~/.koto/config.toml`, machine-specific). Credentials are restricted to user config and environment variables -- they can't be set in project config. Use `koto config list` to see the resolved values.
+
 ## Agent integration
 
 AI coding agents can run koto workflows through the Claude Code plugin. Install it with two commands:
