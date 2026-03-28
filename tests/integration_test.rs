@@ -4785,3 +4785,313 @@ fn export_30_state_template_latency_under_500ms() {
         "should have terminal state marker"
     );
 }
+
+// ─── Config CLI integration tests ─────────────────────────────────────────────
+
+/// Helper that creates a koto command with HOME overridden to a temp dir
+/// so config tests never touch the real ~/.koto/.
+fn koto_config_cmd(dir: &Path, home: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.current_dir(dir);
+    cmd.env("HOME", home);
+    // Prevent env vars from interfering unless explicitly set in the test.
+    cmd.env_remove("AWS_ACCESS_KEY_ID");
+    cmd.env_remove("AWS_SECRET_ACCESS_KEY");
+    cmd
+}
+
+#[test]
+fn config_set_and_get_user_config() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Set a value in user config.
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "set", "session.backend", "cloud"])
+        .assert()
+        .success();
+
+    // Get the value back.
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "get", "session.backend"])
+        .assert()
+        .success()
+        .stdout("cloud\n");
+}
+
+#[test]
+fn config_get_unset_key_exits_1() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "get", "session.cloud.endpoint"])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn config_set_and_get_project_config() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Set a value in project config.
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "set", "--project", "session.backend", "cloud"])
+        .assert()
+        .success();
+
+    // Verify the project config file was created.
+    let project_config = tmp.path().join(".koto").join("config.toml");
+    assert!(project_config.exists());
+
+    // Get the value (resolved config includes project).
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "get", "session.backend"])
+        .assert()
+        .success()
+        .stdout("cloud\n");
+}
+
+#[test]
+fn config_project_rejects_credential_keys() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    koto_config_cmd(tmp.path(), &home)
+        .args([
+            "config",
+            "set",
+            "--project",
+            "session.cloud.access_key",
+            "AKIAEXAMPLE",
+        ])
+        .assert()
+        .failure();
+
+    koto_config_cmd(tmp.path(), &home)
+        .args([
+            "config",
+            "set",
+            "--project",
+            "session.cloud.secret_key",
+            "secret123",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn config_unset_removes_key() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Set then unset.
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "set", "session.cloud.bucket", "my-bucket"])
+        .assert()
+        .success();
+
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "get", "session.cloud.bucket"])
+        .assert()
+        .success()
+        .stdout("my-bucket\n");
+
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "unset", "session.cloud.bucket"])
+        .assert()
+        .success();
+
+    // Now get should exit 1.
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "get", "session.cloud.bucket"])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn config_unset_project_key() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Set in project, then unset from project.
+    koto_config_cmd(tmp.path(), &home)
+        .args([
+            "config",
+            "set",
+            "--project",
+            "session.cloud.region",
+            "us-east-1",
+        ])
+        .assert()
+        .success();
+
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "unset", "--project", "session.cloud.region"])
+        .assert()
+        .success();
+
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "get", "session.cloud.region"])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn config_list_toml_output() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "set", "session.backend", "cloud"])
+        .assert()
+        .success();
+
+    let output = koto_config_cmd(tmp.path(), &home)
+        .args(["config", "list"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("backend"), "should contain backend key");
+    assert!(stdout.contains("cloud"), "should contain the set value");
+}
+
+#[test]
+fn config_list_json_output() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "set", "session.backend", "cloud"])
+        .assert()
+        .success();
+
+    let output = koto_config_cmd(tmp.path(), &home)
+        .args(["config", "list", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(parsed["session"]["backend"], "cloud");
+}
+
+#[test]
+fn config_list_redacts_credentials() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Set credentials in user config.
+    koto_config_cmd(tmp.path(), &home)
+        .args([
+            "config",
+            "set",
+            "session.cloud.access_key",
+            "AKIAIOSFODNN7EXAMPLE",
+        ])
+        .assert()
+        .success();
+
+    koto_config_cmd(tmp.path(), &home)
+        .args([
+            "config",
+            "set",
+            "session.cloud.secret_key",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        ])
+        .assert()
+        .success();
+
+    // List should show <set> not the actual values.
+    let output = koto_config_cmd(tmp.path(), &home)
+        .args(["config", "list", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(parsed["session"]["cloud"]["access_key"], "<set>");
+    assert_eq!(parsed["session"]["cloud"]["secret_key"], "<set>");
+    assert!(!stdout.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(!stdout.contains("wJalrXUtnFEMI"));
+}
+
+#[test]
+fn config_env_var_overrides_config_file() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Set a value in user config.
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "set", "session.cloud.access_key", "config-key"])
+        .assert()
+        .success();
+
+    // Now get with env var override.
+    let output = {
+        let mut cmd = Command::cargo_bin("koto").unwrap();
+        cmd.current_dir(tmp.path());
+        cmd.env("HOME", &home);
+        cmd.env("AWS_ACCESS_KEY_ID", "env-key");
+        cmd.env_remove("AWS_SECRET_ACCESS_KEY");
+        cmd.args(["config", "get", "session.cloud.access_key"]);
+        cmd.output().unwrap()
+    };
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "env-key");
+}
+
+#[test]
+fn config_project_overrides_user() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Set user config.
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "set", "session.backend", "local"])
+        .assert()
+        .success();
+
+    // Set project config.
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "set", "--project", "session.backend", "cloud"])
+        .assert()
+        .success();
+
+    // Resolved value should be project's.
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "get", "session.backend"])
+        .assert()
+        .success()
+        .stdout("cloud\n");
+}
+
+#[test]
+fn config_set_unknown_key_fails() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    koto_config_cmd(tmp.path(), &home)
+        .args(["config", "set", "nonexistent.key", "value"])
+        .assert()
+        .failure();
+}

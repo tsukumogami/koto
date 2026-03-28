@@ -22,6 +22,7 @@ hex = "0.4"
 regex = "1"
 opener = "0.7"
 thiserror = "1"
+toml = "0.8"
 anyhow = "1"
 tempfile = "3"
 

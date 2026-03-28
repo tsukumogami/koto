@@ -3,6 +3,7 @@ pub mod action;
 pub mod buildinfo;
 pub mod cache;
 pub mod cli;
+pub mod config;
 pub mod discover;
 pub mod engine;
 pub mod export;

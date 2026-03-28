@@ -133,6 +133,45 @@ pub enum Command {
         #[command(subcommand)]
         subcommand: DecisionsSubcommand,
     },
+
+    /// Configuration management subcommands
+    Config {
+        #[command(subcommand)]
+        subcommand: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    /// Print the value of a config key
+    Get {
+        /// Dotted key path (e.g., session.backend)
+        key: String,
+    },
+    /// Set a config key to a value
+    Set {
+        /// Dotted key path (e.g., session.backend)
+        key: String,
+        /// Value to set
+        value: String,
+        /// Write to project config (.koto/config.toml) instead of user config
+        #[arg(long)]
+        project: bool,
+    },
+    /// Remove a config key
+    Unset {
+        /// Dotted key path (e.g., session.backend)
+        key: String,
+        /// Remove from project config (.koto/config.toml) instead of user config
+        #[arg(long)]
+        project: bool,
+    },
+    /// List resolved configuration
+    List {
+        /// Output as JSON instead of TOML
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -735,6 +774,78 @@ pub fn run(app: App) -> Result<()> {
                 }
                 DecisionsSubcommand::List { name } => handle_decisions_list(&backend, name),
             }
+        }
+        Command::Config { subcommand } => handle_config(subcommand),
+    }
+}
+
+/// Handle `koto config` subcommands.
+fn handle_config(subcommand: ConfigCommand) -> Result<()> {
+    use crate::config;
+
+    match subcommand {
+        ConfigCommand::Get { key } => {
+            let resolved = config::resolve::load_config()?;
+            match config::get_value(&resolved, &key) {
+                Some(value) => {
+                    println!("{}", value);
+                    Ok(())
+                }
+                None => {
+                    std::process::exit(1);
+                }
+            }
+        }
+        ConfigCommand::Set {
+            key,
+            value,
+            project,
+        } => {
+            if project {
+                config::validate::validate_project_key(&key)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let path = config::resolve::project_config_path();
+                let mut doc = config::resolve::load_toml_value(&path)?;
+                config::set_value_in_toml(&mut doc, &key, &value)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                config::resolve::write_toml_value(&path, &doc)?;
+            } else {
+                config::resolve::ensure_koto_dir()?;
+                let path = config::resolve::user_config_path()
+                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+                let mut doc = config::resolve::load_toml_value(&path)?;
+                config::set_value_in_toml(&mut doc, &key, &value)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                config::resolve::write_toml_value(&path, &doc)?;
+            }
+            Ok(())
+        }
+        ConfigCommand::Unset { key, project } => {
+            if project {
+                let path = config::resolve::project_config_path();
+                let mut doc = config::resolve::load_toml_value(&path)?;
+                config::unset_value_in_toml(&mut doc, &key)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                config::resolve::write_toml_value(&path, &doc)?;
+            } else {
+                let path = config::resolve::user_config_path()
+                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+                let mut doc = config::resolve::load_toml_value(&path)?;
+                config::unset_value_in_toml(&mut doc, &key)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                config::resolve::write_toml_value(&path, &doc)?;
+            }
+            Ok(())
+        }
+        ConfigCommand::List { json } => {
+            let resolved = config::resolve::load_config()?;
+            let redacted = config::redact(&resolved);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&redacted)?);
+            } else {
+                println!("{}", toml::to_string_pretty(&redacted)?);
+            }
+            Ok(())
         }
     }
 }
