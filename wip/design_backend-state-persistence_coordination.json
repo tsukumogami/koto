@@ -1,9 +1,0 @@
-{
-  "topic": "backend-state-persistence",
-  "decisions": [
-    {"id": 1, "question": "How to extend SessionBackend with state I/O: add methods to existing trait, new StateStore trait, or keep persistence module with sync hook?", "status": "pending", "complexity": "standard"},
-    {"id": 2, "question": "Migration strategy for the 16 CLI call sites: big-bang refactor, helper wrapper, or post-write hook?", "status": "pending", "complexity": "standard"}
-  ],
-  "cross_validation": "pending",
-  "round": 0
-}
