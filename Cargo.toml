@@ -34,7 +34,11 @@ wait-timeout = "0.2"
 [dev-dependencies]
 assert_cmd = "2"
 assert_fs = "1"
+predicates = "3.1.4"
 tempfile = "3"
+
+[features]
+cloud = []
 
 [profile.release]
 lto = true

@@ -368,12 +368,40 @@ fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
     }
 }
 
-/// Construct the session backend, honoring `KOTO_SESSIONS_BASE` for testing.
+/// Construct the session backend based on configuration.
 ///
-/// When `KOTO_SESSIONS_BASE` is set, sessions are stored directly under that
-/// directory (bypassing repo-id hashing). This is intended for integration
-/// tests that need to control the storage location.
+/// Reads `session.backend` from the merged config and dispatches:
+/// - `"local"` -> `LocalBackend` (default)
+/// - `"cloud"` without the `cloud` feature -> error with install hint
+/// - `"cloud"` with the `cloud` feature -> stub (CloudBackend not yet implemented)
+/// - anything else -> error
+///
+/// When `KOTO_SESSIONS_BASE` is set, the local backend stores sessions directly
+/// under that directory (bypassing repo-id hashing). This is intended for
+/// integration tests that need to control the storage location.
 fn build_backend() -> Result<LocalBackend> {
+    let config = crate::config::resolve::load_config()?;
+
+    match config.session.backend.as_str() {
+        "local" => build_local_backend(),
+        #[cfg(feature = "cloud")]
+        "cloud" => {
+            anyhow::bail!("cloud backend is not yet implemented")
+        }
+        #[cfg(not(feature = "cloud"))]
+        "cloud" => {
+            anyhow::bail!(
+                "cloud backend requires the 'cloud' feature: cargo install koto --features cloud"
+            )
+        }
+        other => {
+            anyhow::bail!("unknown backend: {other}")
+        }
+    }
+}
+
+/// Build the local backend, honoring `KOTO_SESSIONS_BASE` for testing.
+fn build_local_backend() -> Result<LocalBackend> {
     if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
         Ok(LocalBackend::with_base_dir(PathBuf::from(base)))
     } else {

@@ -5095,3 +5095,93 @@ fn config_set_unknown_key_fails() {
         .assert()
         .failure();
 }
+
+// ---------------------------------------------------------------------------
+// backend selection (config-driven)
+// ---------------------------------------------------------------------------
+
+/// Return a koto command with controlled HOME and KOTO_SESSIONS_BASE.
+fn koto_backend_cmd(dir: &Path, home: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.current_dir(dir);
+    cmd.env("HOME", home);
+    cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
+    cmd.env_remove("AWS_ACCESS_KEY_ID");
+    cmd.env_remove("AWS_SECRET_ACCESS_KEY");
+    cmd
+}
+
+/// Write a project-level .koto/config.toml with the given TOML content.
+fn write_project_config(dir: &Path, content: &str) {
+    let config_dir = dir.join(".koto");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("config.toml"), content).unwrap();
+}
+
+#[test]
+fn backend_defaults_to_local_when_no_config() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let src = write_template_source(tmp.path());
+
+    // init should succeed using the default local backend
+    koto_backend_cmd(tmp.path(), &home)
+        .args(["init", "test-wf", "--template", src.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn backend_local_explicit_config_works() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    write_project_config(tmp.path(), "[session]\nbackend = \"local\"\n");
+
+    let src = write_template_source(tmp.path());
+
+    koto_backend_cmd(tmp.path(), &home)
+        .args(["init", "test-wf", "--template", src.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn backend_cloud_without_feature_fails() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    write_project_config(tmp.path(), "[session]\nbackend = \"cloud\"\n");
+
+    let src = write_template_source(tmp.path());
+
+    // Without the cloud feature, init should fail with a helpful error
+    koto_backend_cmd(tmp.path(), &home)
+        .args(["init", "test-wf", "--template", src.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "cloud backend requires the 'cloud' feature",
+        ));
+}
+
+#[test]
+fn backend_unknown_value_fails() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    write_project_config(tmp.path(), "[session]\nbackend = \"s3-custom\"\n");
+
+    let src = write_template_source(tmp.path());
+
+    koto_backend_cmd(tmp.path(), &home)
+        .args(["init", "test-wf", "--template", src.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unknown backend: s3-custom"));
+}
