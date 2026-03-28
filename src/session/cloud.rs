@@ -4,6 +4,11 @@
 //! locally first (fast, works offline). After each mutating operation it
 //! syncs the affected files to S3. S3 failures are non-fatal: the local
 //! operation succeeds and a warning is printed to stderr.
+//!
+//! Context sync is per-key incremental: only the changed content file and
+//! an updated manifest are transferred on each `add`/`remove`. A short TTL
+//! cache on the remote manifest reduces redundant S3 GETs during rapid
+//! sequential calls.
 
 use std::path::{Path, PathBuf};
 
@@ -14,14 +19,20 @@ use s3::{Bucket, Region};
 use crate::config::CloudConfig;
 use crate::session::context::ContextStore;
 use crate::session::local::{repo_id, LocalBackend};
+use crate::session::sync::{self, ManifestCache};
 use crate::session::{state_file_name, SessionBackend, SessionInfo};
 
 /// S3-backed session storage that delegates to `LocalBackend` for all
 /// filesystem operations and syncs state to an S3-compatible bucket.
+///
+/// Context operations use per-key incremental sync via the helpers in
+/// `sync.rs`. A `ManifestCache` avoids redundant remote manifest GETs
+/// when multiple operations happen within a short window.
 pub struct CloudBackend {
     local: LocalBackend,
     bucket: Box<Bucket>,
     prefix: String,
+    manifest_cache: ManifestCache,
 }
 
 impl CloudBackend {
@@ -38,6 +49,7 @@ impl CloudBackend {
             local,
             bucket,
             prefix,
+            manifest_cache: ManifestCache::new(),
         })
     }
 
@@ -51,6 +63,7 @@ impl CloudBackend {
             local,
             bucket,
             prefix,
+            manifest_cache: ManifestCache::new(),
         }
     }
 
@@ -62,16 +75,6 @@ impl CloudBackend {
     /// S3 key prefix for a session (all artifacts).
     fn session_prefix(&self, id: &str) -> String {
         format!("{}/{}/", self.prefix, id)
-    }
-
-    /// S3 key for a context artifact.
-    fn context_key(&self, session: &str, key: &str) -> String {
-        format!("{}/{}/ctx/{}", self.prefix, session, key)
-    }
-
-    /// S3 key for a session's context manifest.
-    fn manifest_key(&self, session: &str) -> String {
-        format!("{}/{}/ctx/manifest.json", self.prefix, session)
     }
 
     /// Upload the state file to S3. Non-fatal on failure.
@@ -153,65 +156,6 @@ impl CloudBackend {
         self.bucket.head_object(&key).is_ok()
     }
 
-    /// Upload a context key to S3. Non-fatal on failure.
-    fn sync_push_context(&self, session: &str, key: &str) {
-        let content_path = self.local.session_dir(session).join("ctx").join(key);
-        if !content_path.exists() {
-            return;
-        }
-        let data = match std::fs::read(&content_path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!(
-                    "warning: cloud sync: failed to read context key '{}': {}",
-                    key, e
-                );
-                return;
-            }
-        };
-        let s3_key = self.context_key(session, key);
-        if let Err(e) = self.put_object(&s3_key, &data) {
-            eprintln!(
-                "warning: cloud sync failed for context upload '{}': {}",
-                key, e
-            );
-        }
-    }
-
-    /// Upload the context manifest to S3. Non-fatal on failure.
-    fn sync_push_manifest(&self, session: &str) {
-        let manifest_path = self
-            .local
-            .session_dir(session)
-            .join("ctx")
-            .join("manifest.json");
-        if !manifest_path.exists() {
-            return;
-        }
-        let data = match std::fs::read(&manifest_path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("warning: cloud sync: failed to read manifest: {}", e);
-                return;
-            }
-        };
-        let key = self.manifest_key(session);
-        if let Err(e) = self.put_object(&key, &data) {
-            eprintln!("warning: cloud sync failed for manifest upload: {}", e);
-        }
-    }
-
-    /// Delete a context key from S3. Non-fatal on failure.
-    fn sync_delete_context(&self, session: &str, key: &str) {
-        let s3_key = self.context_key(session, key);
-        if let Err(e) = self.bucket.delete_object(&s3_key) {
-            eprintln!(
-                "warning: cloud sync: failed to delete context key '{}': {}",
-                key, e
-            );
-        }
-    }
-
     /// Wrapper around `bucket.put_object` that returns a Result.
     fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
         self.bucket
@@ -273,28 +217,76 @@ impl SessionBackend for CloudBackend {
 impl ContextStore for CloudBackend {
     fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
         self.local.add(session, key, content)?;
-        self.sync_push_context(session, key);
-        self.sync_push_manifest(session);
+        sync::push_context_key(
+            &self.local,
+            &self.bucket,
+            &self.prefix,
+            session,
+            key,
+            &self.manifest_cache,
+        );
         Ok(())
     }
 
     fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+        // Pull from remote if a newer version exists.
+        sync::pull_context_if_newer(
+            &self.local,
+            &self.bucket,
+            &self.prefix,
+            session,
+            key,
+            &self.manifest_cache,
+        );
         self.local.get(session, key)
     }
 
     fn ctx_exists(&self, session: &str, key: &str) -> bool {
-        self.local.ctx_exists(session, key)
+        if self.local.ctx_exists(session, key) {
+            return true;
+        }
+        // Fall back to checking remote manifest.
+        sync::remote_key_exists(
+            &self.bucket,
+            &self.prefix,
+            session,
+            key,
+            &self.manifest_cache,
+        )
+        .unwrap_or(false)
     }
 
     fn remove(&self, session: &str, key: &str) -> anyhow::Result<()> {
         self.local.remove(session, key)?;
-        self.sync_delete_context(session, key);
-        self.sync_push_manifest(session);
+        sync::delete_context_key(
+            &self.local,
+            &self.bucket,
+            &self.prefix,
+            session,
+            key,
+            &self.manifest_cache,
+        );
         Ok(())
     }
 
     fn list_keys(&self, session: &str, prefix: Option<&str>) -> anyhow::Result<Vec<String>> {
-        self.local.list_keys(session, prefix)
+        let mut keys = self.local.list_keys(session, prefix)?;
+        // Merge in remote-only keys.
+        if let Some(remote_keys) = sync::remote_list_keys(
+            &self.bucket,
+            &self.prefix,
+            session,
+            prefix,
+            &self.manifest_cache,
+        ) {
+            for k in remote_keys {
+                if !keys.contains(&k) {
+                    keys.push(k);
+                }
+            }
+        }
+        keys.sort();
+        Ok(keys)
     }
 }
 
@@ -446,7 +438,7 @@ mod tests {
         assert_eq!(sessions[1].id, "beta");
     }
 
-    // -- ContextStore: add delegates to local, S3 sync is non-fatal --
+    // -- ContextStore: add writes locally then attempts sync --
 
     #[test]
     fn context_add_delegates_to_local() {
@@ -459,7 +451,41 @@ mod tests {
         assert_eq!(retrieved, b"hello");
     }
 
-    // -- ContextStore: remove delegates to local --
+    // -- ContextStore: get pulls from remote if newer, then reads locally --
+
+    #[test]
+    fn context_get_reads_local_when_s3_unreachable() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_cloud_backend(tmp.path());
+        fs::create_dir_all(tmp.path().join("sess")).unwrap();
+
+        backend.add("sess", "scope.md", b"local-data").unwrap();
+        // get() tries to pull from remote (fails silently), then reads local.
+        let retrieved = backend.get("sess", "scope.md").unwrap();
+        assert_eq!(retrieved, b"local-data");
+    }
+
+    // -- ContextStore: ctx_exists checks local first, falls back to remote --
+
+    #[test]
+    fn context_ctx_exists_true_when_local() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_cloud_backend(tmp.path());
+        fs::create_dir_all(tmp.path().join("sess")).unwrap();
+
+        backend.add("sess", "scope.md", b"data").unwrap();
+        assert!(backend.ctx_exists("sess", "scope.md"));
+    }
+
+    #[test]
+    fn context_ctx_exists_false_when_neither_local_nor_remote() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_cloud_backend(tmp.path());
+        // S3 remote check will fail (unreachable), returns false.
+        assert!(!backend.ctx_exists("sess", "missing.md"));
+    }
+
+    // -- ContextStore: remove delegates to local, then syncs delete --
 
     #[test]
     fn context_remove_delegates_to_local() {
@@ -474,10 +500,10 @@ mod tests {
         assert!(!backend.ctx_exists("sess", "scope.md"));
     }
 
-    // -- ContextStore: list_keys delegates to local --
+    // -- ContextStore: list_keys merges local and remote --
 
     #[test]
-    fn context_list_keys_delegates_to_local() {
+    fn context_list_keys_returns_local_when_s3_unreachable() {
         let tmp = TempDir::new().unwrap();
         let backend = test_cloud_backend(tmp.path());
         fs::create_dir_all(tmp.path().join("sess")).unwrap();
@@ -485,6 +511,7 @@ mod tests {
         backend.add("sess", "alpha.md", b"a").unwrap();
         backend.add("sess", "beta.md", b"b").unwrap();
 
+        // remote_list_keys returns None (S3 unreachable), so only local keys.
         let keys = backend.list_keys("sess", None).unwrap();
         assert_eq!(keys, vec!["alpha.md", "beta.md"]);
     }
@@ -508,25 +535,8 @@ mod tests {
         assert_eq!(backend.session_prefix("wf"), "test-prefix/wf/");
     }
 
-    #[test]
-    fn context_key_format() {
-        let tmp = TempDir::new().unwrap();
-        let backend = test_cloud_backend(tmp.path());
-        assert_eq!(
-            backend.context_key("wf", "scope.md"),
-            "test-prefix/wf/ctx/scope.md"
-        );
-    }
-
-    #[test]
-    fn manifest_key_format() {
-        let tmp = TempDir::new().unwrap();
-        let backend = test_cloud_backend(tmp.path());
-        assert_eq!(
-            backend.manifest_key("wf"),
-            "test-prefix/wf/ctx/manifest.json"
-        );
-    }
+    // context_key and manifest_key construction is tested indirectly through
+    // sync module functions that build the same S3 key format.
 
     // -- Non-fatal S3 errors: sync methods don't panic --
 
@@ -560,6 +570,84 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = test_cloud_backend(tmp.path());
         // No file, should silently return.
-        backend.sync_push_context("sess", "missing.md");
+        sync::push_context_key(
+            &backend.local,
+            &backend.bucket,
+            &backend.prefix,
+            "sess",
+            "missing.md",
+            &backend.manifest_cache,
+        );
+    }
+
+    // -- Sync: pull is non-fatal when S3 is unreachable --
+
+    #[test]
+    fn sync_pull_non_fatal_on_s3_failure() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_cloud_backend(tmp.path());
+        fs::create_dir_all(tmp.path().join("sess")).unwrap();
+
+        backend.add("sess", "scope.md", b"local").unwrap();
+        // pull attempt fails silently, local data is unaffected.
+        sync::pull_context_if_newer(
+            &backend.local,
+            &backend.bucket,
+            &backend.prefix,
+            "sess",
+            "scope.md",
+            &backend.manifest_cache,
+        );
+        let data = backend.local.get("sess", "scope.md").unwrap();
+        assert_eq!(data, b"local");
+    }
+
+    // -- Sync: delete is non-fatal when S3 is unreachable --
+
+    #[test]
+    fn sync_delete_context_non_fatal_on_s3_failure() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_cloud_backend(tmp.path());
+        // S3 delete will fail, should not panic.
+        sync::delete_context_key(
+            &backend.local,
+            &backend.bucket,
+            &backend.prefix,
+            "sess",
+            "gone.md",
+            &backend.manifest_cache,
+        );
+    }
+
+    // -- Sync: remote_key_exists returns None when S3 is unreachable --
+
+    #[test]
+    fn remote_key_exists_returns_none_on_s3_failure() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_cloud_backend(tmp.path());
+        let result = sync::remote_key_exists(
+            &backend.bucket,
+            &backend.prefix,
+            "sess",
+            "scope.md",
+            &backend.manifest_cache,
+        );
+        assert!(result.is_none());
+    }
+
+    // -- Sync: remote_list_keys returns None when S3 is unreachable --
+
+    #[test]
+    fn remote_list_keys_returns_none_on_s3_failure() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_cloud_backend(tmp.path());
+        let result = sync::remote_list_keys(
+            &backend.bucket,
+            &backend.prefix,
+            "sess",
+            None,
+            &backend.manifest_cache,
+        );
+        assert!(result.is_none());
     }
 }

@@ -2,6 +2,8 @@
 pub mod cloud;
 pub mod context;
 pub mod local;
+#[cfg(feature = "cloud")]
+pub mod sync;
 pub mod validate;
 
 use std::path::PathBuf;
