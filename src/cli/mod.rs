@@ -18,10 +18,7 @@ use crate::buildinfo;
 use crate::cache::{compile_cached, sha256_hex};
 use crate::discover::find_workflows_with_metadata;
 use crate::engine::errors::EngineError;
-use crate::engine::persistence::{
-    append_event, append_header, derive_decisions, derive_machine_state, derive_state_from_log,
-    read_events,
-};
+use crate::engine::persistence::{derive_decisions, derive_machine_state, derive_state_from_log};
 use crate::engine::types::{now_iso8601, EventPayload, StateFileHeader};
 use crate::session::context::ContextStore;
 use crate::session::local::LocalBackend;
@@ -412,11 +409,6 @@ fn build_local_backend() -> Result<LocalBackend> {
         let working_dir = std::env::current_dir()?;
         LocalBackend::new(&working_dir)
     }
-}
-
-/// Compute the state file path for a session.
-fn session_state_path(backend: &dyn SessionBackend, name: &str) -> PathBuf {
-    backend.session_dir(name).join(state_file_name(name))
 }
 
 /// Validate and resolve `--var KEY=VALUE` arguments against the template's
@@ -909,15 +901,12 @@ fn handle_init(
     }
 
     // Create the session directory.
-    let session_dir = match backend.create(name) {
-        Ok(dir) => dir,
-        Err(e) => {
-            exit_with_error(serde_json::json!({
-                "error": e.to_string(),
-                "command": "init"
-            }));
-        }
-    };
+    if let Err(e) = backend.create(name) {
+        exit_with_error(serde_json::json!({
+            "error": e.to_string(),
+            "command": "init"
+        }));
+    }
 
     let (cache_path, hash) = match compile_cached(Path::new(template)) {
         Ok(result) => result,
@@ -956,7 +945,6 @@ fn handle_init(
 
     let initial_state = compiled.initial_state.clone();
     let ts = now_iso8601();
-    let state_path = session_dir.join(state_file_name(name));
 
     // Write header line
     let header = StateFileHeader {
@@ -965,7 +953,7 @@ fn handle_init(
         template_hash: hash,
         created_at: ts.clone(),
     };
-    if let Err(e) = append_header(&state_path, &header) {
+    if let Err(e) = backend.append_header(name, &header) {
         exit_with_error(serde_json::json!({
             "error": e.to_string(),
             "command": "init"
@@ -977,7 +965,7 @@ fn handle_init(
         template_path: cache_path_str,
         variables,
     };
-    if let Err(e) = append_event(&state_path, &init_payload, &ts) {
+    if let Err(e) = backend.append_event(name, &init_payload, &ts) {
         exit_with_error(serde_json::json!({
             "error": e.to_string(),
             "command": "init"
@@ -990,7 +978,7 @@ fn handle_init(
         to: initial_state.clone(),
         condition_type: "auto".to_string(),
     };
-    if let Err(e) = append_event(&state_path, &transition_payload, &ts) {
+    if let Err(e) = backend.append_event(name, &transition_payload, &ts) {
         exit_with_error(serde_json::json!({
             "error": e.to_string(),
             "command": "init"
@@ -1009,16 +997,14 @@ fn handle_init(
 
 /// Handle the `koto rewind` command.
 fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
-    let state_path = session_state_path(backend, name);
-
-    if !state_path.exists() {
+    if !backend.exists(name) {
         exit_with_error(serde_json::json!({
             "error": format!("workflow '{}' not found", name),
             "command": "rewind"
         }));
     }
 
-    let (_header, events) = match read_events(&state_path) {
+    let (_header, events) = match backend.read_events(name) {
         Ok(result) => result,
         Err(err) => {
             let code = exit_code_for_engine_error(&err);
@@ -1066,7 +1052,7 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         to: prev_state.clone(),
     };
 
-    if let Err(e) = append_event(&state_path, &rewind_payload, &now_iso8601()) {
+    if let Err(e) = backend.append_event(name, &rewind_payload, &now_iso8601()) {
         exit_with_error(serde_json::json!({
             "error": e.to_string(),
             "command": "rewind"
@@ -1155,9 +1141,8 @@ fn handle_next(
 
     // 3. Load state file and template
     let current_dir = std::env::current_dir()?;
-    let state_path = session_state_path(backend, &name);
 
-    if !state_path.exists() {
+    if !backend.exists(&name) {
         let err = NextError {
             code: NextErrorCode::WorkflowNotInitialized,
             message: format!("workflow '{}' not found", name),
@@ -1167,7 +1152,7 @@ fn handle_next(
         exit_with_error_code(json, err.code.exit_code());
     }
 
-    let (header, events) = match read_events(&state_path) {
+    let (header, events) = match backend.read_events(&name) {
         Ok(result) => result,
         Err(err) => {
             let code = exit_code_for_engine_error(&err);
@@ -1345,7 +1330,7 @@ fn handle_next(
             from: current_state.clone(),
             to: target.clone(),
         };
-        if let Err(e) = append_event(&state_path, &payload, &now_iso8601()) {
+        if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
             exit_with_error(serde_json::json!({
                 "error": e.to_string(),
                 "command": "next"
@@ -1472,7 +1457,7 @@ fn handle_next(
             state: current_state.clone(),
             fields,
         };
-        if let Err(e) = append_event(&state_path, &payload, &now_iso8601()) {
+        if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
             exit_with_error(serde_json::json!({
                 "error": e.to_string(),
                 "command": "next"
@@ -1482,6 +1467,7 @@ fn handle_next(
 
     // 6. Acquire advisory flock on state file (non-blocking).
     // Prevents concurrent koto next calls from interleaving writes.
+    let state_path = backend.session_dir(&name).join(state_file_name(&name));
     let lock_file = match std::fs::File::open(&state_path) {
         Ok(f) => f,
         Err(e) => {
@@ -1519,7 +1505,7 @@ fn handle_next(
 
     // 8. Merge evidence from current epoch.
     // Re-read events to include the evidence_submitted we may have just appended.
-    let (_, current_events) = match read_events(&state_path) {
+    let (_, current_events) = match backend.read_events(&name) {
         Ok(result) => result,
         Err(err) => {
             let code = exit_code_for_engine_error(&err);
@@ -1536,10 +1522,9 @@ fn handle_next(
     let evidence = merge_epoch_evidence(&epoch_events.into_iter().cloned().collect::<Vec<_>>());
 
     // 9. Set up I/O closures and run advancement loop.
-    let state_path_clone = state_path.clone();
     let mut append_closure = |payload: &EventPayload| -> Result<(), String> {
-        append_event(&state_path_clone, payload, &now_iso8601())
-            .map(|_| ())
+        backend
+            .append_event(&name, payload, &now_iso8601())
             .map_err(|e| e.to_string())
     };
 
@@ -1637,7 +1622,7 @@ fn handle_next(
             stdout: stdout.clone(),
             stderr: stderr.clone(),
         };
-        let _ = append_event(&state_path, &event_payload, &now_iso8601());
+        let _ = backend.append_event(&name, &event_payload, &now_iso8601());
 
         if action.requires_confirmation {
             ActionResult::RequiresConfirmation {
@@ -1908,16 +1893,14 @@ fn handle_decisions_record(
     }
 
     // 2. Load state file
-    let state_path = session_state_path(backend, &name);
-
-    if !state_path.exists() {
+    if !backend.exists(&name) {
         exit_with_error(serde_json::json!({
             "error": format!("workflow '{}' not found", name),
             "command": "decisions record"
         }));
     }
 
-    let (header, events) = match read_events(&state_path) {
+    let (header, events) = match backend.read_events(&name) {
         Ok(result) => result,
         Err(err) => {
             let code = exit_code_for_engine_error(&err);
@@ -2077,7 +2060,7 @@ fn handle_decisions_record(
         state: current_state.clone(),
         decision: data,
     };
-    if let Err(e) = append_event(&state_path, &payload, &now_iso8601()) {
+    if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
         exit_with_error(serde_json::json!({
             "error": e.to_string(),
             "command": "decisions record"
@@ -2085,7 +2068,7 @@ fn handle_decisions_record(
     }
 
     // 6. Count decisions in current epoch
-    let (_, updated_events) = match read_events(&state_path) {
+    let (_, updated_events) = match backend.read_events(&name) {
         Ok(result) => result,
         Err(err) => {
             let code = exit_code_for_engine_error(&err);
@@ -2116,9 +2099,7 @@ fn handle_decisions_record(
 /// Returns accumulated decisions for the current state's epoch as a
 /// standalone JSON response.
 fn handle_decisions_list(backend: &dyn SessionBackend, name: String) -> Result<()> {
-    let state_path = session_state_path(backend, &name);
-
-    if !state_path.exists() {
+    if !backend.exists(&name) {
         exit_with_error_code(
             serde_json::json!({
                 "error": format!("no state file found for workflow '{}'", name),
@@ -2128,7 +2109,7 @@ fn handle_decisions_list(backend: &dyn SessionBackend, name: String) -> Result<(
         );
     }
 
-    let (_, events) = match read_events(&state_path) {
+    let (_, events) = match backend.read_events(&name) {
         Ok(result) => result,
         Err(err) => {
             let code = exit_code_for_engine_error(&err);
@@ -2171,16 +2152,14 @@ fn handle_decisions_list(backend: &dyn SessionBackend, name: String) -> Result<(
 /// Appends a `WorkflowCancelled` event to the event log. Rejects double-cancel
 /// and cancel of already-terminal workflows.
 fn handle_cancel(backend: &dyn SessionBackend, name: &str) -> Result<()> {
-    let state_path = session_state_path(backend, name);
-
-    if !state_path.exists() {
+    if !backend.exists(name) {
         exit_with_error(serde_json::json!({
             "error": format!("workflow '{}' not found", name),
             "command": "cancel"
         }));
     }
 
-    let (header, events) = match read_events(&state_path) {
+    let (header, events) = match backend.read_events(name) {
         Ok(result) => result,
         Err(err) => {
             let code = exit_code_for_engine_error(&err);
@@ -2263,7 +2242,7 @@ fn handle_cancel(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         state: current_state.clone(),
         reason: "cancelled by user".to_string(),
     };
-    if let Err(e) = append_event(&state_path, &payload, &now_iso8601()) {
+    if let Err(e) = backend.append_event(name, &payload, &now_iso8601()) {
         exit_with_error(serde_json::json!({
             "error": e.to_string(),
             "command": "cancel"

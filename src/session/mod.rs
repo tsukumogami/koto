@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use self::context::ContextStore;
 use self::local::LocalBackend;
 
+use crate::engine::types::{Event, EventPayload, StateFileHeader};
+
 /// Information about an existing session.
 #[derive(serde::Serialize)]
 pub struct SessionInfo {
@@ -51,6 +53,19 @@ pub trait SessionBackend: Send + Sync {
 
     /// List all sessions with metadata extracted from state file headers.
     fn list(&self) -> anyhow::Result<Vec<SessionInfo>>;
+
+    /// Append a header line to a new state file.
+    fn append_header(&self, id: &str, header: &StateFileHeader) -> anyhow::Result<()>;
+
+    /// Append an event to the state file.
+    fn append_event(&self, id: &str, payload: &EventPayload, timestamp: &str)
+        -> anyhow::Result<()>;
+
+    /// Read all events from the state file.
+    fn read_events(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)>;
+
+    /// Read just the header from the state file.
+    fn read_header(&self, id: &str) -> anyhow::Result<StateFileHeader>;
 }
 
 /// Unified backend that dispatches to either `LocalBackend` or
@@ -97,6 +112,39 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.list(),
             Backend::Cloud(b) => b.list(),
+        }
+    }
+
+    fn append_header(&self, id: &str, header: &StateFileHeader) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.append_header(id, header),
+            Backend::Cloud(b) => b.append_header(id, header),
+        }
+    }
+
+    fn append_event(
+        &self,
+        id: &str,
+        payload: &EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.append_event(id, payload, timestamp),
+            Backend::Cloud(b) => b.append_event(id, payload, timestamp),
+        }
+    }
+
+    fn read_events(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
+        match self {
+            Backend::Local(b) => b.read_events(id),
+            Backend::Cloud(b) => b.read_events(id),
+        }
+    }
+
+    fn read_header(&self, id: &str) -> anyhow::Result<StateFileHeader> {
+        match self {
+            Backend::Local(b) => b.read_header(id),
+            Backend::Cloud(b) => b.read_header(id),
         }
     }
 }

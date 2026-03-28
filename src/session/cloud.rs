@@ -96,6 +96,24 @@ impl CloudBackend {
         }
     }
 
+    /// Download the state file from S3 to the local session directory.
+    /// Non-fatal on failure: if S3 is unreachable, local state is used as-is.
+    fn sync_pull_state(&self, id: &str) {
+        let key = self.state_key(id);
+        match self.bucket.get_object(&key) {
+            Ok(response) if response.status_code() == 200 => {
+                let state_path = self.local.session_dir(id).join(state_file_name(id));
+                if let Err(e) = std::fs::write(&state_path, response.bytes()) {
+                    eprintln!("warning: cloud sync: failed to write pulled state: {}", e);
+                }
+            }
+            Ok(_) => {} // Not found or other status, use local
+            Err(e) => {
+                eprintln!("warning: cloud sync pull failed: {}", e);
+            }
+        }
+    }
+
     /// Delete all objects under a session's S3 prefix. Non-fatal on failure.
     fn sync_delete_session(&self, id: &str) {
         let prefix = self.session_prefix(id);
@@ -384,7 +402,6 @@ impl CloudBackend {
 impl SessionBackend for CloudBackend {
     fn create(&self, id: &str) -> anyhow::Result<PathBuf> {
         let path = self.local.create(id)?;
-        self.sync_push_state(id);
         Ok(path)
     }
 
@@ -427,6 +444,43 @@ impl SessionBackend for CloudBackend {
 
         local_sessions.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(local_sessions)
+    }
+
+    fn append_header(
+        &self,
+        id: &str,
+        header: &crate::engine::types::StateFileHeader,
+    ) -> anyhow::Result<()> {
+        self.local.append_header(id, header)?;
+        self.sync_push_state(id);
+        Ok(())
+    }
+
+    fn append_event(
+        &self,
+        id: &str,
+        payload: &crate::engine::types::EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        self.local.append_event(id, payload, timestamp)?;
+        self.sync_push_state(id);
+        Ok(())
+    }
+
+    fn read_events(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<(
+        crate::engine::types::StateFileHeader,
+        Vec<crate::engine::types::Event>,
+    )> {
+        self.sync_pull_state(id);
+        self.local.read_events(id)
+    }
+
+    fn read_header(&self, id: &str) -> anyhow::Result<crate::engine::types::StateFileHeader> {
+        self.sync_pull_state(id);
+        self.local.read_header(id)
     }
 }
 
