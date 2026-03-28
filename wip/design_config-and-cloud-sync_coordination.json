@@ -1,0 +1,13 @@
+{
+  "topic": "config-and-cloud-sync",
+  "decisions": [
+    {"id": 1, "question": "Config file format, locations, and precedence", "status": "complete", "complexity": "standard", "chosen": "TOML with dotted key paths, two files, project > user > default", "report_file": "wip/design_config-and-cloud-sync_decision_1_report.md"},
+    {"id": 2, "question": "Config CLI commands", "status": "complete", "complexity": "standard", "chosen": "get/set/unset/list subcommands", "report_file": "wip/design_config-and-cloud-sync_decision_2_report.md"},
+    {"id": 3, "question": "Credential handling and env var overrides", "status": "complete", "complexity": "critical", "chosen": "Env var override with config-file blocklist", "report_file": "wip/design_config-and-cloud-sync_decision_3_report.md"},
+    {"id": 4, "question": "Sync protocol and timing", "status": "complete", "complexity": "standard", "chosen": "Per-key incremental sync on every mutating command", "report_file": "wip/design_config-and-cloud-sync_decision_4_report.md"},
+    {"id": 5, "question": "Version counter and conflict detection", "status": "complete", "complexity": "standard", "chosen": "Monotonic version counter with last_sync_base", "report_file": "wip/design_config-and-cloud-sync_decision_5_report.md"},
+    {"id": 6, "question": "CloudBackend trait implementation", "status": "complete", "complexity": "standard", "chosen": "Local cache wrapping LocalBackend + rust-s3 behind feature flag", "report_file": "wip/design_config-and-cloud-sync_decision_6_report.md"}
+  ],
+  "cross_validation": "pending",
+  "round": 0
+}
