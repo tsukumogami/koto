@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use crate::cache::sha256_hex;
-use crate::engine::persistence::read_header;
-use crate::engine::types::now_iso8601;
+use crate::engine::persistence;
+use crate::engine::types::{now_iso8601, Event, EventPayload, StateFileHeader};
 use crate::session::context::{ContextStore, KeyMeta, Manifest};
 use crate::session::validate::{validate_context_key, validate_session_id};
 use crate::session::{state_file_name, SessionBackend, SessionInfo};
@@ -102,7 +102,7 @@ impl SessionBackend for LocalBackend {
                 continue;
             }
 
-            match read_header(&state_path) {
+            match persistence::read_header(&state_path) {
                 Ok(header) => {
                     results.push(SessionInfo {
                         id: dir_name,
@@ -118,6 +118,32 @@ impl SessionBackend for LocalBackend {
 
         results.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(results)
+    }
+
+    fn append_header(&self, id: &str, header: &StateFileHeader) -> anyhow::Result<()> {
+        let path = self.base_dir.join(id).join(state_file_name(id));
+        persistence::append_header(&path, header)
+    }
+
+    fn append_event(
+        &self,
+        id: &str,
+        payload: &EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        let path = self.base_dir.join(id).join(state_file_name(id));
+        persistence::append_event(&path, payload, timestamp)?;
+        Ok(())
+    }
+
+    fn read_events(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
+        let path = self.base_dir.join(id).join(state_file_name(id));
+        persistence::read_events(&path)
+    }
+
+    fn read_header(&self, id: &str) -> anyhow::Result<StateFileHeader> {
+        let path = self.base_dir.join(id).join(state_file_name(id));
+        persistence::read_header(&path)
     }
 }
 
@@ -394,8 +420,6 @@ fn ensure_koto_root(base_dir: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::persistence::append_header;
-    use crate::engine::types::StateFileHeader;
     use tempfile::TempDir;
 
     /// Helper: create a LocalBackend using a temp directory as base.
@@ -414,7 +438,7 @@ mod tests {
             template_hash: "testhash".to_string(),
             created_at: created_at.to_string(),
         };
-        append_header(&state_path, &header).unwrap();
+        persistence::append_header(&state_path, &header).unwrap();
     }
 
     // -- scenario 1: create session directory --

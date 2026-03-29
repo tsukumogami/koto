@@ -86,6 +86,116 @@ Done.
     template_path.to_string_lossy().to_string()
 }
 
+/// Helper: list R2 bucket objects with a prefix using Python/boto3
+fn list_s3_objects(endpoint: &str, bucket: &str, prefix: &str) -> Vec<String> {
+    let output = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            r#"
+import boto3, os, json
+s3 = boto3.client('s3',
+    endpoint_url='{endpoint}',
+    aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
+    aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+    region_name='auto')
+resp = s3.list_objects_v2(Bucket='{bucket}', Prefix='{prefix}')
+keys = [o['Key'] for o in resp.get('Contents', [])]
+print(json.dumps(keys))
+"#
+        ))
+        .output()
+        .expect("python3");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(stdout.trim()).unwrap_or_default()
+}
+
+#[test]
+fn cloud_state_sync_on_init() {
+    let (endpoint, bucket) = match s3_env() {
+        Some(v) => v,
+        None => {
+            eprintln!("S3 env not set, skipping");
+            return;
+        }
+    };
+    let dir = TempDir::new().unwrap();
+    setup_cloud_config(dir.path(), &endpoint, &bucket);
+    let template = write_template(dir.path());
+
+    // Init a workflow — state file should sync to R2
+    koto_cmd(dir.path())
+        .args(["init", "state-test-1", "--template", &template])
+        .assert()
+        .success();
+
+    // Check R2 for state file
+    let objects = list_s3_objects(&endpoint, &bucket, "");
+    let has_state = objects
+        .iter()
+        .any(|k| k.contains("state-test-1") && k.contains(".state.jsonl"));
+    assert!(
+        has_state,
+        "State file not found in R2. Objects: {:?}",
+        objects
+    );
+
+    // Cleanup
+    koto_cmd(dir.path())
+        .args(["session", "cleanup", "state-test-1"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn cloud_state_sync_on_next() {
+    let (endpoint, bucket) = match s3_env() {
+        Some(v) => v,
+        None => {
+            eprintln!("S3 env not set, skipping");
+            return;
+        }
+    };
+    let dir = TempDir::new().unwrap();
+    setup_cloud_config(dir.path(), &endpoint, &bucket);
+    let template = write_template(dir.path());
+
+    koto_cmd(dir.path())
+        .args(["init", "state-test-2", "--template", &template])
+        .assert()
+        .success();
+
+    // Submit context so gate passes
+    koto_cmd(dir.path())
+        .args(["context", "add", "state-test-2", "plan.md"])
+        .write_stdin("# Plan")
+        .assert()
+        .success();
+
+    // Advance state — should sync updated state to R2
+    // Use --no-cleanup to prevent auto-cleanup from deleting everything
+    koto_cmd(dir.path())
+        .args(["next", "state-test-2", "--to", "done", "--no-cleanup"])
+        .assert()
+        .success();
+
+    // Check R2 — state file should be updated (larger than after init)
+    let objects = list_s3_objects(&endpoint, &bucket, "");
+    let has_state = objects
+        .iter()
+        .any(|k| k.contains("state-test-2") && k.contains(".state.jsonl"));
+    assert!(
+        has_state,
+        "Updated state file not found in R2 after next. Objects: {:?}",
+        objects
+    );
+
+    // Cleanup
+    koto_cmd(dir.path())
+        .args(["session", "cleanup", "state-test-2"])
+        .assert()
+        .success();
+}
+
 #[test]
 fn cloud_context_add_syncs_to_s3() {
     let (endpoint, bucket) = match s3_env() {
