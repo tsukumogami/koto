@@ -101,7 +101,7 @@ jobs:
         run: cargo install cargo-llvm-cov --locked
 
       - name: Generate coverage report
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info -- --test-threads=1
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
