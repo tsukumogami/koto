@@ -84,82 +84,32 @@ jobs:
           echo "Generated checksums.txt:"
           cat checksums.txt
 
-      - name: Extract release notes from tag
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}" --force
-          git tag -l --format='%(contents)' "${TAG}" > /tmp/release-notes.md
-          echo "Release notes:"
-          cat /tmp/release-notes.md
-
-      - name: Create GitHub release
+      - name: Upload assets to draft release or create one
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --notes-file /tmp/release-notes.md \
-            ./artifacts/koto-linux-amd64 \
-            ./artifacts/koto-linux-arm64 \
-            ./artifacts/koto-darwin-amd64 \
-            ./artifacts/koto-darwin-arm64 \
+          ASSETS=(
+            ./artifacts/koto-linux-amd64
+            ./artifacts/koto-linux-arm64
+            ./artifacts/koto-darwin-amd64
+            ./artifacts/koto-darwin-arm64
             ./artifacts/checksums.txt
-
-  finalize-release:
-    name: Finalize Release
-    needs: [release]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-          token: ${{ secrets.RELEASE_PAT }}
-
-      - name: Verify all artifacts present
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-
-          EXPECTED_ARTIFACTS=(
-            "koto-linux-amd64"
-            "koto-linux-arm64"
-            "koto-darwin-amd64"
-            "koto-darwin-arm64"
           )
 
-          echo "Verifying all ${#EXPECTED_ARTIFACTS[@]} artifacts are present..."
-          ASSETS=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+          # Check if a draft release already exists (created by /release skill)
+          DRAFT=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null || echo "not_found")
 
-          for artifact in "${EXPECTED_ARTIFACTS[@]}"; do
-            if ! echo "$ASSETS" | grep -q "^${artifact}$"; then
-              echo "ERROR: Missing artifact: $artifact"
-              exit 1
-            fi
-            echo "Found: $artifact"
-          done
-          echo "All artifacts verified"
-
-      - name: Pin koto-version default in reusable workflow
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          WORKFLOW=".github/workflows/check-template-freshness.yml"
-
-          if [ ! -f "$WORKFLOW" ]; then
-            echo "Reusable workflow not found, skipping version pin"
-            exit 0
+          if [ "$DRAFT" = "true" ]; then
+            echo "Draft release found for $TAG, uploading assets..."
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+          else
+            echo "No draft release found, creating one..."
+            git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}" --force
+            git tag -l --format='%(contents)' "${TAG}" > /tmp/release-notes.md
+            gh release create "$TAG" \
+              --draft \
+              --title "$TAG" \
+              --notes-file /tmp/release-notes.md \
+              "${ASSETS[@]}"
           fi
-
-          sed -i "/koto-version/,/default:/ s/default: '.*'/default: '${TAG}'/" "$WORKFLOW"
-
-          if git diff --quiet "$WORKFLOW"; then
-            echo "No change needed (already pinned or pattern not found)"
-            exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$WORKFLOW"
-          git commit -m "chore(release): pin koto-version default to ${TAG}"
-          git push origin main
