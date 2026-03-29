@@ -16,6 +16,11 @@ on:
         required: true
         type: string
         default: main
+      dry-run:
+        description: 'Skip push and tag creation'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   release:
@@ -24,5 +29,6 @@ jobs:
       version: ${{ inputs.version }}
       tag: ${{ inputs.tag }}
       ref: ${{ inputs.ref }}
+      dry-run: ${{ inputs.dry-run }}
     secrets:
       token: ${{ secrets.RELEASE_PAT }}
