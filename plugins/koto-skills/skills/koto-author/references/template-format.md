@@ -40,19 +40,9 @@ Optional fields: `variables`.
 
 ### Variables
 
-Variables are declared at the root level and interpolated into directive text using `{{VARIABLE_NAME}}` syntax. The agent supplies values at init time via `--var KEY=VALUE`.
+Variables are declared at the root level and interpolated into directive text using `{{VARIABLE_NAME}}` syntax. The agent supplies values at init time via `--var KEY=VALUE`. Each variable has a `description` and a `required` flag.
 
-```yaml
-variables:
-  REPO_URL:
-    description: Repository to clone
-    required: true
-  BRANCH:
-    description: Branch to check out
-    required: false
-```
-
-Koto also provides the built-in variable `{{SESSION_NAME}}`, which resolves to the active session name. You don't need to declare it.
+Koto also provides the built-in variable `{{SESSION_NAME}}` (the active session name). You don't need to declare it.
 
 ### States
 
@@ -201,69 +191,30 @@ transitions:
       status: ready
 ```
 
-### Complete evidence routing example
-
-Here's a state with accepts, conditional transitions, and a fallback:
-
-```yaml
-states:
-  review:
-    accepts:
-      verdict:
-        type: enum
-        values: [approve, request-changes, defer]
-        required: true
-    transitions:
-      - target: merge_prep
-        when:
-          verdict: approve
-      - target: revision
-        when:
-          verdict: request-changes
-      - target: parked
-        when:
-          verdict: defer
-```
-
 See [evidence-routing-workflow.md](examples/evidence-routing-workflow.md) for a full compilable template using this pattern.
 
 ## Layer 3: Advanced features
 
 ### Gates
 
-Gates are conditions checked before a transition is allowed. They're evaluated automatically when the agent calls `koto next` or `koto transition`.
+Gates are preconditions checked before any transition fires. A state can have multiple gates -- all must pass.
 
-Three gate types are available:
-
-**context-exists** -- passes when a key exists in the content store:
+| Type | Passes when | Key fields |
+|------|-------------|------------|
+| `context-exists` | A key exists in the content store | `key: plan.md` |
+| `context-matches` | Content for a key matches a regex | `key: plan.md`, `pattern: "^## Step \\d+"` |
+| `command` | A shell command exits 0 | `command: "test -f deploy.conf"` |
 
 ```yaml
 gates:
   plan_ready:
     type: context-exists
     key: plan.md
-```
-
-**context-matches** -- passes when content for a key matches a regex:
-
-```yaml
-gates:
   plan_has_steps:
     type: context-matches
     key: plan.md
     pattern: "^## Step \\d+"
 ```
-
-**command** -- passes when a shell command exits 0:
-
-```yaml
-gates:
-  config_present:
-    type: command
-    command: "test -f deploy.conf"
-```
-
-A state can have multiple gates. All must pass before any transition fires.
 
 ### Combining gates and evidence routing
 
@@ -297,36 +248,21 @@ Both gates must pass (config exists, tests passed) before the agent can submit e
 
 ### Self-loops
 
-A transition whose target is its own state creates a loop. This is useful for retry patterns -- the agent stays in the same state until conditions change.
+A transition whose target is its own state creates a retry loop. The agent stays in the state until conditions change:
 
 ```yaml
-states:
-  build:
-    accepts:
-      result:
-        type: enum
-        values: [pass, fail]
-        required: true
-    transitions:
-      - target: deploy
-        when:
-          result: pass
-      - target: build
-        when:
-          result: fail
+transitions:
+  - target: deploy
+    when:
+      result: pass
+  - target: build       # loops back to itself on failure
+    when:
+      result: fail
 ```
-
-When the agent submits `result: fail`, it loops back to `build` and receives the same directive again.
 
 ### Split topology
 
-When a state has multiple outbound transitions with `when` conditions, it's a split point. The agent's evidence determines which path the workflow takes.
-
-Splits require an `accepts` block with enough fields to differentiate every conditional transition (the mutual exclusivity constraint from Layer 2 applies). You've already seen this pattern in the evidence routing section -- split topology is just the name for it at the graph level.
-
-### Integration tags and default action
-
-Templates can include `integration_tags` (a list of string labels) and `default_action` (the action returned by `koto next` for non-terminal states, defaults to `"execute"`). These are optional and rarely needed for most workflows.
+A state with multiple outbound `when` transitions is a split point. The mutual exclusivity constraint from Layer 2 applies -- the agent's evidence must unambiguously select one path. The combined gates + evidence example above shows this pattern.
 
 ## Mermaid previews
 

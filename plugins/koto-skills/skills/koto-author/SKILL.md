@@ -104,11 +104,11 @@ Both files follow the coupling convention: the SKILL.md references the template 
 
 **"session already exists"** -- a previous run didn't finish. Run `koto status` to check, then either `koto next` to resume or start a new session.
 
-## Complementary skill: skill-creator
+## Optional: skill-creator for eval
 
-If the `/skill-creator:skill-creator` skill is available, load it after the koto-author workflow completes. The skill-creator adds an eval/testing harness that koto-author doesn't cover: it spawns parallel test runs (with-skill vs baseline), grades the output, and iterates on quality. koto-author handles structural correctness (the template compiles, the coupling convention is followed); skill-creator handles behavioral quality (the skill actually works well for its intended use case).
+The `/skill-creator:skill-creator` skill is a separate, optional complement. If it's available, use it after koto-author completes to test the authored skill's behavioral quality. skill-creator spawns parallel test runs, grades output, and iterates -- it catches problems that compile validation can't (like a skill that compiles but produces poor results).
 
-The two skills complement each other: use koto-author to build the skill, then skill-creator to test and refine it.
+koto-author handles structural correctness. skill-creator handles behavioral quality. You don't need both, but they work well together.
 
 ## This skill's own template
 

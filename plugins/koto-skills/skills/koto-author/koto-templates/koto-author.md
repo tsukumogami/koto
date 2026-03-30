@@ -187,6 +187,23 @@ Follow the format from `${CLAUDE_SKILL_DIR}/references/template-format.md`:
 - Every state in the frontmatter must have a matching `## state_name` body section.
 - Use double-brace syntax (e.g., `{{MODE}}`) for variable interpolation in directives.
 
+When writing directive text for each state, follow these guidelines:
+
+- Each directive should be completable in one agent turn. If it's too big, the state should be split.
+- Tell the agent what to do, what to produce, and what evidence to submit when done.
+- Be specific: name files, paths, and commands. "Write the template" is vague. "Write the template to `koto-templates/<name>.md` with states for X, Y, Z" is actionable.
+- For mode-conditional behavior, use clear "If {{MODE}} is new / convert" blocks rather than mixing instructions.
+
+Example directive (from this skill's own template):
+
+```
+Run `koto template compile <path>` to validate the template.
+If compilation succeeds, submit `compile_result: pass`.
+If it fails, read the error, fix the template, and submit `compile_result: fail` to retry.
+```
+
+Notice the pattern: action, success path, failure path. Each directive should make the agent's next steps obvious.
+
 Submit `template_drafted: done` when the template file is written.
 
 ## compile_validation
