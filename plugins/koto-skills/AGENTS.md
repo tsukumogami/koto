@@ -58,6 +58,15 @@ koto next <name> --with-data '{"mode": "issue_backed", "issue_number": "42"}'
 koto next <name> --to <target_state>
 ```
 
+**Force full details** (with `--full`):
+
+```bash
+koto next <name> --full
+```
+
+The `--full` flag includes the `details` field regardless of visit count (see
+the `details` field section below).
+
 `--with-data` and `--to` are mutually exclusive.
 
 ### koto decisions record
@@ -142,17 +151,19 @@ SKILL.md will specify the exact template path via `${CLAUDE_SKILL_DIR}/koto-temp
 ## Response Shapes
 
 Every `koto next` call returns JSON. The `action` field tells you what to do.
+Each action value maps to exactly one response shape -- dispatch on `action` alone.
 
-### action: "execute" (evidence required)
+### action: "evidence_required"
 
 The state has an `accepts` block. Execute the directive, then submit evidence
 matching the `expects` schema.
 
 ```json
 {
-  "action": "execute",
+  "action": "evidence_required",
   "state": "entry",
   "directive": "Determine the workflow mode...",
+  "details": "### Steps\n\n1. Check if an issue number was provided...",
   "advanced": false,
   "expects": {
     "event_type": "evidence_submitted",
@@ -165,6 +176,7 @@ matching the `expects` schema.
       {"target": "task_validation", "when": {"mode": "free_form"}}
     ]
   },
+  "blocking_conditions": [],
   "error": null
 }
 ```
@@ -175,33 +187,92 @@ The `expects` object tells you exactly what evidence to submit:
 
 Submit evidence using `--with-data` with a JSON object whose keys match the field names.
 
-### action: "execute" (gate blocked)
-
-Gates failed. The directive tells you what to do. Fix the blocking conditions
-and call `koto next` again (the engine re-evaluates gates automatically).
+**When gates fail on a state with accepts**: The response is still
+`"evidence_required"`, but the `blocking_conditions` array is populated with
+the failing gates. Fix the blocking conditions first, then call `koto next`
+again -- the engine re-evaluates gates automatically. Once gates pass, you can
+submit evidence normally.
 
 ```json
 {
-  "action": "execute",
-  "state": "setup_issue_backed",
-  "directive": "Create a feature branch and baseline file...",
+  "action": "evidence_required",
+  "state": "analysis",
+  "directive": "Analyze the issue and create a plan.",
   "advanced": false,
-  "expects": null,
+  "expects": {
+    "event_type": "evidence_submitted",
+    "fields": {
+      "plan_outcome": {"type": "enum", "required": true, "values": ["plan_ready", "needs_research"]}
+    }
+  },
   "blocking_conditions": [
-    {"name": "branch_and_baseline", "type": "command", "status": "failed", "agent_actionable": false}
+    {"name": "baseline_exists", "type": "command", "status": "failed", "agent_actionable": false}
   ],
   "error": null
 }
 ```
 
-When `expects` is null and `blocking_conditions` is present, fix the conditions
-(create the file, switch branches, etc.) and run `koto next <name>` again.
-Don't submit evidence -- just fix the preconditions and re-query.
+When `blocking_conditions` is empty, there are no gate issues -- proceed directly
+with the work described in `directive`.
 
-### action: "execute" (no expects, no blocking)
+### action: "gate_blocked"
 
-The state auto-advances. The engine runs gates, and if they pass, transitions
-automatically. You'll see `"advanced": true` in the response when this happens.
+Gates failed on a state that doesn't accept evidence. The directive tells you what
+to do. Fix the blocking conditions and call `koto next` again.
+
+```json
+{
+  "action": "gate_blocked",
+  "state": "deploy",
+  "directive": "Deploy to staging.",
+  "advanced": false,
+  "expects": null,
+  "blocking_conditions": [
+    {"name": "ci_check", "type": "command", "status": "failed", "agent_actionable": false}
+  ],
+  "error": null
+}
+```
+
+Possible `status` values: `"failed"`, `"timed_out"`, `"error"`. Passing gates
+don't appear in the array. Don't submit evidence -- fix the preconditions and
+re-query.
+
+### action: "integration"
+
+The state declares an integration, and the runner executed it. The `integration`
+object contains the output. If the state also accepts evidence, `expects` will
+be present.
+
+```json
+{
+  "action": "integration",
+  "state": "delegate",
+  "directive": "Review the integration output.",
+  "advanced": false,
+  "expects": null,
+  "integration": {"name": "code_review", "available": true, "output": "..."},
+  "error": null
+}
+```
+
+### action: "integration_unavailable"
+
+The state declares an integration, but the runner isn't available. The
+`integration` object shows `available: false`. Proceed with the directive
+manually.
+
+```json
+{
+  "action": "integration_unavailable",
+  "state": "delegate",
+  "directive": "Run the integration.",
+  "advanced": false,
+  "expects": null,
+  "integration": {"name": "code_review", "available": false},
+  "error": null
+}
+```
 
 ### action: "done"
 
@@ -219,8 +290,8 @@ The workflow reached a terminal state. No further action needed.
 
 ### action: "confirm"
 
-A default action ran and needs your confirmation before the engine records its
-result. Review the `action_output` and submit evidence if the state accepts it.
+A default action ran and needs your review before the engine records its result.
+Check the `action_output` and submit evidence if the state accepts it.
 
 ```json
 {
@@ -234,22 +305,65 @@ result. Review the `action_output` and submit evidence if the state accepts it.
     "stdout": "...",
     "stderr": ""
   },
-  "expects": { ... },
+  "expects": { "..." : "..." },
   "error": null
 }
 ```
 
-### Error responses
+## The `details` Field
+
+The `details` field carries extended instructions for a state. Template authors
+split state content using a `<!-- details -->` marker: text before the marker
+becomes `directive` (always returned), text after becomes `details`.
+
+`details` is included on first visit to a state and omitted on subsequent visits.
+This avoids repeating lengthy instructions that the caller already has. Use the
+`--full` flag to force inclusion regardless of visit count:
+
+```bash
+koto next <name> --full
+```
+
+The field is absent (not `null`) when omitted. It's also absent when the template
+state has no details content.
+
+## The `advanced` Field
+
+`advanced` is a boolean indicating that at least one state transition occurred
+during this invocation of `koto next`. It's informational only -- dispatch on
+`action`, not on `advanced`.
+
+Examples:
+- Evidence submission triggers a transition: `advanced: true`
+- Gates pass and the engine auto-advances: `advanced: true`
+- State is waiting for evidence on first query: `advanced: false`
+- Gates are still blocking on a re-query: `advanced: false`
+
+## Error Responses
 
 Errors include a structured `error` object with a `code`, `message`, and
 `details` array. The process exit code signals the error category:
 
-| Exit code | Meaning | Agent action |
-|-----------|---------|--------------|
-| 0 | Success | Process the response |
-| 1 | Transient (gate_blocked, integration_unavailable) | Retry after fixing |
-| 2 | Caller error (invalid_submission, precondition_failed, terminal_state) | Change your approach |
-| 3 | Infrastructure (corrupted state, template mismatch) | Report to user |
+| Exit code | Error codes | Agent action |
+|-----------|-------------|--------------|
+| 0 | (success) | Process the response |
+| 1 | `gate_blocked`, `integration_unavailable`, `concurrent_access` | Retry after fixing or wait |
+| 2 | `invalid_submission`, `precondition_failed`, `terminal_state`, `workflow_not_initialized` | Change your approach |
+| 3 | `template_error`, `persistence_error` | Report to user |
+
+**Error code details:**
+
+| Code | Exit | Meaning |
+|------|------|---------|
+| `gate_blocked` | 1 | Gate preconditions not met. Fix and retry. |
+| `integration_unavailable` | 1 | Integration runner missing. Proceed manually or retry later. |
+| `concurrent_access` | 1 | Another `koto next` is already running on this workflow. Wait and retry. |
+| `invalid_submission` | 2 | Evidence doesn't match the `expects` schema. Check the `details` array for per-field errors. |
+| `precondition_failed` | 2 | Command flags are invalid (e.g., `--with-data` and `--to` together). |
+| `terminal_state` | 2 | Workflow is already done. No further action possible. |
+| `workflow_not_initialized` | 2 | No workflow with that name exists. |
+| `template_error` | 3 | Template is malformed: cycle detected, chain limit reached, ambiguous transition, dead-end state, unresolvable transition, or unknown state. |
+| `persistence_error` | 3 | Disk I/O failure reading or writing state. |
 
 Example error (exit code 2):
 
@@ -265,8 +379,8 @@ Example error (exit code 2):
 
 ## Execution Loop
 
-Every koto workflow follows the same pattern: init, get directive, execute,
-submit evidence, repeat.
+Every koto workflow follows the same pattern: init, get directive, act on the
+response action, repeat.
 
 ### Simple example: koto-author entry state
 
@@ -289,8 +403,8 @@ koto init authoring --template .koto/templates/koto-author.md --var MODE=new
 koto next authoring
 ```
 
-The response includes an `expects` field with the evidence schema (what the agent
-needs to submit).
+The response includes `action: "evidence_required"` and an `expects` field with
+the evidence schema.
 
 **3. Submit evidence:**
 
@@ -323,7 +437,8 @@ koto init issue-74 --template .koto/templates/work-on.md \
 koto next issue-74
 ```
 
-The response includes `expects` with the evidence schema. Submit mode selection:
+The response includes `action: "evidence_required"` with the evidence schema.
+Submit mode selection:
 
 ```bash
 koto next issue-74 --with-data '{"mode": "issue_backed", "issue_number": "74"}'
@@ -332,11 +447,17 @@ koto next issue-74 --with-data '{"mode": "issue_backed", "issue_number": "74"}'
 The engine evaluates your evidence, routes to `context_injection` based on
 `mode: issue_backed`, and continues advancing through gates.
 
-**3. Auto-advance through gates:**
+**3. Handle gate-blocked or evidence-required responses:**
 
-If the `context_injection` gate passes (artifact exists), the engine
-auto-advances. If it's blocked, fix the condition and call `koto next issue-74`
-again. When the state has an `accepts` block, submit evidence:
+If `context_injection` gates pass, the engine auto-advances. If gates fail:
+
+- On a state without `accepts`: you get `action: "gate_blocked"`. Fix the
+  condition and call `koto next issue-74` again.
+- On a state with `accepts`: you get `action: "evidence_required"` with a
+  populated `blocking_conditions` array. Fix the conditions first, then submit
+  evidence when gates pass.
+
+When the state has an `accepts` block, submit evidence:
 
 ```bash
 koto next issue-74 --with-data '{"status": "completed"}'
@@ -404,6 +525,12 @@ finally reaches `done`.
   and resubmit.
 - **Terminal state** (exit code 2): You called `koto next --with-data` on a
   terminal state. The workflow is already done.
+- **Template error** (exit code 3): The template has a structural problem (cycle,
+  dead-end, ambiguous transition). Report to the user -- this isn't fixable by
+  the agent.
+- **Persistence error** (exit code 3): Disk I/O failed. Report to the user.
+- **Concurrent access** (exit code 1): Another `koto next` process is running on
+  this workflow. Wait a moment and retry.
 - **State file already exists**: A previous workflow with the same name is active.
   Run `koto workflows` to check. Cancel with `koto cancel <name>` if needed,
   then re-init.

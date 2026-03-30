@@ -14,7 +14,7 @@ alwaysApply: false
 
 koto is a state machine engine for AI agent workflows. It enforces workflow
 progression through evidence-gated transitions. You call `koto` commands to
-initialize a workflow, get directives, execute them, and transition between states.
+initialize a workflow, get directives, submit evidence, and advance between states.
 
 ## Prerequisites
 
@@ -40,18 +40,19 @@ The skill's SKILL.md specifies the template path via `${CLAUDE_SKILL_DIR}/koto-t
 
 ## Execution Loop
 
-Every koto workflow follows the same loop: init, next, execute, transition, repeat.
+Every koto workflow follows the same loop: init, get directive, dispatch on
+`action`, submit evidence when needed, repeat.
 
 ### 1. Initialize the workflow
 
 ```bash
-koto init --template .koto/templates/<name>.md --name <session> --var KEY=value
+koto init <session> --template .koto/templates/<name>.md --var KEY=value
 ```
 
 Returns JSON with the initial state:
 
 ```json
-{"state": "<initial_state>"}
+{"name": "<session>", "state": "<initial_state>"}
 ```
 
 The template is compiled and cached on first init.
@@ -59,72 +60,147 @@ The template is compiled and cached on first init.
 ### 2. Get the current directive
 
 ```bash
-koto next
+koto next <session>
 ```
 
-Returns JSON with an action, the current state, and a directive to execute:
+Returns JSON with an `action` field that tells you what to do:
 
 ```json
 {
-  "action": "execute",
-  "state": "awakening",
-  "directive": "You are <name>, a tsukumogami spirit awakening for the first time.\n\nCreate a file at `wip/spirit-greeting.txt` containing a greeting from <name> to the world."
+  "action": "evidence_required",
+  "state": "entry",
+  "directive": "Determine the workflow mode.",
+  "details": "### Steps\n\n1. Check if an issue number was provided...",
+  "advanced": false,
+  "expects": {
+    "event_type": "evidence_submitted",
+    "fields": {
+      "mode": {"type": "enum", "required": true, "values": ["issue_backed", "free_form"]}
+    },
+    "options": [
+      {"target": "context_injection", "when": {"mode": "issue_backed"}}
+    ]
+  },
+  "blocking_conditions": [],
+  "error": null
 }
 ```
 
-### 3. Execute the directive
+### 3. Dispatch on the action value
 
-Follow the instructions in the `directive` field. Do whatever work the directive
-describes, then advance the workflow.
+| Action | What it means | What to do |
+|--------|---------------|------------|
+| `"evidence_required"` | State needs evidence | Do the work, then submit evidence with `--with-data` |
+| `"gate_blocked"` | Gates are blocking | Fix the conditions, call `koto next` again |
+| `"integration"` | Integration ran | Review `integration` output, submit evidence if `expects` is present |
+| `"integration_unavailable"` | Integration runner missing | Proceed manually with the directive |
+| `"confirm"` | Action ran, needs review | Review `action_output`, submit evidence if needed |
+| `"done"` | Workflow complete | Stop |
 
-### 4. Transition to the next state
+For `"evidence_required"` responses, check `blocking_conditions` first. If the
+array is non-empty, fix those conditions before submitting evidence.
 
-```bash
-koto transition eternal
-```
-
-The engine evaluates gates before allowing the transition. If all gates pass,
-the transition succeeds:
-
-```json
-{"state": "<next_state>"}
-```
-
-If the gate fails, the transition is rejected with a gate error. Fix the issue
-(create the missing file) and retry the transition.
-
-### 5. Confirm completion
+### 4. Submit evidence
 
 ```bash
-koto next
+koto next <session> --with-data '{"mode": "issue_backed", "issue_number": "42"}'
 ```
+
+The engine evaluates evidence, routes to the matching target state, and continues
+advancing. The response shows the new state with `advanced: true`.
+
+### 5. Directed transitions
+
+Use `--to` when you need to jump to a specific state:
+
+```bash
+koto next <session> --to feedback
+```
+
+`--with-data` and `--to` are mutually exclusive.
+
+### 6. Confirm completion
 
 When the workflow reaches a terminal state, `koto next` returns:
 
 ```json
-{"action": "done", "state": "<terminal_state>", "message": "workflow complete"}
+{"action": "done", "state": "done", "advanced": true, "expects": null, "error": null}
 ```
 
 The workflow is finished. Report completion to the user.
 
+## Full Workflow Example
+
+```bash
+# Initialize
+koto init task-42 --template .koto/templates/work-on.md --var ISSUE_NUMBER=42
+
+# Main loop
+while true; do
+  result=$(koto next task-42)
+  action=$(echo "$result" | jq -r '.action')
+
+  case "$action" in
+    "done")
+      break
+      ;;
+    "gate_blocked")
+      # Read .blocking_conditions, fix the issue, then re-query
+      continue
+      ;;
+    "evidence_required")
+      # Check .blocking_conditions first -- fix if non-empty
+      # Then do the work described in .directive
+      # Submit evidence matching .expects schema
+      result=$(koto next task-42 --with-data '{"decision": "proceed"}')
+      ;;
+    "integration"|"integration_unavailable")
+      # Review .integration output (or proceed manually if unavailable)
+      # Submit evidence if .expects is present
+      ;;
+    "confirm")
+      # Review .action_output, submit evidence if needed
+      ;;
+  esac
+done
+```
+
+## The details Field
+
+The `details` field carries extended instructions. It's included on first visit
+to a state and omitted on subsequent visits to save context. Use `--full` to
+force inclusion:
+
+```bash
+koto next <session> --full
+```
+
 ## Error Handling
+
+Errors return structured JSON with exit codes:
+
+| Exit code | Meaning | Agent action |
+|-----------|---------|--------------|
+| 1 | Transient (`gate_blocked`, `integration_unavailable`, `concurrent_access`) | Retry after fixing or wait |
+| 2 | Caller error (`invalid_submission`, `precondition_failed`, `terminal_state`, `workflow_not_initialized`) | Change your approach |
+| 3 | Infrastructure (`template_error`, `persistence_error`) | Report to user |
 
 - **koto not found**: Tell the user to install koto and add it to PATH.
 - **Template not found**: Verify the template path. Copy the template from the
   skill's `koto-templates/` directory to `.koto/templates/` if it's missing.
-- **Gate failure**: The transition's precondition isn't met. Read the error message,
-  fix the issue, and retry `koto transition`.
-- **State file already exists**: A previous workflow may be active. Run
-  `koto workflows` to check. Cancel with
-  `koto cancel --state wip/koto-hello.state.json` if needed, then re-init.
+- **Gate blocked**: Read `blocking_conditions`, fix the issue, call `koto next` again.
+- **Template error**: Template has a structural problem (cycle, dead-end). Report to user.
+- **Concurrent access**: Another `koto next` is running. Wait and retry.
+- **State file already exists**: Run `koto workflows` to check. Cancel with
+  `koto cancel <name>` if needed, then re-init.
 
 ## Resume
 
 If a session is interrupted mid-workflow:
 
 1. Run `koto workflows` to find active state files.
-2. Run `koto next` to get the current directive.
+2. Run `koto next <session>` to get the current directive.
 3. Continue from wherever the workflow left off.
 
-State files in `wip/` persist between sessions. The workflow resumes from the last
+State files persist between sessions. The workflow resumes from the last
 completed transition.

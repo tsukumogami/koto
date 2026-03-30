@@ -67,6 +67,7 @@ koto next <name> [--with-data <json>] [--to <target>] [--no-cleanup]
 
 The `--with-data` and `--to` flags are mutually exclusive. Passing both produces a `precondition_failed` error with exit code 2. The `--with-data` payload is capped at 1 MB.
 
+- `--full` -- Include the `details` field in the response regardless of visit count. By default, `details` is included on first visit to a state and omitted on subsequent visits. This flag forces inclusion every time.
 - `--no-cleanup` -- Skip automatic session directory cleanup when the workflow reaches a terminal state. Useful for debugging or when you need to inspect session artifacts after completion. Without this flag, koto removes the session directory once it outputs the terminal response.
 
 **Runtime variable substitution:**
@@ -85,26 +86,30 @@ Write an implementation plan to {{SESSION_DIR}}/plan.md.
 
 **Response variants:**
 
-Every successful response is a JSON object with an `action` field (`"execute"` or `"done"`) and an `error` field set to `null`. The remaining fields depend on the variant.
+Every successful response is a JSON object with an `action` field and an `error` field set to `null`. The `action` value identifies the response type -- dispatch on it directly.
 
-| Field | EvidenceRequired | GateBlocked | Integration | IntegrationUnavailable | Terminal |
-|-------|:---:|:---:|:---:|:---:|:---:|
-| `action` | `"execute"` | `"execute"` | `"execute"` | `"execute"` | `"done"` |
-| `state` | yes | yes | yes | yes | yes |
-| `directive` | yes | yes | yes | yes | -- |
-| `advanced` | yes | yes | yes | yes | yes |
-| `expects` | object | `null` | object or `null` | object or `null` | `null` |
-| `blocking_conditions` | -- | array | -- | -- | -- |
-| `integration` | -- | -- | object | object | -- |
-| `error` | `null` | `null` | `null` | `null` | `null` |
+| Field | EvidenceRequired | GateBlocked | Integration | IntegrationUnavailable | Confirm | Terminal |
+|-------|:---:|:---:|:---:|:---:|:---:|:---:|
+| `action` | `"evidence_required"` | `"gate_blocked"` | `"integration"` | `"integration_unavailable"` | `"confirm"` | `"done"` |
+| `state` | yes | yes | yes | yes | yes | yes |
+| `directive` | yes | yes | yes | yes | yes | -- |
+| `details` | optional | optional | optional | optional | optional | -- |
+| `advanced` | yes | yes | yes | yes | yes | yes |
+| `expects` | object | `null` | object or `null` | object or `null` | object or `null` | `null` |
+| `blocking_conditions` | array | array | -- | -- | -- | -- |
+| `action_output` | -- | -- | -- | -- | object | -- |
+| `integration` | -- | -- | object | object | -- | -- |
+| `error` | `null` | `null` | `null` | `null` | `null` | `null` |
 
-"yes" = always present. "--" = absent from the JSON (not `null`, just missing). "object or `null`" = present as an object when the state has an `accepts` block, `null` otherwise.
+"yes" = always present. "--" = absent from the JSON (not `null`, just missing). "object or `null`" = present as an object when the state has an `accepts` block, `null` otherwise. "optional" = present on first visit to the state (or when `--full` is passed), absent on subsequent visits and when the state has no details content.
+
+The `advanced` field is a boolean indicating that at least one state transition occurred during this invocation. It's informational only -- dispatch on `action`, not on `advanced`.
 
 **EvidenceRequired** -- the state expects the agent to do work and submit evidence:
 
 ```json
 {
-  "action": "execute",
+  "action": "evidence_required",
   "state": "review",
   "directive": "Review the code changes.",
   "advanced": false,
@@ -117,17 +122,20 @@ Every successful response is a JSON object with an `action` field (`"execute"` o
       {"target": "implement", "when": {"decision": "proceed"}}
     ]
   },
+  "blocking_conditions": [],
   "error": null
 }
 ```
 
 The `expects.options` array is omitted when no transitions have `when` conditions. The `values` array on a field is omitted when empty.
 
-**GateBlocked** -- one or more command gates failed, timed out, or errored:
+The `blocking_conditions` array is always present on `evidence_required` responses. When gates fail on a state with an `accepts` block, the array is populated with the failing gates. Fix the conditions first, then call `koto next` again -- once gates pass, submit evidence normally. When no gates are blocking, the array is empty.
+
+**GateBlocked** -- one or more command gates failed, timed out, or errored on a state without an `accepts` block:
 
 ```json
 {
-  "action": "execute",
+  "action": "gate_blocked",
   "state": "deploy",
   "directive": "Deploy to staging.",
   "advanced": false,
@@ -141,11 +149,11 @@ The `expects.options` array is omitted when no transitions have `when` condition
 
 Possible `status` values: `"failed"`, `"timed_out"`, `"error"`. Passing gates don't appear in the array.
 
-**Integration / IntegrationUnavailable** -- the state declares an integration. When the runner is available, you get `Integration` with the output. When unavailable, you get `IntegrationUnavailable` with `available: false`:
+**Integration / IntegrationUnavailable** -- the state declares an integration. When the runner is available, you get `"integration"` with the output. When unavailable, you get `"integration_unavailable"` with `available: false`:
 
 ```json
 {
-  "action": "execute",
+  "action": "integration_unavailable",
   "state": "delegate",
   "directive": "Run the integration.",
   "advanced": false,
@@ -154,6 +162,32 @@ Possible `status` values: `"failed"`, `"timed_out"`, `"error"`. Passing gates do
   "error": null
 }
 ```
+
+**Confirm** -- a default action ran and needs review before the engine records its result:
+
+```json
+{
+  "action": "confirm",
+  "state": "context_injection",
+  "directive": "Review the action output.",
+  "advanced": false,
+  "action_output": {
+    "command": "extract-context.sh --issue 42",
+    "exit_code": 0,
+    "stdout": "...",
+    "stderr": ""
+  },
+  "expects": {
+    "event_type": "evidence_submitted",
+    "fields": {
+      "status": {"type": "enum", "required": true, "values": ["accepted", "rejected"]}
+    }
+  },
+  "error": null
+}
+```
+
+Review the `action_output` and submit evidence if the state accepts it.
 
 **Terminal** -- the workflow has ended:
 
@@ -167,19 +201,34 @@ Possible `status` values: `"failed"`, `"timed_out"`, `"error"`. Passing gates do
 }
 ```
 
-Terminal responses don't include `directive`, `blocking_conditions`, or `integration`.
+Terminal responses don't include `directive`, `details`, `blocking_conditions`, `action_output`, or `integration`.
 
 **Dispatcher classification order:**
 
 The dispatcher evaluates the current state in this order and returns the first match:
 
 1. Terminal state -> `Terminal`
-2. Any gate failed/timed_out/errored -> `GateBlocked`
+2. Any gate failed/timed_out/errored (no accepts block) -> `GateBlocked`
 3. Integration declared -> `Integration` or `IntegrationUnavailable`
 4. Accepts block exists -> `EvidenceRequired`
-5. Fallback -> `EvidenceRequired` with empty `expects` (auto-advance candidate)
+5. Gates failed but accepts block exists -> `EvidenceRequired` (with populated `blocking_conditions`)
+6. Fallback -> `EvidenceRequired` with empty `expects` (auto-advance candidate)
 
-**Error responses** use the structured format described in the [error code reference](../reference/error-codes.md). Domain errors exit with code 1 (transient) or 2 (caller error). Infrastructure errors (corrupt state, template hash mismatch) exit with code 3.
+**Error responses:**
+
+All errors use a structured JSON format with `code`, `message`, and `details` fields:
+
+```json
+{"error": {"code": "<string>", "message": "<string>", "details": [...]}}
+```
+
+| Exit code | Error codes | Agent action |
+|-----------|-------------|--------------|
+| 1 | `gate_blocked`, `integration_unavailable`, `concurrent_access` | Retry after fixing or wait |
+| 2 | `invalid_submission`, `precondition_failed`, `terminal_state`, `workflow_not_initialized` | Change your approach |
+| 3 | `template_error`, `persistence_error` | Report to user |
+
+`template_error` covers structural template problems: cycle detected, chain limit reached, ambiguous transition, dead-end state, unresolvable transition, unknown state. `persistence_error` covers disk I/O failures. `concurrent_access` means another `koto next` is already running on this workflow -- wait and retry.
 
 ### rewind
 
@@ -609,7 +658,7 @@ koto version
 
 ## Typical agent workflow
 
-The standard loop for an AI agent:
+The standard loop for an AI agent dispatches on the `action` field:
 
 ```bash
 # Initialize from a template
@@ -620,19 +669,31 @@ while true; do
   result=$(koto next task-42)
   action=$(echo "$result" | jq -r '.action')
 
-  # Terminal state -- workflow is done
-  if [ "$action" = "done" ]; then
-    break
-  fi
-
-  # Agent does the work described in .directive
-  # ...
-
-  # Submit evidence if the state expects it
-  expects=$(echo "$result" | jq -r '.expects // empty')
-  if [ -n "$expects" ]; then
-    result=$(koto next task-42 --with-data '{"decision": "proceed"}')
-  fi
+  case "$action" in
+    "done")
+      # Terminal state -- workflow is done
+      break
+      ;;
+    "gate_blocked")
+      # Read .blocking_conditions, fix the issue, then re-query
+      continue
+      ;;
+    "evidence_required")
+      # Check .blocking_conditions first -- fix if non-empty
+      # Do the work described in .directive
+      # Submit evidence matching .expects schema
+      result=$(koto next task-42 --with-data '{"decision": "proceed"}')
+      ;;
+    "integration"|"integration_unavailable")
+      # Review .integration output (or proceed manually if unavailable)
+      # Submit evidence if .expects is present
+      ;;
+    "confirm")
+      # Review .action_output
+      # Submit evidence if the state accepts it
+      result=$(koto next task-42 --with-data '{"status": "accepted"}')
+      ;;
+  esac
 done
 ```
 
