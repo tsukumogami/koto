@@ -860,6 +860,7 @@ mod tests {
     ) -> TemplateState {
         TemplateState {
             directive: "Do the thing.".to_string(),
+            details: String::new(),
             transitions,
             terminal: false,
             gates: BTreeMap::new(),

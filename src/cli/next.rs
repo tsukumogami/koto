@@ -135,6 +135,7 @@ mod tests {
     ) -> TemplateState {
         TemplateState {
             directive: directive.to_string(),
+            details: String::new(),
             transitions,
             terminal,
             gates,

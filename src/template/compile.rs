@@ -145,7 +145,7 @@ pub fn compile(source_path: &Path) -> anyhow::Result<CompiledTemplate> {
     // Build compiled states.
     let mut compiled_states: BTreeMap<String, TemplateState> = BTreeMap::new();
     for (state_name, source_state) in &fm.states {
-        let directive = directives.get(state_name).cloned().unwrap_or_default();
+        let (directive, details) = directives.get(state_name).cloned().unwrap_or_default();
         if directive.is_empty() {
             return Err(anyhow!(
                 "state {:?} has no directive section in markdown body",
@@ -212,6 +212,7 @@ pub fn compile(source_path: &Path) -> anyhow::Result<CompiledTemplate> {
             state_name.clone(),
             TemplateState {
                 directive,
+                details,
                 transitions: compiled_transitions,
                 terminal: source_state.terminal,
                 gates: compiled_gates,
@@ -376,19 +377,28 @@ fn find_frontmatter_close(s: &str) -> Option<usize> {
     None
 }
 
-/// Extract directive content for each declared state from the markdown body.
+/// The `<!-- details -->` marker used to split directive from details content.
+const DETAILS_MARKER: &str = "<!-- details -->";
+
+/// Extract directive and details content for each declared state from the
+/// markdown body.
 ///
 /// States are identified by `## <state-name>` headings. Content between two
 /// consecutive state headings belongs to the first. The declared state list
 /// from the front-matter is the authority — headings that don't match a
 /// declared state name are treated as directive content, not state boundaries.
+///
+/// Within each state's content, if a `<!-- details -->` line is found, the
+/// content before it becomes the directive and the content after becomes the
+/// details. Only the first occurrence of the marker is used. If no marker is
+/// present, the entire content is the directive and details is empty.
 fn extract_directives(
     states: &HashMap<String, SourceState>,
     body: &str,
-) -> HashMap<String, String> {
+) -> HashMap<String, (String, String)> {
     let state_names: std::collections::HashSet<&str> = states.keys().map(|s| s.as_str()).collect();
 
-    let mut directives: HashMap<String, String> = HashMap::new();
+    let mut directives: HashMap<String, (String, String)> = HashMap::new();
     let mut current_state: Option<&str> = None;
     let mut current_lines: Vec<&str> = Vec::new();
 
@@ -397,10 +407,7 @@ fn extract_directives(
             if state_names.contains(heading) {
                 // Save the previous state's directive.
                 if let Some(state) = current_state {
-                    directives.insert(
-                        state.to_string(),
-                        current_lines.join("\n").trim().to_string(),
-                    );
+                    directives.insert(state.to_string(), split_directive_details(&current_lines));
                 }
                 current_state = Some(heading);
                 current_lines.clear();
@@ -415,13 +422,27 @@ fn extract_directives(
 
     // Save the last state's directive.
     if let Some(state) = current_state {
-        directives.insert(
-            state.to_string(),
-            current_lines.join("\n").trim().to_string(),
-        );
+        directives.insert(state.to_string(), split_directive_details(&current_lines));
     }
 
     directives
+}
+
+/// Split collected lines into (directive, details) at the first `<!-- details -->` marker.
+fn split_directive_details(lines: &[&str]) -> (String, String) {
+    let marker_pos = lines.iter().position(|line| line.trim() == DETAILS_MARKER);
+
+    match marker_pos {
+        Some(pos) => {
+            let directive = lines[..pos].join("\n").trim().to_string();
+            let details = lines[pos + 1..].join("\n").trim().to_string();
+            (directive, details)
+        }
+        None => {
+            let directive = lines.join("\n").trim().to_string();
+            (directive, String::new())
+        }
+    }
 }
 
 /// If the line is a `## heading`, return the heading text.
@@ -915,5 +936,153 @@ Complete.
         let json = serde_json::to_string(&compiled).unwrap();
         let restored: CompiledTemplate = serde_json::from_str(&json).unwrap();
         assert_eq!(compiled, restored);
+    }
+
+    #[test]
+    fn details_marker_splits_directive_and_details() {
+        let src = r#"---
+name: details-test
+version: "1.0"
+initial_state: work
+states:
+  work:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## work
+
+Do the main task.
+
+<!-- details -->
+
+Here are some extra guidelines:
+- Step 1
+- Step 2
+
+## done
+
+Work is complete.
+"#;
+        let f = write_temp(src);
+        let result = compile(f.path()).unwrap();
+
+        let work = &result.states["work"];
+        assert_eq!(work.directive, "Do the main task.");
+        assert_eq!(
+            work.details,
+            "Here are some extra guidelines:\n- Step 1\n- Step 2"
+        );
+
+        // State without marker should have empty details.
+        let done = &result.states["done"];
+        assert_eq!(done.directive, "Work is complete.");
+        assert!(done.details.is_empty());
+    }
+
+    #[test]
+    fn no_details_marker_produces_empty_details() {
+        let src = r#"---
+name: no-details
+version: "1.0"
+initial_state: only
+states:
+  only:
+    terminal: true
+---
+
+## only
+
+Just a directive, no details marker here.
+"#;
+        let f = write_temp(src);
+        let result = compile(f.path()).unwrap();
+
+        let only = &result.states["only"];
+        assert_eq!(only.directive, "Just a directive, no details marker here.");
+        assert!(only.details.is_empty());
+    }
+
+    #[test]
+    fn multiple_details_markers_only_first_splits() {
+        let src = r#"---
+name: multi-details
+version: "1.0"
+initial_state: work
+states:
+  work:
+    terminal: true
+---
+
+## work
+
+The directive part.
+
+<!-- details -->
+
+First details section.
+
+<!-- details -->
+
+This stays in details, not a second split.
+"#;
+        let f = write_temp(src);
+        let result = compile(f.path()).unwrap();
+
+        let work = &result.states["work"];
+        assert_eq!(work.directive, "The directive part.");
+        assert_eq!(
+            work.details,
+            "First details section.\n\n<!-- details -->\n\nThis stays in details, not a second split."
+        );
+    }
+
+    #[test]
+    fn compiled_json_round_trips_with_details() {
+        let src = r#"---
+name: round-trip-details
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Main directive.
+
+<!-- details -->
+
+Extra context for first visit.
+
+## done
+
+Complete.
+"#;
+        let f = write_temp(src);
+        let compiled = compile(f.path()).unwrap();
+
+        // Verify the details field is populated.
+        assert_eq!(
+            compiled.states["start"].details,
+            "Extra context for first visit."
+        );
+        assert!(compiled.states["done"].details.is_empty());
+
+        // Round-trip through JSON.
+        let json = serde_json::to_string(&compiled).unwrap();
+        let restored: CompiledTemplate = serde_json::from_str(&json).unwrap();
+        assert_eq!(compiled, restored);
+
+        // Verify details is present in JSON for start but absent for done.
+        let json_val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(json_val["states"]["start"]["details"].is_string());
+        assert!(json_val["states"]["done"].get("details").is_none());
     }
 }
