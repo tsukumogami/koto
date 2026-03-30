@@ -15,7 +15,7 @@ Feature: Workflow lifecycle
     When I run "koto next hello"
     Then the exit code is 0
     And the JSON output has field "directive"
-    And the JSON output field "action" equals "execute"
+    And the JSON output field "action" equals "evidence_required"
     And the JSON output field "state" equals "awakening"
 
   Scenario: Next advances when gate passes

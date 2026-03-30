@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::ser::SerializeMap;
 use serde::Serialize;
 
+use crate::gate::GateResult;
 use crate::template::types::TemplateState;
 
 /// Summary of a recorded decision, used in `koto decisions list` responses.
@@ -14,7 +15,7 @@ pub struct DecisionSummary {
     pub alternatives_considered: Option<Vec<String>>,
 }
 
-/// The five possible responses from `koto next`.
+/// The six possible responses from `koto next`.
 ///
 /// Each variant maps 1:1 to a JSON output shape. Custom `Serialize`
 /// writes the correct fields per variant, including `action` and
@@ -25,18 +26,22 @@ pub enum NextResponse {
     EvidenceRequired {
         state: String,
         directive: String,
+        details: Option<String>,
         advanced: bool,
         expects: ExpectsSchema,
+        blocking_conditions: Vec<BlockingCondition>,
     },
     GateBlocked {
         state: String,
         directive: String,
+        details: Option<String>,
         advanced: bool,
         blocking_conditions: Vec<BlockingCondition>,
     },
     Integration {
         state: String,
         directive: String,
+        details: Option<String>,
         advanced: bool,
         expects: Option<ExpectsSchema>,
         integration: IntegrationOutput,
@@ -44,6 +49,7 @@ pub enum NextResponse {
     IntegrationUnavailable {
         state: String,
         directive: String,
+        details: Option<String>,
         advanced: bool,
         expects: Option<ExpectsSchema>,
         integration: IntegrationUnavailableMarker,
@@ -55,6 +61,7 @@ pub enum NextResponse {
     ActionRequiresConfirmation {
         state: String,
         directive: String,
+        details: Option<String>,
         advanced: bool,
         action_output: ActionOutput,
         expects: Option<ExpectsSchema>,
@@ -62,8 +69,9 @@ pub enum NextResponse {
 }
 
 impl NextResponse {
-    /// Return a new `NextResponse` with the directive field substituted using the
-    /// given function. Terminal variants have no directive and are returned unchanged.
+    /// Return a new `NextResponse` with the directive and details fields substituted
+    /// using the given function. Terminal variants have no directive and are returned
+    /// unchanged.
     pub fn with_substituted_directive<F>(self, f: F) -> Self
     where
         F: Fn(&str) -> String,
@@ -72,34 +80,42 @@ impl NextResponse {
             NextResponse::EvidenceRequired {
                 state,
                 directive,
+                details,
                 advanced,
                 expects,
+                blocking_conditions,
             } => NextResponse::EvidenceRequired {
                 state,
                 directive: f(&directive),
+                details: details.map(|d| f(&d)),
                 advanced,
                 expects,
+                blocking_conditions,
             },
             NextResponse::GateBlocked {
                 state,
                 directive,
+                details,
                 advanced,
                 blocking_conditions,
             } => NextResponse::GateBlocked {
                 state,
                 directive: f(&directive),
+                details: details.map(|d| f(&d)),
                 advanced,
                 blocking_conditions,
             },
             NextResponse::Integration {
                 state,
                 directive,
+                details,
                 advanced,
                 expects,
                 integration,
             } => NextResponse::Integration {
                 state,
                 directive: f(&directive),
+                details: details.map(|d| f(&d)),
                 advanced,
                 expects,
                 integration,
@@ -107,12 +123,14 @@ impl NextResponse {
             NextResponse::IntegrationUnavailable {
                 state,
                 directive,
+                details,
                 advanced,
                 expects,
                 integration,
             } => NextResponse::IntegrationUnavailable {
                 state,
                 directive: f(&directive),
+                details: details.map(|d| f(&d)),
                 advanced,
                 expects,
                 integration,
@@ -121,12 +139,14 @@ impl NextResponse {
             NextResponse::ActionRequiresConfirmation {
                 state,
                 directive,
+                details,
                 advanced,
                 action_output,
                 expects,
             } => NextResponse::ActionRequiresConfirmation {
                 state,
                 directive: f(&directive),
+                details: details.map(|d| f(&d)),
                 advanced,
                 action_output,
                 expects,
@@ -141,28 +161,40 @@ impl Serialize for NextResponse {
             NextResponse::EvidenceRequired {
                 state,
                 directive,
+                details,
                 advanced,
                 expects,
+                blocking_conditions,
             } => {
-                let mut map = serializer.serialize_map(Some(6))?;
-                map.serialize_entry("action", "execute")?;
+                let count = 7 + details.as_ref().map_or(0, |_| 1);
+                let mut map = serializer.serialize_map(Some(count))?;
+                map.serialize_entry("action", "evidence_required")?;
                 map.serialize_entry("state", state)?;
                 map.serialize_entry("directive", directive)?;
+                if let Some(d) = details {
+                    map.serialize_entry("details", d)?;
+                }
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("expects", expects)?;
+                map.serialize_entry("blocking_conditions", blocking_conditions)?;
                 map.serialize_entry("error", &None::<()>)?;
                 map.end()
             }
             NextResponse::GateBlocked {
                 state,
                 directive,
+                details,
                 advanced,
                 blocking_conditions,
             } => {
-                let mut map = serializer.serialize_map(Some(7))?;
-                map.serialize_entry("action", "execute")?;
+                let count = 7 + details.as_ref().map_or(0, |_| 1);
+                let mut map = serializer.serialize_map(Some(count))?;
+                map.serialize_entry("action", "gate_blocked")?;
                 map.serialize_entry("state", state)?;
                 map.serialize_entry("directive", directive)?;
+                if let Some(d) = details {
+                    map.serialize_entry("details", d)?;
+                }
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("expects", &None::<()>)?;
                 map.serialize_entry("blocking_conditions", blocking_conditions)?;
@@ -172,14 +204,19 @@ impl Serialize for NextResponse {
             NextResponse::Integration {
                 state,
                 directive,
+                details,
                 advanced,
                 expects,
                 integration,
             } => {
-                let mut map = serializer.serialize_map(Some(7))?;
-                map.serialize_entry("action", "execute")?;
+                let count = 7 + details.as_ref().map_or(0, |_| 1);
+                let mut map = serializer.serialize_map(Some(count))?;
+                map.serialize_entry("action", "integration")?;
                 map.serialize_entry("state", state)?;
                 map.serialize_entry("directive", directive)?;
+                if let Some(d) = details {
+                    map.serialize_entry("details", d)?;
+                }
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("expects", expects)?;
                 map.serialize_entry("integration", integration)?;
@@ -189,14 +226,19 @@ impl Serialize for NextResponse {
             NextResponse::IntegrationUnavailable {
                 state,
                 directive,
+                details,
                 advanced,
                 expects,
                 integration,
             } => {
-                let mut map = serializer.serialize_map(Some(7))?;
-                map.serialize_entry("action", "execute")?;
+                let count = 7 + details.as_ref().map_or(0, |_| 1);
+                let mut map = serializer.serialize_map(Some(count))?;
+                map.serialize_entry("action", "integration_unavailable")?;
                 map.serialize_entry("state", state)?;
                 map.serialize_entry("directive", directive)?;
+                if let Some(d) = details {
+                    map.serialize_entry("details", d)?;
+                }
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("expects", expects)?;
                 map.serialize_entry("integration", integration)?;
@@ -215,14 +257,19 @@ impl Serialize for NextResponse {
             NextResponse::ActionRequiresConfirmation {
                 state,
                 directive,
+                details,
                 advanced,
                 action_output,
                 expects,
             } => {
-                let mut map = serializer.serialize_map(Some(7))?;
+                let count = 7 + details.as_ref().map_or(0, |_| 1);
+                let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("action", "confirm")?;
                 map.serialize_entry("state", state)?;
                 map.serialize_entry("directive", directive)?;
+                if let Some(d) = details {
+                    map.serialize_entry("details", d)?;
+                }
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("action_output", action_output)?;
                 map.serialize_entry("expects", expects)?;
@@ -241,7 +288,7 @@ pub struct NextError {
     pub details: Vec<ErrorDetail>,
 }
 
-/// The six error codes for `koto next` domain errors.
+/// The nine error codes for `koto next` domain errors.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NextErrorCode {
@@ -251,6 +298,9 @@ pub enum NextErrorCode {
     IntegrationUnavailable,
     TerminalState,
     WorkflowNotInitialized,
+    TemplateError,
+    PersistenceError,
+    ConcurrentAccess,
 }
 
 impl NextErrorCode {
@@ -258,14 +308,18 @@ impl NextErrorCode {
     ///
     /// Exit code 1 = transient (may resolve on retry).
     /// Exit code 2 = caller error (agent must change behavior).
+    /// Exit code 3 = infrastructure / config errors.
     pub fn exit_code(&self) -> i32 {
         match self {
             NextErrorCode::GateBlocked => 1,
             NextErrorCode::IntegrationUnavailable => 1,
+            NextErrorCode::ConcurrentAccess => 1,
             NextErrorCode::InvalidSubmission => 2,
             NextErrorCode::PreconditionFailed => 2,
             NextErrorCode::TerminalState => 2,
             NextErrorCode::WorkflowNotInitialized => 2,
+            NextErrorCode::TemplateError => 3,
+            NextErrorCode::PersistenceError => 3,
         }
     }
 }
@@ -336,6 +390,32 @@ pub struct ErrorDetail {
     pub reason: String,
 }
 
+/// Convert gate evaluation results into a list of blocking conditions.
+///
+/// Passed gates are excluded. Each non-passing gate produces a `BlockingCondition`
+/// with `condition_type: "command"` and `agent_actionable: false`.
+pub fn blocking_conditions_from_gates(
+    gate_results: &BTreeMap<String, GateResult>,
+) -> Vec<BlockingCondition> {
+    gate_results
+        .iter()
+        .filter_map(|(name, result)| {
+            let status = match result {
+                GateResult::Passed => return None,
+                GateResult::Failed { .. } => "failed",
+                GateResult::TimedOut => "timed_out",
+                GateResult::Error { .. } => "error",
+            };
+            Some(BlockingCondition {
+                name: name.clone(),
+                condition_type: "command".to_string(),
+                status: status.to_string(),
+                agent_actionable: false,
+            })
+        })
+        .collect()
+}
+
 /// Derive an `ExpectsSchema` from a template state's `accepts` block and transitions.
 ///
 /// Returns `None` when the state has no `accepts` block. When present, maps each
@@ -401,6 +481,7 @@ mod tests {
         let resp = NextResponse::EvidenceRequired {
             state: "review".to_string(),
             directive: "Review the code changes.".to_string(),
+            details: None,
             advanced: false,
             expects: ExpectsSchema {
                 event_type: "evidence_submitted".to_string(),
@@ -410,15 +491,17 @@ mod tests {
                     when,
                 }],
             },
+            blocking_conditions: vec![],
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
 
-        assert_eq!(json["action"], "execute");
+        assert_eq!(json["action"], "evidence_required");
         assert_eq!(json["state"], "review");
         assert_eq!(json["directive"], "Review the code changes.");
         assert_eq!(json["advanced"], false);
         assert!(json["error"].is_null());
+        assert!(json.get("details").is_none());
 
         // expects present as object
         let expects = &json["expects"];
@@ -435,8 +518,9 @@ mod tests {
             serde_json::json!("proceed")
         );
 
-        // Fields that should be absent
-        assert!(json.get("blocking_conditions").is_none());
+        // blocking_conditions present as empty array
+        assert_eq!(json["blocking_conditions"], serde_json::json!([]));
+        // integration should be absent
         assert!(json.get("integration").is_none());
     }
 
@@ -455,17 +539,20 @@ mod tests {
         let resp = NextResponse::EvidenceRequired {
             state: "gather".to_string(),
             directive: "Collect notes.".to_string(),
+            details: Some("Extra context here.".to_string()),
             advanced: true,
             expects: ExpectsSchema {
                 event_type: "evidence_submitted".to_string(),
                 fields,
                 options: vec![],
             },
+            blocking_conditions: vec![],
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
 
         assert_eq!(json["advanced"], true);
+        assert_eq!(json["details"], "Extra context here.");
         // options should be omitted when empty
         assert!(json["expects"].get("options").is_none());
         // values should be omitted when empty
@@ -477,6 +564,7 @@ mod tests {
         let resp = NextResponse::GateBlocked {
             state: "deploy".to_string(),
             directive: "Deploy to staging.".to_string(),
+            details: None,
             advanced: false,
             blocking_conditions: vec![
                 BlockingCondition {
@@ -496,7 +584,7 @@ mod tests {
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
 
-        assert_eq!(json["action"], "execute");
+        assert_eq!(json["action"], "gate_blocked");
         assert_eq!(json["state"], "deploy");
         assert_eq!(json["directive"], "Deploy to staging.");
         assert_eq!(json["advanced"], false);
@@ -521,6 +609,7 @@ mod tests {
         let resp = NextResponse::Integration {
             state: "delegate".to_string(),
             directive: "Run the integration.".to_string(),
+            details: None,
             advanced: false,
             expects: None,
             integration: IntegrationOutput {
@@ -531,7 +620,7 @@ mod tests {
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
 
-        assert_eq!(json["action"], "execute");
+        assert_eq!(json["action"], "integration");
         assert_eq!(json["state"], "delegate");
         assert_eq!(json["directive"], "Run the integration.");
         assert!(json["error"].is_null());
@@ -562,6 +651,7 @@ mod tests {
         let resp = NextResponse::Integration {
             state: "delegate".to_string(),
             directive: "Run and confirm.".to_string(),
+            details: None,
             advanced: true,
             expects: Some(ExpectsSchema {
                 event_type: "evidence_submitted".to_string(),
@@ -587,6 +677,7 @@ mod tests {
         let resp = NextResponse::IntegrationUnavailable {
             state: "delegate".to_string(),
             directive: "Run the integration.".to_string(),
+            details: None,
             advanced: false,
             expects: None,
             integration: IntegrationUnavailableMarker {
@@ -597,7 +688,7 @@ mod tests {
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
 
-        assert_eq!(json["action"], "execute");
+        assert_eq!(json["action"], "integration_unavailable");
         assert_eq!(json["state"], "delegate");
         assert!(json["error"].is_null());
         assert!(json["expects"].is_null());
@@ -622,6 +713,7 @@ mod tests {
         let resp = NextResponse::IntegrationUnavailable {
             state: "delegate".to_string(),
             directive: "Integration unavailable, provide fallback.".to_string(),
+            details: None,
             advanced: false,
             expects: Some(ExpectsSchema {
                 event_type: "evidence_submitted".to_string(),
@@ -703,6 +795,18 @@ mod tests {
             serde_json::to_value(&NextErrorCode::WorkflowNotInitialized).unwrap(),
             serde_json::json!("workflow_not_initialized")
         );
+        assert_eq!(
+            serde_json::to_value(&NextErrorCode::TemplateError).unwrap(),
+            serde_json::json!("template_error")
+        );
+        assert_eq!(
+            serde_json::to_value(&NextErrorCode::PersistenceError).unwrap(),
+            serde_json::json!("persistence_error")
+        );
+        assert_eq!(
+            serde_json::to_value(&NextErrorCode::ConcurrentAccess).unwrap(),
+            serde_json::json!("concurrent_access")
+        );
     }
 
     // -- Exit code mapping tests --
@@ -711,6 +815,7 @@ mod tests {
     fn exit_code_transient_errors() {
         assert_eq!(NextErrorCode::GateBlocked.exit_code(), 1);
         assert_eq!(NextErrorCode::IntegrationUnavailable.exit_code(), 1);
+        assert_eq!(NextErrorCode::ConcurrentAccess.exit_code(), 1);
     }
 
     #[test]
@@ -719,6 +824,12 @@ mod tests {
         assert_eq!(NextErrorCode::PreconditionFailed.exit_code(), 2);
         assert_eq!(NextErrorCode::TerminalState.exit_code(), 2);
         assert_eq!(NextErrorCode::WorkflowNotInitialized.exit_code(), 2);
+    }
+
+    #[test]
+    fn exit_code_infrastructure_errors() {
+        assert_eq!(NextErrorCode::TemplateError.exit_code(), 3);
+        assert_eq!(NextErrorCode::PersistenceError.exit_code(), 3);
     }
 
     // -- NextError serialization tests --
@@ -860,6 +971,7 @@ mod tests {
     ) -> TemplateState {
         TemplateState {
             directive: "Do the thing.".to_string(),
+            details: String::new(),
             transitions,
             terminal: false,
             gates: BTreeMap::new(),

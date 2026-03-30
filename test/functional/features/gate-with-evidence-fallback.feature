@@ -18,7 +18,7 @@ Feature: Gate with evidence fallback
     When I run "koto next test-wf"
     Then the exit code is 0
     And the JSON output field "state" equals "start"
-    And the JSON output field "action" equals "execute"
+    And the JSON output field "action" equals "evidence_required"
     And the JSON output has field "expects"
 
   Scenario: Gate fails then evidence advances

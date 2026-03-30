@@ -53,6 +53,7 @@ mod tests {
             "start".to_string(),
             TemplateState {
                 directive: "Begin work.".to_string(),
+                details: String::new(),
                 transitions: vec![
                     Transition {
                         target: "build".to_string(),
@@ -95,6 +96,7 @@ mod tests {
             "build".to_string(),
             TemplateState {
                 directive: "Build the feature.".to_string(),
+                details: String::new(),
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
@@ -110,6 +112,7 @@ mod tests {
             "investigate".to_string(),
             TemplateState {
                 directive: "Investigate the issue.".to_string(),
+                details: String::new(),
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
@@ -125,6 +128,7 @@ mod tests {
             "done".to_string(),
             TemplateState {
                 directive: "Work complete.".to_string(),
+                details: String::new(),
                 transitions: vec![],
                 terminal: true,
                 gates: BTreeMap::new(),
@@ -217,6 +221,7 @@ mod tests {
             "evil".to_string(),
             TemplateState {
                 directive: "Contains </script> tag".to_string(),
+                details: String::new(),
                 transitions: vec![],
                 terminal: true,
                 gates: BTreeMap::new(),

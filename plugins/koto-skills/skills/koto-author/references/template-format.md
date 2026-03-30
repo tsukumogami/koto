@@ -84,6 +84,54 @@ Repository is ready.
 
 Every state declared in the frontmatter must have a corresponding body section. The compiler will reject templates with missing sections.
 
+### The `<!-- details -->` marker
+
+A directive section can be split into two parts using the `<!-- details -->` HTML comment:
+
+```markdown
+## state_design
+
+Define the full state machine: states, transitions, evidence routing, gates, and variables.
+
+<!-- details -->
+
+Read the template format guide at `${CLAUDE_SKILL_DIR}/references/template-format.md`. Read only the layers you need:
+
+- **Layer 1 (Structure)** -- always read this.
+- **Layer 2 (Evidence routing)** -- read if your workflow has decision points.
+- **Layer 3 (Advanced)** -- read if you need gates, self-loops, or split topology.
+
+Work through the design in this order:
+
+1. List every distinct phase in your workflow.
+2. Draw the transitions between them.
+3. Identify decision points -- these need evidence routing.
+4. Identify retry loops -- these need self-loops.
+5. Identify preconditions -- these need gates.
+```
+
+Content before the marker is the **directive** -- always returned by `koto next`. Content after is the **details** -- returned only on first visit to the state, or when the caller passes `--full`.
+
+Use details for multi-paragraph instructions, step-by-step procedures, or reference material that clutters the directive on repeat visits. Keep the directive itself short: a one- or two-line summary of what the state expects.
+
+States without the marker behave exactly as before -- everything is the directive, and `details` is empty.
+
+If a section contains multiple `<!-- details -->` markers, only the first one counts. Everything after the first marker is details.
+
+### Feature-to-action mapping
+
+Different template features produce different `action` values in the `koto next` response. This table shows what the caller sees for each feature:
+
+| Template feature | Caller sees `action` |
+|-----------------|---------------------|
+| State with `accepts` block | `evidence_required` |
+| State with failing `gates` (no accepts) | `gate_blocked` |
+| State with `integration` | `integration` or `integration_unavailable` |
+| Terminal state (`terminal: true`) | `done` |
+| State with `default_action` + `requires_confirmation` | `confirm` |
+
+Knowing these values helps you predict how callers will interact with each state. A state with an `accepts` block always surfaces as `evidence_required` -- the caller's automation can key on that string to know it needs to submit data.
+
 ## Layer 2: Evidence routing
 
 Evidence routing lets the agent submit structured data that determines which transition fires. This is how you build branching workflows.

@@ -96,6 +96,7 @@ mod tests {
             "start".to_string(),
             TemplateState {
                 directive: "Begin.".to_string(),
+                details: String::new(),
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
@@ -111,6 +112,7 @@ mod tests {
             "done".to_string(),
             TemplateState {
                 directive: "Done.".to_string(),
+                details: String::new(),
                 transitions: vec![],
                 terminal: true,
                 gates: BTreeMap::new(),
@@ -163,6 +165,7 @@ mod tests {
             "only".to_string(),
             TemplateState {
                 directive: "The only state.".to_string(),
+                details: String::new(),
                 transitions: vec![],
                 terminal: true,
                 gates: BTreeMap::new(),
@@ -207,6 +210,7 @@ mod tests {
             "evaluate".to_string(),
             TemplateState {
                 directive: "Evaluate.".to_string(),
+                details: String::new(),
                 transitions: vec![
                     Transition {
                         target: "implement".to_string(),
@@ -228,6 +232,7 @@ mod tests {
             "implement".to_string(),
             TemplateState {
                 directive: "Implement.".to_string(),
+                details: String::new(),
                 transitions: vec![],
                 terminal: true,
                 gates: BTreeMap::new(),
@@ -240,6 +245,7 @@ mod tests {
             "research".to_string(),
             TemplateState {
                 directive: "Research.".to_string(),
+                details: String::new(),
                 transitions: vec![],
                 terminal: true,
                 gates: BTreeMap::new(),
@@ -301,6 +307,7 @@ mod tests {
             "explore".to_string(),
             TemplateState {
                 directive: "Explore.".to_string(),
+                details: String::new(),
                 transitions: vec![Transition {
                     target: "evaluate".to_string(),
                     when: None,
@@ -335,6 +342,7 @@ mod tests {
             "evaluate".to_string(),
             TemplateState {
                 directive: "Evaluate.".to_string(),
+                details: String::new(),
                 transitions: vec![
                     Transition {
                         target: "implement".to_string(),
@@ -356,6 +364,7 @@ mod tests {
             "implement".to_string(),
             TemplateState {
                 directive: "Implement.".to_string(),
+                details: String::new(),
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
@@ -371,6 +380,7 @@ mod tests {
             "research".to_string(),
             TemplateState {
                 directive: "Research.".to_string(),
+                details: String::new(),
                 transitions: vec![Transition {
                     target: "evaluate".to_string(),
                     when: None,
@@ -386,6 +396,7 @@ mod tests {
             "done".to_string(),
             TemplateState {
                 directive: "Done.".to_string(),
+                details: String::new(),
                 transitions: vec![],
                 terminal: true,
                 gates: BTreeMap::new(),

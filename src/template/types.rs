@@ -46,6 +46,8 @@ pub struct VariableDecl {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TemplateState {
     pub directive: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub details: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transitions: Vec<Transition>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -456,6 +458,7 @@ mod tests {
             "start".to_string(),
             TemplateState {
                 directive: "Begin.".to_string(),
+                details: String::new(),
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
@@ -471,6 +474,7 @@ mod tests {
             "done".to_string(),
             TemplateState {
                 directive: "Done.".to_string(),
+                details: String::new(),
                 transitions: vec![],
                 terminal: true,
                 gates: BTreeMap::new(),
@@ -705,6 +709,7 @@ mod tests {
             "other".to_string(),
             TemplateState {
                 directive: "Other.".to_string(),
+                details: String::new(),
                 transitions: vec![],
                 terminal: true,
                 gates: BTreeMap::new(),
@@ -762,6 +767,7 @@ mod tests {
             "other".to_string(),
             TemplateState {
                 directive: "Other.".to_string(),
+                details: String::new(),
                 transitions: vec![],
                 terminal: true,
                 gates: BTreeMap::new(),
@@ -810,6 +816,7 @@ mod tests {
             "other".to_string(),
             TemplateState {
                 directive: "Other.".to_string(),
+                details: String::new(),
                 transitions: vec![],
                 terminal: true,
                 gates: BTreeMap::new(),
@@ -856,6 +863,7 @@ mod tests {
             "other".to_string(),
             TemplateState {
                 directive: "Other.".to_string(),
+                details: String::new(),
                 transitions: vec![],
                 terminal: true,
                 gates: BTreeMap::new(),

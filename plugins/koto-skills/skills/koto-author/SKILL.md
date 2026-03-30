@@ -44,10 +44,13 @@ koto init --template ${CLAUDE_SKILL_DIR}/koto-templates/koto-author.md \
 
 After init, follow the koto execution loop:
 
-1. Run `koto next` to read the current state's directive
-2. Do the work the directive asks for
-3. Submit evidence with `koto next --with-data '{"field": "value"}'`
-4. Repeat until the workflow reaches the done state
+1. Run `koto next` to get the current state's response
+2. Check the `action` field to determine what's needed:
+   - `evidence_required` -- the state needs you to submit data. Do the work, then call `koto next --with-data '{"field": "value"}'`
+   - `gate_blocked` -- a precondition hasn't been met. Read `blocking_conditions` for what's failing, fix it, then call `koto next` again
+   - `done` -- the workflow finished
+3. Read the `directive` for instructions. On first visit to a state, a `details` field may contain extended guidance (pass `--full` to force it on repeat visits)
+4. Repeat until `action` is `done`
 
 Run `koto status` at any point to see where you are.
 

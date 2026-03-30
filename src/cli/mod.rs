@@ -90,6 +90,10 @@ pub enum Command {
         /// Skip session cleanup when reaching a terminal state (useful for debugging)
         #[arg(long)]
         no_cleanup: bool,
+
+        /// Always include the details field in the response, regardless of visit count
+        #[arg(long)]
+        full: bool,
     },
 
     /// Cancel a workflow, preventing further advancement
@@ -593,10 +597,19 @@ pub fn run(app: App) -> Result<()> {
             with_data,
             to,
             no_cleanup,
+            full,
         } => {
             let backend = build_backend()?;
             let context_store: &dyn ContextStore = &backend;
-            handle_next(&backend, context_store, name, with_data, to, no_cleanup)
+            handle_next(
+                &backend,
+                context_store,
+                name,
+                with_data,
+                to,
+                no_cleanup,
+                full,
+            )
         }
         Command::Cancel { name } => {
             let backend = build_backend()?;
@@ -1096,19 +1109,21 @@ fn handle_next(
     with_data: Option<String>,
     to: Option<String>,
     no_cleanup: bool,
+    full: bool,
 ) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
-        BlockingCondition, ErrorDetail, ExpectsSchema, IntegrationOutput,
+        blocking_conditions_from_gates, ErrorDetail, ExpectsSchema, IntegrationOutput,
         IntegrationUnavailableMarker, NextError, NextErrorCode, NextResponse,
     };
     use crate::engine::advance::{
-        advance_until_stop, merge_epoch_evidence, ActionResult, IntegrationError, StopReason,
+        advance_until_stop, merge_epoch_evidence, ActionResult, AdvanceError, IntegrationError,
+        StopReason,
     };
     use crate::engine::evidence::validate_evidence;
-    use crate::engine::persistence::derive_evidence;
+    use crate::engine::persistence::{derive_evidence, derive_visit_counts};
     use crate::engine::substitute::Variables;
-    use crate::gate::{evaluate_gates, GateResult};
+    use crate::gate::evaluate_gates;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -1155,22 +1170,24 @@ fn handle_next(
     let (header, events) = match backend.read_events(&name) {
         Ok(result) => result,
         Err(err) => {
-            let code = exit_code_for_engine_error(&err);
-            exit_with_error_code(
-                serde_json::json!({
-                    "error": err.to_string(),
-                    "command": "next"
-                }),
-                code,
-            );
+            let ne = NextError {
+                code: NextErrorCode::PersistenceError,
+                message: err.to_string(),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
         }
     };
 
     if events.is_empty() {
-        exit_with_error(serde_json::json!({
-            "error": "state file has no events",
-            "command": "next"
-        }));
+        let ne = NextError {
+            code: NextErrorCode::PersistenceError,
+            message: "state file has no events".to_string(),
+            details: vec![],
+        };
+        let json = serde_json::json!({"error": ne});
+        exit_with_error_code(json, ne.code.exit_code());
     }
 
     // Check for cancelled workflow before any processing.
@@ -1192,23 +1209,26 @@ fn handle_next(
     let variables = match Variables::from_events(&events) {
         Ok(v) => v,
         Err(e) => {
-            exit_with_error_code(
-                serde_json::json!({
-                    "error": format!("variable re-validation failed: {}", e),
-                    "command": "next"
-                }),
-                EXIT_INFRASTRUCTURE,
-            );
+            let ne = NextError {
+                code: NextErrorCode::PersistenceError,
+                message: format!("variable re-validation failed: {}", e),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
         }
     };
 
     let machine_state = match derive_machine_state(&header, &events) {
         Some(ms) => ms,
         None => {
-            exit_with_error(serde_json::json!({
-                "error": "corrupt state file: cannot derive current state",
-                "command": "next"
-            }));
+            let ne = NextError {
+                code: NextErrorCode::PersistenceError,
+                message: "corrupt state file: cannot derive current state".to_string(),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
         }
     };
 
@@ -1216,39 +1236,45 @@ fn handle_next(
     let template_bytes = match std::fs::read(&machine_state.template_path) {
         Ok(b) => b,
         Err(e) => {
-            exit_with_error_code(
-                serde_json::json!({
-                    "error": format!("failed to read template {}: {}", machine_state.template_path, e),
-                    "command": "next"
-                }),
-                3,
-            );
+            let ne = NextError {
+                code: NextErrorCode::TemplateError,
+                message: format!(
+                    "failed to read template {}: {}",
+                    machine_state.template_path, e
+                ),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
         }
     };
     let actual_hash = sha256_hex(&template_bytes);
     if actual_hash != machine_state.template_hash {
-        exit_with_error_code(
-            serde_json::json!({
-                "error": format!(
-                    "template hash mismatch: header says {} but cached template hashes to {}",
-                    machine_state.template_hash, actual_hash
-                ),
-                "command": "next"
-            }),
-            3,
-        );
+        let ne = NextError {
+            code: NextErrorCode::TemplateError,
+            message: format!(
+                "template hash mismatch: header says {} but cached template hashes to {}",
+                machine_state.template_hash, actual_hash
+            ),
+            details: vec![],
+        };
+        let json = serde_json::json!({"error": ne});
+        exit_with_error_code(json, ne.code.exit_code());
     }
 
     let compiled: CompiledTemplate = match serde_json::from_slice(&template_bytes) {
         Ok(t) => t,
         Err(e) => {
-            exit_with_error_code(
-                serde_json::json!({
-                    "error": format!("failed to parse template {}: {}", machine_state.template_path, e),
-                    "command": "next"
-                }),
-                3,
-            );
+            let ne = NextError {
+                code: NextErrorCode::TemplateError,
+                message: format!(
+                    "failed to parse template {}: {}",
+                    machine_state.template_path, e
+                ),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
         }
     };
 
@@ -1256,7 +1282,7 @@ fn handle_next(
     for reserved in crate::cli::vars::RESERVED_VARIABLE_NAMES {
         if compiled.variables.contains_key(*reserved) {
             let err = NextError {
-                code: NextErrorCode::PreconditionFailed,
+                code: NextErrorCode::TemplateError,
                 message: format!(
                     "template declares reserved variable '{}'; this name is injected by the runtime and cannot be redefined",
                     reserved
@@ -1284,13 +1310,13 @@ fn handle_next(
         let current_template_state = match compiled.states.get(current_state) {
             Some(s) => s,
             None => {
-                exit_with_error_code(
-                    serde_json::json!({
-                        "error": format!("state '{}' not found in template", current_state),
-                        "command": "next"
-                    }),
-                    3,
-                );
+                let ne = NextError {
+                    code: NextErrorCode::TemplateError,
+                    message: format!("state '{}' not found in template", current_state),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": ne});
+                exit_with_error_code(json, ne.code.exit_code());
             }
         };
 
@@ -1316,13 +1342,13 @@ fn handle_next(
 
         // Validate target state exists in template.
         if !compiled.states.contains_key(target) {
-            exit_with_error_code(
-                serde_json::json!({
-                    "error": format!("target state '{}' not found in template", target),
-                    "command": "next"
-                }),
-                3,
-            );
+            let ne = NextError {
+                code: NextErrorCode::TemplateError,
+                message: format!("target state '{}' not found in template", target),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
         }
 
         // Append directed_transition event.
@@ -1331,10 +1357,13 @@ fn handle_next(
             to: target.clone(),
         };
         if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
-            exit_with_error(serde_json::json!({
-                "error": e.to_string(),
-                "command": "next"
-            }));
+            let ne = NextError {
+                code: NextErrorCode::PersistenceError,
+                message: e.to_string(),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
         }
 
         // Dispatch on the new (target) state, skip gate evaluation.
@@ -1369,13 +1398,13 @@ fn handle_next(
     let template_state = match compiled.states.get(current_state) {
         Some(s) => s,
         None => {
-            exit_with_error_code(
-                serde_json::json!({
-                    "error": format!("state '{}' not found in template", current_state),
-                    "command": "next"
-                }),
-                3,
-            );
+            let ne = NextError {
+                code: NextErrorCode::TemplateError,
+                message: format!("state '{}' not found in template", current_state),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
         }
     };
 
@@ -1458,10 +1487,13 @@ fn handle_next(
             fields,
         };
         if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
-            exit_with_error(serde_json::json!({
-                "error": e.to_string(),
-                "command": "next"
-            }));
+            let ne = NextError {
+                code: NextErrorCode::PersistenceError,
+                message: e.to_string(),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
         }
     }
 
@@ -1471,10 +1503,13 @@ fn handle_next(
     let lock_file = match std::fs::File::open(&state_path) {
         Ok(f) => f,
         Err(e) => {
-            exit_with_error(serde_json::json!({
-                "error": format!("failed to open state file for locking: {}", e),
-                "command": "next"
-            }));
+            let ne = NextError {
+                code: NextErrorCode::PersistenceError,
+                message: format!("failed to open state file for locking: {}", e),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
         }
     };
     {
@@ -1483,7 +1518,7 @@ fn handle_next(
         let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
         if ret != 0 {
             let err = NextError {
-                code: NextErrorCode::PreconditionFailed,
+                code: NextErrorCode::ConcurrentAccess,
                 message: "another koto next is already running for this workflow".to_string(),
                 details: vec![],
             };
@@ -1508,14 +1543,13 @@ fn handle_next(
     let (_, current_events) = match backend.read_events(&name) {
         Ok(result) => result,
         Err(err) => {
-            let code = exit_code_for_engine_error(&err);
-            exit_with_error_code(
-                serde_json::json!({
-                    "error": err.to_string(),
-                    "command": "next"
-                }),
-                code,
-            );
+            let ne = NextError {
+                code: NextErrorCode::PersistenceError,
+                message: err.to_string(),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
         }
     };
     let epoch_events = derive_evidence(&current_events);
@@ -1659,13 +1693,13 @@ fn handle_next(
             let final_template_state = match compiled.states.get(final_state) {
                 Some(s) => s,
                 None => {
-                    exit_with_error_code(
-                        serde_json::json!({
-                            "error": format!("state '{}' not found in template", final_state),
-                            "command": "next"
-                        }),
-                        3,
-                    );
+                    let ne = NextError {
+                        code: NextErrorCode::TemplateError,
+                        message: format!("state '{}' not found in template", final_state),
+                        details: vec![],
+                    };
+                    let json = serde_json::json!({"error": ne});
+                    exit_with_error_code(json, ne.code.exit_code());
                 }
             };
 
@@ -1675,37 +1709,40 @@ fn handle_next(
             // runtime and template variable substitution before serialization.
             let directive = final_template_state.directive.clone();
 
+            // Derive visit counts to decide whether to include details.
+            // Re-read events to capture transitions appended during the advancement loop.
+            let details = if final_template_state.details.is_empty() {
+                None
+            } else {
+                let post_events = backend
+                    .read_events(&name)
+                    .map(|(_, evts)| evts)
+                    .unwrap_or_default();
+                let visit_counts = derive_visit_counts(&post_events);
+                let count = visit_counts.get(final_state.as_str()).copied().unwrap_or(0);
+                if full || count <= 1 {
+                    Some(final_template_state.details.clone())
+                } else {
+                    None
+                }
+            };
+
             let resp = match advance_result.stop_reason {
                 StopReason::Terminal => NextResponse::Terminal {
                     state: final_state.clone(),
                     advanced,
                 },
                 StopReason::GateBlocked(gate_results) => {
-                    let blocking: Vec<BlockingCondition> = gate_results
-                        .iter()
-                        .filter_map(|(name, result)| {
-                            let status = match result {
-                                GateResult::Passed => return None,
-                                GateResult::Failed { .. } => "failed",
-                                GateResult::TimedOut => "timed_out",
-                                GateResult::Error { .. } => "error",
-                            };
-                            Some(BlockingCondition {
-                                name: name.clone(),
-                                condition_type: "command".to_string(),
-                                status: status.to_string(),
-                                agent_actionable: false,
-                            })
-                        })
-                        .collect();
+                    let blocking = blocking_conditions_from_gates(&gate_results);
                     NextResponse::GateBlocked {
                         state: final_state.clone(),
                         directive: directive.clone(),
+                        details: details.clone(),
                         advanced,
                         blocking_conditions: blocking,
                     }
                 }
-                StopReason::EvidenceRequired => {
+                StopReason::EvidenceRequired { failed_gates } => {
                     // The engine only returns EvidenceRequired when accepts is Some,
                     // so expects is always populated here.
                     let es = expects.unwrap_or_else(|| ExpectsSchema {
@@ -1713,16 +1750,22 @@ fn handle_next(
                         fields: std::collections::BTreeMap::new(),
                         options: vec![],
                     });
+                    let blocking = failed_gates
+                        .as_ref()
+                        .map(blocking_conditions_from_gates)
+                        .unwrap_or_default();
                     NextResponse::EvidenceRequired {
                         state: final_state.clone(),
                         directive: directive.clone(),
+                        details: details.clone(),
                         advanced,
                         expects: es,
+                        blocking_conditions: blocking,
                     }
                 }
                 StopReason::UnresolvableTransition => {
                     let err = NextError {
-                        code: NextErrorCode::PreconditionFailed,
+                        code: NextErrorCode::TemplateError,
                         message: format!(
                             "state '{}' has conditional transitions but no accepts block; \
                              the agent cannot submit evidence to resolve this",
@@ -1736,6 +1779,7 @@ fn handle_next(
                 StopReason::Integration { name, output } => NextResponse::Integration {
                     state: final_state.clone(),
                     directive: directive.clone(),
+                    details: details.clone(),
                     advanced,
                     expects,
                     integration: IntegrationOutput { name, output },
@@ -1744,6 +1788,7 @@ fn handle_next(
                     NextResponse::IntegrationUnavailable {
                         state: final_state.clone(),
                         directive: directive.clone(),
+                        details: details.clone(),
                         advanced,
                         expects,
                         integration: IntegrationUnavailableMarker {
@@ -1760,6 +1805,7 @@ fn handle_next(
                 } => NextResponse::ActionRequiresConfirmation {
                     state: action_state,
                     directive: final_template_state.directive.clone(),
+                    details: details.clone(),
                     advanced,
                     action_output: crate::cli::next_types::ActionOutput {
                         command: final_template_state
@@ -1776,7 +1822,7 @@ fn handle_next(
                 StopReason::CycleDetected { state: cycle_state } => {
                     // Cycle is a template bug; report as an error.
                     let err = NextError {
-                        code: NextErrorCode::PreconditionFailed,
+                        code: NextErrorCode::TemplateError,
                         message: format!(
                             "cycle detected: advancement loop would revisit state '{}'",
                             cycle_state
@@ -1788,7 +1834,7 @@ fn handle_next(
                 }
                 StopReason::ChainLimitReached => {
                     let err = NextError {
-                        code: NextErrorCode::PreconditionFailed,
+                        code: NextErrorCode::TemplateError,
                         message: "advancement chain limit reached (100 transitions)".to_string(),
                         details: vec![],
                     };
@@ -1807,19 +1853,23 @@ fn handle_next(
                         NextResponse::EvidenceRequired {
                             state: final_state.clone(),
                             directive: directive.clone(),
+                            details: details.clone(),
                             advanced,
                             expects: es.clone(),
+                            blocking_conditions: vec![],
                         }
                     } else {
                         NextResponse::EvidenceRequired {
                             state: final_state.clone(),
                             directive: directive.clone(),
+                            details: details.clone(),
                             advanced,
                             expects: ExpectsSchema {
                                 event_type: "evidence_submitted".to_string(),
                                 fields: std::collections::BTreeMap::new(),
                                 options: vec![],
                             },
+                            blocking_conditions: vec![],
                         }
                     }
                 }
@@ -1839,8 +1889,14 @@ fn handle_next(
             std::process::exit(0);
         }
         Err(advance_err) => {
+            let code = match &advance_err {
+                AdvanceError::AmbiguousTransition { .. } => NextErrorCode::TemplateError,
+                AdvanceError::DeadEndState { .. } => NextErrorCode::TemplateError,
+                AdvanceError::UnknownState { .. } => NextErrorCode::TemplateError,
+                AdvanceError::PersistenceError(_) => NextErrorCode::PersistenceError,
+            };
             let err = NextError {
-                code: NextErrorCode::PreconditionFailed,
+                code,
                 message: advance_err.to_string(),
                 details: vec![],
             };
@@ -1859,6 +1915,7 @@ fn handle_next(
     _with_data: Option<String>,
     _to: Option<String>,
     _no_cleanup: bool,
+    _full: bool,
 ) -> Result<()> {
     exit_with_error_code(
         serde_json::json!({

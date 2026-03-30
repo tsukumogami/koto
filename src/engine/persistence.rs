@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -319,6 +320,27 @@ pub fn derive_machine_state(header: &StateFileHeader, events: &[Event]) -> Optio
         template_path,
         template_hash: header.template_hash.clone(),
     })
+}
+
+/// Derive per-state visit counts from the event log.
+///
+/// Counts the number of times each state has been entered via Transitioned,
+/// DirectedTransition, or Rewound events. Returns a map from state name to
+/// visit count.
+pub fn derive_visit_counts(events: &[Event]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for event in events {
+        let target = match &event.payload {
+            EventPayload::Transitioned { to, .. } => Some(to.as_str()),
+            EventPayload::DirectedTransition { to, .. } => Some(to.as_str()),
+            EventPayload::Rewound { to, .. } => Some(to.as_str()),
+            _ => None,
+        };
+        if let Some(state_name) = target {
+            *counts.entry(state_name.to_string()).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 #[cfg(test)]
@@ -968,5 +990,198 @@ mod tests {
         let decisions = derive_decisions(&events);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].seq, 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // derive_visit_counts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn derive_visit_counts_empty_events() {
+        let counts = derive_visit_counts(&[]);
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn derive_visit_counts_single_transitioned() {
+        let events = vec![make_event(
+            1,
+            EventPayload::Transitioned {
+                from: None,
+                to: "gather".to_string(),
+                condition_type: "auto".to_string(),
+            },
+        )];
+        let counts = derive_visit_counts(&events);
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts["gather"], 1);
+    }
+
+    #[test]
+    fn derive_visit_counts_multiple_visits_same_state() {
+        let events = vec![
+            make_event(
+                1,
+                EventPayload::Transitioned {
+                    from: None,
+                    to: "gather".to_string(),
+                    condition_type: "auto".to_string(),
+                },
+            ),
+            make_event(
+                2,
+                EventPayload::Transitioned {
+                    from: Some("gather".to_string()),
+                    to: "analyze".to_string(),
+                    condition_type: "gate".to_string(),
+                },
+            ),
+            make_event(
+                3,
+                EventPayload::Rewound {
+                    from: "analyze".to_string(),
+                    to: "gather".to_string(),
+                },
+            ),
+        ];
+        let counts = derive_visit_counts(&events);
+        assert_eq!(counts["gather"], 2);
+        assert_eq!(counts["analyze"], 1);
+    }
+
+    #[test]
+    fn derive_visit_counts_directed_transition() {
+        let events = vec![make_event(
+            1,
+            EventPayload::DirectedTransition {
+                from: "plan".to_string(),
+                to: "implement".to_string(),
+            },
+        )];
+        let counts = derive_visit_counts(&events);
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts["implement"], 1);
+    }
+
+    #[test]
+    fn derive_visit_counts_rewound() {
+        let events = vec![make_event(
+            1,
+            EventPayload::Rewound {
+                from: "analyze".to_string(),
+                to: "gather".to_string(),
+            },
+        )];
+        let counts = derive_visit_counts(&events);
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts["gather"], 1);
+    }
+
+    #[test]
+    fn derive_visit_counts_mixed_event_types() {
+        let events = vec![
+            make_event(
+                1,
+                EventPayload::WorkflowInitialized {
+                    template_path: "/cache/abc.json".to_string(),
+                    variables: HashMap::new(),
+                },
+            ),
+            make_event(
+                2,
+                EventPayload::Transitioned {
+                    from: None,
+                    to: "gather".to_string(),
+                    condition_type: "auto".to_string(),
+                },
+            ),
+            make_event(
+                3,
+                EventPayload::EvidenceSubmitted {
+                    state: "gather".to_string(),
+                    fields: HashMap::new(),
+                },
+            ),
+            make_event(
+                4,
+                EventPayload::DirectedTransition {
+                    from: "gather".to_string(),
+                    to: "analyze".to_string(),
+                },
+            ),
+            make_event(
+                5,
+                EventPayload::DecisionRecorded {
+                    state: "analyze".to_string(),
+                    decision: serde_json::json!({"choice": "A"}),
+                },
+            ),
+            make_event(
+                6,
+                EventPayload::Rewound {
+                    from: "analyze".to_string(),
+                    to: "gather".to_string(),
+                },
+            ),
+        ];
+        let counts = derive_visit_counts(&events);
+        assert_eq!(counts["gather"], 2);
+        assert_eq!(counts["analyze"], 1);
+        // Non-entry events should not appear as keys
+        assert_eq!(counts.len(), 2);
+    }
+
+    #[test]
+    fn derive_visit_counts_ignores_non_entry_events() {
+        let events = vec![
+            make_event(
+                1,
+                EventPayload::WorkflowInitialized {
+                    template_path: "/cache/abc.json".to_string(),
+                    variables: HashMap::new(),
+                },
+            ),
+            make_event(
+                2,
+                EventPayload::EvidenceSubmitted {
+                    state: "gather".to_string(),
+                    fields: HashMap::new(),
+                },
+            ),
+            make_event(
+                3,
+                EventPayload::DecisionRecorded {
+                    state: "gather".to_string(),
+                    decision: serde_json::json!({"choice": "X"}),
+                },
+            ),
+            make_event(
+                4,
+                EventPayload::IntegrationInvoked {
+                    state: "gather".to_string(),
+                    integration: "github".to_string(),
+                    output: serde_json::json!(null),
+                },
+            ),
+            make_event(
+                5,
+                EventPayload::DefaultActionExecuted {
+                    state: "gather".to_string(),
+                    command: "echo hi".to_string(),
+                    exit_code: 0,
+                    stdout: "hi\n".to_string(),
+                    stderr: String::new(),
+                },
+            ),
+            make_event(
+                6,
+                EventPayload::WorkflowCancelled {
+                    state: "gather".to_string(),
+                    reason: "test".to_string(),
+                },
+            ),
+        ];
+        let counts = derive_visit_counts(&events);
+        assert!(counts.is_empty());
     }
 }

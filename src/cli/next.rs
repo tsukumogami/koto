@@ -6,13 +6,18 @@
 use std::collections::BTreeMap;
 
 use crate::cli::next_types::{
-    BlockingCondition, ExpectsSchema, IntegrationUnavailableMarker, NextError, NextResponse,
+    blocking_conditions_from_gates, ExpectsSchema, IntegrationUnavailableMarker, NextError,
+    NextResponse,
 };
 #[cfg(unix)]
 use crate::gate::GateResult;
 use crate::template::types::TemplateState;
 
 /// Classify the current workflow state into a response or error.
+///
+/// This function handles five of the six `NextResponse` variants.
+/// `ActionRequiresConfirmation` is produced by the handler when a
+/// default action runs and requires confirmation, not by this dispatcher.
 ///
 /// Classification order:
 /// 1. Terminal state -> `Terminal`
@@ -39,23 +44,13 @@ pub fn dispatch_next(
     }
 
     // 2. Gates failed
-    let blocking: Vec<BlockingCondition> = gate_results
-        .iter()
-        .filter_map(|(name, result)| {
-            let status = match result {
-                GateResult::Passed => return None,
-                GateResult::Failed { .. } => "failed",
-                GateResult::TimedOut => "timed_out",
-                GateResult::Error { .. } => "error",
-            };
-            Some(BlockingCondition {
-                name: name.clone(),
-                condition_type: "command".to_string(),
-                status: status.to_string(),
-                agent_actionable: false,
-            })
-        })
-        .collect();
+    let blocking = blocking_conditions_from_gates(gate_results);
+
+    let details = if template_state.details.is_empty() {
+        None
+    } else {
+        Some(template_state.details.clone())
+    };
 
     if !blocking.is_empty() {
         // If the state has an accepts block, fall through to EvidenceRequired
@@ -65,6 +60,7 @@ pub fn dispatch_next(
             return Ok(NextResponse::GateBlocked {
                 state: state.to_string(),
                 directive: template_state.directive.clone(),
+                details: details.clone(),
                 advanced,
                 blocking_conditions: blocking,
             });
@@ -82,6 +78,7 @@ pub fn dispatch_next(
         return Ok(NextResponse::IntegrationUnavailable {
             state: state.to_string(),
             directive: template_state.directive.clone(),
+            details: details.clone(),
             advanced,
             expects,
             integration: IntegrationUnavailableMarker {
@@ -96,8 +93,10 @@ pub fn dispatch_next(
         return Ok(NextResponse::EvidenceRequired {
             state: state.to_string(),
             directive: template_state.directive.clone(),
+            details: details.clone(),
             advanced,
             expects: es.clone(),
+            blocking_conditions: blocking,
         });
     }
 
@@ -108,12 +107,14 @@ pub fn dispatch_next(
     Ok(NextResponse::EvidenceRequired {
         state: state.to_string(),
         directive: template_state.directive.clone(),
+        details,
         advanced,
         expects: ExpectsSchema {
             event_type: "evidence_submitted".to_string(),
             fields: BTreeMap::new(),
             options: vec![],
         },
+        blocking_conditions: blocking,
     })
 }
 
@@ -135,6 +136,7 @@ mod tests {
     ) -> TemplateState {
         TemplateState {
             directive: directive.to_string(),
+            details: String::new(),
             transitions,
             terminal,
             gates,
