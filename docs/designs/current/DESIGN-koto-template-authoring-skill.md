@@ -1,5 +1,5 @@
 ---
-status: Planned
+status: Current
 problem: |
   There's no guided way to create a koto-backed skill. Template authoring requires
   understanding the YAML frontmatter schema, state machine semantics, evidence routing
@@ -26,7 +26,7 @@ rationale: |
 
 ## Status
 
-Planned
+Current
 
 ## Context and problem statement
 
