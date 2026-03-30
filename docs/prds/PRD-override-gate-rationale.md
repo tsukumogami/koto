@@ -1,5 +1,5 @@
 ---
-status: Draft
+status: Accepted
 problem: |
   When agents bypass gates in koto, the reasoning disappears. Overrides are
   implicit (inferred from evidence on a gate-failed state), and states without
@@ -18,7 +18,7 @@ source_issue: 108
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem statement
 
