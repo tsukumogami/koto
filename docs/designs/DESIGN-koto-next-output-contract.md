@@ -333,3 +333,7 @@ Deliverables:
 - The empty `blocking_conditions` array is ~25 bytes -- negligible compared to directive text
 - Typical workflows have tens to low hundreds of events; the full scan is sub-millisecond
 - The koto-author skill teaches the marker during the template_drafting phase, and template-format.md documents it as a Layer 1 concept
+
+## Security considerations
+
+No security dimensions apply to this design. It restructures how `koto next` serializes responses and classifies errors, operating entirely on data already loaded in memory from local files with owner-only permissions. The new `blocking_conditions` and `details` fields expose template-authored content and gate evaluation results that were previously computed but discarded -- this is the design's intended behavior, not an unintended leak. No new external inputs, dependencies, network access, or privilege changes are introduced.
