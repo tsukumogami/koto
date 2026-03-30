@@ -1099,7 +1099,7 @@ fn handle_next(
 ) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
-        BlockingCondition, ErrorDetail, ExpectsSchema, IntegrationOutput,
+        blocking_conditions_from_gates, ErrorDetail, ExpectsSchema, IntegrationOutput,
         IntegrationUnavailableMarker, NextError, NextErrorCode, NextResponse,
     };
     use crate::engine::advance::{
@@ -1108,7 +1108,7 @@ fn handle_next(
     use crate::engine::evidence::validate_evidence;
     use crate::engine::persistence::derive_evidence;
     use crate::engine::substitute::Variables;
-    use crate::gate::{evaluate_gates, GateResult};
+    use crate::gate::evaluate_gates;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -1674,6 +1674,11 @@ fn handle_next(
             // Use the raw directive here; with_substituted_directive applies both
             // runtime and template variable substitution before serialization.
             let directive = final_template_state.directive.clone();
+            let details = if final_template_state.details.is_empty() {
+                None
+            } else {
+                Some(final_template_state.details.clone())
+            };
 
             let resp = match advance_result.stop_reason {
                 StopReason::Terminal => NextResponse::Terminal {
@@ -1681,31 +1686,16 @@ fn handle_next(
                     advanced,
                 },
                 StopReason::GateBlocked(gate_results) => {
-                    let blocking: Vec<BlockingCondition> = gate_results
-                        .iter()
-                        .filter_map(|(name, result)| {
-                            let status = match result {
-                                GateResult::Passed => return None,
-                                GateResult::Failed { .. } => "failed",
-                                GateResult::TimedOut => "timed_out",
-                                GateResult::Error { .. } => "error",
-                            };
-                            Some(BlockingCondition {
-                                name: name.clone(),
-                                condition_type: "command".to_string(),
-                                status: status.to_string(),
-                                agent_actionable: false,
-                            })
-                        })
-                        .collect();
+                    let blocking = blocking_conditions_from_gates(&gate_results);
                     NextResponse::GateBlocked {
                         state: final_state.clone(),
                         directive: directive.clone(),
+                        details: details.clone(),
                         advanced,
                         blocking_conditions: blocking,
                     }
                 }
-                StopReason::EvidenceRequired { .. } => {
+                StopReason::EvidenceRequired { failed_gates } => {
                     // The engine only returns EvidenceRequired when accepts is Some,
                     // so expects is always populated here.
                     let es = expects.unwrap_or_else(|| ExpectsSchema {
@@ -1713,11 +1703,17 @@ fn handle_next(
                         fields: std::collections::BTreeMap::new(),
                         options: vec![],
                     });
+                    let blocking = failed_gates
+                        .as_ref()
+                        .map(blocking_conditions_from_gates)
+                        .unwrap_or_default();
                     NextResponse::EvidenceRequired {
                         state: final_state.clone(),
                         directive: directive.clone(),
+                        details: details.clone(),
                         advanced,
                         expects: es,
+                        blocking_conditions: blocking,
                     }
                 }
                 StopReason::UnresolvableTransition => {
@@ -1736,6 +1732,7 @@ fn handle_next(
                 StopReason::Integration { name, output } => NextResponse::Integration {
                     state: final_state.clone(),
                     directive: directive.clone(),
+                    details: details.clone(),
                     advanced,
                     expects,
                     integration: IntegrationOutput { name, output },
@@ -1744,6 +1741,7 @@ fn handle_next(
                     NextResponse::IntegrationUnavailable {
                         state: final_state.clone(),
                         directive: directive.clone(),
+                        details: details.clone(),
                         advanced,
                         expects,
                         integration: IntegrationUnavailableMarker {
@@ -1760,6 +1758,7 @@ fn handle_next(
                 } => NextResponse::ActionRequiresConfirmation {
                     state: action_state,
                     directive: final_template_state.directive.clone(),
+                    details: details.clone(),
                     advanced,
                     action_output: crate::cli::next_types::ActionOutput {
                         command: final_template_state
@@ -1807,19 +1806,23 @@ fn handle_next(
                         NextResponse::EvidenceRequired {
                             state: final_state.clone(),
                             directive: directive.clone(),
+                            details: details.clone(),
                             advanced,
                             expects: es.clone(),
+                            blocking_conditions: vec![],
                         }
                     } else {
                         NextResponse::EvidenceRequired {
                             state: final_state.clone(),
                             directive: directive.clone(),
+                            details: details.clone(),
                             advanced,
                             expects: ExpectsSchema {
                                 event_type: "evidence_submitted".to_string(),
                                 fields: std::collections::BTreeMap::new(),
                                 options: vec![],
                             },
+                            blocking_conditions: vec![],
                         }
                     }
                 }
