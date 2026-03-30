@@ -126,12 +126,14 @@ Specific mapping:
 
 **R8. `--to` does not chain auto-advancement.** After a directed transition, the caller receives the target state's classification. If the target is an auto-advanceable state (no accepts, unconditional transition), the response reflects that state -- the caller must call `koto next` again to trigger the advancement loop. This is intentional: the caller chose a destination and should see it.
 
-**R9. Directive split: summary and details.** Template states support two text fields: `directive` (short summary, always returned) and an optional `details` (extended instructions). Response behavior:
-- **First visit** to a state: both `directive` and `details` are present in the response. `details` contains the full instructions the caller needs to execute the phase.
-- **Subsequent visits** (retries, self-loops, polling): only `directive` is returned. `details` is omitted. The caller already received the full instructions on the first visit.
-- **Force-full retrieval**: A mechanism (flag like `--full` or a dedicated command) allows callers to retrieve `details` even on subsequent visits, for cases where context was lost (new session, context compression dropped the instructions).
-- States without a `details` field behave identically to today: `directive` is always returned, `details` is absent.
-- Visit tracking uses existing JSONL state (the engine already knows whether a state has been visited).
+**R9. Directive split: summary and details.** Responses include `directive` (short summary, always present on non-terminal shapes) and an optional `details` field (extended instructions). Response behavior:
+- **First visit** to a state: both `directive` and `details` are present. `details` contains the full instructions the caller needs to execute the phase.
+- **Subsequent visits** (retries, self-loops, polling): `directive` is present, `details` is absent (omitted from JSON, not null). The caller already received the full instructions on the first visit.
+- **Force-full retrieval**: `koto next --full` forces `details` to be included regardless of visit count. This covers context recovery (new session, context compression dropped the instructions).
+- **No details defined**: States that don't define extended instructions produce no `details` key. Callers see the same response shape as today.
+- **Visit tracking**: Uses existing JSONL state events. A state's visit count is derived from the event log (counting `Transitioned`, `DirectedTransition`, and `Rewound` events targeting that state). No new state files or schema changes needed.
+
+How template authors specify the summary/details split (markdown separator, YAML field, external file) is a template format concern, not an output contract concern. The downstream design doc determines the template source format.
 
 **R10. SignalReceived transparency.** When SIGTERM/SIGINT interrupts the advancement loop, the response resolves to a fully valid response shape for the state the engine stopped at. The caller sees a normal response with no interruption indicator. This is the intended contract: the response is complete and valid for the stopped-at state, and calling `koto next` again continues correctly from that state.
 
@@ -189,7 +191,10 @@ Specific mapping:
 **D1. Keep `advanced` rather than rename or deprecate.**
 Renaming to `state_changed` or `transitioned` would be a breaking change to the JSON wire format. Adding a companion field (like `transitions_made: u32`) was considered but adds complexity for a signal callers shouldn't dispatch on. The chosen path: formal definition + documentation that callers use `action`, not `advanced`. Alternatives: rename (breaking), deprecate (removes useful context), add companion field (marginal value).
 
-**D6. Descriptive `action` values instead of generic `"execute"`.**
+**D6. PRD specifies details output contract, defers template source format to design.**
+The `details` field behavior (present on first visit, absent on retries, `--full` forces it) is an output contract concern and belongs in the PRD. How template authors write the summary/details split (markdown separator, YAML field, external file) is a template format concern. Research confirmed all source format options converge to the same compiled representation, so the output contract is format-agnostic. Prescribing the template format in the PRD would overconstrain the design without benefiting callers. Alternative: prescribe markdown separator in the PRD (rejected: crosses the what/how boundary).
+
+**D7. Descriptive `action` values instead of generic `"execute"`.**
 The original design used `"execute"` for all non-terminal, non-confirm shapes, requiring callers to reconstruct the shape from field presence. This forced a field-presence dance (`if expects... elif blocking_conditions... elif integration...`) that the action field should have handled. The fix: `action` carries the shape name directly (`"evidence_required"`, `"gate_blocked"`, `"integration"`, `"integration_unavailable"`). The terminal check (`action == "done"`) stays simple. This is a breaking change for callers matching `action == "execute"`, but koto is pre-1.0 and the current callers are internal skill plugins that will be updated alongside the contract. Alternative: keep `"execute"` and add a `shape` field (rejected: two fields for the same information, `action` is the natural discriminator).
 
 **D2. Add `blocking_conditions` to `EvidenceRequired` rather than a new response variant.**
