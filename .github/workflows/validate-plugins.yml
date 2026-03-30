@@ -26,8 +26,9 @@ jobs:
       - name: Compile all templates
         run: |
           failed=0
-          # Find template .md files under skills/, skipping SKILL.md files
+          # Find template .md files in koto-templates/ directories, skipping generated artifacts
           while IFS= read -r template; do
+            case "$template" in *.mermaid.md) continue ;; esac
             echo "--- Compiling: $template"
             if ./target/release/koto template compile "$template"; then
               echo "PASS: $template"
@@ -35,7 +36,7 @@ jobs:
               echo "::error::Template compilation failed: $template"
               failed=1
             fi
-          done < <(find plugins/koto-skills/skills/ -name '*.md' ! -name 'SKILL.md' -type f)
+          done < <(find plugins/koto-skills/skills/ -path '*/koto-templates/*.md' -type f)
 
           if [ "$failed" -eq 1 ]; then
             echo "::error::One or more templates failed compilation"

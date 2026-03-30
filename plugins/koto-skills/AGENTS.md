@@ -127,18 +127,17 @@ Workflow templates define the states, transitions, and gates for a koto workflow
 Before running a workflow, ensure the template file exists at a stable project-local
 path.
 
-For the hello-koto workflow:
+For any koto-skills workflow:
 
-1. Check if `.koto/templates/hello-koto.md` already exists in the project.
-2. If not, create the directory and write the template there:
+1. Check if the template already exists at a stable project-local path (e.g., `.koto/templates/<name>.md`).
+2. If not, create the directory and copy the template there:
 
 ```bash
 mkdir -p .koto/templates
 ```
 
-Then write the template file to `.koto/templates/hello-koto.md` with the content from
-`plugins/koto-skills/skills/hello-koto/hello-koto.md` in the koto-skills plugin. If the
-plugin isn't installed locally, find the template in the koto repository at that path.
+Then write the template file from the skill's `koto-templates/` directory. The skill's
+SKILL.md will specify the exact template path via `${CLAUDE_SKILL_DIR}/koto-templates/<name>.md`.
 
 ## Response Shapes
 
@@ -269,69 +268,37 @@ Example error (exit code 2):
 Every koto workflow follows the same pattern: init, get directive, execute,
 submit evidence, repeat.
 
-### Simple example: hello-koto
+### Simple example: koto-author entry state
 
-This workflow has two states: `awakening` (create a greeting file) and `eternal`
-(terminal).
+The koto-author workflow starts at `entry`, where the agent confirms the authoring
+mode. This shows the basic init + evidence submission loop.
 
 **1. Initialize:**
 
 ```bash
-koto init hello --template .koto/templates/hello-koto.md --var SPIRIT_NAME=Tanuki
+koto init authoring --template .koto/templates/koto-author.md --var MODE=new
 ```
 
 ```json
-{"name": "hello", "state": "awakening"}
+{"name": "authoring", "state": "entry"}
 ```
 
 **2. Get directive:**
 
 ```bash
-koto next hello
+koto next authoring
 ```
 
-```json
-{
-  "action": "execute",
-  "state": "awakening",
-  "directive": "You are Tanuki, a tsukumogami spirit awakening for the first time.\n\nCreate a file at `wip/spirit-greeting.txt` containing a greeting from Tanuki to the world.",
-  "advanced": false,
-  "expects": null,
-  "blocking_conditions": [
-    {"name": "greeting_exists", "type": "command", "status": "failed", "agent_actionable": false}
-  ],
-  "error": null
-}
-```
+The response includes an `expects` field with the evidence schema (what the agent
+needs to submit).
 
-Gates are blocking -- the greeting file doesn't exist yet.
-
-**3. Execute the directive:**
+**3. Submit evidence:**
 
 ```bash
-mkdir -p wip
-echo "Greetings from Tanuki to the world." > wip/spirit-greeting.txt
+koto next authoring --with-data '{"mode_confirmed": "new"}'
 ```
 
-**4. Get next directive:**
-
-```bash
-koto next hello
-```
-
-Gates now pass, the engine auto-advances to the terminal state:
-
-```json
-{
-  "action": "done",
-  "state": "eternal",
-  "advanced": true,
-  "expects": null,
-  "error": null
-}
-```
-
-The workflow is finished.
+The engine evaluates evidence and advances to `context_gathering`.
 
 ### Advanced example: work-on workflow
 
