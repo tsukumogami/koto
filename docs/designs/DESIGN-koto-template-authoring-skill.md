@@ -231,3 +231,183 @@ structural errors without human intervention, and the gate enforcement prevents
 advancing past a broken template. This is cleaner as a koto gate than as a prose
 instruction the agent might skip -- exactly the kind of problem the shirabe PRD
 identified with prose-only skills.
+
+## Solution Architecture
+
+### Overview
+
+The authoring skill is a new skill within the existing `koto-skills` plugin at
+`plugins/koto-skills/`. It consists of a SKILL.md (workflow entry point and koto
+execution loop), a koto template (8-state workflow definition), and reference
+material (condensed format guide + graded examples). When invoked, it uses koto
+to drive the agent through a structured authoring workflow, producing a new skill
+directory as output.
+
+### Components
+
+```
+plugins/koto-skills/
+  .claude-plugin/
+    plugin.json                              # Updated: add koto-author entry
+  skills/
+    hello-koto/                              # Existing skill
+    koto-author/                            # New: the authoring skill
+      SKILL.md                               # Workflow entry, koto execution loop
+      koto-templates/
+        koto-author.md                      # 8-state koto template (the skill's own)
+      references/
+        template-format.md                   # Condensed authoring guide (~200-250 lines)
+        examples/
+          linear-workflow.md                 # Graded example: 3 states, variables only
+          evidence-routing-workflow.md        # Graded example: accepts/when, enum types
+          complex-workflow.md                 # Graded example: gates, self-loops, split
+```
+
+### Key interfaces
+
+**Input (via koto template variable):**
+- `MODE`: "new" or "convert" -- determines directive behavior in each phase
+
+**Output (produced by the agent during the workflow):**
+A new skill directory at a user-specified location:
+```
+<target-plugin>/skills/<skill-name>/
+  SKILL.md
+  koto-templates/<skill-name>.md
+  references/                               # Optional, if the skill needs them
+```
+
+**Koto integration:**
+The SKILL.md instructs agents to run:
+1. `koto init --template ${CLAUDE_SKILL_DIR}/koto-templates/koto-author.md`
+2. `koto next` to read the current directive
+3. `koto transition <state> --evidence '...'` to advance
+4. Loop until the workflow reaches the done state
+
+**Compile validation gate:**
+The template's compile_validation state has a self-loop transition. The agent runs
+`koto template compile <drafted-template>` and submits the result as evidence.
+If compilation fails, the transition loops back to compile_validation (up to 3 times).
+On success, it advances to skill_authoring.
+
+### Data flow
+
+```
+Agent invokes /koto-skills:koto-author
+  |
+  v
+SKILL.md -> koto init (copies template to .koto/)
+  |
+  v
+koto next -> entry state directive
+  |
+  v
+Agent selects mode (new/convert), submits evidence
+  |
+  v
+[context_gathering] -> [phase_identification] -> [state_design]
+  |
+  v
+[template_drafting] -> agent writes template to target skill dir
+  |
+  v
+[compile_validation] --fail--> [compile_validation] (self-loop, max 3)
+  |                   --pass-->
+  v
+[skill_authoring] -> agent writes/refactors SKILL.md
+  |
+  v
+[integration_check] -> verify coupling convention
+  |
+  v
+[done]
+```
+
+Intermediate artifacts during authoring:
+- The drafted template at `<target>/koto-templates/<name>.md`
+- The SKILL.md at `<target>/SKILL.md`
+- Compile output (transient, used for evidence submission)
+
+### Template state details
+
+| State | Gate | Evidence | Transitions |
+|-------|------|----------|-------------|
+| entry | none | mode: new/convert | -> context_gathering |
+| context_gathering | none | context_captured: true | -> phase_identification |
+| phase_identification | none | phases_identified: true | -> state_design |
+| state_design | none | states_designed: true | -> template_drafting |
+| template_drafting | none | template_drafted: true | -> compile_validation |
+| compile_validation | context-exists: drafted template file | compile_result: pass/fail | pass -> skill_authoring, fail -> compile_validation |
+| skill_authoring | none | skill_authored: true | -> integration_check |
+| integration_check | context-exists: SKILL.md + template | checks_passed: true | -> done |
+| done | none | none | (terminal) |
+
+## Implementation Approach
+
+### Phase 1: Reference material
+
+Write the condensed format guide and graded example templates. These are
+self-contained and don't depend on the skill or template.
+
+Deliverables:
+- `references/template-format.md` -- condensed authoring guide
+- `references/examples/linear-workflow.md` -- simple example
+- `references/examples/evidence-routing-workflow.md` -- medium example
+- `references/examples/complex-workflow.md` -- complex example
+
+### Phase 2: Koto template
+
+Write the authoring skill's own koto template. Use the reference material from
+Phase 1 to inform the directive content in each state. Validate with
+`koto template compile`.
+
+Deliverables:
+- `koto-templates/koto-author.md` -- the 8-state template
+
+### Phase 3: SKILL.md and plugin registration
+
+Write the SKILL.md with the koto execution loop and references to the template
+and guide. Update plugin.json to register the new skill.
+
+Deliverables:
+- `SKILL.md` -- skill entry point
+- `.claude-plugin/plugin.json` -- updated with koto-author entry
+
+### Phase 4: End-to-end test
+
+Use the skill to author a test skill (new mode). Verify the output compiles and
+follows the coupling convention. Then test convert mode against a simple prose
+skill.
+
+Deliverables:
+- Verified working skill for both input modes
+
+## Consequences
+
+### Positive
+
+- Agents get a structured, repeatable path to authoring koto-backed skills instead
+  of manual template writing
+- The compile validation self-loop catches structural errors mechanically, reducing
+  the chance of broken templates reaching production
+- The skill's own template serves as a mid-complexity reference (8 states), filling
+  the gap between hello-koto (trivial) and work-on (15+ states)
+- The 7 shirabe skill conversions from the adoption PRD have a guided workflow
+
+### Negative
+
+- v1 must be hand-written (bootstrapping cost), can't use the skill to build itself
+- The condensed format guide needs maintenance alongside the template format design
+  docs -- when the format evolves, two sources need updates
+- Mode-conditional directives put prose quality burden on the template author -- if
+  mode-specific instructions are unclear, agents may do the wrong thing for their mode
+- The skill can't catch runtime behavior issues -- templates that compile but produce
+  poor workflows won't be flagged until someone actually runs them
+
+### Mitigations
+
+- Bootstrapping is a one-time cost; v2+ can be self-authored
+- The format guide is ~200-250 lines, small enough that maintenance is manageable
+- Graded examples complement the guide, reducing dependence on directive prose quality
+- The compiler catches the most common and most dangerous errors (structural issues,
+  evidence routing conflicts); runtime quality improves as agents gain experience
