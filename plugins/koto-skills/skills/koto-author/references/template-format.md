@@ -150,7 +150,27 @@ transitions:
 
 This transition fires only when `result` is `pass` AND `environment` is `production`.
 
-A transition without a `when` block is unconditional -- it fires if no conditional transition matches first. You can use this as a fallback.
+A transition without a `when` block is unconditional -- it fires if no conditional transition matches first. Use this as a fallback:
+
+```yaml
+states:
+  process:
+    accepts:
+      outcome:
+        type: enum
+        values: [success, error, unknown]
+        required: true
+    transitions:
+      - target: complete
+        when:
+          outcome: success
+      - target: failed
+        when:
+          outcome: error
+      - target: review
+```
+
+Here, `outcome: success` goes to `complete`, `outcome: error` goes to `failed`, and anything else (including `unknown`) falls through to `review`.
 
 ### Mutual exclusivity
 
@@ -245,6 +265,36 @@ gates:
 
 A state can have multiple gates. All must pass before any transition fires.
 
+### Combining gates and evidence routing
+
+Gates and `accepts` blocks work together on the same state. Gates are checked first -- if any gate fails, the agent can't advance regardless of evidence. Once all gates pass, evidence routing determines which transition fires.
+
+```yaml
+states:
+  deploy:
+    gates:
+      config_valid:
+        type: context-exists
+        key: deploy.conf
+      tests_pass:
+        type: command
+        command: "test -f test-results.txt && grep -q PASS test-results.txt"
+    accepts:
+      target:
+        type: enum
+        values: [staging, production]
+        required: true
+    transitions:
+      - target: staging_deploy
+        when:
+          target: staging
+      - target: production_deploy
+        when:
+          target: production
+```
+
+Both gates must pass (config exists, tests passed) before the agent can submit evidence choosing the deploy target.
+
 ### Self-loops
 
 A transition whose target is its own state creates a loop. This is useful for retry patterns -- the agent stays in the same state until conditions change.
@@ -280,13 +330,15 @@ Templates can include `integration_tags` (a list of string labels) and `default_
 
 ## Mermaid previews
 
-Every template ships with a `.mermaid.md` preview file alongside it. Generate it with:
+Every template ships with a `.mermaid.md` preview file alongside it. This preview renders as a state diagram on GitHub and is validated by CI -- if it's missing or stale, the build fails.
+
+Generate it with:
 
 ```bash
 koto template export <template>.md --format mermaid --output <template>.mermaid.md
 ```
 
-For a template at `koto-templates/my-skill.md`, the preview goes at `koto-templates/my-skill.mermaid.md`. CI validates that previews are fresh -- if you change the template, regenerate the preview before committing.
+For a template at `koto-templates/my-skill.md`, the preview goes at `koto-templates/my-skill.mermaid.md`. Regenerate after every template change.
 
 ## Security note
 

@@ -114,14 +114,17 @@ gh api repos/tsukumogami/koto/contents/docs/guides --jq '.[].name'
 
 Read any relevant guide with `gh api repos/tsukumogami/koto/contents/docs/guides/<name> --jq '.content' | base64 -d`.
 
-**If {{MODE}} is "convert":** Read the existing SKILL.md that you're converting. Break it down:
+**If {{MODE}} is "convert":** Read the existing SKILL.md that you're converting. Look for these patterns:
 
-- Identify phases, sections, or numbered steps in the prose.
-- Find resume logic (state files, progress tracking, checkpoint patterns).
-- Locate gate checks (file existence tests, validation steps, preconditions).
-- Separate workflow mechanics (ordering, branching, resume) from domain logic (what to actually build or check).
+- **Phases**: headings like `## Phase 1`, `### Step 3`, or numbered sections that define a sequence.
+- **Resume logic**: code like "if wip/state.json exists, read it and skip to phase N" or "check if X file exists, if so resume from here." These become koto gates.
+- **Gate checks**: file existence tests (`test -f`), validation steps, or preconditions that must pass before continuing. These become koto gates.
+- **Branching**: if/else blocks that route to different sections based on conditions. These become evidence routing.
+- **Progress tracking**: writing state files, updating progress markers, checkpoint artifacts. Koto handles this automatically.
 
-Workflow mechanics will move into the koto template. Domain-specific instructions stay in SKILL.md.
+Separate what you find into two piles:
+- **Workflow mechanics** (ordering, branching, resume, progress) -- these move into the koto template.
+- **Domain logic** (what to actually build, check, or produce) -- these stay in SKILL.md.
 
 Submit `context_captured: done` when you have a clear picture of the workflow.
 
@@ -147,20 +150,27 @@ Submit `phases_identified: done` when you have a list of states and know how the
 
 Define the full state machine: states, transitions, evidence routing, gates, and variables.
 
-Read the template format guide at `${CLAUDE_SKILL_DIR}/references/template-format.md` for the schema. It covers three layers:
+Read the template format guide at `${CLAUDE_SKILL_DIR}/references/template-format.md`. Read only the layers you need:
 
-1. **Structure** -- states, transitions, variables, terminal states
-2. **Evidence routing** -- `accepts` blocks, `when` conditions, mutual exclusivity
-3. **Advanced features** -- gates (context-exists, context-matches, command), self-loops
+- **Layer 1 (Structure)** -- always read this. Covers states, transitions, variables, terminal states.
+- **Layer 2 (Evidence routing)** -- read if your workflow has decision points where the agent's output determines the next state. Covers `accepts` blocks, `when` conditions, and the mutual exclusivity constraint.
+- **Layer 3 (Advanced)** -- read if you need gates (preconditions), self-loops (retries), or split topology.
 
-Start with a linear flow. Then add evidence routing at decision points. Finally, layer in gates where preconditions need enforcement.
+Work through the design in this order:
 
-Pay attention to the mutual exclusivity constraint: for any pair of conditional transitions from the same state, at least one shared evidence field must have different values. The compiler rejects overlapping conditions.
+1. List every distinct phase in your workflow.
+2. Draw the transitions between them -- what follows what?
+3. Identify decision points: places where the agent chooses between paths. These need evidence routing (`accepts` + `when`).
+4. Identify retry loops: places where work might fail and repeat. These need self-loops.
+5. Identify preconditions: things that must be true before a phase starts. These need gates.
 
-Browse `${CLAUDE_SKILL_DIR}/references/examples/` and pick the example closest to your target complexity:
+For the mutual exclusivity constraint: if two conditional transitions from the same state could both match the same evidence values, the compiler rejects it. Make sure each conditional transition is distinguished by at least one field with a different value.
 
-- `evidence-routing-workflow.md` -- branching with accepts/when
-- `complex-workflow.md` -- gates, self-loops, split topology
+Pick an example from `${CLAUDE_SKILL_DIR}/references/examples/` that matches your workflow:
+
+- Simple linear flow with no branching? Inspect `hello-koto` (2 states, 1 gate).
+- Decision points where the agent chooses a path? Use `evidence-routing-workflow.md`.
+- Gates, retries, or precondition checks? Use `complex-workflow.md`.
 
 Submit `states_designed: done` when the state machine design is complete.
 
@@ -185,14 +195,15 @@ Run `koto template compile <path-to-drafted-template>` to validate the template.
 
 If compilation succeeds, submit `compile_result: pass` to advance.
 
-If compilation fails, read the error messages carefully. Common issues include:
+If compilation fails, read the error message and apply the matching fix:
 
-- **Missing transition targets** -- a typo in a state name that doesn't match any declared state.
-- **Non-mutually-exclusive evidence routing** -- two transitions from the same state that can both match the same evidence values.
-- **Invalid regex in context-matches gates** -- malformed regular expression patterns.
-- **Unreferenced variables** -- variables used in directives but not declared in the frontmatter (or vice versa).
+- **Missing transition target** -- a state name in a `target:` field doesn't match any declared state. Fix: check for typos. Common mistake: `validate` vs `validation`, `check` vs `checking`.
+- **Non-mutually-exclusive evidence routing** -- two conditional transitions could both match the same evidence. Fix: add a discriminating field to one transition's `when` block, or change an enum value so they don't overlap.
+- **Invalid regex in context-matches gates** -- malformed pattern. Fix: test the regex separately, escape special characters with `\\`.
+- **Unreferenced variables** -- a double-brace variable reference in a directive body doesn't match any declared variable (or a declared variable isn't used anywhere). Fix: add the missing declaration, or remove the unused variable.
+- **Missing directive section** -- a state exists in the frontmatter but has no `## state_name` section in the body. Fix: add the missing markdown heading and directive text.
 
-Fix the template and recompile. You get a maximum of 3 attempts before escalating to the user for help. Submit `compile_result: fail` to loop back and try again.
+Fix the template and recompile. Maximum 3 attempts before escalating to the user. Submit `compile_result: fail` to loop back and try again.
 
 ## skill_authoring
 
@@ -214,9 +225,9 @@ gh api repos/tsukumogami/koto/contents/docs/guides/custom-skill-authoring.md --j
 
 **If {{MODE}} is "convert":** Refactor the existing SKILL.md:
 
-- Strip out workflow boilerplate: resume logic, phase ordering, gate checks, progress tracking.
+- Remove workflow boilerplate. This includes: progress files (state.json, checkpoint markers), resume logic ("if X exists, skip to step N"), phase ordering comments ("## Phase 1, 2, 3"), and inline gate checks ("test -f" conditionals in prose).
 - Add koto integration: init, next, evidence submission commands.
-- Keep all domain-specific instructions -- the WHAT. The template handles the HOW (ordering, branching, gating).
+- Keep all domain-specific instructions -- the WHAT. The template handles the HOW.
 - The result should be a leaner SKILL.md that focuses on domain knowledge, with koto managing the workflow.
 
 Submit `skill_authored: done` when the SKILL.md is complete.
