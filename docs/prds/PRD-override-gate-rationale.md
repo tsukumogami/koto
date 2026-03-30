@@ -99,14 +99,13 @@ The flag is required when the current state is gate-blocked and evidence is
 being submitted via `--with-data`. It's ignored (or optional) when the state
 isn't gate-blocked.
 
-**R6: Cross-epoch override query.** A `derive_overrides` function (or
-equivalent) returns all `GateOverrideRecorded` events across the full session,
-not scoped to the current epoch. This follows the existing `derive_*` pattern
-in persistence.rs.
+**R6: Cross-epoch override query.** A `derive_overrides` function returns all
+`GateOverrideRecorded` events across the full session, not scoped to the
+current epoch. This follows the existing `derive_*` pattern in persistence.rs.
 
-**R7: CLI query surface.** `koto overrides list` (or equivalent subcommand)
-returns all override events for a workflow, formatted as JSON. Supports the
-"all overrides in session" query pattern.
+**R7: CLI query surface.** `koto overrides list` returns all override events
+for a workflow, formatted as JSON. Supports the "all overrides in session"
+query pattern.
 
 **R8: Non-override evidence is unaffected.** Evidence submitted on states where
 gates pass (or states without gates) doesn't require rationale and doesn't
@@ -150,6 +149,15 @@ emitted in strict sequence (evidence first, override second) within the same
   with their individual results
 - [ ] `--rationale` on a non-blocked state is accepted without error (no-op,
   doesn't produce override event)
+- [ ] `--rationale ""` (empty string) on a gate-blocked state returns a
+  validation error -- rationale must be non-empty
+- [ ] `EvidenceSubmitted` event has a lower sequence number than
+  `GateOverrideRecorded` event within the same invocation (R11 ordering)
+- [ ] `derive_overrides` returns all `GateOverrideRecorded` events across
+  epochs, including events from states that were later rewound past
+- [ ] Submitting evidence with `--rationale` on a gate-blocked state where the
+  evidence doesn't match any transition does NOT emit `GateOverrideRecorded`
+  (override event only on successful transition per D4)
 
 ## Out of scope
 
