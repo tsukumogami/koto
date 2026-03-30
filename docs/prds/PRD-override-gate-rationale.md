@@ -72,6 +72,96 @@ are bypassing legitimate checks.
 self-contained (gate failure context + rationale + evidence) so I can render an
 override timeline without correlating multiple event types.
 
+## Interaction examples
+
+These show the concrete CLI interactions between an agent and koto, before and
+after this feature.
+
+### Example 1: CI gate override during implementation
+
+A template has a `verify` state with a CI gate that checks test results. The
+agent has made a documentation-only change and CI is red because of a flaky
+integration test.
+
+**Today (no override tracking):**
+
+```bash
+# Agent calls next, gate fails
+$ koto next my-workflow
+{"action": "evidence_required", "state": "verify", "directive": "...",
+ "blocking_conditions": [{"gate": "ci_check", "result": "failed", "exit_code": 1}],
+ "expects": {"fields": {"status": {"type": "enum", "values": ["completed", "override"]}}}}
+
+# Agent submits override evidence -- rationale is lost
+$ koto next my-workflow --with-data '{"status": "override"}'
+{"action": "done", "state": "complete", "advanced": true}
+
+# Later, reviewer asks: "why did the agent skip CI?" -- no answer in the log
+```
+
+**After this feature:**
+
+```bash
+# Agent calls next, gate fails (same as today)
+$ koto next my-workflow
+{"action": "evidence_required", "state": "verify", "directive": "...",
+ "blocking_conditions": [{"gate": "ci_check", "result": "failed", "exit_code": 1}],
+ "expects": {"fields": {"status": {"type": "enum", "values": ["completed", "override"]}}}}
+
+# Agent submits override with rationale -- koto records both
+$ koto next my-workflow --with-data '{"status": "override"}' \
+    --rationale "CI failure is flaky integration test (test_network_timeout), unrelated to docs change"
+{"action": "done", "state": "complete", "advanced": true}
+
+# Without rationale, koto rejects the submission
+$ koto next my-workflow --with-data '{"status": "override"}'
+{"error": {"code": "invalid_submission", "message": "rationale required when overriding a blocked gate"}}
+
+# Reviewer queries overrides
+$ koto overrides list my-workflow
+{"overrides": [
+  {"state": "verify", "gates_failed": {"ci_check": {"result": "failed", "exit_code": 1}},
+   "rationale": "CI failure is flaky integration test (test_network_timeout), unrelated to docs change",
+   "evidence": {"status": "override"},
+   "seq": 8, "timestamp": "2026-03-30T14:22:00Z"}
+]}
+```
+
+### Example 2: Context injection override in a skill workflow
+
+A skill template has a `context_injection` state where the gate checks if a
+baseline artifact file exists. The agent already has the context from reading
+the issue via `gh issue view` and wants to skip generating the artifact.
+
+```bash
+# Gate fails because baseline artifact doesn't exist
+$ koto next work-session
+{"action": "evidence_required", "state": "context_injection",
+ "blocking_conditions": [{"gate": "baseline_exists", "result": "failed", "exit_code": 1}],
+ "expects": {"fields": {"status": {"type": "enum", "values": ["completed", "override", "blocked"]}}}}
+
+# Agent overrides with rationale
+$ koto next work-session --with-data '{"status": "override"}' \
+    --rationale "Issue context already loaded via gh issue view #42, baseline artifact not needed"
+{"action": "evidence_required", "state": "planning", "advanced": true, ...}
+```
+
+### Example 3: Gates pass, no rationale needed
+
+When gates pass, evidence submission works exactly as it does today. No
+`--rationale` is required and no override event is emitted.
+
+```bash
+# Gate passes (file exists), auto-advances
+$ koto next my-workflow
+{"action": "done", "state": "complete", "advanced": true}
+
+# Or: gates pass but state needs evidence for transition routing (not an override)
+$ koto next my-workflow --with-data '{"mode": "issue_backed", "issue_number": "42"}'
+{"action": "evidence_required", "state": "planning", "advanced": true, ...}
+# No --rationale needed, no GateOverrideRecorded emitted
+```
+
 ## Requirements
 
 ### Functional
