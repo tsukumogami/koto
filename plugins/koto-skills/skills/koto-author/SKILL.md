@@ -72,6 +72,12 @@ The skill produces a new skill directory containing:
 
 Both files follow the coupling convention: the SKILL.md references the template via `${CLAUDE_SKILL_DIR}/koto-templates/<skill-name>.md`.
 
+## Complementary skill: skill-creator
+
+If the `/skill-creator:skill-creator` skill is available, load it after the koto-author workflow completes. The skill-creator adds an eval/testing harness that koto-author doesn't cover: it spawns parallel test runs (with-skill vs baseline), grades the output, and iterates on quality. koto-author handles structural correctness (the template compiles, the coupling convention is followed); skill-creator handles behavioral quality (the skill actually works well for its intended use case).
+
+The two skills complement each other: use koto-author to build the skill, then skill-creator to test and refine it.
+
 ## This skill's own template
 
 This skill is itself koto-backed. Its template at `${CLAUDE_SKILL_DIR}/koto-templates/koto-author.md` serves as a mid-complexity example (8 states, evidence routing, self-loop, gates). You can inspect it to learn template patterns.
