@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 problem: |
   There's no guided way to create a koto-backed skill. Template authoring requires
   understanding the YAML frontmatter schema, state machine semantics, evidence routing
