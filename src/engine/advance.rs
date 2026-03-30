@@ -53,7 +53,9 @@ pub enum StopReason {
     /// One or more gates failed.
     GateBlocked(BTreeMap<String, GateResult>),
     /// Conditional transitions exist but evidence doesn't match any.
-    EvidenceRequired,
+    EvidenceRequired {
+        failed_gates: Option<BTreeMap<String, GateResult>>,
+    },
     /// Integration was invoked and returned output.
     Integration {
         name: String,
@@ -289,6 +291,7 @@ where
 
         // 6. Evaluate gates
         let mut gates_failed = false;
+        let mut failed_gate_results: Option<BTreeMap<String, GateResult>> = None;
         if !template_state.gates.is_empty() {
             let gate_results = evaluate_gates(&template_state.gates);
             let any_failed = gate_results
@@ -307,6 +310,7 @@ where
                     });
                 }
                 gates_failed = true;
+                failed_gate_results = Some(gate_results);
                 // Fall through to transition resolution with gate_failed=true.
             }
         }
@@ -343,7 +347,9 @@ where
                     return Ok(AdvanceResult {
                         final_state: state,
                         advanced,
-                        stop_reason: StopReason::EvidenceRequired,
+                        stop_reason: StopReason::EvidenceRequired {
+                            failed_gates: failed_gate_results,
+                        },
                     });
                 } else {
                     return Ok(AdvanceResult {
@@ -466,6 +472,7 @@ mod tests {
     fn make_state(transitions: Vec<Transition>) -> TemplateState {
         TemplateState {
             directive: "test".to_string(),
+            details: String::new(),
             transitions,
             terminal: false,
             gates: BTreeMap::new(),
@@ -807,6 +814,7 @@ mod tests {
                 "plan",
                 TemplateState {
                     directive: "Plan.".to_string(),
+                    details: String::new(),
                     transitions: vec![unconditional("implement")],
                     terminal: false,
                     gates: BTreeMap::new(),
@@ -819,6 +827,7 @@ mod tests {
                 "implement",
                 TemplateState {
                     directive: "Implement.".to_string(),
+                    details: String::new(),
                     transitions: vec![unconditional("verify")],
                     terminal: false,
                     gates: BTreeMap::new(),
@@ -831,6 +840,7 @@ mod tests {
                 "verify",
                 TemplateState {
                     directive: "Verify.".to_string(),
+                    details: String::new(),
                     transitions: vec![
                         conditional("done", vec![("decision", serde_json::json!("approve"))]),
                         conditional("implement", vec![("decision", serde_json::json!("reject"))]),
@@ -846,6 +856,7 @@ mod tests {
                 "done",
                 TemplateState {
                     directive: "Done.".to_string(),
+                    details: String::new(),
                     transitions: vec![],
                     terminal: true,
                     gates: BTreeMap::new(),
@@ -877,7 +888,10 @@ mod tests {
 
         assert_eq!(result.final_state, "verify");
         assert!(result.advanced);
-        assert_eq!(result.stop_reason, StopReason::EvidenceRequired);
+        assert!(matches!(
+            result.stop_reason,
+            StopReason::EvidenceRequired { .. }
+        ));
         assert_eq!(appended.len(), 2); // plan->implement, implement->verify
     }
 
@@ -901,6 +915,7 @@ mod tests {
             "gated",
             TemplateState {
                 directive: "Gated.".to_string(),
+                details: String::new(),
                 transitions: vec![unconditional("next")],
                 terminal: false,
                 gates,
@@ -944,6 +959,7 @@ mod tests {
             "review",
             TemplateState {
                 directive: "Review.".to_string(),
+                details: String::new(),
                 transitions: vec![
                     conditional("approved", vec![("decision", serde_json::json!("approve"))]),
                     conditional("rejected", vec![("decision", serde_json::json!("reject"))]),
@@ -973,7 +989,129 @@ mod tests {
 
         assert_eq!(result.final_state, "review");
         assert!(!result.advanced);
-        assert_eq!(result.stop_reason, StopReason::EvidenceRequired);
+        assert!(matches!(
+            result.stop_reason,
+            StopReason::EvidenceRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn evidence_required_no_gates_has_none_failed_gates() {
+        // When no gates are defined, failed_gates should be None.
+        let template = make_template(vec![(
+            "review",
+            TemplateState {
+                directive: "Review.".to_string(),
+                details: String::new(),
+                transitions: vec![conditional(
+                    "approved",
+                    vec![("decision", serde_json::json!("approve"))],
+                )],
+                terminal: false,
+                gates: BTreeMap::new(),
+                accepts: make_accepts(vec!["decision"]),
+                integration: None,
+                default_action: None,
+            },
+        )]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        let result = advance_until_stop(
+            "review",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        match &result.stop_reason {
+            StopReason::EvidenceRequired { failed_gates } => {
+                assert!(
+                    failed_gates.is_none(),
+                    "expected None when no gates defined"
+                );
+            }
+            other => panic!("expected EvidenceRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn gate_with_evidence_fallback_carries_gate_data() {
+        use crate::template::types::Gate;
+
+        // State with gates + accepts: when gates fail, engine returns
+        // EvidenceRequired with failed_gates populated.
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "ci_check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "false".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+            },
+        );
+
+        let template = make_template(vec![(
+            "verify",
+            TemplateState {
+                directive: "Verify.".to_string(),
+                details: String::new(),
+                transitions: vec![conditional(
+                    "done",
+                    vec![("result", serde_json::json!("pass"))],
+                )],
+                terminal: false,
+                gates,
+                accepts: make_accepts(vec!["result"]),
+                integration: None,
+                default_action: None,
+            },
+        )]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(name.clone(), GateResult::Failed { exit_code: 1 });
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "verify",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(result.final_state, "verify");
+        assert!(!result.advanced);
+        match &result.stop_reason {
+            StopReason::EvidenceRequired { failed_gates } => {
+                let gates = failed_gates
+                    .as_ref()
+                    .expect("failed_gates should be Some when gates failed");
+                assert_eq!(gates.len(), 1);
+                assert!(gates.contains_key("ci_check"));
+                assert_eq!(gates["ci_check"], GateResult::Failed { exit_code: 1 });
+            }
+            other => panic!("expected EvidenceRequired, got {:?}", other),
+        }
     }
 
     #[test]
@@ -986,6 +1124,7 @@ mod tests {
                 "a",
                 TemplateState {
                     directive: "A.".to_string(),
+                    details: String::new(),
                     transitions: vec![unconditional("b")],
                     terminal: false,
                     gates: BTreeMap::new(),
@@ -998,6 +1137,7 @@ mod tests {
                 "b",
                 TemplateState {
                     directive: "B.".to_string(),
+                    details: String::new(),
                     transitions: vec![unconditional("a")],
                     terminal: false,
                     gates: BTreeMap::new(),
@@ -1041,6 +1181,7 @@ mod tests {
             "integrate",
             TemplateState {
                 directive: "Integrate.".to_string(),
+                details: String::new(),
                 transitions: vec![unconditional("next")],
                 terminal: false,
                 gates: BTreeMap::new(),
@@ -1091,6 +1232,7 @@ mod tests {
                 names[i],
                 TemplateState {
                     directive: format!("State {}.", i),
+                    details: String::new(),
                     transitions: vec![unconditional(names[i + 1])],
                     terminal: false,
                     gates: BTreeMap::new(),
@@ -1105,6 +1247,7 @@ mod tests {
             *names.last().unwrap(),
             TemplateState {
                 directive: "Final.".to_string(),
+                details: String::new(),
                 transitions: vec![],
                 terminal: true,
                 gates: BTreeMap::new(),
@@ -1140,6 +1283,7 @@ mod tests {
             "done",
             TemplateState {
                 directive: "Done.".to_string(),
+                details: String::new(),
                 transitions: vec![],
                 terminal: true,
                 gates: BTreeMap::new(),
@@ -1176,6 +1320,7 @@ mod tests {
                 "a",
                 TemplateState {
                     directive: "A.".to_string(),
+                    details: String::new(),
                     transitions: vec![unconditional("b")],
                     terminal: false,
                     gates: BTreeMap::new(),
@@ -1188,6 +1333,7 @@ mod tests {
                 "b",
                 TemplateState {
                     directive: "B.".to_string(),
+                    details: String::new(),
                     transitions: vec![unconditional("c")],
                     terminal: false,
                     gates: BTreeMap::new(),
@@ -1200,6 +1346,7 @@ mod tests {
                 "c",
                 TemplateState {
                     directive: "C.".to_string(),
+                    details: String::new(),
                     transitions: vec![],
                     terminal: true,
                     gates: BTreeMap::new(),
@@ -1240,6 +1387,7 @@ mod tests {
                 "start",
                 TemplateState {
                     directive: "Start.".to_string(),
+                    details: String::new(),
                     transitions: vec![conditional("middle", vec![("go", serde_json::json!(true))])],
                     terminal: false,
                     gates: BTreeMap::new(),
@@ -1252,6 +1400,7 @@ mod tests {
                 "middle",
                 TemplateState {
                     directive: "Middle.".to_string(),
+                    details: String::new(),
                     transitions: vec![conditional("end", vec![("go", serde_json::json!(true))])],
                     terminal: false,
                     gates: BTreeMap::new(),
@@ -1264,6 +1413,7 @@ mod tests {
                 "end",
                 TemplateState {
                     directive: "End.".to_string(),
+                    details: String::new(),
                     transitions: vec![],
                     terminal: true,
                     gates: BTreeMap::new(),
@@ -1323,6 +1473,7 @@ mod tests {
             "act",
             TemplateState {
                 directive: "Act.".to_string(),
+                details: String::new(),
                 transitions: vec![conditional(
                     "done",
                     vec![("result", serde_json::json!("ok"))],
@@ -1372,6 +1523,7 @@ mod tests {
             "plain",
             TemplateState {
                 directive: "Plain.".to_string(),
+                details: String::new(),
                 transitions: vec![conditional(
                     "done",
                     vec![("result", serde_json::json!("ok"))],
@@ -1413,6 +1565,7 @@ mod tests {
             "confirm",
             TemplateState {
                 directive: "Confirm.".to_string(),
+                details: String::new(),
                 transitions: vec![unconditional("next")],
                 terminal: false,
                 gates: BTreeMap::new(),
@@ -1482,6 +1635,7 @@ mod tests {
             "gated_action",
             TemplateState {
                 directive: "Gated action.".to_string(),
+                details: String::new(),
                 transitions: vec![unconditional("next")],
                 terminal: false,
                 gates,
@@ -1532,6 +1686,7 @@ mod tests {
                 "act",
                 TemplateState {
                     directive: "Act.".to_string(),
+                    details: String::new(),
                     transitions: vec![unconditional("done")],
                     terminal: false,
                     gates: BTreeMap::new(),
@@ -1544,6 +1699,7 @@ mod tests {
                 "done",
                 TemplateState {
                     directive: "Done.".to_string(),
+                    details: String::new(),
                     transitions: vec![],
                     terminal: true,
                     gates: BTreeMap::new(),
@@ -1594,6 +1750,7 @@ mod tests {
                 "check",
                 TemplateState {
                     directive: "Check.".to_string(),
+                    details: String::new(),
                     transitions: vec![conditional(
                         "done",
                         vec![("result", serde_json::json!("ok"))],
@@ -1609,6 +1766,7 @@ mod tests {
                 "done",
                 TemplateState {
                     directive: "Done.".to_string(),
+                    details: String::new(),
                     transitions: vec![],
                     terminal: true,
                     gates: BTreeMap::new(),

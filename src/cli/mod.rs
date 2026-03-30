@@ -1705,7 +1705,7 @@ fn handle_next(
                         blocking_conditions: blocking,
                     }
                 }
-                StopReason::EvidenceRequired => {
+                StopReason::EvidenceRequired { .. } => {
                     // The engine only returns EvidenceRequired when accepts is Some,
                     // so expects is always populated here.
                     let es = expects.unwrap_or_else(|| ExpectsSchema {
