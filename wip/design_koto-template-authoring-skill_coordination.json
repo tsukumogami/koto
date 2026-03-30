@@ -1,10 +1,10 @@
 {
   "topic": "koto-template-authoring-skill",
   "decisions": [
-    {"id": 1, "question": "What phases does the authoring skill go through, and what input modes does it support (new from scratch vs converting existing prose skills)?", "status": "pending", "complexity": "standard"},
-    {"id": 2, "question": "What reference material does the skill bundle, and how does it present koto template knowledge to the agent (full spec, condensed guide, examples, or combination)?", "status": "pending", "complexity": "standard"},
-    {"id": 3, "question": "Should the authoring skill itself use a koto template as its execution engine (self-hosting/dog-fooding)?", "status": "pending", "complexity": "standard"}
+    {"id": 1, "question": "What phases does the authoring skill go through, and what input modes does it support (new from scratch vs converting existing prose skills)?", "status": "complete", "complexity": "standard", "report": "wip/design_koto-template-authoring-skill_decision_1_report.md"},
+    {"id": 2, "question": "What reference material does the skill bundle, and how does it present koto template knowledge to the agent (full spec, condensed guide, examples, or combination)?", "status": "complete", "complexity": "standard", "report": "wip/design_koto-template-authoring-skill_decision_2_report.md"},
+    {"id": 3, "question": "Should the authoring skill itself use a koto template as its execution engine (self-hosting/dog-fooding)?", "status": "complete", "complexity": "standard", "report": "wip/design_koto-template-authoring-skill_decision_3_report.md"}
   ],
-  "cross_validation": "pending",
+  "cross_validation": "passed",
   "round": 0
 }
