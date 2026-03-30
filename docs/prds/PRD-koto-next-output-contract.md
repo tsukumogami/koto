@@ -143,14 +143,16 @@ How template authors specify the summary/details split (markdown separator, YAML
 
 **R12. Error response consistency.** All error responses (exit 1, 2, 3) must use the structured `NextError` format: `{"error": {"code": "<string>", "message": "<string>", "details": [...]}}`. Unstructured error shapes (`{"error": "<string>", "command": "next"}`) must be migrated to the structured format.
 
-**R13. Caller documentation updates.** The koto-skills plugin's AGENTS.md is the primary document AI agents read at runtime to understand `koto next` responses. It must be updated atomically with the contract changes:
-- All `action: "execute"` references updated to descriptive action values (`evidence_required`, `gate_blocked`)
-- JSON examples updated with new action values
-- Error code table expanded with `template_error`, `persistence_error`, `concurrent_access`
-- `blocking_conditions` documented on `EvidenceRequired` responses (not just `GateBlocked`)
-- `details` field documented with first-visit/subsequent-visit behavior and `--full` flag
-- `advanced` field definition added ("at least one state transition during this invocation, informational only")
-- The `.cursor/rules/koto.mdc` file must also be updated (it still references the removed `koto transition` command and outdated response shapes)
+**R13. Caller and authoring documentation updates.** Documentation that references `koto next` response shapes must be updated atomically with the contract changes. Affected files:
+
+*Caller-facing (what agents read at runtime):*
+- **AGENTS.md**: All `action: "execute"` references updated to descriptive action values. JSON examples updated. Error code table expanded with `template_error`, `persistence_error`, `concurrent_access`. `blocking_conditions` documented on `EvidenceRequired` responses. `details` field documented with first-visit/subsequent-visit behavior and `--full` flag. `advanced` field definition added.
+- **`.cursor/rules/koto.mdc`**: Updated to current `koto next` API (still references removed `koto transition` command and outdated response shapes).
+
+*Template authoring (what skill authors read when writing templates):*
+- **koto-author SKILL.md** (`plugins/koto-skills/skills/koto-author/SKILL.md`): The koto execution loop section (lines 46-50) describes the generic "run next, do work, submit evidence" pattern but doesn't mention distinct action values for gates, confirmations, or integrations. Must be updated so template authors understand what response shapes their template features produce for callers.
+- **template-format.md** (`plugins/koto-skills/skills/koto-author/references/template-format.md`): The template format guide teaches how to write templates. Must explain the mapping from template features (gates, accepts, terminals, integrations) to caller-visible action values (`gate_blocked`, `evidence_required`, `done`, etc.) and how the `details` split works in directive body sections.
+- **Example templates**: The koto-author's own template and bundled examples should demonstrate the `details` marker convention (once the design doc determines the template source format).
 
 ## Acceptance criteria
 
@@ -178,6 +180,9 @@ How template authors specify the summary/details split (markdown separator, YAML
 - [ ] AGENTS.md documents `blocking_conditions` on `EvidenceRequired` responses
 - [ ] AGENTS.md documents the `details` field and `--full` flag
 - [ ] `.cursor/rules/koto.mdc` uses current `koto next` API (no `koto transition` references)
+- [ ] koto-author SKILL.md execution loop section references distinct action values (not just generic "run next, submit evidence")
+- [ ] template-format.md documents the mapping from template features (gates, accepts, terminals) to caller-visible action values
+- [ ] At least one example template demonstrates the `details` directive split
 - [ ] `template_error` (exit 3) and `persistence_error` (exit 3) are distinguishable by `error.code`
 - [ ] First visit to a state with `details` defined returns both `directive` and `details` in the response
 - [ ] Subsequent visits to the same state omit `details` from the response
