@@ -27,16 +27,14 @@ The skill supports two modes, selected at init time:
 
 ```bash
 koto init --template ${CLAUDE_SKILL_DIR}/koto-templates/koto-author.md \
-  --var MODE=new \
-  --var KOTO_REPO=<path-to-koto-repo>
+  --var MODE=new
 ```
 
 ### Converting an existing skill
 
 ```bash
 koto init --template ${CLAUDE_SKILL_DIR}/koto-templates/koto-author.md \
-  --var MODE=convert \
-  --var KOTO_REPO=<path-to-koto-repo>
+  --var MODE=convert
 ```
 
 ### Workflow loop
@@ -56,9 +54,11 @@ The skill bundles reference material for template authoring:
 - **Example templates**: `${CLAUDE_SKILL_DIR}/references/examples/` -- graded examples at increasing complexity
 - **hello-koto**: `plugins/koto-skills/skills/hello-koto/hello-koto.md` -- the simplest koto template (good starting point)
 
-For SKILL.md conventions, see `docs/guides/custom-skill-authoring.md` in the koto repository.
+Additional guides are available at https://github.com/tsukumogami/koto/tree/main/docs/guides. To list them:
 
-For supplementary guides that may have been added after this skill was installed, browse `<KOTO_REPO>/docs/guides/`.
+```bash
+gh api repos/tsukumogami/koto/contents/docs/guides --jq '.[].name'
+```
 
 ## Resuming interrupted sessions
 

@@ -8,9 +8,6 @@ variables:
   MODE:
     description: "Authoring mode: 'new' to create from scratch, 'convert' to migrate an existing prose skill"
     required: true
-  KOTO_REPO:
-    description: "Path to the koto repository for dynamic guide discovery"
-    required: true
 
 states:
   entry:
@@ -109,7 +106,13 @@ Gather the information needed to design the skill's state machine.
 - What triggers transitions between phases? Are there decision points?
 - What's the expected shape -- linear, branching, looping?
 
-Read `{{KOTO_REPO}}/docs/guides/` for supplementary material on template patterns and conventions.
+For supplementary material on template patterns, check the koto guides:
+
+```bash
+gh api repos/tsukumogami/koto/contents/docs/guides --jq '.[].name'
+```
+
+Read any relevant guide with `gh api repos/tsukumogami/koto/contents/docs/guides/<name> --jq '.content' | base64 -d`.
 
 **If {{MODE}} is "convert":** Read the existing SKILL.md that you're converting. Break it down:
 
@@ -203,7 +206,11 @@ Write or refactor the SKILL.md to work with the koto template.
 - Resume instructions for interrupted sessions -- `koto status` to check state, `koto next` to pick up where you left off.
 - References to `${CLAUDE_SKILL_DIR}/references/template-format.md` and `${CLAUDE_SKILL_DIR}/references/examples/` for agents who want to understand the underlying template.
 
-Read `{{KOTO_REPO}}/docs/guides/custom-skill-authoring.md` for SKILL.md structure conventions.
+For SKILL.md structure conventions, read the custom skill authoring guide:
+
+```bash
+gh api repos/tsukumogami/koto/contents/docs/guides/custom-skill-authoring.md --jq '.content' | base64 -d
+```
 
 **If {{MODE}} is "convert":** Refactor the existing SKILL.md:
 
