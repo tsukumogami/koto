@@ -8,6 +8,18 @@ problem: |
   reading docs and existing templates. A skill that guides Claude Code agents through
   authoring both the SKILL.md and its bundled koto template would lower the barrier
   and produce more consistent output.
+decision: |
+  Build a self-hosted koto-backed skill (koto-author) within the existing koto-skills
+  plugin. The skill uses a unified 8-state koto template to orchestrate authoring for
+  both new and conversion modes. Reference material consists of a condensed format guide
+  and graded example templates. A compile validation self-loop enforces structural
+  correctness before advancing.
+rationale: |
+  Self-hosting means the skill's own template is a living, inspectable example of what
+  it produces. The unified workflow keeps the template compact (8 states vs 14+ for a
+  forked approach). The condensed guide plus examples balances knowledge completeness
+  with context efficiency. The compile validation gate replaces prose-only instructions
+  that agents can skip, addressing the exact failure mode the shirabe PRD identified.
 ---
 
 # DESIGN: Koto template authoring skill
@@ -265,8 +277,11 @@ plugins/koto-skills/
 
 ### Key interfaces
 
-**Input (via koto template variable):**
-- `MODE`: "new" or "convert" -- determines directive behavior in each phase
+**Input (via koto init-time variable):**
+- `MODE`: "new" or "convert" -- set at `koto init` via `--var MODE=new`, determines
+  directive behavior in each phase. This is an init-time variable (not runtime evidence),
+  so the template's state graph doesn't branch on mode -- directives use `{{MODE}}` to
+  conditionally instruct the agent.
 
 **Output (produced by the agent during the workflow):**
 A new skill directory at a user-specified location:
@@ -280,15 +295,17 @@ A new skill directory at a user-specified location:
 **Koto integration:**
 The SKILL.md instructs agents to run:
 1. `koto init --template ${CLAUDE_SKILL_DIR}/koto-templates/koto-author.md`
-2. `koto next` to read the current directive
-3. `koto transition <state> --evidence '...'` to advance
+2. `koto next` to read the current directive and expected evidence schema
+3. `koto next --with-data '{"field": "value"}'` to submit evidence and advance
 4. Loop until the workflow reaches the done state
 
 **Compile validation gate:**
 The template's compile_validation state has a self-loop transition. The agent runs
 `koto template compile <drafted-template>` and submits the result as evidence.
-If compilation fails, the transition loops back to compile_validation (up to 3 times).
-On success, it advances to skill_authoring.
+If compilation fails, the transition loops back to compile_validation. On success,
+it advances to skill_authoring. The max-3 retry limit is enforced in the directive
+prose (the agent is instructed to stop and report after 3 failures), not by a koto
+engine mechanism. Koto doesn't have a built-in retry counter.
 
 ### Data flow
 
@@ -340,6 +357,10 @@ Intermediate artifacts during authoring:
 | compile_validation | context-exists: drafted template file | compile_result: pass/fail | pass -> skill_authoring, fail -> compile_validation |
 | skill_authoring | none | skill_authored: true | -> integration_check |
 | integration_check | context-exists: SKILL.md + template | checks_passed: true | -> done |
+
+Note: the integration_check directive should also verify that the output directory
+is within the expected target path (no path traversal) and that the template doesn't
+contain command gates with unsanitized variable interpolation.
 | done | none | none | (terminal) |
 
 ## Implementation Approach
@@ -347,13 +368,21 @@ Intermediate artifacts during authoring:
 ### Phase 1: Reference material
 
 Write the condensed format guide and graded example templates. These are
-self-contained and don't depend on the skill or template.
+self-contained and don't depend on the skill or template. The format guide
+should include a security note warning against variable interpolation in
+command gate strings.
+
+The existing hello-koto template can serve as the simple example (or its
+pattern can be referenced). The medium evidence-routing example is the
+genuinely new artifact. The SKILL.md authoring phase should reference the
+existing `docs/guides/custom-skill-authoring.md` for SKILL.md structure
+conventions.
 
 Deliverables:
-- `references/template-format.md` -- condensed authoring guide
-- `references/examples/linear-workflow.md` -- simple example
-- `references/examples/evidence-routing-workflow.md` -- medium example
-- `references/examples/complex-workflow.md` -- complex example
+- `references/template-format.md` -- condensed authoring guide (with command gate security note)
+- `references/examples/evidence-routing-workflow.md` -- medium example (new)
+- `references/examples/complex-workflow.md` -- complex example (new)
+- Reference to hello-koto as the simple example and custom-skill-authoring.md for SKILL.md conventions
 
 ### Phase 2: Koto template
 
@@ -411,3 +440,34 @@ Deliverables:
 - Graded examples complement the guide, reducing dependence on directive prose quality
 - The compiler catches the most common and most dangerous errors (structural issues,
   evidence routing conflicts); runtime quality improves as agents gain experience
+
+## Security Considerations
+
+This design has a minimal attack surface. The skill reads and writes local markdown
+files and runs a trusted local binary (`koto template compile`) -- both standard
+agent behaviors within the Claude Code sandbox.
+
+All four security dimensions were assessed:
+
+- **External artifact handling**: the skill doesn't download or execute external inputs.
+  In convert mode it reads existing SKILL.md files, which could theoretically contain
+  adversarial content that influences template drafting. This is a general LLM concern,
+  not specific to this design, and the `koto template compile` gate structurally
+  validates all output regardless of how it was influenced.
+- **Permission scope**: standard filesystem read/write within the working directory.
+  No elevated permissions, network access, or process spawning beyond the compiler.
+- **Supply chain**: no external dependencies. The skill, template, and reference
+  material are all bundled in the plugin.
+- **Data exposure**: no user data is transmitted. All artifacts stay local.
+
+One concern surfaced during review: koto's command gate implementation performs
+`{{VARIABLE}}` substitution in command strings before passing them to `sh -c`.
+Templates with command gates that interpolate user-supplied values could enable
+shell injection. This is a pre-existing koto concern (not introduced by this
+design), but the authoring skill amplifies it by teaching agents to write command
+gates. The condensed format guide should explicitly warn about this and recommend
+`context-exists` gates over command gates when checking for user-supplied paths.
+
+Produced templates should be reviewed by a human before deployment. The compiler
+validates structure but not intent -- a structurally valid template with a
+malicious command gate passes compilation.
