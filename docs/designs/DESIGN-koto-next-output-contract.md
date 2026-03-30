@@ -173,3 +173,163 @@ Documentation (AGENTS.md, koto.mdc, koto-author SKILL.md and template-format.md,
 The decisions reinforce each other through a clean layering: the template format decision (D1) feeds the compiler, the gate threading decision (D2) feeds the engine, and the visit counting decision (D3) feeds the persistence layer. All three converge at the CLI handler, which constructs `NextResponse` from compiled template data + engine results + visit counts. No decision constrains another.
 
 The breaking change to `action` values is the right trade-off: koto is pre-1.0, callers are internal skill plugins in the same repo, and the gain (callers dispatch on `action` alone, no field-presence reconstruction) is permanent. The `advanced` field stays unchanged because the breaking change budget is better spent on `action`, and the PRD formally defines `advanced` as informational-only.
+
+## Solution architecture
+
+### Overview
+
+The changes touch four code layers that converge at the CLI handler. Each layer is modified independently, and the handler orchestrates the data flow from template -> engine -> persistence -> serialization.
+
+### Components
+
+**1. Template compiler** (`src/template/compile.rs`)
+- `extract_directives` gains `<!-- details -->` splitting logic
+- `TemplateState` gains `details: String` field (`#[serde(default, skip_serializing_if = "String::is_empty")]`)
+- No changes to YAML frontmatter parsing
+
+**2. Engine advance** (`src/engine/advance.rs`)
+- `StopReason::EvidenceRequired` changes from unit variant to `EvidenceRequired { failed_gates: Option<BTreeMap<String, GateResult>> }`
+- `gate_results` hoisted from the gate evaluation block to be available at the EvidenceRequired construction site
+- All match arms on StopReason updated for destructuring
+
+**3. Persistence** (`src/engine/persistence.rs`)
+- New `derive_visit_counts(events: &[Event]) -> HashMap<String, usize>` function
+- Follows the existing `derive_*` pattern (pure function, `&[Event]` input)
+
+**4. CLI next_types** (`src/cli/next_types.rs`)
+- `NextResponse::EvidenceRequired` gains `blocking_conditions: Vec<BlockingCondition>` field (always present, empty when no gate issues)
+- All non-terminal variants gain `details: Option<String>` field
+- Custom `Serialize` impl changes action strings: `"execute"` -> variant-specific names
+- `Serialize` conditionally includes `details` (present when `Some`, absent when `None`)
+- New shared function: `blocking_conditions_from_gates(gate_results: &BTreeMap<String, GateResult>) -> Vec<BlockingCondition>`
+
+**5. CLI handler** (`src/cli/mod.rs`)
+- `NextErrorCode` gains `TemplateError`, `PersistenceError`, `ConcurrentAccess` variants with exit codes
+- The `Err(advance_err)` catch-all splits into per-variant mapping
+- Unstructured error paths migrated to `NextError` format
+- After `advance_until_stop` returns, calls `derive_visit_counts` and passes count to response construction
+- `--full` flag added to CLI arg parsing, bypasses visit check
+- Response construction populates `details` from `TemplateState.details` when visit count == 1 or `--full` is set
+
+**6. Documentation** (`plugins/koto-skills/`)
+- AGENTS.md: action values, error codes, blocking_conditions, details, advanced definition
+- `.cursor/rules/koto.mdc`: full rewrite to current API
+- koto-author SKILL.md: execution loop section updated
+- template-format.md: `<!-- details -->` documented as Layer 1 concept, feature-to-action mapping added
+- Example templates: at least one demonstrates `<!-- details -->`
+- koto-author's own template: dogfoods `<!-- details -->` on state_design and template_drafting
+
+### Key interfaces
+
+**Response JSON shapes (exit 0):**
+
+```
+action: "evidence_required"  -- state, directive, details?, advanced, expects, blocking_conditions, error: null
+action: "gate_blocked"       -- state, directive, details?, advanced, expects: null, blocking_conditions, error: null
+action: "integration"        -- state, directive, details?, advanced, expects?, integration, error: null
+action: "integration_unavailable" -- state, directive, details?, advanced, expects?, integration, error: null
+action: "confirm"            -- state, directive, details?, advanced, action_output, expects?, error: null
+action: "done"               -- state, advanced, expects: null, error: null
+```
+
+`details?` = present on first visit (or with `--full`), absent on subsequent visits and when state has no details.
+
+**Error JSON shape (exit 1, 2, 3):**
+
+```json
+{"error": {"code": "<string>", "message": "<string>", "details": [...]}}
+```
+
+All error paths use this format. No unstructured errors.
+
+**New error codes:**
+
+| Code | Exit | Replaces |
+|------|------|----------|
+| `template_error` | 3 | `precondition_failed` for CycleDetected, ChainLimitReached, AmbiguousTransition, DeadEndState, UnresolvableTransition, UnknownState |
+| `persistence_error` | 3 | `precondition_failed` for PersistenceError |
+| `concurrent_access` | 1 | `precondition_failed` for lock contention |
+
+### Data flow
+
+```
+Template .md --[compile]--> TemplateState { directive, details } --[load]-->
+                                                                            |
+Events .jsonl --[read]--> [Event] --[derive_visit_counts]--> HashMap -------+
+                                  --[derive_state_from_log]--> current_state |
+                                  --[merge_epoch_evidence]--> evidence ------+
+                                                                            |
+                           advance_until_stop(state, template, evidence) ----+
+                                       |                                    |
+                              AdvanceResult { stop_reason, advanced } ------+
+                                       |                                    |
+                              CLI handler: visit_count + stop_reason --------+
+                                       |                                    |
+                              NextResponse { action, directive, details?, blocking_conditions, ... }
+                                       |
+                              JSON serialization --> stdout
+```
+
+## Implementation approach
+
+### Phase 1: Engine and type changes
+
+Core Rust changes that don't affect the wire format yet.
+
+Deliverables:
+- `TemplateState.details` field in `src/template/types.rs`
+- `extract_directives` splitting in `src/template/compile.rs`
+- `StopReason::EvidenceRequired { failed_gates }` in `src/engine/advance.rs`
+- `derive_visit_counts` in `src/engine/persistence.rs`
+- `blocking_conditions_from_gates` shared helper in `src/cli/next_types.rs`
+- Updated tests for all of the above
+
+### Phase 2: Wire format changes
+
+The breaking changes to JSON output.
+
+Deliverables:
+- Action value rename in `NextResponse` custom Serialize impl
+- `blocking_conditions` field on `EvidenceRequired` serialization
+- `details` field on all non-terminal variants (conditional on visit count)
+- `--full` flag in CLI arg parsing
+- `NextErrorCode` new variants (`TemplateError`, `PersistenceError`, `ConcurrentAccess`)
+- Per-variant error mapping replacing the catch-all
+- Unstructured error migration to `NextError` format
+- Updated integration tests and functional feature tests
+
+### Phase 3: Documentation
+
+All doc updates, shipping with Phase 2.
+
+Deliverables:
+- AGENTS.md rewrite (action values, error codes, blocking_conditions, details, advanced)
+- `.cursor/rules/koto.mdc` rewrite
+- koto-author SKILL.md execution loop update
+- template-format.md `<!-- details -->` section + feature-to-action mapping
+- Example template with `<!-- details -->`
+- koto-author template dogfooding
+
+## Consequences
+
+### Positive
+
+- Callers dispatch on `action` alone -- no field-presence reconstruction needed
+- Error codes tell callers what to do (fix input / report template bug / retry) instead of lumping everything into "precondition failed"
+- Gate-with-evidence-fallback is visible: callers can see which gates failed and decide whether to override via evidence
+- Long directives don't waste context window on repeat visits
+- One authoritative contract spec (AGENTS.md) replaces scattered, inconsistent documentation
+
+### Negative
+
+- Breaking change to `action` values requires updating all callers in the same release
+- `EvidenceRequired` responses gain `blocking_conditions` (always-present array), adding ~20 bytes to every evidence-required response even when no gates are involved
+- `derive_visit_counts` scans the full event log on every `koto next` call, adding O(n) work proportional to workflow length
+- The `<!-- details -->` marker is a convention that authors must learn -- it's not self-documenting
+
+### Mitigations
+
+- All callers (AGENTS.md consumers, koto.mdc, koto-author skill) are in the same repo and updated atomically
+- The empty `blocking_conditions` array is ~25 bytes -- negligible compared to directive text
+- Typical workflows have tens to low hundreds of events; the full scan is sub-millisecond
+- The koto-author skill teaches the marker during the template_drafting phase, and template-format.md documents it as a Layer 1 concept
