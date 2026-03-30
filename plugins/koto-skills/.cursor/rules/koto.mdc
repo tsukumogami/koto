@@ -27,18 +27,16 @@ Workflow templates define the states, transitions, and gates for a koto workflow
 Before running a workflow, ensure the template file exists at a stable project-local
 path.
 
-For the hello-koto workflow:
+For any koto-skills workflow:
 
-1. Check if `.koto/templates/hello-koto.md` already exists in the project.
-2. If not, create the directory and write the template there:
+1. Check if the template already exists at a stable project-local path (e.g., `.koto/templates/<name>.md`).
+2. If not, create the directory and copy the template there:
 
 ```bash
 mkdir -p .koto/templates
 ```
 
-Then write the template file to `.koto/templates/hello-koto.md` with the content from
-`plugins/koto-skills/skills/hello-koto/hello-koto.md` in the koto-skills plugin. If the
-plugin isn't installed locally, find the template in the koto repository at that path.
+The skill's SKILL.md specifies the template path via `${CLAUDE_SKILL_DIR}/koto-templates/<name>.md`.
 
 ## Execution Loop
 
@@ -47,13 +45,13 @@ Every koto workflow follows the same loop: init, next, execute, transition, repe
 ### 1. Initialize the workflow
 
 ```bash
-koto init --template .koto/templates/hello-koto.md --name hello --var SPIRIT_NAME=<name>
+koto init --template .koto/templates/<name>.md --name <session> --var KEY=value
 ```
 
 Returns JSON with the initial state:
 
 ```json
-{"state": "awakening"}
+{"state": "<initial_state>"}
 ```
 
 The template is compiled and cached on first init.
@@ -76,13 +74,8 @@ Returns JSON with an action, the current state, and a directive to execute:
 
 ### 3. Execute the directive
 
-Follow the instructions in the `directive` field. For hello-koto, create the
-greeting file:
-
-```bash
-mkdir -p wip
-echo "Greetings from <name> to the world." > wip/spirit-greeting.txt
-```
+Follow the instructions in the `directive` field. Do whatever work the directive
+describes, then advance the workflow.
 
 ### 4. Transition to the next state
 
@@ -90,12 +83,11 @@ echo "Greetings from <name> to the world." > wip/spirit-greeting.txt
 koto transition eternal
 ```
 
-The engine evaluates gates before allowing the transition. For hello-koto, the
-command gate runs `test -f wip/spirit-greeting.txt`. If the file exists, the
-transition succeeds:
+The engine evaluates gates before allowing the transition. If all gates pass,
+the transition succeeds:
 
 ```json
-{"state": "eternal"}
+{"state": "<next_state>"}
 ```
 
 If the gate fails, the transition is rejected with a gate error. Fix the issue
@@ -110,7 +102,7 @@ koto next
 When the workflow reaches a terminal state, `koto next` returns:
 
 ```json
-{"action": "done", "state": "eternal", "message": "workflow complete"}
+{"action": "done", "state": "<terminal_state>", "message": "workflow complete"}
 ```
 
 The workflow is finished. Report completion to the user.
@@ -118,8 +110,8 @@ The workflow is finished. Report completion to the user.
 ## Error Handling
 
 - **koto not found**: Tell the user to install koto and add it to PATH.
-- **Template not found**: Verify the template path. Copy the template to
-  `.koto/templates/hello-koto.md` if it's missing.
+- **Template not found**: Verify the template path. Copy the template from the
+  skill's `koto-templates/` directory to `.koto/templates/` if it's missing.
 - **Gate failure**: The transition's precondition isn't met. Read the error message,
   fix the issue, and retry `koto transition`.
 - **State file already exists**: A previous workflow may be active. Run

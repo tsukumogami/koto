@@ -2,5 +2,5 @@
   "name": "koto-skills",
   "version": "0.1.0",
   "description": "Workflow skills for koto -- the state machine engine for AI agent workflows",
-  "skills": ["./skills/hello-koto", "./skills/koto-author"]
+  "skills": ["./skills/koto-author"]
 }

@@ -168,7 +168,7 @@ For the mutual exclusivity constraint: if two conditional transitions from the s
 
 Pick an example from `${CLAUDE_SKILL_DIR}/references/examples/` that matches your workflow:
 
-- Simple linear flow with no branching? Inspect `hello-koto` (2 states, 1 gate).
+- Simple linear flow with no branching? This skill's own template is a mid-complexity reference. For the simplest possible structure, a template needs just 2 states (initial + terminal) with one transition.
 - Decision points where the agent chooses a path? Use `evidence-routing-workflow.md`.
 - Gates, retries, or precondition checks? Use `complex-workflow.md`.
 

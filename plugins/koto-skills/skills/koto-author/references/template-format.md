@@ -284,7 +284,6 @@ Prefer `context-exists` gates over `command` gates when checking paths or files 
 
 ## References
 
-- **Simple example**: [hello-koto](../../hello-koto/hello-koto.md) -- two states, one gate, one variable
 - **Evidence routing example**: [evidence-routing-workflow.md](examples/evidence-routing-workflow.md) -- branching with accepts/when
 - **Advanced example**: [complex-workflow.md](examples/complex-workflow.md) -- gates, self-loops, split topology
 - **SKILL.md conventions**: [Custom skill authoring guide](../../../../../docs/guides/custom-skill-authoring.md)

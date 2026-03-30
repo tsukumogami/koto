@@ -72,8 +72,7 @@ The skill bundles reference material, loaded during specific states:
 - **Example templates** (`${CLAUDE_SKILL_DIR}/references/examples/`) -- read during state_design. Pick the one matching your complexity:
   - Branching workflows? `evidence-routing-workflow.md`
   - Gates, retries, split topology? `complex-workflow.md`
-  - Simple linear flow? Inspect `hello-koto` instead
-- **hello-koto** -- the simplest koto template. Good for understanding basic syntax.
+  - Simple linear flow? This skill's own template is a good mid-complexity reference
 
 Additional guides are available at https://github.com/tsukumogami/koto/tree/main/docs/guides. To list them:
 
