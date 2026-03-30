@@ -143,6 +143,15 @@ How template authors specify the summary/details split (markdown separator, YAML
 
 **R12. Error response consistency.** All error responses (exit 1, 2, 3) must use the structured `NextError` format: `{"error": {"code": "<string>", "message": "<string>", "details": [...]}}`. Unstructured error shapes (`{"error": "<string>", "command": "next"}`) must be migrated to the structured format.
 
+**R13. Caller documentation updates.** The koto-skills plugin's AGENTS.md is the primary document AI agents read at runtime to understand `koto next` responses. It must be updated atomically with the contract changes:
+- All `action: "execute"` references updated to descriptive action values (`evidence_required`, `gate_blocked`)
+- JSON examples updated with new action values
+- Error code table expanded with `template_error`, `persistence_error`, `concurrent_access`
+- `blocking_conditions` documented on `EvidenceRequired` responses (not just `GateBlocked`)
+- `details` field documented with first-visit/subsequent-visit behavior and `--full` flag
+- `advanced` field definition added ("at least one state transition during this invocation, informational only")
+- The `.cursor/rules/koto.mdc` file must also be updated (it still references the removed `koto transition` command and outdated response shapes)
+
 ## Acceptance criteria
 
 - [ ] Every `NextResponse` variant's JSON shape is documented with field names, types, and presence rules
@@ -164,6 +173,11 @@ How template authors specify the summary/details split (markdown separator, YAML
 - [ ] When SIGTERM interrupts a multi-state advancement chain, the response is a valid shape for the state the engine stopped at
 - [ ] `EvidenceRequired` with empty `blocking_conditions` array (no gate issues) is distinguishable from `EvidenceRequired` with populated `blocking_conditions` (gate failure with evidence fallback)
 - [ ] Callers that don't inspect `blocking_conditions` or new error codes receive no regressions in existing response shapes
+- [ ] AGENTS.md JSON examples use descriptive action values (no `action: "execute"` references remain)
+- [ ] AGENTS.md error code table includes `template_error`, `persistence_error`, and `concurrent_access`
+- [ ] AGENTS.md documents `blocking_conditions` on `EvidenceRequired` responses
+- [ ] AGENTS.md documents the `details` field and `--full` flag
+- [ ] `.cursor/rules/koto.mdc` uses current `koto next` API (no `koto transition` references)
 - [ ] `template_error` (exit 3) and `persistence_error` (exit 3) are distinguishable by `error.code`
 - [ ] First visit to a state with `details` defined returns both `directive` and `details` in the response
 - [ ] Subsequent visits to the same state omit `details` from the response
@@ -175,7 +189,7 @@ How template authors specify the summary/details split (markdown separator, YAML
 - **Engine refactoring.** The auto-advancement loop, gate evaluation, and transition resolution logic are correct and not changing. This PRD specifies the output contract, not the engine internals.
 - **Template authoring guide.** How to write templates that produce good caller experiences is a separate concern.
 - **Stale documentation cleanup.** The 12+ files referencing `koto transition` (a removed command) need cleanup but aren't part of this contract specification.
-- **AGENTS.md vs. cli-usage.md consolidation.** Whether these docs should be merged or kept separate is an implementation decision, not a requirements question.
+- **AGENTS.md vs. cli-usage.md consolidation.** Whether these docs should be merged or kept separate is deferred. Both must be updated to reflect the new contract, but structural consolidation is a separate concern.
 - **`advanced` field rename or removal.** The field stays as-is with a formal definition. The breaking change budget is spent on descriptive `action` values, which provides more value than renaming `advanced`.
 - **Contract versioning.** Whether the output contract version is independent of the CLI version is deferred.
 
