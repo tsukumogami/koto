@@ -182,9 +182,9 @@ The changes touch four code layers that converge at the CLI handler. Each layer 
 
 ### Components
 
-**1. Template compiler** (`src/template/compile.rs`)
+**1. Template compiler** (`src/template/compile.rs`, `src/template/types.rs`)
 - `extract_directives` gains `<!-- details -->` splitting logic
-- `TemplateState` gains `details: String` field (`#[serde(default, skip_serializing_if = "String::is_empty")]`)
+- `TemplateState` gains `details: String` field in `src/template/types.rs` (`#[serde(default, skip_serializing_if = "String::is_empty")]`)
 - No changes to YAML frontmatter parsing
 
 **2. Engine advance** (`src/engine/advance.rs`)
@@ -201,9 +201,16 @@ The changes touch four code layers that converge at the CLI handler. Each layer 
 - All non-terminal variants gain `details: Option<String>` field
 - Custom `Serialize` impl changes action strings: `"execute"` -> variant-specific names
 - `Serialize` conditionally includes `details` (present when `Some`, absent when `None`)
+- `with_substituted_directive` extended to also apply `{{VARIABLE}}` substitution to the `details` field (same two-pass substitution as `directive`)
 - New shared function: `blocking_conditions_from_gates(gate_results: &BTreeMap<String, GateResult>) -> Vec<BlockingCondition>`
 
-**5. CLI handler** (`src/cli/mod.rs`)
+**5. CLI dispatch** (`src/cli/next.rs`)
+- `dispatch_next` is retained -- it's the only code path for `--to` directed transitions
+- Its gate-with-evidence-fallback logic (lines 60-73) is updated to use `blocking_conditions_from_gates` shared helper instead of inline conversion
+- The gate-to-EvidenceRequired fallback in `dispatch_next` stays because `--to` skips the advancement loop and needs its own classification
+- The doc comment ("five possible responses") corrected to six (includes ActionRequiresConfirmation)
+
+**6. CLI handler** (`src/cli/mod.rs`)
 - `NextErrorCode` gains `TemplateError`, `PersistenceError`, `ConcurrentAccess` variants with exit codes
 - The `Err(advance_err)` catch-all splits into per-variant mapping
 - Unstructured error paths migrated to `NextError` format
@@ -211,7 +218,7 @@ The changes touch four code layers that converge at the CLI handler. Each layer 
 - `--full` flag added to CLI arg parsing, bypasses visit check
 - Response construction populates `details` from `TemplateState.details` when visit count == 1 or `--full` is set
 
-**6. Documentation** (`plugins/koto-skills/`)
+**7. Documentation** (`plugins/koto-skills/`)
 - AGENTS.md: action values, error codes, blocking_conditions, details, advanced definition
 - `.cursor/rules/koto.mdc`: full rewrite to current API
 - koto-author SKILL.md: execution loop section updated
@@ -296,7 +303,7 @@ Deliverables:
 - `NextErrorCode` new variants (`TemplateError`, `PersistenceError`, `ConcurrentAccess`)
 - Per-variant error mapping replacing the catch-all
 - Unstructured error migration to `NextError` format
-- Updated integration tests and functional feature tests
+- Updated integration tests and functional feature tests (~12 serialization tests assert `action == "execute"` and need updating)
 
 ### Phase 3: Documentation
 
