@@ -52,34 +52,36 @@ This isn't a naming problem. It's an absent contract. The engine's behavior is c
 
 ### Functional requirements
 
-**R1. Response shape catalog.** `koto next` must produce exactly one of these success response shapes (exit 0):
+**R1. Response shape catalog.** `koto next` must produce exactly one of these success response shapes (exit 0). The `action` field carries the shape name directly -- callers dispatch on `action`, not on field presence:
 
-| Shape | `action` | Distinguishing fields |
-|-------|----------|----------------------|
-| EvidenceRequired | `"execute"` | `expects` is non-null object |
-| GateBlocked | `"execute"` | `blocking_conditions` is non-empty array |
-| Integration | `"execute"` | `integration.output` present |
-| IntegrationUnavailable | `"execute"` | `integration.available` is `false` |
-| Terminal | `"done"` | No `directive` field |
-| ActionRequiresConfirmation | `"confirm"` | `action_output` present |
+| Shape | `action` |
+|-------|----------|
+| EvidenceRequired | `"evidence_required"` |
+| GateBlocked | `"gate_blocked"` |
+| Integration | `"integration"` |
+| IntegrationUnavailable | `"integration_unavailable"` |
+| Terminal | `"done"` |
+| ActionRequiresConfirmation | `"confirm"` |
 
-A bare `execute` response with only `state`, `directive`, and `advanced` (no `expects`, `blocking_conditions`, or `integration`) is a passthrough state. This occurs after `koto next --to` lands on an auto-advanceable state (since `--to` doesn't trigger the advancement loop). Callers should call `koto next` again to trigger advancement. Under normal `koto next` (no `--to`), the engine auto-advances through passthrough states internally, so callers don't see this shape.
+The only loop control a caller needs is `action == "done"`. All other action values mean "the workflow isn't done, here's what's needed." The action value tells the caller exactly what kind of stop it hit, without inspecting other fields.
 
-**R2. `advanced` field definition.** The `advanced` field is present in every success response as a boolean. Its meaning: "at least one state transition occurred during this invocation of `koto next`." Callers must not use `advanced` to determine their next action. The response shape (determined by `action` and field presence) is the authoritative signal for caller behavior. `advanced` is informational context only.
+After `koto next --to` lands on an auto-advanceable state (no accepts, unconditional transition), the response reflects that state as `evidence_required` with empty `expects`. The caller should call `koto next` again to trigger the advancement loop. Under normal `koto next` (no `--to`), the engine auto-advances through these states internally.
+
+**R2. `advanced` field definition.** The `advanced` field is present in every success response as a boolean. Its meaning: "at least one state transition occurred during this invocation of `koto next`." Callers must not use `advanced` to determine their next action. The `action` field is the authoritative signal for caller behavior. `advanced` is informational context only.
 
 **R3. `advanced` consistency across code paths.** The `advanced` field must have the same semantic across all invocation modes:
 - Bare `koto next`: true if the advancement loop made at least one transition.
 - `koto next --with-data`: true if evidence submission triggered at least one transition.
 - `koto next --to`: true (a directed transition always constitutes a transition).
 
-**R4. Caller decision tree.** The documented caller contract must specify what callers should do for each response shape. The decision tree dispatches on exit code, then `action`, then field presence:
+**R4. Caller decision tree.** The documented caller contract must specify what callers should do for each response shape. The decision tree dispatches on exit code, then `action`:
 
 - `action: "done"` -> Stop. Workflow is complete.
+- `action: "evidence_required"` -> Read directive, do the work, submit evidence via `--with-data` matching `expects.fields`. If `blocking_conditions` is non-empty, gates failed but evidence can override (see R6).
+- `action: "gate_blocked"` -> Fix blocking conditions, call `koto next` again. Don't submit evidence.
+- `action: "integration"` -> Process `integration.output`. If `expects` is present, submit evidence. If `expects` is null, call `koto next` again.
+- `action: "integration_unavailable"` -> Integration runner is missing. The caller can: submit evidence if `expects` is present, use `--to` to skip to another state, or report to the user that the runner needs configuration (an out-of-band action).
 - `action: "confirm"` -> Read `action_output` (command, exit code, stdout, stderr). If `expects` is present, evaluate the output and submit evidence via `--with-data`. If `expects` is null, call `koto next` again to re-evaluate.
-- `action: "execute"` with `integration` present -> Process integration output. If `expects` is present, submit evidence. If integration is unavailable (`available: false`), the caller can: submit evidence if `expects` is present, use `--to` to skip to another state, or report to the user that the integration runner needs configuration (an out-of-band action).
-- `action: "execute"` with `blocking_conditions` present -> Fix blocking conditions, call `koto next` again. Don't submit evidence.
-- `action: "execute"` with `expects` present (non-null) -> Read directive, do the work, submit evidence via `--with-data` matching `expects.fields`.
-- `action: "execute"` with no `expects`, no `blocking_conditions`, no `integration` -> Passthrough state. Call `koto next` again.
 
 **R5. Error code categories.** Error responses must use distinct codes that tell callers which category of failure occurred:
 
@@ -126,7 +128,7 @@ Specific mapping:
 
 ### Non-functional requirements
 
-**R10. Backward compatibility.** Adding `blocking_conditions` to `EvidenceRequired` responses and adding new error codes (`template_error`, `persistence_error`, `concurrent_access`) are additive changes. Callers that don't inspect these new fields continue to work. The `advanced` field is not removed or renamed.
+**R10. Backward compatibility.** The `action` field values change from `"execute"` to descriptive names (`"evidence_required"`, `"gate_blocked"`, `"integration"`, `"integration_unavailable"`). This is a breaking change for callers that match on `action == "execute"`. The `"done"` and `"confirm"` values are unchanged. Adding `blocking_conditions` to `EvidenceRequired` responses and adding new error codes (`template_error`, `persistence_error`, `concurrent_access`) are additive changes. The `advanced` field is not removed or renamed.
 
 **R11. Error response consistency.** All error responses (exit 1, 2, 3) must use the structured `NextError` format: `{"error": {"code": "<string>", "message": "<string>", "details": [...]}}`. Unstructured error shapes (`{"error": "<string>", "command": "next"}`) must be migrated to the structured format.
 
@@ -134,8 +136,9 @@ Specific mapping:
 
 - [ ] Every `NextResponse` variant's JSON shape is documented with field names, types, and presence rules
 - [ ] The `advanced` field definition ("at least one state transition during this invocation") appears in user-facing documentation
-- [ ] Documentation explicitly states that callers dispatch on `action` + field presence, not on `advanced`
-- [ ] A complete caller decision tree covers all response shapes (EvidenceRequired, GateBlocked, Integration, IntegrationUnavailable, Terminal, ActionRequiresConfirmation)
+- [ ] Documentation explicitly states that callers dispatch on `action`, not on `advanced` or field presence
+- [ ] The `action` field carries descriptive shape names: `evidence_required`, `gate_blocked`, `integration`, `integration_unavailable`, `done`, `confirm`
+- [ ] A complete caller decision tree covers all six `action` values
 - [ ] Error code `template_error` (exit 3) exists for cycle detection, chain limit, ambiguous transition, dead-end state, unresolvable transition, and unknown state
 - [ ] Error code `persistence_error` (exit 3) exists for disk I/O failures
 - [ ] Error code `concurrent_access` (exit 1) exists for lock contention
@@ -158,7 +161,7 @@ Specific mapping:
 - **Template authoring guide.** How to write templates that produce good caller experiences is a separate concern.
 - **Stale documentation cleanup.** The 12+ files referencing `koto transition` (a removed command) need cleanup but aren't part of this contract specification.
 - **AGENTS.md vs. cli-usage.md consolidation.** Whether these docs should be merged or kept separate is an implementation decision, not a requirements question.
-- **`advanced` field rename or removal.** The field stays as-is with a formal definition. Renaming would be a breaking change with limited benefit over clear documentation.
+- **`advanced` field rename or removal.** The field stays as-is with a formal definition. The breaking change budget is spent on descriptive `action` values, which provides more value than renaming `advanced`.
 - **Contract versioning.** Whether the output contract version is independent of the CLI version is deferred.
 
 ## Known limitations
@@ -171,7 +174,10 @@ Specific mapping:
 ## Decisions and trade-offs
 
 **D1. Keep `advanced` rather than rename or deprecate.**
-Renaming to `state_changed` or `transitioned` would be a breaking change to the JSON wire format. Adding a companion field (like `transitions_made: u32`) was considered but adds complexity for a signal callers shouldn't dispatch on. The chosen path: formal definition + documentation that callers use `action` + field presence, not `advanced`. Alternatives: rename (breaking), deprecate (removes useful context), add companion field (marginal value).
+Renaming to `state_changed` or `transitioned` would be a breaking change to the JSON wire format. Adding a companion field (like `transitions_made: u32`) was considered but adds complexity for a signal callers shouldn't dispatch on. The chosen path: formal definition + documentation that callers use `action`, not `advanced`. Alternatives: rename (breaking), deprecate (removes useful context), add companion field (marginal value).
+
+**D6. Descriptive `action` values instead of generic `"execute"`.**
+The original design used `"execute"` for all non-terminal, non-confirm shapes, requiring callers to reconstruct the shape from field presence. This forced a field-presence dance (`if expects... elif blocking_conditions... elif integration...`) that the action field should have handled. The fix: `action` carries the shape name directly (`"evidence_required"`, `"gate_blocked"`, `"integration"`, `"integration_unavailable"`). The terminal check (`action == "done"`) stays simple. This is a breaking change for callers matching `action == "execute"`, but koto is pre-1.0 and the current callers are internal skill plugins that will be updated alongside the contract. Alternative: keep `"execute"` and add a `shape` field (rejected: two fields for the same information, `action` is the natural discriminator).
 
 **D2. Add `blocking_conditions` to `EvidenceRequired` rather than a new response variant.**
 A new variant (`EvidenceRequiredWithGateContext`) would fragment the response space for what's the same caller action (submit evidence). An always-present `blocking_conditions` array on `EvidenceRequired` (empty when no gate issues) is additive, backward-compatible, and keeps the type system simple. Alternative: optional `gate_context` nested object (rejected: adds unnecessary nesting).
