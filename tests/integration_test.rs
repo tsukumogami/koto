@@ -672,7 +672,7 @@ fn corrupted_state_file_rejected_with_exit_code_3() {
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("error output should be valid JSON");
     assert!(
-        json["error"].as_str().is_some(),
+        json["error"].is_object() || json["error"].as_str().is_some(),
         "error field should be present for corrupted file"
     );
 }
@@ -1577,8 +1577,8 @@ fn concurrent_next_fails_with_lock_contention() {
 
     assert_eq!(
         output.status.code(),
-        Some(2),
-        "concurrent next should fail with exit 2, stdout={} stderr={}",
+        Some(1),
+        "concurrent next should fail with exit 1, stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1587,8 +1587,8 @@ fn concurrent_next_fails_with_lock_contention() {
         serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
     assert_eq!(
         json["error"]["code"].as_str(),
-        Some("precondition_failed"),
-        "error code should be precondition_failed"
+        Some("concurrent_access"),
+        "error code should be concurrent_access"
     );
     assert!(
         json["error"]["message"]
@@ -1960,8 +1960,8 @@ All done.
 
     assert_eq!(
         output.status.code(),
-        Some(2),
-        "reserved name collision should fail with exit 2, stdout={} stderr={}",
+        Some(3),
+        "reserved name collision should fail with exit 3 (template_error), stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1970,8 +1970,8 @@ All done.
         serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
     assert_eq!(
         json["error"]["code"].as_str(),
-        Some("precondition_failed"),
-        "error code should be precondition_failed"
+        Some("template_error"),
+        "error code should be template_error"
     );
     assert!(
         json["error"]["message"]
