@@ -141,9 +141,9 @@ Key assumptions: agents benefit more from pattern-matching against annotated exa
 than from specification prose, and the compiler's error messages are clear enough for
 self-correction.
 
-#### Chosen: Condensed authoring guide plus graded example templates
+#### Chosen: Condensed authoring guide plus graded examples plus dynamic repo discovery
 
-Two types of reference material in the skill's references/ directory:
+Three layers of reference material:
 
 1. **A condensed template format guide** (~200-250 lines) covering YAML frontmatter
    schema, state/transition declarations, accepts/when evidence routing, gate types,
@@ -151,13 +151,20 @@ Two types of reference material in the skill's references/ directory:
    layers so agents can stop reading after the layer matching their target complexity.
    Each section includes a minimal YAML snippet.
 
-2. **Two or three graded example templates** at increasing complexity: (a) a linear
-   3-state workflow with variables only, (b) a medium workflow with accepts/when evidence
-   routing, (c) a complex workflow with command gates, self-loops, and split topology.
+2. **Graded example templates** at increasing complexity: (a) a medium workflow with
+   accepts/when evidence routing, (b) a complex workflow with command gates, self-loops,
+   and split topology. Hello-koto serves as the simple example.
 
-The SKILL.md body covers the authoring workflow and directs agents to read the guide for
-format rules and choose an example for pattern matching. It doesn't embed format
-knowledge beyond a high-level overview.
+3. **Dynamic koto repo discovery.** The skill knows the path to koto's repository
+   (resolved at init time) and instructs agents to browse its `docs/guides/` directory
+   for supplementary material. This means guides added after the skill is installed are
+   still available -- the agent can list the directory, read relevant guides, and apply
+   what it learns. The SKILL.md includes the repo path as a variable and the template
+   directives reference it during context gathering and state design phases.
+
+The SKILL.md body covers the authoring workflow and directs agents to read the bundled
+guide for format rules, choose an example for pattern matching, and browse koto's guides
+for additional context. It doesn't embed format knowledge beyond a high-level overview.
 
 #### Alternatives considered
 
@@ -224,10 +231,11 @@ resubmits. A context-exists gate on the integration check state verifies that th
 output follows the coupling convention (template in koto-templates/, SKILL.md with
 correct ${CLAUDE_SKILL_DIR} references).
 
-Template format knowledge lives in references/ files: a ~200-250 line condensed guide
-organized by conceptual layer (structure, evidence routing, advanced), plus 2-3 graded
-example templates at increasing complexity. The SKILL.md stays lean -- it handles the
-koto execution loop and points agents to reference material when needed.
+Template format knowledge lives in three layers: a ~200-250 line condensed guide in
+references/ organized by conceptual layer, graded example templates at increasing
+complexity, and dynamic discovery of koto's `docs/guides/` directory for supplementary
+material that may be added after the skill is installed. The SKILL.md stays lean -- it
+handles the koto execution loop and points agents to reference material when needed.
 
 ### Rationale
 
@@ -277,11 +285,15 @@ plugins/koto-skills/
 
 ### Key interfaces
 
-**Input (via koto init-time variable):**
+**Input (via koto init-time variables):**
 - `MODE`: "new" or "convert" -- set at `koto init` via `--var MODE=new`, determines
   directive behavior in each phase. This is an init-time variable (not runtime evidence),
   so the template's state graph doesn't branch on mode -- directives use `{{MODE}}` to
   conditionally instruct the agent.
+- `KOTO_REPO`: path to the koto repository -- resolved by the SKILL.md at init time
+  (e.g., from the plugin's installed location or a well-known path). Used in directives
+  to point agents at `{{KOTO_REPO}}/docs/guides/` for dynamic discovery of supplementary
+  documentation.
 
 **Output (produced by the agent during the workflow):**
 A new skill directory at a user-specified location:
@@ -427,7 +439,8 @@ Deliverables:
 
 - v1 must be hand-written (bootstrapping cost), can't use the skill to build itself
 - The condensed format guide needs maintenance alongside the template format design
-  docs -- when the format evolves, two sources need updates
+  docs -- when the format evolves, two sources need updates (partially mitigated by
+  dynamic repo discovery, which surfaces new guides without skill updates)
 - Mode-conditional directives put prose quality burden on the template author -- if
   mode-specific instructions are unclear, agents may do the wrong thing for their mode
 - The skill can't catch runtime behavior issues -- templates that compile but produce
