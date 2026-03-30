@@ -944,8 +944,8 @@ fn next_integration_state_returns_integration_unavailable() {
 
     assert_eq!(
         json["action"].as_str(),
-        Some("execute"),
-        "action should be execute"
+        Some("integration_unavailable"),
+        "action should be integration_unavailable"
     );
     assert_eq!(
         json["state"].as_str(),
@@ -1134,8 +1134,8 @@ fn next_with_failing_gate_returns_gate_blocked() {
 
     assert_eq!(
         json["action"].as_str(),
-        Some("execute"),
-        "action should be execute"
+        Some("gate_blocked"),
+        "action should be gate_blocked"
     );
     assert_eq!(
         json["state"].as_str(),
@@ -1469,8 +1469,8 @@ fn auto_advance_reaches_verify_from_plan() {
     );
     assert_eq!(
         json["action"].as_str(),
-        Some("execute"),
-        "action should be execute at non-terminal state"
+        Some("evidence_required"),
+        "action should be evidence_required at non-terminal state"
     );
     assert!(
         json["expects"].is_object(),
@@ -1756,8 +1756,8 @@ fn gate_timeout_returns_gate_blocked() {
 
     assert_eq!(
         json["action"].as_str(),
-        Some("execute"),
-        "action should be execute"
+        Some("gate_blocked"),
+        "action should be gate_blocked"
     );
     assert!(
         json["error"].is_null(),
