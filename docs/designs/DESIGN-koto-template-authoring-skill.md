@@ -35,6 +35,15 @@ doesn't know about koto templates. We need a koto-native equivalent that produce
 both the skill definition (what to do) and the template (how to do it) as a paired
 unit.
 
+The shirabe koto adoption PRD (tsukumogami/shirabe#48) provides immediate context:
+7 existing skills need koto template conversions. Each follows the same pattern --
+extract phases from prose SKILL.md, encode as koto states with gates and transitions,
+maintain separation of concerns (SKILL.md = what to achieve, template = how to get
+there). The PRD documents that 60-80% of current SKILL.md line counts are duplicated
+workflow boilerplate (resume logic, phase ordering, gate checks), and that this
+duplication causes real failures: phase skipping, lost decisions, brittle resume.
+These 7 conversions are the immediate use case for this skill.
+
 ## Decision drivers
 
 - The skill must teach agents how to write valid koto templates, not just generate them blindly
@@ -43,6 +52,8 @@ unit.
 - Distribution should use koto's existing marketplace infrastructure
 - The teaching approach should layer concepts: linear workflows first, then evidence routing, then advanced features
 - The skill-creator's workflow pattern (capture intent, draft, validate, iterate) is proven and should be adapted
+- The shirabe koto adoption PRD identifies 7 skills needing conversion, establishing concrete patterns: gate selection (7+ types), fan-out collection (parallel agents + glob gate), graceful degradation (skills must work without koto), and phase decomposition from existing prose
+- The skill should be aware of koto's evolving feature surface -- templates shouldn't depend on unshipped features without flagging it
 
 ## Decisions already made
 
