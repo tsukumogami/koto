@@ -63,6 +63,8 @@ This isn't a naming problem. It's an absent contract. The engine's behavior is c
 | Terminal | `"done"` | No `directive` field |
 | ActionRequiresConfirmation | `"confirm"` | `action_output` present |
 
+A bare `execute` response with only `state`, `directive`, and `advanced` (no `expects`, `blocking_conditions`, or `integration`) is a passthrough state. This occurs after `koto next --to` lands on an auto-advanceable state (since `--to` doesn't trigger the advancement loop). Callers should call `koto next` again to trigger advancement. Under normal `koto next` (no `--to`), the engine auto-advances through passthrough states internally, so callers don't see this shape.
+
 **R2. `advanced` field definition.** The `advanced` field is present in every success response as a boolean. Its meaning: "at least one state transition occurred during this invocation of `koto next`." Callers must not use `advanced` to determine their next action. The response shape (determined by `action` and field presence) is the authoritative signal for caller behavior. `advanced` is informational context only.
 
 **R3. `advanced` consistency across code paths.** The `advanced` field must have the same semantic across all invocation modes:
@@ -73,8 +75,8 @@ This isn't a naming problem. It's an absent contract. The engine's behavior is c
 **R4. Caller decision tree.** The documented caller contract must specify what callers should do for each response shape. The decision tree dispatches on exit code, then `action`, then field presence:
 
 - `action: "done"` -> Stop. Workflow is complete.
-- `action: "confirm"` -> Read `action_output`, review the result, submit evidence via `--with-data` if `expects` is present, otherwise call `koto next` again.
-- `action: "execute"` with `integration` present -> Process integration output. If `expects` is present, submit evidence. If integration is unavailable, install the runner or use `--to` to skip.
+- `action: "confirm"` -> Read `action_output` (command, exit code, stdout, stderr). If `expects` is present, evaluate the output and submit evidence via `--with-data`. If `expects` is null, call `koto next` again to re-evaluate.
+- `action: "execute"` with `integration` present -> Process integration output. If `expects` is present, submit evidence. If integration is unavailable (`available: false`), the caller can: submit evidence if `expects` is present, use `--to` to skip to another state, or report to the user that the integration runner needs configuration (an out-of-band action).
 - `action: "execute"` with `blocking_conditions` present -> Fix blocking conditions, call `koto next` again. Don't submit evidence.
 - `action: "execute"` with `expects` present (non-null) -> Read directive, do the work, submit evidence via `--with-data` matching `expects.fields`.
 - `action: "execute"` with no `expects`, no `blocking_conditions`, no `integration` -> Passthrough state. Call `koto next` again.
@@ -84,9 +86,8 @@ This isn't a naming problem. It's an absent contract. The engine's behavior is c
 | Category | Exit code | Caller action |
 |----------|-----------|---------------|
 | Caller error (fixable input) | 2 | Fix the input and retry |
-| Template/structural error | 3 | Report to user; agent can't fix |
+| Template or infrastructure error | 3 | Report to user; agent can't fix. Distinguish by `error.code`: `template_error` means the template is malformed, `persistence_error` means I/O failure. |
 | Transient error | 1 | Wait and retry |
-| Infrastructure error | 3 | Report to user; not a caller problem |
 
 Specific mapping:
 
@@ -110,7 +111,7 @@ Specific mapping:
 | Gate blocked (from dispatch path) | `gate_blocked` | 1 |
 | Integration unavailable | `integration_unavailable` | 1 |
 
-**R6. Gate-with-evidence-fallback visibility.** When gates fail on a state that has an `accepts` block, the response must be `EvidenceRequired` (not `GateBlocked`) with `blocking_conditions` included as an array. An empty `blocking_conditions` array means no gate issues. A populated array means gates failed but evidence can override. This lets callers distinguish normal evidence requests from gate-failure overrides.
+**R6. Gate-with-evidence-fallback visibility.** When gates fail on a state that has an `accepts` block, the response must be `EvidenceRequired` (not `GateBlocked`) with `blocking_conditions` included as an array. An empty `blocking_conditions` array means no gate issues. A populated array means gates failed but the state accepts evidence -- submitting valid evidence that matches a conditional transition advances the workflow past the failed gates. Gates are not re-evaluated; the evidence submission resolves the transition directly.
 
 **R7. `--to` behavior contract.** `koto next --to <target>` is a single-shot directed transition. It must:
 - Validate the target is a legal transition from the current state
@@ -121,7 +122,7 @@ Specific mapping:
 
 **R8. `--to` does not chain auto-advancement.** After a directed transition, the caller receives the target state's classification. If the target is an auto-advanceable state (no accepts, unconditional transition), the response reflects that state -- the caller must call `koto next` again to trigger the advancement loop. This is intentional: the caller chose a destination and should see it.
 
-**R9. SignalReceived transparency.** When SIGTERM/SIGINT interrupts the advancement loop, the response degrades to whichever shape fits the state the engine stopped at. The caller sees a normal-looking response with no indication of interruption. This is the intended contract: the response is valid for the stopped-at state, and calling `koto next` again continues correctly.
+**R9. SignalReceived transparency.** When SIGTERM/SIGINT interrupts the advancement loop, the response resolves to a fully valid response shape for the state the engine stopped at. The caller sees a normal response with no interruption indicator. This is the intended contract: the response is complete and valid for the stopped-at state, and calling `koto next` again continues correctly from that state.
 
 ### Non-functional requirements
 
@@ -141,8 +142,15 @@ Specific mapping:
 - [ ] `EvidenceRequired` responses include a `blocking_conditions` field (empty array when no gate issues, populated when gates failed with evidence fallback)
 - [ ] `--to` does not trigger auto-advancement or gate evaluation on the target state
 - [ ] All error responses use the structured `NextError` format (no unstructured error shapes)
-- [ ] Calling `koto next` twice on a gate-blocked state (without fixing gates) returns `advanced: false` on the second call
+- [ ] Calling `koto next` twice on a gate-blocked state (without fixing gates) returns `advanced: false` on both calls (no transitions occur in either invocation)
 - [ ] `koto next --to <current_state>` returns `advanced: true` (a directed transition is always a transition)
+- [ ] `koto next --with-data` returns `advanced: true` when evidence submission triggers at least one transition
+- [ ] Bare `koto next` on a state requiring evidence (no prior transitions) returns `advanced: false`
+- [ ] `koto next --to <invalid_target>` returns `precondition_failed` with exit code 2
+- [ ] When SIGTERM interrupts a multi-state advancement chain, the response is a valid shape for the state the engine stopped at
+- [ ] `EvidenceRequired` with empty `blocking_conditions` array (no gate issues) is distinguishable from `EvidenceRequired` with populated `blocking_conditions` (gate failure with evidence fallback)
+- [ ] Callers that don't inspect `blocking_conditions` or new error codes receive no regressions in existing response shapes
+- [ ] `template_error` (exit 3) and `persistence_error` (exit 3) are distinguishable by `error.code`
 
 ## Out of scope
 
