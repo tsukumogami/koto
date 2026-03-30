@@ -150,6 +150,8 @@ Submit `phases_identified: done` when you have a list of states and know how the
 
 Define the full state machine: states, transitions, evidence routing, gates, and variables.
 
+<!-- details -->
+
 Read the template format guide at `${CLAUDE_SKILL_DIR}/references/template-format.md`. Read only the layers you need:
 
 - **Layer 1 (Structure)** -- always read this. Covers states, transitions, variables, terminal states.
@@ -177,6 +179,8 @@ Submit `states_designed: done` when the state machine design is complete.
 ## template_drafting
 
 Write the koto template as a markdown file with YAML frontmatter and directive body sections.
+
+<!-- details -->
 
 Place the file at `<target-dir>/koto-templates/<skill-name>.md`. The frontmatter defines the state machine (name, version, description, initial_state, variables, states). The body contains `## <state_name>` sections with the directive text the agent receives in each state.
 

@@ -73,7 +73,9 @@ Compile the application, package it as `build-output.tar.gz`, and submit it to t
 
 ## test
 
-Run the test suite against the build for {{VERSION}}.
+Run the test suite against the build for {{VERSION}}. Submit `pass` or `fail` when done.
+
+<!-- details -->
 
 Execute integration and smoke tests. Submit your result:
 
