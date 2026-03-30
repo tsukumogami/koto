@@ -35,7 +35,7 @@ jobs:
               echo "::error::Template compilation failed: $template"
               failed=1
             fi
-          done < <(find plugins/koto-skills/skills/ -name '*.md' ! -name 'SKILL.md' ! -name 'AGENTS.md' ! -path '*/references/*' -type f)
+          done < <(find plugins/koto-skills/skills/ -name '*.md' ! -name 'SKILL.md' ! -name 'AGENTS.md' ! -name '*.mermaid.md' ! -path '*/references/*' -type f)
 
           if [ "$failed" -eq 1 ]; then
             echo "::error::One or more templates failed compilation"
