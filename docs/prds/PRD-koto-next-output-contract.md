@@ -65,6 +65,8 @@ This isn't a naming problem. It's an absent contract. The engine's behavior is c
 
 The only loop control a caller needs is `action == "done"`. All other action values mean "the workflow isn't done, here's what's needed." The action value tells the caller exactly what kind of stop it hit, without inspecting other fields.
 
+All non-terminal shapes include `directive` (always present) and optionally `details` (present on first visit, omitted on retries; see R9).
+
 After `koto next --to` lands on an auto-advanceable state (no accepts, unconditional transition), the response reflects that state as `evidence_required` with empty `expects`. The caller should call `koto next` again to trigger the advancement loop. Under normal `koto next` (no `--to`), the engine auto-advances through these states internally.
 
 **R2. `advanced` field definition.** The `advanced` field is present in every success response as a boolean. Its meaning: "at least one state transition occurred during this invocation of `koto next`." Callers must not use `advanced` to determine their next action. The `action` field is the authoritative signal for caller behavior. `advanced` is informational context only.
@@ -124,13 +126,20 @@ Specific mapping:
 
 **R8. `--to` does not chain auto-advancement.** After a directed transition, the caller receives the target state's classification. If the target is an auto-advanceable state (no accepts, unconditional transition), the response reflects that state -- the caller must call `koto next` again to trigger the advancement loop. This is intentional: the caller chose a destination and should see it.
 
-**R9. SignalReceived transparency.** When SIGTERM/SIGINT interrupts the advancement loop, the response resolves to a fully valid response shape for the state the engine stopped at. The caller sees a normal response with no interruption indicator. This is the intended contract: the response is complete and valid for the stopped-at state, and calling `koto next` again continues correctly from that state.
+**R9. Directive split: summary and details.** Template states support two text fields: `directive` (short summary, always returned) and an optional `details` (extended instructions). Response behavior:
+- **First visit** to a state: both `directive` and `details` are present in the response. `details` contains the full instructions the caller needs to execute the phase.
+- **Subsequent visits** (retries, self-loops, polling): only `directive` is returned. `details` is omitted. The caller already received the full instructions on the first visit.
+- **Force-full retrieval**: A mechanism (flag like `--full` or a dedicated command) allows callers to retrieve `details` even on subsequent visits, for cases where context was lost (new session, context compression dropped the instructions).
+- States without a `details` field behave identically to today: `directive` is always returned, `details` is absent.
+- Visit tracking uses existing JSONL state (the engine already knows whether a state has been visited).
+
+**R10. SignalReceived transparency.** When SIGTERM/SIGINT interrupts the advancement loop, the response resolves to a fully valid response shape for the state the engine stopped at. The caller sees a normal response with no interruption indicator. This is the intended contract: the response is complete and valid for the stopped-at state, and calling `koto next` again continues correctly from that state.
 
 ### Non-functional requirements
 
-**R10. Backward compatibility.** The `action` field values change from `"execute"` to descriptive names (`"evidence_required"`, `"gate_blocked"`, `"integration"`, `"integration_unavailable"`). This is a breaking change for callers that match on `action == "execute"`. The `"done"` and `"confirm"` values are unchanged. Adding `blocking_conditions` to `EvidenceRequired` responses and adding new error codes (`template_error`, `persistence_error`, `concurrent_access`) are additive changes. The `advanced` field is not removed or renamed.
+**R11. Backward compatibility.** The `action` field values change from `"execute"` to descriptive names (`"evidence_required"`, `"gate_blocked"`, `"integration"`, `"integration_unavailable"`). This is a breaking change for callers that match on `action == "execute"`. The `"done"` and `"confirm"` values are unchanged. Adding `blocking_conditions` to `EvidenceRequired` responses, adding the optional `details` field, and adding new error codes (`template_error`, `persistence_error`, `concurrent_access`) are additive changes. The `advanced` field is not removed or renamed.
 
-**R11. Error response consistency.** All error responses (exit 1, 2, 3) must use the structured `NextError` format: `{"error": {"code": "<string>", "message": "<string>", "details": [...]}}`. Unstructured error shapes (`{"error": "<string>", "command": "next"}`) must be migrated to the structured format.
+**R12. Error response consistency.** All error responses (exit 1, 2, 3) must use the structured `NextError` format: `{"error": {"code": "<string>", "message": "<string>", "details": [...]}}`. Unstructured error shapes (`{"error": "<string>", "command": "next"}`) must be migrated to the structured format.
 
 ## Acceptance criteria
 
@@ -154,6 +163,10 @@ Specific mapping:
 - [ ] `EvidenceRequired` with empty `blocking_conditions` array (no gate issues) is distinguishable from `EvidenceRequired` with populated `blocking_conditions` (gate failure with evidence fallback)
 - [ ] Callers that don't inspect `blocking_conditions` or new error codes receive no regressions in existing response shapes
 - [ ] `template_error` (exit 3) and `persistence_error` (exit 3) are distinguishable by `error.code`
+- [ ] First visit to a state with `details` defined returns both `directive` and `details` in the response
+- [ ] Subsequent visits to the same state omit `details` from the response
+- [ ] A force-full mechanism (flag or command) returns `details` even on subsequent visits
+- [ ] States without `details` defined behave identically to current behavior (`details` field absent)
 
 ## Out of scope
 
