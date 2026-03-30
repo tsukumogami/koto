@@ -143,16 +143,15 @@ How template authors specify the summary/details split (markdown separator, YAML
 
 **R12. Error response consistency.** All error responses (exit 1, 2, 3) must use the structured `NextError` format: `{"error": {"code": "<string>", "message": "<string>", "details": [...]}}`. Unstructured error shapes (`{"error": "<string>", "command": "next"}`) must be migrated to the structured format.
 
-**R13. Caller and authoring documentation updates.** Documentation that references `koto next` response shapes must be updated atomically with the contract changes. Affected files:
-
-*Caller-facing (what agents read at runtime):*
+**R13. Caller documentation updates.** Documentation that agents read at runtime must be updated atomically with the contract changes:
 - **AGENTS.md**: All `action: "execute"` references updated to descriptive action values. JSON examples updated. Error code table expanded with `template_error`, `persistence_error`, `concurrent_access`. `blocking_conditions` documented on `EvidenceRequired` responses. `details` field documented with first-visit/subsequent-visit behavior and `--full` flag. `advanced` field definition added.
 - **`.cursor/rules/koto.mdc`**: Updated to current `koto next` API (still references removed `koto transition` command and outdated response shapes).
 
-*Template authoring (what skill authors read when writing templates):*
-- **koto-author SKILL.md** (`plugins/koto-skills/skills/koto-author/SKILL.md`): The koto execution loop section (lines 46-50) describes the generic "run next, do work, submit evidence" pattern but doesn't mention distinct action values for gates, confirmations, or integrations. Must be updated so template authors understand what response shapes their template features produce for callers.
-- **template-format.md** (`plugins/koto-skills/skills/koto-author/references/template-format.md`): The template format guide teaches how to write templates. Must explain the mapping from template features (gates, accepts, terminals, integrations) to caller-visible action values (`gate_blocked`, `evidence_required`, `done`, etc.) and how the `details` split works in directive body sections.
-- **Example templates**: The koto-author's own template and bundled examples should demonstrate the `details` marker convention (once the design doc determines the template source format).
+**R14. koto-author skill teaches the details split.** The koto-author skill is the primary tool that teaches template authors how to write koto templates. It must teach the `details` split as a first-class template authoring concept:
+- **template-format.md** must document the `details` split syntax as part of the template format, alongside directives. It should explain when to use `details` (long multi-paragraph instructions, checklists, examples) vs. keeping everything in `directive` (short single-line instructions). It must explain the mapping from template features (gates, accepts, terminals, integrations) to caller-visible action values (`gate_blocked`, `evidence_required`, `done`, etc.) so authors understand what their templates produce.
+- **The koto-author workflow** must guide authors through the `details` split during the state_design and template_drafting phases. When authors are designing states with long directive text, the skill should prompt them to consider splitting summary from extended instructions.
+- **The koto-author template itself** should dogfood the `details` split on its longer states (state_design, template_drafting, compile_validation have multi-paragraph directives that are candidates for the split).
+- **Example templates** should demonstrate the `details` convention so authors can see the pattern in context.
 
 ## Acceptance criteria
 
@@ -180,9 +179,11 @@ How template authors specify the summary/details split (markdown separator, YAML
 - [ ] AGENTS.md documents `blocking_conditions` on `EvidenceRequired` responses
 - [ ] AGENTS.md documents the `details` field and `--full` flag
 - [ ] `.cursor/rules/koto.mdc` uses current `koto next` API (no `koto transition` references)
-- [ ] koto-author SKILL.md execution loop section references distinct action values (not just generic "run next, submit evidence")
+- [ ] template-format.md documents the `details` split syntax as a first-class template format concept
 - [ ] template-format.md documents the mapping from template features (gates, accepts, terminals) to caller-visible action values
-- [ ] At least one example template demonstrates the `details` directive split
+- [ ] The koto-author workflow's state_design or template_drafting phases guide authors on when and how to use the `details` split
+- [ ] The koto-author's own template uses the `details` split on at least one state with long directive text
+- [ ] At least one bundled example template demonstrates the `details` convention
 - [ ] `template_error` (exit 3) and `persistence_error` (exit 3) are distinguishable by `error.code`
 - [ ] First visit to a state with `details` defined returns both `directive` and `details` in the response
 - [ ] Subsequent visits to the same state omit `details` from the response
