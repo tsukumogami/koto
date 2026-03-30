@@ -115,12 +115,12 @@ $ koto next my-workflow
  "blocking_conditions": [{"gate": "ci_check", "result": "failed", "exit_code": 1}]}
 
 # Agent overrides the gate with rationale -- no --with-data needed
-$ koto next my-workflow --override --rationale "CI failure is flaky test_network_timeout, unrelated to docs change"
+$ koto next my-workflow --override-rationale "CI failure is flaky test_network_timeout, unrelated to docs change"
 {"action": "done", "state": "complete", "advanced": true}
 
-# Without rationale, koto rejects the override
-$ koto next my-workflow --override
-{"error": {"code": "invalid_submission", "message": "--override requires --rationale"}}
+# Empty rationale is rejected
+$ koto next my-workflow --override-rationale ""
+{"error": {"code": "invalid_submission", "message": "--override-rationale requires a non-empty string"}}
 
 # Reviewer queries overrides
 $ koto overrides list my-workflow
@@ -135,7 +135,7 @@ $ koto overrides list my-workflow
 
 A template has a `lint` state with a gate but no `accepts` block. Today this
 state can't be overridden via evidence -- the agent's only option is `--to`.
-With `--override`, the engine handles it directly.
+With `--override-rationale`, the engine handles it directly.
 
 ```bash
 # Gate fails, no accepts block -- today returns gate_blocked with no way forward
@@ -144,7 +144,7 @@ $ koto next my-workflow
  "blocking_conditions": [{"gate": "lint_check", "result": "failed", "exit_code": 1}]}
 
 # Agent overrides at the engine level -- no template accepts block needed
-$ koto next my-workflow --override --rationale "Lint failure is a known false positive on generated code"
+$ koto next my-workflow --override-rationale "Lint failure is a known false positive on generated code"
 {"action": "evidence_required", "state": "review", "advanced": true, ...}
 ```
 
@@ -161,15 +161,15 @@ $ koto next work-session
  "blocking_conditions": [{"gate": "baseline_exists", "result": "failed", "exit_code": 1}]}
 
 # Agent overrides with rationale
-$ koto next work-session --override \
-    --rationale "Issue context already loaded via gh issue view #42, baseline artifact not needed"
+$ koto next work-session \
+    --override-rationale "Issue context already loaded via gh issue view #42, baseline artifact not needed"
 {"action": "evidence_required", "state": "planning", "advanced": true, ...}
 ```
 
 ### Example 4: Normal evidence submission (not an override)
 
 When gates pass, or evidence is submitted for transition routing (not gate
-bypass), everything works exactly as today. `--override` is not involved.
+bypass), everything works exactly as today. `--override-rationale` is not involved.
 
 ```bash
 # Gate passes (file exists), auto-advances
@@ -195,7 +195,7 @@ $ koto next my-workflow
  "expects": {"fields": {"status": {"type": "enum", "values": ["completed", "override"]}}}}
 
 # Agent overrides the gate AND provides evidence for transition resolution
-$ koto next my-workflow --override --rationale "Reusing existing branch per user request" \
+$ koto next my-workflow --override-rationale "Reusing existing branch per user request" \
     --with-data '{"status": "override"}'
 {"action": "evidence_required", "state": "implementation", "advanced": true, ...}
 ```
@@ -204,13 +204,14 @@ $ koto next my-workflow --override --rationale "Reusing existing branch per user
 
 ### Functional
 
-**R1: First-class override event.** When an agent uses `--override` on a
+**R1: First-class override event.** When an agent uses `--override-rationale` on a
 gate-blocked state and the transition resolves, the engine emits a
 `GateOverrideRecorded` event in the JSONL log. The event is distinct from
 `EvidenceSubmitted` and `DecisionRecorded`.
 
-**R2: Mandatory rationale.** `--override` requires `--rationale <string>`.
-Using `--override` without `--rationale` is rejected with a validation error.
+**R2: Mandatory rationale.** The `--override-rationale` flag takes a non-empty
+string argument. Providing the flag is both the override signal and the
+rationale in one. No separate `--override` or `--rationale` flags exist.
 
 **R3: Gate failure context in the override event.** The `GateOverrideRecorded`
 event includes: the state name, which gates failed (names and result details),
@@ -221,13 +222,14 @@ and the rationale string.
 they failed (exit code, timeout, error), and why the agent overrode. No
 correlation with other events is needed.
 
-**R5: Engine-level override flags.** `koto next` accepts `--override` and
-`--rationale <string>` flags. `--override` tells the engine to bypass failed
-gates and advance. `--override` can be combined with `--with-data` when the
-state also needs evidence for transition routing. `--override` without a
-gate-blocked state is a no-op (no error, no override event).
+**R5: Engine-level override flag.** `koto next` accepts
+`--override-rationale <string>`. The flag tells the engine to bypass failed
+gates and advance, and its argument is the rationale. It can be combined with
+`--with-data` when the state also needs evidence for transition routing.
+`--override-rationale` on a non-gate-blocked state is a no-op (no error, no
+override event).
 
-**R6: Every gate-blocked state is overridable.** `--override` works on any
+**R6: Every gate-blocked state is overridable.** `--override-rationale` works on any
 state where gates have failed, regardless of whether the template declares an
 `accepts` block. Override is an engine capability, not a template schema
 concern. States with gates but no `accepts` block (which today can only be
@@ -243,13 +245,13 @@ query pattern.
 
 **R9: Normal evidence is unaffected.** Evidence submitted via `--with-data`
 on states where gates pass (or states without gates) doesn't require
-`--override` or `--rationale` and doesn't produce override events. The
-override mechanism only triggers when `--override` is used on a gate-blocked
+`--override-rationale` and doesn't produce override events. The
+override mechanism only triggers when `--override-rationale` is used on a gate-blocked
 state.
 
 **R10: Partial gate failure handling.** When a state has multiple gates and
 some fail while others pass, the override event lists all failed gates.
-`--override` bypasses all failed gates simultaneously (no per-gate
+`--override-rationale` bypasses all failed gates simultaneously (no per-gate
 granularity).
 
 ### Non-functional
@@ -257,29 +259,31 @@ granularity).
 **R11: Backward compatibility.** Existing workflows without override events
 continue to function. Old state files without `GateOverrideRecorded` events
 are valid. Templates that currently use `override` as an evidence enum value
-continue to work -- `--with-data '{"status": "override"}'` without `--override`
-is still plain evidence submission.
+continue to work -- `--with-data '{"status": "override"}'` without
+`--override-rationale` is still plain evidence submission.
 
-**R12: Event ordering.** When `--override` is combined with `--with-data`,
-`EvidenceSubmitted` and `GateOverrideRecorded` are emitted in strict sequence
-(evidence first, override second) within the same invocation. When `--override`
-is used alone (no `--with-data`), only `GateOverrideRecorded` is emitted.
+**R12: Event ordering.** When `--override-rationale` is combined with
+`--with-data`, `EvidenceSubmitted` and `GateOverrideRecorded` are emitted in
+strict sequence (evidence first, override second) within the same invocation.
+When `--override-rationale` is used alone, only `GateOverrideRecorded` is
+emitted.
 
 ## Acceptance criteria
 
-- [ ] `--override` without `--rationale` returns a validation error (exit code 2)
-- [ ] `--override --rationale "reason"` on a gate-blocked state emits a
+- [ ] `--override-rationale ""` (empty string) returns a validation error
+  (exit code 2)
+- [ ] `--override-rationale "reason"` on a gate-blocked state emits a
   `GateOverrideRecorded` event and advances past the failed gates
 - [ ] `GateOverrideRecorded` event contains: state, failed gate names, gate
   result details (exit code/timeout/error), and rationale string
-- [ ] `--override` on a gate-blocked state with no `accepts` block works --
+- [ ] `--override-rationale` on a gate-blocked state with no `accepts` block works --
   the engine bypasses gates and advances to the next state
-- [ ] `--override --rationale "reason" --with-data '{"status": "override"}'`
+- [ ] `--override-rationale "reason" --with-data '{"status": "override"}'`
   on a state with both gates and accepts emits both `EvidenceSubmitted` and
   `GateOverrideRecorded` events, with evidence first (lower sequence number)
 - [ ] `--with-data` on a non-gate-blocked state works as today -- no
-  `--override` needed, no `GateOverrideRecorded` emitted
-- [ ] `--override` on a non-blocked state is a no-op (no error, no event)
+  `--override-rationale` needed, no `GateOverrideRecorded` emitted
+- [ ] `--override-rationale` on a non-blocked state is a no-op (no error, no event)
 - [ ] `koto overrides list` returns all override events across the full session
   as JSON
 - [ ] Override events survive rewind: if state A is overridden, agent advances
@@ -287,14 +291,12 @@ is used alone (no `--with-data`), only `GateOverrideRecorded` is emitted.
   visible via `koto overrides list`
 - [ ] Re-overriding a state after rewind produces a new, separate override event
 - [ ] Existing workflows that use `--with-data '{"status": "override"}'`
-  without `--override` continue to work (backward compatible plain evidence)
+  without `--override-rationale` continue to work (backward compatible plain evidence)
 - [ ] State with 3 gates where 2 fail: override event lists both failed gates
   with their individual results
-- [ ] `--rationale ""` (empty string) returns a validation error -- rationale
-  must be non-empty
 - [ ] `derive_overrides` returns all `GateOverrideRecorded` events across
   epochs, including events from states that were later rewound past
-- [ ] `--override` on a gate-blocked state where the transition can't resolve
+- [ ] `--override-rationale` on a gate-blocked state where the transition can't resolve
   does NOT emit `GateOverrideRecorded` (override event only on successful
   transition per D5)
 
@@ -342,13 +344,14 @@ overrides are engine-detected (not agent-initiated), need cross-epoch
 queryability, and are conceptually distinct from agent deliberation. Mixing them
 would complicate queries and blur the semantic boundary.
 
-**D2: Override as engine-level flags, not evidence schema.** Override and
-rationale could be fields in the evidence JSON (e.g., `{"status": "override",
+**D2: Single engine-level flag, not evidence schema.** Override and rationale
+could be fields in the evidence JSON (e.g., `{"status": "override",
 "rationale": "..."}`), but that would only work for states where the template
-author happened to declare those fields. We chose engine-level `--override` and
-`--rationale` flags so that every gate-blocked state is overridable regardless
-of template design. This also avoids the inconsistency of override intent
-living in evidence JSON while rationale lives in a separate flag.
+author happened to declare those fields. We chose a single engine-level
+`--override-rationale` flag so that every gate-blocked state is overridable
+regardless of template design. A single flag (not separate `--override` +
+`--rationale`) eliminates invalid combinations -- providing the flag is both
+the override signal and the justification.
 
 **D3: Scope to gate overrides only.** The codebase has three implicit override
 mechanisms: gate bypass, action skipping via evidence presence, and `--to`
@@ -356,14 +359,14 @@ directed transitions. We scoped to gate bypass because it's the primary user
 need (issue #108), the most common pattern in workflow skills, and the cleanest
 to define. Action skipping and `--to` tracking are noted as future work.
 
-**D4: `--override` and `--with-data` can be combined.** When a state has both
-gates and an accepts block, the agent may need to override the gate AND provide
-evidence for transition routing. Making the flags mutually exclusive would
-force agents to use `--to` in these cases, losing the rationale. Allowing
-combination keeps the override audit trail intact.
+**D4: `--override-rationale` and `--with-data` can be combined.** When a state
+has both gates and an accepts block, the agent may need to override the gate
+AND provide evidence for transition routing. Making them mutually exclusive
+would force agents to use `--to` in these cases, losing the rationale.
+Allowing combination keeps the override audit trail intact.
 
 **D5: Override event emitted only on successful transition.** An override event
-could be emitted whenever `--override` is used (even if the transition can't
+could be emitted whenever `--override-rationale` is used (even if the transition can't
 resolve). We chose to emit only when the override succeeds because a failed
 attempt doesn't actually override anything. The agent will retry, producing a
 new override event on success.
