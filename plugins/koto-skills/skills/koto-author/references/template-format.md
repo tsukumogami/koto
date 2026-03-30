@@ -278,6 +278,16 @@ Splits require an `accepts` block with enough fields to differentiate every cond
 
 Templates can include `integration_tags` (a list of string labels) and `default_action` (the action returned by `koto next` for non-terminal states, defaults to `"execute"`). These are optional and rarely needed for most workflows.
 
+## Mermaid previews
+
+Every template ships with a `.mermaid.md` preview file alongside it. Generate it with:
+
+```bash
+koto template export <template>.md --format mermaid --output <template>.mermaid.md
+```
+
+For a template at `koto-templates/my-skill.md`, the preview goes at `koto-templates/my-skill.mermaid.md`. CI validates that previews are fresh -- if you change the template, regenerate the preview before committing.
+
 ## Security note
 
 Koto performs `{{VARIABLE}}` substitution in `command` gate strings before passing them to `sh -c`. If a variable contains user-supplied input, this creates a shell injection risk.

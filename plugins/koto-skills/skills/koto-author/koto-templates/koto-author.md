@@ -218,12 +218,13 @@ Submit `skill_authored: done` when the SKILL.md is complete.
 
 Verify the coupling convention between SKILL.md and the koto template.
 
-Check these four things:
+Check these five things:
 
 1. **Template file exists** at `<target-dir>/koto-templates/<skill-name>.md`.
 2. **SKILL.md references the template** -- it should contain `${CLAUDE_SKILL_DIR}/koto-templates/<skill-name>.md` in its koto init instructions.
-3. **Output stays within bounds** -- the output directory is within the expected target path with no path traversal (`../`).
-4. **No shell injection risk** -- the template doesn't use `command` gates with unsanitized variable interpolation. Prefer `context-exists` or `context-matches` gates for variable-derived paths.
+3. **Mermaid preview exists** -- run `koto template export <template-path> --format mermaid --output <template-path-without-.md>.mermaid.md` to generate the state diagram preview. CI validates that every template has a fresh `.mermaid.md` alongside it.
+4. **Output stays within bounds** -- the output directory is within the expected target path with no path traversal (`../`).
+5. **No shell injection risk** -- the template doesn't use `command` gates with unsanitized variable interpolation. Prefer `context-exists` or `context-matches` gates for variable-derived paths.
 
 If all checks pass, submit `checks_passed: done`.
 
