@@ -15,7 +15,7 @@ pub struct DecisionSummary {
     pub alternatives_considered: Option<Vec<String>>,
 }
 
-/// The five possible responses from `koto next`.
+/// The six possible responses from `koto next`.
 ///
 /// Each variant maps 1:1 to a JSON output shape. Custom `Serialize`
 /// writes the correct fields per variant, including `action` and

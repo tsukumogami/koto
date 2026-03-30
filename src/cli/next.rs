@@ -15,6 +15,10 @@ use crate::template::types::TemplateState;
 
 /// Classify the current workflow state into a response or error.
 ///
+/// This function handles five of the six `NextResponse` variants.
+/// `ActionRequiresConfirmation` is produced by the handler when a
+/// default action runs and requires confirmation, not by this dispatcher.
+///
 /// Classification order:
 /// 1. Terminal state -> `Terminal`
 /// 2. Any gate failed/timed_out/errored -> `GateBlocked`
