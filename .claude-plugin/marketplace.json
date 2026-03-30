@@ -1,11 +1,19 @@
 {
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "koto",
-  "owner": { "name": "tsukumogami" },
+  "description": "Workflow skills for koto -- the state machine engine for AI agent workflows",
+  "owner": {
+    "name": "tsukumogami"
+  },
   "plugins": [
     {
       "name": "koto-skills",
-      "source": "./plugins/koto-skills",
-      "description": "Workflow skills for koto"
+      "description": "Workflow skills for koto",
+      "version": "0.4.2-dev",
+      "author": {
+        "name": "tsukumogami"
+      },
+      "source": "./plugins/koto-skills"
     }
   ]
 }
