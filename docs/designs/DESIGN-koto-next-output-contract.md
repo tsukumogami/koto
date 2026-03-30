@@ -57,3 +57,119 @@ The engine logic is correct. The changes are to the serialization layer, error c
 - **Breaking change is acceptable for `action`.** koto is pre-1.0. Current callers are internal skill plugins that ship in the same repo and can be updated atomically.
 - **Template format for details is a design decision.** The PRD specifies the output contract (details field behavior). This design must choose the template source format.
 - **Documentation is part of the deliverable.** AGENTS.md, koto.mdc, koto-author skill materials, and template-format.md must be updated in the same release.
+
+## Considered options
+
+### Decision 1: Template source format for the directive/details split
+
+Templates need a way for authors to separate short summary text (returned every time) from extended instructions (returned only on first visit). The compiled format is settled: `TemplateState` gets `directive: String` + `details: String`. But the source format -- how authors express the split in their markdown template -- has three viable options.
+
+The choice matters for the koto-author skill (which teaches the format), template-format.md (which documents it), and the compiler (which parses it). It doesn't affect the engine, CLI handler, or response serialization.
+
+#### Chosen: Markdown separator (`<!-- details -->`)
+
+Authors add an HTML comment `<!-- details -->` within a state's `## heading` section. Content before the marker becomes `directive`; content after becomes `details`. States without the marker behave identically to today.
+
+```markdown
+## analyze
+
+Read the issue body and identify acceptance criteria.
+
+<!-- details -->
+
+### Steps
+
+1. Run `gh issue view {{ISSUE}} --json body` to fetch the full issue.
+2. Extract each acceptance criterion into a checklist.
+3. If the issue references a design doc, read it and cross-reference.
+```
+
+The compiler change is localized to `extract_directives` in `src/template/compile.rs`: after collecting lines for a state section, split on the first `<!-- details -->` line. Lines before become `directive`, lines after become `details`. No YAML schema changes. The marker is an HTML comment, invisible in GitHub rendered previews and unambiguous (unlike `---` which is overloaded in markdown).
+
+#### Alternatives considered
+
+**YAML summary field**: Add an optional `summary` field to the YAML state declaration. When present, `summary` becomes `directive` and the markdown body becomes `details`. Rejected because it breaks the existing pattern where directives come from the markdown body (not YAML), forces content into two locations, and YAML multiline strings are awkward for markdown-formatted content.
+
+**External file reference (`details_file`)**: Add an optional YAML field pointing to a separate markdown file inlined at compile time. Rejected because it breaks the single-file template model, adds file resolution complexity to the compiler, and creates the highest maintenance burden for template authors.
+
+### Decision 2: Threading gate results through StopReason
+
+When gates fail on a state with an `accepts` block, the engine falls through to `EvidenceRequired` instead of `GateBlocked`. But `StopReason::EvidenceRequired` is currently a unit variant -- it carries no gate data. The CLI handler can't populate `blocking_conditions` on the response because the information was discarded in the engine.
+
+#### Chosen: Add gate data to StopReason::EvidenceRequired
+
+Change `StopReason::EvidenceRequired` from a unit variant to a struct variant carrying `Option<BTreeMap<String, GateResult>>`. The engine passes gate results when gates failed, `None` otherwise. The CLI handler converts to `Vec<BlockingCondition>` using the existing conversion logic (extracted into a shared helper to eliminate the current duplication).
+
+```rust
+pub enum StopReason {
+    // ...
+    EvidenceRequired {
+        failed_gates: Option<BTreeMap<String, GateResult>>,
+    },
+    // ...
+}
+```
+
+In `advance.rs`, `gate_results` is hoisted out of the gate evaluation block so it's available when constructing the EvidenceRequired return. The construction passes `Some(gate_results)` when `gates_failed` is true, `None` otherwise.
+
+The `GateResult -> BlockingCondition` conversion logic (currently duplicated in `src/cli/next.rs` lines 42-55 and `src/cli/mod.rs` lines 1684-1697) is extracted into a shared `blocking_conditions_from_gates` function.
+
+#### Alternatives considered
+
+**Re-evaluate gates in the CLI handler**: After the loop returns EvidenceRequired, call `evaluate_gates` again on the final state. Rejected because gate commands may produce different results on a second run (non-deterministic), it doubles execution time, and the CLI layer shouldn't be making engine-level evaluation decisions.
+
+**Thread gate results through a separate AdvanceResult field**: Add `gate_results: Option<...>` to `AdvanceResult` alongside `stop_reason`. Rejected because it scatters related data across two struct fields -- the compiler can't enforce that handlers check the separate field, and it pollutes the common result type with data meaningful for only 2 of 9 stop reasons.
+
+### Decision 3: Visit count computation
+
+The `details` field should be included on first visit to a state and omitted on subsequent visits. The JSONL event log contains all state-entry events (`Transitioned`, `DirectedTransition`, `Rewound`), and the PRD prohibits new state files or schema changes. The question is how to compute and propagate visit information.
+
+#### Chosen: `derive_visit_counts` with `HashMap<String, usize>`
+
+Add a `derive_visit_counts(events: &[Event]) -> HashMap<String, usize>` function to `src/engine/persistence.rs`. It scans all events once, incrementing a counter for each state name that appears as a `to` field in entry events. The CLI handler calls it alongside `derive_state_from_log` and passes the count for the final state to the response construction layer.
+
+```rust
+pub fn derive_visit_counts(events: &[Event]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for event in events {
+        let target = match &event.payload {
+            EventPayload::Transitioned { to, .. } => Some(to),
+            EventPayload::DirectedTransition { to, .. } => Some(to),
+            EventPayload::Rewound { to, .. } => Some(to),
+            _ => None,
+        };
+        if let Some(state_name) = target {
+            *counts.entry(state_name.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+```
+
+First visit = count of 1 (the transition event for the current state is already in the log when `koto next` reads it). The `--full` flag bypasses the check at the serialization layer, not inside `derive_visit_counts`.
+
+#### Alternatives considered
+
+**Boolean scan with `HashSet<String>`**: Same approach but returns presence, not count. Rejected because it's strictly less capable for identical implementation complexity -- counts support future features (loop detection, retry budgets) at zero extra cost.
+
+**Persist visit count alongside events**: Add a running counter to derived state or a separate tracking file. Rejected because it violates PRD R9 ("no new state files or schema changes").
+
+## Decision outcome
+
+### Summary
+
+The output contract changes span four code layers, all shipping together. At the serialization layer, the custom `Serialize` impl on `NextResponse` changes the `action` strings from `"execute"` to descriptive names (`"evidence_required"`, `"gate_blocked"`, `"integration"`, `"integration_unavailable"`) while keeping `"done"` and `"confirm"` unchanged. Rust enum variant names stay the same -- only the wire format changes.
+
+At the engine layer, `StopReason::EvidenceRequired` gains an `Option<BTreeMap<String, GateResult>>` field that carries gate failure data through to the CLI handler. The handler converts this to a `blocking_conditions` array on the `EvidenceRequired` response: empty when gates passed or weren't evaluated, populated when gates failed and the state accepts evidence. The duplicated `GateResult -> BlockingCondition` conversion is extracted into a shared helper.
+
+At the template layer, a `<!-- details -->` marker within state markdown sections splits content into `directive` (before marker, always returned) and `details` (after marker, returned only on first visit). The compiler's `extract_directives` function splits on the marker. A new `derive_visit_counts` function in `persistence.rs` scans the JSONL event log to count state entries, and the CLI handler uses the count to conditionally include `details` in the response. The `--full` flag bypasses the visit check.
+
+At the error layer, `NextErrorCode` gains `TemplateError`, `PersistenceError`, and `ConcurrentAccess` variants. The blanket `Err(advance_err)` catch-all in the CLI handler splits into per-variant mapping: template structural errors -> `template_error` (exit 3), disk I/O -> `persistence_error` (exit 3), lock contention -> `concurrent_access` (exit 1). Unstructured error paths (`{"error": "...", "command": "next"}`) are migrated to the `NextError` format.
+
+Documentation (AGENTS.md, koto.mdc, koto-author SKILL.md and template-format.md, example templates) updates in the same release. The koto-author skill's template dogfoods the `<!-- details -->` marker on its longer states.
+
+### Rationale
+
+The decisions reinforce each other through a clean layering: the template format decision (D1) feeds the compiler, the gate threading decision (D2) feeds the engine, and the visit counting decision (D3) feeds the persistence layer. All three converge at the CLI handler, which constructs `NextResponse` from compiled template data + engine results + visit counts. No decision constrains another.
+
+The breaking change to `action` values is the right trade-off: koto is pre-1.0, callers are internal skill plugins in the same repo, and the gain (callers dispatch on `action` alone, no field-presence reconstruction) is permanent. The `advanced` field stays unchanged because the breaking change budget is better spent on `action`, and the PRD formally defines `advanced` as informational-only.
