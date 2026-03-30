@@ -288,7 +288,7 @@ pub struct NextError {
     pub details: Vec<ErrorDetail>,
 }
 
-/// The six error codes for `koto next` domain errors.
+/// The nine error codes for `koto next` domain errors.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NextErrorCode {
@@ -298,6 +298,9 @@ pub enum NextErrorCode {
     IntegrationUnavailable,
     TerminalState,
     WorkflowNotInitialized,
+    TemplateError,
+    PersistenceError,
+    ConcurrentAccess,
 }
 
 impl NextErrorCode {
@@ -305,14 +308,18 @@ impl NextErrorCode {
     ///
     /// Exit code 1 = transient (may resolve on retry).
     /// Exit code 2 = caller error (agent must change behavior).
+    /// Exit code 3 = infrastructure / config errors.
     pub fn exit_code(&self) -> i32 {
         match self {
             NextErrorCode::GateBlocked => 1,
             NextErrorCode::IntegrationUnavailable => 1,
+            NextErrorCode::ConcurrentAccess => 1,
             NextErrorCode::InvalidSubmission => 2,
             NextErrorCode::PreconditionFailed => 2,
             NextErrorCode::TerminalState => 2,
             NextErrorCode::WorkflowNotInitialized => 2,
+            NextErrorCode::TemplateError => 3,
+            NextErrorCode::PersistenceError => 3,
         }
     }
 }
@@ -788,6 +795,18 @@ mod tests {
             serde_json::to_value(&NextErrorCode::WorkflowNotInitialized).unwrap(),
             serde_json::json!("workflow_not_initialized")
         );
+        assert_eq!(
+            serde_json::to_value(&NextErrorCode::TemplateError).unwrap(),
+            serde_json::json!("template_error")
+        );
+        assert_eq!(
+            serde_json::to_value(&NextErrorCode::PersistenceError).unwrap(),
+            serde_json::json!("persistence_error")
+        );
+        assert_eq!(
+            serde_json::to_value(&NextErrorCode::ConcurrentAccess).unwrap(),
+            serde_json::json!("concurrent_access")
+        );
     }
 
     // -- Exit code mapping tests --
@@ -796,6 +815,7 @@ mod tests {
     fn exit_code_transient_errors() {
         assert_eq!(NextErrorCode::GateBlocked.exit_code(), 1);
         assert_eq!(NextErrorCode::IntegrationUnavailable.exit_code(), 1);
+        assert_eq!(NextErrorCode::ConcurrentAccess.exit_code(), 1);
     }
 
     #[test]
@@ -804,6 +824,12 @@ mod tests {
         assert_eq!(NextErrorCode::PreconditionFailed.exit_code(), 2);
         assert_eq!(NextErrorCode::TerminalState.exit_code(), 2);
         assert_eq!(NextErrorCode::WorkflowNotInitialized.exit_code(), 2);
+    }
+
+    #[test]
+    fn exit_code_infrastructure_errors() {
+        assert_eq!(NextErrorCode::TemplateError.exit_code(), 3);
+        assert_eq!(NextErrorCode::PersistenceError.exit_code(), 3);
     }
 
     // -- NextError serialization tests --
