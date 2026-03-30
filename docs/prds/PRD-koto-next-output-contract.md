@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: In Progress
 problem: |
   The koto auto-advancement engine's caller-facing behavioral contract was never specified.
   Design docs cover engine internals but no document defines what callers see or how they
@@ -18,7 +18,7 @@ source_issue: 102
 
 ## Status
 
-Accepted
+In Progress
 
 ## Problem statement
 
