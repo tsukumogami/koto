@@ -1,5 +1,5 @@
 ---
-status: Planned
+status: Current
 upstream: docs/prds/PRD-koto-next-output-contract.md
 problem: |
   koto next produces six NextResponse variants and 14+ error paths, but the action
@@ -29,7 +29,7 @@ rationale: |
 
 ## Status
 
-Accepted
+Current
 
 ## Context and problem statement
 

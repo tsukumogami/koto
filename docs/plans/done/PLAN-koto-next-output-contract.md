@@ -1,8 +1,8 @@
 ---
 schema: plan/v1
-status: Draft
+status: Done
 execution_mode: single-pr
-upstream: docs/designs/DESIGN-koto-next-output-contract.md
+upstream: docs/designs/current/DESIGN-koto-next-output-contract.md
 milestone: "koto next output contract"
 issue_count: 8
 ---
@@ -11,7 +11,7 @@ issue_count: 8
 
 ## Status
 
-Draft
+Done
 
 ## Scope summary
 
