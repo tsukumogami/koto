@@ -194,41 +194,58 @@ structured model, not a separate concept.
 
 ### Example 4: Selective override with rationale
 
-Each `koto next` call re-evaluates gates from scratch. Overrides aren't
-sticky -- they apply to that call only.
+A `validate` state has two command gates: `schema_check` (runs a schema
+validator) and `size_check` (checks file size). Each `koto next` call
+re-evaluates gates from scratch. Overrides aren't sticky.
 
 ```bash
-# Two gates fail
+# Two command gates fail
 $ koto next my-workflow
 {"action": "gate_blocked", "state": "validate",
  "blocking_conditions": [
-   {"gate": "schema_check", "output": {"valid": false, "errors": 3}},
-   {"gate": "size_check", "output": {"within_limit": false, "size_mb": 15}}
+   {"gate": "schema_check", "output": {"exit_code": 1, "error": ""}},
+   {"gate": "size_check", "output": {"exit_code": 2, "error": ""}}
  ]}
 
-# Override both in one call, targeting each by name
+# Override both in one call
 $ koto next my-workflow --override-rationale "Schema: deprecated fields; Size: test fixture" \
     --gate schema_check --gate size_check
-# Both gates get their override defaults, transition proceeds
+# Both gates get override_default {exit_code: 0}, transition proceeds
 {"action": "done", "state": "process", "advanced": true}
 
 # Or override all at once (no --gate flag)
 $ koto next my-workflow --override-rationale "Both checks are irrelevant for this change"
-# All failing gates get their override defaults
 {"action": "done", "state": "process", "advanced": true}
 
 # Selective override that leaves some gates blocked
 $ koto next my-workflow --override-rationale "Schema errors are in deprecated fields" \
     --gate schema_check
-# schema_check is overridden, but size_check still fails -- state stays blocked
+# schema_check overridden, size_check still fails -- state stays blocked
 {"action": "gate_blocked", "state": "validate",
  "blocking_conditions": [
-   {"gate": "size_check", "output": {"within_limit": false, "size_mb": 15}}
+   {"gate": "size_check", "output": {"exit_code": 2, "error": ""}}
  ]}
-# Agent must override size_check in the same call or a subsequent one
 ```
 
-### Example 5: Override audit trail
+### Example 5: Multi-agent override via `koto override` command
+
+Sub-agents push overrides independently. Orchestrator advances when ready.
+
+```bash
+# Sub-agent A overrides schema_check (no advancement)
+$ koto override my-workflow --gate schema_check \
+    --rationale "Schema errors are in deprecated fields"
+
+# Sub-agent B overrides size_check (no advancement)
+$ koto override my-workflow --gate size_check \
+    --rationale "Large file is a test fixture"
+
+# Orchestrator advances -- both overrides are read during gate evaluation
+$ koto next my-workflow
+{"action": "done", "state": "process", "advanced": true}
+```
+
+### Example 6: Override audit trail
 
 ```bash
 $ koto overrides list my-workflow
@@ -236,25 +253,24 @@ $ koto overrides list my-workflow
   {"state": "validate",
    "gates_overridden": [
      {"gate": "schema_check",
-      "actual_output": {"valid": false, "errors": 3},
-      "override_applied": {"valid": true, "errors": 0}}
+      "actual_output": {"exit_code": 1, "error": ""},
+      "override_applied": {"exit_code": 0, "error": ""}}
    ],
    "rationale": "Schema errors are in deprecated fields",
    "seq": 12, "timestamp": "2026-03-31T10:15:00Z"},
   {"state": "validate",
    "gates_overridden": [
      {"gate": "size_check",
-      "actual_output": {"within_limit": false, "size_mb": 15},
-      "override_applied": {"within_limit": true, "size_mb": 0}}
+      "actual_output": {"exit_code": 2, "error": ""},
+      "override_applied": {"exit_code": 0, "error": ""}}
    ],
-   "rationale": "Large file is a test fixture, expected",
+   "rationale": "Large file is a test fixture",
    "seq": 14, "timestamp": "2026-03-31T10:15:30Z"}
 ]}
 ```
 
 Each override event captures what the gate actually returned, what default was
-applied, and why. Self-contained for visualization. Selective overrides produce
-separate events per invocation.
+applied, and why. Self-contained for visualization.
 
 ## Requirements
 
@@ -308,11 +324,11 @@ types, not through extending existing types' schemas.
 
 **R3: Gate output feeds into transition routing.** Gate output is available to
 transition `when` clauses via namespaced fields. The namespace is a nested
-JSON map: `{"gates": {"ci_check": {"status": "passed"}}}`. In template YAML,
-`when` clauses use dot-path keys to reference nested values:
+JSON map: `{"gates": {"ci_check": {"exit_code": 0, "error": ""}}}`. In
+template YAML, `when` clauses use dot-path keys to reference nested values:
 ```yaml
 when:
-  gates.ci_check.status: passed
+  gates.ci_check.exit_code: 0
 ```
 The transition resolver traverses the dot-separated path to find the value in
 the merged evidence map. Agent-submitted evidence lives at the top level (no
@@ -339,6 +355,10 @@ invocation paths:
 Both paths accept `--gate <name>` (repeatable, optional). When `--gate` is
 omitted, all failing gates are overridden. The rationale is mandatory
 (non-empty string) and applies to all gates being overridden in that call.
+
+When `koto override` is used (command path), a subsequent `koto next` reads
+the override events from the current epoch and substitutes gate defaults
+during gate evaluation, the same way it reads `EvidenceSubmitted` events.
 
 **R5a: Selective override.** `--gate <name>` can be repeated to override
 multiple specific gates in one call. If a named gate isn't actually failing,
@@ -376,25 +396,28 @@ that:
 - When override defaults are applied to all failing gates, at least one
   transition resolves (no dead ends on override)
 
-**R10: Backward compatibility.** Existing templates without `output_schema`
-continue to compile and run. Gates without schemas behave as today: boolean
-pass/fail, the `gate_failed` flag controls transition resolution, and no
-`gates.*` data enters the transition resolver. The transition resolver only
-receives `gates.*` namespaced data when the gate declares an `output_schema`.
-No implicit schema is generated for legacy gates. The compiler warns about
-gates without schemas but doesn't error. Templates that use `accepts` blocks
-with `override` enum values as the workaround pattern continue to work
-identically -- `--with-data '{"status": "override"}'` is still plain evidence
-submission unrelated to the new override mechanism.
+**R10: Backward compatibility.** Existing templates continue to compile and
+run. When transition `when` clauses don't reference `gates.*` fields, gates
+behave as today (boolean pass/fail, no structured output enters the resolver).
+The resolver only receives `gates.*` namespaced data when `when` clauses
+reference gate fields. The compiler warns about gates on states where no
+`when` clause references their output, but doesn't error. Templates that use
+`accepts` blocks with `override` enum values as the workaround pattern
+continue to work identically -- `--with-data '{"status": "override"}'` is
+still plain evidence submission unrelated to the new override mechanism.
 
 ### Non-functional
 
-**R11: Event ordering.** When `--override-rationale` is combined with
-`--with-data`, `EvidenceSubmitted` and `GateOverrideRecorded` are emitted in
-strict sequence within the same invocation.
+**R11: Event ordering.** Within a single `koto next --override-rationale
+--with-data` invocation, `EvidenceSubmitted` and `GateOverrideRecorded` are
+emitted in strict sequence (evidence first). When `koto override` and
+`koto next --with-data` are separate invocations, the events are ordered by
+their invocation timestamps (the override event from the earlier call has a
+lower sequence number).
 
-**R12: Rationale size limit.** `--override-rationale` values are subject to
-the same size limit as `--with-data` (1MB).
+**R12: Rationale size limit.** Rationale values (via `--override-rationale`
+on `koto next` or `--rationale` on `koto override`) are subject to the same
+size limit as `--with-data` (1MB).
 
 ## Acceptance criteria
 
@@ -416,13 +439,15 @@ the same size limit as `--with-data` (1MB).
 - [ ] `GateOverrideRecorded` event contains: state, gate name, actual output,
   override default applied, and rationale
 - [ ] `koto overrides list` returns all override events across the session
-- [ ] Compiler rejects templates where `override_default` doesn't match the
-  gate type's schema
 - [ ] Compiler rejects templates where applying all override defaults leads to
   no valid transition (dead end on override)
 - [ ] Compiler rejects templates where a `when` clause references a
   nonexistent gate or nonexistent field in a gate type's schema
 - [ ] Existing templates compile and run without changes (backward compatible)
+- [ ] Gates on states where no `when` clause references `gates.*` fields
+  produce no structured output (legacy boolean behavior)
+- [ ] Templates using `accepts` blocks with `override` enum values continue
+  to work identically via `--with-data` (workaround pattern preserved)
 - [ ] `--override-rationale` with `--gate ci_check` overrides only `ci_check`;
   other failing gates remain blocked
 - [ ] `--override-rationale` with `--gate a --gate b` overrides both named gates
@@ -439,7 +464,10 @@ the same size limit as `--with-data` (1MB).
 - [ ] `koto next --override-rationale "reason"` produces the same result as
   `koto override` followed by `koto next`
 - [ ] `--override-rationale ""` returns a validation error
-- [ ] `--override-rationale` on a non-blocked state is a no-op
+- [ ] `--override-rationale` on a non-blocked state is a no-op (no error, no
+  event)
+- [ ] `koto override` on a non-blocked state is a no-op (no error, no event)
+- [ ] `koto override` without `--gate` overrides all failing gates
 - [ ] Override events survive rewind and are visible in `koto overrides list`
 - [ ] Passing gates produce their structured output and transition routing
   works without agent interaction
