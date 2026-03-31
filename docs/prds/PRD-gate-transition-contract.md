@@ -109,30 +109,24 @@ states:
     gates:
       ci_check:
         type: command
-        command: "run-ci --json"
-        output_schema:
-          status:
-            type: enum
-            values: [passed, failed]
-        pass_condition:
-          status: passed
-        override_default:
-          status: passed
+        command: "run-ci"
+        # No output_schema needed -- compiler knows command gates produce {exit_code: number}
+        # override_default is optional -- defaults to {exit_code: 0} for command gates
     transitions:
       - target: deploy
         when:
-          gates.ci_check.status: passed
+          gates.ci_check.exit_code: 0
       - target: fix
         when:
-          gates.ci_check.status: failed
+          gates.ci_check.exit_code: 1
 ```
 
-**CI passes:** gate produces `{status: "passed"}`, transition resolver matches
-`gates.ci_check.status: passed`, advances to `deploy`. No agent interaction
+**CI passes:** gate produces `{exit_code: 0}`, transition resolver matches
+`gates.ci_check.exit_code: 0`, advances to `deploy`. No agent interaction
 needed.
 
-**CI fails:** gate produces `{status: "failed"}`, transition resolver matches
-`gates.ci_check.status: failed`, advances to `fix`. No agent interaction
+**CI fails:** gate produces `{exit_code: 1}`, transition resolver matches
+`gates.ci_check.exit_code: 1`, advances to `fix`. No agent interaction
 needed -- the gate result drives routing automatically.
 
 **CI fails + agent overrides:**
@@ -140,16 +134,16 @@ needed -- the gate result drives routing automatically.
 ```bash
 $ koto next my-workflow
 {"action": "gate_blocked", "state": "verify",
- "blocking_conditions": [{"gate": "ci_check", "status": "failed"}]}
+ "blocking_conditions": [{"gate": "ci_check", "output": {"exit_code": 1}}]}
 
 $ koto next my-workflow --override-rationale "Flaky test, unrelated to this change"
-# Engine applies ci_check's override_default: {status: "passed"}
-# Transition resolver matches gates.ci_check.status: passed -> deploy
+# Engine applies ci_check's override_default: {exit_code: 0}
+# Transition resolver matches gates.ci_check.exit_code: 0 -> deploy
 {"action": "done", "state": "deploy", "advanced": true}
 ```
 
 The override default tells the engine: "when overridden, treat this gate as if
-it returned `{status: passed}`." The transition resolver routes normally.
+it returned `{exit_code: 0}`." The transition resolver routes normally.
 
 ### Example 2: Gate data and agent evidence coexisting
 
@@ -159,15 +153,9 @@ states:
     gates:
       lint:
         type: command
-        command: "run-lint --json"
-        output_schema:
-          status:
-            type: enum
-            values: [clean, warnings, errors]
-        pass_condition:
-          status: clean
-        override_default:
-          status: clean
+        command: "run-lint"
+        # command gate produces {exit_code: number}
+        # override_default: {exit_code: 0} (implicit for command gates)
     accepts:
       decision:
         type: enum
@@ -176,15 +164,11 @@ states:
     transitions:
       - target: merge
         when:
-          gates.lint.status: clean
+          gates.lint.exit_code: 0
           decision: approve
       - target: revise
         when:
           decision: request_changes
-      - target: merge
-        when:
-          gates.lint.status: warnings
-          decision: approve
 ```
 
 Gate output (`gates.lint.status`) and agent evidence (`decision`) coexist in the
@@ -200,13 +184,8 @@ states:
       file_exists:
         type: context-exists
         key: "config.yaml"
-        output_schema:
-          exists:
-            type: boolean
-        pass_condition:
-          exists: true
-        override_default:
-          exists: true
+        # context-exists produces {exists: boolean}
+        # override_default: {exists: true} (implicit)
     transitions:
       - target: proceed
         when:
@@ -287,26 +266,30 @@ separate events per invocation.
 
 ### Functional
 
-**R1: Gate output schemas with pass condition.** Each gate in a template
-declares an `output_schema` defining the structured data it produces (same
-field types as `accepts` blocks: string, number, boolean, enum) and a
-`pass_condition` -- a set of field/value pairs that define when the gate is
-considered "passed." The engine evaluates `pass_condition` against the gate's
-actual output to determine pass/fail. This replaces the boolean
-`GateResult::Passed` with a condition evaluated against structured data.
-Example: `pass_condition: { status: "passed" }` means the gate passes when
-its output's `status` field equals `"passed"`.
+**R1: Gate type owns the output schema.** Each gate type (command,
+context-exists, context-matches, and future types) defines a fixed output
+schema built into the engine. Template authors don't declare `output_schema`
+-- they pick a gate type and get its fields. The engine knows what each gate
+type produces and how to parse the raw execution result into structured data.
+Built-in schemas for existing types:
+- **command**: `{exit_code: number}`
+- **context-exists**: `{exists: boolean}`
+- **context-matches**: `{matches: boolean}`
+Each gate type also defines a built-in `pass_condition` (command: `exit_code
+== 0`, context-exists: `exists == true`, context-matches: `matches == true`).
+Template authors can declare `override_default` per gate, which the compiler
+validates against the gate type's known schema.
 
 **R2: Gate evaluation produces structured data.** When a gate evaluates, it
-produces a structured result matching its declared `output_schema`, not just
-pass/fail. Each built-in gate type has a default output mapping:
-- **command**: produces `{exit_code: number}` (0 on success, non-zero on
-  failure). Richer output (stdout parsing to JSON) is a future extension.
-- **context-exists**: produces `{exists: boolean}`.
-- **context-matches**: produces `{matches: boolean}`.
-Template authors can extend these with custom `output_schema` fields when
-gate types support richer output in the future. For now, the built-in
-mappings define the minimum structured output per type.
+produces a structured result matching its gate type's schema, not just
+pass/fail. The engine contains the parsing logic for each gate type:
+- **command**: runs the command, captures exit code -> `{exit_code: N}`
+- **context-exists**: checks key existence -> `{exists: true/false}`
+- **context-matches**: runs regex match -> `{matches: true/false}`
+Future gate types (e.g., `json-command` that parses stdout as JSON, `http`
+that checks an endpoint) extend the system by registering new types with
+their own schemas and parsing logic. Richer output comes through new gate
+types, not through extending existing types' schemas.
 
 **R3: Gate output feeds into transition routing.** Gate output is available to
 transition `when` clauses via namespaced fields. The namespace is a nested
@@ -320,12 +303,13 @@ The transition resolver traverses the dot-separated path to find the value in
 the merged evidence map. Agent-submitted evidence lives at the top level (no
 `gates.` prefix), preventing collisions.
 
-**R4: Override defaults per gate.** Each gate declares an `override_default`
-in its schema -- the values to use when the agent overrides the gate. Override
-defaults must match the gate's `output_schema` and must satisfy the gate's
-`pass_condition` (the compiler validates this -- an override that doesn't
-satisfy the pass condition would leave the gate "failing" after override,
-which is contradictory).
+**R4: Override defaults per gate.** Each gate in the template declares an
+`override_default` -- the values to substitute when the agent overrides.
+The compiler validates that override defaults match the gate type's schema
+and satisfy the gate type's built-in pass condition. If no `override_default`
+is declared, the gate type provides a sensible default (command:
+`{exit_code: 0}`, context-exists: `{exists: true}`, context-matches:
+`{matches: true}`).
 
 **R5: Engine-level override with rationale.** `koto next` accepts
 `--override-rationale <string>` with an optional `--gate <name>` flag to
@@ -359,12 +343,12 @@ exposes this to the CLI.
 
 **R9: Compiler validation of the contract.** The template compiler validates
 that:
-- Every gate has an `output_schema`, a `pass_condition`, and an
-  `override_default`
-- `pass_condition` references fields that exist in the gate's `output_schema`
-- `override_default` matches the gate's `output_schema` types
-- `override_default` satisfies the gate's `pass_condition`
-- Transition `when` clauses reference valid gate output fields
+- Gate types referenced in templates are registered (known to the engine)
+- If `override_default` is declared, it matches the gate type's schema
+- If `override_default` is declared, it satisfies the gate type's pass
+  condition
+- Transition `when` clauses that reference `gates.*` fields reference valid
+  gate names and fields from the gate type's schema
 - When override defaults are applied to all failing gates, at least one
   transition resolves (no dead ends on override)
 
@@ -390,14 +374,15 @@ the same size limit as `--with-data` (1MB).
 
 ## Acceptance criteria
 
-- [ ] A gate with `output_schema` produces structured data on evaluation, not
-  just pass/fail
-- [ ] A gate is considered "passed" when its output satisfies `pass_condition`
-  and "failed" when it doesn't
-- [ ] Compiler rejects `override_default` that doesn't satisfy the gate's
-  `pass_condition`
-- [ ] Compiler rejects `pass_condition` that references fields not in
-  `output_schema`
+- [ ] A gate produces structured data matching its gate type's schema on
+  evaluation, not just pass/fail
+- [ ] A gate is considered "passed" when its output satisfies the gate type's
+  built-in pass condition (command: exit_code == 0, context-exists: exists ==
+  true, context-matches: matches == true)
+- [ ] Compiler rejects `override_default` that doesn't match the gate type's
+  schema
+- [ ] Compiler rejects `override_default` that doesn't satisfy the gate type's
+  pass condition
 - [ ] Transition `when` clauses can reference `gates.<name>.<field>` and match
   against gate output
 - [ ] A state with both gates and `accepts` block routes correctly using both
@@ -407,16 +392,13 @@ the same size limit as `--with-data` (1MB).
 - [ ] `GateOverrideRecorded` event contains: state, gate name, actual output,
   override default applied, and rationale
 - [ ] `koto overrides list` returns all override events across the session
-- [ ] Compiler rejects templates where a gate has `output_schema` but no
-  `override_default`
-- [ ] Compiler rejects templates where `override_default` doesn't match
-  `output_schema`
+- [ ] Compiler rejects templates where `override_default` doesn't match the
+  gate type's schema
 - [ ] Compiler rejects templates where applying all override defaults leads to
   no valid transition (dead end on override)
 - [ ] Compiler warns on templates where a `when` clause references a
   nonexistent gate or field
-- [ ] Existing templates without `output_schema` compile and run without
-  changes (backward compatible)
+- [ ] Existing templates compile and run without changes (backward compatible)
 - [ ] `--override-rationale` with `--gate ci_check` overrides only `ci_check`;
   other failing gates remain blocked
 - [ ] `--override-rationale` with `--gate a --gate b` overrides both named gates
@@ -454,9 +436,10 @@ the same size limit as `--with-data` (1MB).
   enables this; the redo mechanism is future work.
 - **Dynamic override values.** Override defaults are static (declared in the
   template). Letting agents supply runtime override values is deferred.
-- **Gate output from stdout parsing.** How command gates produce structured
-  data from command output (JSON parsing, regex extraction) is a design
-  concern. This PRD requires that they can, not how.
+- **Custom gate output schemas.** Template authors can't declare custom
+  output schemas for existing gate types. Richer output comes through new
+  gate types (e.g., `json-command` that parses stdout as JSON). This keeps
+  parsing logic in the engine, not the template.
 - **`--to` directed transition tracking.** Separate mechanism, separate audit.
 - **Action skip tracking.** Related but distinct.
 - **Evidence verification by koto.** Future capability where koto
@@ -508,8 +491,18 @@ gate/transition contract. The override rationale requirement (R5, R6, R8) is
 preserved and strengthened -- override events now include both actual and
 default gate output, not just the rationale.
 
-**D4: Backward compatibility via optional schemas.** New gate schemas could be
-required on all templates immediately, but that would break every existing
-template. We chose to make `output_schema` optional with a compiler warning,
-so existing templates keep working. Gates without schemas behave as today
-(boolean pass/fail). This lets adoption be gradual.
+**D4: Backward compatibility via gradual adoption.** Structured gate output
+could be required on all templates immediately, but that would break every
+existing template. We chose to have gates without `when` clauses referencing
+`gates.*` fields behave as today (boolean pass/fail). The compiler warns but
+doesn't error. This lets adoption be gradual.
+
+**D5: Gate type owns the output schema, not the template author.** Output
+schemas could be declared per-gate in the template YAML (`output_schema:`
+field). We chose gate-type-owned schemas because there's no mechanism to
+connect a gate's raw execution (e.g., a shell command's exit code) to a
+user-declared schema. The parsing logic that converts raw output to structured
+data belongs in the gate type implementation, not the template. Each gate
+type registers a fixed schema and built-in pass condition. Future richer
+output comes through new gate types (e.g., `json-command` that parses stdout
+as JSON), not through template-level schema declarations.
