@@ -39,10 +39,10 @@ existing templates.
 
 ## Features
 
-### Feature 1: Structured gate output and transition routing
+### Feature 1: Structured gate output and transition routing ([#116](https://github.com/tsukumogami/koto/issues/116))
 **Dependencies:** None
 **Status:** Not started
-**PRD requirements:** R1, R2, R3, R4a, R11
+**Upstream:** [PRD-gate-transition-contract](../prds/PRD-gate-transition-contract.md) (R1, R2, R3, R4a, R11)
 
 Gates produce structured data matching their gate type's schema. Gate output
 feeds into transition `when` clauses via namespaced fields
@@ -64,10 +64,10 @@ Scope:
 
 Design doc: TBD
 
-### Feature 2: Override mechanism
+### Feature 2: Override mechanism ([#117](https://github.com/tsukumogami/koto/issues/117))
 **Dependencies:** Feature 1
 **Status:** Not started
-**PRD requirements:** R4, R5, R5a, R6, R7, R8, R12
+**Upstream:** [PRD-gate-transition-contract](../prds/PRD-gate-transition-contract.md) (R4, R5, R5a, R6, R7, R8, R12)
 
 `koto overrides record` substitutes a gate's output with override data (either
 the gate's `override_default` or agent-provided `--with-data`). Override events
@@ -92,10 +92,10 @@ Scope:
 
 Design doc: TBD
 
-### Feature 3: Compiler validation
+### Feature 3: Compiler validation ([#118](https://github.com/tsukumogami/koto/issues/118))
 **Dependencies:** Feature 1, Feature 2
 **Status:** Not started
-**PRD requirements:** R9
+**Upstream:** [PRD-gate-transition-contract](../prds/PRD-gate-transition-contract.md) (R9)
 
 The template compiler validates the full gate/transition/override contract at
 compile time: gate types are registered, override defaults match schemas,
@@ -115,10 +115,10 @@ Scope:
 
 Design doc: TBD
 
-### Feature 4: Backward compatibility
+### Feature 4: Backward compatibility ([#119](https://github.com/tsukumogami/koto/issues/119))
 **Dependencies:** Feature 1
 **Status:** Not started
-**PRD requirements:** R10
+**Upstream:** [PRD-gate-transition-contract](../prds/PRD-gate-transition-contract.md) (R10)
 
 Existing templates work without changes. Gates on states where no `when`
 clause references `gates.*` fields use the legacy boolean pass/block behavior.
@@ -156,9 +156,44 @@ needs the complete picture (schemas + override defaults + transitions) to
 validate the contract. Building validation incrementally as features land
 is possible but the reachability check specifically needs the full model.
 
+## Implementation Issues
+
+### Milestone: [Gate-transition contract](https://github.com/tsukumogami/koto/milestone/9)
+
+| Issue | Dependencies | Tier |
+|-------|--------------|------|
+| [#116: structured gate output and transition routing](https://github.com/tsukumogami/koto/issues/116) | None | testable |
+| _Gates produce structured data per gate type schema. Gate output feeds into transition `when` clauses via `gates.*` namespace. Resolver gains dot-path traversal. Foundation for all other features._ | | |
+| [#117: gate override mechanism with rationale](https://github.com/tsukumogami/koto/issues/117) | [#116](https://github.com/tsukumogami/koto/issues/116) | testable |
+| _`koto overrides record` substitutes gate output with default or agent-provided data. Override events capture rationale and full context. `koto overrides list` for session-wide queries._ | | |
+| [#118: gate-transition contract compiler validation](https://github.com/tsukumogami/koto/issues/118) | [#116](https://github.com/tsukumogami/koto/issues/116), [#117](https://github.com/tsukumogami/koto/issues/117) | testable |
+| _Compiler validates gate types are registered, override defaults match schemas, `when` clauses reference valid fields, and override defaults produce reachable transitions._ | | |
+| [#119: backward compatibility for legacy gate templates](https://github.com/tsukumogami/koto/issues/119) | [#116](https://github.com/tsukumogami/koto/issues/116) | testable |
+| _Existing templates work without changes. Legacy boolean behavior when `when` clauses don't reference `gates.*`. Likely implemented alongside #116._ | | |
+
+### Dependency graph
+
+```mermaid
+graph TD
+    I116["#116: Structured gate output<br/>+ transition routing"]
+    I117["#117: Override mechanism<br/>with rationale"]
+    I118["#118: Compiler validation"]
+    I119["#119: Backward compatibility"]
+
+    I116 --> I117
+    I116 --> I118
+    I117 --> I118
+    I116 --> I119
+
+    classDef needsDesign fill:#e1bee7
+    class I116,I117,I118,I119 needsDesign
+```
+
+**Legend**: Purple = needs-design
+
 ## Progress
 
-- Feature 1: Not started (structured gate output + routing)
-- Feature 2: Not started (override mechanism)
-- Feature 3: Not started (compiler validation)
-- Feature 4: Not started (backward compatibility)
+- Feature 1 (#116): Not started
+- Feature 2 (#117): Not started
+- Feature 3 (#118): Not started
+- Feature 4 (#119): Not started
