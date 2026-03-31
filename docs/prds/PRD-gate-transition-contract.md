@@ -167,7 +167,7 @@ states:
           decision: request_changes
 ```
 
-Gate output (`gates.lint.status`) and agent evidence (`decision`) coexist in the
+Gate output (`gates.lint.exit_code`) and agent evidence (`decision`) coexist in the
 same transition resolver. The `when` clause can reference both. Lint runs
 automatically; the agent provides its review decision.
 
@@ -270,17 +270,25 @@ Initial gate types and their schemas:
 
 | Gate type | Output schema | Pass condition |
 |-----------|--------------|----------------|
-| `command` | `{exit_code: number}` | `exit_code == 0` |
-| `context-exists` | `{exists: boolean}` | `exists == true` |
-| `context-matches` | `{matches: boolean}` | `matches == true` |
+| `command` | `{exit_code: number, error: string}` | `exit_code == 0` |
+| `context-exists` | `{exists: boolean, error: string}` | `exists == true` |
+| `context-matches` | `{matches: boolean, error: string}` | `matches == true` |
+
+The `error` field is empty on success. On failure, it contains the failure
+reason. On timeout, the gate produces `{exit_code: -1, error: "timed_out"}`
+(for command) or `{exists: false, error: "timed_out"}` (for context types).
+On spawn/evaluation errors, `error` contains the error message. This means
+the output shape is always consistent -- `when` clauses can route on any
+field regardless of whether the gate succeeded, failed, timed out, or
+errored.
 
 Future gate types extend this registry with richer schemas:
 
 | Gate type (future) | Output schema | Pass condition |
 |-----------|--------------|----------------|
-| `json-command` | `{exit_code: number, data: object}` (stdout parsed as JSON) | `exit_code == 0` |
-| `http` | `{status_code: number, body: object}` | `status_code >= 200 && < 300` |
-| `jira` | `{assigned: boolean, status: string, assignee: string}` | `assigned == true` |
+| `json-command` | `{exit_code: number, data: object, error: string}` | `exit_code == 0` |
+| `http` | `{status_code: number, body: object, error: string}` | `status_code >= 200 && < 300` |
+| `jira` | `{assigned: boolean, status: string, assignee: string, error: string}` | `assigned == true` |
 
 Each gate type owns both the schema and the parsing logic that converts raw
 execution results into structured output. Template authors pick a gate type,
@@ -342,7 +350,9 @@ leaves some gates still failing, the event still records what was overridden
 (producing `gates.*` data) and an `accepts` block (for agent-submitted
 evidence). Both feed into the same transition resolver. Gate output is
 namespaced under `gates.<gate_name>` to prevent field collisions with agent
-evidence.
+evidence. The `gates` top-level key is reserved -- evidence validation
+rejects `--with-data` payloads containing a `gates` field to prevent agents
+from overwriting engine-produced gate output.
 
 **R8: Cross-epoch override query.** A `derive_overrides` function returns all
 `GateOverrideRecorded` events across the full session. `koto overrides list`
@@ -403,8 +413,8 @@ the same size limit as `--with-data` (1MB).
   gate type's schema
 - [ ] Compiler rejects templates where applying all override defaults leads to
   no valid transition (dead end on override)
-- [ ] Compiler warns on templates where a `when` clause references a
-  nonexistent gate or field
+- [ ] Compiler rejects templates where a `when` clause references a
+  nonexistent gate or nonexistent field in a gate type's schema
 - [ ] Existing templates compile and run without changes (backward compatible)
 - [ ] `--override-rationale` with `--gate ci_check` overrides only `ci_check`;
   other failing gates remain blocked
@@ -418,22 +428,29 @@ the same size limit as `--with-data` (1MB).
 - [ ] Override events survive rewind and are visible in `koto overrides list`
 - [ ] Passing gates produce their structured output and transition routing
   works without agent interaction
-- [ ] Command gate produces `{exit_code: 0}` on success, `{exit_code: N}` on
-  failure
-- [ ] Context-exists gate produces `{exists: true}` when key exists,
-  `{exists: false}` when missing
-- [ ] Context-matches gate produces `{matches: true}` when pattern matches,
-  `{matches: false}` when it doesn't
+- [ ] Command gate produces `{exit_code: 0, error: ""}` on success,
+  `{exit_code: N, error: ""}` on failure
+- [ ] Context-exists gate produces `{exists: true, error: ""}` when key
+  exists, `{exists: false, error: ""}` when missing
+- [ ] Context-matches gate produces `{matches: true, error: ""}` when pattern
+  matches, `{matches: false, error: ""}` when it doesn't
 - [ ] When `--override-rationale` is combined with `--with-data`,
   `EvidenceSubmitted` has a lower sequence number than `GateOverrideRecorded`
   (R11)
 - [ ] `--override-rationale` with a string exceeding 1MB returns a validation
   error (R12)
-- [ ] A gate that times out produces a structured error output (e.g.,
-  `{error: "timed_out"}`) that doesn't match the gate's `pass_condition`
-- [ ] A gate that errors (spawn failure, invalid regex) produces a structured
-  error output that doesn't match the gate's `pass_condition`
+- [ ] A command gate that times out produces `{exit_code: -1, error:
+  "timed_out"}` -- same schema shape, doesn't satisfy pass condition
+- [ ] A command gate that errors (spawn failure) produces `{exit_code: -1,
+  error: "<message>"}` -- same schema shape, doesn't satisfy pass condition
+- [ ] A context-exists gate that errors produces `{exists: false, error:
+  "<message>"}` -- consistent shape
 - [ ] `--gate` targeting a gate that already passed is silently ignored
+- [ ] `--with-data '{"gates": {...}}'` is rejected with a validation error
+  (reserved namespace)
+- [ ] `koto next` response for a gate-blocked state includes structured gate
+  output in `blocking_conditions` (gate name + output fields, not just
+  pass/fail)
 
 ## Out of scope
 
@@ -469,6 +486,18 @@ the same size limit as `--with-data` (1MB).
   (command, context-exists, context-matches) must be updated to produce
   structured data. New gate types automatically benefit from the schema
   contract.
+- **Override always routes through the passing path.** Override defaults must
+  satisfy the gate's pass condition, so overrides always produce the "gate
+  passed" routing outcome. You can't override a CI gate and route to a
+  "needs-review" state instead of "deploy." This is intentional: override
+  means "treat the gate as passed." If the agent wants a non-passing route,
+  they use `--with-data` evidence on states with `accepts` blocks, or `--to`
+  for directed transitions.
+- **Dot-path traversal is new resolver capability.** The current
+  `resolve_transition` does flat key matching against a `BTreeMap`. Gate
+  output namespaced as nested maps (`{"gates": {"ci_check": {...}}}`)
+  requires dot-path traversal in `when` clause matching. This is new work
+  for the transition resolver, addressed in the design doc.
 - **Compiler reachability is limited to enum fields.** The R9 reachability
   check (verifying override defaults lead to a valid transition) can only be
   done statically for enum-typed fields where all possible values are known.
