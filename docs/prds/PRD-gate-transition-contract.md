@@ -1,5 +1,5 @@
 ---
-status: Draft
+status: Accepted
 problem: |
   Gates in koto are boolean pass/fail checks completely decoupled from
   transition routing. Gate results don't produce structured data, don't feed
@@ -19,7 +19,7 @@ source_issue: 108
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem statement
 
