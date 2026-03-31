@@ -86,14 +86,14 @@ blocks with `override` enum values as a workaround for routing on gate results.
 override defaults, and transition conditions don't fit together, so I catch
 dead-end states before runtime.
 
-**As an agent (workflow skill)**, I want to override a failed gate via
-`koto overrides record` and have the engine use the gate's default override
-values for transition routing on the next `koto next`, so I don't need to
-know the gate's internal schema to bypass it.
+**As an agent (workflow skill)**, I want to override a gate's output via
+`koto overrides record` and have the engine substitute the override values
+for transition routing on the next `koto next`, so I can unblock the
+workflow when the gate's actual output doesn't match my intent.
 
 **As a human reviewer**, I want to query all gate overrides in a session and
-see the rationale, the gate failure context, and what default values were
-applied, so I can audit agent behavior.
+see the rationale, the gate's actual output, and what values were substituted,
+so I can audit agent behavior.
 
 **As a template author**, I want gates that return richer data (coverage
 percentage, matched content, severity level) so transitions can route on
@@ -198,45 +198,45 @@ structured model, not a separate concept.
 
 ### Example 4: Override with explicit data (richer gate)
 
-A future `list_github_issue_labels` gate returns labels. No transition
-matches when the issue has no labels. The agent provides the data the gate
-should have returned.
+A future `jira` gate checks issue assignment. The gate returns structured
+data, and transitions route on it. The agent overrides with explicit data
+when the gate's actual output doesn't match their intent.
 
 ```yaml
 states:
   triage:
     gates:
-      labels:
-        type: list_github_issue_labels    # produces {labels: [string]}
-        key: "{GH_ISSUE}"
+      ticket:
+        type: jira                        # produces {assigned: boolean, status: string, ...}
+        key: "{JIRA_TICKET}"
     transitions:
-      - target: is_bug
+      - target: work
         when:
-          gates.labels.contains: bug
-      - target: is_feature
+          gates.ticket.assigned: true
+      - target: assign
         when:
-          gates.labels.contains: feature_request
+          gates.ticket.assigned: false
 ```
 
 ```bash
-# Gate returns empty labels -- no transition matches
+# Gate returns assigned: false (ticket isn't assigned in Jira)
 $ koto next my-workflow
 {"action": "gate_blocked", "state": "triage",
- "blocking_conditions": [{"gate": "labels", "output": {"labels": [], "error": ""}}]}
+ "blocking_conditions": [{"gate": "ticket", "output": {"assigned": false, "status": "open", "error": ""}}]}
 
-# Agent knows from context that this is a bug, provides explicit override data
-$ koto overrides record my-workflow --gate labels \
-    --rationale "Issue is a bug based on conversation with reporter" \
-    --with-data '{"contains": "bug"}'
+# Agent assigned the ticket out-of-band, overrides with explicit data
+$ koto overrides record my-workflow --gate ticket \
+    --rationale "Assigned ticket to myself via Jira UI" \
+    --with-data '{"assigned": true, "status": "in_progress"}'
 
 $ koto next my-workflow
-# Transition resolver matches gates.labels.contains: bug -> is_bug
-{"action": "done", "state": "is_bug", "advanced": true}
+# Transition resolver matches gates.ticket.assigned: true -> work
+{"action": "done", "state": "work", "advanced": true}
 ```
 
-Without `--with-data`, the override would substitute `override_default`,
-which might not match any transition. With `--with-data`, the agent tells
-the resolver exactly what the gate data should be.
+Without `--with-data`, the override would substitute `override_default`
+(which for jira gates defaults to `{assigned: true}`). With `--with-data`,
+the agent provides specific values -- here including the updated status.
 
 ### Example 5: Selective override with per-gate rationale
 
@@ -392,6 +392,12 @@ context-exists: `{exists: true, error: ""}`, context-matches:
 `override_default` per gate to route overrides to a different transition.
 The compiler validates that override defaults match the gate type's schema.
 
+**R4a: Response format when gates don't pass.** When `koto next` encounters
+gates whose output doesn't satisfy their pass condition and no override
+exists, the response includes the gate name and its structured output in
+the `blocking_conditions` array. The agent uses this data to decide whether
+to override and what data to provide.
+
 **R5: Override via `koto overrides record`.** Override is a subcommand of
 `koto overrides`, mirroring the `koto decisions record` / `koto decisions
 list` pattern:
@@ -455,14 +461,15 @@ that:
   resolves (no dead ends on override)
 
 **R10: Backward compatibility.** Existing templates continue to compile and
-run. When transition `when` clauses don't reference `gates.*` fields, gates
-behave as today (boolean pass/fail, no structured output enters the resolver).
-The resolver only receives `gates.*` namespaced data when `when` clauses
-reference gate fields. The compiler warns about gates on states where no
-`when` clause references their output, but doesn't error. Templates that use
-`accepts` blocks with `override` enum values as the workaround pattern
-continue to work identically -- `--with-data '{"status": "override"}'` is
-still plain evidence submission unrelated to the new override mechanism.
+run. Gates still produce data internally (R1), but when transition `when`
+clauses don't reference `gates.*` fields, the gate data doesn't enter the
+resolver -- the legacy boolean pass/block behavior applies. This means
+existing templates work without changes. The compiler warns about gates on
+states where no `when` clause references their output, but doesn't error.
+Templates that use `accepts` blocks with `override` enum values as the
+workaround pattern continue to work identically -- `--with-data
+'{"status": "override"}'` is still plain evidence submission unrelated to
+the new override mechanism.
 
 ### Non-functional
 
@@ -483,6 +490,9 @@ are subject to the same size limit as `--with-data` (1MB).
   true, context-matches: matches == true)
 - [ ] Compiler rejects `override_default` that doesn't match the gate type's
   schema
+- [ ] Template author can declare a custom `override_default` per gate that
+  differs from the gate type's default, and the compiler validates it against
+  the schema
 - [ ] `koto overrides record` with `--with-data` substitutes the provided data
   instead of the override default
 - [ ] `koto overrides record` with `--with-data` validates the data against
