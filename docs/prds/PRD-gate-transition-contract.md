@@ -108,14 +108,12 @@ states:
   verify:
     gates:
       ci_check:
-        type: command
+        type: command                    # produces {exit_code: number}
         command: "run-ci"
-        # No output_schema needed -- compiler knows command gates produce {exit_code: number}
-        # override_default is optional -- defaults to {exit_code: 0} for command gates
     transitions:
       - target: deploy
         when:
-          gates.ci_check.exit_code: 0
+          gates.ci_check.exit_code: 0    # route on the gate type's documented output
       - target: fix
         when:
           gates.ci_check.exit_code: 1
@@ -152,10 +150,8 @@ states:
   review:
     gates:
       lint:
-        type: command
+        type: command                    # produces {exit_code: number}
         command: "run-lint"
-        # command gate produces {exit_code: number}
-        # override_default: {exit_code: 0} (implicit for command gates)
     accepts:
       decision:
         type: enum
@@ -182,10 +178,8 @@ states:
   check:
     gates:
       file_exists:
-        type: context-exists
+        type: context-exists             # produces {exists: boolean}
         key: "config.yaml"
-        # context-exists produces {exists: boolean}
-        # override_default: {exists: true} (implicit)
     transitions:
       - target: proceed
         when:
@@ -266,19 +260,32 @@ separate events per invocation.
 
 ### Functional
 
-**R1: Gate type owns the output schema.** Each gate type (command,
-context-exists, context-matches, and future types) defines a fixed output
-schema built into the engine. Template authors don't declare `output_schema`
--- they pick a gate type and get its fields. The engine knows what each gate
-type produces and how to parse the raw execution result into structured data.
-Built-in schemas for existing types:
-- **command**: `{exit_code: number}`
-- **context-exists**: `{exists: boolean}`
-- **context-matches**: `{matches: boolean}`
-Each gate type also defines a built-in `pass_condition` (command: `exit_code
-== 0`, context-exists: `exists == true`, context-matches: `matches == true`).
-Template authors can declare `override_default` per gate, which the compiler
-validates against the gate type's known schema.
+**R1: Gate types are reusable building blocks with documented schemas.** Each
+gate type defines a public output schema and a pass condition. These are
+documented so template authors know what fields are available when writing
+`when` clauses. The schema is the gate type's contract -- it tells authors
+exactly what data the gate produces and what "passing" means.
+
+Initial gate types and their schemas:
+
+| Gate type | Output schema | Pass condition |
+|-----------|--------------|----------------|
+| `command` | `{exit_code: number}` | `exit_code == 0` |
+| `context-exists` | `{exists: boolean}` | `exists == true` |
+| `context-matches` | `{matches: boolean}` | `matches == true` |
+
+Future gate types extend this registry with richer schemas:
+
+| Gate type (future) | Output schema | Pass condition |
+|-----------|--------------|----------------|
+| `json-command` | `{exit_code: number, data: object}` (stdout parsed as JSON) | `exit_code == 0` |
+| `http` | `{status_code: number, body: object}` | `status_code >= 200 && < 300` |
+| `jira` | `{assigned: boolean, status: string, assignee: string}` | `assigned == true` |
+
+Each gate type owns both the schema and the parsing logic that converts raw
+execution results into structured output. Template authors pick a gate type,
+reference its documented fields in `when` clauses, and optionally declare
+`override_default` values (validated against the schema by the compiler).
 
 **R2: Gate evaluation produces structured data.** When a gate evaluates, it
 produces a structured result matching its gate type's schema, not just
@@ -497,12 +504,12 @@ existing template. We chose to have gates without `when` clauses referencing
 `gates.*` fields behave as today (boolean pass/fail). The compiler warns but
 doesn't error. This lets adoption be gradual.
 
-**D5: Gate type owns the output schema, not the template author.** Output
-schemas could be declared per-gate in the template YAML (`output_schema:`
-field). We chose gate-type-owned schemas because there's no mechanism to
-connect a gate's raw execution (e.g., a shell command's exit code) to a
-user-declared schema. The parsing logic that converts raw output to structured
-data belongs in the gate type implementation, not the template. Each gate
-type registers a fixed schema and built-in pass condition. Future richer
-output comes through new gate types (e.g., `json-command` that parses stdout
-as JSON), not through template-level schema declarations.
+**D5: Gate types are documented building blocks, not hidden compiler logic.**
+Each gate type publishes a schema that template authors reference when writing
+`when` clauses. The schema is the gate type's public contract, not an
+implementation detail. Output schemas could alternatively be declared per-gate
+in the template YAML, but there's no mechanism to connect a gate's raw
+execution to a user-declared schema -- the parsing logic belongs in the gate
+type, not the template. Future gate types (jira, http, json-command) extend
+the registry with richer schemas and parsing logic, giving template authors
+new building blocks to compose workflows from.
