@@ -86,10 +86,10 @@ blocks with `override` enum values as a workaround for routing on gate results.
 override defaults, and transition conditions don't fit together, so I catch
 dead-end states before runtime.
 
-**As an agent (workflow skill)**, I want to override a failed gate with
-`--override-rationale "reason"` and have the engine use the gate's declared
-default override values for transition routing, so I don't need to know the
-gate's internal schema to bypass it.
+**As an agent (workflow skill)**, I want to override a failed gate (via
+`koto override` or `koto next --override-rationale`) and have the engine use
+the gate's declared default override values for transition routing, so I
+don't need to know the gate's internal schema to bypass it.
 
 **As a human reviewer**, I want to query all gate overrides in a session and
 see the rationale, the gate failure context, and what default values were
