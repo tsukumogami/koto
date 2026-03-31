@@ -326,11 +326,18 @@ is declared, the gate type provides a sensible default (command:
 `{exit_code: 0}`, context-exists: `{exists: true}`, context-matches:
 `{matches: true}`).
 
-**R5: Engine-level override with rationale.** `koto next` accepts
-`--override-rationale <string>` with an optional `--gate <name>` flag to
-target specific gates. When `--gate` is omitted, all failing gates are
-overridden. When `--gate` is provided (repeatable), only the named gates are
-overridden; other failing gates remain blocked. The rationale is mandatory
+**R5: Override as a command and a shorthand flag.** Override has two
+invocation paths:
+- **Command (primitive):** `koto override <name> --gate <name> --rationale
+  "reason"` appends a `GateOverrideRecorded` event without advancing. Multiple
+  agents can push overrides independently before an orchestrator calls
+  `koto next`.
+- **Flag (shorthand):** `koto next <name> --override-rationale "reason"`
+  appends the override event and advances in one call. Syntactic sugar for the
+  common single-agent case.
+
+Both paths accept `--gate <name>` (repeatable, optional). When `--gate` is
+omitted, all failing gates are overridden. The rationale is mandatory
 (non-empty string) and applies to all gates being overridden in that call.
 
 **R5a: Selective override.** `--gate <name>` can be repeated to override
@@ -423,6 +430,14 @@ the same size limit as `--with-data` (1MB).
 - [ ] `--gate nonexistent_gate` is silently ignored (no error)
 - [ ] Selective override that leaves some gates failing keeps the state blocked
 - [ ] Each override invocation produces its own `GateOverrideRecorded` event
+- [ ] `koto override <name> --gate ci --rationale "reason"` appends a
+  `GateOverrideRecorded` event without advancing the workflow
+- [ ] After `koto override`, a subsequent `koto next` reads the override event
+  and substitutes gate defaults during gate evaluation
+- [ ] Multiple `koto override` calls from different agents can append to the
+  same workflow without lock contention
+- [ ] `koto next --override-rationale "reason"` produces the same result as
+  `koto override` followed by `koto next`
 - [ ] `--override-rationale ""` returns a validation error
 - [ ] `--override-rationale` on a non-blocked state is a no-op
 - [ ] Override events survive rewind and are visible in `koto overrides list`
@@ -556,3 +571,13 @@ allow agents to inject explicit gate output values at override time (instead of
 always using the default), enabling non-passing override routing without
 bypassing the resolver. This was identified during adversarial review but
 deferred because the use case isn't validated.
+
+**D7: Override is both a command and a flag.** Override could be only a flag on
+`koto next` (simpler, one call) or only a separate command (more composable).
+We chose both: `koto override` as the primitive (append event, no advance) and
+`koto next --override-rationale` as shorthand (append + advance). The separate
+command enables multi-agent composition -- sub-agents push overrides
+independently, orchestrator calls `next` when ready. The flag preserves
+simplicity for single-agent workflows. This follows the existing pattern:
+`koto decisions record` appends without advancing, while evidence via
+`--with-data` on `koto next` submits and advances in one call.
