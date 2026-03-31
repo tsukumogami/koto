@@ -86,10 +86,10 @@ blocks with `override` enum values as a workaround for routing on gate results.
 override defaults, and transition conditions don't fit together, so I catch
 dead-end states before runtime.
 
-**As an agent (workflow skill)**, I want to override a failed gate (via
-`koto override` or `koto next --override-rationale`) and have the engine use
-the gate's declared default override values for transition routing, so I
-don't need to know the gate's internal schema to bypass it.
+**As an agent (workflow skill)**, I want to override a failed gate via
+`koto overrides record` and have the engine use the gate's default override
+values for transition routing on the next `koto next`, so I don't need to
+know the gate's internal schema to bypass it.
 
 **As a human reviewer**, I want to query all gate overrides in a session and
 see the rationale, the gate failure context, and what default values were
@@ -132,10 +132,14 @@ needed -- the gate result drives routing automatically.
 ```bash
 $ koto next my-workflow
 {"action": "gate_blocked", "state": "verify",
- "blocking_conditions": [{"gate": "ci_check", "output": {"exit_code": 1}}]}
+ "blocking_conditions": [{"gate": "ci_check", "output": {"exit_code": 1, "error": ""}}]}
 
-$ koto next my-workflow --override-rationale "Flaky test, unrelated to this change"
-# Engine applies ci_check's override_default: {exit_code: 0}
+# Override the gate
+$ koto overrides record my-workflow --gate ci_check \
+    --rationale "Flaky test, unrelated to this change"
+
+# Advance -- engine reads the override event, substitutes {exit_code: 0}
+$ koto next my-workflow
 # Transition resolver matches gates.ci_check.exit_code: 0 -> deploy
 {"action": "done", "state": "deploy", "advanced": true}
 ```
@@ -192,11 +196,10 @@ states:
 Even simple gates get a schema. The boolean model is a special case of the
 structured model, not a separate concept.
 
-### Example 4: Selective override with rationale
+### Example 4: Selective override with per-gate rationale
 
-A `validate` state has two command gates: `schema_check` (runs a schema
-validator) and `size_check` (checks file size). Each `koto next` call
-re-evaluates gates from scratch. Overrides aren't sticky.
+A `validate` state has two command gates. Override events are sticky within
+an epoch -- they persist until the state transitions.
 
 ```bash
 # Two command gates fail
@@ -207,37 +210,40 @@ $ koto next my-workflow
    {"gate": "size_check", "output": {"exit_code": 2, "error": ""}}
  ]}
 
-# Override both in one call
-$ koto next my-workflow --override-rationale "Schema: deprecated fields; Size: test fixture" \
-    --gate schema_check --gate size_check
-# Both gates get override_default {exit_code: 0}, transition proceeds
-{"action": "done", "state": "process", "advanced": true}
+# Override schema_check with its own rationale
+$ koto overrides record my-workflow --gate schema_check \
+    --rationale "Schema errors are in deprecated fields"
 
-# Or override all at once (no --gate flag)
-$ koto next my-workflow --override-rationale "Both checks are irrelevant for this change"
-{"action": "done", "state": "process", "advanced": true}
-
-# Selective override that leaves some gates blocked
-$ koto next my-workflow --override-rationale "Schema errors are in deprecated fields" \
-    --gate schema_check
-# schema_check overridden, size_check still fails -- state stays blocked
+# Advance -- schema_check is overridden, but size_check still fails
+$ koto next my-workflow
 {"action": "gate_blocked", "state": "validate",
  "blocking_conditions": [
    {"gate": "size_check", "output": {"exit_code": 2, "error": ""}}
  ]}
+
+# Override size_check with its own rationale
+$ koto overrides record my-workflow --gate size_check \
+    --rationale "Large file is a test fixture"
+
+# Advance -- both overrides in effect, state advances
+$ koto next my-workflow
+{"action": "done", "state": "process", "advanced": true}
 ```
 
-### Example 5: Multi-agent override via `koto override` command
+Each gate gets its own rationale. Overrides accumulate across calls within
+the same epoch.
+
+### Example 5: Multi-agent override
 
 Sub-agents push overrides independently. Orchestrator advances when ready.
 
 ```bash
 # Sub-agent A overrides schema_check (no advancement)
-$ koto override my-workflow --gate schema_check \
+$ koto overrides record my-workflow --gate schema_check \
     --rationale "Schema errors are in deprecated fields"
 
 # Sub-agent B overrides size_check (no advancement)
-$ koto override my-workflow --gate size_check \
+$ koto overrides record my-workflow --gate size_check \
     --rationale "Large file is a test fixture"
 
 # Orchestrator advances -- both overrides are read during gate evaluation
@@ -342,29 +348,31 @@ is declared, the gate type provides a sensible default (command:
 `{exit_code: 0}`, context-exists: `{exists: true}`, context-matches:
 `{matches: true}`).
 
-**R5: Override as a command and a shorthand flag.** Override has two
-invocation paths:
-- **Command (primitive):** `koto override <name> --gate <name> --rationale
-  "reason"` appends a `GateOverrideRecorded` event without advancing. Multiple
-  agents can push overrides independently before an orchestrator calls
-  `koto next`.
-- **Flag (shorthand):** `koto next <name> --override-rationale "reason"`
-  appends the override event and advances in one call. Syntactic sugar for the
-  common single-agent case.
+**R5: Override via `koto overrides record`.** Override is a subcommand of
+`koto overrides`, mirroring the `koto decisions record` / `koto decisions
+list` pattern:
 
-Both paths accept `--gate <name>` (repeatable, optional). When `--gate` is
-omitted, all failing gates are overridden. The rationale is mandatory
-(non-empty string) and applies to all gates being overridden in that call.
+```
+koto overrides record <name> --gate <gate_name> --rationale "reason"
+```
 
-When `koto override` is used (command path), a subsequent `koto next` reads
-the override events from the current epoch and substitutes gate defaults
-during gate evaluation, the same way it reads `EvidenceSubmitted` events.
+Each call overrides a single gate with a single rationale. It appends a
+`GateOverrideRecorded` event without advancing the workflow. Multiple agents
+can push overrides independently before an orchestrator calls `koto next`.
 
-**R5a: Selective override.** `--gate <name>` can be repeated to override
-multiple specific gates in one call. If a named gate isn't actually failing,
-it's ignored (no error). If after applying selective overrides some gates
-still fail, the state remains blocked -- the agent must override those too
-or wait for them to pass.
+A subsequent `koto next` reads override events from the current epoch and
+substitutes the gate's override defaults during gate evaluation, the same
+way it reads `EvidenceSubmitted` events.
+
+Override events are sticky within an epoch -- they persist in the event log
+until the state transitions (new epoch). An agent can override gates across
+multiple `koto overrides record` calls, then advance with a single
+`koto next`.
+
+**R5a: One gate, one rationale.** Each `koto overrides record` call targets
+exactly one gate. To override multiple gates, make multiple calls. This
+ensures each override has its own rationale. If a named gate isn't actually
+failing, the call is a no-op (no error, no event).
 
 **R6: Override event with full context.** On each override (whether it
 advances the state or not), the engine emits a `GateOverrideRecorded` event
@@ -408,16 +416,13 @@ still plain evidence submission unrelated to the new override mechanism.
 
 ### Non-functional
 
-**R11: Event ordering.** Within a single `koto next --override-rationale
---with-data` invocation, `EvidenceSubmitted` and `GateOverrideRecorded` are
-emitted in strict sequence (evidence first). When `koto override` and
-`koto next --with-data` are separate invocations, the events are ordered by
-their invocation timestamps (the override event from the earlier call has a
-lower sequence number).
+**R11: Event ordering.** `koto overrides record` and `koto next` are
+separate invocations. Events are ordered by their invocation timestamps via
+sequence numbers. Override events from earlier calls have lower sequence
+numbers than events from later calls.
 
-**R12: Rationale size limit.** Rationale values (via `--override-rationale`
-on `koto next` or `--rationale` on `koto override`) are subject to the same
-size limit as `--with-data` (1MB).
+**R12: Rationale size limit.** `--rationale` values on `koto overrides record`
+are subject to the same size limit as `--with-data` (1MB).
 
 ## Acceptance criteria
 
@@ -434,11 +439,26 @@ size limit as `--with-data` (1MB).
   against gate output
 - [ ] A state with both gates and `accepts` block routes correctly using both
   data sources in the same `when` clause
-- [ ] `--override-rationale` on a gate-blocked state applies override defaults
-  for failing gates and advances via normal transition resolution
+- [ ] `koto overrides record <name> --gate ci_check --rationale "reason"`
+  appends a `GateOverrideRecorded` event without advancing the workflow
+- [ ] After `koto overrides record`, a subsequent `koto next` reads the
+  override event and substitutes gate defaults during gate evaluation
 - [ ] `GateOverrideRecorded` event contains: state, gate name, actual output,
   override default applied, and rationale
 - [ ] `koto overrides list` returns all override events across the session
+- [ ] Override events are sticky within an epoch -- multiple
+  `koto overrides record` calls accumulate, and `koto next` reads all of them
+- [ ] Multiple `koto overrides record` calls from different agents can append
+  to the same workflow without lock contention
+- [ ] Each `koto overrides record` call produces its own `GateOverrideRecorded`
+  event with its own rationale
+- [ ] `koto overrides record` targeting a gate that isn't failing is a no-op
+  (no error, no event)
+- [ ] `koto overrides record` with `--rationale ""` returns a validation error
+- [ ] `koto overrides record` with `--rationale` exceeding 1MB returns a
+  validation error (R12)
+- [ ] After overriding one gate, `koto next` advances only if all remaining
+  gates pass or have been overridden -- otherwise state stays blocked
 - [ ] Compiler rejects templates where applying all override defaults leads to
   no valid transition (dead end on override)
 - [ ] Compiler rejects templates where a `when` clause references a
@@ -448,26 +468,6 @@ size limit as `--with-data` (1MB).
   produce no structured output (legacy boolean behavior)
 - [ ] Templates using `accepts` blocks with `override` enum values continue
   to work identically via `--with-data` (workaround pattern preserved)
-- [ ] `--override-rationale` with `--gate ci_check` overrides only `ci_check`;
-  other failing gates remain blocked
-- [ ] `--override-rationale` with `--gate a --gate b` overrides both named gates
-- [ ] `--override-rationale` without `--gate` overrides all failing gates
-- [ ] `--gate nonexistent_gate` is silently ignored (no error)
-- [ ] Selective override that leaves some gates failing keeps the state blocked
-- [ ] Each override invocation produces its own `GateOverrideRecorded` event
-- [ ] `koto override <name> --gate ci --rationale "reason"` appends a
-  `GateOverrideRecorded` event without advancing the workflow
-- [ ] After `koto override`, a subsequent `koto next` reads the override event
-  and substitutes gate defaults during gate evaluation
-- [ ] Multiple `koto override` calls from different agents can append to the
-  same workflow without lock contention
-- [ ] `koto next --override-rationale "reason"` produces the same result as
-  `koto override` followed by `koto next`
-- [ ] `--override-rationale ""` returns a validation error
-- [ ] `--override-rationale` on a non-blocked state is a no-op (no error, no
-  event)
-- [ ] `koto override` on a non-blocked state is a no-op (no error, no event)
-- [ ] `koto override` without `--gate` overrides all failing gates
 - [ ] Override events survive rewind and are visible in `koto overrides list`
 - [ ] Passing gates produce their structured output and transition routing
   works without agent interaction
@@ -477,11 +477,8 @@ size limit as `--with-data` (1MB).
   exists, `{exists: false, error: ""}` when missing
 - [ ] Context-matches gate produces `{matches: true, error: ""}` when pattern
   matches, `{matches: false, error: ""}` when it doesn't
-- [ ] When `--override-rationale` is combined with `--with-data`,
-  `EvidenceSubmitted` has a lower sequence number than `GateOverrideRecorded`
-  (R11)
-- [ ] `--override-rationale` with a string exceeding 1MB returns a validation
-  error (R12)
+- [ ] Override events from `koto overrides record` have sequence numbers
+  reflecting their invocation order relative to other events (R11)
 - [ ] A command gate that times out produces `{exit_code: -1, error:
   "timed_out"}` -- same schema shape, doesn't satisfy pass condition
 - [ ] A command gate that errors (spawn failure) produces `{exit_code: -1,
@@ -520,9 +517,9 @@ size limit as `--with-data` (1MB).
   "override to passed but with actual coverage value"). Dynamic override
   values would require the agent to submit gate-shaped evidence, which could
   be a future extension.
-- **Rationale is shared across gates in one call.** When overriding multiple
-  gates with `--gate a --gate b`, both share the same rationale string. If
-  each gate needs distinct reasoning, the agent must make separate calls.
+- **One gate per override call.** Each `koto overrides record` call targets
+  exactly one gate. Overriding N gates requires N calls. This is intentional:
+  each gate gets its own rationale.
 - **No caller identity.** Override events don't record who performed the
   override. This is a pre-existing gap across all koto event types.
 - **Gate output depends on gate type implementation.** Each gate type
@@ -600,12 +597,13 @@ always using the default), enabling non-passing override routing without
 bypassing the resolver. This was identified during adversarial review but
 deferred because the use case isn't validated.
 
-**D7: Override is both a command and a flag.** Override could be only a flag on
-`koto next` (simpler, one call) or only a separate command (more composable).
-We chose both: `koto override` as the primitive (append event, no advance) and
-`koto next --override-rationale` as shorthand (append + advance). The separate
-command enables multi-agent composition -- sub-agents push overrides
-independently, orchestrator calls `next` when ready. The flag preserves
-simplicity for single-agent workflows. This follows the existing pattern:
-`koto decisions record` appends without advancing, while evidence via
-`--with-data` on `koto next` submits and advances in one call.
+**D7: Override is a subcommand, not a flag on `koto next`.** Override could
+be a flag on `koto next` (one call does override + advance) or a separate
+command. We chose `koto overrides record` as a subcommand under the existing
+`koto overrides` namespace, mirroring `koto decisions record`. One gate per
+call, one rationale per call. This keeps concerns separated (`koto next`
+advances, `koto overrides record` records overrides), enables multi-agent
+composition (sub-agents push overrides independently), ensures every gate
+gets its own rationale, and eliminates the complexity of a shorthand flag
+that combines two operations. The pattern is proven: `koto decisions record`
+works this way already.
