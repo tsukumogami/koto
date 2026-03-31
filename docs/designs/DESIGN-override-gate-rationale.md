@@ -8,14 +8,16 @@ problem: |
   evidence submission or template schemas.
 decision: |
   Add --override-rationale flag to koto next, threading rationale as a direct
-  parameter to advance_until_stop. Gate-only states use unconditional fallback
-  transitions as override targets. A purpose-built derive_overrides function
-  provides cross-epoch queries. One flag, one event type, one query function.
+  parameter to advance_until_stop. Override neutralizes gate failure
+  (gate_failed = false), letting normal transition resolution proceed. A
+  purpose-built derive_overrides function provides cross-epoch queries. One
+  flag, one event type, one query function -- no template schema changes.
 rationale: |
   Direct parameter threading is minimal and matches the existing evidence
-  pattern. Unconditional fallbacks handle gate-only states without schema
-  changes. Purpose-built query follows the derive_visit_counts precedent.
-  All three decisions reinforce engine universality without template evolution.
+  pattern. Neutralizing gate_failed reuses existing transition resolution
+  logic with no new code path. This eliminates the template workaround where
+  authors add accepts blocks with override enum values on deterministic gate
+  states. Purpose-built query follows the derive_visit_counts precedent.
 ---
 
 # DESIGN: Override gate rationale
@@ -27,10 +29,12 @@ Proposed
 ## Context and problem statement
 
 The koto engine's advance loop (`advance_until_stop` in `src/engine/advance.rs`)
-handles gate failures through a fallback path: if gates fail and the state has
-an `accepts` block, the engine returns `EvidenceRequired` instead of
-`GateBlocked`, letting the agent submit evidence to resolve a conditional
-transition. This implicit override works but produces no audit trail.
+has no built-in gate override mechanism. Today, template authors work around
+this by adding `accepts` blocks with `override` enum values and matching
+conditional transitions on deterministic gate states -- boilerplate that
+exists solely to give agents a way past a failed gate. Without that
+workaround, the agent's only option on a gate-blocked state is `--to`, which
+bypasses everything with no audit trail.
 
 The technical challenge has four parts:
 
@@ -49,10 +53,10 @@ The technical challenge has four parts:
    but reaches the point where gate failure is detected.
 
 3. **Advance loop changes.** When `--override-rationale` is present and gates
-   fail, the engine should bypass the gate-blocked stop reason, emit
-   `GateOverrideRecorded`, and continue advancing. Today, gate-only states
-   (no `accepts` block) return `GateBlocked` with no override path. The
-   `--override-rationale` flag must work on these states too.
+   fail, the engine should emit `GateOverrideRecorded` and then treat gates
+   as passed -- letting normal transition resolution proceed. This is simple:
+   the override neutralizes the gate failure, and the existing transition
+   logic handles routing.
 
 4. **Cross-epoch query function.** Existing `derive_*` functions in
    `src/engine/persistence.rs` are epoch-scoped (they filter events after the
@@ -117,43 +121,42 @@ for extensibility. Rejected because it's premature abstraction -- only two
 fields need threading today, and refactoring to a struct later is trivial if
 more fields accumulate.
 
-### Decision 2: advance loop override on gate-only states
+### Decision 2: advance loop override behavior
 
-States with gates and an `accepts` block already have an override path: the
-engine falls through to transition resolution and the agent provides evidence.
-But states with gates and NO `accepts` block return `GateBlocked` immediately
-with no forward path. `--override-rationale` must work on these states too
-(PRD R6). The question is: where does the engine transition to?
+When `--override-rationale` is present and gates fail, how should the advance
+loop behave? The current code has two paths depending on whether the state
+has an `accepts` block: with accepts, it falls through to transition
+resolution; without accepts, it returns `GateBlocked` immediately. The
+override mechanism needs to work identically in both cases.
 
-#### Chosen: use unconditional fallback transition
+#### Chosen: neutralize gate failure, let normal transition resolution proceed
 
-When gates fail on a gate-only state and `--override-rationale` is present,
-check for an unconditional transition (one with no `when` condition). If found,
-use it as the override target. If no unconditional transition exists, return an
-error -- the state has no valid progression path.
+When `override_rationale` is `Some` and gates fail, the engine emits
+`GateOverrideRecorded` and then sets `gate_failed = false` before calling
+`resolve_transition`. This is the same thing as treating the gates as if they
+had passed. Normal transition resolution handles routing from there --
+unconditional fallbacks fire, conditional transitions match against evidence
+if `--with-data` was also provided.
 
-This requires ~5-10 lines in the gate evaluation block. The existing
-`resolve_transition` function already uses unconditional fallbacks when no
-conditional matches, so this reuses proven semantics. Analysis of test fixtures
-shows all gate-having states already have unconditional fallback transitions,
-making this the de facto standard pattern.
+This is simple because it doesn't introduce a new code path. The existing
+transition resolution logic already handles every combination of evidence,
+conditionals, and fallbacks. The override just removes the gate-failure
+block that would have prevented transition resolution from running.
 
-Key assumption: templates with gates typically include an unconditional
-transition as a natural progression path. Gate-only states without any
-unconditional transition are edge cases that can't be overridden (the engine
-doesn't know where to go).
+There's no special handling for "states with accepts" vs "states without
+accepts." Today, template authors add `accepts` blocks with `override` enum
+values on deterministic gate states as a workaround for the lack of an engine
+override. With `--override-rationale`, that workaround is unnecessary.
+Templates can be simplified to just gates + transitions, and the override
+works the same way regardless.
 
 #### Alternatives considered
 
-**Explicit override_target annotation**: add an `override_target` field to the
-template state schema. Template authors declare where overrides should go.
-Rejected because it adds schema complexity for a case that unconditional
-fallbacks already handle. Kept as a backup if gate-only states become common
-enough to warrant explicit author intent.
-
-**Forbid gate-only states via validation**: require every state with gates to
-have an `accepts` block. Rejected because it blocks valid patterns like
-informational gates and compliance checkpoints that don't need user override.
+**Separate override path with explicit target resolution**: treat override as
+a distinct code path that resolves transitions differently from the normal
+path. Rejected because the existing transition resolution logic already
+handles all cases correctly once `gate_failed` is neutralized. Adding a
+separate path would duplicate logic and create divergence risk.
 
 ### Decision 3: cross-epoch query pattern
 
@@ -197,13 +200,15 @@ The override feature adds one CLI flag (`--override-rationale`), one event type
 
 The `--override-rationale` value threads from CLI argument parsing through to
 `advance_until_stop` as an `Option<&str>` parameter. Inside the advance loop,
-when gates fail on any state -- whether it has an `accepts` block or not -- the
-engine checks for the override parameter. If present, it emits a
-`GateOverrideRecorded` event carrying the failed gate names and results, the
-rationale string, and the state name. Then instead of stopping with
-`GateBlocked`, it continues advancing using the unconditional fallback
-transition (for gate-only states) or the normal evidence-based transition
-resolution (for states with `accepts` blocks).
+when gates fail and the override parameter is present, the engine emits a
+`GateOverrideRecorded` event and then neutralizes the gate failure
+(`gate_failed = false`). Normal transition resolution proceeds as if gates
+had passed. There's no branching based on whether the state has an `accepts`
+block -- the override behavior is identical in all cases.
+
+This eliminates the template workaround where authors add `accepts` blocks
+with `override` enum values on deterministic gate states. Templates can be
+simplified to just gates + transitions. The engine handles override.
 
 When `--override-rationale` is combined with `--with-data`, evidence is
 submitted and validated first (`EvidenceSubmitted` event), then the advance
@@ -217,25 +222,22 @@ exposes this to the CLI. Override events persist across rewinds -- they're
 immutable log entries, not epoch-scoped state.
 
 Edge cases: `--override-rationale` on a non-blocked state is a no-op. Empty
-rationale strings are rejected at CLI validation. Gate-only states without
-an unconditional fallback transition can't be overridden (no valid target
-exists).
+rationale strings are rejected at CLI validation.
 
 ### Rationale
 
 These three decisions reinforce each other: the direct parameter approach (D1)
 gives the advance loop immediate access to the rationale at the exact point
-where gate failure is detected, which is where it needs to decide whether to
-bypass (D2) and emit the event. The unconditional fallback strategy (D2) works
-because the advance loop already has this transition resolution logic -- the
-override just unblocks it from firing on gate-only states. And the purpose-built
-query function (D3) follows the pattern already established by
-`derive_visit_counts`, keeping the persistence layer consistent.
+where gate failure is detected. The neutralize-gate-failure approach (D2)
+is simple because it reuses existing transition resolution logic -- no new
+code path, no branching on accepts. And the purpose-built query function (D3)
+follows the pattern already established by `derive_visit_counts`.
 
 The combination achieves the PRD's key goal -- engine universality (R6) --
-without template schema changes. Every gate-blocked state that has a natural
-progression path becomes overridable. The audit trail is self-contained in a
-single event type, queryable across the full session.
+without template schema changes. Every gate-blocked state becomes overridable.
+Template authors no longer need `accepts` block workarounds on deterministic
+gate states. The audit trail is self-contained in a single event type,
+queryable across the full session.
 
 ## Solution architecture
 
@@ -282,10 +284,9 @@ to surface overrides.
 - At the gate evaluation block (~line 295-315):
   - If gates fail AND `override_rationale` is `Some`:
     - Emit `GateOverrideRecorded` event via `append_event`
-    - For states with `accepts`: fall through to transition resolution
-      (existing path, `gates_failed=true`)
-    - For states without `accepts`: resolve unconditional fallback transition
-      directly, bypassing the current `GateBlocked` return
+    - Set `gates_failed = false` (neutralize the failure)
+    - Fall through to normal transition resolution -- identical to the
+      gates-passed path
   - If gates fail AND `override_rationale` is `None`: existing behavior
     (return `GateBlocked` or fall through to `EvidenceRequired`)
 
@@ -355,9 +356,10 @@ Gate evaluation: gates fail
   +-- override_rationale is Some:
   |     |
   |     +-- append GateOverrideRecorded event
+  |     +-- set gate_failed = false (neutralize failure)
   |     |
-  |     +-- state has accepts? -> fall through to transition resolution
-  |     +-- state has no accepts? -> resolve unconditional fallback
+  |     v
+  |   Normal transition resolution (same as gates-passed path)
   |     |
   |     v
   |   Continue advancing (transition fires, loop continues)
@@ -384,15 +386,15 @@ Deliverables:
 
 Add `override_rationale: Option<&str>` parameter to `advance_until_stop`.
 Implement the gate-bypass logic: when override is present and gates fail, emit
-the override event and continue advancing. Handle both states with `accepts`
-(fall through to existing transition resolution) and states without `accepts`
-(resolve unconditional fallback directly).
+the override event, set `gate_failed = false`, and let normal transition
+resolution proceed. No branching on accepts -- the override neutralizes gate
+failure and the existing logic handles everything from there.
 
 Deliverables:
 - Modified `advance_until_stop` signature and gate evaluation block
-- Gate-only state override via unconditional fallback
+- Override neutralizes `gate_failed` for transition resolution
 - Updated all callers to pass `None` for existing code paths
-- Unit tests for override path on both state types
+- Unit tests for override on states with and without accepts blocks
 
 ### Phase 3: CLI integration
 
@@ -412,7 +414,10 @@ Deliverables:
 Update all caller-facing documentation and the koto-author skill to reflect
 the new override mechanism. Templates that currently use `override` as an
 evidence enum value still work (backward compatible), but documentation should
-teach the `--override-rationale` flag as the primary override mechanism.
+teach two things: (1) `--override-rationale` is the primary override mechanism,
+and (2) deterministic gate states no longer need `accepts` blocks with
+`override` enum values -- that pattern was a workaround the engine now handles
+natively.
 
 Deliverables:
 - `plugins/koto-skills/AGENTS.md`: add `--override-rationale` flag to command
@@ -473,8 +478,9 @@ This feature adds a new event type to the JSONL log and a new CLI flag.
 
 - `advance_until_stop` gains another parameter, making an already-long
   signature longer
-- Gate-only states without unconditional fallback transitions can't be
-  overridden (the engine doesn't know where to go)
+- States without any resolvable transition (no unconditional fallback, no
+  matching conditional) still can't advance -- but this is a template
+  validation concern, not an override limitation
 - The override event doesn't include evidence fields when `--with-data` isn't
   used, so visualization consumers may need to check the preceding
   `EvidenceSubmitted` event for full context in combined-flag cases
@@ -487,9 +493,9 @@ This feature adds a new event type to the JSONL log and a new CLI flag.
 
 - If the parameter list becomes unwieldy, refactoring to a context struct is
   straightforward (the rejected Option C from Decision 1)
-- Gate-only states without fallbacks are an edge case. If they become common,
-  the explicit `override_target` annotation (rejected Option B from Decision 2)
-  can be added without breaking changes
+- States without resolvable transitions are a template validation concern.
+  A future template compiler check could warn about non-terminal states with
+  no progression path
 - For the evidence gap in override events: the PRD scoped this as acceptable
   (R4 says "self-contained" for rationale + gate context, not evidence). Future
   work can add an `evidence_ref` field if needed

@@ -26,19 +26,27 @@ Gate overrides in koto are invisible. When an agent submits evidence on a
 gate-failed state, the engine advances the workflow, but no event records that
 a gate was bypassed or why the agent chose to proceed despite the failure.
 
-Three things are broken:
+Four things are broken:
 
-1. **Overrides are implicit.** The engine infers override from evidence presence
-   on a gate-failed state. There's no explicit "I'm overriding this gate" signal.
-   And states with gates but no `accepts` block can't be overridden at all --
-   the agent's only option is `--to`, which bypasses everything.
+1. **Overrides require template workarounds.** On deterministic gate states
+   (where the gate checks a condition and the workflow should advance when it
+   passes), template authors must add an `accepts` block with an `override`
+   enum value and a matching conditional transition -- all just so agents
+   have a way to bypass a failed gate. This is boilerplate that exists only
+   because the engine lacks a built-in override mechanism. Without this
+   workaround, the agent's only option on a gate-blocked state is `--to`,
+   which bypasses everything with no audit trail.
 
-2. **Rationale is disconnected.** An agent can call `koto decisions record` to
+2. **Overrides are implicit.** Even with the workaround, the engine infers
+   override from evidence presence on a gate-failed state. There's no
+   explicit "I'm overriding this gate" signal.
+
+3. **Rationale is disconnected.** An agent can call `koto decisions record` to
    log reasoning, but that's a separate operation with no structural link to the
    override. Nothing forces it. The override and the rationale live in different
    events with no connection.
 
-3. **No cross-session query surface.** `koto decisions list` is epoch-scoped
+4. **No cross-session query surface.** `koto decisions list` is epoch-scoped
    (current state only). There's no way to ask "show me all overrides in this
    session" without parsing raw JSONL.
 
@@ -84,39 +92,73 @@ timeline without correlating multiple event types.
 These show the concrete CLI interactions between an agent and koto, before and
 after this feature.
 
-### Example 1: CI gate override during implementation
+### Example 1: CI gate override -- today's workaround vs. engine-level override
 
-A template has a `verify` state with a CI gate that checks test results. The
-agent has made a documentation-only change and CI is red because of a flaky
-integration test.
+A template has a `verify` state with a CI gate. Today, template authors must
+add an `accepts` block with an `override` enum value just so agents have a
+way to bypass a failed gate. This is boilerplate that exists only because the
+engine lacks a built-in override mechanism.
 
-**Today (no override tracking):**
+**Today (workaround pattern):**
+
+The template must include accepts + override enum + matching transition:
+```yaml
+verify:
+  gates:
+    ci_check:
+      type: command
+      command: "test -f ci-passed.txt"
+  accepts:                    # workaround: only exists for override
+    status:
+      type: enum
+      values: [completed, override]
+      required: true
+  transitions:
+    - target: deploy
+      when:
+        status: completed     # workaround: manual coupling
+    - target: deploy
+      when:
+        status: override      # workaround: manual coupling
+    - target: deploy          # unconditional fallback (gates pass)
+```
 
 ```bash
-# Agent calls next, gate fails
+# Gate fails -- agent gets evidence_required because accepts block exists
 $ koto next my-workflow
-{"action": "evidence_required", "state": "verify", "directive": "...",
+{"action": "evidence_required", "state": "verify",
  "blocking_conditions": [{"gate": "ci_check", "result": "failed", "exit_code": 1}],
  "expects": {"fields": {"status": {"type": "enum", "values": ["completed", "override"]}}}}
 
 # Agent submits override evidence -- rationale is lost
 $ koto next my-workflow --with-data '{"status": "override"}'
-{"action": "done", "state": "complete", "advanced": true}
+{"action": "done", "state": "deploy", "advanced": true}
 
 # Later, reviewer asks: "why did the agent skip CI?" -- no answer in the log
 ```
 
 **After this feature:**
 
+The template is simpler -- just gates and a transition. No accepts workaround:
+```yaml
+verify:
+  gates:
+    ci_check:
+      type: command
+      command: "test -f ci-passed.txt"
+  transitions:
+    - target: deploy          # gates pass -> auto-advance here
+```
+
 ```bash
-# Agent calls next, gate fails
+# Gate fails -- returns gate_blocked (no accepts block needed)
 $ koto next my-workflow
-{"action": "gate_blocked", "state": "verify", "directive": "...",
+{"action": "gate_blocked", "state": "verify",
  "blocking_conditions": [{"gate": "ci_check", "result": "failed", "exit_code": 1}]}
 
-# Agent overrides the gate with rationale -- no --with-data needed
+# Agent overrides at the engine level -- no --with-data, no accepts block
 $ koto next my-workflow --override-rationale "CI failure is flaky test_network_timeout, unrelated to docs change"
-{"action": "done", "state": "complete", "advanced": true}
+{"action": "done", "state": "deploy", "advanced": true}
 
 # Empty rationale is rejected
 $ koto next my-workflow --override-rationale ""
@@ -129,23 +171,6 @@ $ koto overrides list my-workflow
    "rationale": "CI failure is flaky test_network_timeout, unrelated to docs change",
    "seq": 8, "timestamp": "2026-03-30T14:22:00Z"}
 ]}
-```
-
-### Example 2: Overriding a gate-only state (no accepts block)
-
-A template has a `lint` state with a gate but no `accepts` block. Today this
-state can't be overridden via evidence -- the agent's only option is `--to`.
-With `--override-rationale`, the engine handles it directly.
-
-```bash
-# Gate fails, no accepts block -- today returns gate_blocked with no way forward
-$ koto next my-workflow
-{"action": "gate_blocked", "state": "lint",
- "blocking_conditions": [{"gate": "lint_check", "result": "failed", "exit_code": 1}]}
-
-# Agent overrides at the engine level -- no template accepts block needed
-$ koto next my-workflow --override-rationale "Lint failure is a known false positive on generated code"
-{"action": "evidence_required", "state": "review", "advanced": true, ...}
 ```
 
 ### Example 3: Context injection override in a skill workflow
@@ -344,14 +369,15 @@ overrides are engine-detected (not agent-initiated), need cross-epoch
 queryability, and are conceptually distinct from agent deliberation. Mixing them
 would complicate queries and blur the semantic boundary.
 
-**D2: Single engine-level flag, not evidence schema.** Override and rationale
-could be fields in the evidence JSON (e.g., `{"status": "override",
-"rationale": "..."}`), but that would only work for states where the template
-author happened to declare those fields. We chose a single engine-level
-`--override-rationale` flag so that every gate-blocked state is overridable
-regardless of template design. A single flag (not separate `--override` +
-`--rationale`) eliminates invalid combinations -- providing the flag is both
-the override signal and the justification.
+**D2: Engine-level flag eliminates template workarounds.** Today, template
+authors working with deterministic gates must add `accepts` blocks with
+`override` enum values and matching conditional transitions -- boilerplate
+that exists only because the engine has no override mechanism. The
+`--override-rationale` flag makes all of that unnecessary. Override becomes
+an engine capability: the flag neutralizes gate failure, and normal transition
+resolution proceeds as if gates had passed. Templates with deterministic gates
+can be simplified to just gates + an unconditional transition. A single flag
+(not separate `--override` + `--rationale`) eliminates invalid combinations.
 
 **D3: Scope to gate overrides only.** The codebase has three implicit override
 mechanisms: gate bypass, action skipping via evidence presence, and `--to`
