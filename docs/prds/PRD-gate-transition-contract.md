@@ -542,3 +542,17 @@ execution to a user-declared schema -- the parsing logic belongs in the gate
 type, not the template. Future gate types (jira, http, json-command) extend
 the registry with richer schemas and parsing logic, giving template authors
 new building blocks to compose workflows from.
+
+**D6: Override substitutes gate output, not transition destination.** Overrides
+could target a specific transition destination (agent says "go to state X"),
+bypassing the resolver entirely. We chose gate output substitution because:
+(1) it preserves the resolver as the single routing authority -- one code path
+for all transitions, (2) most overrides are "treat as passed" and don't need
+routing control, (3) agents shouldn't need template topology knowledge for
+simple overrides, and (4) gate output and agent evidence compose cleanly in the
+resolver when both are present. The existing `--to` command covers the rare
+case where agents need explicit destination control. A future extension could
+allow agents to inject explicit gate output values at override time (instead of
+always using the default), enabling non-passing override routing without
+bypassing the resolver. This was identified during adversarial review but
+deferred because the use case isn't validated.
