@@ -196,7 +196,49 @@ states:
 Even simple gates get a schema. The boolean model is a special case of the
 structured model, not a separate concept.
 
-### Example 4: Selective override with per-gate rationale
+### Example 4: Override with explicit data (richer gate)
+
+A future `list_github_issue_labels` gate returns labels. No transition
+matches when the issue has no labels. The agent provides the data the gate
+should have returned.
+
+```yaml
+states:
+  triage:
+    gates:
+      labels:
+        type: list_github_issue_labels    # produces {labels: [string]}
+        key: "{GH_ISSUE}"
+    transitions:
+      - target: is_bug
+        when:
+          gates.labels.contains: bug
+      - target: is_feature
+        when:
+          gates.labels.contains: feature_request
+```
+
+```bash
+# Gate returns empty labels -- no transition matches
+$ koto next my-workflow
+{"action": "gate_blocked", "state": "triage",
+ "blocking_conditions": [{"gate": "labels", "output": {"labels": [], "error": ""}}]}
+
+# Agent knows from context that this is a bug, provides explicit override data
+$ koto overrides record my-workflow --gate labels \
+    --rationale "Issue is a bug based on conversation with reporter" \
+    --with-data '{"contains": "bug"}'
+
+$ koto next my-workflow
+# Transition resolver matches gates.labels.contains: bug -> is_bug
+{"action": "done", "state": "is_bug", "advanced": true}
+```
+
+Without `--with-data`, the override would substitute `override_default`,
+which might not match any transition. With `--with-data`, the agent tells
+the resolver exactly what the gate data should be.
+
+### Example 5: Selective override with per-gate rationale
 
 A `validate` state has two command gates. Override events are sticky within
 an epoch -- they persist until the state transitions.
@@ -233,7 +275,7 @@ $ koto next my-workflow
 Each gate gets its own rationale. Overrides accumulate across calls within
 the same epoch.
 
-### Example 5: Multi-agent override
+### Example 6: Multi-agent override
 
 Sub-agents push overrides independently. Orchestrator advances when ready.
 
@@ -251,7 +293,7 @@ $ koto next my-workflow
 {"action": "done", "state": "process", "advanced": true}
 ```
 
-### Example 6: Override audit trail
+### Example 7: Override audit trail
 
 ```bash
 $ koto overrides list my-workflow
@@ -283,10 +325,12 @@ applied, and why. Self-contained for visualization.
 ### Functional
 
 **R1: Gate types are reusable building blocks with documented schemas.** Each
-gate type defines a public output schema and a pass condition. These are
-documented so template authors know what fields are available when writing
-`when` clauses. The schema is the gate type's contract -- it tells authors
-exactly what data the gate produces and what "passing" means.
+gate type defines a public output schema and a pass condition. Gates always
+run and always return data -- there's no separate "failure" state. The pass
+condition determines whether the state auto-advances (all gates pass) or
+stops for agent input (any gate doesn't pass). The schema is the gate type's
+contract -- it tells template authors what fields are available for `when`
+clauses and what "passing" means for override defaults.
 
 Initial gate types and their schemas:
 
@@ -340,13 +384,13 @@ The transition resolver traverses the dot-separated path to find the value in
 the merged evidence map. Agent-submitted evidence lives at the top level (no
 `gates.` prefix), preventing collisions.
 
-**R4: Override defaults per gate.** Each gate in the template declares an
-`override_default` -- the values to substitute when the agent overrides.
-The compiler validates that override defaults match the gate type's schema
-and satisfy the gate type's built-in pass condition. If no `override_default`
-is declared, the gate type provides a sensible default (command:
-`{exit_code: 0}`, context-exists: `{exists: true}`, context-matches:
-`{matches: true}`).
+**R4: Override defaults per gate.** Each gate type provides a default
+`override_default` -- the values to substitute when the agent overrides
+without providing explicit data. Command: `{exit_code: 0, error: ""}`,
+context-exists: `{exists: true, error: ""}`, context-matches:
+`{matches: true, error: ""}`. Template authors can declare a custom
+`override_default` per gate to route overrides to a different transition.
+The compiler validates that override defaults match the gate type's schema.
 
 **R5: Override via `koto overrides record`.** Override is a subcommand of
 `koto overrides`, mirroring the `koto decisions record` / `koto decisions
@@ -354,15 +398,25 @@ list` pattern:
 
 ```
 koto overrides record <name> --gate <gate_name> --rationale "reason"
+koto overrides record <name> --gate <gate_name> --rationale "reason" --with-data '{"field": "value"}'
 ```
 
 Each call overrides a single gate with a single rationale. It appends a
 `GateOverrideRecorded` event without advancing the workflow. Multiple agents
 can push overrides independently before an orchestrator calls `koto next`.
 
+**Without `--with-data`:** the gate's `override_default` values are
+substituted. This is the simple case for gates with a clear "passing" value.
+
+**With `--with-data`:** the provided data is substituted instead of the
+override default. The data is validated against the gate type's schema. This
+is for gates where the agent needs to specify what the output should be
+(e.g., a label-checking gate where the agent provides which label to treat
+as present).
+
 A subsequent `koto next` reads override events from the current epoch and
-substitutes the gate's override defaults during gate evaluation, the same
-way it reads `EvidenceSubmitted` events.
+substitutes the override data during gate evaluation, the same way it reads
+`EvidenceSubmitted` events.
 
 Override events are sticky within an epoch -- they persist in the event log
 until the state transitions (new epoch). An agent can override gates across
@@ -371,15 +425,13 @@ multiple `koto overrides record` calls, then advance with a single
 
 **R5a: One gate, one rationale.** Each `koto overrides record` call targets
 exactly one gate. To override multiple gates, make multiple calls. This
-ensures each override has its own rationale. If a named gate isn't actually
-failing, the call is a no-op (no error, no event).
+ensures each override has its own rationale.
 
-**R6: Override event with full context.** On each override (whether it
-advances the state or not), the engine emits a `GateOverrideRecorded` event
-containing: the state name, each overridden gate's name, actual output, and
-applied override default, and the rationale string. If selective override
-leaves some gates still failing, the event still records what was overridden
-(the state just doesn't advance yet).
+**R6: Override event with full context.** On each override, the engine emits
+a `GateOverrideRecorded` event containing: the state name, the overridden
+gate's name, the gate's actual output, the substituted values (either
+`override_default` or the agent-provided `--with-data`), and the rationale
+string.
 
 **R7: Gate and agent evidence coexistence.** A state can have both gates
 (producing `gates.*` data) and an `accepts` block (for agent-submitted
@@ -397,12 +449,10 @@ exposes this to the CLI.
 that:
 - Gate types referenced in templates are registered (known to the engine)
 - If `override_default` is declared, it matches the gate type's schema
-- If `override_default` is declared, it satisfies the gate type's pass
-  condition
 - Transition `when` clauses that reference `gates.*` fields reference valid
   gate names and fields from the gate type's schema
-- When override defaults are applied to all failing gates, at least one
-  transition resolves (no dead ends on override)
+- When override defaults are applied to all gates, at least one transition
+  resolves (no dead ends on override)
 
 **R10: Backward compatibility.** Existing templates continue to compile and
 run. When transition `when` clauses don't reference `gates.*` fields, gates
@@ -433,8 +483,12 @@ are subject to the same size limit as `--with-data` (1MB).
   true, context-matches: matches == true)
 - [ ] Compiler rejects `override_default` that doesn't match the gate type's
   schema
-- [ ] Compiler rejects `override_default` that doesn't satisfy the gate type's
-  pass condition
+- [ ] `koto overrides record` with `--with-data` substitutes the provided data
+  instead of the override default
+- [ ] `koto overrides record` with `--with-data` validates the data against
+  the gate type's schema (rejects mismatched types)
+- [ ] Override audit trail shows the agent-provided data (not the override
+  default) when `--with-data` was used
 - [ ] Transition `when` clauses can reference `gates.<name>.<field>` and match
   against gate output
 - [ ] A state with both gates and `accepts` block routes correctly using both
@@ -452,13 +506,15 @@ are subject to the same size limit as `--with-data` (1MB).
   to the same workflow without lock contention
 - [ ] Each `koto overrides record` call produces its own `GateOverrideRecorded`
   event with its own rationale
-- [ ] `koto overrides record` targeting a gate that isn't failing is a no-op
-  (no error, no event)
+- [ ] `koto overrides record` targeting a gate whose output already satisfies
+  the pass condition still records the override (the agent's rationale is
+  captured regardless)
 - [ ] `koto overrides record` with `--rationale ""` returns a validation error
 - [ ] `koto overrides record` with `--rationale` exceeding 1MB returns a
   validation error (R12)
-- [ ] After overriding one gate, `koto next` advances only if all remaining
-  gates pass or have been overridden -- otherwise state stays blocked
+- [ ] `koto next` resolves transitions using a merged evidence map: actual
+  gate output for non-overridden gates, substituted data for overridden gates,
+  plus any agent evidence. State advances only if a `when` clause matches.
 - [ ] Compiler rejects templates where applying all override defaults leads to
   no valid transition (dead end on override)
 - [ ] Compiler rejects templates where a `when` clause references a
@@ -485,7 +541,8 @@ are subject to the same size limit as `--with-data` (1MB).
   error: "<message>"}` -- same schema shape, doesn't satisfy pass condition
 - [ ] A context-exists gate that errors produces `{exists: false, error:
   "<message>"}` -- consistent shape
-- [ ] `--gate` targeting a gate that already passed is silently ignored
+- [ ] `koto overrides record` can override any gate regardless of its current
+  output (the agent can substitute data even for gates that already "pass")
 - [ ] `--with-data '{"gates": {...}}'` is rejected with a validation error
   (reserved namespace)
 - [ ] `koto next` response for a gate-blocked state includes structured gate
@@ -498,8 +555,9 @@ are subject to the same size limit as `--with-data` (1MB).
   future consumer.
 - **Redo/rewind triggered by override disagreement.** The override data
   enables this; the redo mechanism is future work.
-- **Dynamic override values.** Override defaults are static (declared in the
-  template). Letting agents supply runtime override values is deferred.
+- **New gate type implementations.** This PRD covers the schema contract and
+  override mechanism. Implementing new gate types (json-command, http, jira)
+  is separate work that builds on this contract.
 - **Custom gate output schemas.** Template authors can't declare custom
   output schemas for existing gate types. Richer output comes through new
   gate types (e.g., `json-command` that parses stdout as JSON). This keeps
@@ -512,11 +570,10 @@ are subject to the same size limit as `--with-data` (1MB).
 
 ## Known limitations
 
-- **Override defaults are static.** The `override_default` is declared in the
-  template at compile time. It can't vary based on runtime context (e.g.,
-  "override to passed but with actual coverage value"). Dynamic override
-  values would require the agent to submit gate-shaped evidence, which could
-  be a future extension.
+- **Override default is a convenience, not the full mechanism.** The
+  `override_default` provides a one-call shorthand for the common case. For
+  richer gates where the agent needs to specify non-default values, they must
+  use `--with-data` on `koto overrides record`.
 - **One gate per override call.** Each `koto overrides record` call targets
   exactly one gate. Overriding N gates requires N calls. This is intentional:
   each gate gets its own rationale.
@@ -526,13 +583,10 @@ are subject to the same size limit as `--with-data` (1MB).
   (command, context-exists, context-matches) must be updated to produce
   structured data. New gate types automatically benefit from the schema
   contract.
-- **Override always routes through the passing path.** Override defaults must
-  satisfy the gate's pass condition, so overrides always produce the "gate
-  passed" routing outcome. You can't override a CI gate and route to a
-  "needs-review" state instead of "deploy." This is intentional: override
-  means "treat the gate as passed." If the agent wants a non-passing route,
-  they use `--with-data` evidence on states with `accepts` blocks, or `--to`
-  for directed transitions.
+- **Override without `--with-data` always uses the default.** When the agent
+  doesn't provide explicit data, the gate type's `override_default` is
+  substituted. This defaults to the "passing" value. To route to a non-default
+  transition, the agent must provide `--with-data` with the desired values.
 - **Dot-path traversal is new resolver capability.** The current
   `resolve_transition` does flat key matching against a `BTreeMap`. Gate
   output namespaced as nested maps (`{"gates": {"ci_check": {...}}}`)
@@ -590,12 +644,11 @@ bypassing the resolver entirely. We chose gate output substitution because:
 for all transitions, (2) most overrides are "treat as passed" and don't need
 routing control, (3) agents shouldn't need template topology knowledge for
 simple overrides, and (4) gate output and agent evidence compose cleanly in the
-resolver when both are present. The existing `--to` command covers the rare
-case where agents need explicit destination control. A future extension could
-allow agents to inject explicit gate output values at override time (instead of
-always using the default), enabling non-passing override routing without
-bypassing the resolver. This was identified during adversarial review but
-deferred because the use case isn't validated.
+resolver when both are present. For richer gates where the agent needs to
+route to a non-default transition, `--with-data` on `koto overrides record`
+lets the agent specify explicit gate output values. This keeps override
+within the gate data model (the resolver still picks the target) rather than
+bypassing it.
 
 **D7: Override is a subcommand, not a flag on `koto next`.** Override could
 be a flag on `koto next` (one call does override + advance) or a separate
