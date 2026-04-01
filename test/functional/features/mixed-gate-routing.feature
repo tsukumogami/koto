@@ -12,7 +12,7 @@ Feature: Gate output and agent evidence coexist in when clause matching
     Then the exit code is 0
     And the JSON output field "action" equals "done"
     And the JSON output field "state" equals "approved"
-    And the JSON output field "advanced" equals "true"
+    And the JSON output field "advanced" is true
 
   Scenario: Agent evidence alone without matching gate output does not advance
     Given a clean koto environment
@@ -25,4 +25,4 @@ Feature: Gate output and agent evidence coexist in when clause matching
     Then the exit code is 0
     And the JSON output field "action" equals "done"
     And the JSON output field "state" equals "rejected"
-    And the JSON output field "advanced" equals "true"
+    And the JSON output field "advanced" is true

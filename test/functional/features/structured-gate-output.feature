@@ -26,7 +26,7 @@ Feature: Structured gate output in blocking_conditions and routing
     Then the exit code is 0
     And the JSON output field "action" equals "done"
     And the JSON output field "state" equals "pass"
-    And the JSON output field "advanced" equals "true"
+    And the JSON output field "advanced" is true
 
   # Scenario 15: gate fails and routes to different state based on gates.* exit_code
   Scenario: Gate fails and routes to fix state via gates.* routing
@@ -37,4 +37,4 @@ Feature: Structured gate output in blocking_conditions and routing
     Then the exit code is 0
     And the JSON output field "action" equals "done"
     And the JSON output field "state" equals "fix"
-    And the JSON output field "advanced" equals "true"
+    And the JSON output field "advanced" is true

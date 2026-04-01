@@ -9,7 +9,7 @@ Feature: Gate with evidence fallback
     Then the exit code is 0
     And the JSON output field "state" equals "done"
     And the JSON output field "action" equals "done"
-    And the JSON output field "advanced" equals "true"
+    And the JSON output field "advanced" is true
 
   Scenario: Gate fails and evidence is required
     Given a clean koto environment
@@ -33,4 +33,4 @@ Feature: Gate with evidence fallback
     Then the exit code is 0
     And the JSON output field "state" equals "done"
     And the JSON output field "action" equals "done"
-    And the JSON output field "advanced" equals "true"
+    And the JSON output field "advanced" is true

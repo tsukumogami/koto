@@ -13,5 +13,5 @@ Feature: Context-exists gate blocked response with structured output
     And the JSON output field "blocking_conditions.0.name" equals "ctx_check"
     And the JSON output field "blocking_conditions.0.type" equals "context-exists"
     And the JSON output field "blocking_conditions.0.status" equals "failed"
-    And the JSON output field "blocking_conditions.0.output.exists" equals "false"
+    And the JSON output field "blocking_conditions.0.output.exists" is false
     And the JSON output field "blocking_conditions.0.output.error" equals ""

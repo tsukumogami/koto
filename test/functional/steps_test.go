@@ -62,6 +62,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the JSON output has field "([^"]*)"$`, theJSONOutputHasField)
 	ctx.Step(`^the JSON output field "([^"]*)" equals "([^"]*)"$`, theJSONOutputFieldEquals)
 	ctx.Step(`^the JSON output field "([^"]*)" equals (\d+)$`, theJSONOutputFieldEqualsInt)
+	ctx.Step(`^the JSON output field "([^"]*)" is (true|false)$`, theJSONOutputFieldEqualsBool)
 	ctx.Step(`^the state file for "([^"]*)" exists$`, theStateFileExists)
 }
 
@@ -295,6 +296,26 @@ func theJSONOutputFieldEquals(field, expected string) error {
 	if actual != expected {
 		return fmt.Errorf("JSON field %q: expected %q, got %q\nfull output:\n%s",
 			field, expected, actual, sc.stdout)
+	}
+	return nil
+}
+
+// theJSONOutputFieldEqualsBool parses stdout as JSON and checks field boolean value.
+func theJSONOutputFieldEqualsBool(field, expected string) error {
+	val, err := getJSONField(sc.stdout, field)
+	if err != nil {
+		return err
+	}
+	if val == nil {
+		return fmt.Errorf("JSON field %q not found in output:\n%s", field, sc.stdout)
+	}
+	b, ok := val.(bool)
+	if !ok {
+		return fmt.Errorf("JSON field %q is not a boolean: %v", field, val)
+	}
+	if fmt.Sprintf("%v", b) != expected {
+		return fmt.Errorf("JSON field %q: expected %s, got %v\nfull output:\n%s",
+			field, expected, b, sc.stdout)
 	}
 	return nil
 }
