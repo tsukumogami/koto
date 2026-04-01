@@ -145,7 +145,8 @@ Issues covered: 5
 **Commands**:
 - `cargo test -p koto cli::next_types::tests::blocking_conditions -- --nocapture`
 **Expected**: `blocking_conditions_from_gates` called with `StructuredGateResult` values produces `BlockingCondition` entries that include the gate name and the full structured `output` field (e.g., `{"exit_code": 1, "error": ""}`). Passed gates are excluded. The output field is not omitted or summarized.
-**Status**: pending
+**Status**: passed (2026-04-01)
+**Verified by**: blocking_conditions_passed_gate_excluded, blocking_conditions_command_gate_failed_includes_structured_output, blocking_conditions_context_exists_gate_includes_structured_output, blocking_conditions_timed_out_gate, blocking_conditions_error_gate, blocking_conditions_gate_not_in_defs_falls_back_to_command_type, blocking_conditions_mixed_passed_and_failed
 
 ---
 
@@ -170,7 +171,8 @@ Example expected shape:
   ]
 }
 ```
-**Status**: pending
+**Status**: passed (2026-04-01)
+**Verified by**: "Failing command gate returns structured output in blocking_conditions" in structured-gate-output.feature
 
 ---
 
@@ -187,7 +189,8 @@ Example expected shape:
 **Expected**: When a command gate passes (`exit_code: 0`) and the template has `when: { gates.ci_check.exit_code: 0 }` targeting a next state, `koto next` returns `action: "done"` with `advanced: true` and the workflow moves to the target state. No agent evidence is needed -- gate output alone drives routing.
 
 This validates the core user story from the PRD (Example 1): gate output feeds into transition routing automatically.
-**Status**: pending
+**Status**: passed (2026-04-01)
+**Verified by**: "Gate passes and auto-advances via gates.* routing" in structured-gate-output.feature
 
 ---
 
@@ -203,7 +206,8 @@ This validates the core user story from the PRD (Example 1): gate output feeds i
 **Expected**: When a command gate fails (`exit_code: 1`) and the template has `when: { gates.ci_check.exit_code: 1 }` targeting a "fix" state, `koto next` automatically routes to the "fix" state and returns `action: "done"` with `advanced: true`. No manual override or evidence submission is required -- the gate's structured output drives the route selection.
 
 This validates the automatic routing-on-failure path from PRD Example 1.
-**Status**: pending
+**Status**: passed (2026-04-01)
+**Verified by**: "Gate fails and routes to fix state via gates.* routing" in structured-gate-output.feature
 
 ---
 
@@ -218,7 +222,8 @@ This validates the automatic routing-on-failure path from PRD Example 1.
 - Gate passes (exit 0)
 - `koto next test-wf --with-data '{"decision": "approve"}'`
 **Expected**: A transition `when: { gates.lint.exit_code: 0, decision: approve }` resolves when both the gate output and agent evidence match. If either does not match, the transition is not selected. This validates PRD Example 2: gate data and agent evidence coexist in the same resolver call.
-**Status**: pending
+**Status**: passed (2026-04-01)
+**Verified by**: "Gate passes and agent evidence match the combined when clause" in mixed-gate-routing.feature
 
 ---
 
@@ -236,7 +241,8 @@ This validates the automatic routing-on-failure path from PRD Example 1.
 3. Gate fails then evidence advances
 
 The existing `simple-gates.md` template uses `when: { status: completed }` (flat agent evidence, no `gates.*` key). These flat conditions must work identically after the dot-path resolver is added.
-**Status**: pending
+**Status**: passed (2026-04-01)
+**Verified by**: All three scenarios in gate-with-evidence-fallback.feature continue to pass
 
 ---
 
@@ -251,7 +257,8 @@ The existing `simple-gates.md` template uses `when: { status: completed }` (flat
 - Do not set the required context key
 - `koto next test-wf`
 **Expected**: The `koto next` response includes `blocking_conditions` with an entry whose `output` field is `{"exists": false, "error": ""}`. The `action` is `"gate_blocked"`. The structured output confirms the gate type's schema (exists + error) rather than a generic status string.
-**Status**: pending
+**Status**: passed (2026-04-01)
+**Verified by**: "Missing context key produces structured output in blocking_conditions" in context-gate-output.feature
 
 ---
 
