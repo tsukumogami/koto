@@ -60,7 +60,8 @@ loop during gate evaluation, so subsequent `koto next` calls see the substituted
   against the gate type's schema (R5).
 - Each `koto overrides record` call targets one gate with one rationale (R5a). Multiple gates
   in a state each need their own call.
-- Override events must be sticky within the current epoch -- they persist until the state
+- Override events must be sticky within the current epoch (the span of events from the most
+  recent state-entry to the next state transition or rewind) -- they persist until the state
   transitions -- and accumulate across multiple `overrides record` calls in the same epoch (R5).
 - The `gates` evidence key must be reserved: agents may not submit `gates.*` keys via
   `koto next --with-data`, preventing injection of fake gate data (R7).
@@ -99,8 +100,10 @@ would require.
 
 Satisfying R6 under this model requires that gate outputs from blocking runs are persisted in
 the event log. A new `GateEvaluated` event (emitted by the advance loop for each gate that
-runs) provides the anchor. The `koto overrides record` handler reads the most recent
-`GateEvaluated` for the named gate in the current epoch to populate `actual_output`.
+executes without an active override) provides the anchor. The `koto overrides record` handler
+reads the most recent `GateEvaluated` for the named gate in the current epoch to populate
+`actual_output`. `GateEvaluated` is not emitted for overridden gates -- their output is already
+captured in `GateOverrideRecorded.actual_output` from when they last ran.
 
 The full sequence from a blocked workflow to an advance:
 
@@ -111,9 +114,9 @@ $ koto next myflow
   "status": "gate_blocked",
   "blocking_conditions": [
     {
-      "gate": "ci_check",
+      "name": "ci_check",
       "output": {"exit_code": 1, "error": "test_util_test failed"},
-      "agent_actionable": true
+      "agent_actionable": false   // Feature 1 hardcodes false; Feature 2 (this design) sets true
     }
   ]
 }
@@ -132,6 +135,11 @@ Between steps 2 and 3, `ci_check` never runs. The gate's contribution to `gates.
 `{"exit_code": 0, "error": ""}` (the built-in default, since no `override_default` was
 declared). The `GateOverrideRecorded` event carries the actual output from step 1 as
 `actual_output`, so the audit trail reflects what the agent actually observed.
+
+Note: this example uses a simplified template with no `override_default` on `ci_check` to
+keep the skip-execution mechanic uncluttered. D2 introduces a richer template where
+`ci_check` has `override_default: {exit_code: 1}` routing overrides to `manual_review`.
+The D2 template is used in all subsequent examples.
 
 #### Alternatives considered
 
@@ -283,8 +291,8 @@ $ koto next myflow
 {
   "status": "gate_blocked",
   "blocking_conditions": [
-    {"gate": "ci_check",   "output": {"exit_code": 1, "error": "..."}, "agent_actionable": true},
-    {"gate": "size_check", "output": {"exit_code": 1, "error": "..."}, "agent_actionable": true}
+    {"name": "ci_check",   "output": {"exit_code": 1, "error": "..."}, "agent_actionable": true},
+    {"name": "size_check", "output": {"exit_code": 1, "error": "..."}, "agent_actionable": true}
   ]
 }
 
@@ -297,7 +305,7 @@ $ koto next myflow
 {
   "status": "gate_blocked",
   "blocking_conditions": [
-    {"gate": "size_check", "output": {"exit_code": 1, "error": "..."}, "agent_actionable": true}
+    {"name": "size_check", "output": {"exit_code": 1, "error": "..."}, "agent_actionable": true}
   ]
 }
 
@@ -335,10 +343,11 @@ every gate without an explicit `override_default` field, even though the agent c
 
 ### Decision 4: CLI structure and derive_overrides scope
 
-The CLI surface needs to mirror `koto decisions record` / `koto decisions list` (R5). The
-`decisions record` handler takes a single `--with-data` JSON blob containing `choice`,
-`rationale`, and optionally `alternatives_considered`. The question is whether `overrides record`
-should follow the same implementation pattern or use the interface the PRD specifies.
+The CLI surface follows the `koto decisions record` / `koto decisions list` naming pattern (R5).
+However, the `decisions record` handler takes a single `--with-data` JSON blob containing
+`choice`, `rationale`, and optionally `alternatives_considered`, while the PRD specifies a
+different interface for `overrides record`. The question is whether to follow the same
+implementation pattern or the PRD's specified interface.
 
 The scope of `derive_overrides` also needs a decision. The advance loop needs only current-epoch
 overrides (a rewind should reset which gates are overridden, just as it resets which decisions
@@ -380,18 +389,18 @@ $ koto rewind myflow
 $ koto next myflow
 {
   "status": "gate_blocked",
-  "blocking_conditions": [{"gate": "ci_check", ...}]
+  "blocking_conditions": [{"name": "ci_check", ...}]
 }
 
 # But the list shows the full history across all epochs:
 $ koto overrides list myflow
 {
-  "state": "review",
+  "state": "review",    // top-level: current workflow state
   "overrides": {
     "count": 1,
     "items": [
       {
-        "state": "review",
+        "state": "review",   // per-item: state when this override was recorded
         "gate": "ci_check",
         "rationale": "Flaky test",
         "override_applied": {"exit_code": 0, "error": ""},
@@ -505,11 +514,14 @@ returns the set of active overrides for the current epoch. Gates in that set get
 is computed from the combined results, so overridden gates never block the workflow regardless
 of what value `override_applied` contains.
 
-The CLI gains a `koto overrides` subcommand with `record` and `list` variants, mirroring
-`koto decisions`. `koto overrides list` calls `derive_overrides_all` (not the epoch-scoped
-`derive_overrides`) so the full session history is visible even after rewinds. Template
-authors gain an `override_default` field on the `Gate` struct to declare custom override
-values per gate instance; gates without one fall back to built-in type defaults.
+The CLI gains a `koto overrides` subcommand with `record` and `list` variants, following the
+`koto decisions` naming pattern. `koto overrides list` calls `derive_overrides_all` (not the
+epoch-scoped `derive_overrides`) so the full session history is visible even after rewinds.
+Template authors gain an `override_default` field on the `Gate` struct to declare custom
+override values per gate instance; gates without one fall back to built-in type defaults.
+Finally, `handle_next` gains an explicit rejection for any `--with-data` payload containing
+a top-level `"gates"` key, enforcing the namespace reservation with a clear error message
+rather than the current silent overwrite.
 
 ### Rationale
 
@@ -591,15 +603,18 @@ pub fn built_in_default(gate_type: &str) -> Option<serde_json::Value> {
 The gate evaluation block gains a pre-check for epoch overrides:
 
 ```
-1. Call derive_overrides(all_events) → epoch_overrides: BTreeMap<String, Value>
+1. Call derive_overrides(all_events) → Vec<&Event> (epoch-scoped GateOverrideRecorded events)
+   Transform into epoch_overrides: BTreeMap<String, Value> by extracting gate → override_applied
+   from each event's payload
 2. For each gate in template_state.gates:
    a. If gate name is in epoch_overrides:
       - Insert override_applied into gate_evidence_map
-      - Insert synthetic StructuredGateResult { outcome: Passed, output: override_applied }
-        into gate_results
+      - Insert a StructuredGateResult { outcome: Passed, output: override_applied }
+        constructed directly (not from evaluate_gates) into gate_results
    b. Otherwise: add to gates_to_evaluate
 3. Call evaluate_gates(&gates_to_evaluate) for non-overridden gates
-   - Emit GateEvaluated for each result
+   - Call append_event(GateEvaluated { ... }) for each result
+   - GateEvaluated is NOT emitted for overridden gates
 4. Merge live results into gate_evidence_map and gate_results
 5. Compute any_failed from gate_results
 6. Build blocking_conditions from non-passing gate_results
@@ -648,11 +663,13 @@ pub enum OverridesSubcommand {
    `template_state.gates`. Return an error if not found.
 2. Parse and validate `--with-data` JSON if provided (key presence, value types, no extra
    keys, size ≤ 1MB per R5 and R12).
-3. Resolve override value: `--with-data` → instance `override_default` → built-in type
+3. Validate rationale length ≤ 1MB (R12).
+4. Resolve override value: `--with-data` → instance `override_default` → built-in type
    default.
-4. Validate rationale length ≤ 1MB (R12).
 5. Read `actual_output` via `derive_last_gate_evaluated`.
-6. Append `GateOverrideRecorded` event.
+6. Append `GateOverrideRecorded` event with fields: `state` (current state name), `gate`
+   (from `--gate`), `rationale` (from `--rationale`), `override_applied` (resolved in step 4),
+   `actual_output` (from step 5), `timestamp` (now).
 
 `handle_overrides_list` calls `derive_overrides_all` and returns the JSON structure shown in
 Decision 4 above.
