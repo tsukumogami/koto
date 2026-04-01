@@ -294,8 +294,19 @@ where
         // 6. Evaluate gates
         let mut gates_failed = false;
         let mut failed_gate_results: Option<BTreeMap<String, StructuredGateResult>> = None;
+        // Gate outputs to inject into evidence (populated whenever gates are present).
+        let mut gate_evidence_map: serde_json::Map<String, serde_json::Value> =
+            serde_json::Map::new();
         if !template_state.gates.is_empty() {
             let gate_results = evaluate_gates(&template_state.gates);
+
+            // Build the gates sub-map: {"gate_name": output, ...}
+            // This is injected into the evidence regardless of pass/fail so that
+            // when clauses referencing gates.* can route based on gate output.
+            for (name, result) in &gate_results {
+                gate_evidence_map.insert(name.clone(), result.output.clone());
+            }
+
             let any_failed = gate_results
                 .values()
                 .any(|r| !matches!(r.outcome, GateOutcome::Passed));
@@ -318,15 +329,21 @@ where
         }
 
         // 7. Resolve transition
-        // Convert the BTreeMap evidence to a serde_json::Value::Object for
-        // resolve_transition. The resolver accepts Value so it can also traverse
-        // nested gate output merged in by Issue 4.
-        let evidence_value = serde_json::Value::Object(
-            current_evidence
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        );
+        // Build a merged evidence Value: start with agent evidence (flat keys),
+        // then layer gate output under "gates" (engine data takes precedence).
+        // This allows when clauses to reference both agent-submitted fields and
+        // gate output via dot-path traversal (e.g. gates.ci_check.exit_code).
+        let mut merged: serde_json::Map<String, serde_json::Value> = current_evidence
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if !gate_evidence_map.is_empty() {
+            merged.insert(
+                "gates".to_string(),
+                serde_json::Value::Object(gate_evidence_map),
+            );
+        }
+        let evidence_value = serde_json::Value::Object(merged);
         match resolve_transition(template_state, &evidence_value, gates_failed) {
             TransitionResolution::Resolved(target) => {
                 // Check for cycle before transitioning
@@ -1284,6 +1301,506 @@ mod tests {
             }
             other => panic!("expected EvidenceRequired, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Gate evidence merging tests (scenario-10, scenario-11)
+    // -----------------------------------------------------------------------
+
+    /// scenario-10: Gate output is injected into the merged evidence map under
+    /// "gates" so that when clauses referencing gates.* route correctly.
+    #[test]
+    fn gate_output_injected_into_evidence_for_routing() {
+        use crate::template::types::Gate;
+
+        // State has a passing gate and routes based on gates.ci.exit_code.
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "ci".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "exit 0".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+            },
+        );
+
+        let template = make_template(vec![
+            (
+                "check",
+                TemplateState {
+                    directive: "Check.".to_string(),
+                    details: String::new(),
+                    transitions: vec![
+                        conditional(
+                            "success",
+                            vec![("gates.ci.exit_code", serde_json::json!(0))],
+                        ),
+                        conditional(
+                            "failure",
+                            vec![("gates.ci.exit_code", serde_json::json!(1))],
+                        ),
+                    ],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "success",
+                TemplateState {
+                    directive: "Success.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "failure",
+                TemplateState {
+                    directive: "Failure.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        // Gate evaluator returns passing gate with exit_code 0.
+        let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Passed,
+                        output: serde_json::json!({"exit_code": 0, "error": ""}),
+                    },
+                );
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "check",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Gate passed (exit_code 0), so the engine routes to "success".
+        assert_eq!(result.final_state, "success");
+        assert!(result.advanced);
+        assert_eq!(result.stop_reason, StopReason::Terminal);
+    }
+
+    /// scenario-10 (failure path): Gate fails and routes via gates.* when clause.
+    /// The state must have an accepts block so the engine falls through to
+    /// transition resolution instead of returning GateBlocked immediately.
+    #[test]
+    fn gate_output_routes_to_failure_state() {
+        use crate::template::types::Gate;
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "ci".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "exit 1".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+            },
+        );
+
+        // The state has an accepts block so that when gates fail, the engine
+        // falls through to transition resolution (gate_failed=true). The
+        // conditional transitions route on gate output; the matching one fires.
+        let template = make_template(vec![
+            (
+                "check",
+                TemplateState {
+                    directive: "Check.".to_string(),
+                    details: String::new(),
+                    transitions: vec![
+                        conditional(
+                            "success",
+                            vec![("gates.ci.exit_code", serde_json::json!(0))],
+                        ),
+                        conditional(
+                            "fix",
+                            vec![("gates.ci.exit_code", serde_json::json!(1))],
+                        ),
+                    ],
+                    terminal: false,
+                    gates,
+                    accepts: make_accepts(vec!["override"]),
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "success",
+                TemplateState {
+                    directive: "Success.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "fix",
+                TemplateState {
+                    directive: "Fix.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        // Gate evaluator returns a failing gate with exit_code 1.
+        let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Failed,
+                        output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    },
+                );
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "check",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Gate failed with exit_code 1, so the engine routes to "fix" via the
+        // matching gates.ci.exit_code == 1 conditional transition.
+        assert_eq!(result.final_state, "fix");
+        assert!(result.advanced);
+        assert_eq!(result.stop_reason, StopReason::Terminal);
+    }
+
+    /// scenario-10: Agent evidence keys appear at the top level alongside
+    /// gate output nested under "gates". Engine data (gates) takes precedence
+    /// if both define the same top-level key.
+    #[test]
+    fn gate_evidence_merged_after_agent_evidence() {
+        use crate::template::types::Gate;
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "lint".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "exit 0".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+            },
+        );
+
+        // Transition requires both gate output and agent evidence.
+        let template = make_template(vec![
+            (
+                "verify",
+                TemplateState {
+                    directive: "Verify.".to_string(),
+                    details: String::new(),
+                    transitions: vec![conditional(
+                        "done",
+                        vec![
+                            ("gates.lint.exit_code", serde_json::json!(0)),
+                            ("decision", serde_json::json!("approve")),
+                        ],
+                    )],
+                    terminal: false,
+                    gates,
+                    accepts: make_accepts(vec!["decision"]),
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        // Agent evidence has the decision field.
+        let mut agent_evidence = BTreeMap::new();
+        agent_evidence.insert("decision".to_string(), serde_json::json!("approve"));
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Passed,
+                        output: serde_json::json!({"exit_code": 0, "error": ""}),
+                    },
+                );
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "verify",
+            &template,
+            &agent_evidence,
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Both gate output and agent evidence match the transition condition.
+        assert_eq!(result.final_state, "done");
+        assert!(result.advanced);
+        assert_eq!(result.stop_reason, StopReason::Terminal);
+    }
+
+    /// scenario-11: any_failed is derived from GateOutcome. Passed gates do not
+    /// contribute to any_failed; Failed/TimedOut/Error outcomes do.
+    #[test]
+    fn gate_pass_fail_from_outcome() {
+        use crate::template::types::Gate;
+
+        // State has a gate and an unconditional fallback. When the gate passes,
+        // the engine auto-advances via the unconditional fallback (gate_failed=false).
+        // When the gate fails, the unconditional fallback is suppressed and the
+        // engine returns GateBlocked.
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "exit 0".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+            },
+        );
+
+        let template = make_template(vec![
+            (
+                "guarded",
+                TemplateState {
+                    directive: "Guarded.".to_string(),
+                    details: String::new(),
+                    transitions: vec![unconditional("next")],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "next",
+                TemplateState {
+                    directive: "Next.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        // Passing gate: outcome Passed -- any_failed should be false.
+        let passing_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Passed,
+                        output: serde_json::json!({"exit_code": 0, "error": ""}),
+                    },
+                );
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "guarded",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &passing_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Gate passed: engine should auto-advance via unconditional to "next".
+        assert_eq!(result.final_state, "next");
+        assert!(result.advanced);
+        assert_eq!(result.stop_reason, StopReason::Terminal);
+
+        // Failing gate: outcome Failed -- any_failed should be true.
+        let failing_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Failed,
+                        output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    },
+                );
+            }
+            results
+        };
+
+        let mut append2 = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown2 = AtomicBool::new(false);
+
+        let result2 = advance_until_stop(
+            "guarded",
+            &template,
+            &BTreeMap::new(),
+            &mut append2,
+            &failing_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown2,
+        )
+        .unwrap();
+
+        // Gate failed: engine should return GateBlocked (no accepts block).
+        assert_eq!(result2.final_state, "guarded");
+        assert!(!result2.advanced);
+        assert!(matches!(result2.stop_reason, StopReason::GateBlocked(_)));
+
+        // TimedOut gate: outcome TimedOut also contributes to any_failed.
+        let timeout_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::TimedOut,
+                        output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+                    },
+                );
+            }
+            results
+        };
+
+        let mut append3 = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown3 = AtomicBool::new(false);
+
+        let result3 = advance_until_stop(
+            "guarded",
+            &template,
+            &BTreeMap::new(),
+            &mut append3,
+            &timeout_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown3,
+        )
+        .unwrap();
+
+        assert!(matches!(result3.stop_reason, StopReason::GateBlocked(_)));
+
+        // Error gate: outcome Error also contributes to any_failed.
+        let error_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Error,
+                        output: serde_json::json!({"exit_code": -1, "error": "spawn failed"}),
+                    },
+                );
+            }
+            results
+        };
+
+        let mut append4 = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown4 = AtomicBool::new(false);
+
+        let result4 = advance_until_stop(
+            "guarded",
+            &template,
+            &BTreeMap::new(),
+            &mut append4,
+            &error_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown4,
+        )
+        .unwrap();
+
+        assert!(matches!(result4.stop_reason, StopReason::GateBlocked(_)));
     }
 
     #[test]
