@@ -141,13 +141,21 @@ The `blocking_conditions` array is always present on `evidence_required` respons
   "advanced": false,
   "expects": null,
   "blocking_conditions": [
-    {"name": "ci_check", "type": "command", "status": "failed", "agent_actionable": false}
+    {
+      "name": "ci_check",
+      "type": "command",
+      "status": "failed",
+      "agent_actionable": false,
+      "output": {"exit_code": 1, "error": ""}
+    }
   ],
   "error": null
 }
 ```
 
-Possible `status` values: `"failed"`, `"timed_out"`, `"error"`. Passing gates don't appear in the array.
+Each entry in `blocking_conditions` includes structured gate output in the `output` field. The shape of `output` depends on the gate type -- see the [gate output schemas](#gate-output-schemas) in the custom skill authoring guide for details. Passing gates don't appear in the array.
+
+`status` reflects the `GateOutcome`: `"failed"` (pass condition not met), `"timed_out"` (command exceeded its timeout), `"error"` (spawn or evaluation error).
 
 **Integration / IntegrationUnavailable** -- the state declares an integration. When the runner is available, you get `"integration"` with the output. When unavailable, you get `"integration_unavailable"` with `available: false`:
 
