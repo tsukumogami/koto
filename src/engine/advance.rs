@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine::types::{Event, EventPayload};
-use crate::gate::GateResult;
+use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::template::types::{ActionDecl, CompiledTemplate, TemplateState};
 
 /// Maximum number of transitions per invocation. Defense-in-depth against
@@ -51,10 +51,10 @@ pub enum StopReason {
     /// Reached a terminal state.
     Terminal,
     /// One or more gates failed.
-    GateBlocked(BTreeMap<String, GateResult>),
+    GateBlocked(BTreeMap<String, StructuredGateResult>),
     /// Conditional transitions exist but evidence doesn't match any.
     EvidenceRequired {
-        failed_gates: Option<BTreeMap<String, GateResult>>,
+        failed_gates: Option<BTreeMap<String, StructuredGateResult>>,
     },
     /// Integration was invoked and returned output.
     Integration {
@@ -172,7 +172,9 @@ pub fn advance_until_stop<F, G, I, A>(
 ) -> Result<AdvanceResult, AdvanceError>
 where
     F: FnMut(&EventPayload) -> Result<(), String>,
-    G: Fn(&BTreeMap<String, crate::template::types::Gate>) -> BTreeMap<String, GateResult>,
+    G: Fn(
+        &BTreeMap<String, crate::template::types::Gate>,
+    ) -> BTreeMap<String, StructuredGateResult>,
     I: Fn(&str) -> Result<serde_json::Value, IntegrationError>,
     A: Fn(&str, &ActionDecl, bool) -> ActionResult,
 {
@@ -291,12 +293,12 @@ where
 
         // 6. Evaluate gates
         let mut gates_failed = false;
-        let mut failed_gate_results: Option<BTreeMap<String, GateResult>> = None;
+        let mut failed_gate_results: Option<BTreeMap<String, StructuredGateResult>> = None;
         if !template_state.gates.is_empty() {
             let gate_results = evaluate_gates(&template_state.gates);
             let any_failed = gate_results
                 .values()
-                .any(|r| !matches!(r, GateResult::Passed));
+                .any(|r| !matches!(r.outcome, GateOutcome::Passed));
             if any_failed {
                 // If the state has an accepts block, fall through to transition
                 // resolution instead of returning GateBlocked. The transition
@@ -540,7 +542,7 @@ mod tests {
 
     fn noop_gates(
         _gates: &BTreeMap<String, crate::template::types::Gate>,
-    ) -> BTreeMap<String, GateResult> {
+    ) -> BTreeMap<String, StructuredGateResult> {
         BTreeMap::new()
     }
 
@@ -931,7 +933,13 @@ mod tests {
         let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
             for (name, _) in gates {
-                results.insert(name.clone(), GateResult::Failed { exit_code: 1 });
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Failed,
+                        output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    },
+                );
             }
             results
         };
@@ -1082,7 +1090,13 @@ mod tests {
         let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
             for (name, _) in gates {
-                results.insert(name.clone(), GateResult::Failed { exit_code: 1 });
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Failed,
+                        output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    },
+                );
             }
             results
         };
@@ -1108,7 +1122,8 @@ mod tests {
                     .expect("failed_gates should be Some when gates failed");
                 assert_eq!(gates.len(), 1);
                 assert!(gates.contains_key("ci_check"));
-                assert_eq!(gates["ci_check"], GateResult::Failed { exit_code: 1 });
+                assert_eq!(gates["ci_check"].outcome, GateOutcome::Failed);
+                assert_eq!(gates["ci_check"].output["exit_code"], 1);
             }
             other => panic!("expected EvidenceRequired, got {:?}", other),
         }
@@ -1656,7 +1671,13 @@ mod tests {
         let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
             for (name, _) in gates {
-                results.insert(name.clone(), GateResult::Failed { exit_code: 1 });
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Failed,
+                        output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    },
+                );
             }
             results
         };

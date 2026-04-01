@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::ser::SerializeMap;
 use serde::Serialize;
 
-use crate::gate::GateResult;
+use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::template::types::TemplateState;
 
 /// Summary of a recorded decision, used in `koto decisions list` responses.
@@ -395,16 +395,16 @@ pub struct ErrorDetail {
 /// Passed gates are excluded. Each non-passing gate produces a `BlockingCondition`
 /// with `condition_type: "command"` and `agent_actionable: false`.
 pub fn blocking_conditions_from_gates(
-    gate_results: &BTreeMap<String, GateResult>,
+    gate_results: &BTreeMap<String, StructuredGateResult>,
 ) -> Vec<BlockingCondition> {
     gate_results
         .iter()
         .filter_map(|(name, result)| {
-            let status = match result {
-                GateResult::Passed => return None,
-                GateResult::Failed { .. } => "failed",
-                GateResult::TimedOut => "timed_out",
-                GateResult::Error { .. } => "error",
+            let status = match result.outcome {
+                GateOutcome::Passed => return None,
+                GateOutcome::Failed => "failed",
+                GateOutcome::TimedOut => "timed_out",
+                GateOutcome::Error => "error",
             };
             Some(BlockingCondition {
                 name: name.clone(),
