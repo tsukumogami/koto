@@ -10,7 +10,7 @@ use crate::cli::next_types::{
     NextResponse,
 };
 #[cfg(unix)]
-use crate::gate::GateResult;
+use crate::gate::StructuredGateResult;
 use crate::template::types::TemplateState;
 
 /// Classify the current workflow state into a response or error.
@@ -33,7 +33,7 @@ pub fn dispatch_next(
     state: &str,
     template_state: &TemplateState,
     advanced: bool,
-    gate_results: &BTreeMap<String, GateResult>,
+    gate_results: &BTreeMap<String, StructuredGateResult>,
 ) -> Result<NextResponse, NextError> {
     // 1. Terminal
     if template_state.terminal {
@@ -44,7 +44,7 @@ pub fn dispatch_next(
     }
 
     // 2. Gates failed
-    let blocking = blocking_conditions_from_gates(gate_results);
+    let blocking = blocking_conditions_from_gates(gate_results, &template_state.gates);
 
     let details = if template_state.details.is_empty() {
         None
@@ -122,7 +122,7 @@ pub fn dispatch_next(
 mod tests {
     use super::*;
     use crate::cli::next_types::*;
-    use crate::gate::GateResult;
+    use crate::gate::{GateOutcome, StructuredGateResult};
     use crate::template::types::{FieldSchema, Gate, TemplateState, Transition};
     use std::collections::BTreeMap;
 
@@ -183,7 +183,13 @@ mod tests {
     fn gate_blocked_when_gate_failed() {
         let ts = make_state("Deploy.", false, vec![], BTreeMap::new(), None, None);
         let mut gates = BTreeMap::new();
-        gates.insert("ci".to_string(), GateResult::Failed { exit_code: 1 });
+        gates.insert(
+            "ci".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exit_code": 1, "error": ""}),
+            },
+        );
 
         let result = dispatch_next("deploy", &ts, false, &gates);
         let resp = result.unwrap();
@@ -208,7 +214,13 @@ mod tests {
     fn gate_blocked_when_gate_timed_out() {
         let ts = make_state("Deploy.", false, vec![], BTreeMap::new(), None, None);
         let mut gates = BTreeMap::new();
-        gates.insert("slow_check".to_string(), GateResult::TimedOut);
+        gates.insert(
+            "slow_check".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::TimedOut,
+                output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+            },
+        );
 
         let result = dispatch_next("deploy", &ts, false, &gates);
         let resp = result.unwrap();
@@ -229,8 +241,9 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert(
             "broken".to_string(),
-            GateResult::Error {
-                message: "spawn failed".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Error,
+                output: serde_json::json!({"exit_code": -1, "error": "spawn failed"}),
             },
         );
 
@@ -251,9 +264,27 @@ mod tests {
     fn gate_blocked_includes_all_failures() {
         let ts = make_state("Deploy.", false, vec![], BTreeMap::new(), None, None);
         let mut gates = BTreeMap::new();
-        gates.insert("ci".to_string(), GateResult::Failed { exit_code: 1 });
-        gates.insert("lint".to_string(), GateResult::TimedOut);
-        gates.insert("ok".to_string(), GateResult::Passed);
+        gates.insert(
+            "ci".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exit_code": 1, "error": ""}),
+            },
+        );
+        gates.insert(
+            "lint".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::TimedOut,
+                output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+            },
+        );
+        gates.insert(
+            "ok".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Passed,
+                output: serde_json::json!({"exit_code": 0, "error": ""}),
+            },
+        );
 
         let result = dispatch_next("deploy", &ts, false, &gates);
         let resp = result.unwrap();
@@ -279,8 +310,20 @@ mod tests {
     fn passing_gates_do_not_block() {
         let ts = make_state("Deploy.", false, vec![], BTreeMap::new(), None, None);
         let mut gates = BTreeMap::new();
-        gates.insert("ci".to_string(), GateResult::Passed);
-        gates.insert("lint".to_string(), GateResult::Passed);
+        gates.insert(
+            "ci".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Passed,
+                output: serde_json::json!({"exit_code": 0, "error": ""}),
+            },
+        );
+        gates.insert(
+            "lint".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Passed,
+                output: serde_json::json!({"exit_code": 0, "error": ""}),
+            },
+        );
 
         let result = dispatch_next("deploy", &ts, false, &gates);
         let resp = result.unwrap();
@@ -301,7 +344,13 @@ mod tests {
     fn terminal_takes_priority_over_failed_gates() {
         let ts = make_state("Done.", true, vec![], BTreeMap::new(), None, None);
         let mut gates = BTreeMap::new();
-        gates.insert("ci".to_string(), GateResult::Failed { exit_code: 1 });
+        gates.insert(
+            "ci".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exit_code": 1, "error": ""}),
+            },
+        );
 
         let result = dispatch_next("done", &ts, false, &gates);
         let resp = result.unwrap();
@@ -389,7 +438,13 @@ mod tests {
             Some("review".to_string()),
         );
         let mut gates = BTreeMap::new();
-        gates.insert("ci".to_string(), GateResult::Failed { exit_code: 1 });
+        gates.insert(
+            "ci".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exit_code": 1, "error": ""}),
+            },
+        );
 
         let result = dispatch_next("delegate", &ts, false, &gates);
         let resp = result.unwrap();
@@ -527,7 +582,13 @@ mod tests {
             Some("tool".to_string()),
         );
         let mut gates = BTreeMap::new();
-        gates.insert("check".to_string(), GateResult::Failed { exit_code: 1 });
+        gates.insert(
+            "check".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exit_code": 1, "error": ""}),
+            },
+        );
 
         let result = dispatch_next("step", &ts, false, &gates);
         match result.unwrap() {
@@ -580,7 +641,10 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert(
             "branch_check".to_string(),
-            GateResult::Failed { exit_code: 1 },
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exit_code": 1, "error": ""}),
+            },
         );
 
         let result = dispatch_next("setup", &ts, false, &gates);
@@ -601,7 +665,13 @@ mod tests {
     fn gate_failed_without_accepts_still_returns_gate_blocked() {
         let ts = make_state("Deploy.", false, vec![], BTreeMap::new(), None, None);
         let mut gates = BTreeMap::new();
-        gates.insert("ci".to_string(), GateResult::Failed { exit_code: 1 });
+        gates.insert(
+            "ci".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exit_code": 1, "error": ""}),
+            },
+        );
 
         let result = dispatch_next("deploy", &ts, false, &gates);
         let resp = result.unwrap();
@@ -634,7 +704,13 @@ mod tests {
         );
 
         let mut gates = BTreeMap::new();
-        gates.insert("check".to_string(), GateResult::Passed);
+        gates.insert(
+            "check".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Passed,
+                output: serde_json::json!({"exit_code": 0, "error": ""}),
+            },
+        );
 
         let result = dispatch_next("check_state", &ts, false, &gates);
         let resp = result.unwrap();
@@ -670,8 +746,20 @@ mod tests {
         );
 
         let mut gates = BTreeMap::new();
-        gates.insert("check_a".to_string(), GateResult::Passed);
-        gates.insert("check_b".to_string(), GateResult::Failed { exit_code: 1 });
+        gates.insert(
+            "check_a".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Passed,
+                output: serde_json::json!({"exit_code": 0, "error": ""}),
+            },
+        );
+        gates.insert(
+            "check_b".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exit_code": 1, "error": ""}),
+            },
+        );
 
         let result = dispatch_next("setup", &ts, false, &gates);
         let resp = result.unwrap();

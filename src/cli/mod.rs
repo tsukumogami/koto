@@ -515,7 +515,7 @@ fn execute_with_polling<G>(
 where
     G: Fn(
         &std::collections::BTreeMap<String, crate::template::types::Gate>,
-    ) -> std::collections::BTreeMap<String, crate::gate::GateResult>,
+    ) -> std::collections::BTreeMap<String, crate::gate::StructuredGateResult>,
 {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -538,7 +538,7 @@ where
             let gate_results = evaluate_gates_fn(gates);
             let all_passed = gate_results
                 .values()
-                .all(|r| matches!(r, crate::gate::GateResult::Passed));
+                .all(|r| matches!(r.outcome, crate::gate::GateOutcome::Passed));
             if all_passed {
                 return output;
             }
@@ -1733,7 +1733,8 @@ fn handle_next(
                     advanced,
                 },
                 StopReason::GateBlocked(gate_results) => {
-                    let blocking = blocking_conditions_from_gates(&gate_results);
+                    let blocking =
+                        blocking_conditions_from_gates(&gate_results, &final_template_state.gates);
                     NextResponse::GateBlocked {
                         state: final_state.clone(),
                         directive: directive.clone(),
@@ -1752,7 +1753,7 @@ fn handle_next(
                     });
                     let blocking = failed_gates
                         .as_ref()
-                        .map(blocking_conditions_from_gates)
+                        .map(|fg| blocking_conditions_from_gates(fg, &final_template_state.gates))
                         .unwrap_or_default();
                     NextResponse::EvidenceRequired {
                         state: final_state.clone(),

@@ -8,23 +8,43 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::action::run_shell_command;
 use crate::session::context::ContextStore;
 use crate::template::types::{
     Gate, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS, GATE_TYPE_CONTEXT_MATCHES,
 };
 
-/// Result of evaluating a single gate.
-#[derive(Debug, Clone, PartialEq)]
-pub enum GateResult {
+/// Outcome of a structured gate evaluation.
+///
+/// Carries the control-flow signal used by the advance loop to determine
+/// whether a state should block or continue. The associated structured output
+/// is held in [`StructuredGateResult`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum GateOutcome {
     /// The gate condition was satisfied.
     Passed,
-    /// The command exited with a non-zero status, or the context check failed.
-    Failed { exit_code: i32 },
+    /// The gate condition was not satisfied.
+    Failed,
     /// The command did not finish within the configured timeout.
     TimedOut,
     /// The command could not be spawned or an OS error occurred.
-    Error { message: String },
+    Error,
+}
+
+/// Structured result of evaluating a single gate.
+///
+/// Carries both the control-flow outcome and the gate-type-specific JSON
+/// output. The `output` field holds structured data matching the gate type's
+/// schema (e.g. `{"exit_code": 0, "error": ""}` for command gates), making it
+/// available for injection into the evidence map and transition routing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StructuredGateResult {
+    /// Control-flow outcome used by the advance loop.
+    pub outcome: GateOutcome,
+    /// Gate-type-specific structured output for evidence injection.
+    pub output: serde_json::Value,
 }
 
 /// Evaluate all gates, running each command with `working_dir` as the current
@@ -38,7 +58,7 @@ pub fn evaluate_gates(
     working_dir: &Path,
     context_store: Option<&dyn ContextStore>,
     session: Option<&str>,
-) -> BTreeMap<String, GateResult> {
+) -> BTreeMap<String, StructuredGateResult> {
     let mut results = BTreeMap::new();
     for (name, gate) in gates {
         let result = match gate.gate_type.as_str() {
@@ -47,12 +67,16 @@ pub fn evaluate_gates(
             GATE_TYPE_CONTEXT_MATCHES => {
                 evaluate_context_matches_gate(gate, context_store, session)
             }
-            other => GateResult::Error {
-                message: format!(
-                    "unsupported gate type '{}'; only command, context-exists, \
-                     and context-matches gates are evaluated",
-                    other
-                ),
+            other => StructuredGateResult {
+                outcome: GateOutcome::Error,
+                output: serde_json::json!({
+                    "exit_code": -1,
+                    "error": format!(
+                        "unsupported gate type '{}'; only command, context-exists, \
+                         and context-matches gates are evaluated",
+                        other
+                    )
+                }),
             },
         };
         results.insert(name.clone(), result);
@@ -64,19 +88,29 @@ fn evaluate_context_exists_gate(
     gate: &Gate,
     context_store: Option<&dyn ContextStore>,
     session: Option<&str>,
-) -> GateResult {
+) -> StructuredGateResult {
     let (store, sess) = match (context_store, session) {
         (Some(s), Some(n)) => (s, n),
         _ => {
-            return GateResult::Error {
-                message: "context-exists gate requires a context store and session".to_string(),
+            return StructuredGateResult {
+                outcome: GateOutcome::Error,
+                output: serde_json::json!({
+                    "exists": false,
+                    "error": "context-exists gate requires a context store and session"
+                }),
             };
         }
     };
     if store.ctx_exists(sess, &gate.key) {
-        GateResult::Passed
+        StructuredGateResult {
+            outcome: GateOutcome::Passed,
+            output: serde_json::json!({"exists": true, "error": ""}),
+        }
     } else {
-        GateResult::Failed { exit_code: 1 }
+        StructuredGateResult {
+            outcome: GateOutcome::Failed,
+            output: serde_json::json!({"exists": false, "error": ""}),
+        }
     }
 }
 
@@ -84,12 +118,16 @@ fn evaluate_context_matches_gate(
     gate: &Gate,
     context_store: Option<&dyn ContextStore>,
     session: Option<&str>,
-) -> GateResult {
+) -> StructuredGateResult {
     let (store, sess) = match (context_store, session) {
         (Some(s), Some(n)) => (s, n),
         _ => {
-            return GateResult::Error {
-                message: "context-matches gate requires a context store and session".to_string(),
+            return StructuredGateResult {
+                outcome: GateOutcome::Error,
+                output: serde_json::json!({
+                    "matches": false,
+                    "error": "context-matches gate requires a context store and session"
+                }),
             };
         }
     };
@@ -97,44 +135,68 @@ fn evaluate_context_matches_gate(
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(s) => s,
             Err(_) => {
-                return GateResult::Failed { exit_code: 1 };
+                return StructuredGateResult {
+                    outcome: GateOutcome::Failed,
+                    output: serde_json::json!({"matches": false, "error": ""}),
+                };
             }
         },
         Err(_) => {
-            return GateResult::Failed { exit_code: 1 };
+            return StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"matches": false, "error": ""}),
+            };
         }
     };
     match regex::Regex::new(&gate.pattern) {
         Ok(re) => {
             if re.is_match(&content) {
-                GateResult::Passed
+                StructuredGateResult {
+                    outcome: GateOutcome::Passed,
+                    output: serde_json::json!({"matches": true, "error": ""}),
+                }
             } else {
-                GateResult::Failed { exit_code: 1 }
+                StructuredGateResult {
+                    outcome: GateOutcome::Failed,
+                    output: serde_json::json!({"matches": false, "error": ""}),
+                }
             }
         }
-        Err(e) => GateResult::Error {
-            message: format!("invalid regex pattern: {}", e),
+        Err(e) => StructuredGateResult {
+            outcome: GateOutcome::Error,
+            output: serde_json::json!({
+                "matches": false,
+                "error": format!("invalid regex pattern: {}", e)
+            }),
         },
     }
 }
 
-fn evaluate_command_gate(gate: &Gate, working_dir: &Path) -> GateResult {
+fn evaluate_command_gate(gate: &Gate, working_dir: &Path) -> StructuredGateResult {
     let output = run_shell_command(&gate.command, working_dir, gate.timeout);
 
     if output.exit_code == -1 {
         // Distinguish timeout from spawn/wait errors by checking the message.
         if output.stderr.contains("timed out") {
-            GateResult::TimedOut
+            StructuredGateResult {
+                outcome: GateOutcome::TimedOut,
+                output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+            }
         } else {
-            GateResult::Error {
-                message: output.stderr,
+            StructuredGateResult {
+                outcome: GateOutcome::Error,
+                output: serde_json::json!({"exit_code": -1, "error": output.stderr}),
             }
         }
     } else if output.exit_code == 0 {
-        GateResult::Passed
+        StructuredGateResult {
+            outcome: GateOutcome::Passed,
+            output: serde_json::json!({"exit_code": 0, "error": ""}),
+        }
     } else {
-        GateResult::Failed {
-            exit_code: output.exit_code,
+        StructuredGateResult {
+            outcome: GateOutcome::Failed,
+            output: serde_json::json!({"exit_code": output.exit_code, "error": ""}),
         }
     }
 }
@@ -168,7 +230,9 @@ mod tests {
 
         let results = evaluate_gates(&gates, dir.path(), None, None);
         assert_eq!(results.len(), 1);
-        assert_eq!(results["check"], GateResult::Passed);
+        assert_eq!(results["check"].outcome, GateOutcome::Passed);
+        assert_eq!(results["check"].output["exit_code"], 0);
+        assert_eq!(results["check"].output["error"], "");
     }
 
     #[test]
@@ -179,7 +243,9 @@ mod tests {
 
         let results = evaluate_gates(&gates, dir.path(), None, None);
         assert_eq!(results.len(), 1);
-        assert_eq!(results["check"], GateResult::Failed { exit_code: 42 });
+        assert_eq!(results["check"].outcome, GateOutcome::Failed);
+        assert_eq!(results["check"].output["exit_code"], 42);
+        assert_eq!(results["check"].output["error"], "");
     }
 
     #[test]
@@ -190,7 +256,9 @@ mod tests {
 
         let results = evaluate_gates(&gates, dir.path(), None, None);
         assert_eq!(results.len(), 1);
-        assert_eq!(results["slow"], GateResult::TimedOut);
+        assert_eq!(results["slow"].outcome, GateOutcome::TimedOut);
+        assert_eq!(results["slow"].output["exit_code"], -1);
+        assert_eq!(results["slow"].output["error"], "timed_out");
     }
 
     #[test]
@@ -201,13 +269,9 @@ mod tests {
 
         let results = evaluate_gates(&gates, dir.path(), None, None);
         assert_eq!(results.len(), 1);
-        match &results["bad"] {
-            // The shell itself exits 127 for command-not-found.
-            GateResult::Failed { exit_code } => {
-                assert_eq!(*exit_code, 127);
-            }
-            other => panic!("expected Failed with exit_code 127, got {:?}", other),
-        }
+        // The shell itself exits 127 for command-not-found.
+        assert_eq!(results["bad"].outcome, GateOutcome::Failed);
+        assert_eq!(results["bad"].output["exit_code"], 127);
     }
 
     #[test]
@@ -220,9 +284,10 @@ mod tests {
 
         let results = evaluate_gates(&gates, dir.path(), None, None);
         assert_eq!(results.len(), 3);
-        assert_eq!(results["pass"], GateResult::Passed);
-        assert_eq!(results["fail"], GateResult::Failed { exit_code: 1 });
-        assert_eq!(results["timeout"], GateResult::TimedOut);
+        assert_eq!(results["pass"].outcome, GateOutcome::Passed);
+        assert_eq!(results["fail"].outcome, GateOutcome::Failed);
+        assert_eq!(results["fail"].output["exit_code"], 1);
+        assert_eq!(results["timeout"].outcome, GateOutcome::TimedOut);
     }
 
     #[test]
@@ -235,7 +300,7 @@ mod tests {
         gates.insert("check_dir".to_string(), make_gate("test -f marker.txt", 5));
 
         let results = evaluate_gates(&gates, dir.path(), None, None);
-        assert_eq!(results["check_dir"], GateResult::Passed);
+        assert_eq!(results["check_dir"].outcome, GateOutcome::Passed);
     }
 
     #[test]
@@ -247,7 +312,7 @@ mod tests {
         gates.insert("quick".to_string(), make_gate("exit 0", 0));
 
         let results = evaluate_gates(&gates, dir.path(), None, None);
-        assert_eq!(results["quick"], GateResult::Passed);
+        assert_eq!(results["quick"].outcome, GateOutcome::Passed);
     }
 
     // -----------------------------------------------------------------------
@@ -334,7 +399,9 @@ mod tests {
         );
 
         let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
-        assert_eq!(results["research"], GateResult::Passed);
+        assert_eq!(results["research"].outcome, GateOutcome::Passed);
+        assert_eq!(results["research"].output["exists"], true);
+        assert_eq!(results["research"].output["error"], "");
     }
 
     #[test]
@@ -355,7 +422,9 @@ mod tests {
         );
 
         let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
-        assert_eq!(results["research"], GateResult::Failed { exit_code: 1 });
+        assert_eq!(results["research"].outcome, GateOutcome::Failed);
+        assert_eq!(results["research"].output["exists"], false);
+        assert_eq!(results["research"].output["error"], "");
     }
 
     #[test]
@@ -374,7 +443,8 @@ mod tests {
         );
 
         let results = evaluate_gates(&gates, dir.path(), None, None);
-        assert!(matches!(&results["research"], GateResult::Error { .. }));
+        assert_eq!(results["research"].outcome, GateOutcome::Error);
+        assert_eq!(results["research"].output["exists"], false);
     }
 
     #[test]
@@ -400,7 +470,9 @@ mod tests {
         );
 
         let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
-        assert_eq!(results["review"], GateResult::Passed);
+        assert_eq!(results["review"].outcome, GateOutcome::Passed);
+        assert_eq!(results["review"].output["matches"], true);
+        assert_eq!(results["review"].output["error"], "");
     }
 
     #[test]
@@ -426,7 +498,9 @@ mod tests {
         );
 
         let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
-        assert_eq!(results["review"], GateResult::Failed { exit_code: 1 });
+        assert_eq!(results["review"].outcome, GateOutcome::Failed);
+        assert_eq!(results["review"].output["matches"], false);
+        assert_eq!(results["review"].output["error"], "");
     }
 
     #[test]
@@ -447,7 +521,8 @@ mod tests {
         );
 
         let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
-        assert_eq!(results["review"], GateResult::Failed { exit_code: 1 });
+        assert_eq!(results["review"].outcome, GateOutcome::Failed);
+        assert_eq!(results["review"].output["matches"], false);
     }
 
     #[test]
@@ -466,7 +541,8 @@ mod tests {
         );
 
         let results = evaluate_gates(&gates, dir.path(), None, None);
-        assert!(matches!(&results["review"], GateResult::Error { .. }));
+        assert_eq!(results["review"].outcome, GateOutcome::Error);
+        assert_eq!(results["review"].output["matches"], false);
     }
 
     #[test]
@@ -488,7 +564,137 @@ mod tests {
         );
 
         let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
-        assert_eq!(results["status"], GateResult::Passed);
+        assert_eq!(results["status"].outcome, GateOutcome::Passed);
+        assert_eq!(results["status"].output["matches"], true);
+    }
+
+    // -----------------------------------------------------------------------
+    // StructuredGateResult / GateOutcome serialization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gate_outcome_passed_round_trip() {
+        let outcome = GateOutcome::Passed;
+        let json = serde_json::to_string(&outcome).unwrap();
+        let decoded: GateOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, GateOutcome::Passed);
+    }
+
+    #[test]
+    fn gate_outcome_failed_round_trip() {
+        let outcome = GateOutcome::Failed;
+        let json = serde_json::to_string(&outcome).unwrap();
+        let decoded: GateOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, GateOutcome::Failed);
+    }
+
+    #[test]
+    fn gate_outcome_timed_out_round_trip() {
+        let outcome = GateOutcome::TimedOut;
+        let json = serde_json::to_string(&outcome).unwrap();
+        let decoded: GateOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, GateOutcome::TimedOut);
+    }
+
+    #[test]
+    fn gate_outcome_error_round_trip() {
+        let outcome = GateOutcome::Error;
+        let json = serde_json::to_string(&outcome).unwrap();
+        let decoded: GateOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, GateOutcome::Error);
+    }
+
+    #[test]
+    fn structured_gate_result_passed_round_trip() {
+        let result = StructuredGateResult {
+            outcome: GateOutcome::Passed,
+            output: serde_json::json!({"exit_code": 0, "error": ""}),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.outcome, GateOutcome::Passed);
+        assert_eq!(decoded.output["exit_code"], 0);
+        assert_eq!(decoded.output["error"], "");
+    }
+
+    #[test]
+    fn structured_gate_result_failed_round_trip() {
+        let result = StructuredGateResult {
+            outcome: GateOutcome::Failed,
+            output: serde_json::json!({"exit_code": 1, "error": ""}),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.outcome, GateOutcome::Failed);
+        assert_eq!(decoded.output["exit_code"], 1);
+    }
+
+    #[test]
+    fn structured_gate_result_timed_out_round_trip() {
+        let result = StructuredGateResult {
+            outcome: GateOutcome::TimedOut,
+            output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.outcome, GateOutcome::TimedOut);
+        assert_eq!(decoded.output["exit_code"], -1);
+        assert_eq!(decoded.output["error"], "timed_out");
+    }
+
+    #[test]
+    fn structured_gate_result_error_round_trip() {
+        let result = StructuredGateResult {
+            outcome: GateOutcome::Error,
+            output: serde_json::json!({"exit_code": -1, "error": "spawn failed: no such file"}),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.outcome, GateOutcome::Error);
+        assert_eq!(decoded.output["error"], "spawn failed: no such file");
+    }
+
+    #[test]
+    fn structured_gate_result_context_exists_schema() {
+        let result = StructuredGateResult {
+            outcome: GateOutcome::Passed,
+            output: serde_json::json!({"exists": true, "error": ""}),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.outcome, GateOutcome::Passed);
+        assert_eq!(decoded.output["exists"], true);
+        assert_eq!(decoded.output["error"], "");
+    }
+
+    #[test]
+    fn structured_gate_result_context_matches_schema() {
+        let result = StructuredGateResult {
+            outcome: GateOutcome::Failed,
+            output: serde_json::json!({"matches": false, "error": ""}),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.outcome, GateOutcome::Failed);
+        assert_eq!(decoded.output["matches"], false);
+    }
+
+    #[test]
+    fn gate_outcome_partial_eq() {
+        assert_eq!(GateOutcome::Passed, GateOutcome::Passed);
+        assert_ne!(GateOutcome::Passed, GateOutcome::Failed);
+        assert_ne!(GateOutcome::TimedOut, GateOutcome::Error);
+    }
+
+    #[test]
+    fn structured_gate_result_clone() {
+        let result = StructuredGateResult {
+            outcome: GateOutcome::Passed,
+            output: serde_json::json!({"exit_code": 0, "error": ""}),
+        };
+        let cloned = result.clone();
+        assert_eq!(cloned.outcome, GateOutcome::Passed);
+        assert_eq!(cloned.output, result.output);
     }
 
     #[test]
@@ -531,8 +737,8 @@ mod tests {
 
         let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
         assert_eq!(results.len(), 3);
-        assert_eq!(results["cmd"], GateResult::Passed);
-        assert_eq!(results["ctx_exists"], GateResult::Passed);
-        assert_eq!(results["ctx_matches"], GateResult::Passed);
+        assert_eq!(results["cmd"].outcome, GateOutcome::Passed);
+        assert_eq!(results["ctx_exists"].outcome, GateOutcome::Passed);
+        assert_eq!(results["ctx_matches"].outcome, GateOutcome::Passed);
     }
 }

@@ -235,9 +235,12 @@ The `awakening` state has one gate:
 
 - **greeting_exists** (context-exists gate): checks for key `spirit-greeting.txt` in the content
   store. The agent must submit the greeting via `koto context add` before transitioning to `eternal`.
+  Produces `{"exists": bool, "error": ""}` output, available under `gates.greeting_exists` in evidence.
 ```
 
 For templates with multiple gates across several states, list them per-state so the agent can look up what's needed at each transition.
+
+Each gate type produces structured output matching its schema (see [Gate output schemas](#gate-output-schemas)). The engine injects this output into the evidence map under `gates.<name>` after evaluation. Templates can reference these fields in `when` conditions using dot-path syntax: `gates.<name>.<field>`. For example, `gates.greeting_exists.exists: true` would route a transition only when the context-exists gate found the key.
 
 #### Response schemas
 
@@ -415,6 +418,42 @@ gates:
 ```
 
 These gates are evaluated automatically when the agent calls `koto next` or `koto transition`. They replace the older pattern of using `command` gates with `test -f` checks against the session directory.
+
+### Gate output schemas
+
+Every gate type produces structured output, available under `gates.<gate_name>` in the evidence map and in `blocking_conditions` when a gate fails.
+
+| Gate type | Output schema |
+|-----------|--------------|
+| `command` | `{"exit_code": number, "error": string}` |
+| `context-exists` | `{"exists": boolean, "error": string}` |
+| `context-matches` | `{"matches": boolean, "error": string}` |
+
+For `command` gates, `error` is `""` on normal exit (pass or fail). On timeout it's `"timed_out"` with `exit_code: -1`. On spawn errors it's the error message with `exit_code: -1`.
+
+Templates can route transitions based on gate output using dot-path `when` clauses. The path format is `gates.<gate_name>.<field>`:
+
+```yaml
+states:
+  build:
+    transitions: [deploy, fix]
+    gates:
+      ci_check:
+        type: command
+        command: "make test"
+```
+
+```yaml
+transitions:
+  - target: deploy
+    when:
+      gates.ci_check.exit_code: 0
+  - target: fix
+    when:
+      gates.ci_check.exit_code: 1
+```
+
+Single-segment paths like `decision: proceed` still work for agent-submitted evidence. Dot-path traversal (`gates.ci_check.exit_code`) is for gate output fields injected by the engine.
 
 ### Updating your SKILL.md
 

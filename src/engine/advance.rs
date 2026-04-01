@@ -6,8 +6,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine::types::{Event, EventPayload};
-use crate::gate::GateResult;
-use crate::template::types::{ActionDecl, CompiledTemplate, TemplateState};
+use crate::gate::{GateOutcome, StructuredGateResult};
+use crate::template::types::{
+    ActionDecl, CompiledTemplate, TemplateState, GATES_EVIDENCE_NAMESPACE,
+};
 
 /// Maximum number of transitions per invocation. Defense-in-depth against
 /// template bugs with hundreds of linearly chaining states.
@@ -51,10 +53,10 @@ pub enum StopReason {
     /// Reached a terminal state.
     Terminal,
     /// One or more gates failed.
-    GateBlocked(BTreeMap<String, GateResult>),
+    GateBlocked(BTreeMap<String, StructuredGateResult>),
     /// Conditional transitions exist but evidence doesn't match any.
     EvidenceRequired {
-        failed_gates: Option<BTreeMap<String, GateResult>>,
+        failed_gates: Option<BTreeMap<String, StructuredGateResult>>,
     },
     /// Integration was invoked and returned output.
     Integration {
@@ -172,7 +174,9 @@ pub fn advance_until_stop<F, G, I, A>(
 ) -> Result<AdvanceResult, AdvanceError>
 where
     F: FnMut(&EventPayload) -> Result<(), String>,
-    G: Fn(&BTreeMap<String, crate::template::types::Gate>) -> BTreeMap<String, GateResult>,
+    G: Fn(
+        &BTreeMap<String, crate::template::types::Gate>,
+    ) -> BTreeMap<String, StructuredGateResult>,
     I: Fn(&str) -> Result<serde_json::Value, IntegrationError>,
     A: Fn(&str, &ActionDecl, bool) -> ActionResult,
 {
@@ -291,18 +295,47 @@ where
 
         // 6. Evaluate gates
         let mut gates_failed = false;
-        let mut failed_gate_results: Option<BTreeMap<String, GateResult>> = None;
+        let mut failed_gate_results: Option<BTreeMap<String, StructuredGateResult>> = None;
+        // Gate outputs to inject into evidence (populated whenever gates are present).
+        let mut gate_evidence_map: serde_json::Map<String, serde_json::Value> =
+            serde_json::Map::new();
         if !template_state.gates.is_empty() {
             let gate_results = evaluate_gates(&template_state.gates);
+
+            // Build the gates sub-map: {"gate_name": output, ...}
+            // This is injected into the evidence regardless of pass/fail so that
+            // when clauses referencing gates.* can route based on gate output.
+            for (name, result) in &gate_results {
+                gate_evidence_map.insert(name.clone(), result.output.clone());
+            }
+
             let any_failed = gate_results
                 .values()
-                .any(|r| !matches!(r, GateResult::Passed));
+                .any(|r| !matches!(r.outcome, GateOutcome::Passed));
             if any_failed {
-                // If the state has an accepts block, fall through to transition
-                // resolution instead of returning GateBlocked. The transition
-                // resolver will skip unconditional transitions when gate_failed
-                // is true, ensuring the agent must submit evidence.
-                if template_state.accepts.is_none() {
+                // Determine whether this state can route based on gate output alone.
+                // A state does so when it has at least one conditional transition
+                // whose when clause references a gates.* key. In that case, fall
+                // through to transition resolution so the gate output can drive
+                // routing (scenarios 14, 15, 16 in the structured-gate-output PRD).
+                //
+                // If the state has an accepts block, also fall through so the
+                // transition resolver can use evidence as a fallback. The resolver
+                // will skip unconditional transitions when gate_failed is true,
+                // ensuring the agent must submit evidence when no conditional
+                // transition matches.
+                //
+                // If neither condition holds, return GateBlocked immediately.
+                let has_gates_routing = template_state.transitions.iter().any(|t| {
+                    t.when
+                        .as_ref()
+                        .map(|w| {
+                            w.keys()
+                                .any(|k| k.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)))
+                        })
+                        .unwrap_or(false)
+                });
+                if template_state.accepts.is_none() && !has_gates_routing {
                     return Ok(AdvanceResult {
                         final_state: state,
                         advanced,
@@ -316,7 +349,25 @@ where
         }
 
         // 7. Resolve transition
-        match resolve_transition(template_state, &current_evidence, gates_failed) {
+        // Build a merged evidence Value: start with agent evidence (flat keys),
+        // then layer gate output under "gates" (engine data takes precedence).
+        // This allows when clauses to reference both agent-submitted fields and
+        // gate output via dot-path traversal (e.g. gates.ci_check.exit_code).
+        // TODO(#117): once Feature 2 reserves the gates namespace in evidence
+        // validation, the precedence comment above shifts from "defense in
+        // depth" to "invariant" -- update this comment when that lands.
+        let mut merged: serde_json::Map<String, serde_json::Value> = current_evidence
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if !gate_evidence_map.is_empty() {
+            merged.insert(
+                "gates".to_string(),
+                serde_json::Value::Object(gate_evidence_map),
+            );
+        }
+        let evidence_value = serde_json::Value::Object(merged);
+        match resolve_transition(template_state, &evidence_value, gates_failed) {
             TransitionResolution::Resolved(target) => {
                 // Check for cycle before transitioning
                 if visited.contains(&target) {
@@ -351,6 +402,14 @@ where
                             failed_gates: failed_gate_results,
                         },
                     });
+                } else if let Some(gate_results) = failed_gate_results {
+                    // No accepts block but gate(s) failed and no gates.* condition
+                    // matched -- the gate itself is blocking.
+                    return Ok(AdvanceResult {
+                        final_state: state,
+                        advanced,
+                        stop_reason: StopReason::GateBlocked(gate_results),
+                    });
                 } else {
                     return Ok(AdvanceResult {
                         final_state: state,
@@ -374,11 +433,39 @@ where
     }
 }
 
+/// Traverse a nested `serde_json::Value` using a dot-separated path.
+///
+/// Each segment of `path` is split on `.` and used as a key into the current
+/// JSON object. Returns `None` if any segment is missing, if an intermediate
+/// value is not an object, or if `path` is empty.
+///
+/// Single-segment paths behave identically to a direct `.get()` call, so flat
+/// evidence keys work without any changes at call sites.
+///
+/// # Examples
+///
+/// ```ignore
+/// let v = serde_json::json!({"gates": {"ci": {"exit_code": 0}}});
+/// assert_eq!(resolve_value(&v, "gates.ci.exit_code"), Some(&serde_json::json!(0)));
+/// assert_eq!(resolve_value(&v, "gates.ci.missing"), None);
+/// ```
+fn resolve_value<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    if path.is_empty() {
+        return None;
+    }
+    let mut current = root;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
 /// Resolve which transition to take from a state given current evidence.
 ///
 /// Resolution algorithm:
 /// 1. Collect conditional transitions (those with `when: Some(...)`)
 /// 2. For each, check if ALL `when` fields match the evidence (exact JSON equality)
+///    using dot-path traversal so nested keys like `gates.ci.exit_code` work
 /// 3. If exactly one matches, return `Resolved(target)`
 /// 4. If multiple match, return `Ambiguous(targets)`
 /// 5. If none match and an unconditional transition exists:
@@ -393,7 +480,7 @@ where
 /// gates fail — defeating the evidence-fallback mechanism.
 pub fn resolve_transition(
     template_state: &TemplateState,
-    evidence: &BTreeMap<String, serde_json::Value>,
+    evidence: &serde_json::Value,
     gate_failed: bool,
 ) -> TransitionResolution {
     if template_state.transitions.is_empty() {
@@ -410,7 +497,7 @@ pub fn resolve_transition(
                 has_conditional = true;
                 let all_match = conditions
                     .iter()
-                    .all(|(field, expected)| evidence.get(field) == Some(expected));
+                    .all(|(field, expected)| resolve_value(evidence, field) == Some(expected));
                 if all_match {
                     conditional_matches.push(transition.target.clone());
                 }
@@ -540,7 +627,7 @@ mod tests {
 
     fn noop_gates(
         _gates: &BTreeMap<String, crate::template::types::Gate>,
-    ) -> BTreeMap<String, GateResult> {
+    ) -> BTreeMap<String, StructuredGateResult> {
         BTreeMap::new()
     }
 
@@ -560,10 +647,15 @@ mod tests {
     // resolve_transition tests
     // -----------------------------------------------------------------------
 
+    /// Wrap a BTreeMap as a serde_json::Value::Object for resolve_transition.
+    fn as_evidence(m: BTreeMap<String, serde_json::Value>) -> serde_json::Value {
+        serde_json::to_value(m).unwrap()
+    }
+
     #[test]
     fn unconditional_transition_resolves() {
         let state = make_state(vec![unconditional("next")]);
-        let evidence = BTreeMap::new();
+        let evidence = as_evidence(BTreeMap::new());
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("next".to_string())
@@ -576,8 +668,9 @@ mod tests {
             "approved",
             vec![("decision", serde_json::json!("approve"))],
         )]);
-        let mut evidence = BTreeMap::new();
-        evidence.insert("decision".to_string(), serde_json::json!("approve"));
+        let mut m = BTreeMap::new();
+        m.insert("decision".to_string(), serde_json::json!("approve"));
+        let evidence = as_evidence(m);
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("approved".to_string())
@@ -590,8 +683,9 @@ mod tests {
             conditional("approved", vec![("decision", serde_json::json!("approve"))]),
             unconditional("fallback"),
         ]);
-        let mut evidence = BTreeMap::new();
-        evidence.insert("decision".to_string(), serde_json::json!("approve"));
+        let mut m = BTreeMap::new();
+        m.insert("decision".to_string(), serde_json::json!("approve"));
+        let evidence = as_evidence(m);
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("approved".to_string())
@@ -604,8 +698,9 @@ mod tests {
             conditional("approved", vec![("decision", serde_json::json!("approve"))]),
             unconditional("fallback"),
         ]);
-        let mut evidence = BTreeMap::new();
-        evidence.insert("decision".to_string(), serde_json::json!("reject"));
+        let mut m = BTreeMap::new();
+        m.insert("decision".to_string(), serde_json::json!("reject"));
+        let evidence = as_evidence(m);
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("fallback".to_string())
@@ -618,8 +713,9 @@ mod tests {
             conditional("target_a", vec![("x", serde_json::json!(1))]),
             conditional("target_b", vec![("x", serde_json::json!(1))]),
         ]);
-        let mut evidence = BTreeMap::new();
-        evidence.insert("x".to_string(), serde_json::json!(1));
+        let mut m = BTreeMap::new();
+        m.insert("x".to_string(), serde_json::json!(1));
+        let evidence = as_evidence(m);
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::Ambiguous(vec!["target_a".to_string(), "target_b".to_string()])
@@ -629,7 +725,7 @@ mod tests {
     #[test]
     fn no_transitions_returns_no_transitions() {
         let state = make_state(vec![]);
-        let evidence = BTreeMap::new();
+        let evidence = as_evidence(BTreeMap::new());
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::NoTransitions
@@ -643,7 +739,7 @@ mod tests {
             conditional("rejected", vec![("decision", serde_json::json!("reject"))]),
         ]);
         // Empty evidence -- no match.
-        let evidence = BTreeMap::new();
+        let evidence = as_evidence(BTreeMap::new());
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::NeedsEvidence
@@ -658,15 +754,17 @@ mod tests {
         )]);
 
         // Only one field matches -- should not resolve.
-        let mut evidence = BTreeMap::new();
-        evidence.insert("a".to_string(), serde_json::json!("x"));
+        let mut m = BTreeMap::new();
+        m.insert("a".to_string(), serde_json::json!("x"));
+        let evidence = as_evidence(m.clone());
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::NeedsEvidence
         );
 
         // Both fields match.
-        evidence.insert("b".to_string(), serde_json::json!("y"));
+        m.insert("b".to_string(), serde_json::json!("y"));
+        let evidence = as_evidence(m);
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("target".to_string())
@@ -686,7 +784,7 @@ mod tests {
             unconditional("fallback_state"),
         ]);
 
-        let evidence = BTreeMap::new(); // no evidence
+        let evidence = as_evidence(BTreeMap::new()); // no evidence
 
         // gate_failed=false: unconditional fallback fires
         assert_eq!(
@@ -701,11 +799,120 @@ mod tests {
         );
 
         // gate_failed=true but evidence matches conditional: resolves normally
-        let mut with_evidence = BTreeMap::new();
-        with_evidence.insert("status".to_string(), serde_json::json!("completed"));
+        let mut m = BTreeMap::new();
+        m.insert("status".to_string(), serde_json::json!("completed"));
+        let with_evidence = as_evidence(m);
         assert_eq!(
             resolve_transition(&state, &with_evidence, true),
             TransitionResolution::Resolved("next_state".to_string())
+        );
+    }
+
+    #[test]
+    fn dot_path_traversal_on_nested_gate_data() {
+        // gate output is nested under "gates.ci_check" -- when clause uses
+        // dot-path "gates.ci_check.exit_code"
+        let state = make_state(vec![
+            conditional(
+                "success",
+                vec![("gates.ci_check.exit_code", serde_json::json!(0))],
+            ),
+            conditional(
+                "failed",
+                vec![("gates.ci_check.exit_code", serde_json::json!(1))],
+            ),
+        ]);
+
+        // Evidence with nested gate output matching success condition
+        let evidence = serde_json::json!({
+            "gates": {
+                "ci_check": {
+                    "exit_code": 0,
+                    "error": ""
+                }
+            }
+        });
+        assert_eq!(
+            resolve_transition(&state, &evidence, false),
+            TransitionResolution::Resolved("success".to_string())
+        );
+
+        // Non-zero exit code routes to failed
+        let evidence_fail = serde_json::json!({
+            "gates": {
+                "ci_check": {
+                    "exit_code": 1,
+                    "error": "lint failed"
+                }
+            }
+        });
+        assert_eq!(
+            resolve_transition(&state, &evidence_fail, false),
+            TransitionResolution::Resolved("failed".to_string())
+        );
+    }
+
+    #[test]
+    fn dot_path_missing_segment_returns_none() {
+        // when clause references a nested path that does not exist in evidence
+        let state = make_state(vec![conditional(
+            "target",
+            vec![("gates.ci.exit_code", serde_json::json!(0))],
+        )]);
+
+        // Evidence without the "gates" key at all
+        let evidence = serde_json::json!({ "mode": "issue_backed" });
+        assert_eq!(
+            resolve_transition(&state, &evidence, false),
+            TransitionResolution::NeedsEvidence
+        );
+
+        // Evidence with "gates" but missing the "ci" sub-key
+        let evidence_partial = serde_json::json!({ "gates": { "lint": { "exit_code": 0 } } });
+        assert_eq!(
+            resolve_transition(&state, &evidence_partial, false),
+            TransitionResolution::NeedsEvidence
+        );
+    }
+
+    #[test]
+    fn mixed_gate_and_flat_evidence() {
+        // when clause mixes a dot-path gate key with a flat agent-evidence key
+        let state = make_state(vec![
+            conditional(
+                "approved",
+                vec![
+                    ("gates.ci.exit_code", serde_json::json!(0)),
+                    ("decision", serde_json::json!("approve")),
+                ],
+            ),
+            unconditional("pending"),
+        ]);
+
+        // Both conditions satisfied
+        let evidence_both = serde_json::json!({
+            "gates": { "ci": { "exit_code": 0, "error": "" } },
+            "decision": "approve"
+        });
+        assert_eq!(
+            resolve_transition(&state, &evidence_both, false),
+            TransitionResolution::Resolved("approved".to_string())
+        );
+
+        // Only gate satisfied, no agent decision yet -- falls through to unconditional
+        let evidence_gate_only = serde_json::json!({
+            "gates": { "ci": { "exit_code": 0, "error": "" } }
+        });
+        assert_eq!(
+            resolve_transition(&state, &evidence_gate_only, false),
+            TransitionResolution::Resolved("pending".to_string())
+        );
+
+        // Only decision provided, gate output missing -- falls through to unconditional
+        let evidence_decision_only = serde_json::json!({ "decision": "approve" });
+        assert_eq!(
+            resolve_transition(&state, &evidence_decision_only, false),
+            TransitionResolution::Resolved("pending".to_string())
         );
     }
 
@@ -931,7 +1138,13 @@ mod tests {
         let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
             for (name, _) in gates {
-                results.insert(name.clone(), GateResult::Failed { exit_code: 1 });
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Failed,
+                        output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    },
+                );
             }
             results
         };
@@ -1082,7 +1295,13 @@ mod tests {
         let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
             for (name, _) in gates {
-                results.insert(name.clone(), GateResult::Failed { exit_code: 1 });
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Failed,
+                        output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    },
+                );
             }
             results
         };
@@ -1108,10 +1327,508 @@ mod tests {
                     .expect("failed_gates should be Some when gates failed");
                 assert_eq!(gates.len(), 1);
                 assert!(gates.contains_key("ci_check"));
-                assert_eq!(gates["ci_check"], GateResult::Failed { exit_code: 1 });
+                assert_eq!(gates["ci_check"].outcome, GateOutcome::Failed);
+                assert_eq!(gates["ci_check"].output["exit_code"], 1);
             }
             other => panic!("expected EvidenceRequired, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Gate evidence merging tests (scenario-10, scenario-11)
+    // -----------------------------------------------------------------------
+
+    /// scenario-10: Gate output is injected into the merged evidence map under
+    /// "gates" so that when clauses referencing gates.* route correctly.
+    #[test]
+    fn gate_output_injected_into_evidence_for_routing() {
+        use crate::template::types::Gate;
+
+        // State has a passing gate and routes based on gates.ci.exit_code.
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "ci".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "exit 0".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+            },
+        );
+
+        let template = make_template(vec![
+            (
+                "check",
+                TemplateState {
+                    directive: "Check.".to_string(),
+                    details: String::new(),
+                    transitions: vec![
+                        conditional(
+                            "success",
+                            vec![("gates.ci.exit_code", serde_json::json!(0))],
+                        ),
+                        conditional(
+                            "failure",
+                            vec![("gates.ci.exit_code", serde_json::json!(1))],
+                        ),
+                    ],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "success",
+                TemplateState {
+                    directive: "Success.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "failure",
+                TemplateState {
+                    directive: "Failure.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        // Gate evaluator returns passing gate with exit_code 0.
+        let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Passed,
+                        output: serde_json::json!({"exit_code": 0, "error": ""}),
+                    },
+                );
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "check",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Gate passed (exit_code 0), so the engine routes to "success".
+        assert_eq!(result.final_state, "success");
+        assert!(result.advanced);
+        assert_eq!(result.stop_reason, StopReason::Terminal);
+    }
+
+    /// scenario-10 (failure path): Gate fails and routes via gates.* when clause.
+    /// The state must have an accepts block so the engine falls through to
+    /// transition resolution instead of returning GateBlocked immediately.
+    #[test]
+    fn gate_output_routes_to_failure_state() {
+        use crate::template::types::Gate;
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "ci".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "exit 1".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+            },
+        );
+
+        // The state has an accepts block so that when gates fail, the engine
+        // falls through to transition resolution (gate_failed=true). The
+        // conditional transitions route on gate output; the matching one fires.
+        let template = make_template(vec![
+            (
+                "check",
+                TemplateState {
+                    directive: "Check.".to_string(),
+                    details: String::new(),
+                    transitions: vec![
+                        conditional(
+                            "success",
+                            vec![("gates.ci.exit_code", serde_json::json!(0))],
+                        ),
+                        conditional("fix", vec![("gates.ci.exit_code", serde_json::json!(1))]),
+                    ],
+                    terminal: false,
+                    gates,
+                    accepts: make_accepts(vec!["override"]),
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "success",
+                TemplateState {
+                    directive: "Success.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "fix",
+                TemplateState {
+                    directive: "Fix.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        // Gate evaluator returns a failing gate with exit_code 1.
+        let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Failed,
+                        output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    },
+                );
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "check",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Gate failed with exit_code 1, so the engine routes to "fix" via the
+        // matching gates.ci.exit_code == 1 conditional transition.
+        assert_eq!(result.final_state, "fix");
+        assert!(result.advanced);
+        assert_eq!(result.stop_reason, StopReason::Terminal);
+    }
+
+    /// scenario-10: Agent evidence keys appear at the top level alongside
+    /// gate output nested under "gates". Engine data (gates) takes precedence
+    /// if both define the same top-level key.
+    #[test]
+    fn gate_evidence_merged_after_agent_evidence() {
+        use crate::template::types::Gate;
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "lint".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "exit 0".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+            },
+        );
+
+        // Transition requires both gate output and agent evidence.
+        let template = make_template(vec![
+            (
+                "verify",
+                TemplateState {
+                    directive: "Verify.".to_string(),
+                    details: String::new(),
+                    transitions: vec![conditional(
+                        "done",
+                        vec![
+                            ("gates.lint.exit_code", serde_json::json!(0)),
+                            ("decision", serde_json::json!("approve")),
+                        ],
+                    )],
+                    terminal: false,
+                    gates,
+                    accepts: make_accepts(vec!["decision"]),
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        // Agent evidence has the decision field.
+        let mut agent_evidence = BTreeMap::new();
+        agent_evidence.insert("decision".to_string(), serde_json::json!("approve"));
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Passed,
+                        output: serde_json::json!({"exit_code": 0, "error": ""}),
+                    },
+                );
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "verify",
+            &template,
+            &agent_evidence,
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Both gate output and agent evidence match the transition condition.
+        assert_eq!(result.final_state, "done");
+        assert!(result.advanced);
+        assert_eq!(result.stop_reason, StopReason::Terminal);
+    }
+
+    /// scenario-11: any_failed is derived from GateOutcome. Passed gates do not
+    /// contribute to any_failed; Failed/TimedOut/Error outcomes do.
+    #[test]
+    fn gate_pass_fail_from_outcome() {
+        use crate::template::types::Gate;
+
+        // State has a gate and an unconditional fallback. When the gate passes,
+        // the engine auto-advances via the unconditional fallback (gate_failed=false).
+        // When the gate fails, the unconditional fallback is suppressed and the
+        // engine returns GateBlocked.
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "exit 0".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+            },
+        );
+
+        let template = make_template(vec![
+            (
+                "guarded",
+                TemplateState {
+                    directive: "Guarded.".to_string(),
+                    details: String::new(),
+                    transitions: vec![unconditional("next")],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "next",
+                TemplateState {
+                    directive: "Next.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        // Passing gate: outcome Passed -- any_failed should be false.
+        let passing_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Passed,
+                        output: serde_json::json!({"exit_code": 0, "error": ""}),
+                    },
+                );
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "guarded",
+            &template,
+            &BTreeMap::new(),
+            &mut append,
+            &passing_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Gate passed: engine should auto-advance via unconditional to "next".
+        assert_eq!(result.final_state, "next");
+        assert!(result.advanced);
+        assert_eq!(result.stop_reason, StopReason::Terminal);
+
+        // Failing gate: outcome Failed -- any_failed should be true.
+        let failing_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Failed,
+                        output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    },
+                );
+            }
+            results
+        };
+
+        let mut append2 = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown2 = AtomicBool::new(false);
+
+        let result2 = advance_until_stop(
+            "guarded",
+            &template,
+            &BTreeMap::new(),
+            &mut append2,
+            &failing_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown2,
+        )
+        .unwrap();
+
+        // Gate failed: engine should return GateBlocked (no accepts block).
+        assert_eq!(result2.final_state, "guarded");
+        assert!(!result2.advanced);
+        assert!(matches!(result2.stop_reason, StopReason::GateBlocked(_)));
+
+        // TimedOut gate: outcome TimedOut also contributes to any_failed.
+        let timeout_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::TimedOut,
+                        output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+                    },
+                );
+            }
+            results
+        };
+
+        let mut append3 = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown3 = AtomicBool::new(false);
+
+        let result3 = advance_until_stop(
+            "guarded",
+            &template,
+            &BTreeMap::new(),
+            &mut append3,
+            &timeout_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown3,
+        )
+        .unwrap();
+
+        assert!(matches!(result3.stop_reason, StopReason::GateBlocked(_)));
+
+        // Error gate: outcome Error also contributes to any_failed.
+        let error_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Error,
+                        output: serde_json::json!({"exit_code": -1, "error": "spawn failed"}),
+                    },
+                );
+            }
+            results
+        };
+
+        let mut append4 = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown4 = AtomicBool::new(false);
+
+        let result4 = advance_until_stop(
+            "guarded",
+            &template,
+            &BTreeMap::new(),
+            &mut append4,
+            &error_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown4,
+        )
+        .unwrap();
+
+        assert!(matches!(result4.stop_reason, StopReason::GateBlocked(_)));
     }
 
     #[test]
@@ -1656,7 +2373,13 @@ mod tests {
         let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
             for (name, _) in gates {
-                results.insert(name.clone(), GateResult::Failed { exit_code: 1 });
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Failed,
+                        output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    },
+                );
             }
             results
         };

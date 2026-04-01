@@ -41,7 +41,7 @@ existing templates.
 
 ### Feature 1: Structured gate output and transition routing ([#116](https://github.com/tsukumogami/koto/issues/116))
 **Dependencies:** None
-**Status:** Not started
+**Status:** Complete ([#120](https://github.com/tsukumogami/koto/pull/120))
 **Upstream:** [PRD-gate-transition-contract](../prds/PRD-gate-transition-contract.md) (R1, R2, R3, R4a, R11)
 
 Gates produce structured data matching their gate type's schema. Gate output
@@ -62,7 +62,7 @@ Scope:
 - `error` field on all gate types for timeout/spawn errors
 - Event ordering via sequence numbers (R11)
 
-Design doc: TBD
+Design doc: [DESIGN-structured-gate-output](../designs/current/DESIGN-structured-gate-output.md)
 
 ### Feature 2: Override mechanism ([#117](https://github.com/tsukumogami/koto/issues/117))
 **Dependencies:** Feature 1
@@ -193,7 +193,7 @@ graph TD
 
 ## Progress
 
-- Feature 1 (#116): Not started
+- Feature 1 (#116): Complete (PR #120)
 - Feature 2 (#117): Not started
 - Feature 3 (#118): Not started
 - Feature 4 (#119): Not started

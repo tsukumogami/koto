@@ -62,6 +62,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the JSON output has field "([^"]*)"$`, theJSONOutputHasField)
 	ctx.Step(`^the JSON output field "([^"]*)" equals "([^"]*)"$`, theJSONOutputFieldEquals)
 	ctx.Step(`^the JSON output field "([^"]*)" equals (\d+)$`, theJSONOutputFieldEqualsInt)
+	ctx.Step(`^the JSON output field "([^"]*)" is (true|false)$`, theJSONOutputFieldEqualsBool)
 	ctx.Step(`^the state file for "([^"]*)" exists$`, theStateFileExists)
 }
 
@@ -299,6 +300,26 @@ func theJSONOutputFieldEquals(field, expected string) error {
 	return nil
 }
 
+// theJSONOutputFieldEqualsBool parses stdout as JSON and checks field boolean value.
+func theJSONOutputFieldEqualsBool(field, expected string) error {
+	val, err := getJSONField(sc.stdout, field)
+	if err != nil {
+		return err
+	}
+	if val == nil {
+		return fmt.Errorf("JSON field %q not found in output:\n%s", field, sc.stdout)
+	}
+	b, ok := val.(bool)
+	if !ok {
+		return fmt.Errorf("JSON field %q is not a boolean: %v", field, val)
+	}
+	if fmt.Sprintf("%v", b) != expected {
+		return fmt.Errorf("JSON field %q: expected %s, got %v\nfull output:\n%s",
+			field, expected, b, sc.stdout)
+	}
+	return nil
+}
+
 // theJSONOutputFieldEqualsInt parses stdout as JSON and checks field numeric value.
 func theJSONOutputFieldEqualsInt(field string, expected int) error {
 	val, err := getJSONField(sc.stdout, field)
@@ -353,12 +374,23 @@ func getJSONField(jsonStr, field string) (interface{}, error) {
 	parts := strings.Split(field, ".")
 	current := data
 	for _, part := range parts {
-		m, ok := current.(map[string]interface{})
-		if !ok {
-			return nil, nil
-		}
-		current, ok = m[part]
-		if !ok {
+		switch v := current.(type) {
+		case map[string]interface{}:
+			val, ok := v[part]
+			if !ok {
+				return nil, nil
+			}
+			current = val
+		case []interface{}:
+			idx := 0
+			if _, err := fmt.Sscanf(part, "%d", &idx); err != nil {
+				return nil, nil
+			}
+			if idx < 0 || idx >= len(v) {
+				return nil, nil
+			}
+			current = v[idx]
+		default:
 			return nil, nil
 		}
 	}
