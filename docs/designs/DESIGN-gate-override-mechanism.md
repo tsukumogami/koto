@@ -102,6 +102,37 @@ the event log. A new `GateEvaluated` event (emitted by the advance loop for each
 runs) provides the anchor. The `koto overrides record` handler reads the most recent
 `GateEvaluated` for the named gate in the current epoch to populate `actual_output`.
 
+The full sequence from a blocked workflow to an advance:
+
+```
+# 1. Advance -- ci_check gate runs and fails, GateEvaluated event written
+$ koto next myflow
+{
+  "status": "gate_blocked",
+  "blocking_conditions": [
+    {
+      "gate": "ci_check",
+      "output": {"exit_code": 1, "error": "test_util_test failed"},
+      "agent_actionable": true
+    }
+  ]
+}
+
+# 2. Record the override -- GateOverrideRecorded appended;
+#    actual_output read from the GateEvaluated event above; ci_check not re-run
+$ koto overrides record myflow --gate ci_check --rationale "CI flaky on unrelated test"
+{"status": "recorded"}
+
+# 3. Advance again -- ci_check skipped entirely; override_applied injected into gates.*
+$ koto next myflow
+{"status": "advanced", "transitioned_to": "deploy"}
+```
+
+Between steps 2 and 3, `ci_check` never runs. The gate's contribution to `gates.*` is
+`{"exit_code": 0, "error": ""}` (the built-in default, since no `override_default` was
+declared). The `GateOverrideRecorded` event carries the actual output from step 1 as
+`actual_output`, so the audit trail reflects what the agent actually observed.
+
 #### Alternatives considered
 
 **Execute then substitute**: Run the gate first to capture its current output, then discard
@@ -166,6 +197,28 @@ Co-location also makes Feature 3 (compiler validation) straightforward: the comp
 `gate.override_default.is_some()` and validates the JSON against the gate type's schema without
 traversing a parent structure.
 
+The three cases an agent encounters at runtime, using the template above:
+
+```
+# ci_check has override_default: {exit_code: 1} -- routes to manual_review
+$ koto overrides record myflow --gate ci_check --rationale "Taking to manual review"
+# override_applied = {exit_code: 1, error: ""} → koto next routes to manual_review
+
+# schema_check has no override_default -- falls back to built-in {exists: true, error: ""}
+$ koto overrides record myflow --gate schema_check --rationale "Schema version set externally"
+# override_applied = {exists: true, error: ""} → satisfies any when clause on schema_check.exists
+
+# Agent can always supply --with-data to use a specific value regardless of defaults
+$ koto overrides record myflow --gate ci_check \
+    --rationale "CI passed in the rerun I triggered manually" \
+    --with-data '{"exit_code": 0, "error": ""}'
+# override_applied = {exit_code: 0, error: ""} → routes to deploy
+```
+
+In the first case, the template author's intent (route overrides to `manual_review`) is
+expressed in the template, not in the agent's command. The agent doesn't need to know the
+gate's schema or the routing logic.
+
 #### Alternatives considered
 
 **Separate override_defaults block at state level**: A parallel `BTreeMap<String, Value>` at
@@ -221,6 +274,43 @@ defaults exist for all three known gate types, this is effectively always true a
 The check encodes a precise semantic: "a default is available, so the agent can call
 `koto overrides record` without needing to know the gate's schema."
 
+The partial override case shows why unconditional pass semantics matter. With two gates
+failing, the agent overrides them one at a time:
+
+```
+# Both gates failing:
+$ koto next myflow
+{
+  "status": "gate_blocked",
+  "blocking_conditions": [
+    {"gate": "ci_check",   "output": {"exit_code": 1, "error": "..."}, "agent_actionable": true},
+    {"gate": "size_check", "output": {"exit_code": 1, "error": "..."}, "agent_actionable": true}
+  ]
+}
+
+# Override ci_check only:
+$ koto overrides record myflow --gate ci_check --rationale "Flaky on unrelated test"
+
+# Advance -- ci_check is gone from blocking_conditions (unconditional pass);
+# size_check still runs and still fails
+$ koto next myflow
+{
+  "status": "gate_blocked",
+  "blocking_conditions": [
+    {"gate": "size_check", "output": {"exit_code": 1, "error": "..."}, "agent_actionable": true}
+  ]
+}
+
+# Override size_check:
+$ koto overrides record myflow --gate size_check --rationale "Large file is intentional"
+
+# All gates overridden -- workflow advances
+$ koto next myflow
+{"status": "advanced", "transitioned_to": "deploy"}
+```
+
+Both overrides are sticky for the rest of this epoch. A rewind would clear them.
+
 #### Alternatives considered
 
 **Per-gate override check inside evaluate_gates**: Thread the override map into the
@@ -273,17 +363,37 @@ state-changing event (`Transitioned`, `DirectedTransition`, `Rewound`) whose `to
 current state, then return only matching events after that index. The `GateOverrideRecorded`
 payload's `state` field makes the filter direct (no backwards traversal needed).
 
-`koto overrides list` output mirrors `koto decisions list`:
-```json
+`koto overrides list` output mirrors `koto decisions list`. The cross-epoch scope of
+`derive_overrides_all` means the list persists across rewinds, unlike the advance loop's
+epoch-scoped view:
+
+```
+# Record an override, advance to deploy:
+$ koto overrides record myflow --gate ci_check --rationale "Flaky test"
+$ koto next myflow
+{"status": "advanced", "transitioned_to": "deploy"}
+
+# Something goes wrong -- rewind back to review (new epoch begins)
+$ koto rewind myflow
+
+# The advance loop sees no active overrides in the new epoch:
+$ koto next myflow
 {
-  "state": "<current_state>",
+  "status": "gate_blocked",
+  "blocking_conditions": [{"gate": "ci_check", ...}]
+}
+
+# But the list shows the full history across all epochs:
+$ koto overrides list myflow
+{
+  "state": "review",
   "overrides": {
-    "count": 2,
+    "count": 1,
     "items": [
       {
-        "state": "<state_when_recorded>",
+        "state": "review",
         "gate": "ci_check",
-        "rationale": "CI was flaky on an unrelated test",
+        "rationale": "Flaky test",
         "override_applied": {"exit_code": 0, "error": ""},
         "actual_output": {"exit_code": 1, "error": "test_util_test failed"},
         "timestamp": "2026-04-01T10:00:00Z"
@@ -292,6 +402,10 @@ payload's `state` field makes the filter direct (no backwards traversal needed).
   }
 }
 ```
+
+The override from before the rewind is visible in `koto overrides list` but invisible to the
+advance loop. The agent needs to call `koto overrides record` again in the new epoch if they
+want to unblock `ci_check` again.
 
 #### Alternatives considered
 
@@ -337,6 +451,22 @@ Context store (`koto context set`) is not affected. Context and evidence are str
 separate -- context lives under `ctx/` as a filesystem key-value store and is never merged
 into the evidence map. A context key named `"gates"` has no semantic overlap with the
 `gates.*` evidence namespace.
+
+An agent attempting to inject gate data directly via evidence submission gets a clear error:
+
+```
+# Attempting to fake gate output via koto next --with-data:
+$ koto next myflow --with-data '{"gates": {"ci_check": {"exit_code": 0, "error": ""}}}'
+error: invalid submission: "gates" is a reserved field; agent submissions must not include this key
+
+# The correct way to substitute gate output is koto overrides record,
+# which requires a rationale and records the actual gate output:
+$ koto overrides record myflow --gate ci_check --rationale "CI passed in the manual rerun"
+{"status": "recorded"}
+```
+
+The error fires before the event is persisted, so the state file is never written with a
+`"gates"` key in `EvidenceSubmitted`.
 
 #### Alternatives considered
 
