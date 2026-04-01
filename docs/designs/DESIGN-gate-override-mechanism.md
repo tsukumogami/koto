@@ -97,6 +97,32 @@ constants: command → `{"exit_code": 0, "error": ""}`, context-exists → `{"ex
 `override_default` → built-in type default. The call to `koto overrides record` without
 `--with-data` never fails for any gate of a known type.
 
+Example template using `override_default`:
+
+```yaml
+states:
+  review:
+    gates:
+      ci_check:
+        type: command
+        command: "run_ci.sh"
+        override_default: {exit_code: 1, error: ""}   # routes to manual_review, not deploy
+      schema_check:
+        type: context-exists
+        key: schema_version
+        # no override_default: built-in default {exists: true, error: ""} applies
+    transitions:
+      - target: deploy
+        when: {gates.ci_check.exit_code: 0}
+      - target: manual_review
+        when: {gates.ci_check.exit_code: 1}
+```
+
+`ci_check` uses a custom `override_default` so that overriding it routes to `manual_review`
+rather than `deploy`. `schema_check` omits `override_default` and falls back to the built-in
+`context-exists` default (`{exists: true, error: ""}`), which satisfies any `when` clause
+checking `gates.schema_check.exists`.
+
 **Rejected: Separate override_defaults block at state level (Option B).** A parallel map at the
 state level requires cross-validating two independent keys at compile time, and the `agent_actionable`
 flag check must reach back to the parent state's map rather than staying at the gate level. No
