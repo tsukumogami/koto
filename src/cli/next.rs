@@ -44,7 +44,7 @@ pub fn dispatch_next(
     }
 
     // 2. Gates failed
-    let blocking = blocking_conditions_from_gates(gate_results);
+    let blocking = blocking_conditions_from_gates(gate_results, &template_state.gates);
 
     let details = if template_state.details.is_empty() {
         None

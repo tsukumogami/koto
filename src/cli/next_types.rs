@@ -4,7 +4,7 @@ use serde::ser::SerializeMap;
 use serde::Serialize;
 
 use crate::gate::{GateOutcome, StructuredGateResult};
-use crate::template::types::TemplateState;
+use crate::template::types::{Gate, TemplateState};
 
 /// Summary of a recorded decision, used in `koto decisions list` responses.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -358,6 +358,7 @@ pub struct BlockingCondition {
     pub condition_type: String,
     pub status: String,
     pub agent_actionable: bool,
+    pub output: serde_json::Value,
 }
 
 /// Output from a default action that requires confirmation.
@@ -393,9 +394,12 @@ pub struct ErrorDetail {
 /// Convert gate evaluation results into a list of blocking conditions.
 ///
 /// Passed gates are excluded. Each non-passing gate produces a `BlockingCondition`
-/// with `condition_type: "command"` and `agent_actionable: false`.
+/// with `condition_type` taken from the gate definition (falling back to `"command"`
+/// when the gate name is not found in `gate_defs`), and `output` from the structured
+/// gate result.
 pub fn blocking_conditions_from_gates(
     gate_results: &BTreeMap<String, StructuredGateResult>,
+    gate_defs: &BTreeMap<String, Gate>,
 ) -> Vec<BlockingCondition> {
     gate_results
         .iter()
@@ -406,11 +410,16 @@ pub fn blocking_conditions_from_gates(
                 GateOutcome::TimedOut => "timed_out",
                 GateOutcome::Error => "error",
             };
+            let condition_type = gate_defs
+                .get(name)
+                .map(|g| g.gate_type.clone())
+                .unwrap_or_else(|| "command".to_string());
             Some(BlockingCondition {
                 name: name.clone(),
-                condition_type: "command".to_string(),
+                condition_type,
                 status: status.to_string(),
                 agent_actionable: false,
+                output: result.output.clone(),
             })
         })
         .collect()
@@ -572,12 +581,14 @@ mod tests {
                     condition_type: "command".to_string(),
                     status: "failed".to_string(),
                     agent_actionable: false,
+                    output: serde_json::json!({"exit_code": 1, "error": ""}),
                 },
                 BlockingCondition {
                     name: "lint_check".to_string(),
                     condition_type: "command".to_string(),
                     status: "timed_out".to_string(),
                     agent_actionable: false,
+                    output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
                 },
             ],
         };
@@ -919,6 +930,7 @@ mod tests {
             condition_type: "command".to_string(),
             status: "failed".to_string(),
             agent_actionable: false,
+            output: serde_json::json!({"exit_code": 1, "error": ""}),
         };
 
         let json: serde_json::Value = serde_json::to_value(&cond).unwrap();

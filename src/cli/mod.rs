@@ -1733,7 +1733,7 @@ fn handle_next(
                     advanced,
                 },
                 StopReason::GateBlocked(gate_results) => {
-                    let blocking = blocking_conditions_from_gates(&gate_results);
+                    let blocking = blocking_conditions_from_gates(&gate_results, &final_template_state.gates);
                     NextResponse::GateBlocked {
                         state: final_state.clone(),
                         directive: directive.clone(),
@@ -1752,7 +1752,7 @@ fn handle_next(
                     });
                     let blocking = failed_gates
                         .as_ref()
-                        .map(blocking_conditions_from_gates)
+                        .map(|fg| blocking_conditions_from_gates(fg, &final_template_state.gates))
                         .unwrap_or_default();
                     NextResponse::EvidenceRequired {
                         state: final_state.clone(),
