@@ -357,6 +357,9 @@ pub struct BlockingCondition {
     #[serde(rename = "type")]
     pub condition_type: String,
     pub status: String,
+    // False until Feature 2 (override mechanism) lands. Feature 2 sets this
+    // true when the gate has an override_default, signaling the agent can call
+    // `koto overrides record` to substitute gate output with the default.
     pub agent_actionable: bool,
     pub output: serde_json::Value,
 }

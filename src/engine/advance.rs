@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine::types::{Event, EventPayload};
 use crate::gate::{GateOutcome, StructuredGateResult};
-use crate::template::types::{ActionDecl, CompiledTemplate, TemplateState};
+use crate::template::types::{
+    ActionDecl, CompiledTemplate, TemplateState, GATES_EVIDENCE_NAMESPACE,
+};
 
 /// Maximum number of transitions per invocation. Defense-in-depth against
 /// template bugs with hundreds of linearly chaining states.
@@ -327,7 +329,10 @@ where
                 let has_gates_routing = template_state.transitions.iter().any(|t| {
                     t.when
                         .as_ref()
-                        .map(|w| w.keys().any(|k| k.starts_with("gates.")))
+                        .map(|w| {
+                            w.keys()
+                                .any(|k| k.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)))
+                        })
                         .unwrap_or(false)
                 });
                 if template_state.accepts.is_none() && !has_gates_routing {
@@ -348,6 +353,9 @@ where
         // then layer gate output under "gates" (engine data takes precedence).
         // This allows when clauses to reference both agent-submitted fields and
         // gate output via dot-path traversal (e.g. gates.ci_check.exit_code).
+        // TODO(#117): once Feature 2 reserves the gates namespace in evidence
+        // validation, the precedence comment above shifts from "defense in
+        // depth" to "invariant" -- update this comment when that lands.
         let mut merged: serde_json::Map<String, serde_json::Value> = current_evidence
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))

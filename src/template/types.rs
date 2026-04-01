@@ -137,6 +137,11 @@ pub const GATE_TYPE_CONTEXT_EXISTS: &str = "context-exists";
 /// Gate type: check whether context content matches a regex pattern.
 pub const GATE_TYPE_CONTEXT_MATCHES: &str = "context-matches";
 
+/// Evidence namespace reserved for engine-injected gate output.
+/// Agent submissions starting with this prefix are rejected (Feature 2, R7).
+/// All `gates.*` key checks in advance.rs and types.rs use this constant.
+pub const GATES_EVIDENCE_NAMESPACE: &str = "gates";
+
 /// Valid field types for FieldSchema.
 const VALID_FIELD_TYPES: &[&str] = &["enum", "string", "number", "boolean"];
 
@@ -365,11 +370,11 @@ impl CompiledTemplate {
             // because they are populated automatically by the advance loop, not by agents.
             let agent_fields: Vec<(&String, &serde_json::Value)> = when
                 .iter()
-                .filter(|(k, _)| !k.starts_with("gates."))
+                .filter(|(k, _)| !k.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)))
                 .collect();
             let gate_fields: Vec<(&String, &serde_json::Value)> = when
                 .iter()
-                .filter(|(k, _)| k.starts_with("gates."))
+                .filter(|(k, _)| k.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)))
                 .collect();
 
             // Rule 5: when conditions that reference agent evidence require an accepts block.
