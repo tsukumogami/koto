@@ -47,6 +47,7 @@ pub struct StructuredGateResult {
     pub output: serde_json::Value,
 }
 
+// TODO(issue-2): remove -- replaced by StructuredGateResult
 /// Result of evaluating a single gate.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GateResult {
