@@ -360,26 +360,29 @@ impl CompiledTemplate {
                 ));
             }
 
-            // Rule 5: when conditions require the state to have an accepts block.
-            if !has_accepts {
+            // Separate gates.* keys (engine-injected gate output) from agent evidence keys.
+            // gates.* keys bypass the accepts block requirement and field-presence checks
+            // because they are populated automatically by the advance loop, not by agents.
+            let agent_fields: Vec<(&String, &serde_json::Value)> = when
+                .iter()
+                .filter(|(k, _)| !k.starts_with("gates."))
+                .collect();
+            let gate_fields: Vec<(&String, &serde_json::Value)> = when
+                .iter()
+                .filter(|(k, _)| k.starts_with("gates."))
+                .collect();
+
+            // Rule 5: when conditions that reference agent evidence require an accepts block.
+            // Pure gates.* conditions are allowed without an accepts block.
+            if !agent_fields.is_empty() && !has_accepts {
                 return Err(format!(
                     "state {:?} transition to {:?}: when conditions require an accepts block on the state",
                     state_name, transition.target
                 ));
             }
 
-            let accepts = state.accepts.as_ref().unwrap();
-
-            for (field, value) in when {
-                // Rule 1: when fields must reference fields declared in accepts.
-                if !accepts.contains_key(field) {
-                    return Err(format!(
-                        "state {:?} transition to {:?}: when field {:?} is not declared in accepts",
-                        state_name, transition.target, field
-                    ));
-                }
-
-                // Rule 6: when values must be JSON scalars.
+            // Rule 6 applied to gates.* fields: values must be JSON scalars.
+            for (field, value) in &gate_fields {
                 if value.is_array() || value.is_object() {
                     return Err(format!(
                         "state {:?} transition to {:?}: when value for field {:?} must be a scalar \
@@ -387,20 +390,43 @@ impl CompiledTemplate {
                         state_name, transition.target, field
                     ));
                 }
+            }
 
-                // Rule 2: when values for enum fields must appear in the values list.
-                let schema = &accepts[field];
-                if schema.field_type == "enum" {
-                    let value_str = match value.as_str() {
-                        Some(s) => s.to_string(),
-                        None => value.to_string(),
-                    };
-                    if !schema.values.contains(&value_str) {
+            if !agent_fields.is_empty() {
+                let accepts = state.accepts.as_ref().unwrap();
+
+                for (field, value) in &agent_fields {
+                    // Rule 1: agent evidence when fields must reference fields declared in accepts.
+                    if !accepts.contains_key(*field) {
                         return Err(format!(
-                            "state {:?} transition to {:?}: when value {:?} for enum field {:?} \
-                             is not in allowed values {:?}",
-                            state_name, transition.target, value_str, field, schema.values
+                            "state {:?} transition to {:?}: when field {:?} is not declared in accepts",
+                            state_name, transition.target, field
                         ));
+                    }
+
+                    // Rule 6: when values must be JSON scalars.
+                    if value.is_array() || value.is_object() {
+                        return Err(format!(
+                            "state {:?} transition to {:?}: when value for field {:?} must be a scalar \
+                             (string, number, or boolean), not an array or object",
+                            state_name, transition.target, field
+                        ));
+                    }
+
+                    // Rule 2: when values for enum fields must appear in the values list.
+                    let schema = &accepts[*field];
+                    if schema.field_type == "enum" {
+                        let value_str = match value.as_str() {
+                            Some(s) => s.to_string(),
+                            None => value.to_string(),
+                        };
+                        if !schema.values.contains(&value_str) {
+                            return Err(format!(
+                                "state {:?} transition to {:?}: when value {:?} for enum field {:?} \
+                                 is not in allowed values {:?}",
+                                state_name, transition.target, value_str, field, schema.values
+                            ));
+                        }
                     }
                 }
             }
@@ -608,6 +634,120 @@ mod tests {
         }];
         let err = t.validate().unwrap_err();
         assert!(err.contains("not declared in accepts"), "got: {}", err);
+    }
+
+    #[test]
+    fn gates_only_when_does_not_require_accepts() {
+        // A when clause with only gates.* keys is valid without an accepts block.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            "ci_check".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_COMMAND.to_string(),
+                command: "exit 0".to_string(),
+                key: String::new(),
+                pattern: String::new(),
+                timeout: 0,
+            },
+        );
+        let mut when = BTreeMap::new();
+        when.insert("gates.ci_check.exit_code".to_string(), serde_json::json!(0));
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        assert!(
+            t.validate().is_ok(),
+            "gates.* when clause should not require accepts"
+        );
+    }
+
+    #[test]
+    fn gates_only_when_with_multiple_transitions_allowed() {
+        // Multiple transitions using only gates.* keys with distinct values are valid.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            "ci_check".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_COMMAND.to_string(),
+                command: "exit 0".to_string(),
+                key: String::new(),
+                pattern: String::new(),
+                timeout: 0,
+            },
+        );
+        let mut when_pass = BTreeMap::new();
+        when_pass.insert("gates.ci_check.exit_code".to_string(), serde_json::json!(0));
+        let mut when_fail = BTreeMap::new();
+        when_fail.insert("gates.ci_check.exit_code".to_string(), serde_json::json!(1));
+        state.transitions = vec![
+            Transition {
+                target: "done".to_string(),
+                when: Some(when_pass),
+            },
+            Transition {
+                target: "fix".to_string(),
+                when: Some(when_fail),
+            },
+        ];
+        // Add the "fix" terminal state so the template is valid.
+        t.states.insert(
+            "fix".to_string(),
+            TemplateState {
+                directive: "Fix the issue.".to_string(),
+                details: String::new(),
+                transitions: vec![],
+                terminal: true,
+                gates: BTreeMap::new(),
+                accepts: None,
+                integration: None,
+                default_action: None,
+            },
+        );
+        assert!(
+            t.validate().is_ok(),
+            "two gates.* when transitions should be valid"
+        );
+    }
+
+    #[test]
+    fn mixed_gates_and_agent_when_requires_accepts() {
+        // A when clause mixing gates.* and agent evidence keys still requires an accepts block.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert("gates.ci_check.exit_code".to_string(), serde_json::json!(0));
+        when.insert("decision".to_string(), serde_json::json!("approve"));
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("when conditions require an accepts block"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn gates_when_rejects_non_scalar_value() {
+        // gates.* when values must still be scalars.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert(
+            "gates.ci_check.output".to_string(),
+            serde_json::json!({"nested": "object"}),
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        let err = t.validate().unwrap_err();
+        assert!(err.contains("must be a scalar"), "got: {}", err);
     }
 
     #[test]

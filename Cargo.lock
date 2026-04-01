@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "koto"
-version = "0.4.2-dev"
+version = "0.5.1-dev"
 dependencies = [
  "anyhow",
  "assert_cmd",

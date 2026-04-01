@@ -1108,6 +1108,197 @@ mod tests {
         assert!(json.get("options").is_none());
     }
 
+    // -- blocking_conditions_from_gates tests --
+
+    use crate::gate::{GateOutcome, StructuredGateResult};
+    use crate::template::types::Gate;
+
+    fn make_command_gate() -> Gate {
+        Gate {
+            gate_type: "command".to_string(),
+            command: "exit 0".to_string(),
+            key: String::new(),
+            pattern: String::new(),
+            timeout: 0,
+        }
+    }
+
+    fn make_context_exists_gate() -> Gate {
+        Gate {
+            gate_type: "context-exists".to_string(),
+            command: String::new(),
+            key: "my_key".to_string(),
+            pattern: String::new(),
+            timeout: 0,
+        }
+    }
+
+    #[test]
+    fn blocking_conditions_passed_gate_excluded() {
+        let mut gate_results = BTreeMap::new();
+        gate_results.insert(
+            "ci_check".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Passed,
+                output: serde_json::json!({"exit_code": 0, "error": ""}),
+            },
+        );
+
+        let mut gate_defs = BTreeMap::new();
+        gate_defs.insert("ci_check".to_string(), make_command_gate());
+
+        let conditions = blocking_conditions_from_gates(&gate_results, &gate_defs);
+        assert!(
+            conditions.is_empty(),
+            "passed gate must not appear in blocking_conditions"
+        );
+    }
+
+    #[test]
+    fn blocking_conditions_command_gate_failed_includes_structured_output() {
+        let mut gate_results = BTreeMap::new();
+        gate_results.insert(
+            "ci_check".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exit_code": 1, "error": ""}),
+            },
+        );
+
+        let mut gate_defs = BTreeMap::new();
+        gate_defs.insert("ci_check".to_string(), make_command_gate());
+
+        let conditions = blocking_conditions_from_gates(&gate_results, &gate_defs);
+        assert_eq!(conditions.len(), 1);
+
+        let cond = &conditions[0];
+        assert_eq!(cond.name, "ci_check");
+        assert_eq!(cond.condition_type, "command");
+        assert_eq!(cond.status, "failed");
+        assert!(!cond.agent_actionable);
+        assert_eq!(
+            cond.output,
+            serde_json::json!({"exit_code": 1, "error": ""})
+        );
+    }
+
+    #[test]
+    fn blocking_conditions_context_exists_gate_includes_structured_output() {
+        let mut gate_results = BTreeMap::new();
+        gate_results.insert(
+            "ctx_gate".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exists": false, "error": ""}),
+            },
+        );
+
+        let mut gate_defs = BTreeMap::new();
+        gate_defs.insert("ctx_gate".to_string(), make_context_exists_gate());
+
+        let conditions = blocking_conditions_from_gates(&gate_results, &gate_defs);
+        assert_eq!(conditions.len(), 1);
+
+        let cond = &conditions[0];
+        assert_eq!(cond.name, "ctx_gate");
+        assert_eq!(cond.condition_type, "context-exists");
+        assert_eq!(cond.status, "failed");
+        assert_eq!(
+            cond.output,
+            serde_json::json!({"exists": false, "error": ""})
+        );
+    }
+
+    #[test]
+    fn blocking_conditions_timed_out_gate() {
+        let mut gate_results = BTreeMap::new();
+        gate_results.insert(
+            "slow_gate".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::TimedOut,
+                output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+            },
+        );
+
+        let mut gate_defs = BTreeMap::new();
+        gate_defs.insert("slow_gate".to_string(), make_command_gate());
+
+        let conditions = blocking_conditions_from_gates(&gate_results, &gate_defs);
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].status, "timed_out");
+        assert_eq!(
+            conditions[0].output,
+            serde_json::json!({"exit_code": -1, "error": "timed_out"})
+        );
+    }
+
+    #[test]
+    fn blocking_conditions_error_gate() {
+        let mut gate_results = BTreeMap::new();
+        gate_results.insert(
+            "bad_gate".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Error,
+                output: serde_json::json!({"exit_code": -1, "error": "spawn failed"}),
+            },
+        );
+
+        let mut gate_defs = BTreeMap::new();
+        gate_defs.insert("bad_gate".to_string(), make_command_gate());
+
+        let conditions = blocking_conditions_from_gates(&gate_results, &gate_defs);
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].status, "error");
+        assert_eq!(conditions[0].output["error"], "spawn failed");
+    }
+
+    #[test]
+    fn blocking_conditions_gate_not_in_defs_falls_back_to_command_type() {
+        let mut gate_results = BTreeMap::new();
+        gate_results.insert(
+            "unknown_gate".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exit_code": 1, "error": ""}),
+            },
+        );
+
+        // gate_defs is empty -- gate name not found
+        let gate_defs: BTreeMap<String, Gate> = BTreeMap::new();
+
+        let conditions = blocking_conditions_from_gates(&gate_results, &gate_defs);
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].condition_type, "command");
+    }
+
+    #[test]
+    fn blocking_conditions_mixed_passed_and_failed() {
+        let mut gate_results = BTreeMap::new();
+        gate_results.insert(
+            "gate_pass".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Passed,
+                output: serde_json::json!({"exit_code": 0, "error": ""}),
+            },
+        );
+        gate_results.insert(
+            "gate_fail".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exit_code": 2, "error": ""}),
+            },
+        );
+
+        let mut gate_defs = BTreeMap::new();
+        gate_defs.insert("gate_pass".to_string(), make_command_gate());
+        gate_defs.insert("gate_fail".to_string(), make_command_gate());
+
+        let conditions = blocking_conditions_from_gates(&gate_results, &gate_defs);
+        assert_eq!(conditions.len(), 1, "only the failed gate should appear");
+        assert_eq!(conditions[0].name, "gate_fail");
+        assert_eq!(conditions[0].output["exit_code"], 2);
+    }
+
     #[test]
     fn derive_expects_mixed_conditional_and_unconditional() {
         let mut accepts = BTreeMap::new();

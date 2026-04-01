@@ -311,11 +311,26 @@ where
                 .values()
                 .any(|r| !matches!(r.outcome, GateOutcome::Passed));
             if any_failed {
-                // If the state has an accepts block, fall through to transition
-                // resolution instead of returning GateBlocked. The transition
-                // resolver will skip unconditional transitions when gate_failed
-                // is true, ensuring the agent must submit evidence.
-                if template_state.accepts.is_none() {
+                // Determine whether this state can route based on gate output alone.
+                // A state does so when it has at least one conditional transition
+                // whose when clause references a gates.* key. In that case, fall
+                // through to transition resolution so the gate output can drive
+                // routing (scenarios 14, 15, 16 in the structured-gate-output PRD).
+                //
+                // If the state has an accepts block, also fall through so the
+                // transition resolver can use evidence as a fallback. The resolver
+                // will skip unconditional transitions when gate_failed is true,
+                // ensuring the agent must submit evidence when no conditional
+                // transition matches.
+                //
+                // If neither condition holds, return GateBlocked immediately.
+                let has_gates_routing = template_state.transitions.iter().any(|t| {
+                    t.when
+                        .as_ref()
+                        .map(|w| w.keys().any(|k| k.starts_with("gates.")))
+                        .unwrap_or(false)
+                });
+                if template_state.accepts.is_none() && !has_gates_routing {
                     return Ok(AdvanceResult {
                         final_state: state,
                         advanced,
@@ -378,6 +393,14 @@ where
                         stop_reason: StopReason::EvidenceRequired {
                             failed_gates: failed_gate_results,
                         },
+                    });
+                } else if let Some(gate_results) = failed_gate_results {
+                    // No accepts block but gate(s) failed and no gates.* condition
+                    // matched -- the gate itself is blocking.
+                    return Ok(AdvanceResult {
+                        final_state: state,
+                        advanced,
+                        stop_reason: StopReason::GateBlocked(gate_results),
                     });
                 } else {
                     return Ok(AdvanceResult {

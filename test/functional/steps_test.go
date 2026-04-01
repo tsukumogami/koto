@@ -353,12 +353,23 @@ func getJSONField(jsonStr, field string) (interface{}, error) {
 	parts := strings.Split(field, ".")
 	current := data
 	for _, part := range parts {
-		m, ok := current.(map[string]interface{})
-		if !ok {
-			return nil, nil
-		}
-		current, ok = m[part]
-		if !ok {
+		switch v := current.(type) {
+		case map[string]interface{}:
+			val, ok := v[part]
+			if !ok {
+				return nil, nil
+			}
+			current = val
+		case []interface{}:
+			idx := 0
+			if _, err := fmt.Sscanf(part, "%d", &idx); err != nil {
+				return nil, nil
+			}
+			if idx < 0 || idx >= len(v) {
+				return nil, nil
+			}
+			current = v[idx]
+		default:
 			return nil, nil
 		}
 	}
