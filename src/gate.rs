@@ -8,11 +8,44 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::action::run_shell_command;
 use crate::session::context::ContextStore;
 use crate::template::types::{
     Gate, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS, GATE_TYPE_CONTEXT_MATCHES,
 };
+
+/// Outcome of a structured gate evaluation.
+///
+/// Carries the control-flow signal used by the advance loop to determine
+/// whether a state should block or continue. The associated structured output
+/// is held in [`StructuredGateResult`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum GateOutcome {
+    /// The gate condition was satisfied.
+    Passed,
+    /// The gate condition was not satisfied.
+    Failed,
+    /// The command did not finish within the configured timeout.
+    TimedOut,
+    /// The command could not be spawned or an OS error occurred.
+    Error,
+}
+
+/// Structured result of evaluating a single gate.
+///
+/// Carries both the control-flow outcome and the gate-type-specific JSON
+/// output. The `output` field holds structured data matching the gate type's
+/// schema (e.g. `{"exit_code": 0, "error": ""}` for command gates), making it
+/// available for injection into the evidence map and transition routing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuredGateResult {
+    /// Control-flow outcome used by the advance loop.
+    pub outcome: GateOutcome,
+    /// Gate-type-specific structured output for evidence injection.
+    pub output: serde_json::Value,
+}
 
 /// Result of evaluating a single gate.
 #[derive(Debug, Clone, PartialEq)]
@@ -489,6 +522,135 @@ mod tests {
 
         let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
         assert_eq!(results["status"], GateResult::Passed);
+    }
+
+    // -----------------------------------------------------------------------
+    // StructuredGateResult / GateOutcome serialization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gate_outcome_passed_round_trip() {
+        let outcome = GateOutcome::Passed;
+        let json = serde_json::to_string(&outcome).unwrap();
+        let decoded: GateOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, GateOutcome::Passed);
+    }
+
+    #[test]
+    fn gate_outcome_failed_round_trip() {
+        let outcome = GateOutcome::Failed;
+        let json = serde_json::to_string(&outcome).unwrap();
+        let decoded: GateOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, GateOutcome::Failed);
+    }
+
+    #[test]
+    fn gate_outcome_timed_out_round_trip() {
+        let outcome = GateOutcome::TimedOut;
+        let json = serde_json::to_string(&outcome).unwrap();
+        let decoded: GateOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, GateOutcome::TimedOut);
+    }
+
+    #[test]
+    fn gate_outcome_error_round_trip() {
+        let outcome = GateOutcome::Error;
+        let json = serde_json::to_string(&outcome).unwrap();
+        let decoded: GateOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, GateOutcome::Error);
+    }
+
+    #[test]
+    fn structured_gate_result_passed_round_trip() {
+        let result = StructuredGateResult {
+            outcome: GateOutcome::Passed,
+            output: serde_json::json!({"exit_code": 0, "error": ""}),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.outcome, GateOutcome::Passed);
+        assert_eq!(decoded.output["exit_code"], 0);
+        assert_eq!(decoded.output["error"], "");
+    }
+
+    #[test]
+    fn structured_gate_result_failed_round_trip() {
+        let result = StructuredGateResult {
+            outcome: GateOutcome::Failed,
+            output: serde_json::json!({"exit_code": 1, "error": ""}),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.outcome, GateOutcome::Failed);
+        assert_eq!(decoded.output["exit_code"], 1);
+    }
+
+    #[test]
+    fn structured_gate_result_timed_out_round_trip() {
+        let result = StructuredGateResult {
+            outcome: GateOutcome::TimedOut,
+            output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.outcome, GateOutcome::TimedOut);
+        assert_eq!(decoded.output["exit_code"], -1);
+        assert_eq!(decoded.output["error"], "timed_out");
+    }
+
+    #[test]
+    fn structured_gate_result_error_round_trip() {
+        let result = StructuredGateResult {
+            outcome: GateOutcome::Error,
+            output: serde_json::json!({"exit_code": -1, "error": "spawn failed: no such file"}),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.outcome, GateOutcome::Error);
+        assert_eq!(decoded.output["error"], "spawn failed: no such file");
+    }
+
+    #[test]
+    fn structured_gate_result_context_exists_schema() {
+        let result = StructuredGateResult {
+            outcome: GateOutcome::Passed,
+            output: serde_json::json!({"exists": true, "error": ""}),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.outcome, GateOutcome::Passed);
+        assert_eq!(decoded.output["exists"], true);
+        assert_eq!(decoded.output["error"], "");
+    }
+
+    #[test]
+    fn structured_gate_result_context_matches_schema() {
+        let result = StructuredGateResult {
+            outcome: GateOutcome::Failed,
+            output: serde_json::json!({"matches": false, "error": ""}),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.outcome, GateOutcome::Failed);
+        assert_eq!(decoded.output["matches"], false);
+    }
+
+    #[test]
+    fn gate_outcome_partial_eq() {
+        assert_eq!(GateOutcome::Passed, GateOutcome::Passed);
+        assert_ne!(GateOutcome::Passed, GateOutcome::Failed);
+        assert_ne!(GateOutcome::TimedOut, GateOutcome::Error);
+    }
+
+    #[test]
+    fn structured_gate_result_clone() {
+        let result = StructuredGateResult {
+            outcome: GateOutcome::Passed,
+            output: serde_json::json!({"exit_code": 0, "error": ""}),
+        };
+        let cloned = result.clone();
+        assert_eq!(cloned.outcome, GateOutcome::Passed);
+        assert_eq!(cloned.output, result.output);
     }
 
     #[test]
