@@ -162,8 +162,8 @@ is possible but the reachability check specifically needs the full model.
 
 | Issue | Dependencies | Tier |
 |-------|--------------|------|
-| [#116: structured gate output and transition routing](https://github.com/tsukumogami/koto/issues/116) | None | testable |
-| _Gates produce structured data per gate type schema. Gate output feeds into transition `when` clauses via `gates.*` namespace. Resolver gains dot-path traversal. Foundation for all other features._ | | |
+| ~~[#116: structured gate output and transition routing](https://github.com/tsukumogami/koto/issues/116)~~ ✓ | None | testable |
+| ~~_Gates produce structured data per gate type schema. Gate output feeds into transition `when` clauses via `gates.*` namespace. Resolver gains dot-path traversal. Foundation for all other features._~~ | | |
 | [#117: gate override mechanism with rationale](https://github.com/tsukumogami/koto/issues/117) | [#116](https://github.com/tsukumogami/koto/issues/116) | testable |
 | _`koto overrides record` substitutes gate output with default or agent-provided data. Override events capture rationale and full context. `koto overrides list` for session-wide queries._ | | |
 | [#118: gate-transition contract compiler validation](https://github.com/tsukumogami/koto/issues/118) | [#116](https://github.com/tsukumogami/koto/issues/116), [#117](https://github.com/tsukumogami/koto/issues/117) | testable |
@@ -186,10 +186,12 @@ graph TD
     I116 --> I119
 
     classDef needsDesign fill:#e1bee7
-    class I116,I117,I118,I119 needsDesign
+    classDef done fill:#c8e6c9,stroke:#388e3c
+    class I117,I118,I119 needsDesign
+    class I116 done
 ```
 
-**Legend**: Purple = needs-design
+**Legend**: Purple = needs-design, Green = complete
 
 ## Progress
 
