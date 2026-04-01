@@ -321,8 +321,12 @@ where
         // Convert the BTreeMap evidence to a serde_json::Value::Object for
         // resolve_transition. The resolver accepts Value so it can also traverse
         // nested gate output merged in by Issue 4.
-        let evidence_value = serde_json::to_value(&current_evidence)
-            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        let evidence_value = serde_json::Value::Object(
+            current_evidence
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        );
         match resolve_transition(template_state, &evidence_value, gates_failed) {
             TransitionResolution::Resolved(target) => {
                 // Check for cycle before transitioning
@@ -398,6 +402,9 @@ where
 /// assert_eq!(resolve_value(&v, "gates.ci.missing"), None);
 /// ```
 fn resolve_value<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    if path.is_empty() {
+        return None;
+    }
     let mut current = root;
     for segment in path.split('.') {
         current = current.get(segment)?;
