@@ -1446,10 +1446,7 @@ mod tests {
                             "success",
                             vec![("gates.ci.exit_code", serde_json::json!(0))],
                         ),
-                        conditional(
-                            "fix",
-                            vec![("gates.ci.exit_code", serde_json::json!(1))],
-                        ),
+                        conditional("fix", vec![("gates.ci.exit_code", serde_json::json!(1))]),
                     ],
                     terminal: false,
                     gates,
