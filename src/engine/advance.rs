@@ -318,7 +318,12 @@ where
         }
 
         // 7. Resolve transition
-        match resolve_transition(template_state, &current_evidence, gates_failed) {
+        // Convert the BTreeMap evidence to a serde_json::Value::Object for
+        // resolve_transition. The resolver accepts Value so it can also traverse
+        // nested gate output merged in by Issue 4.
+        let evidence_value = serde_json::to_value(&current_evidence)
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        match resolve_transition(template_state, &evidence_value, gates_failed) {
             TransitionResolution::Resolved(target) => {
                 // Check for cycle before transitioning
                 if visited.contains(&target) {
@@ -376,11 +381,36 @@ where
     }
 }
 
+/// Traverse a nested `serde_json::Value` using a dot-separated path.
+///
+/// Each segment of `path` is split on `.` and used as a key into the current
+/// JSON object. Returns `None` if any segment is missing, if an intermediate
+/// value is not an object, or if `path` is empty.
+///
+/// Single-segment paths behave identically to a direct `.get()` call, so flat
+/// evidence keys work without any changes at call sites.
+///
+/// # Examples
+///
+/// ```ignore
+/// let v = serde_json::json!({"gates": {"ci": {"exit_code": 0}}});
+/// assert_eq!(resolve_value(&v, "gates.ci.exit_code"), Some(&serde_json::json!(0)));
+/// assert_eq!(resolve_value(&v, "gates.ci.missing"), None);
+/// ```
+fn resolve_value<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut current = root;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
 /// Resolve which transition to take from a state given current evidence.
 ///
 /// Resolution algorithm:
 /// 1. Collect conditional transitions (those with `when: Some(...)`)
 /// 2. For each, check if ALL `when` fields match the evidence (exact JSON equality)
+///    using dot-path traversal so nested keys like `gates.ci.exit_code` work
 /// 3. If exactly one matches, return `Resolved(target)`
 /// 4. If multiple match, return `Ambiguous(targets)`
 /// 5. If none match and an unconditional transition exists:
@@ -395,7 +425,7 @@ where
 /// gates fail — defeating the evidence-fallback mechanism.
 pub fn resolve_transition(
     template_state: &TemplateState,
-    evidence: &BTreeMap<String, serde_json::Value>,
+    evidence: &serde_json::Value,
     gate_failed: bool,
 ) -> TransitionResolution {
     if template_state.transitions.is_empty() {
@@ -412,7 +442,7 @@ pub fn resolve_transition(
                 has_conditional = true;
                 let all_match = conditions
                     .iter()
-                    .all(|(field, expected)| evidence.get(field) == Some(expected));
+                    .all(|(field, expected)| resolve_value(evidence, field) == Some(expected));
                 if all_match {
                     conditional_matches.push(transition.target.clone());
                 }
@@ -562,10 +592,15 @@ mod tests {
     // resolve_transition tests
     // -----------------------------------------------------------------------
 
+    /// Wrap a BTreeMap as a serde_json::Value::Object for resolve_transition.
+    fn as_evidence(m: BTreeMap<String, serde_json::Value>) -> serde_json::Value {
+        serde_json::to_value(m).unwrap()
+    }
+
     #[test]
     fn unconditional_transition_resolves() {
         let state = make_state(vec![unconditional("next")]);
-        let evidence = BTreeMap::new();
+        let evidence = as_evidence(BTreeMap::new());
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("next".to_string())
@@ -578,8 +613,9 @@ mod tests {
             "approved",
             vec![("decision", serde_json::json!("approve"))],
         )]);
-        let mut evidence = BTreeMap::new();
-        evidence.insert("decision".to_string(), serde_json::json!("approve"));
+        let mut m = BTreeMap::new();
+        m.insert("decision".to_string(), serde_json::json!("approve"));
+        let evidence = as_evidence(m);
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("approved".to_string())
@@ -592,8 +628,9 @@ mod tests {
             conditional("approved", vec![("decision", serde_json::json!("approve"))]),
             unconditional("fallback"),
         ]);
-        let mut evidence = BTreeMap::new();
-        evidence.insert("decision".to_string(), serde_json::json!("approve"));
+        let mut m = BTreeMap::new();
+        m.insert("decision".to_string(), serde_json::json!("approve"));
+        let evidence = as_evidence(m);
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("approved".to_string())
@@ -606,8 +643,9 @@ mod tests {
             conditional("approved", vec![("decision", serde_json::json!("approve"))]),
             unconditional("fallback"),
         ]);
-        let mut evidence = BTreeMap::new();
-        evidence.insert("decision".to_string(), serde_json::json!("reject"));
+        let mut m = BTreeMap::new();
+        m.insert("decision".to_string(), serde_json::json!("reject"));
+        let evidence = as_evidence(m);
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("fallback".to_string())
@@ -620,8 +658,9 @@ mod tests {
             conditional("target_a", vec![("x", serde_json::json!(1))]),
             conditional("target_b", vec![("x", serde_json::json!(1))]),
         ]);
-        let mut evidence = BTreeMap::new();
-        evidence.insert("x".to_string(), serde_json::json!(1));
+        let mut m = BTreeMap::new();
+        m.insert("x".to_string(), serde_json::json!(1));
+        let evidence = as_evidence(m);
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::Ambiguous(vec!["target_a".to_string(), "target_b".to_string()])
@@ -631,7 +670,7 @@ mod tests {
     #[test]
     fn no_transitions_returns_no_transitions() {
         let state = make_state(vec![]);
-        let evidence = BTreeMap::new();
+        let evidence = as_evidence(BTreeMap::new());
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::NoTransitions
@@ -645,7 +684,7 @@ mod tests {
             conditional("rejected", vec![("decision", serde_json::json!("reject"))]),
         ]);
         // Empty evidence -- no match.
-        let evidence = BTreeMap::new();
+        let evidence = as_evidence(BTreeMap::new());
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::NeedsEvidence
@@ -660,15 +699,17 @@ mod tests {
         )]);
 
         // Only one field matches -- should not resolve.
-        let mut evidence = BTreeMap::new();
-        evidence.insert("a".to_string(), serde_json::json!("x"));
+        let mut m = BTreeMap::new();
+        m.insert("a".to_string(), serde_json::json!("x"));
+        let evidence = as_evidence(m.clone());
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::NeedsEvidence
         );
 
         // Both fields match.
-        evidence.insert("b".to_string(), serde_json::json!("y"));
+        m.insert("b".to_string(), serde_json::json!("y"));
+        let evidence = as_evidence(m);
         assert_eq!(
             resolve_transition(&state, &evidence, false),
             TransitionResolution::Resolved("target".to_string())
@@ -688,7 +729,7 @@ mod tests {
             unconditional("fallback_state"),
         ]);
 
-        let evidence = BTreeMap::new(); // no evidence
+        let evidence = as_evidence(BTreeMap::new()); // no evidence
 
         // gate_failed=false: unconditional fallback fires
         assert_eq!(
@@ -703,11 +744,120 @@ mod tests {
         );
 
         // gate_failed=true but evidence matches conditional: resolves normally
-        let mut with_evidence = BTreeMap::new();
-        with_evidence.insert("status".to_string(), serde_json::json!("completed"));
+        let mut m = BTreeMap::new();
+        m.insert("status".to_string(), serde_json::json!("completed"));
+        let with_evidence = as_evidence(m);
         assert_eq!(
             resolve_transition(&state, &with_evidence, true),
             TransitionResolution::Resolved("next_state".to_string())
+        );
+    }
+
+    #[test]
+    fn dot_path_traversal_on_nested_gate_data() {
+        // gate output is nested under "gates.ci_check" -- when clause uses
+        // dot-path "gates.ci_check.exit_code"
+        let state = make_state(vec![
+            conditional(
+                "success",
+                vec![("gates.ci_check.exit_code", serde_json::json!(0))],
+            ),
+            conditional(
+                "failed",
+                vec![("gates.ci_check.exit_code", serde_json::json!(1))],
+            ),
+        ]);
+
+        // Evidence with nested gate output matching success condition
+        let evidence = serde_json::json!({
+            "gates": {
+                "ci_check": {
+                    "exit_code": 0,
+                    "error": ""
+                }
+            }
+        });
+        assert_eq!(
+            resolve_transition(&state, &evidence, false),
+            TransitionResolution::Resolved("success".to_string())
+        );
+
+        // Non-zero exit code routes to failed
+        let evidence_fail = serde_json::json!({
+            "gates": {
+                "ci_check": {
+                    "exit_code": 1,
+                    "error": "lint failed"
+                }
+            }
+        });
+        assert_eq!(
+            resolve_transition(&state, &evidence_fail, false),
+            TransitionResolution::Resolved("failed".to_string())
+        );
+    }
+
+    #[test]
+    fn dot_path_missing_segment_returns_none() {
+        // when clause references a nested path that does not exist in evidence
+        let state = make_state(vec![conditional(
+            "target",
+            vec![("gates.ci.exit_code", serde_json::json!(0))],
+        )]);
+
+        // Evidence without the "gates" key at all
+        let evidence = serde_json::json!({ "mode": "issue_backed" });
+        assert_eq!(
+            resolve_transition(&state, &evidence, false),
+            TransitionResolution::NeedsEvidence
+        );
+
+        // Evidence with "gates" but missing the "ci" sub-key
+        let evidence_partial = serde_json::json!({ "gates": { "lint": { "exit_code": 0 } } });
+        assert_eq!(
+            resolve_transition(&state, &evidence_partial, false),
+            TransitionResolution::NeedsEvidence
+        );
+    }
+
+    #[test]
+    fn mixed_gate_and_flat_evidence() {
+        // when clause mixes a dot-path gate key with a flat agent-evidence key
+        let state = make_state(vec![
+            conditional(
+                "approved",
+                vec![
+                    ("gates.ci.exit_code", serde_json::json!(0)),
+                    ("decision", serde_json::json!("approve")),
+                ],
+            ),
+            unconditional("pending"),
+        ]);
+
+        // Both conditions satisfied
+        let evidence_both = serde_json::json!({
+            "gates": { "ci": { "exit_code": 0, "error": "" } },
+            "decision": "approve"
+        });
+        assert_eq!(
+            resolve_transition(&state, &evidence_both, false),
+            TransitionResolution::Resolved("approved".to_string())
+        );
+
+        // Only gate satisfied, no agent decision yet -- falls through to unconditional
+        let evidence_gate_only = serde_json::json!({
+            "gates": { "ci": { "exit_code": 0, "error": "" } }
+        });
+        assert_eq!(
+            resolve_transition(&state, &evidence_gate_only, false),
+            TransitionResolution::Resolved("pending".to_string())
+        );
+
+        // Only decision provided, gate output missing -- falls through to unconditional
+        let evidence_decision_only = serde_json::json!({ "decision": "approve" });
+        assert_eq!(
+            resolve_transition(&state, &evidence_decision_only, false),
+            TransitionResolution::Resolved("pending".to_string())
         );
     }
 
