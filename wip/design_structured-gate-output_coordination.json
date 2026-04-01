@@ -1,0 +1,10 @@
+{
+  "topic": "structured-gate-output",
+  "decisions": [
+    {"id": 1, "question": "How should gate evaluation produce structured data? Replace GateResult enum with structured JSON output, extend it to carry structured data alongside the existing variants, or add a parallel return type. Each gate type needs to return data matching its schema ({exit_code, error} for command, {exists, error} for context-exists, {matches, error} for context-matches).", "status": "pending", "complexity": "standard"},
+    {"id": 2, "question": "How should gate output enter the transition resolver and support dot-path matching? Gate data needs to reach resolve_transition as nested JSON under the gates.* namespace. The resolver currently does flat key matching (evidence.get(field)). Options: flatten gate data into dot-separated keys, implement nested map traversal, or transform when clause keys at compile time.", "status": "pending", "complexity": "standard"},
+    {"id": 3, "question": "How should the advance loop determine pass/fail from structured gate output? Today it checks matches!(r, GateResult::Passed) for each gate. With structured output, pass conditions are per-gate-type rules evaluated against the data (command: exit_code == 0, etc). Where do pass conditions live and how are they evaluated?", "status": "pending", "complexity": "standard"}
+  ],
+  "cross_validation": "passed",
+  "round": 0
+}
