@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-gate-transition-contract.md
 problem: |
   Gate evaluation returns a boolean GateResult enum (Passed/Failed/TimedOut/
@@ -24,7 +24,7 @@ rationale: |
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and problem statement
 
