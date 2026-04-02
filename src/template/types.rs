@@ -2644,25 +2644,18 @@ command: "./check.sh"
         );
     }
 
-    // AC11/AC16: unreferenced gate field emits a warning to stderr.
-    // This test captures stderr to verify the warning format.
+    // AC11: unreferenced gate field does not cause validate() to return an error.
+    // The warning content (state, gate, field names) is verified by the functional test
+    // `gate_contract_unreferenced_field_warning` in tests/integration_test.rs (AC16).
     #[test]
     fn reachability_unreferenced_field_emits_warning() {
         // Gate has both "exit_code" and "error" fields. Only "exit_code" is referenced.
-        // Expect a warning for "error".
-        // We can't easily capture eprintln! in Rust tests without a custom stderr writer.
-        // Instead: verify compilation succeeds (warning is non-fatal) and separately
-        // assert the warning would be produced for a known-unreferenced field by
-        // checking validate_gate_reachability directly with the expected state.
+        // validate() must succeed (warning is non-fatal).
         let t = template_with_command_gate_transitions(
             "ci_check",
             Some(serde_json::json!({"exit_code": 0, "error": ""})),
             0,
         );
-        // Validation must succeed (warning is non-fatal).
         t.validate().unwrap();
-        // The "error" field is not referenced in any when clause — warning emitted to stderr.
-        // We can't assert the warning text in a unit test without redirecting stderr,
-        // but the functional test (AC16) covers the stderr content check.
     }
 }

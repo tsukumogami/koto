@@ -5784,6 +5784,46 @@ fn gate_contract_d4_dead_end_template_rejected() {
 }
 
 #[test]
+fn gate_contract_unreferenced_field_warning() {
+    // AC11/AC16: a gate field never referenced in any when clause emits a warning to
+    // stderr naming the state, gate, and field. Compilation succeeds (non-fatal).
+    //
+    // Template: state "verify" has a command gate "ci_check". Only "exit_code" is
+    // referenced in when clauses; "error" is declared in the schema but never used.
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("gate-unreferenced-field.md");
+    std::fs::write(&src, gate_contract_valid_template()).unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["template", "compile", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "unreferenced-field warning must be non-fatal: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("verify"),
+        "warning should name the state 'verify': stderr={}",
+        stderr
+    );
+    assert!(
+        stderr.contains("ci_check"),
+        "warning should name the gate 'ci_check': stderr={}",
+        stderr
+    );
+    assert!(
+        stderr.contains("error"),
+        "warning should name the unreferenced field 'error': stderr={}",
+        stderr
+    );
+}
+
+#[test]
 fn gate_contract_regression_existing_templates_compile() {
     // Validate that every *.md fixture under tests/fixtures/ continues to compile
     // after the gate-contract validation is introduced. This is a regression guard.
