@@ -460,6 +460,9 @@ that:
 - When override defaults are applied to all gates, at least one transition
   resolves (no dead ends on override)
 
+*Implemented in [#123](https://github.com/tsukumogami/koto/pull/123). Design:
+[DESIGN-gate-contract-compiler-validation](../designs/current/DESIGN-gate-contract-compiler-validation.md).*
+
 **R10: Backward compatibility.** Existing templates continue to compile and
 run. Gates still produce data internally (R1), but when transition `when`
 clauses don't reference `gates.*` fields, the gate data doesn't enter the
