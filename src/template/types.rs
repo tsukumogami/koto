@@ -158,7 +158,9 @@ pub const GATES_EVIDENCE_NAMESPACE: &str = "gates";
 #[derive(Debug, Clone, PartialEq)]
 pub enum GateSchemaFieldType {
     Number,
-    String,
+    /// String-typed field. Named `Str` to avoid shadowing `std::string::String`
+    /// when this enum is glob-imported with `use GateSchemaFieldType::*`.
+    Str,
     Boolean,
 }
 
@@ -168,15 +170,15 @@ pub enum GateSchemaFieldType {
 /// gate type strings.
 ///
 /// Gate schemas:
-/// - `command`:        `[("exit_code", Number), ("error", String)]`
-/// - `context-exists`: `[("exists", Boolean), ("error", String)]`
-/// - `context-matches`:`[("matches", Boolean), ("error", String)]`
+/// - `command`:        `[("exit_code", Number), ("error", Str)]`
+/// - `context-exists`: `[("exists", Boolean), ("error", Str)]`
+/// - `context-matches`:`[("matches", Boolean), ("error", Str)]`
 pub fn gate_type_schema(gate_type: &str) -> Option<&'static [(&'static str, GateSchemaFieldType)]> {
     use GateSchemaFieldType::*;
     match gate_type {
-        GATE_TYPE_COMMAND => Some(&[("exit_code", Number), ("error", String)]),
-        GATE_TYPE_CONTEXT_EXISTS => Some(&[("exists", Boolean), ("error", String)]),
-        GATE_TYPE_CONTEXT_MATCHES => Some(&[("matches", Boolean), ("error", String)]),
+        GATE_TYPE_COMMAND => Some(&[("exit_code", Number), ("error", Str)]),
+        GATE_TYPE_CONTEXT_EXISTS => Some(&[("exists", Boolean), ("error", Str)]),
+        GATE_TYPE_CONTEXT_MATCHES => Some(&[("matches", Boolean), ("error", Str)]),
         _ => None,
     }
 }
@@ -219,7 +221,7 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 fn gate_schema_field_type_name(t: &GateSchemaFieldType) -> &'static str {
     match t {
         GateSchemaFieldType::Number => "number",
-        GateSchemaFieldType::String => "string",
+        GateSchemaFieldType::Str => "string",
         GateSchemaFieldType::Boolean => "boolean",
     }
 }
@@ -228,7 +230,7 @@ fn gate_schema_field_type_name(t: &GateSchemaFieldType) -> &'static str {
 fn json_value_matches_schema_type(value: &serde_json::Value, t: &GateSchemaFieldType) -> bool {
     match t {
         GateSchemaFieldType::Number => value.is_number(),
-        GateSchemaFieldType::String => value.is_string(),
+        GateSchemaFieldType::Str => value.is_string(),
         GateSchemaFieldType::Boolean => value.is_boolean(),
     }
 }
@@ -1756,7 +1758,7 @@ command: "./check.sh"
         let schema = gate_type_schema(GATE_TYPE_COMMAND).expect("command schema must exist");
         assert_eq!(schema.len(), 2);
         assert_eq!(schema[0], ("exit_code", Number));
-        assert_eq!(schema[1], ("error", String));
+        assert_eq!(schema[1], ("error", Str));
     }
 
     #[test]
@@ -1766,7 +1768,7 @@ command: "./check.sh"
             gate_type_schema(GATE_TYPE_CONTEXT_EXISTS).expect("context-exists schema must exist");
         assert_eq!(schema.len(), 2);
         assert_eq!(schema[0], ("exists", Boolean));
-        assert_eq!(schema[1], ("error", String));
+        assert_eq!(schema[1], ("error", Str));
     }
 
     #[test]
@@ -1776,7 +1778,7 @@ command: "./check.sh"
             gate_type_schema(GATE_TYPE_CONTEXT_MATCHES).expect("context-matches schema must exist");
         assert_eq!(schema.len(), 2);
         assert_eq!(schema[0], ("matches", Boolean));
-        assert_eq!(schema[1], ("error", String));
+        assert_eq!(schema[1], ("error", Str));
     }
 
     #[test]
