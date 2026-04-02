@@ -5533,3 +5533,284 @@ fn gate_override_record_phantom_gate_returns_error() {
         out
     );
 }
+
+// ---------------------------------------------------------------------------
+// Gate contract compiler validation (Feature 3)
+// ---------------------------------------------------------------------------
+
+/// Template with a command gate that has a valid override_default and two
+/// pure-gate transitions routing on exit_code.
+fn gate_contract_valid_template() -> &'static str {
+    r#"---
+name: gate-contract-valid
+version: "1.0"
+initial_state: verify
+states:
+  verify:
+    gates:
+      ci_check:
+        type: command
+        command: "./ci.sh"
+        override_default:
+          exit_code: 0
+          error: ""
+    transitions:
+      - target: done
+        when:
+          gates.ci_check.exit_code: 0
+      - target: fix
+        when:
+          gates.ci_check.exit_code: 1
+  done:
+    terminal: true
+  fix:
+    terminal: true
+---
+
+## verify
+
+Run CI checks.
+
+## done
+
+All checks passed.
+
+## fix
+
+Investigate failures.
+"#
+}
+
+/// Template with a D2 error: override_default missing required field "error".
+fn gate_contract_d2_error_template() -> &'static str {
+    r#"---
+name: gate-contract-d2-error
+version: "1.0"
+initial_state: verify
+states:
+  verify:
+    gates:
+      ci_check:
+        type: command
+        command: "./ci.sh"
+        override_default:
+          exit_code: 0
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## verify
+
+Run CI checks.
+
+## done
+
+All checks passed.
+"#
+}
+
+/// Template with a D3 error: when clause references a nonexistent gate name.
+fn gate_contract_d3_error_template() -> &'static str {
+    r#"---
+name: gate-contract-d3-error
+version: "1.0"
+initial_state: verify
+states:
+  verify:
+    gates:
+      ci_check:
+        type: command
+        command: "./ci.sh"
+    transitions:
+      - target: done
+        when:
+          gates.phantom_gate.exit_code: 0
+      - target: fix
+        when:
+          gates.phantom_gate.exit_code: 1
+  done:
+    terminal: true
+  fix:
+    terminal: true
+---
+
+## verify
+
+Run CI checks.
+
+## done
+
+Passed.
+
+## fix
+
+Failed.
+"#
+}
+
+/// Template that would produce a D4 dead-end error: no transition fires
+/// under the override defaults (both transitions check for exit_code 42/43
+/// but the builtin default is exit_code=0).
+fn gate_contract_d4_dead_end_template() -> &'static str {
+    r#"---
+name: gate-contract-d4-dead-end
+version: "1.0"
+initial_state: verify
+states:
+  verify:
+    gates:
+      ci_check:
+        type: command
+        command: "./ci.sh"
+    transitions:
+      - target: done
+        when:
+          gates.ci_check.exit_code: 42
+      - target: fix
+        when:
+          gates.ci_check.exit_code: 43
+  done:
+    terminal: true
+  fix:
+    terminal: true
+---
+
+## verify
+
+Run CI checks.
+
+## done
+
+All checks passed.
+
+## fix
+
+Investigate failures.
+"#
+}
+
+#[test]
+fn gate_contract_valid_template_compiles() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("gate-contract.md");
+    std::fs::write(&src, gate_contract_valid_template()).unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["template", "compile", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "valid gate-contract template should compile: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn gate_contract_d2_error_template_rejected() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("gate-d2-error.md");
+    std::fs::write(&src, gate_contract_d2_error_template()).unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["template", "compile", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "template with missing override_default field should fail"
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains("override_default missing required field"),
+        "error should name the missing field: {}",
+        out
+    );
+    assert!(
+        out.contains("\"error\""),
+        "error should name the missing field 'error': {}",
+        out
+    );
+}
+
+#[test]
+fn gate_contract_d3_error_template_rejected() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("gate-d3-error.md");
+    std::fs::write(&src, gate_contract_d3_error_template()).unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["template", "compile", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "template with invalid when clause gate reference should fail"
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains("phantom_gate"),
+        "error should name the unknown gate: {}",
+        out
+    );
+}
+
+#[test]
+fn gate_contract_d4_dead_end_template_rejected() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("gate-d4-dead-end.md");
+    std::fs::write(&src, gate_contract_d4_dead_end_template()).unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["template", "compile", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "template with unreachable override path should fail"
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains("no transition fires"),
+        "error should report dead-end reachability failure: {}",
+        out
+    );
+}
+
+#[test]
+fn gate_contract_regression_existing_templates_compile() {
+    // Validate that every *.md fixture under tests/fixtures/ continues to compile
+    // after the gate-contract validation is introduced. This is a regression guard.
+    let fixtures_dir = std::path::Path::new("tests/fixtures");
+    if !fixtures_dir.exists() {
+        return; // No fixtures directory, skip gracefully.
+    }
+    let entries: Vec<_> = std::fs::read_dir(fixtures_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    for entry in entries {
+        let path = entry.path();
+        let output = koto_cmd(dir.path())
+            .args(["template", "compile", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "existing fixture {:?} should still compile: stderr={}",
+            path,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
