@@ -5156,3 +5156,369 @@ fn backend_unknown_value_fails() {
         .failure()
         .stderr(predicates::str::contains("unknown backend: s3-custom"));
 }
+
+// ---------------------------------------------------------------------------
+// gate overrides: functional tests
+// ---------------------------------------------------------------------------
+
+/// A template with a failing command gate so we can test the override flow.
+fn template_with_failing_command_gate() -> String {
+    r#"---
+name: override-test-workflow
+version: "1.0"
+initial_state: start
+states:
+  start:
+    gates:
+      ci_check:
+        type: command
+        command: "exit 1"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Do the gated task.
+
+## done
+
+All done.
+"#
+    .to_string()
+}
+
+/// Full override flow: `koto next` blocks on a gate, `koto overrides record` records the
+/// override, `koto next` advances. The GateOverrideRecorded event in the state file
+/// contains the expected fields.
+#[test]
+fn gate_override_full_flow() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(
+        dir.path(),
+        "override-wf",
+        &template_with_failing_command_gate(),
+    );
+
+    // Step 1: koto next — blocked by failing gate.
+    let blocked = koto_cmd(dir.path())
+        .args(["next", "override-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        blocked.status.success(),
+        "gate_blocked should exit 0: stdout={} stderr={}",
+        String::from_utf8_lossy(&blocked.stdout),
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    let blocked_json: serde_json::Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(
+        blocked_json["action"].as_str(),
+        Some("gate_blocked"),
+        "expected gate_blocked, got: {}",
+        blocked_json
+    );
+
+    // Step 2: koto overrides record — record the override with rationale.
+    let record = koto_cmd(dir.path())
+        .args([
+            "overrides",
+            "record",
+            "override-wf",
+            "--gate",
+            "ci_check",
+            "--rationale",
+            "Manual review confirmed this is safe to proceed.",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        record.status.success(),
+        "overrides record should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&record.stdout),
+        String::from_utf8_lossy(&record.stderr)
+    );
+    let record_json: serde_json::Value = serde_json::from_slice(&record.stdout).unwrap();
+    assert_eq!(
+        record_json["status"].as_str(),
+        Some("recorded"),
+        "expected status=recorded, got: {}",
+        record_json
+    );
+
+    // Step 3: koto next — the override is active; gate is skipped, workflow advances.
+    let advanced = koto_cmd(dir.path())
+        .args(["next", "override-wf", "--no-cleanup"])
+        .output()
+        .unwrap();
+    assert!(
+        advanced.status.success(),
+        "next after override should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&advanced.stdout),
+        String::from_utf8_lossy(&advanced.stderr)
+    );
+    let advanced_json: serde_json::Value = serde_json::from_slice(&advanced.stdout).unwrap();
+    assert_eq!(
+        advanced_json["state"].as_str(),
+        Some("done"),
+        "expected state=done after override, got: {}",
+        advanced_json
+    );
+
+    // Step 4: use koto overrides list to verify the GateOverrideRecorded event
+    // contains the expected fields. Using the CLI avoids direct state file path
+    // concerns when the session directory is cleaned up by auto-advancement.
+    let list = koto_cmd(dir.path())
+        .args(["overrides", "list", "override-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "overrides list should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let list_json: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+
+    let items = list_json["overrides"]["items"]
+        .as_array()
+        .expect("overrides.items should be an array");
+    assert_eq!(
+        items.len(),
+        1,
+        "expected exactly one override, got: {}",
+        items.len()
+    );
+
+    let item = &items[0];
+    assert_eq!(item["state"].as_str(), Some("start"), "item.state mismatch");
+    assert_eq!(
+        item["gate"].as_str(),
+        Some("ci_check"),
+        "item.gate mismatch"
+    );
+    assert_eq!(
+        item["rationale"].as_str(),
+        Some("Manual review confirmed this is safe to proceed."),
+        "item.rationale mismatch"
+    );
+    // override_applied should be the built-in default for "command" type.
+    assert_eq!(
+        item["override_applied"],
+        serde_json::json!({"exit_code": 0, "error": ""}),
+        "item.override_applied mismatch"
+    );
+    assert!(
+        item["timestamp"].as_str().is_some(),
+        "item.timestamp should be present"
+    );
+}
+
+/// `koto overrides list` returns the full session override history in the correct structure,
+/// including overrides recorded before a rewind.
+#[test]
+fn gate_overrides_list_returns_full_history() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "list-wf", &template_with_failing_command_gate());
+
+    // Record an override in the first epoch.
+    let record1 = koto_cmd(dir.path())
+        .args([
+            "overrides",
+            "record",
+            "list-wf",
+            "--gate",
+            "ci_check",
+            "--rationale",
+            "First epoch override.",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        record1.status.success(),
+        "first overrides record should succeed: {}",
+        String::from_utf8_lossy(&record1.stdout)
+    );
+
+    // Advance the workflow past the gated state (the override makes it pass).
+    // Use --no-cleanup so the session survives the terminal state for rewind.
+    let advance = koto_cmd(dir.path())
+        .args(["next", "list-wf", "--to", "done", "--no-cleanup"])
+        .output()
+        .unwrap();
+    assert!(
+        advance.status.success(),
+        "--to done should succeed: {}",
+        String::from_utf8_lossy(&advance.stdout)
+    );
+
+    // Rewind back to start.
+    let rewind = koto_cmd(dir.path())
+        .args(["rewind", "list-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        rewind.status.success(),
+        "rewind should succeed: {}",
+        String::from_utf8_lossy(&rewind.stdout)
+    );
+
+    // Record another override in the second epoch (after rewind).
+    let record2 = koto_cmd(dir.path())
+        .args([
+            "overrides",
+            "record",
+            "list-wf",
+            "--gate",
+            "ci_check",
+            "--rationale",
+            "Second epoch override after rewind.",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        record2.status.success(),
+        "second overrides record should succeed: {}",
+        String::from_utf8_lossy(&record2.stdout)
+    );
+
+    // koto overrides list should return both overrides across all epochs.
+    let list = koto_cmd(dir.path())
+        .args(["overrides", "list", "list-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "overrides list should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let list_json: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+
+    // The state field is the current workflow state.
+    assert!(
+        list_json["state"].as_str().is_some(),
+        "state field should be present: {}",
+        list_json
+    );
+
+    // The overrides.items array contains both overrides (cross-epoch history).
+    let items = list_json["overrides"]["items"]
+        .as_array()
+        .expect("overrides.items should be an array");
+    assert_eq!(
+        items.len(),
+        2,
+        "expected 2 overrides in full history, got: {}",
+        items.len()
+    );
+
+    // Each item has the required fields from Decision 4 of the design.
+    for item in items {
+        assert!(item["state"].as_str().is_some(), "item.state missing");
+        assert!(item["gate"].as_str().is_some(), "item.gate missing");
+        assert!(
+            item["rationale"].as_str().is_some(),
+            "item.rationale missing"
+        );
+        assert!(
+            !item["override_applied"].is_null(),
+            "item.override_applied missing"
+        );
+        assert!(
+            item["timestamp"].as_str().is_some(),
+            "item.timestamp missing"
+        );
+    }
+
+    // Verify the rationales match in order.
+    assert_eq!(
+        items[0]["rationale"].as_str(),
+        Some("First epoch override."),
+        "first item rationale mismatch"
+    );
+    assert_eq!(
+        items[1]["rationale"].as_str(),
+        Some("Second epoch override after rewind."),
+        "second item rationale mismatch"
+    );
+}
+
+/// `koto next --with-data '{"gates": {...}}'` returns a non-zero exit code and prints
+/// the reserved-field error message.
+#[test]
+fn next_with_data_gates_key_returns_reserved_field_error() {
+    let dir = TempDir::new().unwrap();
+    // Use a template with an accepts block so that --with-data is actually processed.
+    init_workflow(dir.path(), "gates-reserved-wf", &template_with_accepts());
+
+    let output = koto_cmd(dir.path())
+        .args([
+            "next",
+            "gates-reserved-wf",
+            "--with-data",
+            r#"{"gates": {"ci_check": {"exit_code": 0}}, "decision": "proceed"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "should fail with non-zero exit code when 'gates' key is present: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains("reserved"),
+        "error message should mention 'reserved': {}",
+        out
+    );
+    assert!(
+        out.contains("gates"),
+        "error message should mention 'gates': {}",
+        out
+    );
+}
+
+/// `koto overrides record` with an unknown gate name returns a non-zero exit code and
+/// an error message identifying the phantom gate.
+#[test]
+fn gate_override_record_phantom_gate_returns_error() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(
+        dir.path(),
+        "phantom-wf",
+        &template_with_failing_command_gate(),
+    );
+
+    let output = koto_cmd(dir.path())
+        .args([
+            "overrides",
+            "record",
+            "phantom-wf",
+            "--gate",
+            "nonexistent_gate",
+            "--rationale",
+            "This gate does not exist.",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "should fail for unknown gate: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains("nonexistent_gate"),
+        "error should mention the unknown gate name: {}",
+        out
+    );
+}

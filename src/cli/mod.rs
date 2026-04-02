@@ -1,6 +1,7 @@
 pub mod context;
 pub mod next;
 pub mod next_types;
+pub mod overrides;
 pub mod session;
 pub mod vars;
 
@@ -133,6 +134,12 @@ pub enum Command {
     Decisions {
         #[command(subcommand)]
         subcommand: DecisionsSubcommand,
+    },
+
+    /// Gate override recording and retrieval
+    Overrides {
+        #[command(subcommand)]
+        subcommand: overrides::OverridesSubcommand,
     },
 
     /// Configuration management subcommands
@@ -496,6 +503,17 @@ fn truncate_output(s: &str, max_bytes: usize) -> String {
     truncated
 }
 
+/// Check whether a parsed evidence JSON object contains the reserved "gates" key.
+///
+/// Returns `true` when the value is a JSON object with a top-level "gates" key.
+/// Returns `false` for non-object values (the evidence schema validator will
+/// catch those separately).
+fn evidence_has_reserved_gates_key(data: &serde_json::Value) -> bool {
+    data.as_object()
+        .map(|o| o.contains_key("gates"))
+        .unwrap_or(false)
+}
+
 /// Execute a command with polling: run repeatedly, evaluate gates after each
 /// execution, and return when all gates pass or the timeout expires.
 ///
@@ -813,6 +831,20 @@ pub fn run(app: App) -> Result<()> {
                     handle_decisions_record(&backend, name, with_data)
                 }
                 DecisionsSubcommand::List { name } => handle_decisions_list(&backend, name),
+            }
+        }
+        Command::Overrides { subcommand } => {
+            let backend = build_backend()?;
+            match subcommand {
+                overrides::OverridesSubcommand::Record {
+                    name,
+                    gate,
+                    rationale,
+                    with_data,
+                } => overrides::handle_overrides_record(&backend, name, gate, rationale, with_data),
+                overrides::OverridesSubcommand::List { name } => {
+                    overrides::handle_overrides_list(&backend, name)
+                }
             }
         }
         Command::Config { subcommand } => handle_config(subcommand),
@@ -1454,6 +1486,20 @@ fn handle_next(
                 exit_with_error_code(json, err.code.exit_code());
             }
         };
+
+        // Reject submissions that include the reserved "gates" key.
+        // The engine writes gate output under this key; agents must not inject it.
+        if evidence_has_reserved_gates_key(&data) {
+            let err = NextError {
+                code: NextErrorCode::InvalidSubmission,
+                message:
+                    r#""gates" is a reserved field; agent submissions must not include this key"#
+                        .to_string(),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code());
+        }
 
         // Validate evidence against schema.
         if let Err(validation_err) = validate_evidence(&data, accepts) {
@@ -2406,5 +2452,36 @@ mod tests {
     fn validate_check_with_output_ok() {
         let args = export_args(ExportFormat::Mermaid, Some("out.md"), false, true);
         assert!(validate_export_flags(&args).is_ok());
+    }
+
+    // ---------------------------------------------------------------------------
+    // evidence_has_reserved_gates_key
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn gates_key_present_is_reserved() {
+        let data = serde_json::json!({"gates": {"ci_check": {"exit_code": 0}}, "other": "value"});
+        assert!(evidence_has_reserved_gates_key(&data));
+    }
+
+    #[test]
+    fn gates_key_absent_is_not_reserved() {
+        let data = serde_json::json!({"decision": "proceed", "notes": "looks good"});
+        assert!(!evidence_has_reserved_gates_key(&data));
+    }
+
+    #[test]
+    fn non_object_value_is_not_reserved() {
+        // Non-objects (malformed payloads) return false; schema validation catches them later.
+        assert!(!evidence_has_reserved_gates_key(&serde_json::json!(
+            "string"
+        )));
+        assert!(!evidence_has_reserved_gates_key(&serde_json::json!(42)));
+        assert!(!evidence_has_reserved_gates_key(&serde_json::json!(null)));
+    }
+
+    #[test]
+    fn empty_object_is_not_reserved() {
+        assert!(!evidence_has_reserved_gates_key(&serde_json::json!({})));
     }
 }

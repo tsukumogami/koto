@@ -419,9 +419,17 @@ where
         // then layer gate output under "gates" (engine data takes precedence).
         // This allows when clauses to reference both agent-submitted fields and
         // gate output via dot-path traversal (e.g. gates.ci_check.exit_code).
-        // TODO(#117): once Feature 2 reserves the gates namespace in evidence
-        // validation, the precedence comment above shifts from "defense in
-        // depth" to "invariant" -- update this comment when that lands.
+        //
+        // The "gates" key is reserved: handle_next rejects any --with-data
+        // payload containing a top-level "gates" key (InvalidSubmission), so by
+        // this point current_evidence must not contain "gates". The assert below
+        // enforces this invariant in debug builds and catches any future code
+        // path that bypasses the CLI check.
+        debug_assert!(
+            !current_evidence.contains_key("gates"),
+            "invariant violated: current_evidence contains reserved key 'gates'; \
+             handle_next must reject submissions with this key before reaching the advance loop"
+        );
         let mut merged: serde_json::Map<String, serde_json::Value> = current_evidence
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
