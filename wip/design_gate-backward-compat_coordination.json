@@ -1,0 +1,23 @@
+{
+  "topic": "gate-backward-compat",
+  "decisions": [
+    {
+      "id": 1,
+      "question": "How is legacy mode declared in a template and enforced by the compiler? Covers: where the opt-in lives (frontmatter field vs CLI flag), what error the compiler emits for undeclared legacy behavior, whether koto init enforces the same rules or only warns, and whether D4 unreferenced-field warnings are suppressed for declared-legacy templates.",
+      "status": "complete",
+      "complexity": "standard",
+      "chosen": "Per-template frontmatter field `legacy_gates: true`",
+      "report_file": "wip/research/design_gate-backward-compat_decision_1_report.md"
+    },
+    {
+      "id": 2,
+      "question": "For states where no when clause references gates.* fields, should the advance loop exclude gate output from the merged resolver evidence map entirely (matching R10), or keep current behavior where gate output is injected but never matched?",
+      "status": "complete",
+      "complexity": "standard",
+      "chosen": "Exclude gate output from merged evidence for legacy states",
+      "report_file": "wip/research/design_gate-backward-compat_decision_2_report.md"
+    }
+  ],
+  "cross_validation": "passed",
+  "round": 1
+}
