@@ -5,7 +5,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::engine::types::{Event, EventPayload};
+use crate::engine::persistence::derive_overrides;
+use crate::engine::types::{now_iso8601, Event, EventPayload};
 use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::template::types::{
     ActionDecl, CompiledTemplate, TemplateState, GATES_EVIDENCE_NAMESPACE,
@@ -166,6 +167,7 @@ pub fn advance_until_stop<F, G, I, A>(
     current_state: &str,
     template: &CompiledTemplate,
     evidence: &BTreeMap<String, serde_json::Value>,
+    all_events: &[Event],
     append_event: &mut F,
     evaluate_gates: &G,
     invoke_integration: &I,
@@ -300,14 +302,78 @@ where
         let mut gate_evidence_map: serde_json::Map<String, serde_json::Value> =
             serde_json::Map::new();
         if !template_state.gates.is_empty() {
-            let gate_results = evaluate_gates(&template_state.gates);
+            // Derive active overrides for the current epoch before iterating gates.
+            // Convert the list of GateOverrideRecorded events to a map from gate name
+            // to override_applied value (last override wins when a gate has multiple).
+            let epoch_overrides: BTreeMap<String, serde_json::Value> = {
+                let override_events = derive_overrides(all_events);
+                let mut map = BTreeMap::new();
+                for event in override_events {
+                    if let EventPayload::GateOverrideRecorded {
+                        gate,
+                        override_applied,
+                        ..
+                    } = &event.payload
+                    {
+                        map.insert(gate.clone(), override_applied.clone());
+                    }
+                }
+                map
+            };
+
+            // Evaluate each gate, injecting a synthetic Passed result for overridden
+            // gates instead of calling evaluate_gates.
+            let mut gate_results: BTreeMap<String, StructuredGateResult> = BTreeMap::new();
+            let mut gates_to_evaluate: BTreeMap<String, crate::template::types::Gate> =
+                BTreeMap::new();
+
+            for (gate_name, gate_def) in &template_state.gates {
+                if let Some(override_applied) = epoch_overrides.get(gate_name) {
+                    // Gate has an active override: inject the override value and a
+                    // synthetic Passed result without calling evaluate_gates.
+                    gate_evidence_map.insert(gate_name.clone(), override_applied.clone());
+                    gate_results.insert(
+                        gate_name.clone(),
+                        StructuredGateResult {
+                            outcome: GateOutcome::Passed,
+                            output: override_applied.clone(),
+                        },
+                    );
+                    // No GateEvaluated event is emitted for overridden gates.
+                    let _ = gate_def; // suppress unused variable warning
+                } else {
+                    gates_to_evaluate.insert(gate_name.clone(), gate_def.clone());
+                }
+            }
+
+            // Evaluate non-overridden gates and emit GateEvaluated events.
+            if !gates_to_evaluate.is_empty() {
+                let evaluated = evaluate_gates(&gates_to_evaluate);
+                for (gate_name, result) in &evaluated {
+                    gate_evidence_map.insert(gate_name.clone(), result.output.clone());
+                    let outcome_str = match result.outcome {
+                        GateOutcome::Passed => "passed",
+                        GateOutcome::Failed => "failed",
+                        GateOutcome::TimedOut => "timed_out",
+                        GateOutcome::Error => "error",
+                    };
+                    let gate_evaluated_payload = EventPayload::GateEvaluated {
+                        state: state.clone(),
+                        gate: gate_name.clone(),
+                        output: result.output.clone(),
+                        outcome: outcome_str.to_string(),
+                        timestamp: now_iso8601(),
+                    };
+                    append_event(&gate_evaluated_payload)
+                        .map_err(AdvanceError::PersistenceError)?;
+                    gate_results.insert(gate_name.clone(), result.clone());
+                }
+            }
 
             // Build the gates sub-map: {"gate_name": output, ...}
             // This is injected into the evidence regardless of pass/fail so that
             // when clauses referencing gates.* can route based on gate output.
-            for (name, result) in &gate_results {
-                gate_evidence_map.insert(name.clone(), result.output.clone());
-            }
+            // (gate_evidence_map is already populated above)
 
             let any_failed = gate_results
                 .values()
@@ -1085,6 +1151,7 @@ mod tests {
             "plan",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &noop_gates,
             &unavailable_integration,
@@ -1154,6 +1221,7 @@ mod tests {
             "gated",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &gate_eval,
             &unavailable_integration,
@@ -1193,6 +1261,7 @@ mod tests {
             "review",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &noop_gates,
             &unavailable_integration,
@@ -1236,6 +1305,7 @@ mod tests {
             "review",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &noop_gates,
             &unavailable_integration,
@@ -1312,6 +1382,7 @@ mod tests {
             "verify",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &gate_eval,
             &unavailable_integration,
@@ -1433,6 +1504,7 @@ mod tests {
             "check",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &gate_eval,
             &unavailable_integration,
@@ -1540,6 +1612,7 @@ mod tests {
             "check",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &gate_eval,
             &unavailable_integration,
@@ -1636,6 +1709,7 @@ mod tests {
             "verify",
             &template,
             &agent_evidence,
+            &[],
             &mut append,
             &gate_eval,
             &unavailable_integration,
@@ -1724,6 +1798,7 @@ mod tests {
             "guarded",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &passing_eval,
             &unavailable_integration,
@@ -1759,6 +1834,7 @@ mod tests {
             "guarded",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append2,
             &failing_eval,
             &unavailable_integration,
@@ -1794,6 +1870,7 @@ mod tests {
             "guarded",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append3,
             &timeout_eval,
             &unavailable_integration,
@@ -1826,6 +1903,7 @@ mod tests {
             "guarded",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append4,
             &error_eval,
             &unavailable_integration,
@@ -1878,6 +1956,7 @@ mod tests {
             "a",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &noop_gates,
             &unavailable_integration,
@@ -1925,6 +2004,7 @@ mod tests {
             "integrate",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &noop_gates,
             &integration,
@@ -1988,6 +2068,7 @@ mod tests {
             "s0",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &noop_gates,
             &unavailable_integration,
@@ -2023,6 +2104,7 @@ mod tests {
             "done",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &noop_gates,
             &unavailable_integration,
@@ -2088,6 +2170,7 @@ mod tests {
             "a",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &noop_gates,
             &unavailable_integration,
@@ -2157,6 +2240,7 @@ mod tests {
             "start",
             &template,
             &evidence,
+            &[],
             &mut append,
             &noop_gates,
             &unavailable_integration,
@@ -2225,6 +2309,7 @@ mod tests {
             "act",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &noop_gates,
             &unavailable_integration,
@@ -2271,6 +2356,7 @@ mod tests {
             "plain",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &noop_gates,
             &unavailable_integration,
@@ -2313,6 +2399,7 @@ mod tests {
             "confirm",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &noop_gates,
             &unavailable_integration,
@@ -2395,6 +2482,7 @@ mod tests {
             "gated_action",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &gate_eval,
             &unavailable_integration,
@@ -2455,6 +2543,7 @@ mod tests {
             "act",
             &template,
             &BTreeMap::new(),
+            &[],
             &mut append,
             &noop_gates,
             &unavailable_integration,
@@ -2522,6 +2611,7 @@ mod tests {
             "check",
             &template,
             &evidence,
+            &[],
             &mut append,
             &noop_gates,
             &unavailable_integration,
@@ -2531,5 +2621,562 @@ mod tests {
         .unwrap();
 
         assert!(received_has_evidence.load(Ordering::Relaxed));
+    }
+
+    // -----------------------------------------------------------------------
+    // Gate override pre-check tests
+    // -----------------------------------------------------------------------
+
+    fn make_event(seq: u64, payload: EventPayload) -> Event {
+        Event {
+            seq,
+            timestamp: "2026-04-01T00:00:00Z".to_string(),
+            event_type: payload.type_name().to_string(),
+            payload,
+        }
+    }
+
+    fn make_gate_def(gate_type: &str) -> crate::template::types::Gate {
+        crate::template::types::Gate {
+            gate_type: gate_type.to_string(),
+            command: String::new(),
+            timeout: 0,
+            key: String::new(),
+            pattern: String::new(),
+            override_default: None,
+        }
+    }
+
+    /// Build a minimal event log that puts `derive_overrides` in the correct epoch:
+    /// a Transitioned event to `state` followed by the given GateOverrideRecorded events.
+    fn override_events(state: &str, gate: &str, override_applied: serde_json::Value) -> Vec<Event> {
+        vec![
+            make_event(
+                1,
+                EventPayload::Transitioned {
+                    from: None,
+                    to: state.to_string(),
+                    condition_type: "auto".to_string(),
+                },
+            ),
+            make_event(
+                2,
+                EventPayload::GateOverrideRecorded {
+                    state: state.to_string(),
+                    gate: gate.to_string(),
+                    rationale: "test override".to_string(),
+                    override_applied,
+                    actual_output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    timestamp: "2026-04-01T00:00:00Z".to_string(),
+                },
+            ),
+        ]
+    }
+
+    // Test 1: one gate with an active GateOverrideRecorded; assert the gate appears
+    // in gate_evidence_map with override_applied, gate_results shows Passed, and
+    // no GateEvaluated event is emitted for the overridden gate.
+    #[test]
+    fn override_injects_passed_result_and_no_gate_evaluated_event() {
+        use crate::template::types::Gate;
+
+        let override_val = serde_json::json!({"exit_code": 0, "error": ""});
+        let all_events = override_events("gated", "ci", override_val.clone());
+
+        let mut gates = BTreeMap::new();
+        gates.insert("ci".to_string(), make_gate_def("command"));
+
+        let template = make_template(vec![
+            (
+                "gated",
+                TemplateState {
+                    directive: "Gated.".to_string(),
+                    details: String::new(),
+                    transitions: vec![unconditional("done")],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        let mut appended: Vec<EventPayload> = Vec::new();
+        let mut append = |payload: &EventPayload| -> Result<(), String> {
+            appended.push(payload.clone());
+            Ok(())
+        };
+        let shutdown = AtomicBool::new(false);
+
+        // evaluate_gates should never be called for the overridden gate.
+        let gate_eval = |_gates: &BTreeMap<String, Gate>| {
+            // If called, this is a test failure (overridden gate should skip evaluate_gates).
+            BTreeMap::new()
+        };
+
+        let result = advance_until_stop(
+            "gated",
+            &template,
+            &BTreeMap::new(),
+            &all_events,
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // The override causes the gate to pass, so the loop advances to "done" (terminal).
+        assert_eq!(result.final_state, "done");
+        assert!(result.advanced);
+        assert!(matches!(result.stop_reason, StopReason::Terminal));
+
+        // GateEvaluated event must NOT appear for the overridden gate "ci".
+        let gate_evaluated_for_ci = appended
+            .iter()
+            .any(|p| matches!(p, EventPayload::GateEvaluated { gate, .. } if gate == "ci"));
+        assert!(
+            !gate_evaluated_for_ci,
+            "GateEvaluated must not be emitted for an overridden gate"
+        );
+    }
+
+    // Test 2: two gates, one overridden one not. The non-overridden gate fails.
+    // Verify: overridden gate has Passed (no GateEvaluated), non-overridden gate
+    // produces GateEvaluated, and any_failed reflects only the non-overridden gate.
+    #[test]
+    fn partial_override_only_non_overridden_gate_contributes_to_failure() {
+        use crate::template::types::Gate;
+
+        let override_val = serde_json::json!({"exit_code": 0, "error": ""});
+        let all_events = override_events("review", "ci", override_val.clone());
+
+        let mut gates = BTreeMap::new();
+        gates.insert("ci".to_string(), make_gate_def("command"));
+        gates.insert("lint".to_string(), make_gate_def("command"));
+
+        let template = make_template(vec![
+            (
+                "review",
+                TemplateState {
+                    directive: "Review.".to_string(),
+                    details: String::new(),
+                    transitions: vec![unconditional("done")],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        let mut appended: Vec<EventPayload> = Vec::new();
+        let mut append = |payload: &EventPayload| -> Result<(), String> {
+            appended.push(payload.clone());
+            Ok(())
+        };
+        let shutdown = AtomicBool::new(false);
+
+        // Only "lint" gate is evaluated; "ci" is overridden.
+        let gate_eval = |gates: &BTreeMap<String, Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                if name == "lint" {
+                    results.insert(
+                        name.clone(),
+                        StructuredGateResult {
+                            outcome: GateOutcome::Failed,
+                            output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        },
+                    );
+                }
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "review",
+            &template,
+            &BTreeMap::new(),
+            &all_events,
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // The "lint" gate failed, so the loop is blocked.
+        assert_eq!(result.final_state, "review");
+        assert!(matches!(result.stop_reason, StopReason::GateBlocked(_)));
+
+        if let StopReason::GateBlocked(gate_results) = &result.stop_reason {
+            // Overridden gate "ci" appears with Passed outcome (override injected).
+            assert!(
+                gate_results
+                    .get("ci")
+                    .map(|r| r.outcome == GateOutcome::Passed)
+                    .unwrap_or(false),
+                "ci gate was overridden; must appear with Passed outcome in gate_results"
+            );
+            // Non-overridden "lint" gate should be failed.
+            assert_eq!(
+                gate_results["lint"].outcome,
+                GateOutcome::Failed,
+                "lint gate should have Failed outcome"
+            );
+        }
+
+        // GateEvaluated should exist for "lint" but NOT for "ci".
+        let evaluated_ci = appended
+            .iter()
+            .any(|p| matches!(p, EventPayload::GateEvaluated { gate, .. } if gate == "ci"));
+        let evaluated_lint = appended
+            .iter()
+            .any(|p| matches!(p, EventPayload::GateEvaluated { gate, .. } if gate == "lint"));
+        assert!(
+            !evaluated_ci,
+            "GateEvaluated must not be emitted for overridden gate 'ci'"
+        );
+        assert!(
+            evaluated_lint,
+            "GateEvaluated must be emitted for non-overridden gate 'lint'"
+        );
+    }
+
+    // Test 3: one command gate, no active override, evaluation returns non-passing.
+    // The blocking condition in GateBlocked must have agent_actionable checked
+    // via blocking_conditions_from_gates (tested in next_types.rs). This test
+    // verifies the advance loop produces a GateBlocked stop reason for a failing gate.
+    #[test]
+    fn failing_command_gate_without_override_produces_gate_blocked() {
+        use crate::template::types::Gate;
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "build".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+            },
+        );
+
+        let template = make_template(vec![
+            (
+                "build-state",
+                TemplateState {
+                    directive: "Build.".to_string(),
+                    details: String::new(),
+                    transitions: vec![unconditional("done")],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        // No overrides in the event log.
+        let all_events: Vec<Event> = vec![make_event(
+            1,
+            EventPayload::Transitioned {
+                from: None,
+                to: "build-state".to_string(),
+                condition_type: "auto".to_string(),
+            },
+        )];
+
+        let mut appended: Vec<EventPayload> = Vec::new();
+        let mut append = |payload: &EventPayload| -> Result<(), String> {
+            appended.push(payload.clone());
+            Ok(())
+        };
+        let shutdown = AtomicBool::new(false);
+
+        let gate_eval = |gates: &BTreeMap<String, Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Failed,
+                        output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    },
+                );
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "build-state",
+            &template,
+            &BTreeMap::new(),
+            &all_events,
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Gate blocked.
+        assert_eq!(result.final_state, "build-state");
+        assert!(matches!(result.stop_reason, StopReason::GateBlocked(_)));
+
+        // GateEvaluated event was emitted for "build".
+        let evaluated_build = appended.iter().any(|p| {
+            matches!(p, EventPayload::GateEvaluated { gate, outcome, .. }
+                if gate == "build" && outcome == "failed")
+        });
+        assert!(
+            evaluated_build,
+            "GateEvaluated must be emitted for non-overridden failing gate"
+        );
+    }
+
+    // Test 4: one gate with active override. The loop must advance past the gate
+    // (blocking_conditions empty, status is not gate_blocked).
+    #[test]
+    fn active_override_causes_gate_to_pass_and_loop_advances() {
+        use crate::template::types::Gate;
+
+        let override_val = serde_json::json!({"exit_code": 0, "error": ""});
+        let all_events = override_events("blocked", "ci", override_val.clone());
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "ci".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+            },
+        );
+
+        let template = make_template(vec![
+            (
+                "blocked",
+                TemplateState {
+                    directive: "Blocked.".to_string(),
+                    details: String::new(),
+                    transitions: vec![unconditional("done")],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        // evaluate_gates would make the gate fail if called, but it shouldn't be.
+        let gate_eval = |gates: &BTreeMap<String, Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Failed,
+                        output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    },
+                );
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "blocked",
+            &template,
+            &BTreeMap::new(),
+            &all_events,
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // The override caused the gate to pass; the loop advanced to terminal state.
+        assert_eq!(result.final_state, "done");
+        assert!(result.advanced);
+        assert!(matches!(result.stop_reason, StopReason::Terminal));
+        // Status is NOT gate_blocked.
+        assert!(!matches!(result.stop_reason, StopReason::GateBlocked(_)));
+    }
+
+    // Test 5: one gate with unknown type and no override_default; evaluation fails.
+    // Verifies that the GateEvaluated event is still emitted for unknown-type gates
+    // (no override path), and the loop produces GateBlocked.
+    #[test]
+    fn unknown_gate_type_no_override_default_produces_gate_blocked() {
+        use crate::template::types::Gate;
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "custom-check".to_string(),
+            Gate {
+                gate_type: "custom-unknown".to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+            },
+        );
+
+        let template = make_template(vec![
+            (
+                "check-state",
+                TemplateState {
+                    directive: "Check.".to_string(),
+                    details: String::new(),
+                    transitions: vec![unconditional("done")],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+        ]);
+
+        let all_events: Vec<Event> = vec![make_event(
+            1,
+            EventPayload::Transitioned {
+                from: None,
+                to: "check-state".to_string(),
+                condition_type: "auto".to_string(),
+            },
+        )];
+
+        let mut appended: Vec<EventPayload> = Vec::new();
+        let mut append = |payload: &EventPayload| -> Result<(), String> {
+            appended.push(payload.clone());
+            Ok(())
+        };
+        let shutdown = AtomicBool::new(false);
+
+        // Gate evaluator returns an Error outcome for the unknown type.
+        let gate_eval = |gates: &BTreeMap<String, Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Error,
+                        output: serde_json::json!({"exit_code": -1, "error": "unsupported gate type"}),
+                    },
+                );
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "check-state",
+            &template,
+            &BTreeMap::new(),
+            &all_events,
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Gate blocked.
+        assert_eq!(result.final_state, "check-state");
+        assert!(matches!(result.stop_reason, StopReason::GateBlocked(_)));
+
+        // GateEvaluated was emitted (no override; the gate was actually evaluated).
+        let evaluated = appended.iter().any(
+            |p| matches!(p, EventPayload::GateEvaluated { gate, .. } if gate == "custom-check"),
+        );
+        assert!(
+            evaluated,
+            "GateEvaluated must be emitted for non-overridden gate with unknown type"
+        );
     }
 }

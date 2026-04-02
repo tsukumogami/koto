@@ -1677,6 +1677,7 @@ fn handle_next(
         current_state,
         &compiled,
         &evidence,
+        &current_events,
         &mut append_closure,
         &gate_closure,
         &integration_closure,
