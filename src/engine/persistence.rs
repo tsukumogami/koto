@@ -335,7 +335,7 @@ pub fn derive_overrides(events: &[Event]) -> Vec<&Event> {
 
     events[start..]
         .iter()
-        .filter(|e| matches!(&e.payload, EventPayload::GateOverrideRecorded { .. }))
+        .filter(|e| matches!(&e.payload, EventPayload::GateOverrideRecorded { state, .. } if state == &current_state))
         .collect()
 }
 
@@ -1219,6 +1219,32 @@ mod tests {
         assert_eq!(overrides.len(), 2);
         assert_eq!(overrides[0].seq, 4);
         assert_eq!(overrides[1].seq, 5);
+    }
+
+    #[test]
+    fn derive_overrides_state_field_mismatch_excluded() {
+        // A GateOverrideRecorded event whose state field does not match the
+        // current state must be excluded, even when it falls after the epoch
+        // boundary. This mirrors the guard applied by derive_decisions and
+        // derive_evidence.
+        let events = vec![
+            make_event(
+                1,
+                EventPayload::Transitioned {
+                    from: None,
+                    to: "review".to_string(),
+                    condition_type: "auto".to_string(),
+                },
+            ),
+            // Mismatched state field: should be excluded.
+            make_override_event(2, "other_state", "ci-passes"),
+            // Correct state field: should be included.
+            make_override_event(3, "review", "lint-passes"),
+        ];
+
+        let overrides = derive_overrides(&events);
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].seq, 3);
     }
 
     // -----------------------------------------------------------------------
