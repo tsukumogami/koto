@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-gate-transition-contract.md
 problem: |
   Features 1 and 2 of the gate-transition contract landed structured gate output
@@ -33,7 +33,7 @@ rationale: |
 
 ## Status
 
-Accepted
+Planned
 
 ## Upstream Design Reference
 
