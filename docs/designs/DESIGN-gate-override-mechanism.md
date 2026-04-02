@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-gate-transition-contract.md
 problem: |
   Gate evaluation is one-directional: the engine runs the gate and the result is final.
@@ -31,7 +31,7 @@ rationale: |
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
