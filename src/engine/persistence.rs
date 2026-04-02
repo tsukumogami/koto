@@ -1115,33 +1115,17 @@ mod tests {
     }
 
     #[test]
-    fn derive_overrides_no_state_change_returns_all() {
-        // No preceding state-changing event: all GateOverrideRecorded events returned.
-        // However, without a state-changing event, derive_state_from_log returns None,
-        // and derive_overrides returns empty per the epoch-boundary contract.
-        // The AC says "no preceding state-changing event" and references overrides being returned,
-        // but the epoch logic requires a current state. We interpret this as: when overrides exist
-        // and the only state-changing event is the one that set the current state, all overrides
-        // after that boundary are returned.
-        //
-        // This test verifies the simplest case: one Transitioned event followed by overrides.
+    fn derive_overrides_no_state_change_returns_empty() {
+        // Event log contains only GateOverrideRecorded events with no preceding state-changing
+        // event. derive_state_from_log returns None, so derive_overrides returns an empty Vec
+        // because no epoch boundary can be established.
         let events = vec![
-            make_event(
-                1,
-                EventPayload::Transitioned {
-                    from: None,
-                    to: "review".to_string(),
-                    condition_type: "auto".to_string(),
-                },
-            ),
-            make_override_event(2, "review", "ci-passes"),
-            make_override_event(3, "review", "lint-passes"),
+            make_override_event(1, "review", "ci-passes"),
+            make_override_event(2, "review", "lint-passes"),
         ];
 
         let overrides = derive_overrides(&events);
-        assert_eq!(overrides.len(), 2);
-        assert_eq!(overrides[0].seq, 2);
-        assert_eq!(overrides[1].seq, 3);
+        assert_eq!(overrides.len(), 0);
     }
 
     #[test]
