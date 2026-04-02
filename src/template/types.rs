@@ -229,6 +229,9 @@ fn resolve_gates_path<'a>(
     evidence: &'a serde_json::Value,
     path: &str,
 ) -> Option<&'a serde_json::Value> {
+    if path.is_empty() {
+        return None;
+    }
     let mut current = evidence;
     for segment in path.split('.') {
         current = current.get(segment)?;
@@ -523,12 +526,10 @@ impl CompiledTemplate {
         }
 
         // D4: gate reachability check. Runs only after D2 and D3 passed for all
-        // states above (any D2 or D3 error causes an early return before this point).
-        // prior_error_count is 0 here by construction; it is passed explicitly so
-        // validate_gate_reachability() can document and enforce the precondition (AC8).
-        let prior_error_count: usize = 0;
+        // states above (any D2 or D3 error causes an early return before this point,
+        // so reaching here guarantees the evidence maps are well-formed).
         for (state_name, state) in &self.states {
-            self.validate_gate_reachability(state_name, state, prior_error_count)?;
+            self.validate_gate_reachability(state_name, state)?;
         }
 
         Ok(())
@@ -547,13 +548,10 @@ impl CompiledTemplate {
         &self,
         state_name: &str,
         state: &TemplateState,
-        prior_error_count: usize,
     ) -> Result<(), String> {
-        // AC8: if D2 or D3 produced errors, the evidence map may be malformed;
-        // skip to avoid cascading false positives.
-        if prior_error_count > 0 {
-            return Ok(());
-        }
+        // D4 is only reachable after D2 and D3 pass for all states (validate() returns
+        // early on any D2 or D3 error before the D4 loop). Evidence maps are therefore
+        // well-formed when this method runs.
 
         let gates_prefix = format!("{}.", GATES_EVIDENCE_NAMESPACE);
 
