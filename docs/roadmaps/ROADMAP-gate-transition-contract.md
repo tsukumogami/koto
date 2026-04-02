@@ -166,8 +166,8 @@ is possible but the reachability check specifically needs the full model.
 | ~~_Gates produce structured data per gate type schema. Gate output feeds into transition `when` clauses via `gates.*` namespace. Resolver gains dot-path traversal. Foundation for all other features._~~ | | |
 | ~~[#117: gate override mechanism with rationale](https://github.com/tsukumogami/koto/issues/117)~~ ✓ | [#116](https://github.com/tsukumogami/koto/issues/116) | testable |
 | ~~_`koto overrides record` substitutes gate output with default or agent-provided data. Override events capture rationale and full context. `koto overrides list` for session-wide queries._~~ | | |
-| [#118: gate-transition contract compiler validation](https://github.com/tsukumogami/koto/issues/118) | [#116](https://github.com/tsukumogami/koto/issues/116), [#117](https://github.com/tsukumogami/koto/issues/117) | testable |
-| _Compiler validates gate types are registered, override defaults match schemas, `when` clauses reference valid fields, and override defaults produce reachable transitions._ | | |
+| ~~[#118: gate-transition contract compiler validation](https://github.com/tsukumogami/koto/issues/118)~~ ✓ | [#116](https://github.com/tsukumogami/koto/issues/116), [#117](https://github.com/tsukumogami/koto/issues/117) | testable |
+| ~~_Compiler validates gate types are registered, override defaults match schemas, `when` clauses reference valid fields, and override defaults produce reachable transitions._~~ | | |
 | [#119: backward compatibility for legacy gate templates](https://github.com/tsukumogami/koto/issues/119) | [#116](https://github.com/tsukumogami/koto/issues/116) | testable |
 | _Existing templates work without changes. Legacy boolean behavior when `when` clauses don't reference `gates.*`. Likely implemented alongside #116._ | | |
 
@@ -187,8 +187,8 @@ graph TD
 
     classDef needsDesign fill:#e1bee7
     classDef done fill:#c8e6c9,stroke:#388e3c
-    class I118,I119 needsDesign
-    class I116,I117 done
+    class I119 needsDesign
+    class I116,I117,I118 done
 ```
 
 **Legend**: Purple = needs-design, Green = complete
@@ -197,5 +197,5 @@ graph TD
 
 - Feature 1 (#116): Complete (PR #120)
 - Feature 2 (#117): Complete (PR #122)
-- Feature 3 (#118): Not started
+- Feature 3 (#118): Complete (PR #123)
 - Feature 4 (#119): Not started
