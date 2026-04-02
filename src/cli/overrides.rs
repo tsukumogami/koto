@@ -8,7 +8,6 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::cache::sha256_hex;
-use crate::engine::errors::EngineError;
 use crate::engine::persistence::{
     derive_last_gate_evaluated, derive_machine_state, derive_overrides_all, derive_state_from_log,
 };
@@ -16,25 +15,9 @@ use crate::engine::types::{now_iso8601, EventPayload};
 use crate::gate::built_in_default;
 use crate::session::SessionBackend;
 
-/// Maximum payload size for --with-data and --rationale (1 MB).
-const MAX_WITH_DATA_BYTES: usize = 1_048_576;
-
-/// Exit code for infrastructure / config errors.
-const EXIT_INFRASTRUCTURE: i32 = 3;
-
-/// Print a JSON error and exit with a specific code.
-fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
-    println!("{}", serde_json::to_string(&error).unwrap_or_default());
-    std::process::exit(code);
-}
-
-/// Determine the exit code for an engine error.
-fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
-    match err.downcast_ref::<EngineError>() {
-        Some(EngineError::StateFileCorrupted(_)) => EXIT_INFRASTRUCTURE,
-        _ => 1,
-    }
-}
+use super::{
+    exit_code_for_engine_error, exit_with_error_code, EXIT_INFRASTRUCTURE, MAX_WITH_DATA_BYTES,
+};
 
 #[derive(Subcommand)]
 pub enum OverridesSubcommand {
@@ -161,6 +144,8 @@ pub fn handle_overrides_record(
     let machine_state = match derive_machine_state(&header, &events) {
         Some(ms) => ms,
         None => {
+            // EXIT_INFRASTRUCTURE (3) is correct here; handle_decisions_record uses 1 by
+            // mistake — that's a pre-existing inconsistency in decisions, not a reference to follow.
             exit_with_error_code(
                 serde_json::json!({
                     "error": "corrupt state file: cannot derive current state",
@@ -270,15 +255,16 @@ pub fn handle_overrides_record(
         derive_last_gate_evaluated(&events, &gate).unwrap_or(serde_json::Value::Null);
 
     // 6. Append GateOverrideRecorded event
+    let ts = now_iso8601();
     let payload = EventPayload::GateOverrideRecorded {
         state: current_state.clone(),
         gate: gate.clone(),
         rationale: rationale.clone(),
         override_applied: override_applied.clone(),
         actual_output: actual_output.clone(),
-        timestamp: now_iso8601(),
+        timestamp: ts.clone(),
     };
-    if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
+    if let Err(e) = backend.append_event(&name, &payload, &ts) {
         exit_with_error_code(
             serde_json::json!({
                 "error": e.to_string(),

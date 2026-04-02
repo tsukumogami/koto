@@ -27,7 +27,7 @@ use crate::session::{state_file_name, Backend, SessionBackend};
 use crate::template::types::CompiledTemplate;
 
 /// Maximum payload size for --with-data (1 MB).
-const MAX_WITH_DATA_BYTES: usize = 1_048_576;
+pub(super) const MAX_WITH_DATA_BYTES: usize = 1_048_576;
 
 /// Maximum size of captured stdout/stderr from action execution (64 KB).
 const MAX_ACTION_OUTPUT_BYTES: usize = 64 * 1024;
@@ -40,7 +40,7 @@ const MAX_ACTION_OUTPUT_BYTES: usize = 64 * 1024;
 ///
 /// `NextErrorCode::exit_code()` handles codes 1 and 2 for domain errors.
 /// `exit_code_for_engine_error()` and this constant handle code 3.
-const EXIT_INFRASTRUCTURE: i32 = 3;
+pub(super) const EXIT_INFRASTRUCTURE: i32 = 3;
 
 #[derive(Parser)]
 #[command(
@@ -368,7 +368,7 @@ fn exit_with_error(error: serde_json::Value) -> ! {
 }
 
 /// Print a JSON error and exit with a specific exit code.
-fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
+pub(super) fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
     println!("{}", serde_json::to_string(&error).unwrap_or_default());
     std::process::exit(code);
 }
@@ -377,7 +377,7 @@ fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
 ///
 /// Returns exit code 3 for corrupted state files, and exit code 1 for all
 /// other errors.
-fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
+pub(super) fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
     match err.downcast_ref::<EngineError>() {
         Some(EngineError::StateFileCorrupted(_)) => EXIT_INFRASTRUCTURE,
         _ => 1,
