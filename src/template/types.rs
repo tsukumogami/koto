@@ -171,9 +171,7 @@ pub enum GateSchemaFieldType {
 /// - `command`:        `[("exit_code", Number), ("error", String)]`
 /// - `context-exists`: `[("exists", Boolean), ("error", String)]`
 /// - `context-matches`:`[("matches", Boolean), ("error", String)]`
-pub fn gate_type_schema(
-    gate_type: &str,
-) -> Option<&'static [(&'static str, GateSchemaFieldType)]> {
+pub fn gate_type_schema(gate_type: &str) -> Option<&'static [(&'static str, GateSchemaFieldType)]> {
     use GateSchemaFieldType::*;
     match gate_type {
         GATE_TYPE_COMMAND => Some(&[("exit_code", Number), ("error", String)]),
@@ -197,6 +195,41 @@ pub fn gate_type_builtin_default(gate_type: &str) -> Option<serde_json::Value> {
         GATE_TYPE_CONTEXT_EXISTS => Some(serde_json::json!({"exists": true, "error": ""})),
         GATE_TYPE_CONTEXT_MATCHES => Some(serde_json::json!({"matches": true, "error": ""})),
         _ => None,
+    }
+}
+
+/// Return the lowercase type name of a JSON value (for error messages).
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    if value.is_number() {
+        "number"
+    } else if value.is_string() {
+        "string"
+    } else if value.is_boolean() {
+        "boolean"
+    } else if value.is_array() {
+        "array"
+    } else if value.is_object() {
+        "object"
+    } else {
+        "null"
+    }
+}
+
+/// Return the lowercase name of a `GateSchemaFieldType` for error messages.
+fn gate_schema_field_type_name(t: &GateSchemaFieldType) -> &'static str {
+    match t {
+        GateSchemaFieldType::Number => "number",
+        GateSchemaFieldType::String => "string",
+        GateSchemaFieldType::Boolean => "boolean",
+    }
+}
+
+/// Return true if `value`'s JSON type matches the expected `GateSchemaFieldType`.
+fn json_value_matches_schema_type(value: &serde_json::Value, t: &GateSchemaFieldType) -> bool {
+    match t {
+        GateSchemaFieldType::Number => value.is_number(),
+        GateSchemaFieldType::String => value.is_string(),
+        GateSchemaFieldType::Boolean => value.is_boolean(),
     }
 }
 
@@ -298,6 +331,79 @@ impl CompiledTemplate {
                     }
                 }
             }
+            // D2: validate override_default against gate type schema.
+            for (gate_name, gate) in &state.gates {
+                if let Some(override_val) = &gate.override_default {
+                    // Only known gate types have schemas; unknown types are already
+                    // rejected above, so if gate_type_schema returns None here the
+                    // gate type is unknown and the error was already emitted.
+                    if let Some(schema) = gate_type_schema(gate.gate_type.as_str()) {
+                        // Must be a JSON object.
+                        let obj = match override_val.as_object() {
+                            Some(o) => o,
+                            None => {
+                                return Err(format!(
+                                    "state {:?} gate {:?}: override_default is not a JSON object (found: {})",
+                                    state_name,
+                                    gate_name,
+                                    json_type_name(override_val)
+                                ));
+                            }
+                        };
+
+                        // Check for missing required fields.
+                        for (field, _field_type) in schema {
+                            if !obj.contains_key(*field) {
+                                let hint: Vec<String> = schema
+                                    .iter()
+                                    .map(|(n, t)| {
+                                        format!("{}: {}", n, gate_schema_field_type_name(t))
+                                    })
+                                    .collect();
+                                return Err(format!(
+                                    "state {:?} gate {:?}: override_default missing required field {:?}\n  ({} schema requires: {})",
+                                    state_name,
+                                    gate_name,
+                                    field,
+                                    gate.gate_type,
+                                    hint.join(", ")
+                                ));
+                            }
+                        }
+
+                        // Check for unknown fields.
+                        for key in obj.keys() {
+                            if !schema.iter().any(|(n, _)| n == key) {
+                                let known: Vec<&str> = schema.iter().map(|(n, _)| *n).collect();
+                                return Err(format!(
+                                    "state {:?} gate {:?}: override_default has unknown field {:?}\n  ({} schema: {})",
+                                    state_name,
+                                    gate_name,
+                                    key,
+                                    gate.gate_type,
+                                    known.join(", ")
+                                ));
+                            }
+                        }
+
+                        // Check that each field value matches the expected type.
+                        for (field, expected_type) in schema {
+                            let value = &obj[*field];
+                            if !json_value_matches_schema_type(value, expected_type) {
+                                return Err(format!(
+                                    "state {:?} gate {:?}: override_default field {:?} has wrong type\n  expected: {}, found: {}",
+                                    state_name,
+                                    gate_name,
+                                    field,
+                                    gate_schema_field_type_name(expected_type),
+                                    json_type_name(value)
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
             // Validate accepts block field schemas.
             if let Some(accepts) = &state.accepts {
                 for (field_name, schema) in accepts {
@@ -452,6 +558,46 @@ impl CompiledTemplate {
                          (string, number, or boolean), not an array or object",
                         state_name, transition.target, field
                     ));
+                }
+            }
+
+            // D3: validate gates.* path structure and field references.
+            for (field, _) in &gate_fields {
+                let segments: Vec<&str> = field.splitn(4, '.').collect();
+                // segments[0] is "gates"; we need exactly 3 segments total.
+                if segments.len() != 3 {
+                    return Err(format!(
+                        "state {:?}: when clause key {:?} has invalid format; expected \"gates.<gate>.<field>\"",
+                        state_name, field.as_str()
+                    ));
+                }
+                let gate_name_ref = segments[1];
+                let field_name_ref = segments[2];
+
+                // Gate name must be declared in this state's gates block.
+                let gate = match state.gates.get(gate_name_ref) {
+                    Some(g) => g,
+                    None => {
+                        return Err(format!(
+                            "state {:?}: when clause references gate {:?} which is not declared in this state",
+                            state_name, gate_name_ref
+                        ));
+                    }
+                };
+
+                // Field name must be valid for this gate type's schema.
+                if let Some(schema) = gate_type_schema(&gate.gate_type) {
+                    let valid_fields: Vec<&str> = schema.iter().map(|(name, _)| *name).collect();
+                    if !valid_fields.contains(&field_name_ref) {
+                        return Err(format!(
+                            "state {:?} gate {:?}: when clause references unknown field {:?}; {} gate fields: {}",
+                            state_name,
+                            gate_name_ref,
+                            field_name_ref,
+                            gate.gate_type,
+                            valid_fields.join(", ")
+                        ));
+                    }
                 }
             }
 
@@ -1626,8 +1772,8 @@ command: "./check.sh"
     #[test]
     fn gate_type_schema_context_matches() {
         use GateSchemaFieldType::*;
-        let schema = gate_type_schema(GATE_TYPE_CONTEXT_MATCHES)
-            .expect("context-matches schema must exist");
+        let schema =
+            gate_type_schema(GATE_TYPE_CONTEXT_MATCHES).expect("context-matches schema must exist");
         assert_eq!(schema.len(), 2);
         assert_eq!(schema[0], ("matches", Boolean));
         assert_eq!(schema[1], ("error", String));
@@ -1667,6 +1813,180 @@ command: "./check.sh"
     fn gate_type_builtin_default_unknown_returns_none() {
         assert!(gate_type_builtin_default("jira").is_none());
         assert!(gate_type_builtin_default("").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 2: override_default validation tests
+    // -----------------------------------------------------------------------
+
+    fn make_command_gate(override_default: Option<serde_json::Value>) -> Gate {
+        Gate {
+            gate_type: GATE_TYPE_COMMAND.to_string(),
+            command: "./check.sh".to_string(),
+            timeout: 0,
+            key: String::new(),
+            pattern: String::new(),
+            override_default,
+        }
+    }
+
+    fn make_context_exists_gate(override_default: Option<serde_json::Value>) -> Gate {
+        Gate {
+            gate_type: GATE_TYPE_CONTEXT_EXISTS.to_string(),
+            command: String::new(),
+            timeout: 0,
+            key: "some/key.md".to_string(),
+            pattern: String::new(),
+            override_default,
+        }
+    }
+
+    fn make_context_matches_gate(override_default: Option<serde_json::Value>) -> Gate {
+        Gate {
+            gate_type: GATE_TYPE_CONTEXT_MATCHES.to_string(),
+            command: String::new(),
+            timeout: 0,
+            key: "some/key.md".to_string(),
+            pattern: "approved".to_string(),
+            override_default,
+        }
+    }
+
+    #[test]
+    fn override_default_valid_command() {
+        let mut t = minimal_template();
+        t.states.get_mut("start").unwrap().gates.insert(
+            "ci_check".to_string(),
+            make_command_gate(Some(serde_json::json!({"exit_code": 0, "error": ""}))),
+        );
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn override_default_valid_context_exists() {
+        let mut t = minimal_template();
+        t.states.get_mut("start").unwrap().gates.insert(
+            "doc_check".to_string(),
+            make_context_exists_gate(Some(
+                serde_json::json!({"exists": false, "error": "missing"}),
+            )),
+        );
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn override_default_valid_context_matches() {
+        let mut t = minimal_template();
+        t.states.get_mut("start").unwrap().gates.insert(
+            "review_check".to_string(),
+            make_context_matches_gate(Some(
+                serde_json::json!({"matches": false, "error": "not approved"}),
+            )),
+        );
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn override_default_non_object_null_rejected() {
+        let mut t = minimal_template();
+        t.states.get_mut("start").unwrap().gates.insert(
+            "ci_check".to_string(),
+            make_command_gate(Some(serde_json::Value::Null)),
+        );
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("override_default is not a JSON object"),
+            "got: {}",
+            err
+        );
+        assert!(err.contains("found: null"), "got: {}", err);
+    }
+
+    #[test]
+    fn override_default_non_object_scalar_rejected() {
+        let mut t = minimal_template();
+        t.states.get_mut("start").unwrap().gates.insert(
+            "ci_check".to_string(),
+            make_command_gate(Some(serde_json::json!(42))),
+        );
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("override_default is not a JSON object"),
+            "got: {}",
+            err
+        );
+        assert!(err.contains("found: number"), "got: {}", err);
+    }
+
+    #[test]
+    fn override_default_missing_field_rejected() {
+        let mut t = minimal_template();
+        // Missing "error" field.
+        t.states.get_mut("start").unwrap().gates.insert(
+            "ci_check".to_string(),
+            make_command_gate(Some(serde_json::json!({"exit_code": 0}))),
+        );
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("override_default missing required field"),
+            "got: {}",
+            err
+        );
+        assert!(err.contains("\"error\""), "got: {}", err);
+        // Hint lists all fields with types.
+        assert!(err.contains("exit_code: number"), "got: {}", err);
+        assert!(err.contains("error: string"), "got: {}", err);
+    }
+
+    #[test]
+    fn override_default_extra_field_rejected() {
+        let mut t = minimal_template();
+        // "status" is not in the command schema.
+        t.states.get_mut("start").unwrap().gates.insert(
+            "ci_check".to_string(),
+            make_command_gate(Some(
+                serde_json::json!({"exit_code": 0, "error": "", "status": "ok"}),
+            )),
+        );
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("override_default has unknown field"),
+            "got: {}",
+            err
+        );
+        assert!(err.contains("\"status\""), "got: {}", err);
+        // Hint lists known field names only.
+        assert!(err.contains("exit_code"), "got: {}", err);
+        assert!(err.contains("error"), "got: {}", err);
+    }
+
+    #[test]
+    fn override_default_wrong_type_rejected() {
+        let mut t = minimal_template();
+        // exit_code should be a number, not a string.
+        t.states.get_mut("start").unwrap().gates.insert(
+            "ci_check".to_string(),
+            make_command_gate(Some(serde_json::json!({"exit_code": "0", "error": ""}))),
+        );
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("override_default field \"exit_code\" has wrong type"),
+            "got: {}",
+            err
+        );
+        assert!(err.contains("expected: number"), "got: {}", err);
+        assert!(err.contains("found: string"), "got: {}", err);
+    }
+
+    #[test]
+    fn override_default_none_gate_unaffected() {
+        let mut t = minimal_template();
+        t.states
+            .get_mut("start")
+            .unwrap()
+            .gates
+            .insert("ci_check".to_string(), make_command_gate(None));
+        t.validate().unwrap();
     }
 
     /// Assert that gate_type_builtin_default() returns values identical to
