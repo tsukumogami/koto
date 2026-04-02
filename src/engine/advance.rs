@@ -1115,6 +1115,7 @@ mod tests {
                 timeout: 0,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
 
@@ -1269,6 +1270,7 @@ mod tests {
                 timeout: 0,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
 
@@ -1354,6 +1356,7 @@ mod tests {
                 timeout: 0,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
 
@@ -1460,6 +1463,7 @@ mod tests {
                 timeout: 0,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
 
@@ -1567,6 +1571,7 @@ mod tests {
                 timeout: 0,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
 
@@ -1664,6 +1669,7 @@ mod tests {
                 timeout: 0,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
 
@@ -2345,6 +2351,7 @@ mod tests {
                 timeout: 0,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
 

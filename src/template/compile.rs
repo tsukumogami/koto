@@ -111,6 +111,8 @@ struct SourceGate {
     key: String,
     #[serde(default)]
     pattern: String,
+    #[serde(default)]
+    override_default: Option<serde_json::Value>,
 }
 
 /// Compile a YAML/Markdown template source file to a FormatVersion=1 CompiledTemplate.
@@ -294,6 +296,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 timeout: source.timeout,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: source.override_default.clone(),
             })
         }
         GATE_TYPE_CONTEXT_EXISTS => {
@@ -310,6 +313,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 timeout: 0,
                 key: source.key.clone(),
                 pattern: String::new(),
+                override_default: source.override_default.clone(),
             })
         }
         GATE_TYPE_CONTEXT_MATCHES => {
@@ -333,6 +337,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 timeout: 0,
                 key: source.key.clone(),
                 pattern: source.pattern.clone(),
+                override_default: source.override_default.clone(),
             })
         }
         other => Err(anyhow!(

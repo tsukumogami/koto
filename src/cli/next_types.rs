@@ -1123,6 +1123,7 @@ mod tests {
             key: String::new(),
             pattern: String::new(),
             timeout: 0,
+            override_default: None,
         }
     }
 
@@ -1133,6 +1134,7 @@ mod tests {
             key: "my_key".to_string(),
             pattern: String::new(),
             timeout: 0,
+            override_default: None,
         }
     }
 
