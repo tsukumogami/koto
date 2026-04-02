@@ -355,11 +355,13 @@ pub fn handle_overrides_list(backend: &dyn SessionBackend, name: String) -> Resu
         })
         .collect();
 
+    let count = items.len();
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({
             "state": current_state,
             "overrides": {
+                "count": count,
                 "items": items
             }
         }))?

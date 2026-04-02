@@ -514,6 +514,35 @@ fn evidence_has_reserved_gates_key(data: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Parse a `--with-data` JSON string and check for the reserved `"gates"` key.
+///
+/// Returns the parsed `Value` on success, or a `NextError` with code
+/// `InvalidSubmission` when the JSON is malformed or contains the reserved key.
+/// This function contains only pure logic; callers are responsible for exiting.
+#[cfg(unix)]
+fn validate_with_data_payload(
+    data_str: &str,
+) -> Result<serde_json::Value, crate::cli::next_types::NextError> {
+    use crate::cli::next_types::{NextError, NextErrorCode};
+
+    let data: serde_json::Value = serde_json::from_str(data_str).map_err(|e| NextError {
+        code: NextErrorCode::InvalidSubmission,
+        message: format!("invalid JSON in --with-data: {}", e),
+        details: vec![],
+    })?;
+
+    if evidence_has_reserved_gates_key(&data) {
+        return Err(NextError {
+            code: NextErrorCode::InvalidSubmission,
+            message: r#""gates" is a reserved field; agent submissions must not include this key"#
+                .to_string(),
+            details: vec![],
+        });
+    }
+
+    Ok(data)
+}
+
 /// Execute a command with polling: run repeatedly, evaluate gates after each
 /// execution, and return when all gates pass or the timeout expires.
 ///
@@ -1473,33 +1502,14 @@ fn handle_next(
             }
         };
 
-        // Parse the JSON payload.
-        let data: serde_json::Value = match serde_json::from_str(data_str) {
+        // Parse the JSON payload and reject the reserved "gates" key.
+        let data = match validate_with_data_payload(data_str) {
             Ok(v) => v,
-            Err(e) => {
-                let err = NextError {
-                    code: NextErrorCode::InvalidSubmission,
-                    message: format!("invalid JSON in --with-data: {}", e),
-                    details: vec![],
-                };
+            Err(err) => {
                 let json = serde_json::json!({"error": err});
                 exit_with_error_code(json, err.code.exit_code());
             }
         };
-
-        // Reject submissions that include the reserved "gates" key.
-        // The engine writes gate output under this key; agents must not inject it.
-        if evidence_has_reserved_gates_key(&data) {
-            let err = NextError {
-                code: NextErrorCode::InvalidSubmission,
-                message:
-                    r#""gates" is a reserved field; agent submissions must not include this key"#
-                        .to_string(),
-                details: vec![],
-            };
-            let json = serde_json::json!({"error": err});
-            exit_with_error_code(json, err.code.exit_code());
-        }
 
         // Validate evidence against schema.
         if let Err(validation_err) = validate_evidence(&data, accepts) {
@@ -2483,5 +2493,33 @@ mod tests {
     #[test]
     fn empty_object_is_not_reserved() {
         assert!(!evidence_has_reserved_gates_key(&serde_json::json!({})));
+    }
+
+    // ---------------------------------------------------------------------------
+    // validate_with_data_payload — reserved "gates" key returns InvalidSubmission
+    // ---------------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_next_gates_key_returns_invalid_submission() {
+        use crate::cli::next_types::NextErrorCode;
+
+        // A payload with a top-level "gates" key must be rejected with
+        // NextErrorCode::InvalidSubmission before schema validation runs.
+        let payload = r#"{"gates": {"some": "data"}}"#;
+        let result = validate_with_data_payload(payload);
+        assert!(result.is_err(), "expected Err for reserved 'gates' key");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.code,
+            NextErrorCode::InvalidSubmission,
+            "expected InvalidSubmission error code, got: {:?}",
+            err.code
+        );
+        assert!(
+            err.message.contains("reserved"),
+            "error message should mention 'reserved': {}",
+            err.message
+        );
     }
 }

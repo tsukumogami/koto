@@ -5282,6 +5282,11 @@ fn gate_override_full_flow() {
     );
     let list_json: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
 
+    let count = list_json["overrides"]["count"]
+        .as_u64()
+        .expect("overrides.count should be a number");
+    assert_eq!(count, 1, "expected overrides.count=1, got: {}", count);
+
     let items = list_json["overrides"]["items"]
         .as_array()
         .expect("overrides.items should be an array");
@@ -5403,6 +5408,12 @@ fn gate_overrides_list_returns_full_history() {
         "state field should be present: {}",
         list_json
     );
+
+    // The overrides.count field matches the number of items.
+    let count = list_json["overrides"]["count"]
+        .as_u64()
+        .expect("overrides.count should be a number");
+    assert_eq!(count, 2, "expected overrides.count=2, got: {}", count);
 
     // The overrides.items array contains both overrides (cross-epoch history).
     let items = list_json["overrides"]["items"]
