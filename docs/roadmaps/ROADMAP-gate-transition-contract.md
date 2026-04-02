@@ -94,7 +94,7 @@ Design doc: [DESIGN-gate-override-mechanism](../designs/current/DESIGN-gate-over
 
 ### Feature 3: Compiler validation ([#118](https://github.com/tsukumogami/koto/issues/118))
 **Dependencies:** Feature 1, Feature 2
-**Status:** Not started
+**Status:** Complete ([#123](https://github.com/tsukumogami/koto/pull/123))
 **Upstream:** [PRD-gate-transition-contract](../prds/PRD-gate-transition-contract.md) (R9)
 
 The template compiler validates the full gate/transition/override contract at
@@ -113,7 +113,7 @@ Scope:
   one valid transition (best-effort for non-enum fields)
 - Warn on gates whose output isn't referenced by any `when` clause
 
-Design doc: TBD
+Design doc: [DESIGN-gate-contract-compiler-validation](../designs/DESIGN-gate-contract-compiler-validation.md)
 
 ### Feature 4: Backward compatibility ([#119](https://github.com/tsukumogami/koto/issues/119))
 **Dependencies:** Feature 1

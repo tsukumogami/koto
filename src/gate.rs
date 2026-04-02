@@ -208,6 +208,11 @@ fn evaluate_command_gate(gate: &Gate, working_dir: &Path) -> StructuredGateResul
 ///
 /// Returns `None` for unknown gate types, meaning no built-in default exists
 /// and an explicit value must be supplied via `--with-data`.
+///
+/// **Sync contract**: `gate_type_builtin_default()` in `src/template/types.rs`
+/// mirrors this function for compile-time use (circular dep prevents importing
+/// from there). A test in types.rs asserts the two functions return identical
+/// values for every `GATE_TYPE_*` constant. Update both together if defaults change.
 pub fn built_in_default(gate_type: &str) -> Option<serde_json::Value> {
     match gate_type {
         GATE_TYPE_COMMAND => Some(serde_json::json!({"exit_code": 0, "error": ""})),
