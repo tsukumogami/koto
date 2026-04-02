@@ -1,0 +1,31 @@
+{
+  "topic": "gate-contract-compiler-validation",
+  "decisions": [
+    {
+      "id": 1,
+      "question": "Where does gate type schema information live for compile-time validation? The compiler (template/types.rs) needs to know each gate type's output field names and value types. gate.rs already imports from template/types.rs, so types.rs cannot import from gate.rs without creating a circular dependency. Options include: (A) a static GateTypeSchema registry in template/types.rs alongside existing GATE_TYPE_* constants, (B) derive schema at compile time from built_in_default() output keys/types (requires moving that function to types.rs or a shared module), (C) inline schema knowledge directly in the validate() method without a shared abstraction.",
+      "status": "pending",
+      "complexity": "standard"
+    },
+    {
+      "id": 2,
+      "question": "What should override_default validation enforce? When a gate declares override_default, the compiler should validate it against the gate type's schema. Options: (A) exact match - all schema fields must be present, no extra fields, types must be compatible; (B) subset match - present fields must have correct types, no extra fields allowed, missing fields OK; (C) type-check only - rejects wrong types but not missing or extra fields; (D) warn only - compile succeeds but emits warnings for type mismatches.",
+      "status": "pending",
+      "complexity": "standard"
+    },
+    {
+      "id": 3,
+      "question": "How deep should gates.* when clause validation go? The compiler already splits when clause fields into gates.* and agent fields, but doesn't validate gates.* references. Options: (A) gate existence only - verify gate_name in gates.<gate_name>.<field> names an actual gate declared in the state; (B) gate + field existence - also verify field_name is a valid field in the gate type's schema; (C) gate + field + value type - additionally verify the comparison value's type is compatible with the schema field type. Also decide: should an incorrectly structured path like 'gates.foo' (too short) or 'gates.foo.bar.baz' (too deep) be an error or silently ignored?",
+      "status": "pending",
+      "complexity": "standard"
+    },
+    {
+      "id": 4,
+      "question": "How should the reachability check be scoped and implemented? PRD R9 requires: when override defaults are applied to all gates, at least one transition resolves. Options for scope: (A) only check states where all conditional transitions use exclusively gates.* fields (pure-gate states) - avoids false positives on mixed gate+agent states; (B) check all gated states, but require at least one pure-gate transition to satisfy; (C) skip the reachability check entirely, treating it as best-effort per PRD. Options for implementation: (i) inline resolver call - build override evidence map and call the existing resolve_transition logic at compile time; (ii) pattern analysis - inspect when conditions analytically without running resolver; (iii) error vs. warning for dead ends.",
+      "status": "pending",
+      "complexity": "standard"
+    }
+  ],
+  "cross_validation": "pending",
+  "round": 0
+}
