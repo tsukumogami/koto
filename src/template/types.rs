@@ -2013,4 +2013,213 @@ command: "./check.sh"
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Issue 3: gates.* when clause path and field validation tests
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal template with a single command gate on the "start" state.
+    fn template_with_command_gate(gate_name: &str) -> CompiledTemplate {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            gate_name.to_string(),
+            Gate {
+                gate_type: GATE_TYPE_COMMAND.to_string(),
+                command: "./check.sh".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+            },
+        );
+        t
+    }
+
+    #[test]
+    fn gates_when_two_segment_path_rejected() {
+        // "gates.ci_check" has only 2 segments — missing the field name.
+        let mut t = template_with_command_gate("ci_check");
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert("gates.ci_check".to_string(), serde_json::json!(0));
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("gates.ci_check") && err.contains("invalid format"),
+            "got: {}",
+            err
+        );
+        assert!(err.contains("gates.<gate>.<field>"), "got: {}", err);
+    }
+
+    #[test]
+    fn gates_when_four_segment_path_rejected() {
+        // "gates.ci_check.exit_code.extra" has 4 segments — too many.
+        let mut t = template_with_command_gate("ci_check");
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert(
+            "gates.ci_check.exit_code.extra".to_string(),
+            serde_json::json!(0),
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("gates.ci_check.exit_code.extra") && err.contains("invalid format"),
+            "got: {}",
+            err
+        );
+        assert!(err.contains("gates.<gate>.<field>"), "got: {}", err);
+    }
+
+    #[test]
+    fn gates_when_nonexistent_gate_rejected() {
+        // "gates.nonexistent_gate.exit_code" references a gate not in state.gates.
+        let mut t = template_with_command_gate("ci_check");
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert(
+            "gates.nonexistent_gate.exit_code".to_string(),
+            serde_json::json!(0),
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("nonexistent_gate") && err.contains("not declared in this state"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn gates_when_unknown_field_rejected() {
+        // "gates.ci_check.exitt_code" is a typo — not in command gate schema.
+        let mut t = template_with_command_gate("ci_check");
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert(
+            "gates.ci_check.exitt_code".to_string(),
+            serde_json::json!(0),
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("exitt_code") && err.contains("unknown field"),
+            "got: {}",
+            err
+        );
+        assert!(
+            err.contains("exit_code") && err.contains("error"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn gates_when_valid_command_reference() {
+        // "gates.ci_check.exit_code" for a command gate is valid.
+        let mut t = template_with_command_gate("ci_check");
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert("gates.ci_check.exit_code".to_string(), serde_json::json!(0));
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn gates_when_valid_context_exists_reference() {
+        // "gates.schema_check.exists" for a context-exists gate is valid.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            "schema_check".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_EXISTS.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "schema/check.md".to_string(),
+                pattern: String::new(),
+                override_default: None,
+            },
+        );
+        let mut when = BTreeMap::new();
+        when.insert(
+            "gates.schema_check.exists".to_string(),
+            serde_json::json!(true),
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn gates_when_valid_context_matches_reference() {
+        // "gates.pattern_check.matches" for a context-matches gate is valid.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            "pattern_check".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_MATCHES.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "review.md".to_string(),
+                pattern: "## Approved".to_string(),
+                override_default: None,
+            },
+        );
+        let mut when = BTreeMap::new();
+        when.insert(
+            "gates.pattern_check.matches".to_string(),
+            serde_json::json!(true),
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn gates_when_no_gates_key_unaffected() {
+        // A state with no gates.* when clause keys passes without any gate declared.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "decision".to_string(),
+            FieldSchema {
+                field_type: "string".to_string(),
+                required: true,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+        state.accepts = Some(accepts);
+        let mut when = BTreeMap::new();
+        when.insert("decision".to_string(), serde_json::json!("proceed"));
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        t.validate().unwrap();
+    }
 }
