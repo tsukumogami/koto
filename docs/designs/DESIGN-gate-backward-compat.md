@@ -283,7 +283,7 @@ In `validate()`, two changes:
    ```
    state "<name>": gate "<gate>" has no gates.* routing; declare legacy_gates: true
    in the template frontmatter to allow boolean pass/block behavior, or add a
-   when clause referencing gates.<gate>.<field>
+   when clause referencing gates.<gate>.passed, gates.<gate>.error, ...
    ```
    This check runs before D4 so D4 is still unreachable when this error fires.
 
@@ -345,7 +345,7 @@ initial_state: start
 ```
 error: state "verify" gate "ci_check" has no gates.* routing
   declare legacy_gates: true in frontmatter for boolean pass/block behavior
-  or add a when clause referencing gates.ci_check.<field>
+  or add a when clause referencing gates.ci_check.passed, gates.ci_check.error, ...
 ```
 
 **New compile-time warning for legacy templates:**
@@ -410,8 +410,14 @@ Hoist `has_gates_routing` computation in `src/engine/advance.rs` so it's
 available at the evidence merge step regardless of whether `any_failed` is
 true. Guard the `gate_evidence_map` insertion with `has_gates_routing`.
 
+**Phase 3 must land in the same PR as Phase 1.** If Phase 3 ships without
+Phase 1, the engine stops injecting gate evidence for legacy states before
+the compiler provides a way for those templates to declare `legacy_gates: true`
+— there would be no upgrade path for existing legacy templates.
+
 Deliverables:
-- `has_gates_routing` computed before the `if any_failed` block
+- `has_gates_routing` initialized to `false` before the gate block, then set
+  inside it (ensures it's always in scope at the merge step)
 - Evidence merge guarded by `has_gates_routing`
 - Unit tests: legacy state does not expose `gates.*` keys in merged evidence;
   structured-mode state does
