@@ -150,6 +150,56 @@ pub const GATE_TYPE_CONTEXT_MATCHES: &str = "context-matches";
 /// All `gates.*` key checks in advance.rs and types.rs use this constant.
 pub const GATES_EVIDENCE_NAMESPACE: &str = "gates";
 
+/// The JSON value type of a gate output field.
+///
+/// Used by [`gate_type_schema`] to describe the expected type of each field
+/// in a gate type's output schema. The compiler uses this for exact-match
+/// validation of `override_default` values (D2) and the reachability check (D4).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GateSchemaFieldType {
+    Number,
+    String,
+    Boolean,
+}
+
+/// Return the static output field schema for a known gate type.
+///
+/// Each element is `(field_name, field_type)`. Returns `None` for unknown
+/// gate type strings.
+///
+/// Gate schemas:
+/// - `command`:        `[("exit_code", Number), ("error", String)]`
+/// - `context-exists`: `[("exists", Boolean), ("error", String)]`
+/// - `context-matches`:`[("matches", Boolean), ("error", String)]`
+pub fn gate_type_schema(
+    gate_type: &str,
+) -> Option<&'static [(&'static str, GateSchemaFieldType)]> {
+    use GateSchemaFieldType::*;
+    match gate_type {
+        GATE_TYPE_COMMAND => Some(&[("exit_code", Number), ("error", String)]),
+        GATE_TYPE_CONTEXT_EXISTS => Some(&[("exists", Boolean), ("error", String)]),
+        GATE_TYPE_CONTEXT_MATCHES => Some(&[("matches", Boolean), ("error", String)]),
+        _ => None,
+    }
+}
+
+/// Return the built-in default override value for a known gate type.
+///
+/// Mirrors `built_in_default()` in `src/gate.rs` — the two functions serve
+/// the same purpose in different contexts (compile-time vs. runtime). A unit
+/// test in this module asserts they return identical values for every known
+/// gate type. Update both functions in tandem if a gate type's default changes.
+///
+/// Returns `None` for unknown gate types.
+pub fn gate_type_builtin_default(gate_type: &str) -> Option<serde_json::Value> {
+    match gate_type {
+        GATE_TYPE_COMMAND => Some(serde_json::json!({"exit_code": 0, "error": ""})),
+        GATE_TYPE_CONTEXT_EXISTS => Some(serde_json::json!({"exists": true, "error": ""})),
+        GATE_TYPE_CONTEXT_MATCHES => Some(serde_json::json!({"matches": true, "error": ""})),
+        _ => None,
+    }
+}
+
 /// Valid field types for FieldSchema.
 const VALID_FIELD_TYPES: &[&str] = &["enum", "string", "number", "boolean"];
 
@@ -1548,5 +1598,99 @@ command: "./check.sh"
             "override_default should be absent from output: {}",
             out
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 1: gate schema registry tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gate_type_schema_command() {
+        use GateSchemaFieldType::*;
+        let schema = gate_type_schema(GATE_TYPE_COMMAND).expect("command schema must exist");
+        assert_eq!(schema.len(), 2);
+        assert_eq!(schema[0], ("exit_code", Number));
+        assert_eq!(schema[1], ("error", String));
+    }
+
+    #[test]
+    fn gate_type_schema_context_exists() {
+        use GateSchemaFieldType::*;
+        let schema =
+            gate_type_schema(GATE_TYPE_CONTEXT_EXISTS).expect("context-exists schema must exist");
+        assert_eq!(schema.len(), 2);
+        assert_eq!(schema[0], ("exists", Boolean));
+        assert_eq!(schema[1], ("error", String));
+    }
+
+    #[test]
+    fn gate_type_schema_context_matches() {
+        use GateSchemaFieldType::*;
+        let schema = gate_type_schema(GATE_TYPE_CONTEXT_MATCHES)
+            .expect("context-matches schema must exist");
+        assert_eq!(schema.len(), 2);
+        assert_eq!(schema[0], ("matches", Boolean));
+        assert_eq!(schema[1], ("error", String));
+    }
+
+    #[test]
+    fn gate_type_schema_unknown_returns_none() {
+        assert!(gate_type_schema("jira").is_none());
+        assert!(gate_type_schema("").is_none());
+        assert!(gate_type_schema("http").is_none());
+    }
+
+    #[test]
+    fn gate_type_builtin_default_command() {
+        let val = gate_type_builtin_default(GATE_TYPE_COMMAND).expect("command default must exist");
+        assert_eq!(val["exit_code"], serde_json::json!(0));
+        assert_eq!(val["error"], serde_json::json!(""));
+    }
+
+    #[test]
+    fn gate_type_builtin_default_context_exists() {
+        let val = gate_type_builtin_default(GATE_TYPE_CONTEXT_EXISTS)
+            .expect("context-exists default must exist");
+        assert_eq!(val["exists"], serde_json::json!(true));
+        assert_eq!(val["error"], serde_json::json!(""));
+    }
+
+    #[test]
+    fn gate_type_builtin_default_context_matches() {
+        let val = gate_type_builtin_default(GATE_TYPE_CONTEXT_MATCHES)
+            .expect("context-matches default must exist");
+        assert_eq!(val["matches"], serde_json::json!(true));
+        assert_eq!(val["error"], serde_json::json!(""));
+    }
+
+    #[test]
+    fn gate_type_builtin_default_unknown_returns_none() {
+        assert!(gate_type_builtin_default("jira").is_none());
+        assert!(gate_type_builtin_default("").is_none());
+    }
+
+    /// Assert that gate_type_builtin_default() returns values identical to
+    /// built_in_default() in src/gate.rs for every GATE_TYPE_* constant.
+    ///
+    /// This synchronization test catches drift when a gate type's default changes.
+    /// Both functions must be updated in tandem (circular dep prevents sharing code).
+    #[test]
+    fn gate_type_builtin_default_matches_gate_rs_built_in_default() {
+        use crate::gate::built_in_default;
+        for gate_type in &[
+            GATE_TYPE_COMMAND,
+            GATE_TYPE_CONTEXT_EXISTS,
+            GATE_TYPE_CONTEXT_MATCHES,
+        ] {
+            let types_val = gate_type_builtin_default(gate_type)
+                .unwrap_or_else(|| panic!("gate_type_builtin_default missing for {}", gate_type));
+            let gate_val = built_in_default(gate_type)
+                .unwrap_or_else(|| panic!("built_in_default missing for {}", gate_type));
+            assert_eq!(
+                types_val, gate_val,
+                "gate_type_builtin_default and built_in_default diverged for gate type {}",
+                gate_type
+            );
+        }
     }
 }
