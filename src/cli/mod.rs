@@ -1,6 +1,7 @@
 pub mod context;
 pub mod next;
 pub mod next_types;
+pub mod overrides;
 pub mod session;
 pub mod vars;
 
@@ -26,7 +27,7 @@ use crate::session::{state_file_name, Backend, SessionBackend};
 use crate::template::types::CompiledTemplate;
 
 /// Maximum payload size for --with-data (1 MB).
-const MAX_WITH_DATA_BYTES: usize = 1_048_576;
+pub(super) const MAX_WITH_DATA_BYTES: usize = 1_048_576;
 
 /// Maximum size of captured stdout/stderr from action execution (64 KB).
 const MAX_ACTION_OUTPUT_BYTES: usize = 64 * 1024;
@@ -39,7 +40,7 @@ const MAX_ACTION_OUTPUT_BYTES: usize = 64 * 1024;
 ///
 /// `NextErrorCode::exit_code()` handles codes 1 and 2 for domain errors.
 /// `exit_code_for_engine_error()` and this constant handle code 3.
-const EXIT_INFRASTRUCTURE: i32 = 3;
+pub(super) const EXIT_INFRASTRUCTURE: i32 = 3;
 
 #[derive(Parser)]
 #[command(
@@ -133,6 +134,12 @@ pub enum Command {
     Decisions {
         #[command(subcommand)]
         subcommand: DecisionsSubcommand,
+    },
+
+    /// Gate override recording and retrieval
+    Overrides {
+        #[command(subcommand)]
+        subcommand: overrides::OverridesSubcommand,
     },
 
     /// Configuration management subcommands
@@ -361,7 +368,7 @@ fn exit_with_error(error: serde_json::Value) -> ! {
 }
 
 /// Print a JSON error and exit with a specific exit code.
-fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
+pub(super) fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
     println!("{}", serde_json::to_string(&error).unwrap_or_default());
     std::process::exit(code);
 }
@@ -370,7 +377,7 @@ fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
 ///
 /// Returns exit code 3 for corrupted state files, and exit code 1 for all
 /// other errors.
-fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
+pub(super) fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
     match err.downcast_ref::<EngineError>() {
         Some(EngineError::StateFileCorrupted(_)) => EXIT_INFRASTRUCTURE,
         _ => 1,
@@ -494,6 +501,46 @@ fn truncate_output(s: &str, max_bytes: usize) -> String {
     let mut truncated = s[..end].to_string();
     truncated.push_str("\n... [output truncated]");
     truncated
+}
+
+/// Check whether a parsed evidence JSON object contains the reserved "gates" key.
+///
+/// Returns `true` when the value is a JSON object with a top-level "gates" key.
+/// Returns `false` for non-object values (the evidence schema validator will
+/// catch those separately).
+fn evidence_has_reserved_gates_key(data: &serde_json::Value) -> bool {
+    data.as_object()
+        .map(|o| o.contains_key("gates"))
+        .unwrap_or(false)
+}
+
+/// Parse a `--with-data` JSON string and check for the reserved `"gates"` key.
+///
+/// Returns the parsed `Value` on success, or a `NextError` with code
+/// `InvalidSubmission` when the JSON is malformed or contains the reserved key.
+/// This function contains only pure logic; callers are responsible for exiting.
+#[cfg(unix)]
+fn validate_with_data_payload(
+    data_str: &str,
+) -> Result<serde_json::Value, crate::cli::next_types::NextError> {
+    use crate::cli::next_types::{NextError, NextErrorCode};
+
+    let data: serde_json::Value = serde_json::from_str(data_str).map_err(|e| NextError {
+        code: NextErrorCode::InvalidSubmission,
+        message: format!("invalid JSON in --with-data: {}", e),
+        details: vec![],
+    })?;
+
+    if evidence_has_reserved_gates_key(&data) {
+        return Err(NextError {
+            code: NextErrorCode::InvalidSubmission,
+            message: r#""gates" is a reserved field; agent submissions must not include this key"#
+                .to_string(),
+            details: vec![],
+        });
+    }
+
+    Ok(data)
 }
 
 /// Execute a command with polling: run repeatedly, evaluate gates after each
@@ -813,6 +860,20 @@ pub fn run(app: App) -> Result<()> {
                     handle_decisions_record(&backend, name, with_data)
                 }
                 DecisionsSubcommand::List { name } => handle_decisions_list(&backend, name),
+            }
+        }
+        Command::Overrides { subcommand } => {
+            let backend = build_backend()?;
+            match subcommand {
+                overrides::OverridesSubcommand::Record {
+                    name,
+                    gate,
+                    rationale,
+                    with_data,
+                } => overrides::handle_overrides_record(&backend, name, gate, rationale, with_data),
+                overrides::OverridesSubcommand::List { name } => {
+                    overrides::handle_overrides_list(&backend, name)
+                }
             }
         }
         Command::Config { subcommand } => handle_config(subcommand),
@@ -1441,15 +1502,10 @@ fn handle_next(
             }
         };
 
-        // Parse the JSON payload.
-        let data: serde_json::Value = match serde_json::from_str(data_str) {
+        // Parse the JSON payload and reject the reserved "gates" key.
+        let data = match validate_with_data_payload(data_str) {
             Ok(v) => v,
-            Err(e) => {
-                let err = NextError {
-                    code: NextErrorCode::InvalidSubmission,
-                    message: format!("invalid JSON in --with-data: {}", e),
-                    details: vec![],
-                };
+            Err(err) => {
                 let json = serde_json::json!({"error": err});
                 exit_with_error_code(json, err.code.exit_code());
             }
@@ -1677,6 +1733,7 @@ fn handle_next(
         current_state,
         &compiled,
         &evidence,
+        &current_events,
         &mut append_closure,
         &gate_closure,
         &integration_closure,
@@ -2405,5 +2462,64 @@ mod tests {
     fn validate_check_with_output_ok() {
         let args = export_args(ExportFormat::Mermaid, Some("out.md"), false, true);
         assert!(validate_export_flags(&args).is_ok());
+    }
+
+    // ---------------------------------------------------------------------------
+    // evidence_has_reserved_gates_key
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn gates_key_present_is_reserved() {
+        let data = serde_json::json!({"gates": {"ci_check": {"exit_code": 0}}, "other": "value"});
+        assert!(evidence_has_reserved_gates_key(&data));
+    }
+
+    #[test]
+    fn gates_key_absent_is_not_reserved() {
+        let data = serde_json::json!({"decision": "proceed", "notes": "looks good"});
+        assert!(!evidence_has_reserved_gates_key(&data));
+    }
+
+    #[test]
+    fn non_object_value_is_not_reserved() {
+        // Non-objects (malformed payloads) return false; schema validation catches them later.
+        assert!(!evidence_has_reserved_gates_key(&serde_json::json!(
+            "string"
+        )));
+        assert!(!evidence_has_reserved_gates_key(&serde_json::json!(42)));
+        assert!(!evidence_has_reserved_gates_key(&serde_json::json!(null)));
+    }
+
+    #[test]
+    fn empty_object_is_not_reserved() {
+        assert!(!evidence_has_reserved_gates_key(&serde_json::json!({})));
+    }
+
+    // ---------------------------------------------------------------------------
+    // validate_with_data_payload — reserved "gates" key returns InvalidSubmission
+    // ---------------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_next_gates_key_returns_invalid_submission() {
+        use crate::cli::next_types::NextErrorCode;
+
+        // A payload with a top-level "gates" key must be rejected with
+        // NextErrorCode::InvalidSubmission before schema validation runs.
+        let payload = r#"{"gates": {"some": "data"}}"#;
+        let result = validate_with_data_payload(payload);
+        assert!(result.is_err(), "expected Err for reserved 'gates' key");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.code,
+            NextErrorCode::InvalidSubmission,
+            "expected InvalidSubmission error code, got: {:?}",
+            err.code
+        );
+        assert!(
+            err.message.contains("reserved"),
+            "error message should mention 'reserved': {}",
+            err.message
+        );
     }
 }

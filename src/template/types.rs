@@ -98,6 +98,14 @@ pub struct Gate {
     /// Regex pattern for context-matches gates.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pattern: String,
+    /// Optional instance-level override default value for this gate.
+    ///
+    /// When present, this value is used as the override default instead of
+    /// (or in addition to) the built-in default for the gate type. The
+    /// `koto overrides record` command resolves the override value by
+    /// checking `--with-data`, then this field, then `built_in_default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_default: Option<serde_json::Value>,
 }
 
 /// A default action declaration for a template state.
@@ -542,6 +550,7 @@ mod tests {
                 timeout: 0,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
         let err = t.validate().unwrap_err();
@@ -561,6 +570,7 @@ mod tests {
                 timeout: 0,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
         let err = t.validate().unwrap_err();
@@ -580,6 +590,7 @@ mod tests {
                 timeout: 0,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
         t.validate().unwrap();
@@ -654,6 +665,7 @@ mod tests {
                 key: String::new(),
                 pattern: String::new(),
                 timeout: 0,
+                override_default: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -681,6 +693,7 @@ mod tests {
                 key: String::new(),
                 pattern: String::new(),
                 timeout: 0,
+                override_default: None,
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -1123,6 +1136,7 @@ mod tests {
                 timeout: 0,
                 key: "research/r1/lead.md".to_string(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
         t.validate().unwrap();
@@ -1171,6 +1185,7 @@ mod tests {
                 timeout: 0,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
         let err = t.validate().unwrap_err();
@@ -1201,6 +1216,7 @@ mod tests {
                 timeout: 0,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
         t.validate().unwrap();
@@ -1218,6 +1234,7 @@ mod tests {
                 timeout: 0,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
         let err = t.validate().unwrap_err();
@@ -1240,6 +1257,7 @@ mod tests {
                 timeout: 0,
                 key: "review.md".to_string(),
                 pattern: "## Approved".to_string(),
+                override_default: None,
             },
         );
         t.validate().unwrap();
@@ -1266,6 +1284,7 @@ mod tests {
                 timeout: 0,
                 key: String::new(),
                 pattern: "## Approved".to_string(),
+                override_default: None,
             },
         );
         let err = t.validate().unwrap_err();
@@ -1307,6 +1326,7 @@ mod tests {
                 timeout: 0,
                 key: "review.md".to_string(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
         let err = t.validate().unwrap_err();
@@ -1347,6 +1367,7 @@ mod tests {
                 timeout: 0,
                 key: "review.md".to_string(),
                 pattern: "[invalid".to_string(),
+                override_default: None,
             },
         );
         let err = t.validate().unwrap_err();
@@ -1480,5 +1501,52 @@ mod tests {
         assert!(!json.contains("polling"));
         let restored: ActionDecl = serde_json::from_str(&json).unwrap();
         assert_eq!(action, restored);
+    }
+
+    #[test]
+    fn gate_override_default_present_round_trips_via_serde_yaml() {
+        // A gate YAML with override_default set should round-trip exactly.
+        let yaml = r#"
+type: command
+command: "./check.sh"
+override_default:
+  exit_code: 1
+  error: ""
+"#;
+        let gate: Gate = serde_yml::from_str(yaml).unwrap();
+        assert!(gate.override_default.is_some());
+        let v = gate.override_default.as_ref().unwrap();
+        assert_eq!(v["exit_code"], 1);
+        assert_eq!(v["error"], "");
+
+        // Serialize back and confirm the value is preserved.
+        let out = serde_yml::to_string(&gate).unwrap();
+        assert!(
+            out.contains("override_default"),
+            "override_default should appear in output: {}",
+            out
+        );
+
+        let gate2: Gate = serde_yml::from_str(&out).unwrap();
+        assert_eq!(gate.override_default, gate2.override_default);
+    }
+
+    #[test]
+    fn gate_override_default_absent_deserializes_as_none_and_omits_key() {
+        // A gate YAML without override_default should deserialize with None
+        // and serialize without the key.
+        let yaml = r#"
+type: command
+command: "./check.sh"
+"#;
+        let gate: Gate = serde_yml::from_str(yaml).unwrap();
+        assert!(gate.override_default.is_none());
+
+        let out = serde_yml::to_string(&gate).unwrap();
+        assert!(
+            !out.contains("override_default"),
+            "override_default should be absent from output: {}",
+            out
+        );
     }
 }

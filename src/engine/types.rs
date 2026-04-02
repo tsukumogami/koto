@@ -70,6 +70,21 @@ pub enum EventPayload {
         state: String,
         decision: serde_json::Value,
     },
+    GateEvaluated {
+        state: String,
+        gate: String,
+        output: serde_json::Value,
+        outcome: String,
+        timestamp: String,
+    },
+    GateOverrideRecorded {
+        state: String,
+        gate: String,
+        rationale: String,
+        override_applied: serde_json::Value,
+        actual_output: serde_json::Value,
+        timestamp: String,
+    },
 }
 
 impl EventPayload {
@@ -85,6 +100,8 @@ impl EventPayload {
             EventPayload::WorkflowCancelled { .. } => "workflow_cancelled",
             EventPayload::DefaultActionExecuted { .. } => "default_action_executed",
             EventPayload::DecisionRecorded { .. } => "decision_recorded",
+            EventPayload::GateEvaluated { .. } => "gate_evaluated",
+            EventPayload::GateOverrideRecorded { .. } => "gate_override_recorded",
         }
     }
 }
@@ -231,6 +248,29 @@ impl<'de> Deserialize<'de> for Event {
                     decision: p.decision,
                 }
             }
+            "gate_evaluated" => {
+                let p: GateEvaluatedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::GateEvaluated {
+                    state: p.state,
+                    gate: p.gate,
+                    output: p.output,
+                    outcome: p.outcome,
+                    timestamp: p.timestamp,
+                }
+            }
+            "gate_override_recorded" => {
+                let p: GateOverrideRecordedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::GateOverrideRecorded {
+                    state: p.state,
+                    gate: p.gate,
+                    rationale: p.rationale,
+                    override_applied: p.override_applied,
+                    actual_output: p.actual_output,
+                    timestamp: p.timestamp,
+                }
+            }
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown event type: {}",
@@ -307,6 +347,25 @@ struct DefaultActionExecutedPayload {
 struct DecisionRecordedPayload {
     state: String,
     decision: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct GateEvaluatedPayload {
+    state: String,
+    gate: String,
+    output: serde_json::Value,
+    outcome: String,
+    timestamp: String,
+}
+
+#[derive(Deserialize)]
+struct GateOverrideRecordedPayload {
+    state: String,
+    gate: String,
+    rationale: String,
+    override_applied: serde_json::Value,
+    actual_output: serde_json::Value,
+    timestamp: String,
 }
 
 /// Metadata about a workflow, derived from the state file header.
@@ -568,5 +627,101 @@ mod tests {
             stderr: "err".to_string(),
         };
         assert_eq!(p.type_name(), "default_action_executed");
+    }
+
+    #[test]
+    fn gate_evaluated_round_trip() {
+        let e = Event {
+            seq: 10,
+            timestamp: "2026-04-01T00:00:00Z".to_string(),
+            event_type: "gate_evaluated".to_string(),
+            payload: EventPayload::GateEvaluated {
+                state: "review".to_string(),
+                gate: "ci-passes".to_string(),
+                output: serde_json::json!({"exit_code": 0, "error": ""}),
+                outcome: "passed".to_string(),
+                timestamp: "2026-04-01T00:00:00Z".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"type\":\"gate_evaluated\""));
+        assert!(json.contains("\"gate\":\"ci-passes\""));
+        assert!(json.contains("\"outcome\":\"passed\""));
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn gate_evaluated_type_name() {
+        let p = EventPayload::GateEvaluated {
+            state: "s".to_string(),
+            gate: "g".to_string(),
+            output: serde_json::Value::Null,
+            outcome: "passed".to_string(),
+            timestamp: "2026-04-01T00:00:00Z".to_string(),
+        };
+        assert_eq!(p.type_name(), "gate_evaluated");
+    }
+
+    #[test]
+    fn gate_override_recorded_round_trip() {
+        let e = Event {
+            seq: 11,
+            timestamp: "2026-04-01T00:01:00Z".to_string(),
+            event_type: "gate_override_recorded".to_string(),
+            payload: EventPayload::GateOverrideRecorded {
+                state: "review".to_string(),
+                gate: "ci-passes".to_string(),
+                rationale: "CI is broken in infra, not our code".to_string(),
+                override_applied: serde_json::json!({"exit_code": 0, "error": ""}),
+                actual_output: serde_json::json!({"exit_code": 1, "error": "timeout"}),
+                timestamp: "2026-04-01T00:01:00Z".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"type\":\"gate_override_recorded\""));
+        assert!(json.contains("\"gate\":\"ci-passes\""));
+        assert!(json.contains("\"rationale\":\"CI is broken in infra, not our code\""));
+        assert!(json.contains("\"override_applied\""));
+        assert!(json.contains("\"actual_output\""));
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn gate_override_recorded_type_name() {
+        let p = EventPayload::GateOverrideRecorded {
+            state: "s".to_string(),
+            gate: "g".to_string(),
+            rationale: "r".to_string(),
+            override_applied: serde_json::Value::Null,
+            actual_output: serde_json::Value::Null,
+            timestamp: "2026-04-01T00:00:00Z".to_string(),
+        };
+        assert_eq!(p.type_name(), "gate_override_recorded");
+    }
+
+    #[test]
+    fn gate_evaluated_missing_state_field_fails() {
+        // Negative case: payload missing the required `state` field.
+        let json = r#"{"seq":1,"timestamp":"2026-04-01T00:00:00Z","type":"gate_evaluated","payload":{"gate":"ci-passes","output":{},"outcome":"passed","timestamp":"2026-04-01T00:00:00Z"}}"#;
+        let result: Result<Event, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "expected error for missing state field, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn gate_override_recorded_missing_state_field_fails() {
+        // Negative case: payload missing the required `state` field.
+        let json = r#"{"seq":1,"timestamp":"2026-04-01T00:00:00Z","type":"gate_override_recorded","payload":{"gate":"ci-passes","rationale":"r","override_applied":{},"actual_output":{},"timestamp":"2026-04-01T00:00:00Z"}}"#;
+        let result: Result<Event, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "expected error for missing state field, got: {:?}",
+            result
+        );
     }
 }

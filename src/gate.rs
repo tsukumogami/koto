@@ -201,6 +201,22 @@ fn evaluate_command_gate(gate: &Gate, working_dir: &Path) -> StructuredGateResul
     }
 }
 
+/// Return the built-in default override value for a known gate type.
+///
+/// This is the fallback override value used by `koto overrides record` when
+/// neither `--with-data` nor an instance-level `override_default` is present.
+///
+/// Returns `None` for unknown gate types, meaning no built-in default exists
+/// and an explicit value must be supplied via `--with-data`.
+pub fn built_in_default(gate_type: &str) -> Option<serde_json::Value> {
+    match gate_type {
+        GATE_TYPE_COMMAND => Some(serde_json::json!({"exit_code": 0, "error": ""})),
+        GATE_TYPE_CONTEXT_EXISTS => Some(serde_json::json!({"exists": true, "error": ""})),
+        GATE_TYPE_CONTEXT_MATCHES => Some(serde_json::json!({"matches": true, "error": ""})),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +231,7 @@ mod tests {
             timeout,
             key: String::new(),
             pattern: String::new(),
+            override_default: None,
         }
     }
 
@@ -395,6 +412,7 @@ mod tests {
                 timeout: 0,
                 key: "research/lead.md".to_string(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
 
@@ -418,6 +436,7 @@ mod tests {
                 timeout: 0,
                 key: "research/lead.md".to_string(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
 
@@ -439,6 +458,7 @@ mod tests {
                 timeout: 0,
                 key: "research/lead.md".to_string(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
 
@@ -466,6 +486,7 @@ mod tests {
                 timeout: 0,
                 key: "review.md".to_string(),
                 pattern: "## Approved".to_string(),
+                override_default: None,
             },
         );
 
@@ -494,6 +515,7 @@ mod tests {
                 timeout: 0,
                 key: "review.md".to_string(),
                 pattern: "## Approved".to_string(),
+                override_default: None,
             },
         );
 
@@ -517,6 +539,7 @@ mod tests {
                 timeout: 0,
                 key: "review.md".to_string(),
                 pattern: "## Approved".to_string(),
+                override_default: None,
             },
         );
 
@@ -537,6 +560,7 @@ mod tests {
                 timeout: 0,
                 key: "review.md".to_string(),
                 pattern: "## Approved".to_string(),
+                override_default: None,
             },
         );
 
@@ -560,6 +584,7 @@ mod tests {
                 timeout: 0,
                 key: "status.txt".to_string(),
                 pattern: r"status:\s+PASS".to_string(),
+                override_default: None,
             },
         );
 
@@ -697,6 +722,44 @@ mod tests {
         assert_eq!(cloned.output, result.output);
     }
 
+    // -----------------------------------------------------------------------
+    // built_in_default tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn built_in_default_command_gate() {
+        let val = built_in_default(GATE_TYPE_COMMAND);
+        assert!(val.is_some());
+        let v = val.unwrap();
+        assert_eq!(v["exit_code"], 0);
+        assert_eq!(v["error"], "");
+    }
+
+    #[test]
+    fn built_in_default_context_exists_gate() {
+        let val = built_in_default(GATE_TYPE_CONTEXT_EXISTS);
+        assert!(val.is_some());
+        let v = val.unwrap();
+        assert_eq!(v["exists"], true);
+        assert_eq!(v["error"], "");
+    }
+
+    #[test]
+    fn built_in_default_context_matches_gate() {
+        let val = built_in_default(GATE_TYPE_CONTEXT_MATCHES);
+        assert!(val.is_some());
+        let v = val.unwrap();
+        assert_eq!(v["matches"], true);
+        assert_eq!(v["error"], "");
+    }
+
+    #[test]
+    fn built_in_default_unknown_gate_type_returns_none() {
+        assert!(built_in_default("unknown-gate-type").is_none());
+        assert!(built_in_default("").is_none());
+        assert!(built_in_default("custom").is_none());
+    }
+
     #[test]
     fn mixed_gate_types_all_evaluated() {
         let dir = tmp_dir();
@@ -712,6 +775,7 @@ mod tests {
                 timeout: 5,
                 key: String::new(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
         gates.insert(
@@ -722,6 +786,7 @@ mod tests {
                 timeout: 0,
                 key: "ready.txt".to_string(),
                 pattern: String::new(),
+                override_default: None,
             },
         );
         gates.insert(
@@ -732,6 +797,7 @@ mod tests {
                 timeout: 0,
                 key: "ready.txt".to_string(),
                 pattern: "ready".to_string(),
+                override_default: None,
             },
         );
 

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::ser::SerializeMap;
 use serde::Serialize;
 
-use crate::gate::{GateOutcome, StructuredGateResult};
+use crate::gate::{built_in_default, GateOutcome, StructuredGateResult};
 use crate::template::types::{Gate, TemplateState};
 
 /// Summary of a recorded decision, used in `koto decisions list` responses.
@@ -399,7 +399,9 @@ pub struct ErrorDetail {
 /// Passed gates are excluded. Each non-passing gate produces a `BlockingCondition`
 /// with `condition_type` taken from the gate definition (falling back to `"command"`
 /// when the gate name is not found in `gate_defs`), and `output` from the structured
-/// gate result.
+/// gate result. `agent_actionable` is set to `true` when the gate has either an
+/// instance-level `override_default` or a built-in default for its gate type, signaling
+/// that the agent can call `koto overrides record` to substitute the gate output.
 pub fn blocking_conditions_from_gates(
     gate_results: &BTreeMap<String, StructuredGateResult>,
     gate_defs: &BTreeMap<String, Gate>,
@@ -417,11 +419,15 @@ pub fn blocking_conditions_from_gates(
                 .get(name)
                 .map(|g| g.gate_type.clone())
                 .unwrap_or_else(|| "command".to_string());
+            let agent_actionable = gate_defs
+                .get(name)
+                .map(|g| g.override_default.is_some() || built_in_default(&g.gate_type).is_some())
+                .unwrap_or(false);
             Some(BlockingCondition {
                 name: name.clone(),
                 condition_type,
                 status: status.to_string(),
-                agent_actionable: false,
+                agent_actionable,
                 output: result.output.clone(),
             })
         })
@@ -1123,6 +1129,7 @@ mod tests {
             key: String::new(),
             pattern: String::new(),
             timeout: 0,
+            override_default: None,
         }
     }
 
@@ -1133,6 +1140,7 @@ mod tests {
             key: "my_key".to_string(),
             pattern: String::new(),
             timeout: 0,
+            override_default: None,
         }
     }
 
@@ -1178,7 +1186,8 @@ mod tests {
         assert_eq!(cond.name, "ci_check");
         assert_eq!(cond.condition_type, "command");
         assert_eq!(cond.status, "failed");
-        assert!(!cond.agent_actionable);
+        // command gate has a built-in default, so agent_actionable is true.
+        assert!(cond.agent_actionable);
         assert_eq!(
             cond.output,
             serde_json::json!({"exit_code": 1, "error": ""})
@@ -1335,5 +1344,96 @@ mod tests {
         // Only the conditional transition appears in options
         assert_eq!(expects.options.len(), 1);
         assert_eq!(expects.options[0].target, "path_a");
+    }
+
+    // -- agent_actionable tests (Issue #4: override pre-check) --
+
+    #[test]
+    fn agent_actionable_true_for_command_gate_with_builtin_default() {
+        // command gate has a built-in default; agent_actionable should be true.
+        let mut gate_results = BTreeMap::new();
+        gate_results.insert(
+            "ci".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exit_code": 1, "error": ""}),
+            },
+        );
+
+        let mut gate_defs = BTreeMap::new();
+        gate_defs.insert("ci".to_string(), make_command_gate());
+
+        let conditions = blocking_conditions_from_gates(&gate_results, &gate_defs);
+        assert_eq!(conditions.len(), 1);
+        assert!(
+            conditions[0].agent_actionable,
+            "command gate has built-in default, agent_actionable must be true"
+        );
+    }
+
+    #[test]
+    fn agent_actionable_true_for_gate_with_instance_override_default() {
+        // Gate with an explicit override_default on the instance.
+        let mut gate_results = BTreeMap::new();
+        gate_results.insert(
+            "custom".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exit_code": 1, "error": ""}),
+            },
+        );
+
+        let mut gate_defs = BTreeMap::new();
+        gate_defs.insert(
+            "custom".to_string(),
+            Gate {
+                gate_type: "custom-unknown".to_string(), // no built-in default
+                command: String::new(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: Some(serde_json::json!({"result": "ok"})),
+            },
+        );
+
+        let conditions = blocking_conditions_from_gates(&gate_results, &gate_defs);
+        assert_eq!(conditions.len(), 1);
+        assert!(
+            conditions[0].agent_actionable,
+            "gate with instance override_default must have agent_actionable true"
+        );
+    }
+
+    #[test]
+    fn agent_actionable_false_for_unknown_type_without_override_default() {
+        // Unknown gate type with no override_default; agent_actionable must be false.
+        let mut gate_results = BTreeMap::new();
+        gate_results.insert(
+            "weird".to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({"exit_code": 1, "error": ""}),
+            },
+        );
+
+        let mut gate_defs = BTreeMap::new();
+        gate_defs.insert(
+            "weird".to_string(),
+            Gate {
+                gate_type: "custom-unknown".to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+            },
+        );
+
+        let conditions = blocking_conditions_from_gates(&gate_results, &gate_defs);
+        assert_eq!(conditions.len(), 1);
+        assert!(
+            !conditions[0].agent_actionable,
+            "unknown gate type with no override_default must have agent_actionable false"
+        );
     }
 }
