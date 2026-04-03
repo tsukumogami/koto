@@ -3615,7 +3615,7 @@ This workflow has a single state that is both initial and terminal.
 
 #[test]
 fn export_multi_state_fixture_contains_expected_states_and_transitions() {
-    let compiled = koto::template::compile::compile(&fixture_multi_state()).unwrap();
+    let compiled = koto::template::compile::compile(&fixture_multi_state(), true).unwrap();
     let mermaid = koto::export::to_mermaid(&compiled);
 
     // Header
@@ -3689,7 +3689,7 @@ fn export_multi_state_fixture_contains_expected_states_and_transitions() {
 
 #[test]
 fn export_simple_gates_fixture_has_gate_and_when_labels() {
-    let compiled = koto::template::compile::compile(&fixture_simple_gates()).unwrap();
+    let compiled = koto::template::compile::compile(&fixture_simple_gates(), true).unwrap();
     let mermaid = koto::export::to_mermaid(&compiled);
 
     // Gate note
@@ -3718,7 +3718,7 @@ fn export_simple_gates_fixture_has_gate_and_when_labels() {
 
 #[test]
 fn export_determinism_byte_identical_across_calls() {
-    let compiled = koto::template::compile::compile(&fixture_multi_state()).unwrap();
+    let compiled = koto::template::compile::compile(&fixture_multi_state(), true).unwrap();
     let first = koto::export::to_mermaid(&compiled);
     let second = koto::export::to_mermaid(&compiled);
 
@@ -3741,7 +3741,7 @@ fn export_single_state_template_produces_valid_mermaid() {
     let src = dir.path().join("single-state.md");
     std::fs::write(&src, single_state_template_content()).unwrap();
 
-    let compiled = koto::template::compile::compile(&src).unwrap();
+    let compiled = koto::template::compile::compile(&src, true).unwrap();
     let mermaid = koto::export::to_mermaid(&compiled);
 
     // Header

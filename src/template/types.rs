@@ -267,7 +267,14 @@ const RUNTIME_VARIABLE_NAMES: &[&str] = &["SESSION_DIR", "SESSION_NAME"];
 
 impl CompiledTemplate {
     /// Validate the compiled template against all schema rules.
-    pub fn validate(&self) -> Result<(), String> {
+    ///
+    /// When `strict` is `true`, a state that has gates but no `gates.*`
+    /// when-clause references is a hard error (D5). When `strict` is `false`,
+    /// the same condition emits a warning to stderr and validation continues.
+    /// D4 (gate reachability / unreferenced-field warnings) is suppressed when
+    /// `strict` is `false` — those warnings are aimed at template authors, not
+    /// at agents running workflows.
+    pub fn validate(&self, strict: bool) -> Result<(), String> {
         if self.format_version != 1 {
             return Err(format!(
                 "unsupported format version: {}",
@@ -525,11 +532,46 @@ impl CompiledTemplate {
             }
         }
 
+        // D5: legacy gate detection. A state with gates but no `gates.*`
+        // when-clause references uses the legacy boolean pass/block path. In
+        // strict mode this is an error; in permissive mode it is a stderr
+        // warning and validation continues.
+        let gates_ns_prefix = format!("{}.", GATES_EVIDENCE_NAMESPACE);
+        for (state_name, state) in &self.states {
+            if state.gates.is_empty() {
+                continue;
+            }
+            // Check whether any transition's when clause references gates.*.
+            let has_gates_routing = state.transitions.iter().any(|t| {
+                t.when
+                    .as_ref()
+                    .is_some_and(|w| w.keys().any(|k| k.starts_with(&gates_ns_prefix)))
+            });
+            if !has_gates_routing {
+                for gate_name in state.gates.keys() {
+                    if strict {
+                        return Err(format!(
+                            "state {:?}: gate {:?} has no gates.* routing\n  \
+                             add a when clause referencing gates.{gate_name}.passed, \
+                             gates.{gate_name}.error, ... \
+                             or use --allow-legacy-gates to permit boolean pass/block behavior",
+                            state_name, gate_name
+                        ));
+                    } else {
+                        eprintln!(
+                            "warning: state {:?}: gate {:?} has no gates.* routing (legacy behavior)",
+                            state_name, gate_name
+                        );
+                    }
+                }
+            }
+        }
+
         // D4: gate reachability check. Runs only after D2 and D3 passed for all
         // states above (any D2 or D3 error causes an early return before this point,
         // so reaching here guarantees the evidence maps are well-formed).
         for (state_name, state) in &self.states {
-            self.validate_gate_reachability(state_name, state)?;
+            self.validate_gate_reachability(state_name, state, strict)?;
         }
 
         Ok(())
@@ -544,11 +586,21 @@ impl CompiledTemplate {
     ///
     /// Also emits a non-fatal stderr warning for gate output fields that are declared
     /// in the gate type's schema but never referenced in any `when` clause (AC10).
+    ///
+    /// When `strict` is `false`, returns `Ok(())` immediately — the per-field
+    /// warning loop is aimed at template authors and should not fire for agents.
     fn validate_gate_reachability(
         &self,
         state_name: &str,
         state: &TemplateState,
+        strict: bool,
     ) -> Result<(), String> {
+        // D4 suppression in permissive mode: suppress the per-field eprintln!
+        // warning loop that is only useful for template authors.
+        if !strict {
+            return Ok(());
+        }
+
         // D4 is only reachable after D2 and D3 pass for all states (validate() returns
         // early on any D2 or D3 error before the D4 loop). Evidence maps are therefore
         // well-formed when this method runs.
@@ -865,7 +917,7 @@ mod tests {
 
     #[test]
     fn valid_minimal_template_passes() {
-        minimal_template().validate().unwrap();
+        minimal_template().validate(true).unwrap();
     }
 
     #[test]
@@ -883,7 +935,7 @@ mod tests {
                 override_default: None,
             },
         );
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(err.contains("unsupported gate type"), "got: {}", err);
         assert!(err.contains("accepts/when"), "got: {}", err);
     }
@@ -903,13 +955,14 @@ mod tests {
                 override_default: None,
             },
         );
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(err.contains("unsupported gate type"), "got: {}", err);
         assert!(err.contains("accepts/when"), "got: {}", err);
     }
 
     #[test]
     fn command_gate_still_works() {
+        // A command gate with gates.* routing is valid in strict mode.
         let mut t = minimal_template();
         let state = t.states.get_mut("start").unwrap();
         state.gates.insert(
@@ -923,7 +976,13 @@ mod tests {
                 override_default: None,
             },
         );
-        t.validate().unwrap();
+        let mut when = BTreeMap::new();
+        when.insert("gates.ci.exit_code".to_string(), serde_json::json!(0));
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        t.validate(true).unwrap();
     }
 
     #[test]
@@ -935,7 +994,7 @@ mod tests {
             target: "done".to_string(),
             when: Some(BTreeMap::new()),
         }];
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(err.contains("when block must not be empty"), "got: {}", err);
     }
 
@@ -949,7 +1008,7 @@ mod tests {
             target: "done".to_string(),
             when: Some(when),
         }];
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("when conditions require an accepts block"),
             "got: {}",
@@ -978,7 +1037,7 @@ mod tests {
             target: "done".to_string(),
             when: Some(when),
         }];
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(err.contains("not declared in accepts"), "got: {}", err);
     }
 
@@ -1005,7 +1064,7 @@ mod tests {
             when: Some(when),
         }];
         assert!(
-            t.validate().is_ok(),
+            t.validate(true).is_ok(),
             "gates.* when clause should not require accepts"
         );
     }
@@ -1055,7 +1114,7 @@ mod tests {
             },
         );
         assert!(
-            t.validate().is_ok(),
+            t.validate(true).is_ok(),
             "two gates.* when transitions should be valid"
         );
     }
@@ -1072,7 +1131,7 @@ mod tests {
             target: "done".to_string(),
             when: Some(when),
         }];
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("when conditions require an accepts block"),
             "got: {}",
@@ -1094,7 +1153,7 @@ mod tests {
             target: "done".to_string(),
             when: Some(when),
         }];
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(err.contains("must be a scalar"), "got: {}", err);
     }
 
@@ -1119,7 +1178,7 @@ mod tests {
             target: "done".to_string(),
             when: Some(when),
         }];
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(err.contains("must be a scalar"), "got: {}", err);
     }
 
@@ -1144,7 +1203,7 @@ mod tests {
             target: "done".to_string(),
             when: Some(when),
         }];
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(err.contains("not in allowed values"), "got: {}", err);
     }
 
@@ -1163,7 +1222,7 @@ mod tests {
             },
         );
         state.accepts = Some(accepts);
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(err.contains("invalid field_type"), "got: {}", err);
     }
 
@@ -1182,7 +1241,7 @@ mod tests {
             },
         );
         state.accepts = Some(accepts);
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("enum fields must have a non-empty values list"),
             "got: {}",
@@ -1243,7 +1302,7 @@ mod tests {
                 when: Some(when_b),
             },
         ];
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(err.contains("not mutually exclusive"), "got: {}", err);
         assert!(err.contains("share no fields"), "got: {}", err);
     }
@@ -1292,7 +1351,7 @@ mod tests {
                 when: Some(when_b),
             },
         ];
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(err.contains("not mutually exclusive"), "got: {}", err);
         assert!(err.contains("identical values"), "got: {}", err);
     }
@@ -1341,7 +1400,7 @@ mod tests {
                 when: Some(when_b),
             },
         ];
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     #[test]
@@ -1400,7 +1459,7 @@ mod tests {
             },
         ];
         // Exclusive on priority even though decision overlaps.
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     #[test]
@@ -1424,7 +1483,7 @@ mod tests {
             target: "done".to_string(),
             when: Some(when),
         }];
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     #[test]
@@ -1432,7 +1491,7 @@ mod tests {
         let mut t = minimal_template();
         let state = t.states.get_mut("start").unwrap();
         state.integration = Some("delegate_review".to_string());
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     #[test]
@@ -1451,11 +1510,13 @@ mod tests {
         );
         state.accepts = Some(accepts);
         // No when condition -- unconditional transition is fine.
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     #[test]
     fn context_exists_gate_validates() {
+        // Tests that a context-exists gate with a valid key passes gate-type validation.
+        // Uses permissive mode so the test focuses on D1 gate validation, not D5.
         let mut t = minimal_template();
         let state = t.states.get_mut("start").unwrap();
         state.gates.insert(
@@ -1469,7 +1530,7 @@ mod tests {
                 override_default: None,
             },
         );
-        t.validate().unwrap();
+        t.validate(false).unwrap();
     }
 
     #[test]
@@ -1478,7 +1539,7 @@ mod tests {
         let state = t.states.get_mut("start").unwrap();
         state.directive = "Do {{TASK}} now".to_string();
         // No variable declared for TASK
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("variable reference '{{TASK}}'"),
             "got: {}",
@@ -1500,7 +1561,7 @@ mod tests {
         );
         let state = t.states.get_mut("start").unwrap();
         state.directive = "Do {{TASK}} now".to_string();
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     #[test]
@@ -1518,7 +1579,7 @@ mod tests {
                 override_default: None,
             },
         );
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("variable reference '{{MISSING}}'"),
             "got: {}",
@@ -1528,6 +1589,8 @@ mod tests {
 
     #[test]
     fn accepts_declared_variable_ref_in_gate_command() {
+        // Tests that a declared variable in a gate command passes variable validation.
+        // Uses permissive mode so the test focuses on variable resolution, not D5.
         let mut t = minimal_template();
         t.variables.insert(
             "BRANCH".to_string(),
@@ -1549,7 +1612,7 @@ mod tests {
                 override_default: None,
             },
         );
-        t.validate().unwrap();
+        t.validate(false).unwrap();
     }
 
     #[test]
@@ -1567,7 +1630,7 @@ mod tests {
                 override_default: None,
             },
         );
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("context-exists gate must have a non-empty key"),
             "got: {}",
@@ -1577,6 +1640,8 @@ mod tests {
 
     #[test]
     fn context_matches_gate_validates() {
+        // Tests that a context-matches gate with valid key and pattern passes gate-type
+        // validation. Uses permissive mode so the test focuses on D1 gate validation, not D5.
         let mut t = minimal_template();
         let state = t.states.get_mut("start").unwrap();
         state.gates.insert(
@@ -1590,7 +1655,7 @@ mod tests {
                 override_default: None,
             },
         );
-        t.validate().unwrap();
+        t.validate(false).unwrap();
     }
 
     #[test]
@@ -1599,7 +1664,7 @@ mod tests {
         let state = t.states.get_mut("start").unwrap();
         state.directive = "Use {{name}} style".to_string();
         // Lowercase is not a variable ref, should pass without declaring it
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     #[test]
@@ -1617,7 +1682,7 @@ mod tests {
                 override_default: None,
             },
         );
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("context-matches gate must have a non-empty key"),
             "got: {}",
@@ -1636,7 +1701,7 @@ mod tests {
             requires_confirmation: false,
             polling: None,
         });
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("cannot have both integration and default_action"),
             "got: {}",
@@ -1659,7 +1724,7 @@ mod tests {
                 override_default: None,
             },
         );
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("context-matches gate must have a non-empty pattern"),
             "got: {}",
@@ -1677,7 +1742,7 @@ mod tests {
             requires_confirmation: false,
             polling: None,
         });
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("default_action command must not be empty"),
             "got: {}",
@@ -1700,7 +1765,7 @@ mod tests {
                 override_default: None,
             },
         );
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(err.contains("invalid regex pattern"), "got: {}", err);
     }
 
@@ -1714,7 +1779,7 @@ mod tests {
             requires_confirmation: false,
             polling: None,
         });
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("variable reference '{{MISSING}}'")
                 && err.contains("default_action command"),
@@ -1733,7 +1798,7 @@ mod tests {
             requires_confirmation: false,
             polling: None,
         });
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("variable reference '{{MISSING}}'")
                 && err.contains("default_action working_dir"),
@@ -1755,7 +1820,7 @@ mod tests {
                 timeout_secs: 0,
             }),
         });
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("polling.timeout_secs must be greater than 0"),
             "got: {}",
@@ -1781,7 +1846,7 @@ mod tests {
             requires_confirmation: false,
             polling: None,
         });
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     #[test]
@@ -1797,7 +1862,7 @@ mod tests {
                 timeout_secs: 1800,
             }),
         });
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     #[test]
@@ -1988,12 +2053,15 @@ command: "./check.sh"
 
     #[test]
     fn override_default_valid_command() {
+        // D2 check: a well-formed override_default for a command gate passes.
+        // Uses permissive mode so the test can focus on D2 without requiring
+        // gates.* routing (D5 is the template-author check, not D2).
         let mut t = minimal_template();
         t.states.get_mut("start").unwrap().gates.insert(
             "ci_check".to_string(),
             make_command_gate(Some(serde_json::json!({"exit_code": 0, "error": ""}))),
         );
-        t.validate().unwrap();
+        t.validate(false).unwrap();
     }
 
     #[test]
@@ -2005,7 +2073,7 @@ command: "./check.sh"
                 serde_json::json!({"exists": false, "error": "missing"}),
             )),
         );
-        t.validate().unwrap();
+        t.validate(false).unwrap();
     }
 
     #[test]
@@ -2017,7 +2085,7 @@ command: "./check.sh"
                 serde_json::json!({"matches": false, "error": "not approved"}),
             )),
         );
-        t.validate().unwrap();
+        t.validate(false).unwrap();
     }
 
     #[test]
@@ -2027,7 +2095,7 @@ command: "./check.sh"
             "ci_check".to_string(),
             make_command_gate(Some(serde_json::Value::Null)),
         );
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("override_default is not a JSON object"),
             "got: {}",
@@ -2043,7 +2111,7 @@ command: "./check.sh"
             "ci_check".to_string(),
             make_command_gate(Some(serde_json::json!(42))),
         );
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("override_default is not a JSON object"),
             "got: {}",
@@ -2060,7 +2128,7 @@ command: "./check.sh"
             "ci_check".to_string(),
             make_command_gate(Some(serde_json::json!({"exit_code": 0}))),
         );
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("override_default missing required field"),
             "got: {}",
@@ -2082,7 +2150,7 @@ command: "./check.sh"
                 serde_json::json!({"exit_code": 0, "error": "", "status": "ok"}),
             )),
         );
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("override_default has unknown field"),
             "got: {}",
@@ -2102,7 +2170,7 @@ command: "./check.sh"
             "ci_check".to_string(),
             make_command_gate(Some(serde_json::json!({"exit_code": "0", "error": ""}))),
         );
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("override_default field \"exit_code\" has wrong type"),
             "got: {}",
@@ -2114,13 +2182,15 @@ command: "./check.sh"
 
     #[test]
     fn override_default_none_gate_unaffected() {
+        // D2 check: a gate with no override_default passes D2 regardless of strict mode.
+        // Uses permissive mode so the test can focus on D2.
         let mut t = minimal_template();
         t.states
             .get_mut("start")
             .unwrap()
             .gates
             .insert("ci_check".to_string(), make_command_gate(None));
-        t.validate().unwrap();
+        t.validate(false).unwrap();
     }
 
     /// Assert that gate_type_builtin_default() returns values identical to
@@ -2181,7 +2251,7 @@ command: "./check.sh"
             target: "done".to_string(),
             when: Some(when),
         }];
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("gates.ci_check") && err.contains("invalid format"),
             "got: {}",
@@ -2204,7 +2274,7 @@ command: "./check.sh"
             target: "done".to_string(),
             when: Some(when),
         }];
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("gates.ci_check.exit_code.extra") && err.contains("invalid format"),
             "got: {}",
@@ -2227,7 +2297,7 @@ command: "./check.sh"
             target: "done".to_string(),
             when: Some(when),
         }];
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("nonexistent_gate") && err.contains("not declared in this state"),
             "got: {}",
@@ -2249,7 +2319,7 @@ command: "./check.sh"
             target: "done".to_string(),
             when: Some(when),
         }];
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(
             err.contains("exitt_code") && err.contains("unknown field"),
             "got: {}",
@@ -2273,7 +2343,7 @@ command: "./check.sh"
             target: "done".to_string(),
             when: Some(when),
         }];
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     #[test]
@@ -2301,7 +2371,7 @@ command: "./check.sh"
             target: "done".to_string(),
             when: Some(when),
         }];
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     #[test]
@@ -2329,7 +2399,7 @@ command: "./check.sh"
             target: "done".to_string(),
             when: Some(when),
         }];
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     #[test]
@@ -2354,7 +2424,7 @@ command: "./check.sh"
             target: "done".to_string(),
             when: Some(when),
         }];
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     // -----------------------------------------------------------------------
@@ -2450,7 +2520,7 @@ command: "./check.sh"
             Some(serde_json::json!({"exit_code": 0, "error": ""})),
             0,
         );
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     // AC4/AC13: reachable state with no override_default uses builtin default.
@@ -2459,7 +2529,7 @@ command: "./check.sh"
         // No override_default; builtin default for command is {exit_code: 0, error: ""}.
         // pass_exit_code=0 matches → at least one transition fires → no error.
         let t = template_with_command_gate_transitions("ci_check", None, 0);
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     // AC3/AC12: dead-end state with no firing transition is rejected.
@@ -2469,7 +2539,7 @@ command: "./check.sh"
         // fail transition needs exit_code==1, also doesn't match exit_code=0.
         // So no transition fires → dead-end error.
         let t = template_with_command_gate_transitions("ci_check", None, 99);
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(err.contains("no transition fires"), "got: {}", err);
         assert!(err.contains("\"start\""), "got: {}", err);
         assert!(err.contains("\"ci_check\""), "got: {}", err);
@@ -2524,7 +2594,7 @@ command: "./check.sh"
                 default_action: None,
             },
         );
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         assert!(err.contains("no transition fires"), "got: {}", err);
         // The error must mention gate1 — confirms the builtin default was used.
         assert!(err.contains("\"gate1\""), "got: {}", err);
@@ -2565,14 +2635,14 @@ command: "./check.sh"
             target: "done".to_string(),
             when: Some(when),
         }];
-        t.validate().unwrap();
+        t.validate(true).unwrap();
     }
 
     // AC6/AC15: state with no gates.* when-clause references compiles cleanly.
     #[test]
     fn reachability_no_gates_when_references_unaffected() {
         // This is just the minimal_template() with no gate references.
-        minimal_template().validate().unwrap();
+        minimal_template().validate(true).unwrap();
     }
 
     // AC8/AC9: D4 skipped when D2 produced an error.
@@ -2630,7 +2700,7 @@ command: "./check.sh"
                 default_action: None,
             },
         );
-        let err = t.validate().unwrap_err();
+        let err = t.validate(true).unwrap_err();
         // Must be a D2 error, not a D4 error.
         assert!(
             err.contains("override_default missing required field"),
@@ -2656,6 +2726,101 @@ command: "./check.sh"
             Some(serde_json::json!({"exit_code": 0, "error": ""})),
             0,
         );
-        t.validate().unwrap();
+        t.validate(true).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // D5: legacy gate detection — strict mode errors, permissive mode warns
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal template with a gate but no gates.* when-clause references
+    /// (legacy gate behavior).
+    fn template_with_legacy_gate() -> CompiledTemplate {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            "ci_check".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_COMMAND.to_string(),
+                command: "./check.sh".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+            },
+        );
+        t
+    }
+
+    // scenario-1: validate(strict=true) returns Err for a template with a gate
+    // and no gates.* when references.
+    #[test]
+    fn d5_strict_mode_errors_on_legacy_gate() {
+        let t = template_with_legacy_gate();
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("gate \"ci_check\" has no gates.* routing"),
+            "expected D5 error, got: {}",
+            err
+        );
+        assert!(
+            err.contains("--allow-legacy-gates"),
+            "error should hint at --allow-legacy-gates, got: {}",
+            err
+        );
+    }
+
+    // scenario-2: validate(strict=false) returns Ok for the same template
+    // (warning goes to stderr; not testable here, but the Ok return is verified).
+    #[test]
+    fn d5_permissive_mode_returns_ok_on_legacy_gate() {
+        let t = template_with_legacy_gate();
+        assert!(
+            t.validate(false).is_ok(),
+            "permissive mode should return Ok for legacy-gate template"
+        );
+    }
+
+    // scenario-3: a template with no gates compiles successfully in both modes.
+    #[test]
+    fn d5_no_gate_template_passes_both_modes() {
+        let t = minimal_template();
+        assert!(t.validate(true).is_ok(), "strict mode: no-gate template should pass");
+        assert!(t.validate(false).is_ok(), "permissive mode: no-gate template should pass");
+    }
+
+    // scenario-4: validate_gate_reachability returns Ok early in permissive mode
+    // without emitting per-field warnings. Template has a dead-end gate state
+    // (no transition fires) that would error in strict mode but not in permissive mode.
+    #[test]
+    fn d4_suppressed_in_permissive_mode() {
+        // Dead-end gate template: no transition fires with builtin defaults.
+        // In strict mode this is a D4 error; in permissive mode D4 is suppressed.
+        let t = template_with_command_gate_transitions(
+            "ci_check",
+            None,
+            99, // builtin default exit_code=0 does not match 99, no transition fires
+        );
+        // strict=true: D4 fires (dead-end state).
+        let err = t.validate(true).unwrap_err();
+        assert!(err.contains("no transition fires"), "expected D4 error, got: {}", err);
+        // strict=false: D4 suppressed (early return in validate_gate_reachability).
+        assert!(
+            t.validate(false).is_ok(),
+            "permissive mode should suppress D4 dead-end error"
+        );
+    }
+
+    // scenario-5: compile() propagates strict through to validate().
+    // Tested indirectly: compile.rs tests call compile(path, true/false) and
+    // the D5 check fires (or doesn't) based on the strict argument.
+    // This unit test confirms via validate() directly that strict is wired through.
+    #[test]
+    fn d5_strict_parameter_controls_error_vs_warning() {
+        let t = template_with_legacy_gate();
+        // Strict: error.
+        assert!(t.validate(true).is_err(), "strict=true must return Err");
+        // Permissive: no error.
+        assert!(t.validate(false).is_ok(), "strict=false must return Ok");
     }
 }

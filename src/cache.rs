@@ -30,7 +30,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
 ///
 /// The cache key is SHA256 of the compiled JSON. Returns `(cache_path, hash)`.
 fn compile_cached_into(source_path: &Path, dir: &Path) -> anyhow::Result<(PathBuf, String)> {
-    let compiled = compile(source_path)?;
+    let compiled = compile(source_path, true)?;
     let json =
         serde_json::to_string_pretty(&compiled).context("failed to serialize compiled template")?;
     let json_bytes = json.as_bytes();
