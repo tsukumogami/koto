@@ -20,6 +20,11 @@ states:
         command: "test -f deploy.conf"
     transitions:
       - target: build
+        when:
+          gates.config_exists.exit_code: 0    # config present, advance
+      - target: preflight                      # self-loop: wait for config
+        when:
+          gates.config_exists.exit_code: 1
   build:
     gates:
       build_output:
@@ -27,6 +32,11 @@ states:
         key: build-output.tar.gz
     transitions:
       - target: test
+        when:
+          gates.build_output.exists: true     # artifact registered, advance
+      - target: build                          # self-loop: wait for artifact
+        when:
+          gates.build_output.exists: false
   test:
     accepts:
       result:
@@ -63,13 +73,13 @@ states:
 
 Run preflight checks for deploying {{VERSION}} to {{ENVIRONMENT}}.
 
-Verify that `deploy.conf` exists in the working directory. This file contains the deployment configuration for the target environment. The gate will block until the file is present.
+Verify that `deploy.conf` exists in the working directory. The gate routes to `build` when the file is present, or loops back here to wait.
 
 ## build
 
 Build version {{VERSION}} for {{ENVIRONMENT}}.
 
-Compile the application, package it as `build-output.tar.gz`, and submit it to the content store with `koto context add`. The gate won't pass until the build artifact is registered.
+Compile the application, package it as `build-output.tar.gz`, and add it to the context store with `koto context add`. The gate routes to `test` when the artifact is registered, or loops back here to wait.
 
 ## test
 
