@@ -90,7 +90,9 @@ blocks, with at least one complete example showing a gate-routed state.
 the output fields available for `gates.*` routing:
 - `command`: `exit_code` (number), `error` (string)
 - `context-exists`: `exists` (boolean), `error` (string)
-- `context-matches`: `matches` (boolean), `error` (string)
+- `context-matches`: `matches` (boolean), `error` (string) — provisional: document as
+  available with the stated schema; note that functional-test verification is pending
+  (see Open Questions)
 
 **R4** — Document `override_default`. `references/template-format.md` must
 document `override_default` as an optional per-gate field, its type (must match
@@ -127,14 +129,16 @@ by any Claude Code session working in the koto directory (not buried inside the
 plugin folder).
 
 **R11** — Root AGENTS.md is orientation-level only. Content must cover: what
-koto is, the key CLI commands an agent is likely to encounter, where to find
-the koto-author and koto-user skills, and a pointer to `docs/guides/cli-usage.md`.
-Length must not exceed 80 lines.
+koto is, where to find the koto-author and koto-user skills, and a pointer to
+`docs/guides/cli-usage.md`. It must explicitly name these CLI commands: `koto init`,
+`koto next`, `koto transition`, `koto overrides record`, `koto rewind`, and
+`koto workflows`. Length must not exceed 80 lines.
 
 **R12** — Delete `plugins/koto-skills/AGENTS.md`. That file's content (koto next
-response shapes, error codes, worked examples) must move into koto-user's
-`references/` directory. After migration, `plugins/koto-skills/AGENTS.md` must
-be deleted entirely.
+response shapes, error codes, worked examples) must be reorganized and distributed
+into koto-user's `references/` files per the structure in R17. The original file
+need not be preserved verbatim; content should be restructured to fit the references/
+format. After migration, `plugins/koto-skills/AGENTS.md` must be deleted entirely.
 
 ### koto-user skill (Workstream B)
 
@@ -150,9 +154,11 @@ include:
   with the agent behavior for each
 - The two-step override flow: `koto overrides record` then `koto next` (not a
   single combined command)
-- The `evidence_required` action's three sub-cases (agent data needed, gate
-  failed with accepts block, auto-advance candidate) and how to distinguish them
-  via `expects.fields`
+- The `evidence_required` action's three sub-cases and their distinguishing signals:
+  (a) agent data needed: `expects.fields` is non-empty and `blocking_conditions` is
+  empty; (b) gate failed with accepts block present: `blocking_conditions` is non-empty
+  and `expects.fields` is non-empty; (c) auto-advance candidate: `expects.fields` is
+  empty and `blocking_conditions` is empty — engine can advance without agent input
 
 **R15** — SKILL.md must not reference phantom commands. `koto status` and `koto
 query` must not appear in any koto-user file.
@@ -162,14 +168,20 @@ content (response schemas, error codes, worked examples) must live in files unde
 `skills/koto-user/references/`, linked explicitly from SKILL.md. The
 `plugins/koto-skills/AGENTS.md` content migrated per R12 becomes these files.
 
-**R17** — `references/` must cover at minimum:
-- Runtime command reference: the full koto CLI surface relevant to workflow runners
-  (init, next with all flags, cancel, rewind, workflows, session dir, decisions
-  record/list, overrides record/list, context add/get/exists/list)
-- Response shapes: annotated JSON examples for each `action` value, including
-  `expects` schema structure and `blocking_conditions` item schema
-- Error handling: exit codes (0/1/2/3 semantics), error categories, and correct
-  agent responses for each
+**R17** — `references/` must contain three files with the following names and content:
+- `command-reference.md`: documents every koto CLI subcommand relevant to workflow
+  runners — `init`, `next` (with `--with-data`, `--to`, `--full` flags), `cancel`,
+  `rewind`, `workflows`, `session dir`, `session list`, `session cleanup`, `decisions
+  record`, `decisions list`, `overrides record`, `overrides list`, `context add`,
+  `context get`, `context exists`, `context list`. This list is exhaustive; each
+  subcommand must be present.
+- `response-shapes.md`: annotated JSON examples for each of the 6 `action` values,
+  the `expects` schema structure, and the `blocking_conditions` item schema
+  (including `agent_actionable` and `output`). Must include at least one JSON example
+  per action value.
+- `error-handling.md`: exit codes 0, 1, 2, and 3 with their semantics and correct
+  agent response for each. Must also document `agent_actionable: false` behavior —
+  when a gate is blocked and no override is possible, what the agent should do.
 
 ### Freshness mechanism
 
@@ -179,16 +191,18 @@ expects. The 8 cases must target:
 1. `koto overrides record` exact syntax (not a generic "record" command)
 2. Two-step override flow: record first, then call `koto next` again
 3. `agent_actionable: true` as the signal that overrides are possible
-4. `evidence_required` action with non-empty `blocking_conditions` (gate failed
-   but accepts block present)
+4. `evidence_required` action with non-empty `blocking_conditions` and non-empty
+   `expects.fields` (gate failed but the state has an accepts block, so agent can
+   submit evidence alongside the override)
 5. `koto next --to` skipping gate evaluation
 6. `--full` flag to restore `details` on repeat visits
 7. `koto workflows` as the correct command to list active workflows (not `koto status`)
 8. Reserved `"gates"` key rejected in `--with-data` evidence payloads
 
-**R19** — Expand `eval-plugins.yml` to trigger on `src/**` changes. Failing evals
-on source-only PRs must not block merge — they must report as advisory output only.
-Failing evals on `plugins/**` changes retain their current behavior.
+**R19** — Expand `eval-plugins.yml` to trigger on `src/**` changes. For source-only
+PRs (no `plugins/**` files changed), the eval step must use `continue-on-error: true`
+so a failing eval produces visible output but does not cause the job or workflow to
+fail. Evals triggered by `plugins/**` changes retain their current behavior (blocking).
 
 **R20** — CLAUDE.local.md trigger list maintained. The "koto-skills Plugin
 Maintenance" section in `CLAUDE.local.md` must be kept current as koto evolves.
@@ -202,11 +216,11 @@ Maintenance" section in `CLAUDE.local.md` must be kept current as koto evolves.
 - [ ] `koto query` does not appear in any koto-author file
 - [ ] `template-format.md` Layer 3 includes `gates.<name>.<field>` syntax with a complete example
 - [ ] All three gate type output schemas are documented (command, context-exists, context-matches)
-- [ ] `override_default` field is documented with resolution order
+- [ ] `override_default` field is documented with all three resolution tiers explicitly stated: `--with-data` > `override_default` > built-in default
 - [ ] `koto overrides record` and `koto overrides list` are documented with all flags
 - [ ] `blocking_conditions` item schema (including `agent_actionable` and `output`) is documented
 - [ ] `--allow-legacy-gates` flag and D5 diagnostic are documented
-- [ ] `complex-workflow.md` gates-bearing states use `gates.*` routing; no D5 warnings under strict compile
+- [ ] `complex-workflow.md` gates-bearing states use `gates.*` routing; `koto template compile` (without `--allow-legacy-gates`) exits 0 on the updated file
 - [ ] `koto-author.md` compile_validation gate uses `gates.template_exists.exists: true` routing
 - [ ] compile_validation directive includes a D5 bullet in the error list
 
@@ -214,27 +228,34 @@ Maintenance" section in `CLAUDE.local.md` must be kept current as koto evolves.
 
 - [ ] `AGENTS.md` exists at the koto repo root
 - [ ] File length ≤ 80 lines
-- [ ] Covers: koto purpose, key CLI commands, pointers to koto-author and koto-user skills, cli-usage.md reference
+- [ ] Contains the strings "koto-author" and "koto-user" as skill references
+- [ ] Contains `docs/guides/cli-usage.md` as a pointer
+- [ ] Explicitly names at least these commands: `koto init`, `koto next`, `koto overrides record`, `koto rewind`, `koto workflows`
+- [ ] Does not contain `koto status` or `koto query`
 - [ ] `plugins/koto-skills/AGENTS.md` is deleted
 
 ### koto-user skill
 
 - [ ] `plugins/koto-skills/skills/koto-user/SKILL.md` exists
 - [ ] `./skills/koto-user` is in `plugin.json` skills array
-- [ ] SKILL.md contains the 6-value `action` dispatch table
-- [ ] SKILL.md describes the two-step override flow explicitly (record → then call next again)
-- [ ] SKILL.md explains the three `evidence_required` sub-cases and how to distinguish them
+- [ ] SKILL.md contains the 6-value `action` dispatch table: `evidence_required`, `gate_blocked`, `integration`, `integration_unavailable`, `done`, `confirm` all appear
+- [ ] SKILL.md contains both `koto overrides record` and a phrase indicating the agent must call `koto next` again after recording
+- [ ] SKILL.md contains `expects.fields` alongside descriptions of the three `evidence_required` sub-cases
+- [ ] SKILL.md or `references/error-handling.md` documents what to do when `agent_actionable` is `false` (gate blocked, override not possible)
+- [ ] SKILL.md or `references/command-reference.md` documents `koto rewind` behavior
 - [ ] No koto-user file references `koto status` or `koto query`
-- [ ] `references/` directory exists with runtime command reference, response shapes, and error handling files
-- [ ] Content formerly in `plugins/koto-skills/AGENTS.md` is accessible via koto-user references/
+- [ ] `references/command-reference.md`, `references/response-shapes.md`, and `references/error-handling.md` all exist
+- [ ] `references/command-reference.md` contains entries for all subcommands listed in R17
+- [ ] `references/response-shapes.md` contains at least one annotated JSON example per action value
+- [ ] `references/error-handling.md` documents exit codes 0, 1, 2, and 3 and the `agent_actionable: false` scenario
 
 ### Freshness mechanism
 
 - [ ] `plugins/koto-skills/evals/` exists with 8 subdirectories, each containing `prompt.txt`, `skill_path.txt`, `patterns.txt`
 - [ ] All 8 behaviors from R18 are covered by at least one eval case
 - [ ] `eval-plugins.yml` triggers on both `plugins/**` and `src/**` path changes
-- [ ] Evals failing on source-only PRs are advisory (do not block merge)
-- [ ] CLAUDE.local.md "koto-skills Plugin Maintenance" section is present
+- [ ] The eval step for source-only PRs uses `continue-on-error: true` (or equivalent) so job exits 0 regardless of eval results
+- [ ] CLAUDE.local.md "koto-skills Plugin Maintenance" section is present and has not been removed
 
 ## Out of Scope
 
@@ -247,7 +268,9 @@ Maintenance" section in `CLAUDE.local.md` must be kept current as koto evolves.
 
 ## Open Questions
 
-- **`context-matches` gate**: the output schema is documented in source (`matches: bool, error: string`) but no functional test fixture was examined. Should koto-user and koto-author document this gate type fully, or mark it as "available but behavior pending documentation"?
+- **`context-matches` gate**: the output schema is documented in source (`matches: bool, error: string`) but no functional test fixture was examined. Should koto-user and koto-author document this gate type fully, or mark it as "available but behavior pending documentation"? (R3 uses the provisional marking as the interim answer.)
+
+- **Variable substitution in directives**: `{{VARIABLE_NAME}}` tokens in `directive` and `details` are substituted by the engine before output. Agents receiving raw `{{...}}` tokens vs. substituted values may be confused. Should koto-user's SKILL.md or `references/response-shapes.md` document this behavior explicitly? Neither koto-author nor koto-user currently covers it.
 
 ## Known Limitations
 
