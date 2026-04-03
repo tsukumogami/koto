@@ -12,7 +12,7 @@ goals: |
   Agents running koto-backed workflows can find and follow a skill that accurately
   describes the current runtime loop. The koto-author skill reflects the gate-transition
   roadmap. A lightweight repo-wide AGENTS.md orients any Claude Code session in koto.
-  An eval harness catches skill drift before it accumulates.
+  A CLAUDE.md protocol ensures skill drift is assessed within the same PR cycle that introduced it.
 ---
 
 # PRD: koto-user skill and koto-skills plugin update
@@ -51,8 +51,7 @@ repo root.
   compiler behavior.
 - Any Claude Code session at the koto repo root starts with basic orientation via
   a root-level `AGENTS.md`.
-- An eval harness runs automatically on plugin changes and advises on source
-  changes, so skill drift is visible within the same PR cycle that introduced it.
+- A CLAUDE.md protocol ensures skill drift is assessed within the same PR cycle that introduced it.
 
 ## User Stories
 
@@ -69,9 +68,7 @@ compile cleanly in strict mode and route automatically based on gate results.
 orient me before I start reading skill files or invoking `koto` — covering what
 koto does and where to find guidance.
 
-**As a koto maintainer**, I want eval cases that run on source PRs so I see
-immediately when a code change makes skill guidance stale, even before a
-dedicated skill-update PR is filed.
+**As a koto maintainer**, I want a protocol in CLAUDE.md that prompts skill assessment on every source PR, covering both broken contracts and new surface that should be documented.
 
 ## Requirements
 
@@ -185,28 +182,12 @@ content (response schemas, error codes, worked examples) must live in files unde
 
 ### Freshness mechanism
 
-**R18** — Create 8 eval cases in `plugins/koto-skills/evals/`. Each case must
-have `prompt.txt`, `skill_path.txt`, and `patterns.txt` per the format `eval.sh`
-expects. The 8 cases must target:
-1. `koto overrides record` exact syntax (not a generic "record" command)
-2. Two-step override flow: record first, then call `koto next` again
-3. `agent_actionable: true` as the signal that overrides are possible
-4. `evidence_required` action with non-empty `blocking_conditions` and non-empty
-   `expects.fields` (gate failed but the state has an accepts block, so agent can
-   submit evidence alongside the override)
-5. `koto next --to` skipping gate evaluation
-6. `--full` flag to restore `details` on repeat visits
-7. `koto workflows` as the correct command to list active workflows (not `koto status`)
-8. Reserved `"gates"` key rejected in `--with-data` evidence payloads
-
-**R19** — Expand `eval-plugins.yml` to trigger on `src/**` changes. For source-only
-PRs (no `plugins/**` files changed), the eval step must use `continue-on-error: true`
-so a failing eval produces visible output but does not cause the job or workflow to
-fail. Evals triggered by `plugins/**` changes retain their current behavior (blocking).
-
-**R20** — CLAUDE.md trigger list maintained. The "koto-skills Plugin
-Maintenance" section in `CLAUDE.md` must be kept current as koto evolves.
-(Already implemented; this requirement ensures it's not removed.)
+**R18** — CLAUDE.md skill assessment protocol maintained. The "koto-skills Plugin
+Maintenance" section in `CLAUDE.md` must remain present and instruct contributors
+to assess both skills after any `src/` or `cmd/` change — checking for broken
+contracts (existing skill claims that no longer match the code) and new surface
+(added behavior not yet covered by either skill). (Already implemented; this
+requirement ensures it's not removed or weakened.)
 
 ## Acceptance Criteria
 
@@ -251,11 +232,8 @@ Maintenance" section in `CLAUDE.md` must be kept current as koto evolves.
 
 ### Freshness mechanism
 
-- [ ] `plugins/koto-skills/evals/` exists with 8 subdirectories, each containing `prompt.txt`, `skill_path.txt`, `patterns.txt`
-- [ ] All 8 behaviors from R18 are covered by at least one eval case
-- [ ] `eval-plugins.yml` triggers on both `plugins/**` and `src/**` path changes
-- [ ] The eval step for source-only PRs uses `continue-on-error: true` (or equivalent) so job exits 0 regardless of eval results
 - [ ] CLAUDE.md "koto-skills Plugin Maintenance" section is present and has not been removed
+- [ ] The section instructs contributors to check for broken contracts and new surface after `src/` or `cmd/` changes
 
 ## Out of Scope
 
@@ -274,8 +252,7 @@ Maintenance" section in `CLAUDE.md` must be kept current as koto evolves.
 
 ## Known Limitations
 
-- The eval harness uses positive-only pattern matching (`grep -qP`). Evals can confirm a behavior is mentioned but cannot verify it's described correctly. Semantic accuracy beyond keyword presence requires human review.
-- Evals on source-only PRs are advisory: a maintainer may not notice or act on advisory failures. The CLAUDE.md trigger list remains the primary human signal.
+- The CLAUDE.md protocol relies on the contributor (human or agent) actually following it. There is no automated enforcement — a PR that skips the skill assessment will not be blocked.
 - `--allow-legacy-gates` is transitory — it will be removed once the shirabe `work-on` template migrates to structured gate routing. R7 documentation should note this.
 
 ## Decisions and Trade-offs
@@ -284,9 +261,7 @@ Maintenance" section in `CLAUDE.md` must be kept current as koto evolves.
 
 **Root AGENTS.md is orientation-level, not a skill substitute**: Three functional substitutes for koto-user already exist (AGENTS.md 550 lines, koto.mdc 207 lines, cli-usage.md). The root AGENTS.md is not replacing them — it's a short entry point that orients any Claude Code session and points to the skill for detailed guidance. Content depth lives in the skill's references/, not in AGENTS.md.
 
-**Advisory evals on source PRs (not blocking)**: Blocking evals on source changes would prevent merging legitimate refactors that don't change observable behavior. Advisory mode keeps the signal visible without adding false-positive friction. The CLAUDE.md trigger list handles the human review signal.
-
-**File-change heuristics ruled out**: Heuristic CI checks (require skill file changes when certain source files change) have a high false-positive rate — not every engine refactor changes observable behavior. Advisory evals cover the semantic gap more reliably.
+**CLAUDE.md protocol over automated evals**: LLM-based evals with positive-only pattern matching can confirm that keywords appear but cannot verify correctness, and they fundamentally cannot detect new surface added by a PR. A diff-based assessment prompted by CLAUDE.md — checking both broken contracts and new surface — covers both failure modes more reliably than canned test scenarios.
 
 **plugins/koto-skills/AGENTS.md deleted (not kept as pointer)**: After its content
 migrates to koto-user/references/, the plugin-root AGENTS.md is deleted outright.
