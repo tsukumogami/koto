@@ -196,7 +196,7 @@ The koto repo has a `docs/` folder with human-facing guides (e.g.,
 (command syntax, response schemas, error codes) could reference that folder instead
 of bundling their own content.
 
-#### Chosen: separate bundled documents, different format from docs/
+#### Chosen: separate bundled documents with last-resort docs/ pointer
 
 Skill reference files (`command-reference.md`, `response-shapes.md`,
 `error-handling.md`) are distinct documents from anything in `docs/`. They cover the
@@ -204,25 +204,37 @@ same facts but are shaped differently: dispatch tables, annotated JSON examples,
 exit-code decision trees — formats optimized for an agent consulting a reference
 mid-loop, not for a human learning the tool.
 
+Each reference file ends with a single last-resort pointer to `docs/guides/cli-usage.md`
+for cases the bundled content doesn't cover. This is a safety net for gaps, not a
+primary path. The bundled files remain authoritative; `docs/` is only consulted when
+an agent hits something not represented in the reference file at all.
+
+This differs from the tsuku approach, where `docs/` guides are the intentional
+deep-dive path for known complex topics. koto's reference surface is compact and
+schema-focused — the bundled files cover the domain fully for the expected use cases.
+The docs/ pointer handles the unexpected.
+
 This matches the industry pattern: MCP servers bundle their schemas inline, Cursor
 rules live in `.cursorrules`, GitHub Copilot instructions live in
 `.github/copilot-instructions.md`. Agent-facing content is consistently bundled and
-separately maintained from human-facing docs. The formats have different optimization
-targets and genuine differences in structure justify the duplication.
+separately maintained from human-facing docs.
 
 #### Alternatives considered
 
-**Reference docs/ from skills** — skill files link to `docs/guides/cli-usage.md`
-instead of bundling their own content. Rejected for two reasons: (1) it doesn't
-eliminate staleness — if `cli-usage.md` is stale after a CLI change, the skill is
-still wrong; staleness is a process problem addressed by the CLAUDE.md protocol, not
-a co-location problem; (2) agents consulting a reference mid-loop should not need to
-navigate to a separate human-facing guide with a different reading order and structure.
+**Reference docs/ from skills (primary path)** — skill files link to
+`docs/guides/cli-usage.md` as the main depth mechanism instead of bundling reference
+content. Rejected: (1) staleness is a process problem addressed by the CLAUDE.md
+protocol, not a co-location problem; (2) agents mid-loop should not navigate to a
+human-facing guide with a different reading order.
 
 **Generate skill content from docs/** — treat `docs/` as the source of truth and
 derive skill reference files from it. Rejected: the documents are different shapes.
 `cli-usage.md` explains how to use koto; `command-reference.md` is a flag-lookup
 table. There is no mechanical transform between explanation and dispatch table.
+
+**No docs/ pointer at all** — fully self-contained with no reference to docs/.
+Rejected: leaves agents with no escape hatch when the bundled reference doesn't
+cover an edge case. A single last-resort line costs nothing and prevents dead ends.
 
 ## Decision Outcome
 
@@ -232,15 +244,16 @@ files — satisfying the navigation cost driver. Annotated YAML examples in
 koto-author template-format.md give template authors copyable patterns, filling the
 four documentation gaps without restructuring the skill. The root AGENTS.md routes
 any session to the right skill via a command table and a short heuristic, using
-roughly half its line budget. Skill reference files are standalone bundled documents,
-not proxies for the human-facing `docs/` folder.
+roughly half its line budget. Skill reference files are standalone bundled documents optimized for agent
+consumption, with a last-resort pointer to `docs/guides/cli-usage.md` at the end
+of each file as a safety net for gaps.
 
 The choices reinforce each other: D3 (command table) relies on koto-user providing
 sufficient depth for workflow runners, which D1 (balanced SKILL.md) delivers. D2
 operates independently on koto-author but shares the same "examples over prose"
-reasoning as D1's dispatch table inline in SKILL.md. D4 keeps skill content
-self-contained: agents get dispatch-table-shaped references, not links to
-human-facing guides with a different reading order.
+reasoning as D1's dispatch table inline in SKILL.md. D4 keeps skill content primary
+and self-contained while acknowledging that `docs/` exists as a fallback — not a
+primary reference path, but an escape hatch for the unexpected.
 
 ## Solution Architecture
 
@@ -310,7 +323,25 @@ Layer 3 is additive; existing links remain valid.
 **koto-user references/command-reference.md** must include `koto context`
 subcommands (`add`, `get`, `exists`, `list`) alongside the workflow-runner commands
 listed in PRD R17. Agents hitting a blocking `context-exists` gate need to know how
-to resolve it; omitting these commands leaves a gap in the recovery path.
+to resolve it; omitting these commands leaves a gap in the recovery path. Each file
+ends with: *"For topics not covered here, see `docs/guides/cli-usage.md`."*
+
+**koto-user references/response-shapes.md** scenario coverage criteria — each
+annotated JSON example must represent a distinct, meaningful agent decision point,
+not just a structural variation. Required scenarios:
+- `evidence_required` — sub-case (a): clean state, agent submits evidence
+- `evidence_required` — sub-case (b): gate failed, accepts block present, agent can submit or override
+- `evidence_required` — sub-case (c): both empty, auto-advance candidate
+- `gate_blocked` — `agent_actionable: true`, override is possible
+- `gate_blocked` — `agent_actionable: false`, agent cannot unblock
+- `integration` — external integration running, agent waits
+- `integration_unavailable` — integration not reachable, agent decides whether to override
+- `done` — terminal state
+- `confirm` — agent must confirm before transition
+
+The sub-case (b) and `gate_blocked` with `agent_actionable: false` scenarios are the
+correctness-critical ones; skipping them in favor of simpler examples would leave the
+most error-prone cases undocumented.
 
 **koto-author template-format.md Layer 3 extension** must contain per gate type:
 - Field table: name, type, description for each output field
@@ -391,6 +422,12 @@ apply to code that executes with agent permissions.
 No other security dimensions apply: no external artifacts are fetched or executed, no
 elevated filesystem or network permissions are required, and no sensitive data is
 accessed or embedded in the skill content.
+
+**Hooks policy.** Plugin directories can contain a `hooks.json` that executes
+arbitrary shell commands on the agent's machine. The koto-skills plugin must not
+include `hooks.json` without explicit review. If hooks are added in the future,
+the review bar is higher than for skill content changes — hooks execute code, not
+instructions.
 
 ## Consequences
 
