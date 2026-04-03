@@ -1,0 +1,34 @@
+{
+  "topic": "koto-user-skill",
+  "decisions": [
+    {
+      "id": 1,
+      "question": "How should responsibility be divided between koto-user SKILL.md and its three reference files?",
+      "status": "complete",
+      "complexity": "standard",
+      "chosen": "Balanced SKILL.md",
+      "confidence": "high",
+      "report_file": "wip/design_koto-user-skill_decision_1_report.md"
+    },
+    {
+      "id": 2,
+      "question": "What format should the koto-author gate documentation take in template-format.md?",
+      "status": "complete",
+      "complexity": "standard",
+      "chosen": "Annotated YAML examples with embedded per-gate field tables",
+      "confidence": "high",
+      "report_file": "wip/design_koto-user-skill_decision_2_report.md"
+    },
+    {
+      "id": 3,
+      "question": "Given the 80-line constraint, what should the root AGENTS.md contain?",
+      "status": "complete",
+      "complexity": "standard",
+      "chosen": "Command quick-reference table + skill pointers",
+      "confidence": "high",
+      "report_file": "wip/design_koto-user-skill_decision_3_report.md"
+    }
+  ],
+  "cross_validation": "passed",
+  "round": 0
+}
