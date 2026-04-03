@@ -187,20 +187,60 @@ not read more AGENTS.md prose. Rejected.
 koto-author vs. koto-user without additional prose that erases its compactness
 advantage. An agent that doesn't know which skill applies is not oriented. Rejected.
 
+---
+
+### Decision 4: skill-bundled content vs. reference to docs/
+
+The koto repo has a `docs/` folder with human-facing guides (e.g.,
+`docs/guides/cli-usage.md`). The skill reference files covering the same domain
+(command syntax, response schemas, error codes) could reference that folder instead
+of bundling their own content.
+
+#### Chosen: separate bundled documents, different format from docs/
+
+Skill reference files (`command-reference.md`, `response-shapes.md`,
+`error-handling.md`) are distinct documents from anything in `docs/`. They cover the
+same facts but are shaped differently: dispatch tables, annotated JSON examples, and
+exit-code decision trees — formats optimized for an agent consulting a reference
+mid-loop, not for a human learning the tool.
+
+This matches the industry pattern: MCP servers bundle their schemas inline, Cursor
+rules live in `.cursorrules`, GitHub Copilot instructions live in
+`.github/copilot-instructions.md`. Agent-facing content is consistently bundled and
+separately maintained from human-facing docs. The formats have different optimization
+targets and genuine differences in structure justify the duplication.
+
+#### Alternatives considered
+
+**Reference docs/ from skills** — skill files link to `docs/guides/cli-usage.md`
+instead of bundling their own content. Rejected for two reasons: (1) it doesn't
+eliminate staleness — if `cli-usage.md` is stale after a CLI change, the skill is
+still wrong; staleness is a process problem addressed by the CLAUDE.md protocol, not
+a co-location problem; (2) agents consulting a reference mid-loop should not need to
+navigate to a separate human-facing guide with a different reading order and structure.
+
+**Generate skill content from docs/** — treat `docs/` as the source of truth and
+derive skill reference files from it. Rejected: the documents are different shapes.
+`cli-usage.md` explains how to use koto; `command-reference.md` is a flag-lookup
+table. There is no mechanical transform between explanation and dispatch table.
+
 ## Decision Outcome
 
-The three decisions interlock cleanly. A balanced SKILL.md for koto-user gives
+The four decisions interlock cleanly. A balanced SKILL.md for koto-user gives
 workflow agents everything they need for a typical session without opening reference
 files — satisfying the navigation cost driver. Annotated YAML examples in
 koto-author template-format.md give template authors copyable patterns, filling the
 four documentation gaps without restructuring the skill. The root AGENTS.md routes
 any session to the right skill via a command table and a short heuristic, using
-roughly half its line budget.
+roughly half its line budget. Skill reference files are standalone bundled documents,
+not proxies for the human-facing `docs/` folder.
 
 The choices reinforce each other: D3 (command table) relies on koto-user providing
 sufficient depth for workflow runners, which D1 (balanced SKILL.md) delivers. D2
 operates independently on koto-author but shares the same "examples over prose"
-reasoning as D1's dispatch table inline in SKILL.md.
+reasoning as D1's dispatch table inline in SKILL.md. D4 keeps skill content
+self-contained: agents get dispatch-table-shaped references, not links to
+human-facing guides with a different reading order.
 
 ## Solution Architecture
 
