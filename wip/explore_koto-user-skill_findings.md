@@ -77,6 +77,8 @@ User chose parallel workstreams. Clarified that AGENTS.md should be at the koto 
 should reference custom files from their own `references/` directories, not rely on
 AGENTS.md for skill-specific content.
 
+## Decision: Crystallize
+
 ## Accumulated Understanding
 
 Three distinct workstreams are now in scope:
