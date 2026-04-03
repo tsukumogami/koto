@@ -3783,7 +3783,12 @@ fn export_md_and_json_produce_identical_output() {
     let fixture = fixture_multi_state();
 
     let compile_output = koto_cmd(dir.path())
-        .args(["template", "compile", fixture.to_str().unwrap()])
+        .args([
+            "template",
+            "compile",
+            "--allow-legacy-gates",
+            fixture.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
 

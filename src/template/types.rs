@@ -2785,8 +2785,14 @@ command: "./check.sh"
     #[test]
     fn d5_no_gate_template_passes_both_modes() {
         let t = minimal_template();
-        assert!(t.validate(true).is_ok(), "strict mode: no-gate template should pass");
-        assert!(t.validate(false).is_ok(), "permissive mode: no-gate template should pass");
+        assert!(
+            t.validate(true).is_ok(),
+            "strict mode: no-gate template should pass"
+        );
+        assert!(
+            t.validate(false).is_ok(),
+            "permissive mode: no-gate template should pass"
+        );
     }
 
     // scenario-4: validate_gate_reachability returns Ok early in permissive mode
@@ -2797,13 +2803,16 @@ command: "./check.sh"
         // Dead-end gate template: no transition fires with builtin defaults.
         // In strict mode this is a D4 error; in permissive mode D4 is suppressed.
         let t = template_with_command_gate_transitions(
-            "ci_check",
-            None,
+            "ci_check", None,
             99, // builtin default exit_code=0 does not match 99, no transition fires
         );
         // strict=true: D4 fires (dead-end state).
         let err = t.validate(true).unwrap_err();
-        assert!(err.contains("no transition fires"), "expected D4 error, got: {}", err);
+        assert!(
+            err.contains("no transition fires"),
+            "expected D4 error, got: {}",
+            err
+        );
         // strict=false: D4 suppressed (early return in validate_gate_reachability).
         assert!(
             t.validate(false).is_ok(),

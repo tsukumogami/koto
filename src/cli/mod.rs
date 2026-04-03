@@ -358,7 +358,9 @@ fn validate_compiled_template(path: &str) -> anyhow::Result<()> {
         std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("failed to read file: {}", e))?;
     let template: CompiledTemplate =
         serde_json::from_str(&content).map_err(|e| anyhow::anyhow!("invalid JSON: {}", e))?;
-    template.validate(true).map_err(|e| anyhow::anyhow!("{}", e))
+    template
+        .validate(true)
+        .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 /// Load a compiled template from a cache path.
