@@ -52,7 +52,17 @@ After init, follow the koto execution loop:
 3. Read the `directive` for instructions. On first visit to a state, a `details` field may contain extended guidance (pass `--full` to force it on repeat visits)
 4. Repeat until `action` is `done`
 
-Run `koto status` at any point to see where you are.
+Each item in `blocking_conditions` has five fields:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `name` | string | Gate name as declared in the template |
+| `type` | string | Gate type (`command`, `context-exists`, `context-matches`) |
+| `status` | string | `failed`, `timed_out`, or `error` |
+| `agent_actionable` | boolean | `true` when `koto overrides record` can unblock this gate |
+| `output` | object | Gate-type-specific structured result (e.g., `{"exit_code": 1, "error": ""}` for `command` gates) |
+
+To check where you are at any point, call `koto next <session-name>` without `--with-data` — it returns the current state directive and is idempotent. If you don't know the session name, `koto workflows` lists active sessions.
 
 ## What to expect
 
@@ -85,7 +95,7 @@ gh api repos/tsukumogami/koto/contents/docs/guides --jq '.[].name'
 
 ## Resuming interrupted sessions
 
-koto preserves state across interruptions. Run `koto status` to see where you left off, then `koto next` to continue.
+koto preserves state across interruptions. Call `koto next <session-name>` to see where you left off and pick up where you stopped. If you don't remember the session name, `koto workflows` lists active sessions.
 
 ## Output
 
@@ -104,7 +114,7 @@ Both files follow the coupling convention: the SKILL.md references the template 
 
 **Template won't compile after 3 attempts** -- the directive tells you to escalate. Common causes: state name typos, overlapping evidence routing conditions, missing directive body sections. Run `koto template compile <path>` manually to see the full error.
 
-**"session already exists"** -- a previous run didn't finish. Run `koto status` to check, then either `koto next` to resume or start a new session.
+**"session already exists"** -- a previous run didn't finish. Call `koto next <session-name>` to resume where you left off. If you don't know the session name, `koto workflows` lists active sessions.
 
 ## Optional: skill-creator for eval
 
