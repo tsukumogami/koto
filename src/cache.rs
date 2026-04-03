@@ -29,8 +29,8 @@ pub fn sha256_hex(data: &[u8]) -> String {
 /// Core cache logic with an explicit cache directory.
 ///
 /// The cache key is SHA256 of the compiled JSON. Returns `(cache_path, hash)`.
-fn compile_cached_into(source_path: &Path, dir: &Path) -> anyhow::Result<(PathBuf, String)> {
-    let compiled = compile(source_path, true)?;
+fn compile_cached_into(source_path: &Path, dir: &Path, strict: bool) -> anyhow::Result<(PathBuf, String)> {
+    let compiled = compile(source_path, strict)?;
     let json =
         serde_json::to_string_pretty(&compiled).context("failed to serialize compiled template")?;
     let json_bytes = json.as_bytes();
@@ -80,11 +80,15 @@ fn compile_cached_into(source_path: &Path, dir: &Path) -> anyhow::Result<(PathBu
 /// of that JSON is used as both the cache filename and the returned hash.
 /// On a cache hit, the cached file is returned without recompilation.
 ///
+/// `strict` controls whether legacy gate behavior (gates with no `gates.*`
+/// when-clause references) is rejected (strict=true) or warned (strict=false).
+/// Use strict=false for implicit compilation (init, export, next).
+///
 /// Returns `(cache_path, template_hash)` where `template_hash` is the
 /// SHA256 hex of the compiled JSON — suitable for use as `template_hash`
 /// in the JSONL init event.
-pub fn compile_cached(source_path: &Path) -> anyhow::Result<(PathBuf, String)> {
-    compile_cached_into(source_path, &cache_dir())
+pub fn compile_cached(source_path: &Path, strict: bool) -> anyhow::Result<(PathBuf, String)> {
+    compile_cached_into(source_path, &cache_dir(), strict)
 }
 
 #[cfg(test)]
@@ -133,12 +137,12 @@ Cache test directive.
         let cache_tmp = tempfile::tempdir().unwrap();
         let cache_dir = cache_tmp.path().join("koto");
 
-        let (path1, hash1) = compile_cached_into(f.path(), &cache_dir).unwrap();
+        let (path1, hash1) = compile_cached_into(f.path(), &cache_dir, false).unwrap();
         assert!(path1.exists());
         assert_eq!(hash1.len(), 64);
         assert!(hash1.chars().all(|c| c.is_ascii_hexdigit()));
 
-        let (path2, hash2) = compile_cached_into(f.path(), &cache_dir).unwrap();
+        let (path2, hash2) = compile_cached_into(f.path(), &cache_dir, false).unwrap();
         assert_eq!(path1, path2);
         assert_eq!(hash1, hash2);
     }
@@ -151,7 +155,7 @@ Cache test directive.
         let cache_tmp = tempfile::tempdir().unwrap();
         let cache_dir = cache_tmp.path().join("koto");
 
-        let (cache_path, hash) = compile_cached_into(f.path(), &cache_dir).unwrap();
+        let (cache_path, hash) = compile_cached_into(f.path(), &cache_dir, false).unwrap();
 
         let written_bytes = std::fs::read(&cache_path).unwrap();
         let expected = sha256_hex(&written_bytes);

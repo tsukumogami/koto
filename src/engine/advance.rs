@@ -301,6 +301,10 @@ where
         // Gate outputs to inject into evidence (populated whenever gates are present).
         let mut gate_evidence_map: serde_json::Map<String, serde_json::Value> =
             serde_json::Map::new();
+        // True when this state has at least one transition whose when clause references
+        // a gates.* key. False for legacy states (boolean pass/block only).
+        // Initialized to false; set inside the gates block when gates are present.
+        let mut has_gates_routing = false;
         if !template_state.gates.is_empty() {
             // Derive active overrides for the current epoch before iterating gates.
             // Convert the list of GateOverrideRecorded events to a map from gate name
@@ -378,29 +382,30 @@ where
             let any_failed = gate_results
                 .values()
                 .any(|r| !matches!(r.outcome, GateOutcome::Passed));
+
+            // Determine whether this state uses structured gate routing: at least
+            // one transition's when clause references a gates.* key. Used both to
+            // decide whether to block immediately (when gates fail) and to guard
+            // evidence injection — legacy states (no gates.* references) must not
+            // have gate output merged into the resolver evidence map.
+            has_gates_routing = template_state.transitions.iter().any(|t| {
+                t.when
+                    .as_ref()
+                    .map(|w| {
+                        w.keys()
+                            .any(|k| k.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)))
+                    })
+                    .unwrap_or(false)
+            });
+
             if any_failed {
-                // Determine whether this state can route based on gate output alone.
-                // A state does so when it has at least one conditional transition
-                // whose when clause references a gates.* key. In that case, fall
-                // through to transition resolution so the gate output can drive
-                // routing (scenarios 14, 15, 16 in the structured-gate-output PRD).
-                //
-                // If the state has an accepts block, also fall through so the
+                // If the state has an accepts block, fall through so the
                 // transition resolver can use evidence as a fallback. The resolver
                 // will skip unconditional transitions when gate_failed is true,
                 // ensuring the agent must submit evidence when no conditional
                 // transition matches.
                 //
                 // If neither condition holds, return GateBlocked immediately.
-                let has_gates_routing = template_state.transitions.iter().any(|t| {
-                    t.when
-                        .as_ref()
-                        .map(|w| {
-                            w.keys()
-                                .any(|k| k.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)))
-                        })
-                        .unwrap_or(false)
-                });
                 if template_state.accepts.is_none() && !has_gates_routing {
                     return Ok(AdvanceResult {
                         final_state: state,
@@ -434,7 +439,11 @@ where
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        if !gate_evidence_map.is_empty() {
+        // Only inject gate output for structured-mode states (those with at least
+        // one gates.* when-clause reference). Legacy states (boolean pass/block
+        // only, no gates.* routing) must not have gate output in the resolver
+        // evidence map — their transitions route on agent evidence alone.
+        if !gate_evidence_map.is_empty() && has_gates_routing {
             merged.insert(
                 "gates".to_string(),
                 serde_json::Value::Object(gate_evidence_map),
@@ -3186,5 +3195,171 @@ mod tests {
             evaluated,
             "GateEvaluated must be emitted for non-overridden gate with unknown type"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Gate backward compatibility: evidence map exclusion for legacy states
+    // -----------------------------------------------------------------------
+
+    /// A legacy state (gates present, no gates.* when-clause references) should
+    /// advance via an unconditional transition when the gate passes. The gate
+    /// output is NOT injected into the resolver evidence map, but the advance
+    /// succeeds because the unconditional transition fires.
+    #[test]
+    fn legacy_state_no_gates_evidence() {
+        use crate::template::types::Gate;
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "ci_check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "true".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+            },
+        );
+
+        // Legacy state: transitions do NOT reference gates.* keys.
+        let template = make_template(vec![
+            (
+                "verify",
+                TemplateState {
+                    directive: "Verify.".to_string(),
+                    details: String::new(),
+                    transitions: vec![unconditional("complete")],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            ("complete", {
+                let mut s = make_state(vec![]);
+                s.terminal = true;
+                s
+            }),
+        ]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        // Gate always passes.
+        let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Passed,
+                        output: serde_json::json!({"passed": true, "exit_code": 0}),
+                    },
+                );
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "verify",
+            &template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Advances to terminal state: gate passed, unconditional transition fired.
+        assert_eq!(result.final_state, "complete");
+        assert!(result.advanced);
+        assert!(matches!(result.stop_reason, StopReason::Terminal));
+    }
+
+    /// A structured-mode state (gate present, with at least one gates.* when-clause
+    /// reference) should inject gate output into the resolver evidence map and
+    /// advance when the gate-output condition matches.
+    #[test]
+    fn structured_state_gates_evidence_present() {
+        use crate::template::types::Gate;
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "ci_check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "true".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+            },
+        );
+
+        // Structured state: transition references gates.ci_check.passed.
+        let template = make_template(vec![
+            (
+                "verify",
+                TemplateState {
+                    directive: "Verify.".to_string(),
+                    details: String::new(),
+                    transitions: vec![conditional(
+                        "complete",
+                        vec![("gates.ci_check.passed", serde_json::json!(true))],
+                    )],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                },
+            ),
+            ("complete", {
+                let mut s = make_state(vec![]);
+                s.terminal = true;
+                s
+            }),
+        ]);
+
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+
+        // Gate always passes with structured output.
+        let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut results = BTreeMap::new();
+            for (name, _) in gates {
+                results.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Passed,
+                        output: serde_json::json!({"passed": true, "exit_code": 0}),
+                    },
+                );
+            }
+            results
+        };
+
+        let result = advance_until_stop(
+            "verify",
+            &template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // Advances: gate output injected as gates.ci_check.{passed: true}, matches when clause.
+        assert_eq!(result.final_state, "complete");
+        assert!(result.advanced);
+        assert!(matches!(result.stop_reason, StopReason::Terminal));
     }
 }

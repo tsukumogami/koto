@@ -303,7 +303,7 @@ fn resolve_template(source: &str) -> anyhow::Result<CompiledTemplate> {
         Some("json") => load_compiled_template(source),
         _ => {
             // Treat as markdown source: compile and load.
-            let (cache_path, _hash) = compile_cached(path)?;
+            let (cache_path, _hash) = compile_cached(path, false)?;
             let cache_path_str = cache_path.to_string_lossy().to_string();
             load_compiled_template(&cache_path_str)
         }
@@ -316,6 +316,13 @@ pub enum TemplateSubcommand {
     Compile {
         /// Path to the YAML template source
         source: String,
+        /// Allow templates with gates that have no gates.* when-clause routing.
+        ///
+        /// This flag is transitory and will be removed once legacy templates
+        /// have migrated to structured gate routing.
+        // TODO: remove once shirabe work-on template migrates to gates.* routing
+        #[arg(long)]
+        allow_legacy_gates: bool,
     },
 
     /// Validate a compiled template JSON file
@@ -750,9 +757,13 @@ pub fn run(app: App) -> Result<()> {
             }
         }
         Command::Template { subcommand } => match subcommand {
-            TemplateSubcommand::Compile { source } => {
+            TemplateSubcommand::Compile {
+                source,
+                allow_legacy_gates,
+            } => {
                 let source_path = Path::new(&source);
-                match compile_cached(source_path) {
+                let strict = !allow_legacy_gates;
+                match compile_cached(source_path, strict) {
                     Ok((cache_path, _)) => {
                         println!("{}", cache_path.display());
                         Ok(())
@@ -982,7 +993,7 @@ fn handle_init(
         }));
     }
 
-    let (cache_path, hash) = match compile_cached(Path::new(template)) {
+    let (cache_path, hash) = match compile_cached(Path::new(template), false) {
         Ok(result) => result,
         Err(e) => {
             exit_with_error(serde_json::json!({
