@@ -483,3 +483,39 @@ which are set by the template author at compile time.
 - Hoisting `has_gates_routing` is a small refactor with no behavioral change
   for the `if any_failed` path — the boolean is computed identically, just
   earlier.
+
+## Future work: removing backward compatibility
+
+When the last legacy template migrates to structured `gates.*` routing, the
+compat code introduced by this feature should be removed. This is intentionally
+not planned here — the trigger is shirabe's migration, not a koto milestone.
+
+The removal is a contained, mechanical change across four sites:
+
+**`src/cli/mod.rs`**
+- Remove the `--allow-legacy-gates` flag and its `TODO` comment from
+  `handle_template_compile()`
+- Remove the `strict = false` argument from the `compile()` call in
+  `handle_init()` (or make strict the only mode and drop the parameter)
+
+**`src/template/types.rs`**
+- Remove the `strict: bool` parameter from `validate()`
+- Remove the D5 check (the legacy gate detection block)
+- Remove the D4 early return in `validate_gate_reachability()` (the
+  `if !strict { return Ok(()); }` guard)
+
+**`src/template/compile.rs`**
+- Remove the `strict: bool` parameter from `compile()`
+
+**`src/engine/advance.rs`**
+- Remove the `has_gates_routing` guard on the evidence merge. Gate output
+  is injected for all states once legacy mode no longer exists.
+- `has_gates_routing` may still be needed for the `GateBlocked` early return
+  path — evaluate whether it can be removed entirely at that point.
+
+After removal, `validate()` and `compile()` have no concept of permissive mode.
+`koto init` and `koto template compile` run the same validation. The engine
+always injects gate evidence into the resolver map when gates are present.
+
+The removal PR should include a note in the commit message referencing this
+design and the migration PR in shirabe that triggered it.
