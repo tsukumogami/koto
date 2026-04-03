@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Planned
 upstream: docs/prds/PRD-gate-transition-contract.md
 problem: |
   Feature 1 preserved legacy gate behavior implicitly: when no `when` clause
@@ -28,7 +28,7 @@ rationale: |
 
 ## Status
 
-Proposed
+Planned
 
 ## Upstream design reference
 
