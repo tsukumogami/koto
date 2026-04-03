@@ -1,5 +1,5 @@
 ---
-status: Active
+status: Complete
 theme: |
   Replace koto's boolean gate model with structured gate output that feeds
   directly into transition routing. Gates become data sources, not just
@@ -18,7 +18,7 @@ scope: |
 
 ## Status
 
-Active
+Complete
 
 ## Theme
 
@@ -117,24 +117,22 @@ Design doc: [DESIGN-gate-contract-compiler-validation](../designs/DESIGN-gate-co
 
 ### Feature 4: Backward compatibility ([#119](https://github.com/tsukumogami/koto/issues/119))
 **Dependencies:** Feature 1
-**Status:** Not started
+**Status:** Complete ([#125](https://github.com/tsukumogami/koto/pull/125))
 **Upstream:** [PRD-gate-transition-contract](../prds/PRD-gate-transition-contract.md) (R10)
 
-Existing templates work without changes. Gates on states where no `when`
-clause references `gates.*` fields use the legacy boolean pass/block behavior.
-Templates using `accepts` blocks with `override` enum values continue to work
-as plain evidence submission.
-
-This can be built alongside Feature 1 since it's about preserving existing
-behavior while the new model is added.
+Existing templates work without changes. `koto init` warns and proceeds for
+legacy gate behavior; `koto template compile` errors unless `--allow-legacy-gates`
+is passed. The flag is explicitly transitory — removed once the known legacy
+template migrates to structured routing. The engine excludes gate output from
+the resolver's evidence map for legacy states.
 
 Scope:
-- Legacy gate behavior when `when` clauses don't reference `gates.*`
-- Compiler warnings (not errors) for gates without `when` references
-- Existing `accepts` block workaround patterns preserved
-- No implicit schema generation for legacy gates
+- `--allow-legacy-gates` flag on `koto template compile` (transitory)
+- `koto init` permissive mode: warns, does not error, for legacy gate behavior
+- D4 unreferenced-field warnings suppressed in permissive mode
+- Gate evidence excluded from resolver evidence map for legacy states (R10)
 
-Design doc: TBD (likely part of Feature 1's design doc)
+Design doc: [DESIGN-gate-backward-compat](../designs/current/DESIGN-gate-backward-compat.md)
 
 ## Sequencing rationale
 
@@ -168,8 +166,8 @@ is possible but the reachability check specifically needs the full model.
 | ~~_`koto overrides record` substitutes gate output with default or agent-provided data. Override events capture rationale and full context. `koto overrides list` for session-wide queries._~~ | | |
 | ~~[#118: gate-transition contract compiler validation](https://github.com/tsukumogami/koto/issues/118)~~ ✓ | [#116](https://github.com/tsukumogami/koto/issues/116), [#117](https://github.com/tsukumogami/koto/issues/117) | testable |
 | ~~_Compiler validates gate types are registered, override defaults match schemas, `when` clauses reference valid fields, and override defaults produce reachable transitions._~~ | | |
-| [#119: backward compatibility for legacy gate templates](https://github.com/tsukumogami/koto/issues/119) | [#116](https://github.com/tsukumogami/koto/issues/116) | testable |
-| _Existing templates work without changes. Legacy boolean behavior when `when` clauses don't reference `gates.*`. Likely implemented alongside #116._ | | |
+| ~~[#119: backward compatibility for legacy gate templates](https://github.com/tsukumogami/koto/issues/119)~~ ✓ | [#116](https://github.com/tsukumogami/koto/issues/116) | testable |
+| ~~_Existing templates work without changes. Legacy boolean behavior when `when` clauses don't reference `gates.*`. Likely implemented alongside #116._~~ | | |
 
 ### Dependency graph
 
@@ -185,17 +183,15 @@ graph TD
     I117 --> I118
     I116 --> I119
 
-    classDef needsDesign fill:#e1bee7
     classDef done fill:#c8e6c9,stroke:#388e3c
-    class I119 needsDesign
-    class I116,I117,I118 done
+    class I116,I117,I118,I119 done
 ```
 
-**Legend**: Purple = needs-design, Green = complete
+**Legend**: Green = complete
 
 ## Progress
 
 - Feature 1 (#116): Complete (PR #120)
 - Feature 2 (#117): Complete (PR #122)
 - Feature 3 (#118): Complete (PR #123)
-- Feature 4 (#119): Not started
+- Feature 4 (#119): Complete (PR #125)

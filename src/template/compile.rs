@@ -116,7 +116,11 @@ struct SourceGate {
 }
 
 /// Compile a YAML/Markdown template source file to a FormatVersion=1 CompiledTemplate.
-pub fn compile(source_path: &Path) -> anyhow::Result<CompiledTemplate> {
+///
+/// `strict` is passed through to `validate()`. When `true`, a state with gates
+/// but no `gates.*` when-clause references is a hard error. When `false`, the
+/// same condition emits a warning to stderr and compilation continues.
+pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTemplate> {
     let content = std::fs::read_to_string(source_path)
         .with_context(|| format!("failed to read template source: {}", source_path.display()))?;
 
@@ -274,7 +278,7 @@ pub fn compile(source_path: &Path) -> anyhow::Result<CompiledTemplate> {
 
     // Run validation rules (includes evidence routing validation).
     template
-        .validate()
+        .validate(strict)
         .map_err(|e| anyhow!("validation error: {}", e))?;
 
     Ok(template)
@@ -498,7 +502,7 @@ Analyze the task: {{TASK}}
 Work is complete.
 "#;
         let f = write_temp(src);
-        let result = compile(f.path()).unwrap();
+        let result = compile(f.path(), true).unwrap();
 
         assert_eq!(result.format_version, 1);
         assert_eq!(result.name, "quick-task");
@@ -537,7 +541,7 @@ states:
 Hello.
 "#;
         let f = write_temp(src);
-        let err = compile(f.path()).unwrap_err();
+        let err = compile(f.path(), true).unwrap_err();
         assert!(
             err.to_string().contains("missing required field: name"),
             "unexpected error: {}",
@@ -560,7 +564,7 @@ states:
 Hello.
 "#;
         let f = write_temp(src);
-        let err = compile(f.path()).unwrap_err();
+        let err = compile(f.path(), true).unwrap_err();
         assert!(
             err.to_string()
                 .contains("missing required field: initial_state"),
@@ -577,7 +581,7 @@ version: "1.0"
 ---
 "#;
         let f = write_temp(src);
-        let err = compile(f.path()).unwrap_err();
+        let err = compile(f.path(), true).unwrap_err();
         assert!(
             err.to_string().contains("invalid YAML") || err.to_string().contains("YAML"),
             "unexpected error: {}",
@@ -589,7 +593,7 @@ version: "1.0"
     fn no_frontmatter_returns_error() {
         let src = "This is not a valid template.\n";
         let f = write_temp(src);
-        let err = compile(f.path()).unwrap_err();
+        let err = compile(f.path(), true).unwrap_err();
         assert!(
             err.to_string().contains("front-matter"),
             "unexpected error: {}",
@@ -616,7 +620,7 @@ states:
 Directive.
 "#;
         let f = write_temp(src);
-        let err = compile(f.path()).unwrap_err();
+        let err = compile(f.path(), true).unwrap_err();
         assert!(
             err.to_string().contains("unsupported gate type"),
             "unexpected error: {}",
@@ -643,7 +647,7 @@ states:
 Directive.
 "#;
         let f = write_temp(src);
-        let err = compile(f.path()).unwrap_err();
+        let err = compile(f.path(), true).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unsupported gate type"), "got: {}", msg);
         assert!(msg.contains("accepts/when"), "got: {}", msg);
@@ -668,7 +672,7 @@ states:
 Directive.
 "#;
         let f = write_temp(src);
-        let err = compile(f.path()).unwrap_err();
+        let err = compile(f.path(), true).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unsupported gate type"), "got: {}", msg);
         assert!(msg.contains("accepts/when"), "got: {}", msg);
@@ -694,7 +698,7 @@ states:
 Directive.
 "#;
         let f = write_temp(src);
-        let err = compile(f.path()).unwrap_err();
+        let err = compile(f.path(), true).unwrap_err();
         assert!(
             err.to_string().contains("command must not be empty"),
             "unexpected error: {}",
@@ -718,7 +722,7 @@ states:
 The one and only state.
 "#;
         let f = write_temp(src);
-        let compiled = compile(f.path()).unwrap();
+        let compiled = compile(f.path(), true).unwrap();
         let json = serde_json::to_string(&compiled).unwrap();
         let restored: CompiledTemplate = serde_json::from_str(&json).unwrap();
         assert_eq!(compiled, restored);
@@ -741,7 +745,7 @@ states:
 Hello.
 "#;
         let f = write_temp(src);
-        let err = compile(f.path()).unwrap_err();
+        let err = compile(f.path(), true).unwrap_err();
         assert!(
             err.to_string().contains("undefined transition target"),
             "unexpected error: {}",
@@ -768,7 +772,7 @@ Hello.
 "#;
         // orphan has no ## orphan heading in body
         let f = write_temp(src);
-        let err = compile(f.path()).unwrap_err();
+        let err = compile(f.path(), true).unwrap_err();
         assert!(
             err.to_string().contains("orphan") && err.to_string().contains("directive"),
             "unexpected error: {}",
@@ -824,7 +828,7 @@ Escalate to senior review.
 Complete.
 "#;
         let f = write_temp(src);
-        let result = compile(f.path()).unwrap();
+        let result = compile(f.path(), true).unwrap();
 
         let analyze = &result.states["analyze"];
         assert_eq!(analyze.integration, Some("delegate_review".to_string()));
@@ -845,6 +849,7 @@ Complete.
 
     #[test]
     fn command_gate_alongside_accepts_when() {
+        // A gate with gates.* routing alongside agent accepts/when compiles in strict mode.
         let src = r#"---
 name: mixed
 version: "1.0"
@@ -859,10 +864,10 @@ states:
     transitions:
       - target: done
         when:
-          decision: go
+          gates.ci.exit_code: 0
       - target: halt
         when:
-          decision: stop
+          gates.ci.exit_code: 1
     gates:
       ci:
         type: command
@@ -886,7 +891,7 @@ Proceed.
 Stop.
 "#;
         let f = write_temp(src);
-        compile(f.path()).unwrap();
+        compile(f.path(), true).unwrap();
     }
 
     #[test]
@@ -937,7 +942,7 @@ Path B.
 Complete.
 "#;
         let f = write_temp(src);
-        let compiled = compile(f.path()).unwrap();
+        let compiled = compile(f.path(), true).unwrap();
         let json = serde_json::to_string(&compiled).unwrap();
         let restored: CompiledTemplate = serde_json::from_str(&json).unwrap();
         assert_eq!(compiled, restored);
@@ -972,7 +977,7 @@ Here are some extra guidelines:
 Work is complete.
 "#;
         let f = write_temp(src);
-        let result = compile(f.path()).unwrap();
+        let result = compile(f.path(), true).unwrap();
 
         let work = &result.states["work"];
         assert_eq!(work.directive, "Do the main task.");
@@ -1003,7 +1008,7 @@ states:
 Just a directive, no details marker here.
 "#;
         let f = write_temp(src);
-        let result = compile(f.path()).unwrap();
+        let result = compile(f.path(), true).unwrap();
 
         let only = &result.states["only"];
         assert_eq!(only.directive, "Just a directive, no details marker here.");
@@ -1034,7 +1039,7 @@ First details section.
 This stays in details, not a second split.
 "#;
         let f = write_temp(src);
-        let result = compile(f.path()).unwrap();
+        let result = compile(f.path(), true).unwrap();
 
         let work = &result.states["work"];
         assert_eq!(work.directive, "The directive part.");
@@ -1071,7 +1076,7 @@ Extra context for first visit.
 Complete.
 "#;
         let f = write_temp(src);
-        let compiled = compile(f.path()).unwrap();
+        let compiled = compile(f.path(), true).unwrap();
 
         // Verify the details field is populated.
         assert_eq!(
@@ -1089,5 +1094,80 @@ Complete.
         let json_val: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(json_val["states"]["start"]["details"].is_string());
         assert!(json_val["states"]["done"].get("details").is_none());
+    }
+
+    // D5 integration: verify compile() propagates strict through to validate().
+    // scenario-1 (strict=true): legacy-gate template fails compilation.
+    // scenario-2 (strict=false): legacy-gate template compiles with a warning to stderr.
+    #[test]
+    fn compile_strict_true_errors_on_legacy_gate() {
+        let src = r#"---
+name: legacy
+version: "1.0"
+initial_state: work
+states:
+  work:
+    gates:
+      ci:
+        type: command
+        command: ./check.sh
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## work
+
+Do work.
+
+## done
+
+Done.
+"#;
+        let f = write_temp(src);
+        let err = compile(f.path(), true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("has no gates.* routing"),
+            "expected D5 error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("--allow-legacy-gates"),
+            "error should hint at --allow-legacy-gates, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn compile_strict_false_permits_legacy_gate() {
+        let src = r#"---
+name: legacy
+version: "1.0"
+initial_state: work
+states:
+  work:
+    gates:
+      ci:
+        type: command
+        command: ./check.sh
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## work
+
+Do work.
+
+## done
+
+Done.
+"#;
+        let f = write_temp(src);
+        // strict=false: warning to stderr, but compile returns Ok.
+        compile(f.path(), false).unwrap();
     }
 }

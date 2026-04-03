@@ -3615,7 +3615,7 @@ This workflow has a single state that is both initial and terminal.
 
 #[test]
 fn export_multi_state_fixture_contains_expected_states_and_transitions() {
-    let compiled = koto::template::compile::compile(&fixture_multi_state()).unwrap();
+    let compiled = koto::template::compile::compile(&fixture_multi_state(), false).unwrap();
     let mermaid = koto::export::to_mermaid(&compiled);
 
     // Header
@@ -3689,7 +3689,7 @@ fn export_multi_state_fixture_contains_expected_states_and_transitions() {
 
 #[test]
 fn export_simple_gates_fixture_has_gate_and_when_labels() {
-    let compiled = koto::template::compile::compile(&fixture_simple_gates()).unwrap();
+    let compiled = koto::template::compile::compile(&fixture_simple_gates(), false).unwrap();
     let mermaid = koto::export::to_mermaid(&compiled);
 
     // Gate note
@@ -3718,7 +3718,7 @@ fn export_simple_gates_fixture_has_gate_and_when_labels() {
 
 #[test]
 fn export_determinism_byte_identical_across_calls() {
-    let compiled = koto::template::compile::compile(&fixture_multi_state()).unwrap();
+    let compiled = koto::template::compile::compile(&fixture_multi_state(), false).unwrap();
     let first = koto::export::to_mermaid(&compiled);
     let second = koto::export::to_mermaid(&compiled);
 
@@ -3741,7 +3741,7 @@ fn export_single_state_template_produces_valid_mermaid() {
     let src = dir.path().join("single-state.md");
     std::fs::write(&src, single_state_template_content()).unwrap();
 
-    let compiled = koto::template::compile::compile(&src).unwrap();
+    let compiled = koto::template::compile::compile(&src, true).unwrap();
     let mermaid = koto::export::to_mermaid(&compiled);
 
     // Header
@@ -3783,7 +3783,12 @@ fn export_md_and_json_produce_identical_output() {
     let fixture = fixture_multi_state();
 
     let compile_output = koto_cmd(dir.path())
-        .args(["template", "compile", fixture.to_str().unwrap()])
+        .args([
+            "template",
+            "compile",
+            "--allow-legacy-gates",
+            fixture.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
 
@@ -5819,6 +5824,105 @@ fn gate_contract_unreferenced_field_warning() {
     assert!(
         stderr.contains("error"),
         "warning should name the unreferenced field 'error': stderr={}",
+        stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Gate backward compatibility (legacy gates, --allow-legacy-gates)
+// ---------------------------------------------------------------------------
+
+/// Path to the legacy-gates fixture template.
+fn fixture_legacy_gates() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test/functional/fixtures/templates/legacy-gates.md")
+}
+
+#[test]
+fn allow_legacy_gates_flag_present_in_help() {
+    let output = Command::cargo_bin("koto")
+        .unwrap()
+        .args(["template", "compile", "--help"])
+        .output()
+        .unwrap();
+
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        help.contains("--allow-legacy-gates"),
+        "koto template compile --help should list --allow-legacy-gates, got:\n{}",
+        help
+    );
+}
+
+#[test]
+fn template_compile_legacy_gate_without_flag_exits_nonzero() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_legacy_gates();
+
+    let output = koto_cmd(dir.path())
+        .args(["template", "compile", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "template compile should fail for legacy-gate template without --allow-legacy-gates"
+    );
+    // Errors are emitted as JSON to stdout.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("gates.") || stdout.contains("gates.*"),
+        "error should mention gates.* routing, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("--allow-legacy-gates"),
+        "error should mention --allow-legacy-gates flag, got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn template_compile_legacy_gate_with_flag_exits_0() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_legacy_gates();
+
+    let output = koto_cmd(dir.path())
+        .args([
+            "template",
+            "compile",
+            "--allow-legacy-gates",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "template compile --allow-legacy-gates should succeed for legacy-gate template: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn koto_init_legacy_gate_template_exits_0_with_warning() {
+    let dir = TempDir::new().unwrap();
+    let fixture = fixture_legacy_gates();
+
+    let output = koto_cmd(dir.path())
+        .args(["init", "test-wf", "--template", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "koto init should succeed for legacy-gate template (permissive mode): {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("legacy behavior") || stderr.contains("warning"),
+        "koto init should emit a warning for legacy-gate template, got stderr: {}",
         stderr
     );
 }
