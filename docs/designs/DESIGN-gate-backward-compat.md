@@ -4,21 +4,24 @@ upstream: docs/prds/PRD-gate-transition-contract.md
 problem: |
   Feature 1 preserved legacy gate behavior implicitly: when no `when` clause
   references `gates.*` fields, gates act as boolean pass/fail blockers. This
-  implicit path is invisible to the compiler, so new templates can accidentally
-  use legacy mode with no error or warning. The only known legacy template needs
-  to keep working until it migrates.
+  path is invisible to the compiler. Template authors who accidentally omit
+  `gates.*` references get the old behavior silently, and the only known legacy
+  template needs to keep working without source changes until it migrates.
 decision: |
-  A `legacy_gates: true` field in template frontmatter declares intentional
-  legacy mode. The compiler errors for gates without `gates.*` routing unless
-  this field is present, suppresses D4 warnings for declared-legacy templates,
-  and emits a stderr warning from `koto init`. The engine excludes gate output
-  from the resolver's evidence map for legacy states, matching R10 precisely.
+  `koto template compile` errors on legacy gate behavior unless
+  `--allow-legacy-gates` is passed. `koto init` (implicit compile on cache miss)
+  warns but proceeds — agents starting a workflow can't change the template.
+  The flag is explicitly transitory: it is removed from koto once the last
+  legacy template migrates. The engine excludes gate output from the resolver's
+  evidence map for legacy states, matching R10 precisely.
 rationale: |
-  The frontmatter field was chosen over a CLI flag because the template
-  self-documents its tech debt — reviewers see it in the file, not in CI
-  scripts. The evidence exclusion (rather than injecting-but-ignoring) matches
-  the PRD acceptance criterion and removes a misleading invariant. Both changes
-  are independent and deletable when the last legacy template migrates.
+  The compile/init distinction maps to the real actors: template authors use
+  `koto template compile` and are responsible for correctness; agents use
+  `koto init` and can't change the template. The flag on `koto template compile`
+  is the migration debt signal — its presence in a CI script means a template
+  still owes migration work. The flag's removal from koto is the migration
+  completion signal. No template source changes are required, which preserves
+  existing installs and in-progress workflows.
 ---
 
 # DESIGN: Gate backward compatibility
@@ -62,26 +65,28 @@ evidence for all states regardless.
 
 Second, the only known template using legacy gate behavior uses gates as pure
 pass/fail blockers and routes entirely on agent evidence via `accepts` blocks.
-It needs to keep working until migrated to structured routing, but it should
-carry a visible marker that it's on the legacy path.
+It needs to keep working until migrated to structured routing, and it must do
+so without source changes — agents starting workflows from this template can't
+patch the template themselves.
 
 ## Decision drivers
 
 - Template authors must not accidentally opt into legacy mode. New templates
-  using gates without `gates.*` routing should fail compilation by default.
-- The legacy marker must be easy to locate and remove. When a template migrates
-  to structured routing, the migration PR should consist of removing one
-  frontmatter line and updating the transitions — nothing else.
-- `koto init` must succeed for any template that would also pass `koto template
-  compile`. Templates with legacy gates must declare `legacy_gates: true` to
-  pass both commands.
-- D4's unreferenced-field warning must not fire for templates that have
-  explicitly declared legacy mode. The warning is for structured-mode templates
-  where gate output is meant to drive routing but some fields are never checked.
+  using gates without `gates.*` routing should fail `koto template compile` by
+  default.
+- Existing legacy templates must work with `koto init` without any source
+  changes. Agents starting a workflow from a legacy template can't modify it.
+- The migration debt signal must be visible and removable. A flag in a CI script
+  is an explicit acknowledgment of pending migration work; removing it is the
+  completion signal.
+- The compat flag is explicitly transitory. Once the last legacy template
+  migrates, the flag is removed from koto entirely.
+- D4's unreferenced-field warning must not fire during `koto init`. That warning
+  is aimed at template authors, not at agents running workflows.
 - The engine's behavior for legacy states must match R10 precisely: gate output
   should not enter the resolver's evidence map for legacy states.
-- The legacy code path must be self-contained and deletable. When the last
-  legacy template migrates, removing the compat code should be a contained change.
+- The legacy code path must be self-contained and deletable. When the flag is
+  removed, deleting the compat code should be a contained change.
 
 ## Considered options
 
@@ -90,66 +95,58 @@ carry a visible marker that it's on the legacy path.
 Template authors using gates without `gates.*` routing need a way to signal
 that this is intentional. Without an explicit signal, the compiler can't
 distinguish a legacy template from a new template that forgot to add `gates.*`
-references. The choice of where this signal lives determines how visible and
-removable it is, and how `koto init` vs `koto template compile` behave.
+references. The core tension is between two actors with different capabilities:
+template authors can change templates; agents starting workflows cannot.
 
-#### Chosen: Per-template frontmatter field `legacy_gates: true`
+#### Chosen: `--allow-legacy-gates` flag on `koto template compile`; `koto init` warns and proceeds
 
-A boolean field in the template's YAML frontmatter:
+`koto template compile` errors when it detects a state with gates but no
+`gates.*` when-clause references, unless `--allow-legacy-gates` is passed.
+With the flag, it suppresses the error and D4 unreferenced-field warnings,
+and proceeds.
 
-```yaml
----
-name: my-workflow
-version: "1.0"
-legacy_gates: true
-initial_state: start
-states:
-  ...
----
-```
+`koto init` (which compiles on a cache miss) runs in permissive mode
+unconditionally: legacy gate behavior emits a warning to stderr and proceeds.
+D4 warnings are also suppressed in permissive mode — they are aimed at template
+authors, not at agents.
 
-When `legacy_gates: true` is present, the compiler accepts gates without
-`gates.*` routing and suppresses D4 unreferenced-field warnings. When it's
-absent and legacy behavior is detected (gate present, no `gates.*` references
-in any transition for that state), the compiler emits an error naming the
-state and gate.
+The flag is explicitly transitory. It is added to koto as a temporary
+accommodation for the known legacy template, and is removed from koto once
+that template migrates to structured routing. A comment in the source at the
+flag's definition tracks this intent.
 
-`koto init` runs `compile()` on a cache miss, which calls `validate()`.
-A template with gates but no `gates.*` routing and no `legacy_gates: true`
-field will fail `koto init` with the D5 error — the same as `koto template
-compile`. Templates that carry `legacy_gates: true` succeed on both init and
-compile. After a successful init of a template with `legacy_gates: true`, init
-emits a single `eprintln!` warning informing the caller that the template uses
-legacy gate behavior and linking to migration guidance. No code path divergence
-in the compile chain: `SourceFrontmatter` gets a new optional `legacy_gates`
-field, `CompiledTemplate` carries it through, and `validate()` reads it.
+Template CI scripts that pass `--allow-legacy-gates` carry the migration debt
+visibly: the flag in a Makefile or CI YAML is a searchable, reviewable signal
+that the template still owes migration work. When the template migrates, the
+flag is removed from both the CI script and from koto.
 
-Migration is a one-line change to the template frontmatter plus updating the
-affected transitions to use `gates.*` routing. The migration PR is
-self-contained and reviewable: removing `legacy_gates: true` is the commit
-signal that a template has been fully migrated.
+No template source changes are required. Existing installs and in-progress
+workflows are unaffected — `koto next` never recompiles.
 
 #### Alternatives considered
 
-**CLI flag `--allow-legacy-gates` on `koto template compile`**: The flag is
-external to the template, so the template doesn't self-document its compat
-requirement. CI scripts carry the flag indefinitely, and there's no single
-place to look to understand which templates are on the legacy path. Rejected
-because it violates the co-location and self-documentation requirements.
+**Per-template frontmatter field `legacy_gates: true`**: The field is co-located
+with the template and self-documents its migration status. However, it requires
+changing the template source before `koto init` works. The only known legacy
+template lives in a separate repo (shirabe) whose migration timeline is
+independent of this koto change landing. Requiring a coordinated frontmatter
+change in shirabe before koto ships is a synchronization risk. Rejected because
+it requires template source changes to preserve existing behavior.
 
 **Per-state annotation**: Each state that uses legacy behavior could declare
-`legacy_gates: true` at the state level. But migration is a whole-template
+`legacy_gates: true` at the state level. Migration is a whole-template
 operation — you update all gate-bearing states at once — so state-level
 granularity adds migration surface without benefit. Rejected.
 
-**Separate compile subcommand `koto template compile-legacy`**: This would
-give the compiler a clean signal at invocation time, but it adds a permanent
-new CLI surface that's harder to remove than a frontmatter field. Rejected.
+**Separate compile subcommand `koto template compile-legacy`**: This would give
+the compiler a clean signal at invocation time, but it adds a permanent new CLI
+surface. The explicit goal is that this code path is removed after migration,
+and a subcommand is harder to remove than a flag. Rejected.
 
-**Auto-detect with warning only (no error)**: Leave the compiler permissive
-and rely on D4 warnings to surface legacy behavior. Rejected because it
-allows new templates to accidentally opt into legacy mode silently, which is
-the core problem this feature is meant to solve.
+**Auto-detect with warning only, no error**: Leave `koto template compile`
+permissive and rely on D4 warnings to surface legacy behavior. Rejected because
+it allows new templates to accidentally use legacy mode silently, which is the
+core problem this feature is meant to solve.
 
 ---
 
@@ -202,25 +199,26 @@ invariant in the codebase with no offsetting benefit.
 
 ## Decision outcome
 
-**Chosen: D1 frontmatter field + D2 evidence exclusion**
+**Chosen: D1 context-sensitive validation flag + D2 evidence exclusion**
 
 ### Summary
 
-A new `legacy_gates: true` field in a template's YAML frontmatter declares
-that the template intentionally uses gates as pure pass/fail blockers rather
-than structured routing sources. The compiler reads this field from
-`SourceFrontmatter`, carries it through to `CompiledTemplate`, and uses it
-at two points in `validate()`: to suppress the error that would otherwise fire
-when gates are present without any `gates.*` when-clause references, and to
-suppress D4's unreferenced-field warnings for the entire template. Templates
-without this field that use legacy gate behavior fail compilation with a
-message naming the state and gate.
+`koto template compile` is the template-author context: it runs `validate()` in
+strict mode and errors when it detects a state with gates but no `gates.*`
+routing. Template authors pass `--allow-legacy-gates` to suppress this error
+while their template is on the migration path. The flag also suppresses D4
+unreferenced-field warnings for the duration of its use.
 
-`koto init` runs the same compile and validation pipeline as `koto template
-compile`. A template with legacy gates must carry `legacy_gates: true` to
-succeed on both commands. After initializing a template that carries
-`legacy_gates: true`, init emits a non-fatal warning to stderr to surface the
-legacy status to the caller.
+`koto init` is the agent context: it runs `validate()` in permissive mode
+unconditionally. Legacy gate behavior emits a warning to stderr and proceeds.
+D4 warnings are suppressed. Agents starting a workflow from a legacy template
+are not blocked.
+
+The flag `--allow-legacy-gates` is transitory by design. A comment at its
+definition in the CLI source names the expected removal condition. When the last
+legacy template migrates, the flag is deleted from koto — along with the strict/
+permissive branching in `validate()`, the D4 suppression, and the evidence
+merge guard.
 
 In the engine, the advance loop's evidence merge step is guarded by
 `has_gates_routing`. For states with no `gates.*` when-clause references,
@@ -237,60 +235,69 @@ unrelated to the new override mechanism.
 
 ### Rationale
 
-The frontmatter field (D1) and the evidence exclusion (D2) are independent
-changes to different layers — compiler and engine — that each address a
-separate gap. D1 makes legacy mode explicit and auditable; D2 makes the engine
-behavior match the spec. Neither requires the other, but they should land
-together so the observable semantics are consistent: once a template declares
-`legacy_gates: true`, both the compiler and the engine treat it consistently.
+The compile/init distinction maps directly to the real actors. Template authors
+run `koto template compile` in CI and are responsible for the template's
+correctness — they get an error and a clear path (either migrate or pass the
+flag). Agents run `koto init` to start a workflow and have no ability to change
+the template source — they get a warning and proceed.
 
-The frontmatter field was chosen over a CLI flag because the template
-self-documents its tech debt. A reviewer scanning the template sees the field
-and knows it's on the migration path. When the migration PR arrives, deleting
-`legacy_gates: true` is a commit-level signal that the template has been
-updated.
+The frontmatter field alternative was rejected because it requires template
+source changes before existing behavior is preserved. The only known legacy
+template lives in a separate repo with its own migration timeline. Requiring
+a frontmatter change before this koto change lands creates a cross-repo
+synchronization dependency. The CLI flag avoids this: koto ships the flag,
+the legacy template continues to work at init time without changes, and the
+template author adds `--allow-legacy-gates` to their CI at their own pace.
+
+The flag's transitory nature is intentional and explicit. It is not a permanent
+feature; it is a migration scaffold with a named exit condition.
 
 ## Solution architecture
 
 ### Overview
 
-Two isolated changes in two different layers. The compiler change adds
-`legacy_gates` to the frontmatter schema and uses it to gate error emission
-and D4 warnings. The engine change adds a condition to the evidence merge
-step in the advance loop.
+Two isolated changes in two different layers. The compiler change adds a
+`strict` parameter to `validate()` and wires it to the CLI context — strict
+for `koto template compile`, permissive for `koto init`. The engine change adds
+a condition to the evidence merge step in the advance loop.
 
 ### Components
 
-**`src/template/compile.rs` — SourceFrontmatter + compile()**
+**`src/cli/mod.rs` — handle_template_compile() + handle_init()**
 
-Add `legacy_gates: Option<bool>` to `SourceFrontmatter`. It serializes from
-the YAML frontmatter with a `#[serde(default)]` — absent means `false`.
-The `compile()` function reads it and populates the `CompiledTemplate`
-constructor: `legacy_gates: fm.legacy_gates.unwrap_or(false)`. All three
-sites must be updated together: the `SourceFrontmatter` field, the
-`CompiledTemplate` field, and the `CompiledTemplate` struct literal in
-`compile()`.
+`handle_template_compile()` gains an `--allow-legacy-gates` flag. It passes
+`strict = !allow_legacy_gates` when calling `validate()`. A source comment at
+the flag definition names the removal condition:
 
-**`src/template/types.rs` — CompiledTemplate + validate()**
+```rust
+// TODO: remove --allow-legacy-gates once the shirabe work-on template
+// migrates to gates.* routing. See issue #119.
+```
 
-Add `legacy_gates: bool` to `CompiledTemplate` (default `false`).
+`handle_init()` calls `validate()` with `strict = false` unconditionally. On a
+cache miss the full compile + validate pipeline runs in permissive mode.
 
-In `validate()`, two changes:
+**`src/template/types.rs` — validate()**
 
-1. **New D5 check (legacy gate error):** After the D2/D3 checks, scan each
-   state. If any state has gates but no `gates.*` when-clause references AND
-   `!self.legacy_gates`, emit an error:
-   ```
-   state "<name>": gate "<gate>" has no gates.* routing; declare legacy_gates: true
-   in the template frontmatter to allow boolean pass/block behavior, or add a
-   when clause referencing gates.<gate>.passed, gates.<gate>.error, ...
-   ```
-   This check runs before D4 so D4 is still unreachable when this error fires.
+`validate()` gains a `strict: bool` parameter.
 
-2. **D4 suppression:** The `validate_gate_reachability()` call site gains an
-   early return when `self.legacy_gates` is true:
+1. **D5 check (legacy gate detection):** After the D2/D3 checks, scan each
+   state. If any state has gates but no `gates.*` when-clause references:
+   - `strict = true`: emit an error:
+     ```
+     error: state "verify" gate "ci_check" has no gates.* routing
+       add a when clause referencing gates.ci_check.passed, gates.ci_check.error, ...
+       or use --allow-legacy-gates to permit boolean pass/block behavior
+     ```
+   - `strict = false`: emit a warning to stderr and continue:
+     ```
+     warning: state "verify" gate "ci_check" has no gates.* routing (legacy behavior)
+     ```
+
+2. **D4 suppression in permissive mode:** The `validate_gate_reachability()`
+   call site gains an early return when `!strict`:
    ```rust
-   if self.legacy_gates {
+   if !strict {
        return Ok(());
    }
    ```
@@ -298,16 +305,16 @@ In `validate()`, two changes:
    return `Ok(())` anyway (no gate transitions exist). The early return is
    needed to suppress the `eprintln!` warning loop that iterates over gate
    schema fields — that loop would emit a warning per field for every gate in
-   the template, which is noise for an intentionally-legacy template.
+   the template, which is noise for an agent.
 
-**`src/cli/mod.rs` — handle_init()**
+No changes to `SourceFrontmatter` or `CompiledTemplate` — the strict/permissive
+distinction is entirely in the call context, not in the compiled artifact.
 
-After a successful init, check if `compiled.legacy_gates`. If true, emit:
-```
-warning: this template uses legacy gate behavior (legacy_gates: true).
-Gates block state transitions but their output is not available for routing.
-Migrate to gates.* when-clause references when ready.
-```
+**`src/template/compile.rs` — compile()**
+
+`compile()` calls `validate()`. It gains a `strict: bool` parameter and passes
+it through. Callers (`handle_template_compile`, `handle_init`, tests) set it
+explicitly.
 
 **`src/engine/advance.rs` — advance loop**
 
@@ -325,95 +332,95 @@ if !gate_evidence_map.is_empty() && has_gates_routing {
 }
 ```
 
-`has_gates_routing` is already computed at lines 395–403 in the `if any_failed`
-block. It needs to be hoisted to be available at the evidence merge step
-(~line 437), which runs regardless of whether any gate failed.
+`has_gates_routing` is currently computed inside the `if any_failed` block at
+lines 395–403. It must be hoisted above that block and initialized to `false`
+before the gate evaluation loop, so it is always in scope at the evidence merge
+step (~line 437).
 
 ### Key interfaces
 
-**Frontmatter schema change:**
-```yaml
----
-name: my-workflow
-version: "1.0"
-legacy_gates: true     # optional; default false
-initial_state: start
----
-```
-
-**Compiler error for undeclared legacy behavior:**
+**`koto template compile` with legacy gates (no flag):**
 ```
 error: state "verify" gate "ci_check" has no gates.* routing
-  declare legacy_gates: true in frontmatter for boolean pass/block behavior
-  or add a when clause referencing gates.ci_check.passed, gates.ci_check.error, ...
+  add a when clause referencing gates.ci_check.passed, gates.ci_check.error, ...
+  or use --allow-legacy-gates to permit boolean pass/block behavior
 ```
 
-**New compile-time warning for legacy templates:**
-No warning at `koto template compile` time (the field is the explicit opt-in,
-no further signal needed). Warning is emitted by `koto init` only.
+**`koto template compile --allow-legacy-gates` with legacy gates:**
+No output for legacy behavior. Template compiles successfully.
+
+**`koto init` with legacy gates:**
+```
+warning: state "verify" gate "ci_check" has no gates.* routing (legacy behavior)
+```
+Init proceeds. Workflow starts normally.
 
 ### Data flow
 
 ```
-SourceFrontmatter.legacy_gates
+koto template compile
   │
-  └─► CompiledTemplate.legacy_gates
-        │
-        ├─► validate() D5 check ─── error if gates without routing AND !legacy_gates
-        │
-        ├─► validate_gate_reachability() ── early return if legacy_gates
-        │
-        └─► handle_init() ── eprintln! warning if legacy_gates
-        
+  ├─► --allow-legacy-gates? ──► strict = false ──► validate(strict=false) ── warn + proceed
+  │
+  └─► (no flag) ──────────────► strict = true  ──► validate(strict=true)  ── D5 error
+
+koto init
+  │
+  └─► strict = false (always) ──► validate(strict=false) ── warn + proceed
+
+validate(strict)
+  │
+  ├─► D2/D3 checks (always strict)
+  │
+  ├─► D5 check: gates without gates.* routing
+  │     strict=true  → Err(...)
+  │     strict=false → eprintln! warning, continue
+  │
+  └─► validate_gate_reachability()
+        strict=false → early return (suppress D4 eprintln! loop)
+        strict=true  → run D4 checks
+
 advance loop
   │
   ├─► evaluate gates ──► gate_results (always)
   │                      gate_evidence_map (always)
   │
-  ├─► has_gates_routing (hoisted to cover both GateBlocked path and evidence merge)
+  ├─► has_gates_routing (hoisted, initialized false)
   │
   └─► evidence merge: insert "gates" only if has_gates_routing
 ```
 
 ## Implementation approach
 
-### Phase 1: Frontmatter field and compiler enforcement
+### Phase 1: Context-sensitive validation
 
-Add `legacy_gates: Option<bool>` to `SourceFrontmatter` in
-`src/template/compile.rs`. Add `legacy_gates: bool` (default false) to
-`CompiledTemplate` in `src/template/types.rs`. Add the D5 check in `validate()`
-that errors for gates without `gates.*` routing when `!self.legacy_gates`.
-Add the `validate_gate_reachability()` early return when `self.legacy_gates`.
+Add `strict: bool` to `validate()` and `compile()`. Add the D5 check — error
+in strict mode, warning in permissive mode. Add the D4 early return in
+permissive mode. Add `--allow-legacy-gates` to `handle_template_compile()` with
+a removal comment. Make `handle_init()` call `compile()` with `strict = false`.
 
-Deliverables:
-- `SourceFrontmatter` with `legacy_gates` field
-- `CompiledTemplate` with `legacy_gates` field
-- D5 compiler error with actionable message
-- D4 warning suppression via early return
-- Unit tests: template with `legacy_gates: true` compiles; template without it
-  and with legacy gates fails with the D5 error message; template with neither
-  gates nor `legacy_gates` compiles without change
-
-### Phase 2: `koto init` warning
-
-Add an `eprintln!` warning to `handle_init()` in `src/cli/mod.rs` when the
-initialized template has `compiled.legacy_gates == true`.
+**Phase 1 and Phase 2 must land in the same PR.** If Phase 2 ships without
+Phase 1, the engine stops injecting gate evidence for legacy states before
+`koto init` is updated to permissive mode — agents would hit the D5 error with
+no workaround.
 
 Deliverables:
-- `handle_init()` emits warning for legacy templates
-- Integration test: `koto init` with a `legacy_gates: true` template exits 0
-  and emits the warning to stderr
+- `validate(strict: bool)` and `compile(strict: bool)`
+- D5 error (strict) and warning (permissive) with actionable messages
+- D4 early return in permissive mode
+- `--allow-legacy-gates` flag on `koto template compile` with removal comment
+- `handle_init()` uses `strict = false`
+- Unit tests: strict mode errors on legacy gates; permissive mode warns and
+  compiles; template with no gates compiles in both modes
+- Integration test: `koto init` with a legacy-gate template exits 0 and emits
+  the warning to stderr; `koto template compile` without flag exits nonzero;
+  with `--allow-legacy-gates` exits 0
 
-### Phase 3: Engine evidence exclusion
+### Phase 2: Engine evidence exclusion
 
 Hoist `has_gates_routing` computation in `src/engine/advance.rs` so it's
 available at the evidence merge step regardless of whether `any_failed` is
 true. Guard the `gate_evidence_map` insertion with `has_gates_routing`.
-
-**Phase 3 must land in the same PR as Phase 1.** If Phase 3 ships without
-Phase 1, the engine stops injecting gate evidence for legacy states before
-the compiler provides a way for those templates to declare `legacy_gates: true`
-— there would be no upgrade path for existing legacy templates.
 
 Deliverables:
 - `has_gates_routing` initialized to `false` before the gate block, then set
@@ -424,52 +431,55 @@ Deliverables:
 
 ## Security considerations
 
-This design adds a frontmatter field that the compiler reads and a conditional
+This design adds a CLI flag that conditions compiler behavior and a conditional
 in the engine. Neither introduces new attack surface.
 
-The `legacy_gates: true` field is set by the template author, not by any
-external input at runtime. A malicious template could set this field to bypass
-the new D5 compiler error — but `koto template compile` is run by the template
-author or in CI, not on untrusted input. The same trust boundary applies to all
-other frontmatter fields.
+The `--allow-legacy-gates` flag is supplied by the template author or CI
+operator, not by any external input at runtime. A CI script that passes the
+flag is making an explicit, reviewable acknowledgment that the template uses
+legacy behavior. The flag cannot be supplied by an agent running `koto init`
+— init is always permissive regardless.
 
-The evidence exclusion change (Phase 3) reduces the data available in the
+The evidence exclusion change (Phase 2) reduces the data available in the
 resolver's evidence map for legacy states. It can't be used to inject data
 that wasn't there before; it only removes engine-produced data from the map.
 No new data flows to external parties.
 
 The `koto init` warning writes to stderr only and contains no user data.
+The warning text is derived from the compiled template's state and gate names,
+which are set by the template author at compile time.
 
 ## Consequences
 
 ### Positive
 
-- New templates can't accidentally use legacy mode. The compiler error is clear
-  and actionable.
-- Every template using legacy mode is discoverable by searching for
-  `legacy_gates: true` — one grep across the template corpus.
-- The engine behavior for legacy states now matches the PRD acceptance criterion
-  precisely.
-- The D4 warning suppression eliminates false positives for intentionally-legacy
-  templates, making the warning useful only where it belongs.
-- The compat code path is bounded. Removing it when the last legacy template
-  migrates is a small, contained change: delete the D5 check, the D4 early
-  return, the init warning, and the evidence merge guard.
+- Existing legacy templates work with `koto init` without source changes.
+  In-progress workflows and cached compiled templates are unaffected.
+- New templates can't accidentally use legacy mode — `koto template compile`
+  errors without the flag.
+- The flag in a CI script is a searchable, reviewable migration debt signal.
+  One grep across CI configs finds all templates on the legacy path.
+- The engine behavior for legacy states now matches the PRD R10 acceptance
+  criterion precisely.
+- The D4 warning suppression in permissive mode eliminates noise for agents,
+  making D4 useful only where it belongs (template author validation).
+- The compat code path is bounded and named. Removing it when the flag is
+  dropped is a contained change: delete the flag definition, the `strict`
+  parameter from `validate()` and `compile()`, the D4 early return, and the
+  evidence merge guard.
 
 ### Negative
 
-- Templates currently using legacy gate behavior (any gates without `gates.*`
-  routing, no `legacy_gates` field) will fail compilation after this lands.
-  They must add `legacy_gates: true` to their frontmatter before the next
-  `koto template compile` run.
+- The flag is on the CLI, not the template. A template doesn't self-document
+  its legacy status — you have to check the CI script to know it's on the
+  legacy path.
 - `has_gates_routing` is computed unconditionally rather than only inside the
   `if any_failed` block. Minor structural change to the advance loop.
 
 ### Mitigations
 
-- The compiler error names the specific state and gate, making the fix obvious.
-  Template authors can either add `legacy_gates: true` (one line, preserves
-  behavior) or migrate to structured routing.
+- The scope of legacy templates is known and small (one template in shirabe).
+  The discoverability concern is minimal at this scale.
 - Hoisting `has_gates_routing` is a small refactor with no behavioral change
   for the `if any_failed` path — the boolean is computed identically, just
   earlier.
