@@ -117,24 +117,23 @@ Design doc: [DESIGN-gate-contract-compiler-validation](../designs/DESIGN-gate-co
 
 ### Feature 4: Backward compatibility ([#119](https://github.com/tsukumogami/koto/issues/119))
 **Dependencies:** Feature 1
-**Status:** Not started
+**Status:** Planned (PR pending)
 **Upstream:** [PRD-gate-transition-contract](../prds/PRD-gate-transition-contract.md) (R10)
 
-Existing templates work without changes. Gates on states where no `when`
-clause references `gates.*` fields use the legacy boolean pass/block behavior.
-Templates using `accepts` blocks with `override` enum values continue to work
-as plain evidence submission.
-
-This can be built alongside Feature 1 since it's about preserving existing
-behavior while the new model is added.
+Existing templates work without changes. `koto init` warns and proceeds for
+legacy gate behavior; `koto template compile` errors unless `--allow-legacy-gates`
+is passed. The flag is explicitly transitory — removed once the known legacy
+template migrates to structured routing. The engine excludes gate output from
+the resolver's evidence map for legacy states.
 
 Scope:
-- Legacy gate behavior when `when` clauses don't reference `gates.*`
-- Compiler warnings (not errors) for gates without `when` references
-- Existing `accepts` block workaround patterns preserved
-- No implicit schema generation for legacy gates
+- `--allow-legacy-gates` flag on `koto template compile` (transitory)
+- `koto init` permissive mode: warns, does not error, for legacy gate behavior
+- D4 unreferenced-field warnings suppressed in permissive mode
+- Gate evidence excluded from resolver evidence map for legacy states (R10)
 
-Design doc: TBD (likely part of Feature 1's design doc)
+Design doc: [DESIGN-gate-backward-compat](../designs/DESIGN-gate-backward-compat.md)
+Plan doc: [PLAN-gate-backward-compat](../plans/PLAN-gate-backward-compat.md)
 
 ## Sequencing rationale
 
@@ -187,15 +186,15 @@ graph TD
 
     classDef needsDesign fill:#e1bee7
     classDef done fill:#c8e6c9,stroke:#388e3c
-    class I119 needsDesign
+    class I119 ready
     class I116,I117,I118 done
 ```
 
-**Legend**: Purple = needs-design, Green = complete
+**Legend**: Blue = ready/planned, Green = complete
 
 ## Progress
 
 - Feature 1 (#116): Complete (PR #120)
 - Feature 2 (#117): Complete (PR #122)
 - Feature 3 (#118): Complete (PR #123)
-- Feature 4 (#119): Not started
+- Feature 4 (#119): Planned (PR #125)
