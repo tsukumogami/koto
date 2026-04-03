@@ -204,8 +204,8 @@ PRs (no `plugins/**` files changed), the eval step must use `continue-on-error: 
 so a failing eval produces visible output but does not cause the job or workflow to
 fail. Evals triggered by `plugins/**` changes retain their current behavior (blocking).
 
-**R20** — CLAUDE.local.md trigger list maintained. The "koto-skills Plugin
-Maintenance" section in `CLAUDE.local.md` must be kept current as koto evolves.
+**R20** — CLAUDE.md trigger list maintained. The "koto-skills Plugin
+Maintenance" section in `CLAUDE.md` must be kept current as koto evolves.
 (Already implemented; this requirement ensures it's not removed.)
 
 ## Acceptance Criteria
@@ -255,7 +255,7 @@ Maintenance" section in `CLAUDE.local.md` must be kept current as koto evolves.
 - [ ] All 8 behaviors from R18 are covered by at least one eval case
 - [ ] `eval-plugins.yml` triggers on both `plugins/**` and `src/**` path changes
 - [ ] The eval step for source-only PRs uses `continue-on-error: true` (or equivalent) so job exits 0 regardless of eval results
-- [ ] CLAUDE.local.md "koto-skills Plugin Maintenance" section is present and has not been removed
+- [ ] CLAUDE.md "koto-skills Plugin Maintenance" section is present and has not been removed
 
 ## Out of Scope
 
@@ -263,7 +263,7 @@ Maintenance" section in `CLAUDE.local.md` must be kept current as koto evolves.
 - Changes to koto CLI behavior or template format (PRD covers documentation, not engine changes)
 - Visualization UI
 - Updating other plugins or skills outside koto-skills
-- Fixing `koto query` in CLAUDE.local.md as a documentation-only task (the fix is removing the reference; CLAUDE.local.md is not a committed file this PRD controls)
+- Fixing `koto query` in CLAUDE.local.md as a documentation-only task (the fix was removing the reference; the committed CLAUDE.md does not contain phantom commands)
 - Context-matches gate semantics beyond what current tests demonstrate (requires separate investigation)
 
 ## Open Questions
@@ -275,7 +275,7 @@ Maintenance" section in `CLAUDE.local.md` must be kept current as koto evolves.
 ## Known Limitations
 
 - The eval harness uses positive-only pattern matching (`grep -qP`). Evals can confirm a behavior is mentioned but cannot verify it's described correctly. Semantic accuracy beyond keyword presence requires human review.
-- Evals on source-only PRs are advisory: a maintainer may not notice or act on advisory failures. The CLAUDE.local.md trigger list remains the primary human signal.
+- Evals on source-only PRs are advisory: a maintainer may not notice or act on advisory failures. The CLAUDE.md trigger list remains the primary human signal.
 - `--allow-legacy-gates` is transitory — it will be removed once the shirabe `work-on` template migrates to structured gate routing. R7 documentation should note this.
 
 ## Decisions and Trade-offs
@@ -284,7 +284,7 @@ Maintenance" section in `CLAUDE.local.md` must be kept current as koto evolves.
 
 **Root AGENTS.md is orientation-level, not a skill substitute**: Three functional substitutes for koto-user already exist (AGENTS.md 550 lines, koto.mdc 207 lines, cli-usage.md). The root AGENTS.md is not replacing them — it's a short entry point that orients any Claude Code session and points to the skill for detailed guidance. Content depth lives in the skill's references/, not in AGENTS.md.
 
-**Advisory evals on source PRs (not blocking)**: Blocking evals on source changes would prevent merging legitimate refactors that don't change observable behavior. Advisory mode keeps the signal visible without adding false-positive friction. The CLAUDE.local.md trigger list handles the human review signal.
+**Advisory evals on source PRs (not blocking)**: Blocking evals on source changes would prevent merging legitimate refactors that don't change observable behavior. Advisory mode keeps the signal visible without adding false-positive friction. The CLAUDE.md trigger list handles the human review signal.
 
 **File-change heuristics ruled out**: Heuristic CI checks (require skill file changes when certain source files change) have a high false-positive rate — not every engine refactor changes observable behavior. Advisory evals cover the semantic gap more reliably.
 
