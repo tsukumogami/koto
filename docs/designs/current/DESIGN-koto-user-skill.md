@@ -1,5 +1,5 @@
 ---
-status: Planned
+status: Current
 upstream: docs/prds/PRD-koto-user-skill.md
 problem: |
   The koto-skills plugin has no skill covering the agent runtime loop. koto-author

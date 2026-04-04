@@ -1,5 +1,5 @@
 ---
-status: In Progress
+status: Complete
 problem: |
   AI agents running koto-backed workflows have no installable skill guiding them
   through the runtime loop. The existing koto-author skill covers template authoring
