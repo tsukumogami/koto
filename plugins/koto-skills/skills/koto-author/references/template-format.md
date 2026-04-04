@@ -34,15 +34,18 @@ states:
 ---
 ```
 
-Required fields: `name`, `version`, `description`, `initial_state`, `states`.
+Required fields: `name`, `version`, `initial_state`, `states`.
 
-Optional fields: `variables`.
+Optional fields: `description`, `variables`.
 
 ### Variables
 
 Variables are declared at the root level and interpolated into directive text using `{{VARIABLE_NAME}}` syntax. The agent supplies values at init time via `--var KEY=VALUE`. Each variable has a `description` and a `required` flag.
 
-Koto also provides the built-in variable `{{SESSION_NAME}}` (the active session name). You don't need to declare it.
+Koto also provides two built-in variables that don't need to be declared:
+
+- `{{SESSION_NAME}}` -- the active session name
+- `{{SESSION_DIR}}` -- the session directory path
 
 ### States
 
@@ -245,13 +248,13 @@ See [evidence-routing-workflow.md](examples/evidence-routing-workflow.md) for a 
 
 ### Gates
 
-Gates are preconditions checked before any transition fires. A state can have multiple gates -- all must pass.
+Gates are preconditions evaluated before any transition fires. A state can have multiple gates -- all must pass before the engine attempts transition resolution.
 
-| Type | Passes when | Key fields |
-|------|-------------|------------|
-| `context-exists` | A key exists in the content store | `key: plan.md` |
-| `context-matches` | Content for a key matches a regex | `key: plan.md`, `pattern: "^## Step \\d+"` |
-| `command` | A shell command exits 0 | `command: "test -f deploy.conf"` |
+| Type | Passes when | Required fields |
+|------|-------------|-----------------|
+| `context-exists` | A key exists in the context store | `key` |
+| `context-matches` | Content for a key matches a regex | `key`, `pattern` |
+| `command` | A shell command exits 0 | `command` |
 
 ```yaml
 gates:
@@ -264,53 +267,190 @@ gates:
     pattern: "^## Step \\d+"
 ```
 
-### Combining gates and evidence routing
+### Gate output fields
 
-Gates and `accepts` blocks work together on the same state. Gates are checked first -- if any gate fails, the agent can't advance regardless of evidence. Once all gates pass, evidence routing determines which transition fires.
+Each gate type produces structured output that the engine injects into the evidence map under the `gates.<gate_name>` namespace. Use these fields in `when` conditions to route on gate results.
+
+| Gate type | Field | Type | Meaning |
+|-----------|-------|------|---------|
+| `command` | `exit_code` | number | Process exit code. `0` = passed; positive = failed; `-1` = timed out or spawn error. |
+| `command` | `error` | string | Empty on normal pass or fail. `"timed_out"` on timeout. OS error message on spawn failure. |
+| `context-exists` | `exists` | boolean | `true` if the key was found in the context store. |
+| `context-exists` | `error` | string | Empty on normal pass or fail. Error message when the context store is unavailable. |
+| `context-matches` | `matches` | boolean | `true` if the content at `key` matches `pattern`. |
+| `context-matches` | `error` | string | Empty on normal pass or fail. Error message when the store is unavailable or the pattern is invalid. |
+
+`passed` is not a field name in any gate type. Don't use it in `when` conditions.
+
+### Routing on gate output (`gates.*` paths)
+
+Reference gate output in `when` conditions using `gates.<gate_name>.<field>`. When at least one `when` clause on a state references a `gates.*` key, the engine injects gate outputs and resolves transitions automatically -- no agent action is needed.
+
+**`command` gate routing on exit code:**
 
 ```yaml
 states:
-  deploy:
+  check:
     gates:
-      config_valid:
-        type: context-exists
-        key: deploy.conf
-      tests_pass:
+      ci_check:
         type: command
-        command: "test -f test-results.txt && grep -q PASS test-results.txt"
-    accepts:
-      target:
-        type: enum
-        values: [staging, production]
-        required: true
+        command: "cargo test"
     transitions:
-      - target: staging_deploy
+      - target: passed
         when:
-          target: staging
-      - target: production_deploy
+          gates.ci_check.exit_code: 0   # gate passed
+      - target: failed
         when:
-          target: production
+          gates.ci_check.exit_code: 1   # gate failed with exit code 1
 ```
 
-Both gates must pass (config exists, tests passed) before the agent can submit evidence choosing the deploy target.
+The engine evaluates `ci_check`, injects `gates.ci_check.exit_code` and `gates.ci_check.error` into the evidence map, and resolves the matching transition. No agent submission required.
+
+**`context-exists` gate routing on existence:**
+
+```yaml
+states:
+  await_doc:
+    gates:
+      doc_check:
+        type: context-exists
+        key: research/lead.md
+    transitions:
+      - target: proceed
+        when:
+          gates.doc_check.exists: true    # key present, advance
+      - target: await_doc                 # self-loop: wait for the key
+        when:
+          gates.doc_check.exists: false
+```
+
+**Path format rules:**
+
+- Exactly three dot-separated segments: `gates.<gate_name>.<field>`.
+- `<gate_name>` must be declared in the same state's `gates` block.
+- `<field>` must be a valid output field for that gate type.
+- The compiler enforces all three rules (D3 check) and rejects malformed paths.
+- Agents can't submit evidence with a `gates.*` key -- the engine rejects it.
+
+### `override_default` on gate declarations
+
+Add `override_default` to a gate to control what value the engine uses when an operator records an override with `koto overrides record`. It must be a JSON object matching the gate type's output schema exactly.
+
+```yaml
+gates:
+  ci_check:
+    type: command
+    command: "cargo test"
+    override_default:
+      exit_code: 0
+      error: ""
+```
+
+When `koto overrides record` runs, the value to inject is resolved in this order:
+
+1. `--with-data <json>` supplied on the command line (highest priority)
+2. `override_default` declared on the gate
+3. Built-in default for the gate type (lowest priority)
+
+Built-in defaults for all three gate types:
+
+| Gate type | Built-in default |
+|-----------|-----------------|
+| `command` | `{"exit_code": 0, "error": ""}` |
+| `context-exists` | `{"exists": true, "error": ""}` |
+| `context-matches` | `{"matches": true, "error": ""}` |
+
+All three built-in types always have a built-in default, so `koto overrides record` always succeeds for them without `--with-data` or `override_default`. Setting `override_default` is useful when you want a specific non-passing value injected (for example, a known exit code that triggers a particular routing branch).
+
+The compiler validates `override_default` at compile time (D2 check): all required fields must be present, no extra fields, and each value must match the expected type.
+
+### Override commands
+
+When a gate is blocking and can't be resolved normally, an operator can record an override to unblock it:
+
+```bash
+# Override a gate using the built-in or declared default
+koto overrides record <session-name> --gate <gate-name> --rationale "<reason why>"
+
+# Override with an explicit value (takes priority over override_default and built-in)
+koto overrides record <session-name> --gate <gate-name> --rationale "<reason why>" \
+  --with-data '{"exit_code": 0, "error": ""}'
+
+# List all overrides recorded in the session
+koto overrides list <session-name>
+```
+
+`--rationale` is required. `--with-data` is optional. The override is epoch-scoped -- it applies until the next state transition and is then superseded. The override is recorded in the session event log and appears in `koto overrides list` output even after a rewind.
+
+In `koto next` responses, `blocking_conditions[].agent_actionable` is `true` for all three built-in gate types, signaling that `koto overrides record` is available.
+
+### Combining gates and evidence routing
+
+Gates and `accepts` blocks work together on the same state. Use mixed `when` conditions -- combining `gates.*` fields and agent evidence fields -- when you want the engine to verify both a gate result and an explicit agent decision before advancing.
+
+```yaml
+states:
+  review:
+    gates:
+      lint:
+        type: command
+        command: "cargo clippy --quiet"
+    accepts:
+      decision:
+        type: enum
+        values: [approve, reject]
+        required: true
+    transitions:
+      - target: merge
+        when:
+          gates.lint.exit_code: 0   # lint must have passed
+          decision: approve          # agent must approve
+      - target: revise
+        when:
+          decision: reject           # agent rejects regardless of lint
+```
+
+The `merge` transition fires only when lint exited 0 AND the agent submitted `{"decision": "approve"}`. The `revise` transition fires on rejection regardless of the lint result. States using mixed routing must declare an `accepts` block for the agent evidence fields.
+
+### D5 diagnostic and `--allow-legacy-gates`
+
+If a state has gates but none of its `when` clauses reference a `gates.*` key, the compiler rejects it in strict mode with a D5 error:
+
+```
+state "preflight": gate "config_exists" has no gates.* routing
+  add a when clause referencing gates.config_exists.exit_code, gates.config_exists.error, ...
+  or use --allow-legacy-gates to permit boolean pass/block behavior
+```
+
+**Fix:** add transitions with `gates.<name>.<field>` conditions as shown in the examples above.
+
+**Escape hatch during migration:** if you're working with a template that predates `gates.*` routing, compile it with `--allow-legacy-gates` to suppress D5 temporarily:
+
+```bash
+koto template compile --allow-legacy-gates <template-path>
+```
+
+This flag is transitional. New templates should always use `gates.*` routing and won't need it.
+
+`koto init` always runs in permissive mode and never requires the flag -- it emits a warning for legacy-gate states and initializes anyway.
 
 ### Self-loops
 
-A transition whose target is its own state creates a retry loop. The agent stays in the state until conditions change:
+A transition whose target is its own state creates a retry loop. The agent (or the engine via gate routing) stays in the state until conditions change:
 
 ```yaml
 transitions:
-  - target: deploy
+  - target: proceed
     when:
-      result: pass
-  - target: build       # loops back to itself on failure
+      gates.doc_check.exists: true
+  - target: await_doc           # self-loop: re-evaluate until the key appears
     when:
-      result: fail
+      gates.doc_check.exists: false
 ```
 
 ### Split topology
 
-A state with multiple outbound `when` transitions is a split point. The mutual exclusivity constraint from Layer 2 applies -- the agent's evidence must unambiguously select one path. The combined gates + evidence example above shows this pattern.
+A state with multiple outbound `when` transitions is a split point. The mutual exclusivity constraint from Layer 2 applies -- the transition conditions must be unambiguous. Gate-only splits (no agent evidence) are mutually exclusive naturally as long as the gate field values differ across transitions.
 
 ## Mermaid previews
 

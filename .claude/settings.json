@@ -1,0 +1,13 @@
+{
+  "enabledPlugins": {
+    "koto-skills@koto": true
+  },
+  "extraKnownMarketplaces": {
+    "koto": {
+      "source": {
+        "source": "file",
+        "path": ".claude-plugin/marketplace.json"
+      }
+    }
+  }
+}

@@ -1,0 +1,81 @@
+{
+  "skill_name": "koto-author",
+  "evals": [
+    {
+      "id": 1,
+      "name": "new-skill-init-command",
+      "prompt": "I want to create a new koto-backed skill for a deployment pipeline. The skill should guide agents through build, test, staging, and production phases. How do I start?",
+      "expected_output": "Agent uses koto-author in 'new' mode: runs `koto init --template ${CLAUDE_SKILL_DIR}/koto-templates/koto-author.md --var MODE=new`, then explains the koto next loop to follow.",
+      "files": [],
+      "assertions": [
+        "Response includes `koto init` with `--template` pointing to the koto-author template (koto-templates/koto-author.md)",
+        "Response includes `--var MODE=new` (new mode, not convert)",
+        "Response explains the koto next loop (call `koto next` to get directives, submit evidence with `--with-data`)",
+        "Response does NOT attempt to write a koto template directly without using the koto-author workflow"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "convert-existing-skill",
+      "prompt": "I have an existing prose-based SKILL.md for a code review workflow. It has manual phase tracking with state.json files and if/else branching for different review outcomes. I want to convert it to use koto. What's the process?",
+      "expected_output": "Agent uses koto-author in 'convert' mode: runs `koto init --template ${CLAUDE_SKILL_DIR}/koto-templates/koto-author.md --var MODE=convert`, explains that the workflow will analyze the existing SKILL.md and extract phases, gates, and branching into a koto template.",
+      "files": [],
+      "assertions": [
+        "Response includes `--var MODE=convert` (convert mode, not new)",
+        "Response explains that koto-author will analyze the existing SKILL.md to identify phases, resume logic, and branching",
+        "Response mentions that workflow mechanics (state tracking, phase ordering) move into the koto template while domain logic stays in SKILL.md",
+        "Response does NOT suggest manually rewriting the template without using koto-author"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "compile-error-handling",
+      "prompt": "I'm in the compile_validation state of my koto-author session. `koto template compile my-skill/koto-templates/deploy.md` failed with: \"error: transitions from state 'test' are not mutually exclusive: conditions for 'staging' and 'rollback' both match when test_result='failed'\". What should I do?",
+      "expected_output": "Agent recognizes this as a non-mutually-exclusive evidence routing error. It explains that two conditional transitions overlap -- both match when test_result is 'failed'. The fix is to differentiate the when clauses so each transition matches a unique combination of evidence values.",
+      "files": [],
+      "assertions": [
+        "Response identifies the error as non-mutually-exclusive evidence routing (two transitions match the same evidence)",
+        "Response explains the fix: change the `when` clauses so each transition is distinguished by different field values",
+        "Response mentions fixing the template and recompiling (re-running `koto template compile`)",
+        "Response does NOT suggest bypassing compilation or ignoring the error"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "template-format-layers",
+      "prompt": "I'm designing a koto template for a simple linear workflow with 4 states and no branching or gates. Which parts of the template format reference should I read?",
+      "expected_output": "Agent recommends reading only Layer 1 (Structure) since the workflow is linear with no branching or gates. Layer 2 (Evidence routing) and Layer 3 (Advanced) are unnecessary for a simple linear flow.",
+      "files": [],
+      "assertions": [
+        "Response recommends Layer 1 (Structure) as the required reading",
+        "Response explicitly states that Layer 2 (Evidence routing) is not needed for a linear workflow without branching",
+        "Response explicitly states that Layer 3 (Advanced) is not needed without gates or self-loops",
+        "Response references the template format guide at `${CLAUDE_SKILL_DIR}/references/template-format.md`"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "negative-workflow-execution-redirect",
+      "prompt": "I have a koto workflow running called 'my-deploy'. `koto next my-deploy` returned an evidence_required action. How do I submit the evidence and advance?",
+      "expected_output": "Agent recognizes this is a workflow execution question, not a template authoring question. It redirects to koto-user as the appropriate skill.",
+      "files": [],
+      "assertions": [
+        "Response does NOT provide detailed koto-author workflow instructions (this is not about authoring a template)",
+        "Response mentions koto-user as the appropriate skill for running workflows",
+        "Response distinguishes between authoring templates (koto-author) and executing workflows (koto-user)"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "negative-general-yaml-redirect",
+      "prompt": "I need to write a YAML configuration file for my Kubernetes deployment. Can you help me structure the pods and services?",
+      "expected_output": "Agent recognizes this is a general Kubernetes YAML question, not a koto template authoring question. It does not invoke koto-author concepts.",
+      "files": [],
+      "assertions": [
+        "Response does NOT attempt to use koto-author for this task (mentioning it to explain why it doesn't apply is acceptable)",
+        "Response does NOT suggest using `koto init` or `koto template compile`",
+        "Response treats this as a general Kubernetes configuration question"
+      ]
+    }
+  ]
+}

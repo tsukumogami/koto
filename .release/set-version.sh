@@ -24,3 +24,12 @@ echo "Stamped $MARKETPLACE_JSON to ${VERSION}"
 jq --arg v "$VERSION" '.version = $v' "$PLUGIN_JSON" > "$PLUGIN_JSON.tmp" \
   && mv "$PLUGIN_JSON.tmp" "$PLUGIN_JSON"
 echo "Stamped $PLUGIN_JSON to ${VERSION}"
+
+# Stamp minimum koto version in SKILL.md files (strip -dev suffix for release versions)
+RELEASE_VERSION="${VERSION%%-dev*}"
+for versioned_file in plugins/koto-skills/skills/*/SKILL.md; do
+  if [ -f "$versioned_file" ] && grep -q 'koto >= ' "$versioned_file"; then
+    sed -i "s/koto >= [0-9][0-9.]*[0-9]/koto >= ${RELEASE_VERSION}/" "$versioned_file"
+    echo "Stamped $versioned_file minimum version to ${RELEASE_VERSION}"
+  fi
+done

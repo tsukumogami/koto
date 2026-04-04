@@ -1,6 +1,7 @@
 ---
 name: koto-author
-description: Guides agents through authoring koto-backed skills with paired SKILL.md and koto template
+description: |
+  How to author koto-backed skills. Use when creating or converting skills that need structured, resumable workflows.
 ---
 
 # koto-author
@@ -22,8 +23,21 @@ If your skill is a single linear task with no decision points, koto adds unneces
 
 ## Prerequisites
 
-- koto must be installed and on PATH (`koto --version` to verify)
+- koto >= 0.5.0 must be installed and on PATH (`koto version` to verify)
 - This skill is installed via the koto-skills plugin
+
+If koto is not installed or the version is too old, install the latest release:
+
+```bash
+# Detect platform
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m); [ "$ARCH" = "x86_64" ] && ARCH="amd64"; [ "$ARCH" = "aarch64" ] && ARCH="arm64"
+
+# Download and install
+gh release download -R tsukumogami/koto -p "koto-${OS}-${ARCH}" -D /tmp
+chmod +x "/tmp/koto-${OS}-${ARCH}"
+mv "/tmp/koto-${OS}-${ARCH}" ~/.local/bin/koto
+```
 
 ## Usage
 
@@ -52,7 +66,17 @@ After init, follow the koto execution loop:
 3. Read the `directive` for instructions. On first visit to a state, a `details` field may contain extended guidance (pass `--full` to force it on repeat visits)
 4. Repeat until `action` is `done`
 
-Run `koto status` at any point to see where you are.
+Each item in `blocking_conditions` has five fields:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `name` | string | Gate name as declared in the template |
+| `type` | string | Gate type (`command`, `context-exists`, `context-matches`) |
+| `status` | string | `failed`, `timed_out`, or `error` |
+| `agent_actionable` | boolean | `true` when `koto overrides record` can unblock this gate |
+| `output` | object | Gate-type-specific structured result (e.g., `{"exit_code": 1, "error": ""}` for `command` gates) |
+
+To check where you are at any point, call `koto next <session-name>` without `--with-data` — it returns the current state directive and is idempotent. If you don't know the session name, `koto workflows` lists active sessions.
 
 ## What to expect
 
@@ -85,7 +109,7 @@ gh api repos/tsukumogami/koto/contents/docs/guides --jq '.[].name'
 
 ## Resuming interrupted sessions
 
-koto preserves state across interruptions. Run `koto status` to see where you left off, then `koto next` to continue.
+koto preserves state across interruptions. Call `koto next <session-name>` to see where you left off and pick up where you stopped. If you don't remember the session name, `koto workflows` lists active sessions.
 
 ## Output
 
@@ -104,7 +128,7 @@ Both files follow the coupling convention: the SKILL.md references the template 
 
 **Template won't compile after 3 attempts** -- the directive tells you to escalate. Common causes: state name typos, overlapping evidence routing conditions, missing directive body sections. Run `koto template compile <path>` manually to see the full error.
 
-**"session already exists"** -- a previous run didn't finish. Run `koto status` to check, then either `koto next` to resume or start a new session.
+**"session already exists"** -- a previous run didn't finish. Call `koto next <session-name>` to resume where you left off. If you don't know the session name, `koto workflows` lists active sessions.
 
 ## Optional: skill-creator for eval
 

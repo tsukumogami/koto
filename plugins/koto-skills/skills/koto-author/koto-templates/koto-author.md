@@ -64,9 +64,11 @@ states:
       - target: skill_authoring
         when:
           compile_result: pass
+          gates.template_exists.exists: true
       - target: compile_validation
         when:
           compile_result: fail
+          gates.template_exists.exists: true
   skill_authoring:
     accepts:
       skill_authored:
@@ -223,6 +225,7 @@ If compilation fails, read the error message and apply the matching fix:
 - **Invalid regex in context-matches gates** -- malformed pattern. Fix: test the regex separately, escape special characters with `\\`.
 - **Unreferenced variables** -- a double-brace variable reference in a directive body doesn't match any declared variable (or a declared variable isn't used anywhere). Fix: add the missing declaration, or remove the unused variable.
 - **Missing directive section** -- a state exists in the frontmatter but has no `## state_name` section in the body. Fix: add the missing markdown heading and directive text.
+- **No `gates.*` routing (D5)** -- a state has gates but no transition uses `gates.<gate_name>.<field>` in its `when` clause. Fix: add the gate output field to at least one transition's `when` block. For example, a `context-exists` gate named `my_gate` needs `gates.my_gate.exists: true` in a `when` clause. If the gate is truly redundant, remove it from the state definition.
 
 Fix the template and recompile. Maximum 3 attempts before escalating to the user. Submit `compile_result: fail` to loop back and try again.
 
@@ -235,7 +238,7 @@ Write or refactor the SKILL.md to work with the koto template.
 - YAML frontmatter with name and description.
 - Koto execution loop instructions: initialize with `koto init --template ${CLAUDE_SKILL_DIR}/koto-templates/<name>.md`, retrieve directives with `koto next`, submit evidence with `koto next --with-data`.
 - A prerequisites section (koto must be on PATH).
-- Resume instructions for interrupted sessions -- `koto status` to check state, `koto next` to pick up where you left off.
+- Resume instructions for interrupted sessions -- `koto next <session-name>` to pick up where you left off, `koto workflows` to list active sessions.
 - References to `${CLAUDE_SKILL_DIR}/references/template-format.md` and `${CLAUDE_SKILL_DIR}/references/examples/` for agents who want to understand the underlying template.
 
 For SKILL.md structure conventions, read the custom skill authoring guide:

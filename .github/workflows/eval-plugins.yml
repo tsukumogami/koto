@@ -8,39 +8,47 @@ on:
       - 'plugins/**'
 
 jobs:
-  prompt-eval:
-    name: Prompt Regression Eval
+  eval-coverage:
+    name: Eval Coverage Check
     if: ${{ github.event.pull_request.draft != true }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Check all skills have evals
+        run: bash scripts/check-evals-exist.sh
 
-      - uses: Swatinem/rust-cache@v2
+  no-hooks:
+    name: No Hooks in Skills
+    if: ${{ github.event.pull_request.draft != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Build koto
-        run: cargo build --release
-
-      - name: Run prompt evals
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - name: Verify no hooks.json in skill directories
         run: |
-          if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "ANTHROPIC_API_KEY not configured, skipping prompt evals"
-            exit 0
+          failed=0
+          while IFS= read -r skill_dir; do
+            if [ -f "$skill_dir/hooks.json" ]; then
+              echo "::error::hooks.json found in skill directory: $skill_dir"
+              failed=1
+            fi
+          done < <(find plugins/*/skills/*/ -maxdepth 0 -type d 2>/dev/null)
+          if [ "$failed" -eq 1 ]; then
+            echo "hooks.json belongs at the plugin root, not in individual skill directories."
+            exit 1
           fi
-          export PATH="$PWD/target/release:$PATH"
-          bash plugins/koto-skills/eval.sh
+          echo "No hooks.json found in skill directories."
 
   eval-plugins:
     name: eval-plugins
-    needs: [prompt-eval]
+    needs: [eval-coverage, no-hooks]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check results
         run: |
-          if [ "${{ needs.prompt-eval.result }}" = "failure" ]; then
+          if [ "${{ needs.eval-coverage.result }}" = "failure" ] || \
+             [ "${{ needs.no-hooks.result }}" = "failure" ]; then
             exit 1
           fi
