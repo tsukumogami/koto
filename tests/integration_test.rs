@@ -11,6 +11,9 @@ fn koto_cmd(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("koto").unwrap();
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
+    // Override HOME so tests don't read the user's ~/.koto/config.toml
+    // (which might set backend = "cloud" or other non-default values).
+    cmd.env("HOME", dir);
     cmd
 }
 
