@@ -474,6 +474,14 @@ Process:
 
 Output: fixed-shape JSON (see gate contract above).
 
+The gate checks **direct children only** -- workflows where
+`parent_workflow == current_workflow`. It does not recurse into grandchildren.
+Multi-level convergence (grandparent waiting on parent waiting on grandchild)
+works because each level declares its own `children-complete` gate. The
+grandparent's gate passes when the parent reaches its terminal state, which
+only happens after the parent's own gate passes when its children complete.
+This composition is implicit and requires no special handling.
+
 The gate evaluator closure in the CLI handler (`src/cli/mod.rs`) captures the
 session backend through the same closure injection pattern used for
 `context_store`. The `evaluate_gates` closure gains access to `backend` from
@@ -603,6 +611,29 @@ Add child discovery to cancel, cleanup, and rewind handlers. Include
 Deliverables:
 - `src/cli/mod.rs` -- cancel, cleanup, rewind handlers
 - Tests for advisory output
+
+### Phase 6: Skill updates
+
+Update koto-user and koto-author skills to document hierarchical workflows
+(PRD requirements R16 and R17).
+
+**koto-user:** Add `children-complete` gate to action dispatch table and
+handling guidance. Document temporal vs corrective `category` field. Add
+`koto status`, `--parent` on init, and `--roots`/`--children`/`--orphaned`
+on workflows to command reference. Cover overriding `children-complete` gates
+in override flow section.
+
+**koto-author:** Add `children-complete` gate type to template authoring guide
+with `completion` and `name_filter` fields. Document the single-state fan-out
+pattern (directive + gate on same state). Add compiler validation for
+`children-complete` fields. Include parent+child template pair example.
+
+Deliverables:
+- `plugins/koto-skills/skills/koto-user/SKILL.md` -- hierarchy sections
+- `plugins/koto-skills/skills/koto-user/references/` -- updated references
+- `plugins/koto-skills/skills/koto-author/SKILL.md` -- gate type docs
+- `plugins/koto-skills/skills/koto-author/references/` -- updated references
+- Updated evals for both skills covering hierarchy scenarios
 
 ## Consequences
 
