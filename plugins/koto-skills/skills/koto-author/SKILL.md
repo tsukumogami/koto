@@ -22,8 +22,21 @@ If your skill is a single linear task with no decision points, koto adds unneces
 
 ## Prerequisites
 
-- koto must be installed and on PATH (`koto --version` to verify)
+- koto >= 0.5.0 must be installed and on PATH (`koto version` to verify)
 - This skill is installed via the koto-skills plugin
+
+If koto is not installed or the version is too old, install the latest release:
+
+```bash
+# Detect platform
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m); [ "$ARCH" = "x86_64" ] && ARCH="amd64"; [ "$ARCH" = "aarch64" ] && ARCH="arm64"
+
+# Download and install
+gh release download -R tsukumogami/koto -p "koto-${OS}-${ARCH}" -D /tmp
+chmod +x "/tmp/koto-${OS}-${ARCH}"
+mv "/tmp/koto-${OS}-${ARCH}" ~/.local/bin/koto
+```
 
 ## Usage
 
