@@ -1,5 +1,5 @@
 ---
-status: Draft
+status: Accepted
 problem: |
   koto's state machine is per-workflow with no cross-workflow awareness. When an
   agent workflow needs to fan out over a collection -- issues in a plan, repos in
