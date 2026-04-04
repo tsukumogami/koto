@@ -62,7 +62,7 @@ issue A completing first).
 
 ```yaml
 states:
-  load_plan:
+  run_plan:
     directive: |
       Read the plan file and identify all issues to implement.
       For each issue, create a child workflow:
@@ -74,17 +74,9 @@ states:
 
       Spawn a child agent for each issue that has no unmet dependencies.
       Issues whose dependencies haven't completed yet will be spawned later.
-    transitions:
-      - target: wait_for_children
-        when: {}
 
-  wait_for_children:
-    directive: |
-      All issues have been spawned (or will be spawned as dependencies clear).
-      Wait for child workflows to complete.
-
-      For each completed child, check if it unblocked any dependent issues.
-      If so, spawn those children now.
+      When the gate unblocks, check if any completed children unblocked
+      dependent issues. If so, spawn those children and call koto next again.
     gates:
       children-done:
         type: children-complete
@@ -213,43 +205,39 @@ states:
 # Parent agent initializes the plan
 koto init plan --template plan-workflow.md --var PLAN_FILE=plan.md
 
-# Parent gets directive to spawn children
+# First koto next: gate blocks because no children exist yet
 koto next plan
-# -> action: evidence_required, directive: "Read the plan file..."
+# -> action: gate_blocked, category: temporal
+# -> directive: "Read the plan file and identify all issues..."
+# -> blocking_conditions: [{name: "children-done", type: "children-complete",
+#      output: {total: 0, completed: 0, pending: 0, all_complete: false}}]
 
-# Parent spawns children for issues 1, 2, 3 (issue 3 depends on issue 1)
+# Agent reads the directive and spawns children
 koto init plan.issue-1 --parent plan --template implement-issue.md \
   --var ISSUE_NUMBER=1 --var ISSUE_TITLE="Add header parser"
 koto init plan.issue-2 --parent plan --template implement-issue.md \
   --var ISSUE_NUMBER=2 --var ISSUE_TITLE="Fix validation bug"
 # Issue 3 not spawned yet -- depends on issue 1
 
-# Parent submits evidence to advance
-koto next plan --with-data '{}'
-# -> advances to wait_for_children
-
-# Parent checks on children
+# Re-check: gate still blocks (children pending)
 koto next plan
-# -> action: gate_blocked
-# -> blocking_conditions: [{name: "children-done", type: "children-complete",
-#      category: "temporal", output: {total: 2, completed: 0, pending: 2, ...}}]
+# -> action: gate_blocked, category: temporal
+# -> output: {total: 2, completed: 0, pending: 2, ...}
 
 # [Time passes, child agents run their loops independently]
 
-# Child 1 reaches terminal state
-# Parent re-checks
-koto next plan
-# -> still gate_blocked (child 2 pending)
-
-# Parent spawns issue 3 now that issue 1 is done
+# Child 1 reaches terminal state -- spawn issue 3 (was blocked on issue 1)
 koto init plan.issue-3 --parent plan --template implement-issue.md \
   --var ISSUE_NUMBER=3 --var ISSUE_TITLE="Use new parser in routes"
 
-# [More time passes]
-
-# All children complete
+# Re-check: still pending
 koto next plan
-# -> action: evidence_required (gates passed, parent advances to summarize)
+# -> gate_blocked, output: {total: 3, completed: 1, pending: 2, ...}
+
+# [More time passes, all children complete]
+
+koto next plan
+# -> gates pass, advances to summarize (terminal)
 ```
 
 ### Scenario 2: Multi-repo release coordination
@@ -262,7 +250,7 @@ checklists before cutting the final release.
 
 ```yaml
 states:
-  prepare:
+  coordinate:
     directive: |
       Create a child workflow for each repo's release checklist:
 
@@ -276,13 +264,6 @@ states:
       ```
 
       Spawn an agent per repo to run through the checklist.
-    transitions:
-      - target: wait_for_repos
-        when: {}
-
-  wait_for_repos:
-    directive: |
-      Wait for all repo checklists to complete.
     gates:
       repos-ready:
         type: children-complete
@@ -311,17 +292,15 @@ states:
 ```bash
 # Top-level agent
 koto init release --template release-coordinator.md --var VERSION=0.7.0
+
+# First call: gate blocks (no children yet), directive tells agent what to spawn
 koto next release
-# -> evidence_required: "Create a child workflow for each repo..."
+# -> gate_blocked, category: temporal, directive: "Create a child workflow..."
 
 # Spawn per-repo children
 koto init release.koto --parent release --template repo-checklist.md --var REPO=koto
 koto init release.niwa --parent release --template repo-checklist.md --var REPO=niwa
 koto init release.tsuku --parent release --template repo-checklist.md --var REPO=tsuku
-
-# Advance parent
-koto next release --with-data '{}'
-# -> advances to wait_for_repos
 
 # Check status without side effects
 koto status release.koto
@@ -330,7 +309,7 @@ koto status release.koto
 koto status release.niwa
 # -> {"name": "release.niwa", "current_state": "done", "is_terminal": true}
 
-# Check parent gate
+# Re-check parent gate
 koto next release
 # -> gate_blocked, category: temporal, 1 of 3 complete
 
@@ -338,9 +317,9 @@ koto next release
 koto overrides record release --gate repos-ready \
   --rationale "tsuku repo has a known flaky test, manually verified it passes"
 
-# Parent advances
+# Parent advances (override + 2 complete = all resolved)
 koto next release
-# -> evidence_required (gates passed with override)
+# -> gates pass, advances to cut_release
 ```
 
 ### Scenario 3: Exploration fan-out
@@ -352,7 +331,7 @@ research template. The parent converges their findings.
 
 ```yaml
 states:
-  scope:
+  discover:
     directive: |
       Define the research leads. For each lead, spawn a child:
 
@@ -360,17 +339,8 @@ states:
       koto init explore.lead-<name> --parent explore \
         --template research-lead.md --var LEAD="<question>" --var TOPIC="<topic>"
       ```
-    accepts:
-      leads_spawned:
-        type: number
-        required: true
-    transitions:
-      - target: wait_for_leads
-        when: {}
 
-  wait_for_leads:
-    directive: |
-      Wait for research agents to complete their leads.
+      Wait for all research agents to complete.
     gates:
       leads-done:
         type: children-complete
@@ -401,7 +371,7 @@ states:
         type: enum
         values: [explore_further, crystallize]
     transitions:
-      - target: scope
+      - target: discover
         when:
           decision: explore_further
       - target: produce
@@ -419,8 +389,11 @@ states:
 ```bash
 # Parent agent scopes the exploration
 koto init explore --template exploration.md --var TOPIC="caching strategy"
+
+# First call: gate blocks (no children yet), directive explains what to spawn
 koto next explore
-# -> evidence_required: "Define the research leads..."
+# -> gate_blocked, category: temporal
+# -> directive: "Define the research leads. For each lead, spawn a child..."
 
 # Spawn 3 research leads
 koto init explore.lead-prior-art --parent explore \
@@ -429,9 +402,6 @@ koto init explore.lead-constraints --parent explore \
   --template research-lead.md --var LEAD="What are our constraints?"
 koto init explore.lead-feasibility --parent explore \
   --template research-lead.md --var LEAD="Is approach X feasible?"
-
-koto next explore --with-data '{"leads_spawned": 3}'
-# -> advances to wait_for_leads
 
 # [Research agents run independently]
 
@@ -442,7 +412,7 @@ koto next explore
 
 # All leads finish
 koto next explore
-# -> evidence_required (at converge state)
+# -> gates pass, advances to converge
 
 # Parent reads child results
 koto context get explore.lead-prior-art findings_summary
