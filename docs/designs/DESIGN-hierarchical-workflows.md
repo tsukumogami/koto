@@ -1,6 +1,6 @@
 ---
 status: Proposed
-upstream: docs/prds/PRD-gate-transition-contract.md
+upstream: docs/prds/PRD-hierarchical-workflows.md
 problem: |
   koto's state machine is per-workflow with no awareness of other workflows.
   When a workflow needs to fan out over a collection of items -- each going
