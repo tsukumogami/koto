@@ -69,3 +69,35 @@ Source areas most likely to require skill updates:
 | `src/engine/` -- advance loop, action values, response schema | koto-user |
 | `src/gate/` -- gate types, structured output fields | both |
 | `src/template/` -- frontmatter fields, compiler errors/warnings | koto-author |
+
+### Running skill evals
+
+Run evals after modifying any skill content (`SKILL.md`, reference files, or evals themselves):
+
+```bash
+# Run evals for one skill
+scripts/run-evals.sh koto-user
+
+# Run evals for all skills
+scripts/run-evals.sh --all
+
+# List skills with evals
+scripts/run-evals.sh --list
+
+# Re-validate latest results without re-running
+scripts/run-evals.sh --validate koto-user
+```
+
+The script spawns a single `claude -p` session per skill that runs with-skill and without-skill agents for each eval, then grades against assertions.
+
+**Include eval results in the PR description** when submitting skill changes. Use this format:
+
+```
+## Eval Results
+
+| Skill | Assertions | with_skill | without_skill | Delta |
+|-------|-----------|------------|---------------|-------|
+| koto-user | 18/18 (100%) | 100% | 60% | +40pp |
+```
+
+CI enforces that every skill has at least one eval (`check-evals-exist.sh`). Running the evals themselves is manual -- they require an Anthropic API key and spawn Claude sessions.

@@ -111,14 +111,37 @@ The `action` field is `"execute"` while work remains and `"done"` at the termina
 
 ## Agent integration
 
-AI coding agents can run koto workflows through the Claude Code plugin. Install it with two commands:
+### Plugin installation (Claude Code)
 
-```
-/plugin marketplace add tsukumogami/koto
-/plugin install koto-skills@koto
+The **koto-skills** plugin gives Claude Code agents the skills they need to author and run koto workflows. Add this to your project's `.claude/settings.json`:
+
+```json
+{
+  "enabledPlugins": {
+    "koto-skills@koto": true
+  },
+  "extraKnownMarketplaces": {
+    "koto": {
+      "source": {
+        "source": "github",
+        "repo": "tsukumogami/koto"
+      },
+      "sparsePaths": [".claude-plugin", "plugins/koto-skills"]
+    }
+  }
+}
 ```
 
-The plugin ships with **hello-koto**, a minimal two-state skill that walks through the full loop: template setup, variable interpolation, command gates, and state transitions. Run `/hello-koto Hasami` to try it.
+The `sparsePaths` entry keeps the checkout small -- Claude Code only fetches the plugin files, not the full koto repository.
+
+### What the plugin provides
+
+The plugin includes two skills:
+
+- **koto-author** -- How to author koto-backed skills. Use when creating or converting skills that need structured, resumable workflows.
+- **koto-user** -- How to run koto-backed workflows. Use when a SKILL.md tells you to call `koto init` or `koto next`.
+
+### Workflow cycle
 
 Once a skill is installed, the agent follows a simple cycle:
 
@@ -128,7 +151,11 @@ Once a skill is installed, the agent follows a simple cycle:
 4. `koto next --with-data '{...}'` -- submit evidence matching the schema, or `koto next --to <state>` for a directed transition
 5. Repeat from step 2 until `action` is `"done"`
 
-The plugin also includes a Stop hook that detects active workflows when a session ends, so the agent can resume where it left off.
+The plugin includes a Stop hook that detects active workflows when a session ends, so the agent can resume where it left off.
+
+### For other AI agents
+
+The `CLAUDE.md` at the repository root provides orientation for any AI agent working in the koto codebase, including build commands, project structure, and conventions.
 
 Skills use the [Agent Skills](https://agentskills.io) open standard, which means they work across Claude Code, Codex, Cursor, Windsurf, and other platforms that support it. For project-specific workflows, write a SKILL.md alongside your template in `.claude/skills/<name>/` and commit both to version control.
 
