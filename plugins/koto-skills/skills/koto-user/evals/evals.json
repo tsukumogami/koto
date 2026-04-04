@@ -1,0 +1,41 @@
+{
+  "skill_name": "koto-user",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I have a koto workflow template at `.koto/code-review.md`. I need to start a new workflow session called 'review-pr-443' and run the first cycle. The koto binary is on PATH. Walk me through exactly what to do.",
+      "expected_output": "Agent runs `koto init review-pr-443 --template .koto/code-review.md`, then calls `koto next review-pr-443`, interprets the action field in the JSON response, and explains what to do based on the action returned.",
+      "files": [],
+      "assertions": [
+        "Response includes `koto init review-pr-443 --template .koto/code-review.md` (correct init command with session name and template path)",
+        "Response includes `koto next review-pr-443` (correct loop command with the session name, not a generic placeholder)",
+        "Response explains that the agent should inspect the `action` field in the JSON response and act accordingly (dispatch on action)",
+        "Response does NOT suggest `koto init` without `--template` or suggest a different command for starting a workflow"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "I'm running a koto workflow called 'deploy-staging'. `koto next deploy-staging` returned:\n```json\n{\"action\":\"evidence_required\",\"directive\":\"Run the smoke tests against the staging environment and report whether they passed.\",\"expects\":{\"fields\":{\"smoke_test_result\":{\"type\":\"enum\",\"required\":true,\"values\":[\"passed\",\"failed\",\"partial\"]}}},\"blocking_conditions\":[],\"advanced\":true}\n```\nThe smoke tests all passed. What command do I run to submit that result and advance the workflow?",
+      "expected_output": "Agent produces the exact command: `koto next deploy-staging --with-data '{\"smoke_test_result\": \"passed\"}'` — correct field name, correct value from the enum, correct session name.",
+      "files": [],
+      "assertions": [
+        "Response includes `koto next deploy-staging --with-data` (correct subcommand and session name)",
+        "Response uses the exact field name `smoke_test_result` (taken directly from expects.fields, not guessed)",
+        "Response uses the value `passed` (one of the valid enum values, matching the scenario)",
+        "Response does NOT use incorrect field names like `result`, `test_result`, `status`, or `outcome`"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "My koto workflow 'security-audit' is blocked. `koto next security-audit` returned:\n```json\n{\"action\":\"gate_blocked\",\"directive\":\"The secrets scanner must complete without findings before this step can proceed.\",\"blocking_conditions\":[{\"name\":\"secrets_scan\",\"type\":\"command\",\"status\":\"failed\",\"agent_actionable\":false,\"output\":{\"exit_code\":1,\"error\":\"3 potential secrets found in src/config.rs\"}}],\"advanced\":false}\n```\nCan I override the gate and continue? What should I do?",
+      "expected_output": "Agent recognizes that `agent_actionable: false` means no override is possible. It should NOT suggest `koto overrides record`. It should tell the user they need to resolve the underlying issue (remove the secrets from src/config.rs) or escalate.",
+      "files": [],
+      "assertions": [
+        "Response clearly states that the gate CANNOT be overridden (because `agent_actionable` is `false`)",
+        "Response does NOT suggest running `koto overrides record` (this would be incorrect and would fail)",
+        "Response recommends fixing the underlying issue (removing the secrets from src/config.rs) or escalating to a human",
+        "Response specifically references `agent_actionable: false` as the reason no override is possible"
+      ]
+    }
+  ]
+}
