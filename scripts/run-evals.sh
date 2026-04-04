@@ -215,7 +215,7 @@ for ev in data["evals"]:
     if tier == 2:
         scenario = ev.get("scenario", "")
         lines.append(f"- {name}: TIER 2 (execute) — set EVAL_SCENARIO={scenario}, prepend $fixtures_bin to PATH. "
-                     f"Instruct agent: 'Execute the workflow. koto is available on PATH.'")
+                     f"Instruct agent: 'Execute the workflow. gh and koto are available on PATH.'")
     else:
         lines.append(f"- {name}: TIER 1 (plan_only) — "
                      f"Instruct agent: 'Read the skill file and describe the exact sequence of commands you would run. Do NOT execute any commands.'")

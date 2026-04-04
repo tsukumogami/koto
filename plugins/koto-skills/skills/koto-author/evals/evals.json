@@ -36,7 +36,7 @@
       "assertions": [
         "Response identifies the error as non-mutually-exclusive evidence routing (two transitions match the same evidence)",
         "Response explains the fix: change the `when` clauses so each transition is distinguished by different field values",
-        "Response mentions submitting `compile_result: fail` to loop back and retry after fixing",
+        "Response mentions fixing the template and recompiling (re-running `koto template compile`)",
         "Response does NOT suggest bypassing compilation or ignoring the error"
       ]
     },
@@ -72,7 +72,7 @@
       "expected_output": "Agent recognizes this is a general Kubernetes YAML question, not a koto template authoring question. It does not invoke koto-author concepts.",
       "files": [],
       "assertions": [
-        "Response does NOT reference koto-author, koto templates, or koto states",
+        "Response does NOT attempt to use koto-author for this task (mentioning it to explain why it doesn't apply is acceptable)",
         "Response does NOT suggest using `koto init` or `koto template compile`",
         "Response treats this as a general Kubernetes configuration question"
       ]
