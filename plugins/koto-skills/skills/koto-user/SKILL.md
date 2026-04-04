@@ -1,6 +1,7 @@
 ---
 name: koto-user
-description: Guides agents through running koto-backed workflows — init, execute the action loop, handle gates, submit evidence, and reach completion
+description: |
+  How to run koto-backed workflows. Use when a SKILL.md tells you to call koto init or koto next.
 ---
 
 # koto-user
@@ -8,6 +9,8 @@ description: Guides agents through running koto-backed workflows — init, execu
 koto is a workflow orchestration engine for AI coding agents. It enforces execution order through a state machine, persists progress atomically, and makes every state transition recoverable.
 
 You use koto by calling `koto next` in a loop. Each call returns a JSON object that tells you what to do next. You do it, then call `koto next` again.
+
+This skill is for koto-backed workflows only. If the SKILL.md you're following doesn't mention `koto init` or `koto next`, this skill doesn't apply. For authoring new koto templates, use koto-author instead.
 
 ## Prerequisites
 
@@ -167,6 +170,8 @@ koto decisions record <name> --with-data '{"choice": "option-a", "rationale": "b
 
 ## Reference material
 
+Read these on demand, not upfront. The sections above cover the common path. Consult a reference file only when you hit the specific situation it describes.
+
 - [**Command reference**](references/command-reference.md) — full CLI syntax, flags, and output shapes for all subcommands. Follow this when you need exact flag names or want to check an unfamiliar command.
 - [**Response shapes**](references/response-shapes.md) — annotated JSON examples for every `action` value, sub-object schemas for `expects` and `blocking_conditions`, and field-level annotations. Follow this when a field's presence or shape is unclear.
 - [**Error handling**](references/error-handling.md) — exit code table, error code meanings, and agent actions for each error type. Follow this when a command fails or returns a non-zero exit code.
@@ -180,5 +185,7 @@ koto decisions record <name> --with-data '{"choice": "option-a", "rationale": "b
 **"session already exists"** — a previous session with this name is still active. Call `koto next <name>` to resume. If you don't need it, cancel first with `koto cancel <name>` then re-initialize.
 
 **Gate blocked, `agent_actionable` is `false`** — you can't override this gate yourself. Escalate to the user so they can resolve the underlying condition (for example, a required deployment that only they can trigger).
+
+**Evidence rejected (`invalid_submission`)** — one or more fields didn't pass validation. The error includes a `details` array with per-field reasons. Fix the field values and resubmit. Call `koto next <name>` without `--with-data` to re-read the `expects` schema if needed.
 
 **`koto next` returns the same state repeatedly** — check `advanced` in the response. If it's `false`, the engine stopped where it already was (gates still blocking, or evidence still missing). Re-read `blocking_conditions` and `directive`.

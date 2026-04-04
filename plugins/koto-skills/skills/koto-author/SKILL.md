@@ -1,6 +1,7 @@
 ---
 name: koto-author
-description: Guides agents through authoring koto-backed skills with paired SKILL.md and koto template
+description: |
+  How to author koto-backed skills. Use when creating or converting skills that need structured, resumable workflows.
 ---
 
 # koto-author
