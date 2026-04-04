@@ -1,0 +1,39 @@
+{
+  "topic": "hierarchical-workflows",
+  "decisions": [
+    {
+      "id": 1,
+      "question": "What is the children-complete gate contract?",
+      "status": "complete",
+      "complexity": "critical",
+      "chosen": "Hybrid Discovery with Configurable Completion",
+      "report_file": "wip/design_hierarchical-workflows_decision_1_report.md"
+    },
+    {
+      "id": 2,
+      "question": "How does lineage registration and discovery work?",
+      "status": "complete",
+      "complexity": "standard",
+      "chosen": "Strict Validation, Header-Only, Rich Discovery, Convention-Only Naming",
+      "report_file": "wip/design_hierarchical-workflows_decision_2_report.md"
+    },
+    {
+      "id": 3,
+      "question": "What is the minimum CLI surface for cross-hierarchy queries?",
+      "status": "complete",
+      "complexity": "standard",
+      "chosen": "koto status + existing koto context get",
+      "report_file": "wip/design_hierarchical-workflows_decision_3_report.md"
+    },
+    {
+      "id": 4,
+      "question": "What is the parent-child lifecycle coupling policy?",
+      "status": "complete",
+      "complexity": "standard",
+      "chosen": "Advisory-only (inform, don't act)",
+      "report_file": "wip/design_hierarchical-workflows_decision_4_report.md"
+    }
+  ],
+  "cross_validation": "passed",
+  "round": 0
+}
