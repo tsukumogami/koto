@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-hierarchical-workflows.md
 problem: |
   koto's state machine is per-workflow with no awareness of other workflows.
