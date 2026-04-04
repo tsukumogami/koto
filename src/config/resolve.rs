@@ -135,9 +135,10 @@ mod tests {
     #[test]
     fn test_load_config_defaults() {
         // With no config files, we get defaults.
-        // Run in a temp dir to avoid picking up real project config.
+        // Run in a temp dir and override HOME to avoid picking up real user/project config.
         let tmp = TempDir::new().unwrap();
         let _guard = SetCwd::new(tmp.path());
+        let _home_guard = SetEnv::new("HOME", tmp.path().to_str().unwrap());
 
         // Clear env vars that would interfere.
         env::remove_var("AWS_ACCESS_KEY_ID");
@@ -189,10 +190,9 @@ mod tests {
     fn test_env_var_override() {
         let tmp = TempDir::new().unwrap();
         let _guard = SetCwd::new(tmp.path());
+        let _home_guard = SetEnv::new("HOME", tmp.path().to_str().unwrap());
 
-        // Write a user config with credentials.
-        // We can't easily write to ~/.koto/ in tests, but we can test env override logic
-        // by checking that env vars override whatever was loaded.
+        // Test that env vars override whatever was loaded.
         env::set_var("AWS_ACCESS_KEY_ID", "env-key-id");
         env::set_var("AWS_SECRET_ACCESS_KEY", "env-secret-key");
 
@@ -215,6 +215,7 @@ mod tests {
     fn test_project_config_overrides_user() {
         let tmp = TempDir::new().unwrap();
         let _guard = SetCwd::new(tmp.path());
+        let _home_guard = SetEnv::new("HOME", tmp.path().to_str().unwrap());
         env::remove_var("AWS_ACCESS_KEY_ID");
         env::remove_var("AWS_SECRET_ACCESS_KEY");
 
@@ -252,6 +253,32 @@ mod tests {
         let loaded = load_toml_value(&path).unwrap();
         let config: KotoConfig = loaded.try_into().unwrap();
         assert_eq!(config.session.backend, "cloud");
+    }
+
+    /// RAII guard that sets an env var and restores the previous value on drop.
+    struct SetEnv {
+        key: String,
+        prev: Option<String>,
+    }
+
+    impl SetEnv {
+        fn new(key: &str, val: &str) -> Self {
+            let prev = env::var(key).ok();
+            env::set_var(key, val);
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+    }
+
+    impl Drop for SetEnv {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(val) => env::set_var(&self.key, val),
+                None => env::remove_var(&self.key),
+            }
+        }
     }
 
     /// RAII guard that changes cwd and restores it on drop.
