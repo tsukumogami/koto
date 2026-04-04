@@ -438,6 +438,7 @@ impl SessionBackend for CloudBackend {
                     id: remote_id,
                     created_at: String::new(),
                     template_hash: String::new(),
+                    parent_workflow: None,
                 });
             }
         }
@@ -649,6 +650,7 @@ mod tests {
             workflow: id.to_string(),
             template_hash: "testhash".to_string(),
             created_at: created_at.to_string(),
+            parent_workflow: None,
         };
         append_header(&state_path, &header).unwrap();
     }

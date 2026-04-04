@@ -73,6 +73,10 @@ pub enum Command {
         /// Set a template variable (repeatable)
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
+
+        /// Name of an existing parent workflow (creates a child workflow)
+        #[arg(long)]
+        parent: Option<String>,
     },
 
     /// Get the current state directive for a workflow
@@ -644,9 +648,10 @@ pub fn run(app: App) -> Result<()> {
             name,
             template,
             vars,
+            parent,
         } => {
             let backend = build_backend()?;
-            handle_init(&backend, &name, &template, &vars)
+            handle_init(&backend, &name, &template, &vars, parent.as_deref())
         }
         Command::Next {
             name,
@@ -966,6 +971,7 @@ fn handle_init(
     name: &str,
     template: &str,
     vars: &[String],
+    parent: Option<&str>,
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation.
     if let Err(msg) = crate::discover::validate_workflow_name(name) {
@@ -977,6 +983,16 @@ fn handle_init(
             }),
             2,
         );
+    }
+
+    // Validate parent workflow exists, if specified.
+    if let Some(parent_name) = parent {
+        if !backend.exists(parent_name) {
+            exit_with_error(serde_json::json!({
+                "error": format!("parent workflow '{}' not found", parent_name),
+                "command": "init"
+            }));
+        }
     }
 
     // Check if session already exists (state file present).
@@ -1039,6 +1055,7 @@ fn handle_init(
         workflow: name.to_string(),
         template_hash: hash,
         created_at: ts.clone(),
+        parent_workflow: parent.map(|s| s.to_string()),
     };
     if let Err(e) = backend.append_header(name, &header) {
         exit_with_error(serde_json::json!({

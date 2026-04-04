@@ -5958,3 +5958,172 @@ fn gate_contract_regression_existing_templates_compile() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// parent workflow lineage (hierarchical workflows, issue 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn init_with_valid_parent_writes_parent_workflow_to_header() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    // Create the parent workflow first.
+    let parent_out = koto_cmd(dir.path())
+        .args(["init", "parent-wf", "--template", src_str])
+        .output()
+        .unwrap();
+    assert!(
+        parent_out.status.success(),
+        "parent init should succeed: stderr={}",
+        String::from_utf8_lossy(&parent_out.stderr)
+    );
+
+    // Create a child workflow with --parent.
+    let child_out = koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-wf",
+            "--template",
+            src_str,
+            "--parent",
+            "parent-wf",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        child_out.status.success(),
+        "child init should succeed: stderr={}",
+        String::from_utf8_lossy(&child_out.stderr)
+    );
+
+    // Read the child's state file and verify parent_workflow in the header.
+    let state_path = session_state_path(dir.path(), "child-wf");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    let header_line = content.lines().next().unwrap();
+    let header: serde_json::Value = serde_json::from_str(header_line).unwrap();
+    assert_eq!(
+        header["parent_workflow"].as_str(),
+        Some("parent-wf"),
+        "header should contain parent_workflow"
+    );
+}
+
+#[test]
+fn init_with_missing_parent_fails() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    // Try to create a child with a non-existent parent.
+    let output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "orphan-wf",
+            "--template",
+            src_str,
+            "--parent",
+            "nonexistent-parent",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "init with missing parent should fail"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "exit code should be 1 for missing parent"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let error_msg = json["error"].as_str().unwrap();
+    assert!(
+        error_msg.contains("nonexistent-parent"),
+        "error should name the missing parent, got: {}",
+        error_msg
+    );
+}
+
+#[test]
+fn init_without_parent_has_no_parent_workflow_in_header() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    let output = koto_cmd(dir.path())
+        .args(["init", "solo-wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init without --parent should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Read the state file header.
+    let state_path = session_state_path(dir.path(), "solo-wf");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    let header_line = content.lines().next().unwrap();
+    let header: serde_json::Value = serde_json::from_str(header_line).unwrap();
+    assert!(
+        header.get("parent_workflow").is_none(),
+        "header should not contain parent_workflow when --parent is not given"
+    );
+}
+
+#[test]
+fn workflows_output_includes_parent_workflow_field() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    // Create a parent workflow.
+    koto_cmd(dir.path())
+        .args(["init", "root-wf", "--template", src_str])
+        .output()
+        .unwrap();
+
+    // Create a child workflow.
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "leaf-wf",
+            "--template",
+            src_str,
+            "--parent",
+            "root-wf",
+        ])
+        .output()
+        .unwrap();
+
+    // Run koto workflows and verify the JSON output.
+    let output = koto_cmd(dir.path()).args(["workflows"]).output().unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("workflows output should be valid JSON");
+    let workflows = json.as_array().expect("should be an array");
+
+    // Find each workflow in the output.
+    let leaf = workflows
+        .iter()
+        .find(|w| w["name"] == "leaf-wf")
+        .expect("leaf-wf should be in the output");
+    assert_eq!(
+        leaf["parent_workflow"].as_str(),
+        Some("root-wf"),
+        "child workflow should show parent_workflow"
+    );
+
+    let root = workflows
+        .iter()
+        .find(|w| w["name"] == "root-wf")
+        .expect("root-wf should be in the output");
+    assert!(
+        root["parent_workflow"].is_null(),
+        "root workflow should have parent_workflow: null"
+    );
+}

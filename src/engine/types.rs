@@ -18,6 +18,10 @@ pub struct StateFileHeader {
 
     /// RFC 3339 UTC timestamp of workflow creation.
     pub created_at: String,
+
+    /// Name of the parent workflow, if this workflow was created as a child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_workflow: Option<String>,
 }
 
 /// Type-specific payload for each event variant.
@@ -382,6 +386,13 @@ pub struct WorkflowMetadata {
 
     /// SHA-256 hex of the compiled template JSON.
     pub template_hash: String,
+
+    /// Name of the parent workflow, if this workflow was created as a child.
+    ///
+    /// Always serialized (as `null` when absent) so that `koto workflows`
+    /// JSON output has a consistent shape.
+    #[serde(default)]
+    pub parent_workflow: Option<String>,
 }
 
 /// Derived current state of a workflow.
@@ -467,10 +478,80 @@ mod tests {
             workflow: "my-workflow".to_string(),
             template_hash: "abc123def456".to_string(),
             created_at: "2026-03-15T14:30:00Z".to_string(),
+            parent_workflow: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         let parsed: StateFileHeader = serde_json::from_str(&json).unwrap();
         assert_eq!(header, parsed);
+    }
+
+    #[test]
+    fn header_round_trip_with_parent_workflow() {
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: "child-wf".to_string(),
+            template_hash: "abc123def456".to_string(),
+            created_at: "2026-03-15T14:30:00Z".to_string(),
+            parent_workflow: Some("parent-wf".to_string()),
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(json.contains("\"parent_workflow\":\"parent-wf\""));
+        let parsed: StateFileHeader = serde_json::from_str(&json).unwrap();
+        assert_eq!(header, parsed);
+        assert_eq!(parsed.parent_workflow, Some("parent-wf".to_string()));
+    }
+
+    #[test]
+    fn header_without_parent_workflow_deserializes_to_none() {
+        // Simulates loading an existing state file that was created before
+        // the parent_workflow field existed.
+        let json = r#"{"schema_version":1,"workflow":"old-wf","template_hash":"abc","created_at":"2026-01-01T00:00:00Z"}"#;
+        let parsed: StateFileHeader = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.parent_workflow, None);
+    }
+
+    #[test]
+    fn header_none_parent_workflow_not_serialized() {
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: "wf".to_string(),
+            template_hash: "hash".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: None,
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(
+            !json.contains("parent_workflow"),
+            "parent_workflow should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn workflow_metadata_with_parent_roundtrip() {
+        let wm = WorkflowMetadata {
+            name: "child-wf".to_string(),
+            created_at: "2026-03-15T14:30:00Z".to_string(),
+            template_hash: "abc123".to_string(),
+            parent_workflow: Some("parent-wf".to_string()),
+        };
+        let json = serde_json::to_string(&wm).unwrap();
+        assert!(json.contains("\"parent_workflow\":\"parent-wf\""));
+        let parsed: WorkflowMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(wm, parsed);
+    }
+
+    #[test]
+    fn workflow_metadata_null_parent_in_json() {
+        let wm = WorkflowMetadata {
+            name: "root-wf".to_string(),
+            created_at: "2026-03-15T14:30:00Z".to_string(),
+            template_hash: "abc123".to_string(),
+            parent_workflow: None,
+        };
+        let json = serde_json::to_string(&wm).unwrap();
+        // When serialized via Serialize, None becomes null for non-skip fields
+        // WorkflowMetadata doesn't skip_serializing_if, so null is included
+        assert!(json.contains("\"parent_workflow\":null"));
     }
 
     #[test]
@@ -547,6 +628,7 @@ mod tests {
             name: "test-wf".to_string(),
             created_at: "2026-03-15T14:30:00Z".to_string(),
             template_hash: "abc123".to_string(),
+            parent_workflow: None,
         };
         let json = serde_json::to_string(&wm).unwrap();
         let parsed: WorkflowMetadata = serde_json::from_str(&json).unwrap();

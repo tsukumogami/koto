@@ -23,6 +23,9 @@ pub struct SessionInfo {
 
     /// SHA-256 hash of the compiled template (from state file header).
     pub template_hash: String,
+
+    /// Name of the parent workflow, if this workflow was created as a child.
+    pub parent_workflow: Option<String>,
 }
 
 /// Return the state file name for a given session ID.

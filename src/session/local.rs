@@ -108,6 +108,7 @@ impl SessionBackend for LocalBackend {
                         id: dir_name,
                         created_at: header.created_at,
                         template_hash: header.template_hash,
+                        parent_workflow: header.parent_workflow,
                     });
                 }
                 Err(e) => {
@@ -437,6 +438,7 @@ mod tests {
             workflow: id.to_string(),
             template_hash: "testhash".to_string(),
             created_at: created_at.to_string(),
+            parent_workflow: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
     }

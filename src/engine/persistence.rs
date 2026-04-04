@@ -442,6 +442,7 @@ mod tests {
             workflow: "test-wf".to_string(),
             template_hash: "deadbeef".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: None,
         }
     }
 

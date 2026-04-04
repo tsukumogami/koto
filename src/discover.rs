@@ -87,6 +87,7 @@ pub fn find_workflows_with_metadata(
             name: info.id,
             created_at: info.created_at,
             template_hash: info.template_hash,
+            parent_workflow: info.parent_workflow,
         })
         .collect();
     Ok(results)
@@ -115,6 +116,7 @@ mod tests {
             workflow: workflow_name.to_string(),
             template_hash: template_hash.to_string(),
             created_at: "2026-03-15T10:00:00Z".to_string(),
+            parent_workflow: None,
         };
         append_header(&state_path, &header).unwrap();
     }
@@ -272,5 +274,49 @@ mod tests {
         let results = find_workflows_with_metadata(&backend).unwrap();
         let names: Vec<&str> = results.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "mike", "zulu"]);
+    }
+
+    /// Write a state file with a parent_workflow set.
+    fn write_session_state_with_parent(
+        base_dir: &Path,
+        workflow_name: &str,
+        template_hash: &str,
+        parent: &str,
+    ) {
+        let session_dir = base_dir.join(workflow_name);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let state_path = session_dir.join(state_file_name(workflow_name));
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: workflow_name.to_string(),
+            template_hash: template_hash.to_string(),
+            created_at: "2026-03-15T10:00:00Z".to_string(),
+            parent_workflow: Some(parent.to_string()),
+        };
+        append_header(&state_path, &header).unwrap();
+    }
+
+    #[test]
+    fn metadata_includes_parent_workflow() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(dir.path().to_path_buf());
+        write_session_state(dir.path(), "parent-wf", "hash-p");
+        write_session_state_with_parent(dir.path(), "child-wf", "hash-c", "parent-wf");
+
+        let results = find_workflows_with_metadata(&backend).unwrap();
+        assert_eq!(results.len(), 2);
+
+        let child = results.iter().find(|m| m.name == "child-wf").unwrap();
+        assert_eq!(
+            child.parent_workflow,
+            Some("parent-wf".to_string()),
+            "child should carry parent_workflow"
+        );
+
+        let parent = results.iter().find(|m| m.name == "parent-wf").unwrap();
+        assert_eq!(
+            parent.parent_workflow, None,
+            "parent should have no parent_workflow"
+        );
     }
 }
