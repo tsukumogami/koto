@@ -547,6 +547,26 @@ at any depth.
 repo-id scope. The design assumes under 50 sessions per scope. Performance
 degradation at higher counts is acceptable for MVP.
 
+### Skill updates
+
+**R16. koto-user skill update.** The koto-user skill must document the
+`children-complete` gate type in the action dispatch table and handling
+guidance: how `gate_blocked` responses with `category: "temporal"` differ from
+corrective blocks, how to read `children` array output, when to poll vs take
+action, and how to use `koto status` for side-effect-free child inspection.
+The `--parent` flag on `koto init`, `--roots`/`--children`/`--orphaned` flags
+on `koto workflows`, and the `koto status` command must be added to the
+command reference. The override flow section must cover overriding
+`children-complete` gates.
+
+**R17. koto-author skill update.** The koto-author skill must document the
+`children-complete` gate type in the template authoring guide: the `completion`
+and `name_filter` fields, gate type schema, the single-state pattern (directive
++ gate on the same state), and how `gates.<name>.*` routing works for child
+outcome-dependent transitions. The compiler validation section must cover
+`children-complete` field validation. Template examples should show the
+fan-out pattern (parent template + child template pair).
+
 ## Acceptance Criteria
 
 - [ ] `koto init child --parent parent --template child.md` creates a child
@@ -575,6 +595,15 @@ degradation at higher counts is acceptable for MVP.
   discovery
 - [ ] Resuming a parent after interruption re-evaluates child status correctly
 - [ ] Existing templates without `--parent` continue to work unchanged
+- [ ] koto-user skill documents `children-complete` gate handling, temporal
+  blocking category, `koto status`, and hierarchy discovery commands
+- [ ] koto-user command reference includes `--parent` on init,
+  `--roots`/`--children`/`--orphaned` on workflows, and `koto status`
+- [ ] koto-author skill documents `children-complete` gate type with
+  `completion` and `name_filter` fields
+- [ ] koto-author skill shows the single-state fan-out pattern (directive +
+  gate on same state) in template examples
+- [ ] koto-author compiler validation section covers `children-complete` fields
 
 ## Out of Scope
 
