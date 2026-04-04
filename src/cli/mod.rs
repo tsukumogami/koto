@@ -114,7 +114,19 @@ pub enum Command {
     },
 
     /// List all active workflows in the current directory
-    Workflows,
+    Workflows {
+        /// Show only root workflows (no parent)
+        #[arg(long, group = "filter")]
+        roots: bool,
+
+        /// Show only children of the named workflow
+        #[arg(long, group = "filter", value_name = "NAME")]
+        children: Option<String>,
+
+        /// Show only orphaned workflows whose parent no longer exists
+        #[arg(long, group = "filter")]
+        orphaned: bool,
+    },
 
     /// Template management subcommands
     Template {
@@ -680,7 +692,11 @@ pub fn run(app: App) -> Result<()> {
             let backend = build_backend()?;
             handle_rewind(&backend, &name)
         }
-        Command::Workflows => {
+        Command::Workflows {
+            roots,
+            children,
+            orphaned,
+        } => {
             let backend = build_backend()?;
             let metadata = match find_workflows_with_metadata(&backend) {
                 Ok(m) => m,
@@ -691,7 +707,28 @@ pub fn run(app: App) -> Result<()> {
                     }));
                 }
             };
-            println!("{}", serde_json::to_string(&metadata)?);
+            let filtered: Vec<_> = if roots {
+                metadata
+                    .into_iter()
+                    .filter(|wf| wf.parent_workflow.is_none())
+                    .collect()
+            } else if let Some(ref parent_name) = children {
+                metadata
+                    .into_iter()
+                    .filter(|wf| wf.parent_workflow.as_deref() == Some(parent_name.as_str()))
+                    .collect()
+            } else if orphaned {
+                metadata
+                    .into_iter()
+                    .filter(|wf| match &wf.parent_workflow {
+                        Some(parent) => !backend.exists(parent),
+                        None => false,
+                    })
+                    .collect()
+            } else {
+                metadata
+            };
+            println!("{}", serde_json::to_string(&filtered)?);
             Ok(())
         }
         Command::Session { subcommand } => {

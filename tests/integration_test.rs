@@ -6127,3 +6127,204 @@ fn workflows_output_includes_parent_workflow_field() {
         "root workflow should have parent_workflow: null"
     );
 }
+
+// ---------------------------------------------------------------------------
+// workflows filter flags (--roots, --children, --orphaned)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn workflows_roots_returns_only_parentless() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "root-a", "--template", src_str])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-a",
+            "--template",
+            src_str,
+            "--parent",
+            "root-a",
+        ])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["workflows", "--roots"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "should return only the root workflow");
+    assert_eq!(arr[0]["name"].as_str(), Some("root-a"));
+}
+
+#[test]
+fn workflows_children_returns_only_children_of_named_parent() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "parent-b", "--template", src_str])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-b1",
+            "--template",
+            src_str,
+            "--parent",
+            "parent-b",
+        ])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-b2",
+            "--template",
+            src_str,
+            "--parent",
+            "parent-b",
+        ])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args(["init", "other-root", "--template", src_str])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["workflows", "--children", "parent-b"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "should return exactly 2 children");
+    let names: Vec<&str> = arr.iter().map(|v| v["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"child-b1"));
+    assert!(names.contains(&"child-b2"));
+}
+
+#[test]
+fn workflows_children_no_match_returns_empty_array_exit_0() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "solo-wf", "--template", src_str])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["workflows", "--children", "solo-wf"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "exit code should be 0");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = json.as_array().unwrap();
+    assert!(arr.is_empty(), "should return empty array when no children");
+}
+
+#[test]
+fn workflows_orphaned_returns_workflows_with_missing_parent() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "temp-parent", "--template", src_str])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "orphan-child",
+            "--template",
+            src_str,
+            "--parent",
+            "temp-parent",
+        ])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args(["init", "standalone", "--template", src_str])
+        .output()
+        .unwrap();
+
+    // Delete the parent session to orphan the child.
+    koto_cmd(dir.path())
+        .args(["session", "cleanup", "temp-parent"])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["workflows", "--orphaned"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "should return only the orphaned workflow");
+    assert_eq!(arr[0]["name"].as_str(), Some("orphan-child"));
+}
+
+#[test]
+fn workflows_no_filter_returns_all() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "wf-1", "--template", src_str])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args(["init", "wf-2", "--template", src_str, "--parent", "wf-1"])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path()).args(["workflows"]).output().unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "no filter should return all workflows");
+}
+
+#[test]
+fn workflows_mutually_exclusive_flags_error() {
+    let dir = TempDir::new().unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["workflows", "--roots", "--orphaned"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "combining --roots and --orphaned should fail"
+    );
+
+    let output = koto_cmd(dir.path())
+        .args(["workflows", "--roots", "--children", "x"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "combining --roots and --children should fail"
+    );
+}
