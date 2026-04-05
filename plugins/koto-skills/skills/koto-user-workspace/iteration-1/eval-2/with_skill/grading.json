@@ -1,0 +1,27 @@
+{
+  "eval_id": 2,
+  "configuration": "with_skill",
+  "assertions": [
+    {
+      "text": "Response includes `koto next deploy-staging --with-data` (correct subcommand and session name)",
+      "passed": true,
+      "evidence": "Line 4: `koto next deploy-staging --with-data '{\"smoke_test_result\": \"passed\"}'` — exact match"
+    },
+    {
+      "text": "Response uses the exact field name `smoke_test_result` (taken directly from expects.fields, not guessed)",
+      "passed": true,
+      "evidence": "Line 4 and line 22: field name `smoke_test_result` used exactly"
+    },
+    {
+      "text": "Response uses the value `passed` (one of the valid enum values, matching the scenario)",
+      "passed": true,
+      "evidence": "Line 4: value is `\"passed\"` — correct for 'all smoke tests passed'"
+    },
+    {
+      "text": "Response does NOT use incorrect field names like `result`, `test_result`, `status`, or `outcome`",
+      "passed": true,
+      "evidence": "Only `smoke_test_result` used throughout. No alternate field names."
+    }
+  ],
+  "pass_rate": 1.0
+}
