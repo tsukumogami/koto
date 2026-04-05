@@ -23,7 +23,7 @@ If your skill is a single linear task with no decision points, koto adds unneces
 
 ## Prerequisites
 
-- koto >= 0.7.0 must be installed and on PATH (`koto version` to verify)
+- koto >= 0.7.1 must be installed and on PATH (`koto version` to verify)
 - This skill is installed via the koto-skills plugin
 
 If koto is not installed or the version is too old, install the latest release:
