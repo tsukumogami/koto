@@ -350,6 +350,12 @@ pub struct TransitionOption {
     pub when: BTreeMap<String, serde_json::Value>,
 }
 
+/// Default category for blocking conditions: agent must take corrective action.
+#[allow(dead_code)]
+fn default_category() -> String {
+    "corrective".to_string()
+}
+
 /// A condition blocking state advancement.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BlockingCondition {
@@ -357,6 +363,10 @@ pub struct BlockingCondition {
     #[serde(rename = "type")]
     pub condition_type: String,
     pub status: String,
+    /// `"temporal"` (retry later) for children-complete, `"corrective"` (fix
+    /// something) for all other gate types.
+    #[serde(default = "default_category")]
+    pub category: String,
     // False until Feature 2 (override mechanism) lands. Feature 2 sets this
     // true when the gate has an override_default, signaling the agent can call
     // `koto overrides record` to substitute gate output with the default.
@@ -419,6 +429,7 @@ pub fn blocking_conditions_from_gates(
                 .get(name)
                 .map(|g| g.gate_type.clone())
                 .unwrap_or_else(|| "command".to_string());
+            let category = crate::gate::gate_blocking_category(&condition_type).to_string();
             let agent_actionable = gate_defs
                 .get(name)
                 .map(|g| g.override_default.is_some() || built_in_default(&g.gate_type).is_some())
@@ -427,6 +438,7 @@ pub fn blocking_conditions_from_gates(
                 name: name.clone(),
                 condition_type,
                 status: status.to_string(),
+                category,
                 agent_actionable,
                 output: result.output.clone(),
             })
@@ -589,6 +601,7 @@ mod tests {
                     name: "ci_check".to_string(),
                     condition_type: "command".to_string(),
                     status: "failed".to_string(),
+                    category: "corrective".to_string(),
                     agent_actionable: false,
                     output: serde_json::json!({"exit_code": 1, "error": ""}),
                 },
@@ -596,6 +609,7 @@ mod tests {
                     name: "lint_check".to_string(),
                     condition_type: "command".to_string(),
                     status: "timed_out".to_string(),
+                    category: "corrective".to_string(),
                     agent_actionable: false,
                     output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
                 },
@@ -938,6 +952,7 @@ mod tests {
             name: "ci".to_string(),
             condition_type: "command".to_string(),
             status: "failed".to_string(),
+            category: "corrective".to_string(),
             agent_actionable: false,
             output: serde_json::json!({"exit_code": 1, "error": ""}),
         };
@@ -1130,6 +1145,8 @@ mod tests {
             pattern: String::new(),
             timeout: 0,
             override_default: None,
+            completion: None,
+            name_filter: None,
         }
     }
 
@@ -1141,6 +1158,8 @@ mod tests {
             pattern: String::new(),
             timeout: 0,
             override_default: None,
+            completion: None,
+            name_filter: None,
         }
     }
 
@@ -1393,6 +1412,8 @@ mod tests {
                 key: String::new(),
                 pattern: String::new(),
                 override_default: Some(serde_json::json!({"result": "ok"})),
+                completion: None,
+                name_filter: None,
             },
         );
 
@@ -1426,6 +1447,8 @@ mod tests {
                 key: String::new(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
 

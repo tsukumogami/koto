@@ -290,6 +290,8 @@ mod tests {
                 key: String::new(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         let output = to_mermaid(&t);
@@ -325,6 +327,8 @@ mod tests {
                             key: String::new(),
                             pattern: String::new(),
                             override_default: None,
+                            completion: None,
+                            name_filter: None,
                         },
                     );
                     g

@@ -6710,3 +6710,388 @@ fn session_cleanup_no_children_returns_empty_array() {
         "children should be empty when no children exist"
     );
 }
+
+// ---------------------------------------------------------------------------
+// children-complete gate tests
+// ---------------------------------------------------------------------------
+
+fn parent_with_children_gate_template() -> &'static str {
+    r#"---
+name: parent-workflow
+version: "1.0"
+initial_state: spawn
+states:
+  spawn:
+    gates:
+      children-done:
+        type: children-complete
+        completion: "terminal"
+    transitions:
+      - target: done
+        when:
+          gates.children-done.all_complete: true
+  done:
+    terminal: true
+---
+
+## spawn
+
+Spawn child workflows and wait for them to complete.
+
+## done
+
+All done.
+"#
+}
+
+fn parent_with_name_filter_template() -> &'static str {
+    r#"---
+name: parent-filtered
+version: "1.0"
+initial_state: wait
+states:
+  wait:
+    gates:
+      research-done:
+        type: children-complete
+        completion: "terminal"
+        name_filter: "research."
+    transitions:
+      - target: done
+        when:
+          gates.research-done.all_complete: true
+  done:
+    terminal: true
+---
+
+## wait
+
+Wait for research children to complete.
+
+## done
+
+All done.
+"#
+}
+
+fn write_and_compile_template(dir: &Path, content: &str, filename: &str) -> String {
+    let src = dir.join(filename);
+    std::fs::write(&src, content).unwrap();
+    let output = koto_cmd(dir)
+        .args(["template", "compile", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "template compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    src.to_str().unwrap().to_string()
+}
+
+#[test]
+fn children_complete_gate_all_terminal_passes() {
+    let dir = TempDir::new().unwrap();
+    let parent_compiled = write_and_compile_template(
+        dir.path(),
+        parent_with_children_gate_template(),
+        "parent.md",
+    );
+    let child_compiled = write_template_source(dir.path())
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    koto_cmd(dir.path())
+        .args(["init", "parent-wf", "--template", &parent_compiled])
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-1",
+            "--template",
+            &child_compiled,
+            "--parent",
+            "parent-wf",
+        ])
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-2",
+            "--template",
+            &child_compiled,
+            "--parent",
+            "parent-wf",
+        ])
+        .assert()
+        .success();
+
+    // Advance children to terminal (auto-advance: start -> done in one call).
+    // Use --no-cleanup so the session persists for the parent gate to query.
+    for child in ["child-1", "child-2"] {
+        koto_cmd(dir.path())
+            .args(["next", child, "--no-cleanup"])
+            .assert()
+            .success();
+    }
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "parent-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "parent next failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["action"],
+        "done",
+        "parent should reach terminal: {}",
+        serde_json::to_string_pretty(&json).unwrap()
+    );
+}
+
+#[test]
+fn children_complete_gate_pending_children_fails() {
+    let dir = TempDir::new().unwrap();
+    let parent_compiled = write_and_compile_template(
+        dir.path(),
+        parent_with_children_gate_template(),
+        "parent.md",
+    );
+    let child_compiled = write_template_source(dir.path())
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    koto_cmd(dir.path())
+        .args(["init", "parent-wf", "--template", &parent_compiled])
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-1",
+            "--template",
+            &child_compiled,
+            "--parent",
+            "parent-wf",
+        ])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "parent-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "parent next should exit 0 (gate_blocked exits 0)"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["action"], "gate_blocked");
+    let conditions = json["blocking_conditions"].as_array().unwrap();
+    assert_eq!(conditions.len(), 1);
+    assert_eq!(conditions[0]["type"], "children-complete");
+    assert_eq!(conditions[0]["status"], "failed");
+    assert_eq!(conditions[0]["category"], "temporal");
+    assert_eq!(conditions[0]["output"]["total"], 1);
+    assert_eq!(conditions[0]["output"]["completed"], 0);
+    assert_eq!(conditions[0]["output"]["pending"], 1);
+    assert_eq!(conditions[0]["output"]["all_complete"], false);
+    let children = conditions[0]["output"]["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0]["name"], "child-1");
+    assert_eq!(children[0]["complete"], false);
+}
+
+#[test]
+fn children_complete_gate_zero_children_fails() {
+    let dir = TempDir::new().unwrap();
+    let parent_compiled = write_and_compile_template(
+        dir.path(),
+        parent_with_children_gate_template(),
+        "parent.md",
+    );
+
+    koto_cmd(dir.path())
+        .args(["init", "parent-wf", "--template", &parent_compiled])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "parent-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "parent next should exit 0 (gate_blocked exits 0)"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["action"], "gate_blocked");
+    let conditions = json["blocking_conditions"].as_array().unwrap();
+    assert_eq!(conditions[0]["type"], "children-complete");
+    assert_eq!(conditions[0]["output"]["total"], 0);
+    assert_eq!(conditions[0]["output"]["all_complete"], false);
+    assert!(conditions[0]["output"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("no matching children"));
+}
+
+#[test]
+fn children_complete_gate_name_filter() {
+    let dir = TempDir::new().unwrap();
+    let parent_compiled = write_and_compile_template(
+        dir.path(),
+        parent_with_name_filter_template(),
+        "parent-filtered.md",
+    );
+    let child_compiled = write_template_source(dir.path())
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    koto_cmd(dir.path())
+        .args(["init", "parent-wf", "--template", &parent_compiled])
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "research.r1",
+            "--template",
+            &child_compiled,
+            "--parent",
+            "parent-wf",
+        ])
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "other-child",
+            "--template",
+            &child_compiled,
+            "--parent",
+            "parent-wf",
+        ])
+        .assert()
+        .success();
+
+    // Advance research.r1 to terminal with --no-cleanup.
+    koto_cmd(dir.path())
+        .args(["next", "research.r1", "--no-cleanup"])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "parent-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "parent next should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["action"],
+        "done",
+        "parent should reach terminal: {}",
+        serde_json::to_string_pretty(&json).unwrap()
+    );
+}
+
+#[test]
+fn children_complete_category_temporal_in_output() {
+    let dir = TempDir::new().unwrap();
+    let parent_compiled = write_and_compile_template(
+        dir.path(),
+        parent_with_children_gate_template(),
+        "parent.md",
+    );
+    let child_compiled = write_template_source(dir.path())
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    koto_cmd(dir.path())
+        .args(["init", "parent-wf", "--template", &parent_compiled])
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-1",
+            "--template",
+            &child_compiled,
+            "--parent",
+            "parent-wf",
+        ])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "parent-wf"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let conditions = json["blocking_conditions"].as_array().unwrap();
+    assert_eq!(conditions[0]["category"], "temporal");
+}
+
+#[test]
+fn existing_gates_emit_corrective_category() {
+    let dir = TempDir::new().unwrap();
+    let template_content = r#"---
+name: gate-cat
+version: "1.0"
+initial_state: check
+states:
+  check:
+    gates:
+      ci:
+        type: command
+        command: exit 1
+    transitions:
+      - target: done
+        when:
+          gates.ci.exit_code: 0
+  done:
+    terminal: true
+---
+
+## check
+
+Run the check.
+
+## done
+
+All done.
+"#;
+    let compiled = write_and_compile_template(dir.path(), template_content, "gate-cat.md");
+    koto_cmd(dir.path())
+        .args(["init", "test-wf", "--template", &compiled])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "test-wf"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let conditions = json["blocking_conditions"].as_array().unwrap();
+    assert!(!conditions.is_empty());
+    assert_eq!(
+        conditions[0]["category"], "corrective",
+        "command gates should have corrective category"
+    );
+}

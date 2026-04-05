@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::action::run_shell_command;
 use crate::session::context::ContextStore;
 use crate::template::types::{
-    Gate, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS, GATE_TYPE_CONTEXT_MATCHES,
+    Gate, GATE_TYPE_CHILDREN_COMPLETE, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS,
+    GATE_TYPE_CONTEXT_MATCHES,
 };
 
 /// Outcome of a structured gate evaluation.
@@ -53,11 +54,17 @@ pub struct StructuredGateResult {
 ///
 /// When `context_store` is `None`, context-aware gate types produce an error
 /// result indicating that context evaluation is unavailable.
+///
+/// `children_evaluator` is an optional callback for `children-complete` gates.
+/// When `None`, children-complete gates produce an error result. The CLI
+/// handler supplies a closure that captures the session backend and template
+/// loading logic.
 pub fn evaluate_gates(
     gates: &BTreeMap<String, Gate>,
     working_dir: &Path,
     context_store: Option<&dyn ContextStore>,
     session: Option<&str>,
+    children_evaluator: Option<&dyn Fn(&Gate) -> StructuredGateResult>,
 ) -> BTreeMap<String, StructuredGateResult> {
     let mut results = BTreeMap::new();
     for (name, gate) in gates {
@@ -67,13 +74,27 @@ pub fn evaluate_gates(
             GATE_TYPE_CONTEXT_MATCHES => {
                 evaluate_context_matches_gate(gate, context_store, session)
             }
+            GATE_TYPE_CHILDREN_COMPLETE => match children_evaluator {
+                Some(eval_fn) => eval_fn(gate),
+                None => StructuredGateResult {
+                    outcome: GateOutcome::Error,
+                    output: serde_json::json!({
+                        "total": 0,
+                        "completed": 0,
+                        "pending": 0,
+                        "all_complete": false,
+                        "children": [],
+                        "error": "children-complete gate requires a session backend"
+                    }),
+                },
+            },
             other => StructuredGateResult {
                 outcome: GateOutcome::Error,
                 output: serde_json::json!({
                     "exit_code": -1,
                     "error": format!(
                         "unsupported gate type '{}'; only command, context-exists, \
-                         and context-matches gates are evaluated",
+                         context-matches, and children-complete gates are evaluated",
                         other
                     )
                 }),
@@ -218,7 +239,26 @@ pub fn built_in_default(gate_type: &str) -> Option<serde_json::Value> {
         GATE_TYPE_COMMAND => Some(serde_json::json!({"exit_code": 0, "error": ""})),
         GATE_TYPE_CONTEXT_EXISTS => Some(serde_json::json!({"exists": true, "error": ""})),
         GATE_TYPE_CONTEXT_MATCHES => Some(serde_json::json!({"matches": true, "error": ""})),
+        GATE_TYPE_CHILDREN_COMPLETE => Some(serde_json::json!({
+            "total": 0,
+            "completed": 0,
+            "pending": 0,
+            "all_complete": true,
+            "children": [],
+            "error": ""
+        })),
         _ => None,
+    }
+}
+
+/// Return the blocking condition category for a gate type.
+///
+/// `"temporal"` means the blocking condition is time-dependent (retry later).
+/// `"corrective"` means the agent needs to take corrective action.
+pub fn gate_blocking_category(gate_type: &str) -> &'static str {
+    match gate_type {
+        GATE_TYPE_CHILDREN_COMPLETE => "temporal",
+        _ => "corrective",
     }
 }
 
@@ -237,6 +277,8 @@ mod tests {
             key: String::new(),
             pattern: String::new(),
             override_default: None,
+            completion: None,
+            name_filter: None,
         }
     }
 
@@ -250,7 +292,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("check".to_string(), make_gate("exit 0", 5));
 
-        let results = evaluate_gates(&gates, dir.path(), None, None);
+        let results = evaluate_gates(&gates, dir.path(), None, None, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results["check"].outcome, GateOutcome::Passed);
         assert_eq!(results["check"].output["exit_code"], 0);
@@ -263,7 +305,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("check".to_string(), make_gate("exit 42", 5));
 
-        let results = evaluate_gates(&gates, dir.path(), None, None);
+        let results = evaluate_gates(&gates, dir.path(), None, None, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results["check"].outcome, GateOutcome::Failed);
         assert_eq!(results["check"].output["exit_code"], 42);
@@ -276,7 +318,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("slow".to_string(), make_gate("sleep 60", 1));
 
-        let results = evaluate_gates(&gates, dir.path(), None, None);
+        let results = evaluate_gates(&gates, dir.path(), None, None, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results["slow"].outcome, GateOutcome::TimedOut);
         assert_eq!(results["slow"].output["exit_code"], -1);
@@ -289,7 +331,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("bad".to_string(), make_gate("nonexistent_cmd_xyz_12345", 5));
 
-        let results = evaluate_gates(&gates, dir.path(), None, None);
+        let results = evaluate_gates(&gates, dir.path(), None, None, None);
         assert_eq!(results.len(), 1);
         // The shell itself exits 127 for command-not-found.
         assert_eq!(results["bad"].outcome, GateOutcome::Failed);
@@ -304,7 +346,7 @@ mod tests {
         gates.insert("fail".to_string(), make_gate("exit 1", 5));
         gates.insert("timeout".to_string(), make_gate("sleep 60", 1));
 
-        let results = evaluate_gates(&gates, dir.path(), None, None);
+        let results = evaluate_gates(&gates, dir.path(), None, None, None);
         assert_eq!(results.len(), 3);
         assert_eq!(results["pass"].outcome, GateOutcome::Passed);
         assert_eq!(results["fail"].outcome, GateOutcome::Failed);
@@ -321,7 +363,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("check_dir".to_string(), make_gate("test -f marker.txt", 5));
 
-        let results = evaluate_gates(&gates, dir.path(), None, None);
+        let results = evaluate_gates(&gates, dir.path(), None, None, None);
         assert_eq!(results["check_dir"].outcome, GateOutcome::Passed);
     }
 
@@ -333,7 +375,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("quick".to_string(), make_gate("exit 0", 0));
 
-        let results = evaluate_gates(&gates, dir.path(), None, None);
+        let results = evaluate_gates(&gates, dir.path(), None, None, None);
         assert_eq!(results["quick"].outcome, GateOutcome::Passed);
     }
 
@@ -418,10 +460,12 @@ mod tests {
                 key: "research/lead.md".to_string(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
+        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"), None);
         assert_eq!(results["research"].outcome, GateOutcome::Passed);
         assert_eq!(results["research"].output["exists"], true);
         assert_eq!(results["research"].output["error"], "");
@@ -442,10 +486,12 @@ mod tests {
                 key: "research/lead.md".to_string(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
+        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"), None);
         assert_eq!(results["research"].outcome, GateOutcome::Failed);
         assert_eq!(results["research"].output["exists"], false);
         assert_eq!(results["research"].output["error"], "");
@@ -464,10 +510,12 @@ mod tests {
                 key: "research/lead.md".to_string(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), None, None);
+        let results = evaluate_gates(&gates, dir.path(), None, None, None);
         assert_eq!(results["research"].outcome, GateOutcome::Error);
         assert_eq!(results["research"].output["exists"], false);
     }
@@ -492,10 +540,12 @@ mod tests {
                 key: "review.md".to_string(),
                 pattern: "## Approved".to_string(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
+        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"), None);
         assert_eq!(results["review"].outcome, GateOutcome::Passed);
         assert_eq!(results["review"].output["matches"], true);
         assert_eq!(results["review"].output["error"], "");
@@ -521,10 +571,12 @@ mod tests {
                 key: "review.md".to_string(),
                 pattern: "## Approved".to_string(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
+        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"), None);
         assert_eq!(results["review"].outcome, GateOutcome::Failed);
         assert_eq!(results["review"].output["matches"], false);
         assert_eq!(results["review"].output["error"], "");
@@ -545,10 +597,12 @@ mod tests {
                 key: "review.md".to_string(),
                 pattern: "## Approved".to_string(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
+        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"), None);
         assert_eq!(results["review"].outcome, GateOutcome::Failed);
         assert_eq!(results["review"].output["matches"], false);
     }
@@ -566,10 +620,12 @@ mod tests {
                 key: "review.md".to_string(),
                 pattern: "## Approved".to_string(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), None, None);
+        let results = evaluate_gates(&gates, dir.path(), None, None, None);
         assert_eq!(results["review"].outcome, GateOutcome::Error);
         assert_eq!(results["review"].output["matches"], false);
     }
@@ -590,10 +646,12 @@ mod tests {
                 key: "status.txt".to_string(),
                 pattern: r"status:\s+PASS".to_string(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
+        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"), None);
         assert_eq!(results["status"].outcome, GateOutcome::Passed);
         assert_eq!(results["status"].output["matches"], true);
     }
@@ -781,6 +839,8 @@ mod tests {
                 key: String::new(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         gates.insert(
@@ -792,6 +852,8 @@ mod tests {
                 key: "ready.txt".to_string(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         gates.insert(
@@ -803,10 +865,12 @@ mod tests {
                 key: "ready.txt".to_string(),
                 pattern: "ready".to_string(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"));
+        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"), None);
         assert_eq!(results.len(), 3);
         assert_eq!(results["cmd"].outcome, GateOutcome::Passed);
         assert_eq!(results["ctx_exists"].outcome, GateOutcome::Passed);

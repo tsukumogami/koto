@@ -6,7 +6,8 @@ use serde::Deserialize;
 
 use super::types::{
     ActionDecl, CompiledTemplate, FieldSchema, Gate, PollingConfig, TemplateState, Transition,
-    VariableDecl, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS, GATE_TYPE_CONTEXT_MATCHES,
+    VariableDecl, GATE_TYPE_CHILDREN_COMPLETE, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS,
+    GATE_TYPE_CONTEXT_MATCHES,
 };
 
 /// YAML front-matter structure of a template source file.
@@ -113,6 +114,10 @@ struct SourceGate {
     pattern: String,
     #[serde(default)]
     override_default: Option<serde_json::Value>,
+    #[serde(default)]
+    completion: Option<String>,
+    #[serde(default)]
+    name_filter: Option<String>,
 }
 
 /// Compile a YAML/Markdown template source file to a FormatVersion=1 CompiledTemplate.
@@ -301,6 +306,8 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 key: String::new(),
                 pattern: String::new(),
                 override_default: source.override_default.clone(),
+                completion: None,
+                name_filter: None,
             })
         }
         GATE_TYPE_CONTEXT_EXISTS => {
@@ -318,6 +325,8 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 key: source.key.clone(),
                 pattern: String::new(),
                 override_default: source.override_default.clone(),
+                completion: None,
+                name_filter: None,
             })
         }
         GATE_TYPE_CONTEXT_MATCHES => {
@@ -342,6 +351,43 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 key: source.key.clone(),
                 pattern: source.pattern.clone(),
                 override_default: source.override_default.clone(),
+                completion: None,
+                name_filter: None,
+            })
+        }
+        GATE_TYPE_CHILDREN_COMPLETE => {
+            // Validate completion prefix.
+            if let Some(ref completion) = source.completion {
+                if completion != "terminal"
+                    && !completion.starts_with("state:")
+                    && !completion.starts_with("context:")
+                {
+                    return Err(anyhow!(
+                        "state {:?} gate {:?}: unknown completion prefix {:?}; \
+                         only \"terminal\" is supported (\"state:*\" and \"context:*\" are reserved)",
+                        state_name,
+                        gate_name,
+                        completion
+                    ));
+                }
+                if completion.starts_with("state:") || completion.starts_with("context:") {
+                    return Err(anyhow!(
+                        "state {:?} gate {:?}: completion mode {:?} is reserved but not yet implemented",
+                        state_name,
+                        gate_name,
+                        completion
+                    ));
+                }
+            }
+            Ok(Gate {
+                gate_type: source.gate_type.clone(),
+                command: String::new(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: source.override_default.clone(),
+                completion: source.completion.clone(),
+                name_filter: source.name_filter.clone(),
             })
         }
         other => Err(anyhow!(

@@ -84,6 +84,8 @@ mod tests {
                             key: String::new(),
                             pattern: String::new(),
                             override_default: None,
+                            completion: None,
+                            name_filter: None,
                         },
                     );
                     g

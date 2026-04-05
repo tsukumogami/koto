@@ -106,6 +106,21 @@ pub struct Gate {
     /// checking `--with-data`, then this field, then `built_in_default`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub override_default: Option<serde_json::Value>,
+    /// Completion condition for children-complete gates.
+    ///
+    /// Controls when a child workflow counts as complete. Currently only
+    /// `"terminal"` is implemented (child reached a terminal state). The
+    /// prefixes `"state:*"` and `"context:*"` are reserved for future use.
+    /// Defaults to `"terminal"` when not specified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<String>,
+    /// Name prefix filter for children-complete gates.
+    ///
+    /// When set, only child workflows whose name starts with this prefix
+    /// are considered by the gate. Enables multi-fanout scoping (e.g.,
+    /// only research children, not all children).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_filter: Option<String>,
 }
 
 /// A default action declaration for a template state.
@@ -144,6 +159,8 @@ pub const GATE_TYPE_COMMAND: &str = "command";
 pub const GATE_TYPE_CONTEXT_EXISTS: &str = "context-exists";
 /// Gate type: check whether context content matches a regex pattern.
 pub const GATE_TYPE_CONTEXT_MATCHES: &str = "context-matches";
+/// Gate type: check whether all child workflows have reached their completion condition.
+pub const GATE_TYPE_CHILDREN_COMPLETE: &str = "children-complete";
 
 /// Evidence namespace reserved for engine-injected gate output.
 /// Agent submissions starting with this prefix are rejected (Feature 2, R7).
@@ -179,6 +196,13 @@ pub fn gate_type_schema(gate_type: &str) -> Option<&'static [(&'static str, Gate
         GATE_TYPE_COMMAND => Some(&[("exit_code", Number), ("error", Str)]),
         GATE_TYPE_CONTEXT_EXISTS => Some(&[("exists", Boolean), ("error", Str)]),
         GATE_TYPE_CONTEXT_MATCHES => Some(&[("matches", Boolean), ("error", Str)]),
+        GATE_TYPE_CHILDREN_COMPLETE => Some(&[
+            ("total", Number),
+            ("completed", Number),
+            ("pending", Number),
+            ("all_complete", Boolean),
+            ("error", Str),
+        ]),
         _ => None,
     }
 }
@@ -196,6 +220,14 @@ pub fn gate_type_builtin_default(gate_type: &str) -> Option<serde_json::Value> {
         GATE_TYPE_COMMAND => Some(serde_json::json!({"exit_code": 0, "error": ""})),
         GATE_TYPE_CONTEXT_EXISTS => Some(serde_json::json!({"exists": true, "error": ""})),
         GATE_TYPE_CONTEXT_MATCHES => Some(serde_json::json!({"matches": true, "error": ""})),
+        GATE_TYPE_CHILDREN_COMPLETE => Some(serde_json::json!({
+            "total": 0,
+            "completed": 0,
+            "pending": 0,
+            "all_complete": true,
+            "children": [],
+            "error": ""
+        })),
         _ => None,
     }
 }
@@ -350,6 +382,33 @@ impl CompiledTemplate {
                                 "state {:?} gate {:?}: invalid regex pattern {:?}: {}",
                                 state_name, gate_name, gate.pattern, e
                             ));
+                        }
+                    }
+                    GATE_TYPE_CHILDREN_COMPLETE => {
+                        // Validate completion field.
+                        if let Some(completion) = &gate.completion {
+                            if completion != "terminal"
+                                && !completion.starts_with("state:")
+                                && !completion.starts_with("context:")
+                            {
+                                return Err(format!(
+                                    "state {:?} gate {:?}: unknown completion prefix {:?}; \
+                                     only \"terminal\" is supported (\"state:*\" and \"context:*\" are reserved)",
+                                    state_name, gate_name, completion
+                                ));
+                            }
+                            if completion.starts_with("state:") {
+                                return Err(format!(
+                                    "state {:?} gate {:?}: completion mode {:?} is reserved but not yet implemented",
+                                    state_name, gate_name, completion
+                                ));
+                            }
+                            if completion.starts_with("context:") {
+                                return Err(format!(
+                                    "state {:?} gate {:?}: completion mode {:?} is reserved but not yet implemented",
+                                    state_name, gate_name, completion
+                                ));
+                            }
                         }
                     }
                     other => {
@@ -933,6 +992,8 @@ mod tests {
                 key: String::new(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -953,6 +1014,8 @@ mod tests {
                 key: String::new(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -974,6 +1037,8 @@ mod tests {
                 key: String::new(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -1055,6 +1120,8 @@ mod tests {
                 pattern: String::new(),
                 timeout: 0,
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -1083,6 +1150,8 @@ mod tests {
                 pattern: String::new(),
                 timeout: 0,
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -1528,6 +1597,8 @@ mod tests {
                 key: "research/r1/lead.md".to_string(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         t.validate(false).unwrap();
@@ -1577,6 +1648,8 @@ mod tests {
                 key: String::new(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -1610,6 +1683,8 @@ mod tests {
                 key: String::new(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         t.validate(false).unwrap();
@@ -1628,6 +1703,8 @@ mod tests {
                 key: String::new(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -1653,6 +1730,8 @@ mod tests {
                 key: "review.md".to_string(),
                 pattern: "## Approved".to_string(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         t.validate(false).unwrap();
@@ -1680,6 +1759,8 @@ mod tests {
                 key: String::new(),
                 pattern: "## Approved".to_string(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -1722,6 +1803,8 @@ mod tests {
                 key: "review.md".to_string(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -1763,6 +1846,8 @@ mod tests {
                 key: "review.md".to_string(),
                 pattern: "[invalid".to_string(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -2026,6 +2111,8 @@ command: "./check.sh"
             key: String::new(),
             pattern: String::new(),
             override_default,
+            completion: None,
+            name_filter: None,
         }
     }
 
@@ -2037,6 +2124,8 @@ command: "./check.sh"
             key: "some/key.md".to_string(),
             pattern: String::new(),
             override_default,
+            completion: None,
+            name_filter: None,
         }
     }
 
@@ -2048,6 +2137,8 @@ command: "./check.sh"
             key: "some/key.md".to_string(),
             pattern: "approved".to_string(),
             override_default,
+            completion: None,
+            name_filter: None,
         }
     }
 
@@ -2205,6 +2296,7 @@ command: "./check.sh"
             GATE_TYPE_COMMAND,
             GATE_TYPE_CONTEXT_EXISTS,
             GATE_TYPE_CONTEXT_MATCHES,
+            GATE_TYPE_CHILDREN_COMPLETE,
         ] {
             let types_val = gate_type_builtin_default(gate_type)
                 .unwrap_or_else(|| panic!("gate_type_builtin_default missing for {}", gate_type));
@@ -2235,6 +2327,8 @@ command: "./check.sh"
                 key: String::new(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         t
@@ -2360,6 +2454,8 @@ command: "./check.sh"
                 key: "schema/check.md".to_string(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -2388,6 +2484,8 @@ command: "./check.sh"
                 key: "review.md".to_string(),
                 pattern: "## Approved".to_string(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -2449,6 +2547,8 @@ command: "./check.sh"
                 key: String::new(),
                 pattern: String::new(),
                 override_default,
+                completion: None,
+                name_filter: None,
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -2565,6 +2665,8 @@ command: "./check.sh"
                 key: String::new(),
                 pattern: String::new(),
                 override_default: None, // no override_default; builtin used
+                completion: None,
+                name_filter: None,
             },
         );
         let mut when_a = BTreeMap::new();
@@ -2614,6 +2716,8 @@ command: "./check.sh"
                 key: String::new(),
                 pattern: String::new(),
                 override_default: Some(serde_json::json!({"exit_code": 0, "error": ""})),
+                completion: None,
+                name_filter: None,
             },
         );
         let mut accepts = BTreeMap::new();
@@ -2664,6 +2768,8 @@ command: "./check.sh"
                 pattern: String::new(),
                 // D2 error: missing "error" field
                 override_default: Some(serde_json::json!({"exit_code": 0})),
+                completion: None,
+                name_filter: None,
             },
         );
         // Dead-end transitions (would trigger D4 if D2 didn't block first).
@@ -2747,6 +2853,8 @@ command: "./check.sh"
                 key: String::new(),
                 pattern: String::new(),
                 override_default: None,
+                completion: None,
+                name_filter: None,
             },
         );
         t
