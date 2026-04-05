@@ -6331,3 +6331,101 @@ fn workflows_mutually_exclusive_flags_error() {
         "combining --roots and --children should fail"
     );
 }
+
+// ---------------------------------------------------------------------------
+// koto status
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_active_workflow() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    // Init a workflow (auto-advances to "start").
+    koto_cmd(dir.path())
+        .args(["init", "status-active", "--template", src.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Check status -- workflow is in "start" (non-terminal).
+    let output = koto_cmd(dir.path())
+        .args(["status", "status-active"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("status output should be valid JSON");
+    assert_eq!(json["name"], "status-active");
+    assert_eq!(json["current_state"], "start");
+    assert_eq!(json["is_terminal"], false);
+    assert!(json["template_path"].as_str().is_some());
+    assert!(json["template_hash"].as_str().is_some());
+}
+
+#[test]
+fn status_terminal_workflow() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    // Init (auto-advances to "start").
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "status-terminal",
+            "--template",
+            src.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Advance to "done" (terminal) -- use --no-cleanup so state file is preserved.
+    koto_cmd(dir.path())
+        .args(["next", "status-terminal", "--no-cleanup"])
+        .assert()
+        .success();
+
+    // Check status -- should show is_terminal: true.
+    let output = koto_cmd(dir.path())
+        .args(["status", "status-terminal"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("status output should be valid JSON");
+    assert_eq!(json["name"], "status-terminal");
+    assert_eq!(json["current_state"], "done");
+    assert_eq!(json["is_terminal"], true);
+}
+
+#[test]
+fn status_missing_workflow() {
+    let dir = TempDir::new().unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["status", "no-such-workflow"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "status should fail for missing workflow"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("error output should be valid JSON");
+    assert!(
+        json["error"].as_str().unwrap().contains("not found"),
+        "error message should mention 'not found': {}",
+        json["error"]
+    );
+}
