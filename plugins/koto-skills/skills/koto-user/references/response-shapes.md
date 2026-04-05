@@ -114,6 +114,7 @@ template lets the agent submit override evidence instead of being fully blocked.
       "name": "ci_check",
       "type": "command",
       "status": "failed",
+      "category": "corrective",
       "agent_actionable": true,
       "output": {
         "exit_code": 1,
@@ -127,6 +128,8 @@ template lets the agent submit override evidence instead of being fully blocked.
 
 **Decision points:**
 - `blocking_conditions` is non-empty — one or more gates failed.
+- `category` is `"corrective"` — the agent or user must fix the underlying issue. For
+  `"temporal"` blocks (e.g., `children-complete` gates), retry later instead.
 - The presence of an `accepts` block means the agent can choose to submit override
   evidence rather than being fully blocked. This is why the action is `evidence_required`
   rather than `gate_blocked`.
@@ -188,6 +191,7 @@ actionable (the agent can record an override).
       "name": "ci_check",
       "type": "command",
       "status": "failed",
+      "category": "corrective",
       "agent_actionable": true,
       "output": {
         "exit_code": 1,
@@ -201,12 +205,15 @@ actionable (the agent can record an override).
 
 **Decision points:**
 - `expects` is `null` — there is no `accepts` block, so no evidence submission is possible.
+- `category` is `"corrective"` — the agent or user must fix something. See Scenario (j)
+  for the `"temporal"` variant used by `children-complete` gates.
 - `agent_actionable: true` — the gate has an `override_default` value or a built-in
   default. The agent can call `koto overrides record my-workflow --gate ci_check
   --rationale "manual verification passed"` to unblock.
 - `output` carries the structured result from the gate runner:
   - `command` gates: `{"exit_code": <int>, "error": "<string>"}`
   - `context-exists` gates: `{"exists": false, "error": "<string>"}`
+  - `children-complete` gates: `{"total": <int>, "completed": <int>, "pending": <int>, "all_complete": <bool>, "children": [...], "error": "<string>"}`
 - `blocking_conditions` only includes gates that failed; passing gates are excluded.
 
 ---
@@ -227,6 +234,7 @@ The state has a failed gate that is not actionable. The agent cannot override it
       "name": "manager_sign_off",
       "type": "context-exists",
       "status": "failed",
+      "category": "corrective",
       "agent_actionable": false,
       "output": {
         "exists": false,
@@ -376,6 +384,55 @@ The `action_output` field carries what the command printed.
 - `blocking_conditions` is **absent**.
 - `action_output.stdout` and `action_output.stderr` are truncated to 64 KB each.
 - `expects` may be `null` when the state has no `accepts` block.
+
+---
+
+## Scenario (j): gate_blocked — temporal block (children-complete)
+
+A `children-complete` gate is blocking because one or more child workflows haven't
+finished yet. This is a temporal condition — it resolves on its own as children complete.
+
+```json
+{
+  "action": "gate_blocked",
+  "state": "converge",
+  "directive": "Waiting for all research agents to finish.",
+  "advanced": false,
+  "expects": null,
+  "blocking_conditions": [
+    {
+      "name": "children-done",
+      "type": "children-complete",
+      "status": "failed",
+      "category": "temporal",
+      "agent_actionable": true,
+      "output": {
+        "total": 3,
+        "completed": 2,
+        "pending": 1,
+        "all_complete": false,
+        "children": [
+          {"name": "explore.r1", "state": "done", "complete": true},
+          {"name": "explore.r2", "state": "done", "complete": true},
+          {"name": "explore.r3", "state": "research", "complete": false}
+        ],
+        "error": ""
+      }
+    }
+  ],
+  "error": null
+}
+```
+
+**Decision points:**
+- `category: "temporal"` — don't try to fix anything. The children will finish on their
+  own. Poll `koto next` again later.
+- `output.all_complete` is `false` — at least one child is still running.
+- `output.children` gives per-child detail. Use `koto status <child>` or
+  `koto context get <child> <key>` for deeper inspection.
+- `agent_actionable: true` — you can override with `koto overrides record` if you need
+  to proceed before all children finish. The override pretends all children are done.
+- Don't retry in a tight loop. Children are running their own workflows and need time.
 
 ---
 

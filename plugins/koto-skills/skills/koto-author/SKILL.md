@@ -66,13 +66,14 @@ After init, follow the koto execution loop:
 3. Read the `directive` for instructions. On first visit to a state, a `details` field may contain extended guidance (pass `--full` to force it on repeat visits)
 4. Repeat until `action` is `done`
 
-Each item in `blocking_conditions` has five fields:
+Each item in `blocking_conditions` has six fields:
 
 | Field | Type | Notes |
 |-------|------|-------|
 | `name` | string | Gate name as declared in the template |
-| `type` | string | Gate type (`command`, `context-exists`, `context-matches`) |
+| `type` | string | Gate type (`command`, `context-exists`, `context-matches`, `children-complete`) |
 | `status` | string | `failed`, `timed_out`, or `error` |
+| `category` | string | `"corrective"` (fix something) or `"temporal"` (retry later). `children-complete` gates are temporal; all others are corrective. |
 | `agent_actionable` | boolean | `true` when `koto overrides record` can unblock this gate |
 | `output` | object | Gate-type-specific structured result (e.g., `{"exit_code": 1, "error": ""}` for `command` gates) |
 

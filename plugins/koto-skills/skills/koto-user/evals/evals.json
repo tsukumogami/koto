@@ -54,6 +54,19 @@
     },
     {
       "id": 5,
+      "name": "hierarchy-temporal-blocking",
+      "prompt": "I'm running a parent koto workflow called 'plan-executor'. `koto next plan-executor` returned:\n```json\n{\"action\":\"gate_blocked\",\"state\":\"wait_for_children\",\"directive\":\"Waiting for all implementation workflows to complete.\",\"blocking_conditions\":[{\"name\":\"children-done\",\"type\":\"children-complete\",\"status\":\"failed\",\"category\":\"temporal\",\"agent_actionable\":true,\"output\":{\"total\":3,\"completed\":1,\"pending\":2,\"all_complete\":false,\"children\":[{\"name\":\"plan.issue-1\",\"state\":\"done\",\"complete\":true},{\"name\":\"plan.issue-2\",\"state\":\"implement\",\"complete\":false},{\"name\":\"plan.issue-3\",\"state\":\"review\",\"complete\":false}],\"error\":\"\"}}],\"advanced\":false}\n```\nWhat should I do? Should I try to override this gate or fix something?",
+      "expected_output": "Agent recognizes this is a temporal block (category: temporal) from a children-complete gate. It should NOT try to fix anything or override. It should advise waiting and polling koto next later, since children will complete on their own. It may suggest checking child status with koto status.",
+      "files": [],
+      "assertions": [
+        "Response identifies this as a temporal block that resolves on its own (children finishing their workflows)",
+        "Response recommends waiting and retrying `koto next plan-executor` later rather than taking corrective action",
+        "Response does NOT recommend overriding the gate as the first action (override is acceptable only as a last resort or if the user explicitly wants to skip waiting)",
+        "Response mentions `koto status` or `koto context get` as ways to check child progress, or references the children array in the output"
+      ]
+    },
+    {
+      "id": 6,
       "name": "negative-general-state-machine-redirect",
       "prompt": "I want to build a finite state machine for my order processing system. Orders go through created, paid, shipped, delivered states. Can you design the state transitions?",
       "expected_output": "Agent recognizes this is a general state machine design question, not a koto workflow question. It does not invoke koto commands or reference koto concepts.",
@@ -62,6 +75,19 @@
         "Response does NOT reference koto commands like `koto init`, `koto next`, or `koto template compile`",
         "Response does NOT frame the answer in terms of koto templates, sessions, or evidence fields",
         "Response treats this as a general software design question about state machines"
+      ]
+    },
+    {
+      "id": 7,
+      "name": "hierarchy-init-child-workflow",
+      "prompt": "I have a parent koto workflow called 'release-plan' and I need to create a child workflow for implementing issue #42. The child template is at `.koto/implement.md`. How do I set this up so the parent can track the child?",
+      "expected_output": "Agent uses `koto init` with the `--parent` flag to link the child to the parent workflow.",
+      "files": [],
+      "assertions": [
+        "Response includes `koto init` with `--parent release-plan` (linking to the parent)",
+        "Response includes `--template .koto/implement.md` (the child template path)",
+        "Response mentions that the parent can check children with `koto workflows --children release-plan` or `koto status`",
+        "Response does NOT suggest manual state file editing or workarounds instead of `--parent`"
       ]
     }
   ]
