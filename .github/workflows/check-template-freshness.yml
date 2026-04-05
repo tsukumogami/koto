@@ -15,7 +15,7 @@ on:
           or pin a specific version like 'v0.5.0'. Passed to install.sh --version.
         required: false
         type: string
-        default: 'v0.6.0'
+        default: 'v0.7.0'
       check-html:
         description: >
           Also check HTML freshness. When true, the workflow verifies
