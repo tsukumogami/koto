@@ -86,7 +86,8 @@ Done.
     template_path.to_string_lossy().to_string()
 }
 
-/// Helper: list R2 bucket objects with a prefix using Python/boto3
+/// Helper: list R2 bucket objects with a prefix using Python/boto3.
+/// Handles pagination to avoid missing objects in large buckets.
 fn list_s3_objects(endpoint: &str, bucket: &str, prefix: &str) -> Vec<String> {
     let output = std::process::Command::new("python3")
         .arg("-c")
@@ -98,8 +99,10 @@ s3 = boto3.client('s3',
     aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
     aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
     region_name='auto')
-resp = s3.list_objects_v2(Bucket='{bucket}', Prefix='{prefix}')
-keys = [o['Key'] for o in resp.get('Contents', [])]
+paginator = s3.get_paginator('list_objects_v2')
+keys = []
+for page in paginator.paginate(Bucket='{bucket}', Prefix='{prefix}'):
+    keys.extend(o['Key'] for o in page.get('Contents', []))
 print(json.dumps(keys))
 "#
         ))
@@ -107,6 +110,50 @@ print(json.dumps(keys))
         .expect("python3");
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(stdout.trim()).unwrap_or_default()
+}
+
+/// Helper: delete all objects under a prefix in S3.
+/// Used for test cleanup to prevent bucket pollution.
+fn delete_s3_prefix(endpoint: &str, bucket: &str, prefix: &str) {
+    let _ = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            r#"
+import boto3, os
+s3 = boto3.client('s3',
+    endpoint_url='{endpoint}',
+    aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
+    aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+    region_name='auto')
+paginator = s3.get_paginator('list_objects_v2')
+for page in paginator.paginate(Bucket='{bucket}', Prefix='{prefix}'):
+    objects = [dict(Key=o['Key']) for o in page.get('Contents', [])]
+    if objects:
+        s3.delete_objects(Bucket='{bucket}', Delete=dict(Objects=objects))
+"#
+        ))
+        .output();
+}
+
+/// Compute the repo-id prefix for a temp directory.
+/// Matches koto's repo_id() function: first 16 hex chars of SHA-256 of canonical path.
+fn repo_id_prefix(dir: &Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    // koto uses sha256 of the canonical path, but we can just read it from
+    // the session dir that koto creates after init.
+    let sessions_dir = dir.join(".koto").join("sessions");
+    if sessions_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    return entry.file_name().to_string_lossy().to_string();
+                }
+            }
+        }
+    }
+    // Fallback: empty prefix (lists everything)
+    String::new()
 }
 
 #[test]
@@ -128,22 +175,26 @@ fn cloud_state_sync_on_init() {
         .assert()
         .success();
 
+    // Scope S3 listing to this test's repo-id prefix
+    let prefix = repo_id_prefix(dir.path());
+
     // Check R2 for state file
-    let objects = list_s3_objects(&endpoint, &bucket, "");
+    let objects = list_s3_objects(&endpoint, &bucket, &prefix);
     let has_state = objects
         .iter()
         .any(|k| k.contains("state-test-1") && k.contains(".state.jsonl"));
     assert!(
         has_state,
-        "State file not found in R2. Objects: {:?}",
-        objects
+        "State file not found in R2 under prefix '{}'. Objects: {:?}",
+        prefix, objects
     );
 
-    // Cleanup
+    // Cleanup: both koto session and S3 prefix
     koto_cmd(dir.path())
         .args(["session", "cleanup", "state-test-1"])
         .assert()
         .success();
+    delete_s3_prefix(&endpoint, &bucket, &prefix);
 }
 
 #[test]
@@ -178,22 +229,26 @@ fn cloud_state_sync_on_next() {
         .assert()
         .success();
 
+    // Scope S3 listing to this test's repo-id prefix
+    let prefix = repo_id_prefix(dir.path());
+
     // Check R2 — state file should be updated (larger than after init)
-    let objects = list_s3_objects(&endpoint, &bucket, "");
+    let objects = list_s3_objects(&endpoint, &bucket, &prefix);
     let has_state = objects
         .iter()
         .any(|k| k.contains("state-test-2") && k.contains(".state.jsonl"));
     assert!(
         has_state,
-        "Updated state file not found in R2 after next. Objects: {:?}",
-        objects
+        "Updated state file not found in R2 after next under prefix '{}'. Objects: {:?}",
+        prefix, objects
     );
 
-    // Cleanup
+    // Cleanup: both koto session and S3 prefix
     koto_cmd(dir.path())
         .args(["session", "cleanup", "state-test-2"])
         .assert()
         .success();
+    delete_s3_prefix(&endpoint, &bucket, &prefix);
 }
 
 #[test]
@@ -235,11 +290,13 @@ fn cloud_context_add_syncs_to_s3() {
         .success()
         .stdout(predicates::str::contains("Test Plan"));
 
-    // Cleanup
+    // Cleanup: koto session + S3 prefix
+    let prefix = repo_id_prefix(dir.path());
     koto_cmd(dir.path())
         .args(["session", "cleanup", "cloud-test-1"])
         .assert()
         .success();
+    delete_s3_prefix(&endpoint, &bucket, &prefix);
 }
 
 #[test]
@@ -297,11 +354,15 @@ fn cloud_sync_resume_on_different_machine() {
     }
     // If sync failed (e.g., R2 timing), that's acceptable — sync is non-fatal
 
-    // Cleanup both
+    // Cleanup both machines + S3
+    let prefix_a = repo_id_prefix(machine_a.path());
     koto_cmd(machine_a.path())
         .args(["session", "cleanup", "cloud-test-2"])
         .assert()
         .success();
+    delete_s3_prefix(&endpoint, &bucket, &prefix_a);
+    let prefix_b = repo_id_prefix(machine_b.path());
+    delete_s3_prefix(&endpoint, &bucket, &prefix_b);
 }
 
 #[test]
@@ -348,11 +409,13 @@ fn cloud_context_exists_gate_with_sync() {
         .assert()
         .success();
 
-    // Cleanup
+    // Cleanup: koto session + S3 prefix
+    let prefix = repo_id_prefix(dir.path());
     koto_cmd(dir.path())
         .args(["session", "cleanup", "cloud-test-3"])
         .assert()
         .success();
+    delete_s3_prefix(&endpoint, &bucket, &prefix);
 }
 
 #[test]
@@ -380,11 +443,13 @@ fn cloud_session_list_shows_synced_sessions() {
         .success()
         .stdout(predicates::str::contains("cloud-test-4"));
 
-    // Cleanup
+    // Cleanup: koto session + S3 prefix
+    let prefix = repo_id_prefix(dir.path());
     koto_cmd(dir.path())
         .args(["session", "cleanup", "cloud-test-4"])
         .assert()
         .success();
+    delete_s3_prefix(&endpoint, &bucket, &prefix);
 }
 
 #[test]
