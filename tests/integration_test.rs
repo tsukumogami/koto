@@ -11,6 +11,9 @@ fn koto_cmd(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("koto").unwrap();
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
+    // Override HOME so tests don't read the user's ~/.koto/config.toml
+    // (which might set backend = "cloud" or other non-default values).
+    cmd.env("HOME", dir);
     cmd
 }
 
@@ -5957,4 +5960,1138 @@ fn gate_contract_regression_existing_templates_compile() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// parent workflow lineage (hierarchical workflows, issue 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn init_with_valid_parent_writes_parent_workflow_to_header() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    // Create the parent workflow first.
+    let parent_out = koto_cmd(dir.path())
+        .args(["init", "parent-wf", "--template", src_str])
+        .output()
+        .unwrap();
+    assert!(
+        parent_out.status.success(),
+        "parent init should succeed: stderr={}",
+        String::from_utf8_lossy(&parent_out.stderr)
+    );
+
+    // Create a child workflow with --parent.
+    let child_out = koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-wf",
+            "--template",
+            src_str,
+            "--parent",
+            "parent-wf",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        child_out.status.success(),
+        "child init should succeed: stderr={}",
+        String::from_utf8_lossy(&child_out.stderr)
+    );
+
+    // Read the child's state file and verify parent_workflow in the header.
+    let state_path = session_state_path(dir.path(), "child-wf");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    let header_line = content.lines().next().unwrap();
+    let header: serde_json::Value = serde_json::from_str(header_line).unwrap();
+    assert_eq!(
+        header["parent_workflow"].as_str(),
+        Some("parent-wf"),
+        "header should contain parent_workflow"
+    );
+}
+
+#[test]
+fn init_with_missing_parent_fails() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    // Try to create a child with a non-existent parent.
+    let output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "orphan-wf",
+            "--template",
+            src_str,
+            "--parent",
+            "nonexistent-parent",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "init with missing parent should fail"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "exit code should be 1 for missing parent"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let error_msg = json["error"].as_str().unwrap();
+    assert!(
+        error_msg.contains("nonexistent-parent"),
+        "error should name the missing parent, got: {}",
+        error_msg
+    );
+}
+
+#[test]
+fn init_without_parent_has_no_parent_workflow_in_header() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    let output = koto_cmd(dir.path())
+        .args(["init", "solo-wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init without --parent should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Read the state file header.
+    let state_path = session_state_path(dir.path(), "solo-wf");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    let header_line = content.lines().next().unwrap();
+    let header: serde_json::Value = serde_json::from_str(header_line).unwrap();
+    assert!(
+        header.get("parent_workflow").is_none(),
+        "header should not contain parent_workflow when --parent is not given"
+    );
+}
+
+#[test]
+fn workflows_output_includes_parent_workflow_field() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    // Create a parent workflow.
+    koto_cmd(dir.path())
+        .args(["init", "root-wf", "--template", src_str])
+        .output()
+        .unwrap();
+
+    // Create a child workflow.
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "leaf-wf",
+            "--template",
+            src_str,
+            "--parent",
+            "root-wf",
+        ])
+        .output()
+        .unwrap();
+
+    // Run koto workflows and verify the JSON output.
+    let output = koto_cmd(dir.path()).args(["workflows"]).output().unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("workflows output should be valid JSON");
+    let workflows = json.as_array().expect("should be an array");
+
+    // Find each workflow in the output.
+    let leaf = workflows
+        .iter()
+        .find(|w| w["name"] == "leaf-wf")
+        .expect("leaf-wf should be in the output");
+    assert_eq!(
+        leaf["parent_workflow"].as_str(),
+        Some("root-wf"),
+        "child workflow should show parent_workflow"
+    );
+
+    let root = workflows
+        .iter()
+        .find(|w| w["name"] == "root-wf")
+        .expect("root-wf should be in the output");
+    assert!(
+        root["parent_workflow"].is_null(),
+        "root workflow should have parent_workflow: null"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// workflows filter flags (--roots, --children, --orphaned)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn workflows_roots_returns_only_parentless() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "root-a", "--template", src_str])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-a",
+            "--template",
+            src_str,
+            "--parent",
+            "root-a",
+        ])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["workflows", "--roots"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "should return only the root workflow");
+    assert_eq!(arr[0]["name"].as_str(), Some("root-a"));
+}
+
+#[test]
+fn workflows_children_returns_only_children_of_named_parent() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "parent-b", "--template", src_str])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-b1",
+            "--template",
+            src_str,
+            "--parent",
+            "parent-b",
+        ])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-b2",
+            "--template",
+            src_str,
+            "--parent",
+            "parent-b",
+        ])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args(["init", "other-root", "--template", src_str])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["workflows", "--children", "parent-b"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "should return exactly 2 children");
+    let names: Vec<&str> = arr.iter().map(|v| v["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"child-b1"));
+    assert!(names.contains(&"child-b2"));
+}
+
+#[test]
+fn workflows_children_no_match_returns_empty_array_exit_0() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "solo-wf", "--template", src_str])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["workflows", "--children", "solo-wf"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "exit code should be 0");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = json.as_array().unwrap();
+    assert!(arr.is_empty(), "should return empty array when no children");
+}
+
+#[test]
+fn workflows_orphaned_returns_workflows_with_missing_parent() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "temp-parent", "--template", src_str])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "orphan-child",
+            "--template",
+            src_str,
+            "--parent",
+            "temp-parent",
+        ])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args(["init", "standalone", "--template", src_str])
+        .output()
+        .unwrap();
+
+    // Delete the parent session to orphan the child.
+    koto_cmd(dir.path())
+        .args(["session", "cleanup", "temp-parent"])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["workflows", "--orphaned"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "should return only the orphaned workflow");
+    assert_eq!(arr[0]["name"].as_str(), Some("orphan-child"));
+}
+
+#[test]
+fn workflows_no_filter_returns_all() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "wf-1", "--template", src_str])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args(["init", "wf-2", "--template", src_str, "--parent", "wf-1"])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path()).args(["workflows"]).output().unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "no filter should return all workflows");
+}
+
+#[test]
+fn workflows_mutually_exclusive_flags_error() {
+    let dir = TempDir::new().unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["workflows", "--roots", "--orphaned"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "combining --roots and --orphaned should fail"
+    );
+
+    let output = koto_cmd(dir.path())
+        .args(["workflows", "--roots", "--children", "x"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "combining --roots and --children should fail"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// koto status
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_active_workflow() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    // Init a workflow (auto-advances to "start").
+    koto_cmd(dir.path())
+        .args(["init", "status-active", "--template", src.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Check status -- workflow is in "start" (non-terminal).
+    let output = koto_cmd(dir.path())
+        .args(["status", "status-active"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("status output should be valid JSON");
+    assert_eq!(json["name"], "status-active");
+    assert_eq!(json["current_state"], "start");
+    assert_eq!(json["is_terminal"], false);
+    assert!(json["template_path"].as_str().is_some());
+    assert!(json["template_hash"].as_str().is_some());
+}
+
+#[test]
+fn status_terminal_workflow() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    // Init (auto-advances to "start").
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "status-terminal",
+            "--template",
+            src.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Advance to "done" (terminal) -- use --no-cleanup so state file is preserved.
+    koto_cmd(dir.path())
+        .args(["next", "status-terminal", "--no-cleanup"])
+        .assert()
+        .success();
+
+    // Check status -- should show is_terminal: true.
+    let output = koto_cmd(dir.path())
+        .args(["status", "status-terminal"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("status output should be valid JSON");
+    assert_eq!(json["name"], "status-terminal");
+    assert_eq!(json["current_state"], "done");
+    assert_eq!(json["is_terminal"], true);
+}
+
+#[test]
+fn status_missing_workflow() {
+    let dir = TempDir::new().unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["status", "no-such-workflow"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "status should fail for missing workflow"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("error output should be valid JSON");
+    assert!(
+        json["error"].as_str().unwrap().contains("not found"),
+        "error message should mention 'not found': {}",
+        json["error"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Advisory child info in lifecycle commands
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cancel_parent_includes_children_array() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    // Create parent and child workflows.
+    koto_cmd(dir.path())
+        .args(["init", "parent-cancel", "--template", src_str])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-cancel",
+            "--template",
+            src_str,
+            "--parent",
+            "parent-cancel",
+        ])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["cancel", "parent-cancel"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "cancel should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["cancelled"], true);
+    assert_eq!(json["name"].as_str(), Some("parent-cancel"));
+
+    let children = json["children"]
+        .as_array()
+        .expect("children should be an array");
+    assert_eq!(children.len(), 1, "should have one child");
+    assert_eq!(children[0]["name"].as_str(), Some("child-cancel"));
+    assert!(
+        children[0]["state"].as_str().is_some(),
+        "child should have a state field"
+    );
+}
+
+#[test]
+fn cancel_workflow_no_children_returns_empty_array() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "solo-cancel", "--template", src_str])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["cancel", "solo-cancel"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let children = json["children"]
+        .as_array()
+        .expect("children should be an array");
+    assert!(
+        children.is_empty(),
+        "children should be empty when no children exist"
+    );
+}
+
+#[test]
+fn rewind_parent_includes_children_array() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    // Create parent, advance it so rewind is possible, then create child.
+    koto_cmd(dir.path())
+        .args(["init", "parent-rewind", "--template", src_str])
+        .output()
+        .unwrap();
+
+    // Append a transition event so rewind has somewhere to go back to.
+    let state_path = session_state_path(dir.path(), "parent-rewind");
+    let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&state_path)
+            .unwrap();
+        writeln!(f, "{}", extra_event).unwrap();
+    }
+
+    // Create child workflow.
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-rewind",
+            "--template",
+            src_str,
+            "--parent",
+            "parent-rewind",
+        ])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["rewind", "parent-rewind"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "rewind should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["name"].as_str(), Some("parent-rewind"));
+
+    let children = json["children"]
+        .as_array()
+        .expect("children should be an array");
+    assert_eq!(children.len(), 1, "should have one child");
+    assert_eq!(children[0]["name"].as_str(), Some("child-rewind"));
+    assert!(
+        children[0]["state"].as_str().is_some(),
+        "child should have a state field"
+    );
+}
+
+#[test]
+fn rewind_workflow_no_children_returns_empty_array() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "solo-rewind", "--template", src_str])
+        .output()
+        .unwrap();
+
+    // Append a transition event so rewind is possible.
+    let state_path = session_state_path(dir.path(), "solo-rewind");
+    let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&state_path)
+            .unwrap();
+        writeln!(f, "{}", extra_event).unwrap();
+    }
+
+    let output = koto_cmd(dir.path())
+        .args(["rewind", "solo-rewind"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let children = json["children"]
+        .as_array()
+        .expect("children should be an array");
+    assert!(
+        children.is_empty(),
+        "children should be empty when no children exist"
+    );
+}
+
+#[test]
+fn session_cleanup_parent_includes_children_array() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    // Create parent and child workflows.
+    koto_cmd(dir.path())
+        .args(["init", "parent-cleanup", "--template", src_str])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-cleanup",
+            "--template",
+            src_str,
+            "--parent",
+            "parent-cleanup",
+        ])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["session", "cleanup", "parent-cleanup"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "cleanup should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["name"].as_str(), Some("parent-cleanup"));
+    assert_eq!(json["cleaned_up"], true);
+
+    let children = json["children"]
+        .as_array()
+        .expect("children should be an array");
+    assert_eq!(children.len(), 1, "should have one child");
+    assert_eq!(children[0]["name"].as_str(), Some("child-cleanup"));
+    assert!(
+        children[0]["state"].as_str().is_some(),
+        "child should have a state field"
+    );
+
+    // Verify parent is actually cleaned up.
+    let list_output = koto_cmd(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+    let list: serde_json::Value = serde_json::from_slice(&list_output.stdout).unwrap();
+    let ids: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        !ids.contains(&"parent-cleanup"),
+        "parent should be removed after cleanup"
+    );
+    assert!(
+        ids.contains(&"child-cleanup"),
+        "child should still exist (no cascade)"
+    );
+}
+
+#[test]
+fn session_cleanup_no_children_returns_empty_array() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "solo-cleanup", "--template", src_str])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["session", "cleanup", "solo-cleanup"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let children = json["children"]
+        .as_array()
+        .expect("children should be an array");
+    assert!(
+        children.is_empty(),
+        "children should be empty when no children exist"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// children-complete gate tests
+// ---------------------------------------------------------------------------
+
+fn parent_with_children_gate_template() -> &'static str {
+    r#"---
+name: parent-workflow
+version: "1.0"
+initial_state: spawn
+states:
+  spawn:
+    gates:
+      children-done:
+        type: children-complete
+        completion: "terminal"
+    transitions:
+      - target: done
+        when:
+          gates.children-done.all_complete: true
+  done:
+    terminal: true
+---
+
+## spawn
+
+Spawn child workflows and wait for them to complete.
+
+## done
+
+All done.
+"#
+}
+
+fn parent_with_name_filter_template() -> &'static str {
+    r#"---
+name: parent-filtered
+version: "1.0"
+initial_state: wait
+states:
+  wait:
+    gates:
+      research-done:
+        type: children-complete
+        completion: "terminal"
+        name_filter: "research."
+    transitions:
+      - target: done
+        when:
+          gates.research-done.all_complete: true
+  done:
+    terminal: true
+---
+
+## wait
+
+Wait for research children to complete.
+
+## done
+
+All done.
+"#
+}
+
+fn write_and_compile_template(dir: &Path, content: &str, filename: &str) -> String {
+    let src = dir.join(filename);
+    std::fs::write(&src, content).unwrap();
+    let output = koto_cmd(dir)
+        .args(["template", "compile", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "template compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    src.to_str().unwrap().to_string()
+}
+
+#[test]
+fn children_complete_gate_all_terminal_passes() {
+    let dir = TempDir::new().unwrap();
+    let parent_compiled = write_and_compile_template(
+        dir.path(),
+        parent_with_children_gate_template(),
+        "parent.md",
+    );
+    let child_compiled = write_template_source(dir.path())
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    koto_cmd(dir.path())
+        .args(["init", "parent-wf", "--template", &parent_compiled])
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-1",
+            "--template",
+            &child_compiled,
+            "--parent",
+            "parent-wf",
+        ])
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-2",
+            "--template",
+            &child_compiled,
+            "--parent",
+            "parent-wf",
+        ])
+        .assert()
+        .success();
+
+    // Advance children to terminal (auto-advance: start -> done in one call).
+    // Use --no-cleanup so the session persists for the parent gate to query.
+    for child in ["child-1", "child-2"] {
+        koto_cmd(dir.path())
+            .args(["next", child, "--no-cleanup"])
+            .assert()
+            .success();
+    }
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "parent-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "parent next failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["action"],
+        "done",
+        "parent should reach terminal: {}",
+        serde_json::to_string_pretty(&json).unwrap()
+    );
+}
+
+#[test]
+fn children_complete_gate_pending_children_fails() {
+    let dir = TempDir::new().unwrap();
+    let parent_compiled = write_and_compile_template(
+        dir.path(),
+        parent_with_children_gate_template(),
+        "parent.md",
+    );
+    let child_compiled = write_template_source(dir.path())
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    koto_cmd(dir.path())
+        .args(["init", "parent-wf", "--template", &parent_compiled])
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-1",
+            "--template",
+            &child_compiled,
+            "--parent",
+            "parent-wf",
+        ])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "parent-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "parent next should exit 0 (gate_blocked exits 0)"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["action"], "gate_blocked");
+    let conditions = json["blocking_conditions"].as_array().unwrap();
+    assert_eq!(conditions.len(), 1);
+    assert_eq!(conditions[0]["type"], "children-complete");
+    assert_eq!(conditions[0]["status"], "failed");
+    assert_eq!(conditions[0]["category"], "temporal");
+    assert_eq!(conditions[0]["output"]["total"], 1);
+    assert_eq!(conditions[0]["output"]["completed"], 0);
+    assert_eq!(conditions[0]["output"]["pending"], 1);
+    assert_eq!(conditions[0]["output"]["all_complete"], false);
+    let children = conditions[0]["output"]["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0]["name"], "child-1");
+    assert_eq!(children[0]["complete"], false);
+}
+
+#[test]
+fn children_complete_gate_zero_children_fails() {
+    let dir = TempDir::new().unwrap();
+    let parent_compiled = write_and_compile_template(
+        dir.path(),
+        parent_with_children_gate_template(),
+        "parent.md",
+    );
+
+    koto_cmd(dir.path())
+        .args(["init", "parent-wf", "--template", &parent_compiled])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "parent-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "parent next should exit 0 (gate_blocked exits 0)"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["action"], "gate_blocked");
+    let conditions = json["blocking_conditions"].as_array().unwrap();
+    assert_eq!(conditions[0]["type"], "children-complete");
+    assert_eq!(conditions[0]["output"]["total"], 0);
+    assert_eq!(conditions[0]["output"]["all_complete"], false);
+    assert!(conditions[0]["output"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("no matching children"));
+}
+
+#[test]
+fn children_complete_gate_name_filter() {
+    let dir = TempDir::new().unwrap();
+    let parent_compiled = write_and_compile_template(
+        dir.path(),
+        parent_with_name_filter_template(),
+        "parent-filtered.md",
+    );
+    let child_compiled = write_template_source(dir.path())
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    koto_cmd(dir.path())
+        .args(["init", "parent-wf", "--template", &parent_compiled])
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "research.r1",
+            "--template",
+            &child_compiled,
+            "--parent",
+            "parent-wf",
+        ])
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "other-child",
+            "--template",
+            &child_compiled,
+            "--parent",
+            "parent-wf",
+        ])
+        .assert()
+        .success();
+
+    // Advance research.r1 to terminal with --no-cleanup.
+    koto_cmd(dir.path())
+        .args(["next", "research.r1", "--no-cleanup"])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "parent-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "parent next should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["action"],
+        "done",
+        "parent should reach terminal: {}",
+        serde_json::to_string_pretty(&json).unwrap()
+    );
+}
+
+#[test]
+fn children_complete_category_temporal_in_output() {
+    let dir = TempDir::new().unwrap();
+    let parent_compiled = write_and_compile_template(
+        dir.path(),
+        parent_with_children_gate_template(),
+        "parent.md",
+    );
+    let child_compiled = write_template_source(dir.path())
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    koto_cmd(dir.path())
+        .args(["init", "parent-wf", "--template", &parent_compiled])
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-1",
+            "--template",
+            &child_compiled,
+            "--parent",
+            "parent-wf",
+        ])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "parent-wf"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let conditions = json["blocking_conditions"].as_array().unwrap();
+    assert_eq!(conditions[0]["category"], "temporal");
+}
+
+#[test]
+fn existing_gates_emit_corrective_category() {
+    let dir = TempDir::new().unwrap();
+    let template_content = r#"---
+name: gate-cat
+version: "1.0"
+initial_state: check
+states:
+  check:
+    gates:
+      ci:
+        type: command
+        command: exit 1
+    transitions:
+      - target: done
+        when:
+          gates.ci.exit_code: 0
+  done:
+    terminal: true
+---
+
+## check
+
+Run the check.
+
+## done
+
+All done.
+"#;
+    let compiled = write_and_compile_template(dir.path(), template_content, "gate-cat.md");
+    koto_cmd(dir.path())
+        .args(["init", "test-wf", "--template", &compiled])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "test-wf"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let conditions = json["blocking_conditions"].as_array().unwrap();
+    assert!(!conditions.is_empty());
+    assert_eq!(
+        conditions[0]["category"], "corrective",
+        "command gates should have corrective category"
+    );
 }

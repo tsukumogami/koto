@@ -22,6 +22,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session list` | Runner — primary |
 | `koto session cleanup` | Runner — primary |
 | `koto session resolve` | Runner — cloud backend only |
+| `koto status` | Runner — primary |
 | `koto context add` | Runner — primary |
 | `koto context get` | Runner — primary |
 | `koto context exists` | Runner — primary |
@@ -37,7 +38,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 ## koto init
 
 ```
-koto init <name> --template <path> [--var KEY=VALUE ...]
+koto init <name> --template <path> [--parent <parent-name>] [--var KEY=VALUE ...]
 ```
 
 Initializes a new workflow from a template source file.
@@ -46,6 +47,7 @@ Initializes a new workflow from a template source file.
 |---|---|---|
 | `<name>` | Yes | Workflow name. Must match `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`. Dots, underscores, and hyphens are allowed after the first character. |
 | `--template <path>` | Yes | Path to the template `.md` source file. Compiled automatically on first use. |
+| `--parent <parent-name>` | No | Link this workflow as a child of an existing parent workflow. Fails if the parent doesn't exist. |
 | `--var KEY=VALUE` | No | Set a template variable. Repeatable. Required variables must be supplied; unknown keys are rejected. |
 
 **Success output:**
@@ -139,10 +141,18 @@ Rolls back the workflow to the previous state by appending a `Rewound` event. No
 ## koto workflows
 
 ```
-koto workflows
+koto workflows [--roots] [--children <name>] [--orphaned]
 ```
 
-Lists all active workflows in the current directory as a JSON array.
+Lists active workflows in the current directory as a JSON array.
+
+| Flag | Description |
+|---|---|
+| `--roots` | Show only workflows with no parent (top-level workflows) |
+| `--children <name>` | Show only children of the named parent workflow |
+| `--orphaned` | Show only workflows whose parent no longer exists |
+
+Flags are mutually exclusive. When none are provided, all workflows are listed.
 
 **Success output:**
 ```json
@@ -150,12 +160,41 @@ Lists all active workflows in the current directory as a JSON array.
   {
     "name": "my-workflow",
     "created_at": "2026-01-15T10:30:00Z",
-    "template_hash": "abc123..."
+    "template_hash": "abc123...",
+    "parent_workflow": null
   }
 ]
 ```
 
-Returns `[]` when no workflows exist. The `name` field is the workflow identifier (not `id` — that field name appears only in `koto session list`).
+The `parent_workflow` field is `null` for parentless workflows and a string with the parent's name for children. Returns `[]` when no workflows exist or no workflows match the filter. The `name` field is the workflow identifier (not `id` — that field name appears only in `koto session list`).
+
+---
+
+## koto status
+
+```
+koto status <name>
+```
+
+Returns read-only state metadata for a workflow. No gates are evaluated, no actions run, no state changes happen. Useful for checking child workflow progress from a parent agent.
+
+| Argument | Required | Description |
+|---|---|---|
+| `<name>` | Yes | Workflow name |
+
+**Success output:**
+```json
+{
+  "name": "design.research-agent",
+  "current_state": "synthesize",
+  "template_path": ".koto/research.template.json",
+  "template_hash": "a1b2c3...",
+  "is_terminal": false
+}
+```
+
+**Error cases:**
+- Exit 2: workflow not found
 
 ---
 

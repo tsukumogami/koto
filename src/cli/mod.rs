@@ -73,6 +73,10 @@ pub enum Command {
         /// Set a template variable (repeatable)
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
+
+        /// Name of an existing parent workflow (creates a child workflow)
+        #[arg(long)]
+        parent: Option<String>,
     },
 
     /// Get the current state directive for a workflow
@@ -110,7 +114,19 @@ pub enum Command {
     },
 
     /// List all active workflows in the current directory
-    Workflows,
+    Workflows {
+        /// Show only root workflows (no parent)
+        #[arg(long, group = "filter")]
+        roots: bool,
+
+        /// Show only children of the named workflow
+        #[arg(long, group = "filter", value_name = "NAME")]
+        children: Option<String>,
+
+        /// Show only orphaned workflows whose parent no longer exists
+        #[arg(long, group = "filter")]
+        orphaned: bool,
+    },
 
     /// Template management subcommands
     Template {
@@ -128,6 +144,12 @@ pub enum Command {
     Context {
         #[command(subcommand)]
         subcommand: ContextCommand,
+    },
+
+    /// Show the current status of a workflow (read-only, no state changes)
+    Status {
+        /// Workflow name
+        name: String,
     },
 
     /// Decision recording and retrieval
@@ -644,9 +666,10 @@ pub fn run(app: App) -> Result<()> {
             name,
             template,
             vars,
+            parent,
         } => {
             let backend = build_backend()?;
-            handle_init(&backend, &name, &template, &vars)
+            handle_init(&backend, &name, &template, &vars, parent.as_deref())
         }
         Command::Next {
             name,
@@ -675,7 +698,15 @@ pub fn run(app: App) -> Result<()> {
             let backend = build_backend()?;
             handle_rewind(&backend, &name)
         }
-        Command::Workflows => {
+        Command::Status { name } => {
+            let backend = build_backend()?;
+            handle_status(&backend, &name)
+        }
+        Command::Workflows {
+            roots,
+            children,
+            orphaned,
+        } => {
             let backend = build_backend()?;
             let metadata = match find_workflows_with_metadata(&backend) {
                 Ok(m) => m,
@@ -686,7 +717,28 @@ pub fn run(app: App) -> Result<()> {
                     }));
                 }
             };
-            println!("{}", serde_json::to_string(&metadata)?);
+            let filtered: Vec<_> = if roots {
+                metadata
+                    .into_iter()
+                    .filter(|wf| wf.parent_workflow.is_none())
+                    .collect()
+            } else if let Some(ref parent_name) = children {
+                metadata
+                    .into_iter()
+                    .filter(|wf| wf.parent_workflow.as_deref() == Some(parent_name.as_str()))
+                    .collect()
+            } else if orphaned {
+                metadata
+                    .into_iter()
+                    .filter(|wf| match &wf.parent_workflow {
+                        Some(parent) => !backend.exists(parent),
+                        None => false,
+                    })
+                    .collect()
+            } else {
+                metadata
+            };
+            println!("{}", serde_json::to_string(&filtered)?);
             Ok(())
         }
         Command::Session { subcommand } => {
@@ -694,7 +746,20 @@ pub fn run(app: App) -> Result<()> {
             match subcommand {
                 SessionCommand::Dir { name } => session::handle_dir(&backend, &name),
                 SessionCommand::List => session::handle_list(&backend),
-                SessionCommand::Cleanup { name } => session::handle_cleanup(&backend, &name),
+                SessionCommand::Cleanup { name } => {
+                    // Query children before cleanup so the parent is still visible.
+                    let children = query_children(&backend, &name);
+                    session::handle_cleanup(&backend, &name)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "name": name,
+                            "cleaned_up": true,
+                            "children": children
+                        }))?
+                    );
+                    Ok(())
+                }
                 SessionCommand::Resolve { name, keep } => {
                     session::handle_resolve(&backend, &name, &keep)
                 }
@@ -966,6 +1031,7 @@ fn handle_init(
     name: &str,
     template: &str,
     vars: &[String],
+    parent: Option<&str>,
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation.
     if let Err(msg) = crate::discover::validate_workflow_name(name) {
@@ -977,6 +1043,16 @@ fn handle_init(
             }),
             2,
         );
+    }
+
+    // Validate parent workflow exists, if specified.
+    if let Some(parent_name) = parent {
+        if !backend.exists(parent_name) {
+            exit_with_error(serde_json::json!({
+                "error": format!("parent workflow '{}' not found", parent_name),
+                "command": "init"
+            }));
+        }
     }
 
     // Check if session already exists (state file present).
@@ -1039,6 +1115,7 @@ fn handle_init(
         workflow: name.to_string(),
         template_hash: hash,
         created_at: ts.clone(),
+        parent_workflow: parent.map(|s| s.to_string()),
     };
     if let Err(e) = backend.append_header(name, &header) {
         exit_with_error(serde_json::json!({
@@ -1146,11 +1223,14 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         }));
     }
 
+    let children = query_children(backend, name);
+
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({
             "name": name,
-            "state": prev_state
+            "state": prev_state,
+            "children": children
         }))?
     );
     Ok(())
@@ -1631,6 +1711,14 @@ fn handle_next(
             .map_err(|e| e.to_string())
     };
 
+    // Build the children-complete gate evaluator closure. It captures the
+    // session backend to call list() and read_events() for child discovery.
+    let workflow_name_for_children = name.clone();
+    let children_eval =
+        move |gate: &crate::template::types::Gate| -> crate::gate::StructuredGateResult {
+            evaluate_children_complete(backend, &workflow_name_for_children, gate)
+        };
+
     let vars_for_gates = runtime_vars.clone();
     let session_name = &name;
     let gate_closure =
@@ -1651,6 +1739,7 @@ fn handle_next(
                 &current_dir,
                 Some(context_store),
                 Some(session_name),
+                Some(&children_eval),
             )
         };
 
@@ -1705,6 +1794,7 @@ fn handle_next(
                         &current_dir,
                         Some(context_store),
                         Some(&name),
+                        None, // children-complete not needed in polling loop
                     )
                 },
                 &shutdown,
@@ -2275,6 +2365,249 @@ fn handle_decisions_list(backend: &dyn SessionBackend, name: String) -> Result<(
     Ok(())
 }
 
+/// Handle the `koto status` command.
+///
+/// Returns a JSON object with the workflow's current state, template info,
+/// and terminal status. Read-only: does not evaluate gates, run actions,
+/// or modify the state file.
+fn handle_status(backend: &dyn SessionBackend, name: &str) -> Result<()> {
+    if !backend.exists(name) {
+        exit_with_error_code(
+            serde_json::json!({
+                "error": format!("workflow '{}' not found", name),
+                "command": "status"
+            }),
+            2,
+        );
+    }
+
+    let (header, events) = match backend.read_events(name) {
+        Ok(result) => result,
+        Err(err) => {
+            let code = exit_code_for_engine_error(&err);
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": err.to_string(),
+                    "command": "status"
+                }),
+                code,
+            );
+        }
+    };
+
+    let machine_state = match derive_machine_state(&header, &events) {
+        Some(ms) => ms,
+        None => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": "corrupt state file: cannot derive current state",
+                    "command": "status"
+                }),
+                EXIT_INFRASTRUCTURE,
+            );
+        }
+    };
+
+    // Load the compiled template to determine terminal status.
+    let template_bytes = match std::fs::read(&machine_state.template_path) {
+        Ok(b) => b,
+        Err(e) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!("failed to read template: {}", e),
+                    "command": "status"
+                }),
+                EXIT_INFRASTRUCTURE,
+            );
+        }
+    };
+    let compiled: CompiledTemplate = match serde_json::from_slice(&template_bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!("failed to parse template: {}", e),
+                    "command": "status"
+                }),
+                EXIT_INFRASTRUCTURE,
+            );
+        }
+    };
+
+    let is_terminal = compiled
+        .states
+        .get(&machine_state.current_state)
+        .is_some_and(|s| s.terminal);
+
+    let response = serde_json::json!({
+        "name": name,
+        "current_state": machine_state.current_state,
+        "template_path": machine_state.template_path,
+        "template_hash": machine_state.template_hash,
+        "is_terminal": is_terminal,
+    });
+
+    println!("{}", serde_json::to_string(&response)?);
+    Ok(())
+}
+
+/// Query child workflows for a given parent name.
+///
+/// Returns a JSON array where each entry has `name` and `state` fields.
+/// Uses `backend.list()` filtered by `parent_workflow` to discover children,
+/// then reads each child's event log to derive its current state.
+/// Evaluate a `children-complete` gate by querying the session backend for
+/// child workflows and checking their completion status.
+///
+/// Discovery: calls `backend.list()`, filters by `parent_workflow == workflow_name`.
+/// If `gate.name_filter` is set, further filters by name prefix.
+///
+/// Completion: for now only `"terminal"` is supported. Each child's events are
+/// read, state derived, and checked against the child's compiled template for
+/// terminal status.
+///
+/// Returns `Failed` when zero children match (no vacuous pass) or any child is
+/// not yet complete. Returns `Passed` when all children are complete.
+fn evaluate_children_complete(
+    backend: &dyn SessionBackend,
+    workflow_name: &str,
+    gate: &crate::template::types::Gate,
+) -> crate::gate::StructuredGateResult {
+    use crate::gate::{GateOutcome, StructuredGateResult};
+
+    let sessions = match backend.list() {
+        Ok(s) => s,
+        Err(e) => {
+            return StructuredGateResult {
+                outcome: GateOutcome::Error,
+                output: serde_json::json!({
+                    "total": 0,
+                    "completed": 0,
+                    "pending": 0,
+                    "all_complete": false,
+                    "children": [],
+                    "error": format!("failed to list sessions: {}", e)
+                }),
+            };
+        }
+    };
+
+    // Filter to direct children of this workflow.
+    let mut children: Vec<_> = sessions
+        .into_iter()
+        .filter(|s| s.parent_workflow.as_deref() == Some(workflow_name))
+        .collect();
+
+    // Apply optional name_filter prefix.
+    if let Some(ref prefix) = gate.name_filter {
+        children.retain(|s| s.id.starts_with(prefix.as_str()));
+    }
+
+    // Zero children: fail (no vacuous pass).
+    if children.is_empty() {
+        return StructuredGateResult {
+            outcome: GateOutcome::Failed,
+            output: serde_json::json!({
+                "total": 0,
+                "completed": 0,
+                "pending": 0,
+                "all_complete": false,
+                "children": [],
+                "error": "no matching children found"
+            }),
+        };
+    }
+
+    let total = children.len();
+    let mut completed = 0usize;
+    let mut child_details = Vec::new();
+
+    for child in &children {
+        let (child_header, child_events) = match backend.read_events(&child.id) {
+            Ok(result) => result,
+            Err(_) => {
+                child_details.push(serde_json::json!({
+                    "name": child.id,
+                    "state": "",
+                    "complete": false
+                }));
+                continue;
+            }
+        };
+
+        let machine_state = derive_machine_state(&child_header, &child_events);
+        let current_state = machine_state
+            .as_ref()
+            .map(|ms| ms.current_state.as_str())
+            .unwrap_or("");
+
+        // Determine if the child is complete (terminal state).
+        let is_complete = if let Some(ref ms) = machine_state {
+            // Load the child's compiled template to check terminal status.
+            std::fs::read(&ms.template_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<CompiledTemplate>(&bytes).ok())
+                .and_then(|tmpl| tmpl.states.get(&ms.current_state).map(|s| s.terminal))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if is_complete {
+            completed += 1;
+        }
+
+        child_details.push(serde_json::json!({
+            "name": child.id,
+            "state": current_state,
+            "complete": is_complete
+        }));
+    }
+
+    let pending = total - completed;
+    let all_complete = pending == 0;
+    let outcome = if all_complete {
+        GateOutcome::Passed
+    } else {
+        GateOutcome::Failed
+    };
+
+    StructuredGateResult {
+        outcome,
+        output: serde_json::json!({
+            "total": total,
+            "completed": completed,
+            "pending": pending,
+            "all_complete": all_complete,
+            "children": child_details,
+            "error": ""
+        }),
+    }
+}
+
+fn query_children(backend: &dyn SessionBackend, parent_name: &str) -> Vec<serde_json::Value> {
+    let sessions = match backend.list() {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    sessions
+        .into_iter()
+        .filter(|s| s.parent_workflow.as_deref() == Some(parent_name))
+        .map(|child| {
+            let state = backend
+                .read_events(&child.id)
+                .ok()
+                .and_then(|(_, events)| derive_state_from_log(&events))
+                .unwrap_or_default();
+            serde_json::json!({
+                "name": child.id,
+                "state": state
+            })
+        })
+        .collect()
+}
+
 /// Handle the `koto cancel` command.
 ///
 /// Appends a `WorkflowCancelled` event to the event log. Rejects double-cancel
@@ -2377,12 +2710,15 @@ fn handle_cancel(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         }));
     }
 
+    let children = query_children(backend, name);
+
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({
             "name": name,
             "state": current_state,
-            "cancelled": true
+            "cancelled": true,
+            "children": children
         }))?
     );
     Ok(())

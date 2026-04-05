@@ -376,6 +376,8 @@ mod tests {
             key: String::new(),
             pattern: String::new(),
             override_default,
+            completion: None,
+            name_filter: None,
         }
     }
 
@@ -429,6 +431,8 @@ mod tests {
             key: String::new(),
             pattern: String::new(),
             override_default: None,
+            completion: None,
+            name_filter: None,
         };
         let result = resolve_override_applied(None, &gate);
         assert!(result.is_err());

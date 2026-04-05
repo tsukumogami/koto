@@ -128,7 +128,7 @@ Different template features produce different `action` values in the `koto next`
 | Template feature | Caller sees `action` |
 |-----------------|---------------------|
 | State with `accepts` block | `evidence_required` |
-| State with failing `gates` (no accepts) | `gate_blocked` |
+| State with failing `gates` (no accepts) | `gate_blocked` (with `category: "temporal"` for `children-complete`, `"corrective"` for others) |
 | State with `integration` | `integration` or `integration_unavailable` |
 | Terminal state (`terminal: true`) | `done` |
 | State with `default_action` + `requires_confirmation` | `confirm` |
@@ -255,6 +255,7 @@ Gates are preconditions evaluated before any transition fires. A state can have 
 | `context-exists` | A key exists in the context store | `key` |
 | `context-matches` | Content for a key matches a regex | `key`, `pattern` |
 | `command` | A shell command exits 0 | `command` |
+| `children-complete` | All child workflows have reached their completion condition | (none required) |
 
 ```yaml
 gates:
@@ -265,6 +266,46 @@ gates:
     type: context-matches
     key: plan.md
     pattern: "^## Step \\d+"
+```
+
+#### `children-complete` gate type
+
+The `children-complete` gate waits for child workflows to finish. It discovers children by scanning session headers for workflows whose `parent_workflow` matches the current workflow.
+
+```yaml
+gates:
+  children-done:
+    type: children-complete
+    completion: "terminal"        # optional, default "terminal"
+    name_filter: "research."      # optional, prefix filter
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `completion` | No | When a child counts as complete. Default: `"terminal"` (child reached a terminal state). `"state:<name>"` and `"context:<key>"` are reserved for future releases. |
+| `name_filter` | No | Prefix filter for child names. Only children whose names start with this prefix are checked. Useful when a parent has multiple fan-out phases with different child name prefixes. |
+
+The compiler rejects unknown completion prefixes. If zero children match the filter, the gate fails (prevents vacuous pass).
+
+When the gate blocks, the blocking condition's `category` is `"temporal"` — the agent should retry later rather than take corrective action.
+
+**Single-state fan-out pattern.** The most common hierarchy pattern puts the directive (telling the agent what to spawn) and the children-complete gate on the same state. The agent reads the directive, spawns children, then polls `koto next` until children finish:
+
+```yaml
+states:
+  fan_out:
+    gates:
+      children-done:
+        type: children-complete
+    transitions:
+      - target: converge
+        when:
+          gates.children-done.all_complete: true
+      - target: fan_out
+        when:
+          gates.children-done.all_complete: false
+  converge:
+    # ... process child results
 ```
 
 ### Gate output fields
@@ -279,6 +320,12 @@ Each gate type produces structured output that the engine injects into the evide
 | `context-exists` | `error` | string | Empty on normal pass or fail. Error message when the context store is unavailable. |
 | `context-matches` | `matches` | boolean | `true` if the content at `key` matches `pattern`. |
 | `context-matches` | `error` | string | Empty on normal pass or fail. Error message when the store is unavailable or the pattern is invalid. |
+| `children-complete` | `total` | number | Total number of matching children. |
+| `children-complete` | `completed` | number | Children that meet the completion condition. |
+| `children-complete` | `pending` | number | Children that haven't completed yet. |
+| `children-complete` | `all_complete` | boolean | `true` when every child meets the completion condition. |
+| `children-complete` | `children` | array | Per-child detail: `[{"name": "...", "state": "...", "complete": true/false}]`. |
+| `children-complete` | `error` | string | Empty on normal evaluation. Error message on backend failures. |
 
 `passed` is not a field name in any gate type. Don't use it in `when` conditions.
 
@@ -359,8 +406,9 @@ Built-in defaults for all three gate types:
 | `command` | `{"exit_code": 0, "error": ""}` |
 | `context-exists` | `{"exists": true, "error": ""}` |
 | `context-matches` | `{"matches": true, "error": ""}` |
+| `children-complete` | `{"total": 0, "completed": 0, "pending": 0, "all_complete": true, "children": [], "error": ""}` |
 
-All three built-in types always have a built-in default, so `koto overrides record` always succeeds for them without `--with-data` or `override_default`. Setting `override_default` is useful when you want a specific non-passing value injected (for example, a known exit code that triggers a particular routing branch).
+All four built-in types always have a built-in default, so `koto overrides record` always succeeds for them without `--with-data` or `override_default`. Setting `override_default` is useful when you want a specific non-passing value injected (for example, a known exit code that triggers a particular routing branch).
 
 The compiler validates `override_default` at compile time (D2 check): all required fields must be present, no extra fields, and each value must match the expected type.
 
@@ -382,7 +430,7 @@ koto overrides list <session-name>
 
 `--rationale` is required. `--with-data` is optional. The override is epoch-scoped -- it applies until the next state transition and is then superseded. The override is recorded in the session event log and appears in `koto overrides list` output even after a rewind.
 
-In `koto next` responses, `blocking_conditions[].agent_actionable` is `true` for all three built-in gate types, signaling that `koto overrides record` is available.
+In `koto next` responses, `blocking_conditions[].agent_actionable` is `true` for all four built-in gate types, signaling that `koto overrides record` is available.
 
 ### Combining gates and evidence routing
 
@@ -434,6 +482,14 @@ This flag is transitional. New templates should always use `gates.*` routing and
 
 `koto init` always runs in permissive mode and never requires the flag -- it emits a warning for legacy-gate states and initializes anyway.
 
+### Compiler validation for `children-complete`
+
+The compiler validates `children-complete` gate fields at compile time:
+
+- `completion` must use a recognized prefix: `"terminal"` (the only one shipped so far), `"state:<name>"`, or `"context:<key>"`. Unknown prefixes are rejected.
+- `name_filter` is optional and not validated beyond being a string (the prefix match happens at runtime).
+- Like all gate types, `children-complete` gates must have corresponding `gates.*` when-clause routing or the D5 check will fail.
+
 ### Self-loops
 
 A transition whose target is its own state creates a retry loop. The agent (or the engine via gate routing) stays in the state until conditions change:
@@ -451,6 +507,97 @@ transitions:
 ### Split topology
 
 A state with multiple outbound `when` transitions is a split point. The mutual exclusivity constraint from Layer 2 applies -- the transition conditions must be unambiguous. Gate-only splits (no agent evidence) are mutually exclusive naturally as long as the gate field values differ across transitions.
+
+## Parent-child template pair
+
+A parent template fans out work to child workflows and waits for them. The child template is a normal template — it doesn't know or care that it has a parent.
+
+**Parent template** (`research-coordinator.md`):
+
+```yaml
+---
+name: research-coordinator
+version: "1.0"
+description: Fan out research to agents, then synthesize
+initial_state: fan_out
+
+states:
+  fan_out:
+    gates:
+      children-done:
+        type: children-complete
+        name_filter: "research."
+    transitions:
+      - target: synthesize
+        when:
+          gates.children-done.all_complete: true
+      - target: fan_out
+        when:
+          gates.children-done.all_complete: false
+  synthesize:
+    accepts:
+      summary:
+        type: string
+        required: true
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## fan_out
+
+Spawn child workflows for each research topic. Use `koto init <name> --parent {{SESSION_NAME}} --template <child-template>` for each child. Name them with a `research.` prefix (e.g., `research.topic-1`).
+
+<!-- details -->
+
+After spawning children, call `koto next {{SESSION_NAME}}` to check progress. The `children-done` gate will block until all `research.*` children reach a terminal state. You don't need to do anything to unblock it — just wait for the children to finish, then call `koto next` again.
+
+## synthesize
+
+All research agents have finished. Read their results with `koto context get <child-name> findings` for each child, then synthesize a summary.
+
+## done
+
+Research complete.
+```
+
+**Child template** (`research-agent.md`):
+
+```yaml
+---
+name: research-agent
+version: "1.0"
+description: Research a single topic
+initial_state: research
+
+variables:
+  TOPIC:
+    description: The topic to research
+    required: true
+
+states:
+  research:
+    accepts:
+      findings:
+        type: string
+        required: true
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## research
+
+Research {{TOPIC}} and submit your findings.
+
+## done
+
+Research complete.
+```
+
+The parent creates children with `koto init research.topic-1 --parent coordinator --template research-agent.md --var TOPIC="memory safety"`. Each child runs independently. The parent's `children-done` gate passes once every `research.*` child reaches a terminal state.
 
 ## Mermaid previews
 

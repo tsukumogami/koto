@@ -64,7 +64,7 @@ Every `koto next` response includes an `action` field. Dispatch on this field on
 | `action` | What it means | What you do |
 |---|---|---|
 | `evidence_required` | The state needs input. May have gates blocking too. | Read `directive`. Check `blocking_conditions` and `expects.fields` to determine the sub-case — see below. |
-| `gate_blocked` | One or more gates failed and the state has no evidence fallback. | Read `directive` and `blocking_conditions`. Check `agent_actionable` on each item — override if possible, otherwise escalate to the user. |
+| `gate_blocked` | One or more gates failed and the state has no evidence fallback. | Read `directive` and `blocking_conditions`. Check `category` to distinguish temporal blocks (retry later) from corrective ones (fix something). Check `agent_actionable` on each item — override if possible, otherwise escalate to the user. |
 | `integration` | An integration ran and returned output. | Read `directive` and `integration.output`. Follow the directive's instructions for handling the output. |
 | `integration_unavailable` | An integration is declared but not configured. | Read `directive`. Follow any manual fallback instructions it provides. |
 | `done` | The workflow reached a terminal state. | Stop. The workflow is complete. |
@@ -102,6 +102,7 @@ One or more gates failed, but the state still accepts evidence. You can either f
 
 Check each item in `blocking_conditions`:
 
+- Check `category`: `"temporal"` means the condition will resolve on its own (e.g., child workflows finishing) — retry later. `"corrective"` (the default) means you or the user must fix something.
 - If `agent_actionable` is `true`: record an override (see [Override flow](#override-flow)), then re-query
 - If `agent_actionable` is `false`: you can't override this gate; submit evidence to bypass if the template allows it, or escalate to the user
 
@@ -134,6 +135,8 @@ koto next <name>
 
 The overridden gate is now treated as passed.
 
+For `children-complete` gates, the override pretends all children are done (the default value is `{"total":0, "completed":0, "pending":0, "all_complete":true, "children":[], "error":""}`). Use this when you know children are finished but the gate hasn't picked it up, or when you need to proceed regardless.
+
 When `agent_actionable` is `false`, the gate has no override mechanism. Don't call `koto overrides record` for it — the command will fail. Escalate to the user instead.
 
 ## Resuming a session
@@ -157,6 +160,73 @@ koto rewind <name>
 ```
 
 `koto rewind` walks back one state. Repeated calls walk back further. It can't go past the initial state.
+
+## Hierarchy
+
+A parent workflow can spawn child workflows and wait for them to finish. koto tracks the relationship but doesn't launch child agents — you do that yourself (Agent tool, subprocess, etc.).
+
+### Creating child workflows
+
+Link a child to its parent at init time:
+
+```bash
+koto init <child-name> --parent <parent-name> --template <path>
+```
+
+The `--parent` flag validates that the parent workflow exists and records the link in the child's state file. The naming convention `parent.child` is recommended but not enforced — the metadata link is what matters.
+
+### Checking children
+
+List a parent's children:
+
+```bash
+koto workflows --children <parent-name>
+```
+
+Other useful filters:
+
+```bash
+koto workflows --roots        # only parentless workflows
+koto workflows --orphaned     # children whose parent was cleaned up
+```
+
+### Reading child state
+
+Check where a child is without side effects:
+
+```bash
+koto status <child-name>
+```
+
+Returns `name`, `current_state`, `template_path`, `template_hash`, and `is_terminal`. No gates are evaluated, no state changes happen.
+
+Read a child's stored results:
+
+```bash
+koto context get <child-name> <key>
+```
+
+### Temporal blocking
+
+When a parent has a `children-complete` gate, `koto next` returns `gate_blocked` or `evidence_required` with a blocking condition whose `category` is `"temporal"`. The `output` field shows per-child status:
+
+```json
+{
+  "total": 3, "completed": 2, "pending": 1, "all_complete": false,
+  "children": [
+    {"name": "plan.issue-1", "state": "done", "complete": true},
+    {"name": "plan.issue-2", "state": "done", "complete": true},
+    {"name": "plan.issue-3", "state": "implement", "complete": false}
+  ],
+  "error": ""
+}
+```
+
+Temporal blocks resolve on their own — children will finish without your intervention. Poll `koto next` periodically rather than trying to fix anything. Once all children reach their completion condition, the gate passes and the parent advances.
+
+### Advisory lifecycle
+
+When you cancel, clean up, or rewind a parent, the response includes a `children` array listing affected child workflows. koto doesn't cascade these operations — it tells you which children exist so you can decide what to do with them.
 
 ## Recording decisions
 

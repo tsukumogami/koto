@@ -67,6 +67,19 @@
     },
     {
       "id": 6,
+      "name": "children-complete-gate-template",
+      "prompt": "I'm writing a koto template for a workflow that spawns 5 research agents, waits for all of them to finish, then synthesizes their results. The research children will be named with a 'research.' prefix. How do I write the gate that waits for all children to complete?",
+      "expected_output": "Agent writes a children-complete gate with name_filter for the 'research.' prefix, uses gates.* routing with all_complete field, and shows the self-loop pattern for polling.",
+      "files": [],
+      "assertions": [
+        "Response includes a gate declaration with `type: children-complete`",
+        "Response includes `name_filter: \"research.\"` to scope the gate to research children",
+        "Response uses `gates.*` when-clause routing with `all_complete` (e.g., `gates.<gate-name>.all_complete: true`)",
+        "Response shows a self-loop transition for the case when children aren't done yet (target points back to the same state when all_complete is false)"
+      ]
+    },
+    {
+      "id": 7,
       "name": "negative-general-yaml-redirect",
       "prompt": "I need to write a YAML configuration file for my Kubernetes deployment. Can you help me structure the pods and services?",
       "expected_output": "Agent recognizes this is a general Kubernetes YAML question, not a koto template authoring question. It does not invoke koto-author concepts.",
