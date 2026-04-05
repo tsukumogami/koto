@@ -6429,3 +6429,284 @@ fn status_missing_workflow() {
         json["error"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Advisory child info in lifecycle commands
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cancel_parent_includes_children_array() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    // Create parent and child workflows.
+    koto_cmd(dir.path())
+        .args(["init", "parent-cancel", "--template", src_str])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-cancel",
+            "--template",
+            src_str,
+            "--parent",
+            "parent-cancel",
+        ])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["cancel", "parent-cancel"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "cancel should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["cancelled"], true);
+    assert_eq!(json["name"].as_str(), Some("parent-cancel"));
+
+    let children = json["children"]
+        .as_array()
+        .expect("children should be an array");
+    assert_eq!(children.len(), 1, "should have one child");
+    assert_eq!(children[0]["name"].as_str(), Some("child-cancel"));
+    assert!(
+        children[0]["state"].as_str().is_some(),
+        "child should have a state field"
+    );
+}
+
+#[test]
+fn cancel_workflow_no_children_returns_empty_array() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "solo-cancel", "--template", src_str])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["cancel", "solo-cancel"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let children = json["children"]
+        .as_array()
+        .expect("children should be an array");
+    assert!(
+        children.is_empty(),
+        "children should be empty when no children exist"
+    );
+}
+
+#[test]
+fn rewind_parent_includes_children_array() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    // Create parent, advance it so rewind is possible, then create child.
+    koto_cmd(dir.path())
+        .args(["init", "parent-rewind", "--template", src_str])
+        .output()
+        .unwrap();
+
+    // Append a transition event so rewind has somewhere to go back to.
+    let state_path = session_state_path(dir.path(), "parent-rewind");
+    let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&state_path)
+            .unwrap();
+        writeln!(f, "{}", extra_event).unwrap();
+    }
+
+    // Create child workflow.
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-rewind",
+            "--template",
+            src_str,
+            "--parent",
+            "parent-rewind",
+        ])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["rewind", "parent-rewind"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "rewind should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["name"].as_str(), Some("parent-rewind"));
+
+    let children = json["children"]
+        .as_array()
+        .expect("children should be an array");
+    assert_eq!(children.len(), 1, "should have one child");
+    assert_eq!(children[0]["name"].as_str(), Some("child-rewind"));
+    assert!(
+        children[0]["state"].as_str().is_some(),
+        "child should have a state field"
+    );
+}
+
+#[test]
+fn rewind_workflow_no_children_returns_empty_array() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "solo-rewind", "--template", src_str])
+        .output()
+        .unwrap();
+
+    // Append a transition event so rewind is possible.
+    let state_path = session_state_path(dir.path(), "solo-rewind");
+    let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&state_path)
+            .unwrap();
+        writeln!(f, "{}", extra_event).unwrap();
+    }
+
+    let output = koto_cmd(dir.path())
+        .args(["rewind", "solo-rewind"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let children = json["children"]
+        .as_array()
+        .expect("children should be an array");
+    assert!(
+        children.is_empty(),
+        "children should be empty when no children exist"
+    );
+}
+
+#[test]
+fn session_cleanup_parent_includes_children_array() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    // Create parent and child workflows.
+    koto_cmd(dir.path())
+        .args(["init", "parent-cleanup", "--template", src_str])
+        .output()
+        .unwrap();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-cleanup",
+            "--template",
+            src_str,
+            "--parent",
+            "parent-cleanup",
+        ])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["session", "cleanup", "parent-cleanup"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "cleanup should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["name"].as_str(), Some("parent-cleanup"));
+    assert_eq!(json["cleaned_up"], true);
+
+    let children = json["children"]
+        .as_array()
+        .expect("children should be an array");
+    assert_eq!(children.len(), 1, "should have one child");
+    assert_eq!(children[0]["name"].as_str(), Some("child-cleanup"));
+    assert!(
+        children[0]["state"].as_str().is_some(),
+        "child should have a state field"
+    );
+
+    // Verify parent is actually cleaned up.
+    let list_output = koto_cmd(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+    let list: serde_json::Value = serde_json::from_slice(&list_output.stdout).unwrap();
+    let ids: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        !ids.contains(&"parent-cleanup"),
+        "parent should be removed after cleanup"
+    );
+    assert!(
+        ids.contains(&"child-cleanup"),
+        "child should still exist (no cascade)"
+    );
+}
+
+#[test]
+fn session_cleanup_no_children_returns_empty_array() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+    let src_str = src.to_str().unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "solo-cleanup", "--template", src_str])
+        .output()
+        .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["session", "cleanup", "solo-cleanup"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let children = json["children"]
+        .as_array()
+        .expect("children should be an array");
+    assert!(
+        children.is_empty(),
+        "children should be empty when no children exist"
+    );
+}
