@@ -620,7 +620,15 @@ blocked`. `all_complete` tightens to `pending == 0 AND blocked == 0`.
 can look up the batch definition when computing `blocked` and
 un-spawned task entries.
 
-**5.4 `retry_failed` evidence action.** The parent submits:
+**5.4 `retry_failed` evidence action.** `retry_failed` becomes a
+reserved top-level evidence key, treated like `gates` — the
+existing `evidence_has_reserved_gates_key` check at
+`src/cli/mod.rs:537-545` is generalized to reject any template
+that declares `retry_failed` in `accepts` with a clear compile
+error (so a template author can't accidentally collide with
+scheduler semantics).
+
+The parent submits:
 
 ```json
 {"retry_failed": {"children": ["parent.issue-2"], "include_skipped": true}}
@@ -634,12 +642,28 @@ On submission, a new handler in the scheduler:
    the DAG (`include_skipped: true` extends the set to include
    dependents that were skipped because of a failure in the retry
    set).
-3. For each child in the closure, calls an internal
-   `rewind_to_initial(name)` helper — reusing the existing
-   `Rewound` event machinery from `handle_rewind` — to create a
-   new epoch that drops prior evidence.
+3. For each child in the closure, calls
+   `internal_rewind_to_initial(name)`. For **failed children**,
+   this appends a `Rewound` event targeting the initial state,
+   starting a fresh epoch (prior evidence invisible). For
+   **skipped children**, the situation is different: a skipped
+   child's event log is only `WorkflowInitialized` plus one
+   `Transitioned → skipped_marker_state`, and
+   `handle_rewind` at `src/cli/mod.rs:1198-1204` errors with
+   "already at initial state, cannot rewind" on single-transition
+   chains. The helper detects this case and, instead of rewinding,
+   atomically deletes the synthetic skipped child state file so
+   the next scheduler tick re-classifies the task as
+   `NotYetSpawned` and re-materializes it from scratch. The
+   delete-and-respawn path is only taken for children whose state
+   files carry `skipped_marker: true` on their current state; real
+   failed children always take the rewind path.
 4. Appends a clearing `{"retry_failed": null}` event to the parent
-   so the next scheduler tick doesn't re-rewind.
+   so the next scheduler tick doesn't re-rewind. The null-clearing
+   idiom depends on `merge_epoch_evidence` treating null values
+   as "unset"; this must be documented with a prominent code
+   comment where the handler lives so future maintainers don't
+   accidentally break it.
 
 Subsequent `koto next parent` calls tick the scheduler, which sees
 the rewound children as non-terminal and reclassifies them as
@@ -1072,7 +1096,12 @@ full JSON example.
      `EvidenceSubmitted` event via `derive_evidence` +
      `merge_epoch_evidence`.
    - Builds the DAG and runs runtime validation (R1–R7). Cycles,
-     dangling refs, and duplicate names fail the whole submission.
+     dangling refs, and duplicate names fail the whole submission
+     with `BatchError::InvalidBatchDefinition`. For dynamic
+     additions where the cycle emerges only from the merge of
+     original + appended tasks, the scheduler rejects the
+     resubmission before any new spawn happens; already-spawned
+     children from earlier submissions are untouched.
    - Classifies each task: `Terminal` (child exists and is terminal
      non-failure), `Failed` (child exists and is terminal with
      `failure: true`), `Skipped` (child exists and has
@@ -1455,6 +1484,28 @@ manually `cat`ing the file — no privilege boundary is crossed.
   this context key. This prevents accidental leakage of paths, env
   var values, or secrets into batch status responses that observers
   (other agents, human operators) consume.
+
+### Cloud sync concurrent submission
+
+If two machines submit different task lists to the same parent
+workflow in quick succession while cloud sync is enabled, the
+losing side's write conflicts with the winning side's full-file
+upload (`sync_push_state` is a PUT, not a merge). The existing
+conflict-resolution path (`koto session resolve`, driven by
+`src/session/version.rs::check_sync`) surfaces the divergence to
+the user, but does not merge task lists automatically: whichever
+version wins replaces the other, and any children the losing side
+already spawned locally become orphaned relative to the merged
+parent state.
+
+This matches v0.7.0's behavior for concurrent evidence submission
+generally (cloud sync doesn't merge event logs, it detects and
+surfaces conflicts). Batch spawning doesn't introduce new concurrency
+risks beyond this pre-existing limitation, but the failure mode is
+more visible because batch workflows are more likely to run across
+machines in parallel. Consumers running batched workflows on multiple
+machines simultaneously should coordinate submissions externally
+(e.g., by running all submissions on one coordinator machine).
 
 ### Symlink and directory assumptions
 
