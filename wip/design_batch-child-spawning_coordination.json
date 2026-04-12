@@ -1,0 +1,52 @@
+{
+  "topic": "batch-child-spawning",
+  "mode": "auto",
+  "scope": "tactical",
+  "visibility": "public",
+  "decisions": [
+    {
+      "id": 1,
+      "question": "What is the task list schema, template hook shape, and compiler validation contract?",
+      "status": "pending",
+      "complexity": "standard",
+      "notes": "Couples schema, hook name, and validation depth. Must fit v0.7.0 template format and the new `json` accepts field type."
+    },
+    {
+      "id": 2,
+      "question": "How do we fix the atomic child-spawn window in handle_init without breaking append-only semantics?",
+      "status": "pending",
+      "complexity": "critical",
+      "notes": "Options: tmp+rename for state file creation; write header and first event as one atomic append; repair subcommand; make handle_init idempotent."
+    },
+    {
+      "id": 3,
+      "question": "How do we prevent a batch-hook template from silently no-opping on pre-batch koto binaries?",
+      "status": "pending",
+      "complexity": "standard",
+      "notes": "Options: bump format_version to 2; add deny_unknown_fields retroactively; compile-time warning; accept silent no-op with docs."
+    },
+    {
+      "id": 4,
+      "question": "How should child-template paths resolve when a parent submits tasks from one working directory and koto spawns children?",
+      "status": "pending",
+      "complexity": "standard",
+      "notes": "Options: absolute-only; parent-cwd captured in submission; child-cwd at spawn; dedicated template root."
+    },
+    {
+      "id": 5,
+      "question": "How are failed and skipped children represented, and what is the retry_failed surface?",
+      "status": "pending",
+      "complexity": "critical",
+      "notes": "Couples representation (real state files vs parent-side records), gate output, and retry evidence action shape. Upstream of decision 6."
+    },
+    {
+      "id": 6,
+      "question": "How do koto status and koto workflows --children report batch state to observers?",
+      "status": "pending",
+      "complexity": "standard",
+      "notes": "Options: extend existing JSON outputs additively; new `koto batch status` subcommand; rely on existing --children output. Depends on decision 5 representation."
+    }
+  ],
+  "cross_validation": "pending",
+  "round": 0
+}
