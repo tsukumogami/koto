@@ -693,3 +693,510 @@ They share three cross-cutting PR landing requirements:
    metadata.
 
 See Implementation Approach below for the phased landing sequence.
+
+## Solution Architecture
+
+### Overview
+
+Koto gains one new engine module, four new template fields, two new
+state-file / event-log fields, one new `SessionBackend` trait method,
+and an extended `children-complete` gate output schema. No existing
+components are removed or restructured. The advance loop, persistence
+layer, and gate evaluator core are unchanged.
+
+The new surface divides into three concerns:
+
+1. **Declarative materialization** — the template-level hook
+   (`materialize_children`), its compiler validation, and the scheduler
+   tick that reads it and spawns children.
+2. **Atomic child-spawn safety** — the `init_state_file` backend method
+   that bundles header + initial events into one atomic `rename(2)`.
+   Used by three call sites: regular `koto init`, the scheduler's
+   spawn path, and the skipped-marker synthesis path.
+3. **Failure and retry** — first-class terminal-failure, synthetic
+   skipped-marker state files, extended gate output, `retry_failed`
+   evidence action, and observability through extended `koto status`
+   and `koto workflows --children` output.
+
+### Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  src/cli/mod.rs                                             │
+│                                                             │
+│  handle_next ────────┬──> advance_until_stop (unchanged)    │
+│                      │                                      │
+│                      └──> run_batch_scheduler  (NEW)         │
+│                                    │                        │
+│                                    ▼                        │
+│                          src/engine/batch.rs  (NEW)          │
+│                          ┌──────────────────────────┐        │
+│                          │ run_batch_scheduler      │        │
+│                          │   1. derive_evidence     │        │
+│                          │   2. build_dag           │        │
+│                          │   3. classify_task (all) │        │
+│                          │   4. spawn ready tasks   │        │
+│                          │   5. synthesize skips    │        │
+│                          │                          │        │
+│                          │ derive_batch_view        │        │
+│                          │   (read-only for status) │        │
+│                          │                          │        │
+│                          │ handle_retry_failed      │        │
+│                          │   (rewind + reclassify)  │        │
+│                          └──────────────────────────┘        │
+│                                    │                        │
+│                                    ▼                        │
+│  handle_init ──────┐      ┌────────────────────────┐        │
+│  handle_status ────┼────> │ init_state_file        │        │
+│  handle_workflows ─┘      │   (atomic bundle)      │        │
+│                           └────────────────────────┘        │
+└─────────────────────────────────────────────────────────────┘
+          │
+          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  src/session/  (SessionBackend trait)                       │
+│                                                             │
+│  local.rs: init_state_file via tempfile::persist (NEW)      │
+│  cloud.rs: delegate to local + one sync_push_state (NEW)    │
+│  (mod.rs: add init_state_file method to trait)              │
+└─────────────────────────────────────────────────────────────┘
+          ▲
+          │
+┌─────────────────────────────────────────────────────────────┐
+│  src/gate.rs / src/cli/mod.rs::evaluate_children_complete   │
+│                                                             │
+│  - Extends output schema: success, failed, skipped,         │
+│    blocked, per-child outcome enum (EXTENDED)               │
+│  - Reads TemplateState.failure for classification           │
+│  - Takes parent_events to resolve batch definition          │
+└─────────────────────────────────────────────────────────────┘
+          ▲
+          │
+┌─────────────────────────────────────────────────────────────┐
+│  src/template/                                              │
+│                                                             │
+│  types.rs: TemplateState gains                              │
+│    - materialize_children: Option<MaterializeChildrenSpec>  │
+│    - failure: bool (meaningful when terminal)               │
+│    - skipped_marker: bool (synthetic-marker indicator)      │
+│    - #[serde(deny_unknown_fields)] attribute                │
+│                                                             │
+│  types.rs: accepts field type gains `json` variant          │
+│                                                             │
+│  compile.rs: new validator for materialize_children         │
+│    enforcing E1-E8 errors and W1-W2 warnings                │
+└─────────────────────────────────────────────────────────────┘
+          ▲
+          │
+┌─────────────────────────────────────────────────────────────┐
+│  src/engine/types.rs                                        │
+│                                                             │
+│  StateFileHeader gains                                      │
+│    template_source_dir: Option<String> (Decision 4)         │
+│                                                             │
+│  EventPayload::EvidenceSubmitted gains                      │
+│    submitter_cwd: Option<String> (Decision 4)               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Key Interfaces
+
+**New template fields** (`src/template/types.rs`):
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateState {
+    // ... existing fields ...
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialize_children: Option<MaterializeChildrenSpec>,
+
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub failure: bool,
+
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skipped_marker: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializeChildrenSpec {
+    pub from_field: String,
+    #[serde(default = "default_failure_policy")]
+    pub failure_policy: FailurePolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailurePolicy {
+    SkipDependents,
+    Continue,
+}
+```
+
+**New session backend method** (`src/session/mod.rs`):
+
+```rust
+pub trait SessionBackend: Send + Sync {
+    // ... existing methods ...
+
+    /// Atomically create a session with the given header and initial events.
+    /// Writes to a temp file and renames into place. Replaces the three-call
+    /// sequence (create + append_header + append_event) used by handle_init.
+    fn init_state_file(
+        &self,
+        name: &str,
+        header: StateFileHeader,
+        initial_events: Vec<Event>,
+    ) -> Result<(), SessionError>;
+}
+```
+
+**New engine module** (`src/engine/batch.rs`):
+
+```rust
+pub enum SchedulerOutcome {
+    NoBatch,
+    Scheduled {
+        spawned: Vec<String>,
+        skipped: Vec<(String, String)>,  // (task, reason)
+        already: Vec<String>,
+        blocked: Vec<String>,
+    },
+    Error { reason: String },
+}
+
+pub fn run_batch_scheduler(
+    backend: &dyn SessionBackend,
+    template: &CompiledTemplate,
+    current_state: &str,
+    parent_name: &str,
+    events: &[Event],
+) -> Result<SchedulerOutcome, BatchError>;
+
+pub fn derive_batch_view(
+    backend: &dyn SessionBackend,
+    template: &CompiledTemplate,
+    current_state: &str,
+    parent_name: &str,
+    events: &[Event],
+) -> Result<Option<BatchView>, BatchError>;
+
+pub fn handle_retry_failed(
+    backend: &dyn SessionBackend,
+    template: &CompiledTemplate,
+    parent_name: &str,
+    events: &[Event],
+    retry_set: &[String],
+    include_skipped: bool,
+) -> Result<(), BatchError>;
+```
+
+**Task list schema** (submitted as evidence JSON):
+
+```json
+{
+  "tasks": [
+    {
+      "name": "issue-1",
+      "template": "impl-issue.md",
+      "vars": {"ISSUE_NUMBER": "1"},
+      "waits_on": []
+    },
+    {
+      "name": "issue-2",
+      "template": "impl-issue.md",
+      "vars": {"ISSUE_NUMBER": "2"},
+      "waits_on": ["issue-1"]
+    }
+  ]
+}
+```
+
+**Extended `children-complete` gate output** — see Decision 5 above
+for the full JSON example.
+
+**Extended `koto status` response** — see Decision 6 above for the
+full JSON example.
+
+### Data Flow
+
+**Initial submission and materialization:**
+
+1. Agent writes `plan.json` with the task list and calls
+   `koto next parent --with-data @plan.json`.
+2. `handle_next` reads the state file, compiles the parent template,
+   runs the advance loop. The advance loop validates the evidence
+   against the `accepts` schema (the `tasks` field is declared
+   `type: json`, `required: true`), appends an `EvidenceSubmitted`
+   event with the task list plus the captured `submitter_cwd`, and
+   transitions normally.
+3. After `advance_until_stop` returns, `handle_next` calls
+   `run_batch_scheduler` with the final state, parent name, template,
+   and full event list.
+4. `run_batch_scheduler`:
+   - Reads the `materialize_children` hook on the current state. If
+     absent, returns `NoBatch`.
+   - Extracts the task list from the latest epoch's
+     `EvidenceSubmitted` event via `derive_evidence` +
+     `merge_epoch_evidence`.
+   - Builds the DAG and runs runtime validation (R1–R7). Cycles,
+     dangling refs, and duplicate names fail the whole submission.
+   - Classifies each task: `Terminal` (child exists and is terminal
+     non-failure), `Failed` (child exists and is terminal with
+     `failure: true`), `Skipped` (child exists and has
+     `skipped_marker: true`), `Running` (child exists but not
+     terminal), `NotYetSpawned` but `Ready` (dependencies all
+     Terminal), `NotYetSpawned` but `BlockedByDep` (waits on
+     non-Terminal task), or `NotYetSpawned` but `ShouldBeSkipped` (a
+     dependency is Failed and `failure_policy` is `skip_dependents`).
+   - For each `Ready` task, calls `init_state_file` via a helper
+     refactored from `handle_init`, passing the parent's
+     `template_source_dir` as the resolution base. The child name is
+     `<parent>.<task.name>`.
+   - For each `ShouldBeSkipped` task, synthesizes a skipped child:
+     calls `init_state_file` with a header pointing at the parent
+     template and an initial-events list containing
+     `WorkflowInitialized` plus `Transitioned → <skipped_marker_state>`
+     plus a context write (`skipped_because: <failed_task>`).
+   - Returns `SchedulerOutcome::Scheduled` with per-task counts.
+5. `handle_next` maps `SchedulerOutcome` into the response JSON. The
+   outer response still reflects the advance loop's decision (gate
+   blocked, evidence required, etc.); the scheduler result is an
+   additive field for observability.
+
+**Resume:**
+
+On every subsequent `koto next parent` call, the same code path runs.
+`run_batch_scheduler` is a pure function of (parent event log) +
+(children on disk). No persisted cursor. Task status is derived fresh
+every time. Crashes are recoverable because:
+
+- `init_state_file` is atomic — no half-initialized state files.
+- Children that were spawned before the crash show up in
+  `backend.list()` on resume; the scheduler classifies them as
+  `Running` or `Terminal` based on their event logs.
+- Tasks that hadn't been spawned yet are re-computed as `Ready` or
+  `BlockedByDep` from current disk state.
+- `EvidenceSubmitted` events are append-only; the task list is
+  reconstructed identically on every call.
+
+**Retry:**
+
+1. Parent is at a post-batch analysis state (e.g., `analyze_results`)
+   after `children-complete` passed with some failures and skips.
+2. Agent submits
+   `koto next parent --with-data '{"retry_failed": {"children": ["parent.issue-2"], "include_skipped": true}}'`.
+3. The advance loop sees the `retry_failed` evidence and transitions
+   the parent back to `awaiting_children` via a template-defined
+   route.
+4. `handle_next` then calls the scheduler. Before the normal tick,
+   the scheduler detects the unconsumed `retry_failed` evidence and
+   runs `handle_retry_failed`:
+   - Computes transitive closure of the retry set through the DAG.
+   - For each child in the closure, appends a `Rewound` event to its
+     state file (reusing `handle_rewind`'s machinery via an
+     `internal_rewind_to_initial` helper). This creates a new epoch;
+     prior evidence is invisible to the current epoch.
+   - Appends a clearing `{"retry_failed": null}` evidence event to
+     the parent to mark the action consumed.
+5. The normal scheduler tick then runs on the now-rewound children,
+   sees them as non-terminal, and the usual flow (wait, gate
+   re-evaluates, terminate, etc.) resumes.
+
+## Implementation Approach
+
+The design lands in three sequential PRs. Each PR is independently
+reviewable, testable, and shippable.
+
+### Phase 1: Atomic init bundle (Decision 2)
+
+Ship the atomicity fix first. It's independently valuable for
+v0.7.0's existing `koto init` path and unblocks the scheduler
+implementation.
+
+**Deliverables:**
+- New `SessionBackend::init_state_file` trait method in
+  `src/session/mod.rs`
+- `LocalBackend::init_state_file` using
+  `tempfile::NamedTempFile::persist` in `src/session/local.rs`
+- `CloudBackend::init_state_file` delegating to local + one
+  `sync_push_state` in `src/session/cloud.rs`
+- `handle_init` in `src/cli/mod.rs:1112-1150` refactored to use
+  `init_state_file`
+- New test: crash between `create` and `append_event` leaves no
+  header-only state file
+- New test: resume after simulated crash via temp-file remnants works
+
+**No user-visible change.** Existing `koto init` behavior is
+preserved; only the internal sequence is tightened.
+
+### Phase 2: Schema-layer changes (Decisions 1, 3, 4, 5)
+
+Land all template-format and type changes in one PR. This is the
+big PR but the changes are mostly additive.
+
+**Deliverables:**
+- `TemplateState` gains `materialize_children`, `failure`,
+  `skipped_marker` fields
+- `MaterializeChildrenSpec` and `FailurePolicy` types
+- Accepts schema `VALID_FIELD_TYPES` gains `json`
+- `#[serde(deny_unknown_fields)]` on `SourceState` and `TemplateState`
+  (Decision 3); pre-merge audit confirms no templates rely on unknown
+  fields
+- `StateFileHeader` gains `template_source_dir` (Decision 4)
+- `EventPayload::EvidenceSubmitted` gains `submitter_cwd` (Decision 4)
+- `CompiledTemplate::validate` extended with E1–E8 errors and W1–W2
+  warnings for `materialize_children`
+- `handle_init` captures `template_source_dir` from the canonicalized
+  `--template` argument's parent directory
+- `handle_next` writes `submitter_cwd` into `EvidenceSubmitted` events
+- `--with-data @file.json` prefix added to `validate_with_data_payload`
+- Tests for each compiler rule, each field default, and round-trip
+  compat with v0.7.0 state files and templates
+
+**No batch scheduler yet.** This PR unlocks the template vocabulary
+but doesn't actually spawn children from evidence. Authors can
+declare `materialize_children` and the compiler will validate it,
+but runtime is a no-op.
+
+### Phase 3: Scheduler, retry, and observability (Decisions 5, 6)
+
+Wire up the actual scheduler and observability.
+
+**Deliverables:**
+- New module `src/engine/batch.rs` with `run_batch_scheduler`,
+  `derive_batch_view`, `handle_retry_failed`, `classify_task`,
+  `build_dag`, DAG cycle detector
+- `handle_next` in `src/cli/mod.rs` calls `run_batch_scheduler`
+  after `advance_until_stop`
+- `evaluate_children_complete` extended to accept `parent_events`
+  and emit the Decision 5 gate output schema (additive fields:
+  `success`, `failed`, `skipped`, `blocked`, per-child `outcome`,
+  `failure_mode`, `skipped_because`, `blocked_by`)
+- `koto status` extended with optional `batch` section
+- `koto workflows --children` extended with per-row batch metadata
+- `retry_failed` evidence action wired through the advance loop to
+  `handle_retry_failed`
+- `internal_rewind_to_initial(name)` helper extracted from
+  `handle_rewind` for per-child rewind
+- Integration tests for: linear batch, diamond DAG, mid-flight
+  append, failure with skip-dependents, `retry_failed` recovery,
+  crash-resume walkthrough from Decision 5's section 5.5
+- koto-author and koto-user skill updates covering
+  `materialize_children`, the extended gate output, and the
+  `retry_failed` action
+
+**End of Phase 3, the feature is complete.** The shirabe work-on-plan
+design (tsukumogami/shirabe#67) can begin rewriting its spawn loop
+against the new surface.
+
+### Not in scope for v1
+
+These items are explicitly deferred:
+
+- Per-task `trigger_rule` vocabulary (Airflow-style granular failure
+  rules). The `trigger_rule` field is reserved but only
+  `all_success` is accepted.
+- Multiple `materialize_children` blocks per template. E8 enforces
+  one hook per template in v1. Multi-batch support is a future
+  extension.
+- Pause-on-failure and fail-fast failure policies. Only
+  `skip_dependents` and `continue` are accepted in v1.
+- Automatic retry (exponential backoff, max attempts). Retry is
+  always explicit via `retry_failed` evidence.
+- Cross-batch dependency edges (a task in batch A waiting on a task
+  in batch B). Out of scope.
+- A new `koto batch` subcommand namespace. All observability flows
+  through existing `koto status` and `koto workflows --children`.
+
+## Consequences
+
+### Positive
+
+- **Eliminates prose spawn loops in SKILL.md consumers.** Shirabe
+  PR #67 can replace its `spawn_and_execute` state's prose
+  orchestration with a declarative `materialize_children` hook.
+  Future consumers (including the koto-user skill's own
+  documentation) get a reliable, testable primitive.
+- **Free idempotency on resume.** The disk-derivation storage
+  strategy plus deterministic `<parent>.<task>` naming means the
+  scheduler is idempotent by construction. No persisted cursor, no
+  "replay protection" bookkeeping, no race conditions on retry.
+- **First-class failure semantics.** The new `failure: bool` field
+  on terminal states unblocks not just batch scheduling but any
+  future feature that needs to distinguish success from failure at
+  the protocol level (exit codes for `koto status`, CI gate
+  decisions, downstream automation).
+- **Atomic `init_state_file` fixes a pre-existing correctness bug.**
+  Phase 1 lands a fix that's valuable even if batch spawning never
+  shipped: v0.7.0's existing `koto init` path gets safer on crash.
+- **Extended `children-complete` gate output is backward compatible.**
+  Existing consumers that ignore unknown JSON fields continue to
+  work. New consumers get richer information.
+- **Shared `derive_batch_view` keeps `status` and `workflows --children`
+  in lockstep.** One helper, two read-only call sites, no
+  computation drift.
+
+### Negative
+
+- **Schema PR is large.** Decision 2's atomicity fix is clean, but
+  Phase 2 bundles six decisions' worth of schema changes into one
+  PR: three new `TemplateState` fields, a new accepts field type,
+  `deny_unknown_fields`, a new header field, a new event field.
+  Reviewers have a lot to track.
+- **`deny_unknown_fields` is a one-time migration risk.** Any
+  template fixture that has ever relied on unknown fields as
+  free-form annotations breaks with a clear error, but still
+  breaks. The pre-merge audit must be thorough.
+- **Batch observability has a read-time cost.** `koto status`
+  with a batch section calls `backend.list()` plus per-child reads.
+  For large batches (50+ children) on cloud sync, the per-call
+  cost is non-trivial. Not a regression for existing users (who
+  don't run batch templates), but a new cost class worth
+  monitoring.
+- **Retry semantics require template authors to understand rewind.**
+  `retry_failed` re-runs rewound children via the existing epoch
+  mechanism. Authors writing recovery transitions need to know
+  that `retry_failed` does not clear completed children from the
+  gate's count.
+- **Single-batch-per-template in v1 is a real constraint.** Some
+  use cases (e.g., parallel independent fanouts in different parent
+  states) are expressible under Reading B (nested `koto init
+  --parent`) but not under the flat batch model's single-hook
+  restriction. Users who hit this can fall back to Reading B
+  manually until multi-batch support ships.
+- **`template_source_dir` assumes the parent's template file
+  location is stable.** If a user moves the parent template
+  between submission and scheduler tick, relative resolution
+  fails. The `submitter_cwd` fallback covers the common case but
+  not all cases.
+
+### Mitigations
+
+- **Split Phase 2 if review velocity stalls.** The Decision 3
+  `deny_unknown_fields` attribute and Decision 4's header/event
+  fields can ship as separate small PRs before the main
+  `materialize_children` PR if reviewers prefer smaller chunks.
+- **Audit tooling for pre-merge check.** Add a grep-based
+  pre-merge check (or a one-time audit script committed to
+  `scripts/audit-unknown-fields.sh`) that scans all template
+  fixtures for the fields covered by `deny_unknown_fields`. Run it
+  once before merging Phase 2.
+- **Benchmark batch observability.** Phase 3 integration tests
+  should include a 50-task batch scenario to catch pathological
+  `backend.list()` + per-child-read costs. If the cost is
+  unacceptable, cache the classification within a single
+  `koto status` call.
+- **Document `retry_failed` + rewind interaction.** koto-user skill
+  updates in Phase 3 include a worked example showing how
+  `retry_failed` interacts with the `children-complete` gate
+  output, so consumer agents build the right mental model.
+- **Document the single-batch restriction.** koto-author skill
+  updates note the E8 compile-time check and explain when to use
+  nested batches (Reading B) instead.
+- **Provide a clear error for missing child templates.** The
+  scheduler's resolution fallback (parent template dir →
+  submitter cwd → error) produces an error message listing both
+  attempted paths, so users immediately see what was tried.
