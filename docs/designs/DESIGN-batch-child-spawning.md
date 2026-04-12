@@ -1485,6 +1485,87 @@ every time. Crashes are recoverable because:
    sees them as non-terminal, and the usual flow (wait, gate
    re-evaluates, terminate, etc.) resumes.
 
+### Concurrency model
+
+A common consumer pattern is for an orchestrator agent (e.g.,
+shirabe's `work-on-plan.md`) to spawn multiple sub-agents, each
+driving one child workflow in parallel. This design supports that
+pattern, with one caller-side invariant.
+
+**Parallelism where it works naturally.** Each child workflow has
+its own state file. Once the scheduler has spawned N ready
+children in a tick, the orchestrator can drive them concurrently —
+`koto next child-1`, `koto next child-2`, ..., `koto next child-N`
+all operate on distinct state files with distinct event logs. No
+shared state, no races, no locks needed. This is where the
+parallelism lives.
+
+**Caller invariant: serialize scheduler ticks on the parent.**
+`koto next parent` (the scheduler tick) is not reentrant-safe
+against concurrent invocation. Two concurrent scheduler ticks can
+race on two surfaces:
+
+1. **Parent event log append.** Both ticks read the parent's log
+   at sequence N and both try to append sequence N+1. The existing
+   `expected_seq` integrity check catches this (or worse, silently
+   accepts duplicates and fails the next read). This is a
+   pre-existing v0.7.0 property of koto's append-only event log,
+   not something introduced by batch spawning, but the batch
+   scheduler inherits it.
+
+2. **`init_state_file` TOCTOU.** Both ticks see task-4 as ready,
+   both call `backend.exists("parent.task-4")` (returns false),
+   both call `init_state_file`. Unix `rename(2)` has no
+   "fail if exists" semantics, so the second rename silently
+   overwrites the first. If the child received events between
+   the two ticks, those events are lost.
+
+The invariant consumers must enforce: **only one `koto next parent`
+call may run at a time.** The typical pattern is one coordinator
+task that owns the parent (submits the batch, polls for progress,
+calls `retry_failed` on failures) plus N worker sub-agents that
+each drive one child. The coordinator serializes parent-side
+operations; the workers run in parallel on their own state files.
+
+**When to call `koto next parent` in a parallel batch.** The
+coordinator typically calls `koto next parent` (a) after
+submitting the initial task list, (b) when any child reaches a
+terminal state (to let the scheduler spawn newly-unblocked
+tasks), and (c) periodically as a fallback poll. A simple
+implementation has each worker sub-agent signal the coordinator
+on child-terminal, and the coordinator debounces to one tick per
+signal. A lazier implementation just polls on a timer.
+
+**Why this design doesn't serialize at the koto layer.** Adding
+file locking or `renameat2(RENAME_NOREPLACE)` at the
+`SessionBackend` level is tempting but has two costs: (1) it
+requires Linux-specific syscalls or portable lockfile dancing,
+and (2) it papers over a caller bug rather than surfacing it.
+Koto's stateless-CLI model already assumes "one process writes
+to one workflow at a time" for all non-batch operations; batch
+inherits that assumption unchanged rather than making batch
+special. If the existing v0.7.0 assumption needs to be tightened
+(e.g., for multi-machine cloud sync scenarios), that's a separate
+design concern affecting all of koto, not just batch spawning.
+
+**Concrete worked example.** A coordinator agent submits a
+20-task batch. First scheduler tick spawns 5 ready tasks
+(those with no `waits_on`). The coordinator starts 5 worker
+sub-agents, each calling `koto next child-N` in its own loop,
+driving its child to terminal state. As each child finishes,
+the worker returns control to the coordinator, which calls
+`koto next parent` once to re-tick the scheduler. The scheduler
+classifies: 1 terminal, 4 running, 15 un-spawned; of the 15,
+3 are now ready (their `waits_on` includes the finished task).
+The scheduler spawns those 3 in the same tick. The coordinator
+starts 3 more workers. And so on.
+
+At peak, up to 20 worker sub-agents could be running in parallel
+(minus however many are already terminal) while the coordinator
+serializes its own `koto next parent` calls. This scales
+linearly with task count on the child side and stays O(1) on
+the parent side.
+
 ## Implementation Approach
 
 The design lands in three sequential PRs. Each PR is independently
