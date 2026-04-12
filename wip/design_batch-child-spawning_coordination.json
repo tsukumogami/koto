@@ -9,7 +9,7 @@
       "question": "What is the task list schema, template hook shape, and compiler validation contract?",
       "status": "complete",
       "complexity": "standard",
-      "chosen": "State-level `materialize_children` block on TemplateState with from_field pointing at a required json-typed accepts field; failure_policy on the hook; 8 compile errors + 2 warnings + 7 runtime checks",
+      "chosen": "State-level `materialize_children` block on TemplateState with from_field pointing at a required tasks-typed accepts field; failure_policy on the hook; 8 compile errors + 2 warnings + 7 runtime checks",
       "confidence": "high",
       "report_file": "wip/design_batch-child-spawning_decision_1_report.md"
     },
@@ -72,7 +72,7 @@
       "question": "How does the agent discover the task entry schema and child template path?",
       "status": "complete",
       "complexity": "standard",
-      "chosen": "default_template (required) on MaterializeChildrenSpec + surface existing FieldSchema.description in ExpectsFieldSchema",
+      "chosen": "default_template (required) on MaterializeChildrenSpec + koto-generated item_schema from type: tasks in ExpectsFieldSchema",
       "confidence": "high",
       "report_file": "wip/design_batch-child-spawning_decision_8_report.md"
     }

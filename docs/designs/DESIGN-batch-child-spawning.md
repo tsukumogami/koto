@@ -14,7 +14,7 @@ problem: |
   completion detection, and failure routing end to end.
 decision: |
   The parent template declares a state-level `materialize_children` hook
-  that points at a required `json`-typed accepts field. When evidence is
+  that points at a required `tasks`-typed accepts field. When evidence is
   submitted with that field populated as a JSON array of task specs
   (name, template, vars, waits_on), a new CLI-level scheduler in
   `handle_next` (post-`advance_until_stop`) builds the DAG, classifies
@@ -461,7 +461,7 @@ spawning for any structured evidence payload.
   well-known convention; adding a parallel flag doubles the
   surface without new expressive power.
 
-### Decision E7: Accepts schema supports structured JSON evidence
+### Decision E7: Purpose-built `tasks` type replaces generic `json`
 
 Koto's `accepts` schema today restricts evidence field types to
 `enum`, `string`, `number`, and `boolean` (`VALID_FIELD_TYPES` in
@@ -469,34 +469,45 @@ Koto's `accepts` schema today restricts evidence field types to
 so without schema support for structured data, a template cannot
 declare `tasks: { type: ... }` at all.
 
-#### Chosen: add a `json` field type that accepts any non-null JSON value
+#### Chosen: add a `tasks` field type that koto fully understands
 
-Extend `VALID_FIELD_TYPES` with a new `json` variant that matches
-any `serde_json::Value` other than `null`. Templates can then
-declare `tasks: { type: json, required: true }` and the compiler
-validates the schema while the engine stores the payload intact.
+Instead of a generic `json` type — which creates a hole in the
+contract where the compiler can't validate the schema — koto adds
+`type: tasks` to `VALID_FIELD_TYPES`. The compiler knows the exact
+schema for `tasks` fields the same way it knows `enum` fields must
+have `values`. Templates declare `tasks: { type: tasks, required:
+true }` and the compiler validates the field type while the engine
+validates the payload structure at runtime.
 
-**Rationale.** This is the smallest schema change that unlocks the
-batch feature — one line in the allow-list, one branch in
-`validate_field_type`. It's also strictly additive: no existing
+The `evidence_required` response auto-generates an `item_schema`
+object on any `tasks`-typed field, describing the exact shape of
+each task entry. This mirrors how `enum`-typed fields include
+`values` in the response — the type implies the schema.
+
+**Rationale.** A purpose-built type gives the compiler full
+knowledge of what the field contains. There's no ambiguity about
+the payload shape, no need for a separate schema mechanism, and
+the `item_schema` in the response is generated automatically from
+the type definition. The type is strictly additive: no existing
 template that uses `enum`/`string`/`number`/`boolean` fields is
-affected. And it's reusable: any future feature that wants to
-submit structured evidence benefits, not just batch spawning.
+affected.
 
 #### Alternatives considered
 
-- **Separate `array` and `object` types with item schemas.**
-  Rejected as over-engineering for v1. Per-element schema
-  validation in accepts would drag "schema of schema" into the
-  template compiler and overlap with what the task-list runtime
-  validation already does. Easy to add later if real templates
-  need it.
+- **Generic `json` type that accepts any non-null JSON value.**
+  Rejected: creates a hole in the contract. The compiler accepts
+  the field but knows nothing about its structure. A separate
+  schema mechanism would be needed to describe the payload to
+  agents. The batch feature is the only use case for structured
+  evidence right now — a generic escape hatch is premature.
+- **Inline schema definition on a generic `array`/`object` type.**
+  Rejected as over-engineering. Dragging "schema of schema" into
+  the template compiler serves only one use case today. If future
+  features need generic structured types, they can be added then.
 - **Stringly-typed JSON: declare `tasks: { type: string }` and
-  parse the JSON in the materialization step.** Rejected as a
-  foot-gun — the evidence is parsed by `--with-data` once and
-  then re-parsed as JSON on every scheduler tick. The compiler
-  cannot validate that the string is well-formed JSON, let alone
-  the expected shape.
+  parse the JSON in the materialization step.** Rejected: double
+  parsing on every scheduler tick, no compile-time validation of
+  the payload shape.
 
 ### Decision E8: Per-task `trigger_rule` vocabulary is out of scope for v1
 
@@ -568,7 +579,7 @@ states:
       Otherwise wait for children to complete.
     accepts:
       tasks:
-        type: json
+        type: tasks
         required: true
     materialize_children:
       from_field: tasks
@@ -613,7 +624,7 @@ R1–R7):**
 |------|-------|-------|
 | E1 | error | `from_field` is non-empty |
 | E2 | error | `from_field` names a declared accepts field |
-| E3 | error | Referenced field has `type: json` |
+| E3 | error | Referenced field has `type: tasks` |
 | E4 | error | Referenced field has `required: true` |
 | E5 | error | Declaring state is not terminal |
 | E6 | error | `failure_policy` is `skip_dependents` or `continue` |
@@ -1253,10 +1264,9 @@ Two gaps surfaced during the interactive walkthrough. First, the
 `materialize_children` hook says nothing about what child template to
 use — the path is hardcoded in directive prose, not compile-time
 validated, and not discoverable from koto's structured response.
-Second, the `expects` block advertises `tasks: { type: json,
-required: true }` but `json` is opaque — the agent doesn't learn that
-each entry needs `name`, `template`, `vars`, `waits_on` from anything
-structured in the response.
+Second, while the `tasks` field type tells the compiler what shape to
+expect, the agent needs the schema surfaced in the response to know
+what each entry requires — `name`, `template`, `vars`, `waits_on`.
 
 #### Chosen: `default_template` on the hook + koto-generated `item_schema` in the response
 
@@ -1275,19 +1285,18 @@ materialize_children:
 ```
 
 **2. koto auto-generates `item_schema` in the `expects` response.**
-When a state has a `materialize_children` hook pointing at an accepts
-field, koto knows the schema of that field — the batch task entry
-schema is defined by the feature itself, not by the template author.
-`derive_expects` in `src/cli/next_types.rs` detects the link between
-the accepts field and the hook, and includes a structured
-`item_schema` object in the response:
+The `tasks` type implies a fixed schema — koto knows exactly what
+shape a task entry has because the batch feature defines it. When
+`derive_expects` in `src/cli/next_types.rs` encounters a `tasks`-typed
+field, it includes a structured `item_schema` object in the response,
+the same way `enum`-typed fields include `values`:
 
 ```json
 {
   "expects": {
     "fields": {
       "tasks": {
-        "type": "json",
+        "type": "tasks",
         "required": true,
         "item_schema": {
           "name": { "type": "string", "required": true, "description": "Child workflow short name" },
@@ -1308,15 +1317,12 @@ generated by koto because it's invariant across all batch templates.
 The template author writes no description, no schema annotation, no
 prose about the task shape. koto describes what koto validates.
 
-**Why this differs from what Decision E7 rejected.** E7 rejected
-"separate `array` and `object` types with item schemas" as a
-general-purpose extension to the accepts type system. This is not
-that. This is a special case: when an accepts field is the target of
-`materialize_children`, koto knows exactly what shape it expects
-because the batch feature defines the shape. The `item_schema` is not
-a user-extensible type annotation — it's koto describing its own
-contract. No template-authored `item_schema` field exists on accepts;
-koto generates it in the response from the hook's existence.
+**Why `item_schema` is generated, not authored.** The `tasks` type
+has a fixed schema defined by koto itself — the template author
+doesn't write it, can't override it, and doesn't need to know the
+details. `derive_expects` generates `item_schema` from the type
+definition. No template-authored `item_schema` field exists on
+accepts; it's purely a response-side artifact.
 
 #### Alternatives considered
 
@@ -1330,7 +1336,7 @@ koto generates it in the response from the hook's existence.
   skill has no structured signal about the JSON shape.
 - **Prose only (no engine changes).** Rejected: both gaps remain, no
   compile-time validation of child template paths.
-- **Template-authored `item_schema` annotation on the `json` accepts
+- **Template-authored `item_schema` annotation on the accepts
   type.** Rejected per Decision E7: extending the type system with
   user-authored item schemas is over-engineering for v1. But this
   decision's chosen approach is the opposite — koto generates the
@@ -1355,7 +1361,7 @@ They share three cross-cutting PR landing requirements:
 
 1. **One schema-layer PR.** `TemplateState` grows three new fields
    (`materialize_children`, `failure`, `skipped_marker`) and accepts
-   gains a `json` field type. The narrow `deny_unknown_fields`
+   gains a `tasks` field type. The narrow `deny_unknown_fields`
    attribute from Decision 3 lands in the same PR.
 
 2. **One init-safety PR (can precede the schema PR).** Decision 2's
@@ -1461,7 +1467,7 @@ The new surface divides into three concerns:
 │    - skipped_marker: bool (synthetic-marker indicator)      │
 │    - #[serde(deny_unknown_fields)] attribute                │
 │                                                             │
-│  types.rs: accepts field type gains `json` variant          │
+│  types.rs: accepts field type gains `tasks` variant         │
 │                                                             │
 │  compile.rs: new validator for materialize_children         │
 │    enforcing E1-E8 errors and W1-W2 warnings                │
@@ -1776,7 +1782,7 @@ finds no hook and returns `NoBatch`. Response: `workflow_complete`.
 2. `handle_next` reads the state file, compiles the parent template,
    runs the advance loop. The advance loop validates the evidence
    against the `accepts` schema (the `tasks` field is declared
-   `type: json`, `required: true`), appends an `EvidenceSubmitted`
+   `type: tasks`, `required: true`), appends an `EvidenceSubmitted`
    event with the task list plus the captured `submitter_cwd`, and
    transitions normally.
 3. After `advance_until_stop` returns, `handle_next` calls
@@ -1989,7 +1995,7 @@ split into two sub-PRs if review velocity stalls (see Mitigations).
   `--template` argument's parent directory
 - `handle_next` writes `submitter_cwd` into `EvidenceSubmitted` events
 - `--with-data @file.json` prefix added to `validate_with_data_payload`
-- Accepts schema `VALID_FIELD_TYPES` gains `json`
+- Accepts schema `VALID_FIELD_TYPES` gains `tasks`
 - `#[serde(deny_unknown_fields)]` on `SourceState` only (Decision 3);
   pre-merge audit confirms no source templates rely on unknown fields
 - Tests for round-trip compat with v0.7.0 state files and templates

@@ -31,7 +31,7 @@ states:
         type: children-complete
     accepts:
       tasks:
-        type: json
+        type: tasks
         required: true
     materialize_children:
       from_field: tasks
@@ -145,21 +145,21 @@ issue_count: 3
 
 ## Scope Summary
 
-Add the schema-layer changes for batch child spawning: JSON field
-type, @file.json prefix, and the materialize_children hook.
+Add the schema-layer changes for batch child spawning: tasks field
+type, @file prefix, and the materialize_children hook.
 
 ## Issue Outlines
 
-### 1. Add JSON field type to accepts schema
+### 1. Add tasks field type to accepts schema
 
-**Goal:** Extend `VALID_FIELD_TYPES` with a `json` variant that
-accepts any non-null `serde_json::Value`.
+**Goal:** Extend `VALID_FIELD_TYPES` with a `tasks` variant that
+accepts a structured task list payload.
 
 **Files:** `src/template/types.rs`, `src/engine/evidence.rs`
 
 **Acceptance criteria:**
-- `type: json` is accepted in template `accepts` blocks
-- Evidence submission with nested JSON passes validation
+- `type: tasks` is accepted in template `accepts` blocks
+- Evidence submission with a task list payload passes validation
 - Existing field types (enum, string, number, boolean) unchanged
 
 **Complexity:** simple
@@ -177,7 +177,7 @@ remainder as a file path and use its contents as the evidence payload.
 - Missing file produces a clear error
 
 **Complexity:** simple
-**Dependencies:** issue 1 (needs json type for testing)
+**Dependencies:** issue 1 (needs tasks type for testing)
 
 ### 3. Add materialize_children hook to TemplateState
 
@@ -193,7 +193,7 @@ batch materialization from an accepts field.
 
 **Complexity:** testable
 **Dependencies:** issue 1 (materialize_children.from_field must
-point at a json-typed accepts field)
+point at a tasks-typed accepts field)
 ```
 
 ### Dependency graph
@@ -267,7 +267,7 @@ Note: `template` is omitted from each entry — the scheduler uses
 
 **What happens inside koto:**
 - Reads coord's state file, derives current state: plan_and_await
-- Advance loop: accepts declares `tasks: json, required`, no evidence yet
+- Advance loop: accepts declares `tasks: tasks, required`, no evidence yet
 - children-complete gate: 0 children, no batch definition -> Failed
 - Advance loop stops (gate blocked)
 - Scheduler: plan_and_await has materialize_children, but evidence
@@ -282,7 +282,7 @@ Note: `template` is omitted from each entry — the scheduler uses
   "details": "Each child is an independent koto workflow named `coord.<task-name>`. The scheduler runs on every `koto next coord` call and spawns tasks whose `waits_on` dependencies are all terminal. You don't need to track readiness yourself -- the `scheduler` field in the response tells you what was just spawned. The `blocking_conditions[0].output` field shows per-child status.",
   "expects": {
     "tasks": {
-      "type": "json",
+      "type": "tasks",
       "required": true,
       "item_schema": {
         "name": { "type": "string", "required": true, "description": "Child workflow short name" },
@@ -309,7 +309,7 @@ Note: `template` is omitted from each entry — the scheduler uses
 
 **What this tells the agent:** "I need evidence. The directive says
 to read the plan document and build a task list. The expects block
-says I need a `tasks` field of type `json`. No children exist yet."
+says I need a `tasks` field of type `tasks`. No children exist yet."
 
 The agent reads PLAN-batch-schema.md, parses the 3 issue outlines,
 maps dependencies to waits_on, and writes tasks.json.
@@ -318,7 +318,7 @@ maps dependencies to waits_on, and writes tasks.json.
 
 **What happens inside koto:**
 - Advance loop at plan_and_await
-- Validates evidence: tasks is json, required, present -> OK
+- Validates evidence: tasks is tasks-typed, required, present -> OK
 - Appends EvidenceSubmitted { fields: { tasks: [...3 entries...],
   submitter_cwd: "/home/user/repo" } }
 - Re-evaluates children-complete gate: 0 children on disk, but

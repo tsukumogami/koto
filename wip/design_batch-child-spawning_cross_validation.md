@@ -12,7 +12,7 @@ Cross-validation status: **passed**.
 
 ### Decision 1 (schema + hook + validation)
 
-- `json` accepts field type will be implemented in the same PR
+- `tasks` accepts field type will be implemented in the same PR
 - Child naming is `<parent>.<task>` (dots legal in workflow names)
 - Scheduler runs at CLI layer after the advance loop
 - `format_version` stays at 1 (Decision 3 may override)
