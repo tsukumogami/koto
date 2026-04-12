@@ -552,11 +552,20 @@ exploration's `lead-evidence-shape` research.
 #### Chosen: state-level `materialize_children` block on `TemplateState`
 
 A new optional field on `TemplateState` alongside `gates`,
-`default_action`, and `accepts`:
+`default_action`, and `accepts`. The canonical pattern is
+**single-state fan-out**: the same state declares `accepts` (to
+receive the task list), `materialize_children` (to spawn), and the
+`children-complete` gate (to wait). The scheduler runs on the
+state where the hook lives, which equals the state where the
+advance loop is parked after processing evidence:
 
 ```yaml
 states:
-  plan:
+  plan_and_await:
+    directive: |
+      If you haven't submitted a task list yet, read the plan
+      and submit one via `koto next parent --with-data @tasks.json`.
+      Otherwise wait for children to complete.
     accepts:
       tasks:
         type: json
@@ -564,9 +573,27 @@ states:
     materialize_children:
       from_field: tasks
       failure_policy: skip_dependents   # default; also accepts 'continue'
+    gates:
+      done:
+        type: children-complete
     transitions:
-      - target: await
+      - target: summarize
+        when:
+          gates.done.all_complete: true
+  summarize:
+    terminal: true
 ```
+
+**Why the single-state fan-out is required, not a preference.**
+The scheduler runs on the state the advance loop is parked at
+when it returns. If the hook were on a state that the advance
+loop transitions *through* (e.g. `plan → await` with the hook on
+`plan` and an unconditional transition), the scheduler would
+never see `plan` — by the time it runs, the advance loop is at
+`await`, which has no hook. Putting the hook and the gate on the
+same state guarantees the advance loop parks there until all
+children are terminal, giving the scheduler a stable place to
+run on every tick.
 
 **Task entry schema:**
 
@@ -1397,7 +1424,140 @@ full JSON example.
 
 ### Data Flow
 
-**Initial submission and materialization:**
+**End-to-end sequence for a 10-task batch.** This walks from parent
+init through batch completion, emphasizing the handshake between
+the agent and koto. The parent template uses the single-state
+fan-out pattern shown in Decision 1 above.
+
+**Step 1: Parent init.** Agent runs `koto init parent-42 --template
+parent.md`. Parent's state file is created with initial state
+`plan_and_await`.
+
+**Step 2: Agent gets the planning directive.** `koto next parent-42`:
+- advance loop at `plan_and_await`
+- no evidence yet; `tasks` is `required: true` and absent
+- response: `evidence_required` with the directive "read the plan
+  and submit a task list" and the accepts schema
+- agent receives and interprets
+
+**Step 3: Agent does the planning work.** Reads the source plan
+document, constructs `plan-tasks.json` with 10 task entries (3 with
+empty `waits_on`, 7 with dependencies forming a DAG).
+
+**Step 4: Agent submits the task list.**
+`koto next parent-42 --with-data @plan-tasks.json`:
+- `handle_next` reads state file, compiles template
+- advance loop at `plan_and_await`
+- validates the evidence against the accepts schema
+- appends `EvidenceSubmitted { fields: { tasks: [...], submitter_cwd: "..." } }`
+- re-evaluates the `children-complete` gate: 0 matching children
+  on disk, but the gate reads the batch definition from the just-
+  appended evidence and reports `total: 10, completed: 0,
+  pending: 10, ready: 3, blocked: 7` (the updated
+  `evaluate_children_complete` no longer errors on "no children
+  found" when the state has a `materialize_children` hook)
+- gate returns `Failed`; the transition's `when` clause
+  (`gates.done.all_complete: true`) doesn't match; advance loop
+  stops at `plan_and_await`
+- `handle_next` calls `run_batch_scheduler(final_state =
+  "plan_and_await", ...)`
+- scheduler finds `materialize_children` on `plan_and_await`
+- parses the task list from the latest-epoch `EvidenceSubmitted`
+- builds DAG, runs runtime validation (R1–R7)
+- classifies: all 10 tasks `NotYetSpawned`; 3 with empty
+  `waits_on` are `Ready`; 7 are `BlockedByDep`
+- for each `Ready` task, calls
+  `init_state_file("parent-42.issue-1", header, initial_events)`
+  atomically. The initial event list is
+  `[WorkflowInitialized, Transitioned → <child initial state>]`.
+- returns `SchedulerOutcome::Scheduled { spawned:
+  ["parent-42.issue-1", "parent-42.issue-3", "parent-42.issue-5"],
+  blocked: [...7...] }`
+- response serialized: outer shape is `gate_blocked`, attached
+  `scheduler` field lists what was spawned, batch view shows
+  `ready: 0, blocked: 7, in_progress: 3, completed: 0`
+- response returned to the agent
+
+**Step 5: Agent starts driving children — the parent-to-child
+handshake.** There is no koto-level "jump to child" command. The
+agent simply starts calling `koto next` on a different workflow
+name. From koto's perspective, `parent-42.issue-1` is just another
+workflow — it has its own state file, its own event log, and its
+own directive loop. In the parallel-batch pattern, the coordinator
+agent spawns N worker sub-agents (one per ready child). Each
+worker runs its own drive loop:
+
+```
+loop:
+  response = koto next parent-42.issue-1
+  if response is workflow_complete: break
+  if response is evidence_required: do the work, collect evidence
+  koto next parent-42.issue-1 --with-data @work.json
+```
+
+Three workers run in parallel for the three initially-ready
+children. Each operates on its own state file — no shared state,
+no races, no locks.
+
+**Step 6: A child terminates.** Worker for `parent-42.issue-1`
+reaches a terminal response. Its drive loop exits. The worker
+signals the coordinator (application-level, e.g., Task tool
+return value) that child-1 is done.
+
+**Step 7: Child-to-parent handshake.** Same shape in reverse:
+the coordinator calls `koto next parent-42`. There's no "switch
+back to parent" command — the coordinator just starts driving
+the parent's workflow name again. Inside koto:
+- advance loop at `plan_and_await` (state hasn't changed)
+- gate re-evaluates: now sees `parent-42.issue-1` on disk in a
+  terminal non-failure state. Output: `total: 10, completed: 1,
+  pending: 9, in_progress: 2, ready: 1, blocked: 6`
+- gate still `Failed`; advance loop stays at `plan_and_await`
+- scheduler runs: re-classifies all 10 tasks. Issue-2, which
+  depended only on issue-1, is now `Ready`. Issue-2 gets
+  `init_state_file`'d.
+- response: `gate_blocked` with updated batch view, the
+  scheduler outcome shows `parent-42.issue-2` as newly spawned
+- coordinator spawns a new worker for issue-2
+
+**Step 8: Steps 5–7 repeat.** Each time a child terminates, the
+coordinator re-ticks the parent, the scheduler spawns newly-
+unblocked tasks, the coordinator starts new workers. Up to 10
+workers run in parallel at peak (minus however many are already
+terminal). The coordinator serializes its own `koto next
+parent-42` calls (one at a time) per the Concurrency Model
+section; the workers run independently on their own state files.
+
+**Step 9: Last child terminates, batch completes.** Coordinator
+ticks parent. Gate re-evaluates: all 10 children terminal,
+`all_complete: true`. The transition `when: { gates.done.
+all_complete: true }` matches. Advance loop transitions
+`plan_and_await → summarize`. `summarize` is terminal.
+`handle_next` calls `run_batch_scheduler` on `summarize`, which
+finds no hook and returns `NoBatch`. Response: `workflow_complete`.
+
+**Protocol summary.**
+
+- The only CLI surface for parent-child communication is
+  `koto next <workflow-name>` (with optional `--with-data`).
+  koto does not have a "switch to child" command or a "return
+  to parent" command. The agent keeps its own notion of "which
+  workflow am I driving now."
+- The batch view in `koto status parent-42` and the scheduler
+  outcome attached to each `koto next parent-42` response tell
+  the agent which children are newly spawnable (`ready`) and
+  which already-spawned children are still in progress
+  (`in_progress`).
+- koto does not track "which workflow the agent is currently
+  working on." The agent (or orchestrator) makes that decision
+  based on its own logic: typically one coordinator per parent,
+  one worker per running child.
+- Parent and child state machines are independent. A child can
+  itself be a parent of its own batch (via `koto init --parent
+  <child-name>` — the v0.7.0 primitive) without the outer
+  parent needing to know.
+
+**Details from the Step 4 walkthrough, in code terms:**
 
 1. Agent writes `plan.json` with the task list and calls
    `koto next parent --with-data @plan.json`.
