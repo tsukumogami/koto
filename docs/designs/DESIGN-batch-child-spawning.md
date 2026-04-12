@@ -162,61 +162,375 @@ primary input for this design.
   field), not a format bump unless the forward-compat diagnosability
   problem forces one.
 
-## Decisions Already Made
+## Decisions Settled During Exploration
 
-These were settled during exploration and should be treated as
-constraints, not reopened.
+These decisions were evaluated during `/explore` (see
+`wip/explore_batch-child-spawning_*.md` and the five research leads
+in `wip/research/`) before decomposition ran, so they are treated as
+constraints by the design-phase decisions in the next section. Each
+is documented here in the same format as the design-phase decisions
+so a future reader can see the full reasoning without re-reading the
+exploration artifacts.
 
-- **Primary model: Reading A (flat declarative batch with `waits_on`).**
-  The parent owns a task list with sibling-level dependencies. Reading B
-  (nested via `koto init --parent`) remains unchanged from v0.7.0 for
-  genuinely hierarchical work. The GH-issue use case requires sibling
-  ordering, which nesting cannot express; Reading A is the answer to
-  #129.
+### Decision E1: Flat declarative batch vs nested batches
 
-- **Storage strategy: full derivation from on-disk child state + event
-  log.** The parent persists nothing new. The batch definition lives
-  in the existing `EvidenceSubmitted` event; spawn records are child
-  state files discovered via `backend.list()` filtered by
-  `parent_workflow`. Idempotency is the existing `backend.exists()`
-  check.
+The exploration surfaced two distinct readings of "a task spawns a
+sibling or grandchild mid-flight," which turned out to be different
+architectural models rather than variants of the same approach.
+Picking one is load-bearing for every subsequent decision because
+it determines where dependency ordering lives, what the scheduler
+owns, and whether `children-complete` recurses.
 
-- **Insertion point: CLI-level scheduler tick in `handle_next`,
-  post-`advance_until_stop`.** The advance loop in
-  `src/engine/advance.rs` stays pure (I/O-free, closure-driven). A new
-  module `src/cli/batch.rs` holds the scheduler; `handle_next` calls
-  it once the advance loop has settled on the final state.
+#### Chosen: Reading A (flat declarative batch with sibling-level `waits_on`)
 
-- **Child naming: deterministic `<parent>.<task>`.** Couples child name
-  to parent name; parents can't be renamed, so the coupling is
-  acceptable. Gives free idempotency via `backend.exists()`.
+The parent owns a flat task list. Dependencies are expressed as
+sibling-level `waits_on` references between entries in the same
+batch. The parent's `children-complete` gate waits for every declared
+task to reach terminal state. Reading B (nested batches via
+`koto init --parent <running-child>`) remains available unchanged
+from v0.7.0 for genuinely hierarchical work, but it is not the
+answer to #129.
 
-- **Default failure policy: skip-dependents, per-batch configurable.**
-  Alternatives (`fail-fast`, `continue-independent`, `pause-on-failure`)
-  are opt-ins declared in the submitted evidence's `failure_policy`
-  field. No global config, no per-task `trigger_rule` in v1.
+**Rationale.** The user's canonical use case is orchestrating
+GitHub-issue implementation where "issue 3 depends on issues 1 and 2
+being merged first." Issues 1, 2, and 3 are siblings — they share a
+parent — and the dependency is sibling-level ordering, not a nesting
+relationship. There is no natural reading under Reading B where
+"issue 3 is a child of issue 1" makes sense; issue 3 and issue 1 are
+peers. Forcing the GH-issue case into nested batches would require
+the consumer to invert the dependency graph into a tree, which
+re-introduces the prose spawn loop that #129 set out to eliminate.
 
-- **CLI extension: `--with-data @file.json` prefix.** Mirrors
-  `curl -d @file` and `gh api -f`. Size cap (1 MB) applies to resolved
-  content.
+Reading A can express everything Reading B expresses (a child of a
+batch task can start its own batch under `koto init --parent
+<running-child>` unchanged), so the two compose rather than compete.
+Reading B handles hierarchical decomposition; Reading A handles
+same-level ordering.
 
-- **Template extension: new `json` field type in accepts schema.**
-  Extends the `VALID_FIELD_TYPES` allow-list to permit array/object
-  evidence. Unlocks structured evidence beyond batch spawn.
+#### Alternatives considered
 
-- **Template declaration: state-level hook pointing at an accepts
-  field.** The exact name (`batch`, `materialize_children`,
-  `batch_spawn`) is a surface detail to be picked in this design. What's
-  settled: the declaration lives on `TemplateState`, references an
-  accepts field, and is validated at compile time.
+- **Reading B (nested batches only, no sibling-level ordering).**
+  Rejected because it cannot express the GH-issue use case without
+  forcing users to restructure their plan. A batch of 10 issues
+  with arbitrary dependencies becomes a 10-level-deep tree under
+  Reading B, and `children-complete` only sees direct children —
+  the outer parent never waits for grandchildren, so the
+  "all 10 issues done" signal is unreachable without a separate
+  consumer-maintained aggregation. Solves the wrong problem.
+- **Hybrid model: parent declares a DAG of nested batches.**
+  Rejected because it introduces a third layer of orchestration
+  (outer parent, batch, nested batch) and inherits the downsides
+  of both readings. The user's use case is flat; a hybrid model
+  is premature generalization.
 
-- **Per-task `trigger_rule` vocabulary deferred.** The simpler per-batch
-  `failure_policy` ships first. Airflow-style per-task rules can be
-  added later if real use cases need the granularity.
+### Decision E2: Where batch state lives on disk
 
-- **Adversarial demand-validation lead was skipped.** Issue #129 has
-  a known blocked consumer (shirabe PR #67) and a clear acceptance
-  criteria list. Demand is self-evident.
+Once Reading A is chosen, the next question is where the batch's
+scheduling state (task list, which tasks have been spawned, which
+are waiting) physically lives on disk. The answer has direct
+consequences for append-only invariants, cloud sync, resume, and
+idempotency.
+
+#### Chosen: full derivation from on-disk child state files + parent's event log
+
+Nothing new is persisted at the parent beyond what the existing
+event log already contains. The batch definition lives in an
+existing `EvidenceSubmitted` event payload. Spawn records are child
+state files on disk, discovered via `backend.list()` filtered by
+`parent_workflow == parent_name` — the same discovery mechanism
+the v0.7.0 `children-complete` gate already uses. "Which tasks are
+spawned" is a pure function of (batch definition) ∩ (on-disk
+children). Idempotency on resume is the existing
+`backend.exists()` check.
+
+**Rationale.** This strategy preserves append-only state file
+semantics (no header mutation, no mid-file edits), requires zero
+new event types, adds zero new cloud-sync paths, and needs zero
+new cleanup hooks. Resume is the same code path as first
+invocation — the scheduler tick is stateless and idempotent. It
+is the only strategy that lets the design avoid both a new
+persistence surface AND a scheduler cursor.
+
+#### Alternatives considered
+
+- **New `batch` section on the parent's `StateFileHeader`.**
+  Rejected because the header is currently written once at init
+  and never touched afterward. Mutating it to update
+  `batch.spawned` would force rewriting the whole state file on
+  every scheduler tick, which invalidates `read_last_seq`, breaks
+  the `expected_seq` integrity check in `read_events`, and forces
+  cloud sync to full-reupload on every tick. It would undo the
+  append-only guarantee that makes state files safe to tail and
+  sync incrementally.
+- **Separate `<parent>.batch.jsonl` sidecar in the parent's session
+  directory.** Rejected as workable but introduces a second log
+  file that must stay in sync with the main log on rewind,
+  cleanup, and cancel. `handle_rewind` and `session::handle_cleanup`
+  would need to know about the sidecar. The added coupling is
+  avoidable because strategy (c) already has all the information
+  it needs without a new file.
+
+### Decision E3: Where in the code the scheduler runs
+
+Given the storage decision (nothing new persisted), the next
+question is where the scheduling logic physically lives in the
+codebase — which file, which function, which point in the execution
+flow.
+
+#### Chosen: CLI-level scheduler tick in `handle_next`, post-`advance_until_stop`
+
+A new function `run_batch_scheduler` lives in `src/cli/batch.rs` and
+is called from `handle_next` immediately after `advance_until_stop`
+returns. It receives the session backend, the compiled template,
+the final state name, the parent workflow name, and the full event
+slice. It produces a `SchedulerOutcome` that attaches to the CLI
+response without changing the advance loop's own return shape.
+
+**Rationale.** `advance_until_stop` in `src/engine/advance.rs` is
+deliberately I/O-free: it takes closures (`append_event`,
+`evaluate_gates`, `execute_action`, etc.) for every side effect so
+the state machine stays pure and testable. The spawn path needs
+exactly what the advance loop lacks: the concrete `&dyn
+SessionBackend`, the compile cache, and the `handle_init`
+variable-resolution machinery. Threading these through yet another
+closure would inflate `advance_until_stop`'s signature (already nine
+parameters, already tagged `#[allow(clippy::too_many_arguments)]`)
+and bleed session concerns into the pure state-machine core.
+
+At the CLI layer, all three inputs are already in scope. Placing
+the new module in `src/cli/batch.rs` (not `src/engine/`) reflects
+this: the scheduler is CLI-layer orchestration over a pure engine,
+not engine logic itself.
+
+#### Alternatives considered
+
+- **New gate type `batch-materialize` that fires on state entry.**
+  Rejected because gates in koto are pure functions of
+  `(state, evidence, context)` with no side effects. Giving a gate
+  type write access to the session backend breaks the idempotency
+  invariant that lets gates be re-run across epochs, and forces
+  the blocking-condition category taxonomy to grow a category with
+  no natural name ("I need to create something on first call").
+- **New action/effect verb on `TemplateState`.** Rejected because
+  actions are executed inside `advance_until_stop` via the
+  `execute_action` closure, which has the same I/O-free constraint
+  as gates. `ActionResult` only carries process-exit data, not
+  "spawn children and return their session handles."
+- **New step in the advance loop between transition and return.**
+  Rejected for the same reason as (a) and (b): the advance loop
+  has no session backend access by design.
+
+### Decision E4: How children are named
+
+The scheduler needs an idempotency key: a deterministic way to
+answer "has this task already been spawned?" on every tick without
+maintaining a cursor. The child workflow name is the natural place
+for that key.
+
+#### Chosen: deterministic `<parent>.<task>` naming
+
+Child workflow names are computed as `<parent>.<task>` where
+`<parent>` is the submitting workflow's name and `<task>` is the
+value of the task entry's `name` field. The existing
+`backend.exists()` check in `handle_init` becomes the idempotency
+check: if the child already exists, skip; otherwise, call
+`init_state_file`.
+
+**Rationale.** The naming rule gives the scheduler a free
+idempotency check with no extra state. Resume after a crash is
+trivial — the scheduler classifies each task by looking up its
+deterministic child name on disk. The rule couples child names to
+parent names, which is fine because parents can't be renamed
+anyway (the name is the session identifier). The child's existing
+`parent_workflow` header field provides the back-pointer, so no
+additional state is needed to trace a child to its batch.
+
+`.` is legal in workflow names today (verified via
+`validate_workflow_name`), so the rule doesn't require a workflow
+name syntax change.
+
+#### Alternatives considered
+
+- **User-provided child workflow names.** Rejected because it
+  makes idempotency the user's problem: the agent has to pick
+  unique names, and collisions between separate batch invocations
+  on the same parent (or across parents) are silent. There is
+  also no natural back-pointer from a batch task to its child
+  without an external spawn map — defeating the disk-derivation
+  strategy from Decision E2.
+- **Batch ID plus task index (`<batch-uuid>.<task-index>`).**
+  Rejected because it requires generating and persisting a batch
+  ID per submission, which adds state (where does the batch ID
+  live?) and makes the names user-hostile. Integers-as-indices
+  also drift if the task list is edited between submissions.
+
+### Decision E5: Default failure-routing policy
+
+When a child in a DAG fails, the scheduler has to decide what
+happens to its dependents. There are four defensible policies, each
+with different trade-offs for recovery, parallelism, and the
+agent's mental model.
+
+#### Chosen: skip-dependents as the default, per-batch configurable
+
+A failed child's direct and transitive dependents are marked
+skipped (with a reason code). Independent branches continue running.
+The batch completes with a partial-success result. Recovery is
+explicit: the parent submits `retry_failed` evidence to re-queue
+the failed child and its skipped dependents. Alternative policies
+(`continue` in v1; `fail_fast`, `pause_on_failure` deferred) are
+opt-ins declared on the `materialize_children` hook.
+
+**Rationale.** The canonical use case is "implement a batch of GH
+issues with inter-issue dependencies." If issue 1 fails (tests
+reject the PR), issue 3 (which depends on issue 1) cannot
+legitimately proceed — running it would be either wasted work or
+incorrect work. But issue 2 (independent) should still run and
+merge. Skip-dependents is the only policy that does both: isolates
+the failed chain, maximizes parallelism on independent branches,
+and recovers cleanly via a single retry action.
+
+Prior art corroborates: Airflow's `all_success` default, Argo
+Workflows' pause-on-failure default, and GitHub Actions' `needs:`
+semantics all behave this way. Pause-on-failure would freeze
+independent work and demand human intervention on every failure —
+too conservative for autonomous agents. Fail-fast wastes
+parallelism. Continue-independent ignores dependencies entirely
+and produces confusing downstream cascades.
+
+Per-batch configurability (on the hook, not per-task) keeps the
+parent template's recovery transitions written against a known
+policy. Agents cannot invalidate the template's guarantees by
+editing the payload.
+
+#### Alternatives considered
+
+- **Fail-fast.** Rejected as a default: one PR failing its tests
+  would cancel every queued issue in the batch, even issues with
+  no dependency on the failed one. Wasteful and contradicts the
+  user's explicit preference for isolating failures to dependent
+  chains. Available as an opt-in in a later version.
+- **Pause-on-failure (freeze all scheduling; human decides).**
+  Rejected as a default because it halts unrelated parallel work
+  on every failure. Creates a "call your team" moment on every
+  test flake. Valuable for all-or-nothing release workflows but
+  too strong for the default. Deferred.
+- **Continue-independent (run every branch regardless of
+  dependency state).** Rejected because it contradicts the
+  semantics of `waits_on`: if task 3 waits on task 1 and task 1
+  failed, running task 3 anyway produces either a duplicate
+  failure or an incorrect success. Downstream agents would have
+  to post-hoc reason about which failures are induced versus
+  inherent. Confusing and unsafe.
+
+### Decision E6: CLI surface for submitting a task list
+
+The exploration established that tasks are submitted as a JSON
+array of task entries, but it did not pin down how agents actually
+pass that array to `koto next`. Today `--with-data` takes a JSON
+string argument; task lists beyond a few entries become
+shell-escaping nightmares.
+
+#### Chosen: `@file.json` prefix on `--with-data`
+
+Extend `--with-data` to recognize a leading `@` as a file-reference
+prefix: `koto next parent --with-data @plan-tasks.json` reads the
+named file and uses its contents as the evidence payload. The 1 MB
+size cap applies to the resolved content, not the argument string.
+
+**Rationale.** This mirrors the idiom in `curl -d @file` and
+`gh api -f @file`, which agents already recognize. It is a
+five-line extension to `validate_with_data_payload` in
+`src/cli/mod.rs` and unlocks task lists of any realistic size
+without requiring the agent to embed hundreds of lines of JSON in
+a shell command. The feature is also useful outside batch
+spawning for any structured evidence payload.
+
+#### Alternatives considered
+
+- **Inline JSON strings only (no file prefix).** Rejected because
+  shell-escaping a task list of 20 GH issues produces an
+  unreadable command line that agents cannot reliably construct.
+  Hard to debug and hard to log.
+- **A new `--with-data-file` flag alongside `--with-data`.**
+  Rejected as two flags where one suffices. The `@` prefix is a
+  well-known convention; adding a parallel flag doubles the
+  surface without new expressive power.
+
+### Decision E7: Accepts schema supports structured JSON evidence
+
+Koto's `accepts` schema today restricts evidence field types to
+`enum`, `string`, `number`, and `boolean` (`VALID_FIELD_TYPES` in
+`src/template/types.rs`). A batch task list is an array of objects,
+so without schema support for structured data, a template cannot
+declare `tasks: { type: ... }` at all.
+
+#### Chosen: add a `json` field type that accepts any non-null JSON value
+
+Extend `VALID_FIELD_TYPES` with a new `json` variant that matches
+any `serde_json::Value` other than `null`. Templates can then
+declare `tasks: { type: json, required: true }` and the compiler
+validates the schema while the engine stores the payload intact.
+
+**Rationale.** This is the smallest schema change that unlocks the
+batch feature — one line in the allow-list, one branch in
+`validate_field_type`. It's also strictly additive: no existing
+template that uses `enum`/`string`/`number`/`boolean` fields is
+affected. And it's reusable: any future feature that wants to
+submit structured evidence benefits, not just batch spawning.
+
+#### Alternatives considered
+
+- **Separate `array` and `object` types with item schemas.**
+  Rejected as over-engineering for v1. Per-element schema
+  validation in accepts would drag "schema of schema" into the
+  template compiler and overlap with what the task-list runtime
+  validation already does. Easy to add later if real templates
+  need it.
+- **Stringly-typed JSON: declare `tasks: { type: string }` and
+  parse the JSON in the materialization step.** Rejected as a
+  foot-gun — the evidence is parsed by `--with-data` once and
+  then re-parsed as JSON on every scheduler tick. The compiler
+  cannot validate that the string is well-formed JSON, let alone
+  the expected shape.
+
+### Decision E8: Per-task `trigger_rule` vocabulary is out of scope for v1
+
+Airflow and Argo expose per-task failure rules (`all_success`,
+`all_done`, `none_failed`, `one_success`, etc.) that let each
+dependent task decide for itself whether to run based on its
+upstream results. The exploration's prior-art lead proposed
+borrowing this vocabulary; the failure-routing lead proposed a
+simpler per-batch `failure_policy`.
+
+#### Chosen: per-batch `failure_policy` only in v1; per-task `trigger_rule` deferred
+
+The `trigger_rule` field is reserved on task entries but any value
+other than `"all_success"` is a runtime error in v1. The task list
+schema carries the field so a future version can light it up
+without breaking existing submissions.
+
+**Rationale.** Shipping the simpler model first and extending later
+is cheaper than shipping both and discovering which one users
+actually need. Per-batch `failure_policy` covers the user's stated
+GH-issue use case cleanly; the prior-art precedent for per-task
+rules comes from workflow engines with much richer DAG semantics
+(Airflow's task groups, Argo's `when` expressions) that koto does
+not yet have. Reserving the field avoids a future schema migration.
+
+#### Alternatives considered
+
+- **Adopt Airflow `trigger_rule` vocabulary in v1.** Rejected as
+  premature generalization. The value of `trigger_rule` emerges
+  when DAGs are large and recovery paths are subtle; v1 users
+  will run <100-task batches with simple recovery. Ship the
+  simple model, measure, extend if needed.
+- **Do not reserve the field at all.** Rejected because
+  retroactively adding `trigger_rule` in v2 would then need a
+  migration path. Reserving it now is free — the schema simply
+  rejects non-default values at runtime.
+
+## Considered Options
 
 ## Considered Options
 
