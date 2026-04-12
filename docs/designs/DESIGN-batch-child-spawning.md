@@ -155,12 +155,16 @@ primary input for this design.
   is blocked waiting on Y") is valuable but should be additive, not a
   new command surface.
 
-- **Backward compatibility for old state files and templates.**
-  Pre-batch templates must compile and run unchanged. Pre-batch state
-  files must read unchanged. The migration story for adding batch
-  support to existing templates should be additive (a new optional
-  field), not a format bump unless the forward-compat diagnosability
-  problem forces one.
+- **Backward compatibility for pre-batch templates.** Templates
+  authored before this feature must continue to compile and run
+  unchanged. The migration story for adding batch support to
+  existing templates should be additive (a new optional field),
+  not a format bump unless the forward-compat diagnosability
+  problem forces one. State file compatibility is not a hard
+  constraint — koto is pre-1.0 and state file schemas may evolve
+  across releases — but the design should prefer additive
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`
+  field additions where practical to minimize user disruption.
 
 ## Decisions Settled During Exploration
 
