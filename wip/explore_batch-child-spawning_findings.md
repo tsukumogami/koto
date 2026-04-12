@@ -290,3 +290,8 @@ The finding: this is a well-scoped feature with a clear implementation
 path, strong composition with v0.7.0 primitives, no risky prior-art
 tradeoffs, and an unambiguous default failure policy. The next step is
 a design doc that turns the sketch into a specification.
+
+## Decision: Crystallize
+
+Round 1 produced a bounded, implementable sketch with resolved tensions and
+no gaps that further research would close. Moving to artifact type selection.
