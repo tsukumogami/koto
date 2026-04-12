@@ -7,44 +7,56 @@
     {
       "id": 1,
       "question": "What is the task list schema, template hook shape, and compiler validation contract?",
-      "status": "pending",
+      "status": "complete",
       "complexity": "standard",
-      "notes": "Couples schema, hook name, and validation depth. Must fit v0.7.0 template format and the new `json` accepts field type."
+      "chosen": "State-level `materialize_children` block on TemplateState with from_field pointing at a required json-typed accepts field; failure_policy on the hook; 8 compile errors + 2 warnings + 7 runtime checks",
+      "confidence": "high",
+      "report_file": "wip/design_batch-child-spawning_decision_1_report.md"
     },
     {
       "id": 2,
       "question": "How do we fix the atomic child-spawn window in handle_init without breaking append-only semantics?",
-      "status": "pending",
+      "status": "complete",
       "complexity": "critical",
-      "notes": "Options: tmp+rename for state file creation; write header and first event as one atomic append; repair subcommand; make handle_init idempotent."
+      "chosen": "Atomic init bundle via new init_state_file method on SessionBackend; writes header + WorkflowInitialized + initial Transitioned to a .tmp sibling file and atomic-renames into place",
+      "confidence": "high",
+      "report_file": "wip/design_batch-child-spawning_decision_2_report.md"
     },
     {
       "id": 3,
       "question": "How do we prevent a batch-hook template from silently no-opping on pre-batch koto binaries?",
-      "status": "pending",
+      "status": "complete",
       "complexity": "standard",
-      "notes": "Options: bump format_version to 2; add deny_unknown_fields retroactively; compile-time warning; accept silent no-op with docs."
+      "chosen": "Narrow deny_unknown_fields on SourceState and TemplateState in the same PR as the new materialize_children field, gated by pre-merge audit of existing templates",
+      "confidence": "high",
+      "report_file": "wip/design_batch-child-spawning_decision_3_report.md"
     },
     {
       "id": 4,
-      "question": "How should child-template paths resolve when a parent submits tasks from one working directory and koto spawns children?",
-      "status": "pending",
+      "question": "How should child-template paths resolve across parent-submitter-child working directories?",
+      "status": "complete",
       "complexity": "standard",
-      "notes": "Options: absolute-only; parent-cwd captured in submission; child-cwd at spawn; dedicated template root."
+      "chosen": "Parent's template source directory as primary base (new template_source_dir on StateFileHeader), with submitter_cwd fallback captured on EvidenceSubmitted event",
+      "confidence": "high",
+      "report_file": "wip/design_batch-child-spawning_decision_4_report.md"
     },
     {
       "id": 5,
       "question": "How are failed and skipped children represented, and what is the retry_failed surface?",
-      "status": "pending",
+      "status": "complete",
       "complexity": "critical",
-      "notes": "Couples representation (real state files vs parent-side records), gate output, and retry evidence action shape. Upstream of decision 6."
+      "chosen": "New failure:bool and skipped_marker:bool fields on TemplateState; synthetic state file for skipped children via atomic init bundle; extended children-complete gate output with outcome enum; retry_failed evidence action with transitive-closure rewind loop",
+      "confidence": "high",
+      "report_file": "wip/design_batch-child-spawning_decision_5_report.md"
     },
     {
       "id": 6,
       "question": "How do koto status and koto workflows --children report batch state to observers?",
-      "status": "pending",
+      "status": "complete",
       "complexity": "standard",
-      "notes": "Options: extend existing JSON outputs additively; new `koto batch status` subcommand; rely on existing --children output. Depends on decision 5 representation."
+      "chosen": "Extend both: koto status adds optional batch section (summary, tasks[], ready, blocked, skipped, failed); koto workflows --children adds per-row task_name/waits_on/reason metadata. Shared derive_batch_view helper.",
+      "confidence": "high",
+      "report_file": "wip/design_batch-child-spawning_decision_6_report.md"
     }
   ],
   "cross_validation": "pending",
