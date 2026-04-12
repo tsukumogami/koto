@@ -413,6 +413,15 @@ read the new fields.
 dir, submitter cwd) point at repo content, not koto cache. Koto
 already assumes repo checkouts have stable paths across machines.
 
+**`..` segments are permitted.** Relative paths that escape the base
+directory via `..` are accepted without rejection. Koto's threat model
+treats the invoking user as trusted (see Security Considerations), and
+enforcing a sandbox on template reads would break legitimate use cases
+like a parent template in `templates/parent.md` referencing a shared
+helper at `../shared/helper.md`. Users sharing a machine across trust
+boundaries should avoid running koto as a more-privileged account
+against task lists produced by a less-privileged account.
+
 #### Alternatives considered
 
 - **Absolute paths only.** Rejected: non-portable, brittle across
@@ -628,6 +637,17 @@ current state has a `materialize_children` hook:
 **`koto workflows --children <parent>`** gains optional per-row
 metadata when the parent has a batch: `task_name`, `waits_on`,
 `reason_code`, `reason`, `skip_reason`.
+
+**Source of the `reason` field.** For failed children, `reason` is
+pulled from an explicit context key the child writes before entering
+its terminal-failure state — by convention the key `failure_reason`.
+It is NOT scraped from stderr, task output, or any raw tool output.
+Template authors writing failure-state handlers are responsible for
+writing a sanitized message to this context key. This keeps observer-
+visible output under template-author control and prevents accidental
+leakage of paths, env var values, or secrets into batch status
+responses. When `failure_reason` is unset, `reason` defaults to the
+failure state's name (e.g., `"done_blocked"`).
 
 Both extensions call a shared `derive_batch_view` helper in
 `src/engine/batch.rs` that reuses the scheduler's `classify_task`
@@ -1200,3 +1220,101 @@ These items are explicitly deferred:
   scheduler's resolution fallback (parent template dir →
   submitter cwd → error) produces an error message listing both
   attempted paths, so users immediately see what was tried.
+
+## Security Considerations
+
+Koto is a local-user tool for personal or small-team use. Agents
+submitting evidence are trusted collaborators, not anonymous
+attackers. Templates are authored by developers, not end users. This
+section documents the security-relevant surface added by batch child
+spawning within that model.
+
+### Trust boundaries
+
+- **Task lists are agent-supplied.** The `--with-data @file.json`
+  input carries `template` paths and `vars` values chosen by the
+  submitting agent. An agent with evidence-submission access can
+  point `template` at any template file readable by the invoking
+  user, so evidence submission is a privilege equivalent to template
+  authoring for the purpose of spawning children. Treat the agent as
+  a trusted collaborator; do not use batch spawning to sandbox
+  untrusted input.
+
+- **`vars` have the same trust level as `--var` flags on `koto init`.**
+  Agent-supplied `vars` are interpolated into the child's
+  `resolve_variables()` and may land inside `default_action` shell
+  strings. Template authors must quote variable expansions exactly
+  as they would for `koto init --var` inputs. Do not place secrets
+  in `vars` unless you are comfortable with them being persisted in
+  the append-only event log (and, if cloud sync is enabled, uploaded
+  to the sync bucket). This matches the existing persistence
+  behavior of `koto init --var KEY=SECRET`; it is not a regression.
+
+### Resource bounds
+
+- **Task list size.** `--with-data` is capped at 1 MB of resolved
+  content. The scheduler additionally enforces soft limits on task
+  count (recommended: no more than 1000 tasks per batch) and edge
+  count (recommended: no more than 10 `waits_on` entries per task).
+  Larger batches incur quadratic-ish cost on every `koto next` tick
+  because the scheduler re-classifies all tasks plus calls
+  `backend.list()` on every invocation. These limits are soft
+  self-DoS protections, not adversarial defenses.
+
+- **Retry throttling.** `retry_failed` submissions are not rate-
+  limited. Each retry appends a `Rewound` event per targeted child
+  plus a clearing evidence event on the parent, so state files grow
+  linearly with retries. Self-DoS by rapid retry is possible but
+  limited to the invoking user's own workflow.
+
+### Path resolution
+
+Relative `template` paths are resolved against the parent's
+canonicalized `template_source_dir` first, then against
+`submitter_cwd`. The scheduler does not reject `..` segments (see
+Decision 4). Koto treats the invoking user as trusted and does not
+enforce a sandbox on template reads. The practical blast radius of
+a path-traversal in a task entry is the same as the invoking user
+manually `cat`ing the file — no privilege boundary is crossed.
+
+### Persisted path information
+
+- **New fields carry local absolute paths.** `StateFileHeader` gains
+  `template_source_dir` and `EventPayload::EvidenceSubmitted` gains
+  `submitter_cwd`. Both are absolute paths under the user's home
+  directory and are persisted in state files (and, if cloud sync is
+  enabled, uploaded to the sync bucket). Users sharing state files
+  for debugging should be aware that directory structure will be
+  visible in the shared file. This is an incremental exposure over
+  v0.7.0, which already persists absolute paths to cached template
+  JSON in event payloads, but the surface grows.
+
+### Observer-visible output
+
+- **The `reason` field is sourced from an explicit context key.**
+  Documented in Decision 6 above: batch output's per-child `reason`
+  comes from the `failure_reason` context key written by the child,
+  not from scraped stderr or raw tool output. Template authors
+  writing failure-state handlers must write a sanitized message to
+  this context key. This prevents accidental leakage of paths, env
+  var values, or secrets into batch status responses that observers
+  (other agents, human operators) consume.
+
+### Symlink and directory assumptions
+
+- **Session directory is assumed to be user-owned and not world-
+  writable.** The atomic init bundle (Decision 2) uses
+  `tempfile::NamedTempFile::persist`, which creates the temp file
+  with `O_EXCL` inside the target directory before calling
+  `rename(2)`. A pre-existing symlink at the final name would cause
+  `rename` to overwrite the symlink itself (not its target), so
+  there's no symlink-follow attack against `init_state_file`. This
+  matches the pattern already used by `write_manifest` in
+  `src/session/local.rs`.
+
+### Supply chain
+
+No new dependencies are introduced. The design uses `tempfile`
+(pre-existing), `serde` (pre-existing), and the existing koto
+session backend. The `init_state_file` refactor moves existing crate
+usage to new call sites.
