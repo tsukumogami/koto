@@ -570,9 +570,16 @@ states:
       tasks:
         type: json
         required: true
+        description: >
+          JSON array of task objects. Each entry: { name: string
+          (required), template: string (optional, defaults to
+          impl-issue.md), vars: object (optional), waits_on:
+          string[] (optional), trigger_rule: string (optional,
+          only all_success in v1) }
     materialize_children:
       from_field: tasks
       failure_policy: skip_dependents   # default; also accepts 'continue'
+      default_template: impl-issue.md   # compiler-validated child template
     gates:
       done:
         type: children-complete
@@ -600,7 +607,7 @@ run on every tick.
 | Field | Type | Required | Default | Purpose |
 |-------|------|----------|---------|---------|
 | `name` | string | yes | — | Short task name. Child workflow name is `<parent>.<name>`. Passes `validate_workflow_name()`. |
-| `template` | string | yes | — | Path to child template (resolution covered in Decision 4). |
+| `template` | string | no | hook's `default_template` | Path to child template (resolution covered in Decision 4). Optional when `default_template` is set on the hook. Per-task override wins. |
 | `vars` | object (string → string) | no | `{}` | Forwarded to child's `resolve_variables()`. |
 | `waits_on` | array of string | no | `[]` | Sibling task names that must complete first. |
 | `trigger_rule` | string enum | no | `all_success` | Reserved for v2; only `all_success` accepted in v1. |
@@ -618,6 +625,7 @@ R1–R7):**
 | E6 | error | `failure_policy` is `skip_dependents` or `continue` |
 | E7 | error | State has at least one outgoing transition |
 | E8 | error | No two states reference the same `from_field` (copy-paste guard) |
+| E9 | error | `default_template` is non-empty and resolves to a compilable template |
 | W1 | warning | A `children-complete` gate is reachable from the declaring state |
 | W2 | warning | If `children-complete.name_filter` is set, it starts with `<parent>.` |
 | R1–R7 | runtime | Child template compilable; vars resolve; `waits_on` is a DAG; no dangling refs; task names unique; names pass `validate_workflow_name`; no collisions with existing siblings |
@@ -1245,6 +1253,94 @@ prescribe; the template author does.
   guidance (alongside directive and details) with no clear
   precedence.
 
+### Decision 8: How the agent discovers the task entry schema and child template path
+
+Two gaps surfaced during the interactive walkthrough. First, the
+`materialize_children` hook says nothing about what child template to
+use — the path is hardcoded in directive prose, not compile-time
+validated, and not discoverable from koto's structured response.
+Second, the `expects` block advertises `tasks: { type: json,
+required: true }` but `json` is opaque — the agent doesn't learn that
+each entry needs `name`, `template`, `vars`, `waits_on` from anything
+structured in the response.
+
+#### Chosen: `default_template` on the hook + surface existing `description` field in `expects`
+
+Two changes close both gaps:
+
+**1. `default_template` (required) on `MaterializeChildrenSpec`.**
+The compiler validates the path resolves at compile time. Task entries
+can omit `template` (the default is used); per-task overrides win.
+
+```yaml
+materialize_children:
+  from_field: tasks
+  failure_policy: skip_dependents
+  default_template: impl-issue.md    # compiler-validated
+```
+
+**2. Surface `FieldSchema.description` in `ExpectsFieldSchema`.**
+`FieldSchema` in `src/template/types.rs:75` already has a
+`description: String` field, but `derive_expects` in
+`src/cli/next_types.rs:455` drops it — `ExpectsFieldSchema` carries
+`field_type`, `required`, and `values` but not `description`. A
+one-line struct addition and one-line mapping change surface it.
+
+Template authors write:
+
+```yaml
+accepts:
+  tasks:
+    type: json
+    required: true
+    description: >
+      JSON array of task objects. Each entry: { name: string (required),
+      template: string (optional, defaults to impl-issue.md),
+      vars: object (optional), waits_on: string[] (optional),
+      trigger_rule: string (optional, only all_success in v1) }
+```
+
+The agent sees this in the response:
+
+```json
+{
+  "expects": {
+    "fields": {
+      "tasks": {
+        "type": "json",
+        "required": true,
+        "description": "JSON array of task objects. Each entry: { name: string (required), template: string (optional, defaults to impl-issue.md), vars: object (optional), waits_on: string[] (optional), trigger_rule: string (optional, only all_success in v1) }"
+      }
+    }
+  }
+}
+```
+
+An agent without the koto-user skill reads the `description` to learn
+the schema. The information is next to the field it describes, in the
+same `expects` block the agent already parses.
+
+**Why not a dedicated `task_schema` response field?** The batch task
+entry schema is invariant — the same five fields every time. A
+dedicated `task_schema` object in every response adds a new concept
+for a schema that never changes. The `description` field carries the
+same information through an existing channel and works for any
+`json`-typed field, not just batch tasks.
+
+#### Alternatives considered
+
+- **`default_template` only; prose/skill docs for schema.** Rejected:
+  closes Gap 1 but leaves Gap 2 open. Surfacing `description` is a
+  one-line change; no reason to leave the gap open.
+- **Prose only (no engine changes).** Rejected: both gaps remain, no
+  compile-time validation of child template paths.
+- **`item_schema` annotation on the `json` accepts type.** Rejected:
+  extends the type system in ways Decision E7 explicitly deferred.
+  `description` is a freeform string, not a type system extension.
+- **New `task_schema` response field (Option 1 original).** Rejected:
+  new response concept for an invariant schema is over-engineering when
+  `description` already carries the same information.
+
 ## Decision Outcome
 
 The six decisions interlock into one coherent implementation. The
@@ -1416,6 +1512,7 @@ pub struct TemplateState {
 #[serde(deny_unknown_fields)]
 pub struct MaterializeChildrenSpec {
     pub from_field: String,
+    pub default_template: String,  // compiler-validated path
     #[serde(default = "default_failure_policy")]
     pub failure_policy: FailurePolicy,
 }
@@ -1905,7 +2002,10 @@ split into two sub-PRs if review velocity stalls (see Mitigations).
 **Sub-phase 2b — template vocabulary for batch:**
 - `TemplateState` gains `materialize_children`, `failure`,
   `skipped_marker` fields
-- `MaterializeChildrenSpec` and `FailurePolicy` types
+- `MaterializeChildrenSpec` (with required `default_template`) and
+  `FailurePolicy` types
+- `ExpectsFieldSchema` gains `description: String` field
+  (Decision 8); `derive_expects` updated to propagate it
 - `CompiledTemplate::validate` extended with E1–E8 errors and W1–W2
   warnings for `materialize_children`
 - Tests for each compiler rule and each field default

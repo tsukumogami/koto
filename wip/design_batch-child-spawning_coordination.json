@@ -57,8 +57,26 @@
       "chosen": "Extend both: koto status adds optional batch section (summary, tasks[], ready, blocked, skipped, failed); koto workflows --children adds per-row task_name/waits_on/reason metadata. Shared derive_batch_view helper.",
       "confidence": "high",
       "report_file": "wip/design_batch-child-spawning_decision_6_report.md"
+    },
+    {
+      "id": 7,
+      "question": "How does koto communicate to the agent what to do when children are spawned?",
+      "status": "complete",
+      "complexity": "standard",
+      "chosen": "Existing directive + details mechanism (no new features). The GateBlocked response already includes template-authored directive prose.",
+      "confidence": "high",
+      "report_file": "wip/design_batch-child-spawning_decision_7_report.md"
+    },
+    {
+      "id": 8,
+      "question": "How does the agent discover the task entry schema and child template path?",
+      "status": "complete",
+      "complexity": "standard",
+      "chosen": "default_template (required) on MaterializeChildrenSpec + surface existing FieldSchema.description in ExpectsFieldSchema",
+      "confidence": "high",
+      "report_file": "wip/design_batch-child-spawning_decision_8_report.md"
     }
   ],
-  "cross_validation": "pending",
+  "cross_validation": "passed",
   "round": 0
 }
