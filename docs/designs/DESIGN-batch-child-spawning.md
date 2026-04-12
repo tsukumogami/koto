@@ -1134,6 +1134,117 @@ collapses to one `koto status work-on-plan-42` call per poll:
   violates the "don't force observers to duplicate DAG computation"
   constraint and makes shirabe's consumer expensive.
 
+### Decision 7: How the agent knows what to do when children are spawned
+
+When the parent's `children-complete` gate blocks with spawned
+children, the `gate_blocked` response carries machine-readable data
+(`scheduler.spawned`, `blocking_conditions[].output`) but nothing
+tells the agent in plain English what to do — drive children in
+parallel? delegate? wait for CI? poll? The question is whether
+this needs a new engine feature or whether the existing directive
+mechanism handles it.
+
+#### Chosen: existing `directive` + `details` mechanism (no new features)
+
+The `GateBlocked` response already includes the `directive` field
+— template-authored prose from the state's markdown body section.
+This directive appears on every gate-blocked tick. The existing
+mechanism provides everything needed:
+
+1. **Directive prose (always present).** The template author writes
+   batch-aware text in the state's markdown body:
+   ```markdown
+   ## plan_and_await
+
+   Children have been spawned from your task list. For each child
+   in the `scheduler.spawned` list below, start a sub-agent that
+   drives it via `koto next <child-name>`. Re-check the parent
+   with `koto next parent-42` after each child completes to spawn
+   newly-unblocked tasks.
+   ```
+
+2. **Details text (first visit).** The `<!-- details -->` marker
+   lets authors include extended batch instructions on first
+   visit — how to interpret scheduler output, when to re-tick the
+   parent, whether to run children in parallel — that disappear on
+   repeat visits to reduce noise.
+
+3. **Structured data alongside prose.** The `scheduler` field
+   carries `spawned`/`blocked`/`skipped` lists as machine-readable
+   JSON, and `blocking_conditions[].output` carries per-child
+   status with outcome enums. The agent reads the prose to
+   understand the intent; it reads the JSON to know the specifics.
+
+4. **Skill-level documentation.** The koto-user skill's
+   response-shapes reference documents the batch response pattern,
+   teaching agents how to interpret the scheduler outcome alongside
+   the directive. Agents without the skill can still read the
+   directive prose.
+
+**No code changes needed.** The guidance mechanism is a template
+authoring concern and the authoring tools already exist.
+
+**Concrete response example.** After submitting a batch and one
+child completing, `koto next parent-42` returns:
+
+```json
+{
+  "action": "gate_blocked",
+  "state": "plan_and_await",
+  "directive": "Children have been spawned from your task list. For each child in the scheduler.spawned list below, start a sub-agent that drives it via `koto next <child-name>`. Re-check the parent after each child completes.",
+  "details": "The batch scheduler runs on every `koto next parent-42` call. It spawns tasks whose dependencies are all terminal. Drive children in parallel when possible. Each child is an independent workflow with its own state file.",
+  "blocking_conditions": [{
+    "name": "done",
+    "type": "children-complete",
+    "category": "temporal",
+    "output": {
+      "total": 10, "completed": 1, "pending": 9,
+      "success": 1, "failed": 0, "skipped": 0, "blocked": 6,
+      "all_complete": false,
+      "children": [
+        {"name": "parent-42.issue-1", "outcome": "success"},
+        {"name": "parent-42.issue-2", "outcome": "pending"},
+        {"name": "parent-42.issue-4", "outcome": "blocked", "blocked_by": ["parent-42.issue-2"]}
+      ]
+    }
+  }],
+  "scheduler": {
+    "spawned": ["parent-42.issue-4"],
+    "already": ["parent-42.issue-1", "parent-42.issue-2", "parent-42.issue-3"],
+    "blocked": ["parent-42.issue-5", "parent-42.issue-6", "..."]
+  }
+}
+```
+
+The directive and details text are entirely template-authored. A
+different template might say "wait for CI to complete each child"
+or "delegate to team members via the task system." koto doesn't
+prescribe; the template author does.
+
+#### Alternatives considered
+
+- **Hardcoded engine-generated `suggested_action`.** Rejected:
+  generic prose can't fit every use case (drive vs delegate vs
+  wait). Engine-generated behavioral suggestions contradict koto's
+  "contract layer" philosophy — the engine doesn't know whether
+  children should run in parallel, sequentially, or be delegated.
+- **Template-authored `batch_directive` on `materialize_children`
+  hook.** Rejected as redundant: the state already has a
+  directive. Adding a second prose field creates unclear
+  precedence and two places to maintain guidance text.
+- **Extend directive with batch-aware interpolation
+  (`{{#if batch.spawned}}`, `{{batch.spawned_names}}`).** Rejected:
+  introduces a template engine dependency (Handlebars/Tera) and
+  conditional syntax into a system where directives are currently
+  plain text. Runtime state (child names, counts) is already in
+  `scheduler` and `blocking_conditions` — duplicating it in prose
+  adds no decision-relevant information.
+- **Structured `action_hint` on gate output.** Rejected: new
+  concept in koto's gate output vocabulary that overlaps with the
+  existing directive. Would be a third place to write agent
+  guidance (alongside directive and details) with no clear
+  precedence.
+
 ## Decision Outcome
 
 The six decisions interlock into one coherent implementation. The
