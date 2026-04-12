@@ -1538,24 +1538,33 @@ finds no hook and returns `NoBatch`. Response: `workflow_complete`.
 
 **Protocol summary.**
 
-- The only CLI surface for parent-child communication is
-  `koto next <workflow-name>` (with optional `--with-data`).
-  koto does not have a "switch to child" command or a "return
-  to parent" command. The agent keeps its own notion of "which
-  workflow am I driving now."
-- The batch view in `koto status parent-42` and the scheduler
-  outcome attached to each `koto next parent-42` response tell
-  the agent which children are newly spawnable (`ready`) and
-  which already-spawned children are still in progress
-  (`in_progress`).
-- koto does not track "which workflow the agent is currently
-  working on." The agent (or orchestrator) makes that decision
-  based on its own logic: typically one coordinator per parent,
-  one worker per running child.
-- Parent and child state machines are independent. A child can
-  itself be a parent of its own batch (via `koto init --parent
-  <child-name>` — the v0.7.0 primitive) without the outer
-  parent needing to know.
+- **The agent explicitly picks which child to drive.** Each
+  child is a named workflow (e.g., `parent-42.issue-1`) driven
+  by `koto next parent-42.issue-1` like any other workflow. The
+  `.` in the name is a naming convention, not a hierarchy
+  operator. When the scheduler spawns 3 ready children, the
+  agent decides which to work on, in what order, and whether to
+  run them in parallel or sequentially. koto materializes state
+  files; the agent executes.
+- **No session context switching.** There is no `koto enter-child`
+  or `koto return-to-parent` command that changes a session
+  context. To "switch" from driving the parent to driving a
+  child, the agent simply calls `koto next` with a different
+  workflow name. To "return" to the parent after a child
+  finishes, the agent calls `koto next parent-42` again. koto
+  does not track which workflow the agent is currently working on.
+- **The batch view tells the agent what's available.** The
+  `koto status parent-42` response (and the scheduler outcome
+  attached to each `koto next parent-42` response) lists which
+  children are in progress (`in_progress`), which are newly
+  ready to be driven (`ready` — they've been spawned but not
+  started yet), and which are blocked waiting on dependencies
+  (`blocked`). The agent reads these lists and makes its own
+  scheduling decisions.
+- **Parent and child state machines are independent.** A child
+  can itself be a parent of its own batch (via `koto init
+  --parent <child-name>` — the v0.7.0 primitive) without the
+  outer parent needing to know.
 
 **Details from the Step 4 walkthrough, in code terms:**
 
