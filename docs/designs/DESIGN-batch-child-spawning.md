@@ -5,13 +5,47 @@ problem: |
   consumer has to run the spawn loop themselves: query which children are
   ready, spawn them, check for completion, spawn the next wave. For
   workflows where the full task set is known upfront (e.g. a plan parsed
-  into a DAG of GitHub-issue children), this loop forces every consumer to
-  re-implement scheduling in SKILL.md prose, which is brittle beyond a
-  handful of tasks and blocks shirabe's adoption of koto for hierarchical
-  templates (tsukumogami/shirabe#67). This design specifies a declarative
-  alternative: the parent submits a task list as evidence, and koto owns
-  materialization, dependency-ordered scheduling, completion detection,
-  and failure routing end to end.
+  into a DAG of GitHub-issue children), this loop forces every consumer
+  to re-implement scheduling in SKILL.md prose, which is brittle beyond
+  a handful of tasks and blocks shirabe's adoption of koto for
+  hierarchical templates (tsukumogami/shirabe#67). This design specifies
+  a declarative alternative: the parent submits a task list as evidence,
+  and koto owns materialization, dependency-ordered scheduling,
+  completion detection, and failure routing end to end.
+decision: |
+  The parent template declares a state-level `materialize_children` hook
+  that points at a required `json`-typed accepts field. When evidence is
+  submitted with that field populated as a JSON array of task specs
+  (name, template, vars, waits_on), a new CLI-level scheduler in
+  `handle_next` (post-`advance_until_stop`) builds the DAG, classifies
+  tasks from on-disk child state files, and spawns each ready task via
+  a new atomic `SessionBackend::init_state_file` method. Child names are
+  deterministic `<parent>.<task>`, giving free idempotency via the
+  existing `backend.exists()` check. Failure routing defaults to
+  `skip_dependents` via new first-class `failure: bool` and
+  `skipped_marker: bool` fields on `TemplateState`; the existing
+  `children-complete` gate is extended with per-child `outcome` enum,
+  `success/failed/skipped/blocked` aggregates, and failure-reason
+  fields. A `retry_failed` evidence action re-runs failed chains via
+  the existing rewind machinery. Observability lands as optional
+  `batch` sections on `koto status` and per-row metadata on
+  `koto workflows --children`, sharing a `derive_batch_view` helper.
+rationale: |
+  The state-level hook is the only shape of four candidates that
+  localizes declaration, validation, and execution to a single state
+  block while matching koto's existing `gates` and `default_action`
+  pattern. Disk-derived scheduling means no persistent cursor, no new
+  event types, and free resume via pure re-derivation from child state
+  files plus the parent's event log. Atomic `init_state_file` closes a
+  pre-existing crash window in `handle_init` that affects v0.7.0 too,
+  so it's independently valuable. Placing `failure_policy` on the hook
+  rather than per-task or in the payload keeps parent-template
+  contracts intact. Skip-dependents matches Argo and Airflow's
+  safe-by-default precedent and aligns with the canonical GitHub-issue
+  use case. Narrow `deny_unknown_fields` gives a better error message
+  than a format_version bump with less migration surface. The whole
+  feature lands in three sequential PRs (atomic init, schema layer,
+  scheduler + observability) without breaking v0.7.0 behavior.
 ---
 
 # DESIGN: batch-child-spawning
@@ -150,7 +184,7 @@ constraints, not reopened.
 - **Insertion point: CLI-level scheduler tick in `handle_next`,
   post-`advance_until_stop`.** The advance loop in
   `src/engine/advance.rs` stays pure (I/O-free, closure-driven). A new
-  module `src/engine/batch.rs` holds the scheduler; `handle_next` calls
+  module `src/cli/batch.rs` holds the scheduler; `handle_next` calls
   it once the advance loop has settled on the final state.
 
 - **Child naming: deterministic `<parent>.<task>`.** Couples child name
@@ -328,6 +362,45 @@ cleaned up at next `backend.cleanup`.
   logic in the init path. Doesn't close the crash window, just patches
   around it. Can't recover the original `--var` flags on retry.
 
+### Scheduler-tick ordering on first submission
+
+`handle_next` runs `advance_until_stop` before `run_batch_scheduler`.
+This creates a two-call contract on the first batch submission:
+
+1. **Call 1.** Agent submits the task list:
+   `koto next parent --with-data @tasks.json`. The advance loop
+   processes the evidence, the parent transitions to
+   `awaiting_children`, the `children-complete` gate evaluates
+   against zero children and returns `Failed` (all tasks are
+   unspawned; `evaluate_children_complete` sees no matching
+   sessions). The response is `gate_blocked` with a count of 0/N
+   children ready. The scheduler then runs after the advance loop
+   and spawns all tasks whose `waits_on` is empty. The spawned
+   count appears in the scheduler outcome attached to the
+   response, but the gate result is already finalized.
+
+2. **Call 2.** Agent invokes `koto next parent` again. The advance
+   loop re-evaluates the gate, which now sees the newly-spawned
+   children from Call 1. The gate output reflects actual batch
+   progress.
+
+This contract is acceptable because agents are already in a polling
+loop against `koto next`, but it must be documented so consumers
+don't expect Call 1's response to reflect the spawn. Two concrete
+requirements:
+
+- `evaluate_children_complete`'s "no matching children found" error
+  branch at `src/cli/mod.rs:2507-2519` must be updated to handle the
+  batch-state case. When the current state has a
+  `materialize_children` hook and no children exist yet, it returns
+  `Failed` with `total: <task_count_from_evidence>` and
+  `completed: 0`, not an error. The un-spawned tasks are visible
+  to the caller as `pending` entries.
+- The `SchedulerOutcome::Scheduled` field in the response response
+  serialization must always render, even when the outer response is
+  `gate_blocked`, so agents have visible evidence that spawn
+  happened on this tick.
+
 ### Decision 3: Forward-compat diagnosability
 
 A batch-hook template compiled against a pre-batch koto binary
@@ -336,12 +409,25 @@ silently no-ops today: `CompiledTemplate` does not set
 `materialize_children` field. The user sees their workflow "not
 spawning children" with no error or warning.
 
-#### Chosen: narrow `deny_unknown_fields` on `SourceState` and `TemplateState`
+#### Chosen: narrow `deny_unknown_fields` on `SourceState` only
 
-Add the attribute to `SourceState` and `TemplateState` only, in the
-same PR as the new `materialize_children` field. Gate on a pre-merge
-audit of existing template fixtures to confirm no templates rely on
-unknown fields as annotations.
+Add the attribute to `SourceState` — the markdown parsing
+intermediate — NOT to `TemplateState` — the compiled AST loaded
+from cached JSON. Gate on a pre-merge audit of existing template
+source files to confirm no templates rely on unknown fields as
+annotations.
+
+**Why not also on `TemplateState`.** `TemplateState` deserializes
+from cached compiled JSON written by previous koto binaries. A user
+upgrading their koto binary may have a compile cache with JSON
+fields the new binary doesn't know about (unlikely, but possible
+after a downgrade/upgrade cycle). Adding `deny_unknown_fields` to
+`TemplateState` would fail the cache load with no migration path.
+Keeping it scoped to `SourceState` gives the forward-compat signal
+we want (authors writing new markdown templates get a clear error
+on old binaries) without risking cache-load failures on
+binary-version churn. The compile cache key already invalidates on
+binary version, but belt-and-suspenders avoidance is cheap here.
 
 **Why this beats a format_version bump:** neither v0.6.0 (structured
 gate output) nor v0.7.0 (hierarchical workflows) bumped
@@ -650,7 +736,7 @@ responses. When `failure_reason` is unset, `reason` defaults to the
 failure state's name (e.g., `"done_blocked"`).
 
 Both extensions call a shared `derive_batch_view` helper in
-`src/engine/batch.rs` that reuses the scheduler's `classify_task`
+`src/cli/batch.rs` that reuses the scheduler's `classify_task`
 and `build_dag` functions. The function is side-effect-free and
 callable from read-only paths.
 
@@ -704,7 +790,7 @@ They share three cross-cutting PR landing requirements:
    Three call sites will consume it later (regular init, scheduler
    spawn, skipped-marker synthesis).
 
-3. **One scheduler PR.** Adds `src/engine/batch.rs`, wires
+3. **One scheduler PR.** Adds `src/cli/batch.rs`, wires
    `run_batch_scheduler` into `handle_next` after `advance_until_stop`,
    extends `evaluate_children_complete`'s output schema with the
    Decision 5 fields, adds `derive_batch_view` for Decision 6,
@@ -825,7 +911,6 @@ The new surface divides into three concerns:
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct TemplateState {
     // ... existing fields ...
 
@@ -838,6 +923,11 @@ pub struct TemplateState {
     #[serde(default, skip_serializing_if = "is_false")]
     pub skipped_marker: bool,
 }
+
+// Note: `deny_unknown_fields` is applied to `SourceState` (the
+// markdown intermediate), NOT to `TemplateState` (which loads from
+// the compile cache and must tolerate fields from newer binaries
+// during version churn). See Decision 3.
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -873,7 +963,10 @@ pub trait SessionBackend: Send + Sync {
 }
 ```
 
-**New engine module** (`src/engine/batch.rs`):
+**New CLI module** (`src/cli/batch.rs`). Placed under `src/cli/`, not
+`src/engine/`, because the scheduler needs `SessionBackend` and
+produces CLI response shapes — putting it in `src/engine/` would
+violate the engine's I/O-free invariant:
 
 ```rust
 pub enum SchedulerOutcome {
@@ -886,6 +979,23 @@ pub enum SchedulerOutcome {
     },
     Error { reason: String },
 }
+
+pub enum BatchError {
+    /// Task list failed validation (size, cycles, unique names, refs).
+    InvalidBatchDefinition { reason: String },
+    /// backend.create / init_state_file failed for a specific task.
+    SpawnFailed { task: String, source: SessionError },
+    /// Resolved template path doesn't exist or fails to compile.
+    TemplateResolveFailed { task: String, paths_tried: Vec<String> },
+    /// Backend list/read failed during classification.
+    BackendError { source: SessionError },
+    /// Submission exceeds hard limits (task count, edge count, depth).
+    LimitExceeded { which: &'static str, limit: usize, actual: usize },
+}
+
+// BatchError maps to NextError::Batch { kind, message } for CLI
+// response serialization. The NextError variant is added in the
+// same PR that introduces this module.
 
 pub fn run_batch_scheduler(
     backend: &dyn SessionBackend,
@@ -1045,36 +1155,49 @@ implementation.
   `sync_push_state` in `src/session/cloud.rs`
 - `handle_init` in `src/cli/mod.rs:1112-1150` refactored to use
   `init_state_file`
+- Extract `init_child_from_parent(backend, child_name, parent_name,
+  template_path, vars)` helper from `handle_init`. This is a
+  meaningful refactor, not a trivial move: it must re-run
+  `resolve_variables` against the child template's `variables`
+  block (not the parent's), compile-cache the child template, and
+  return a typed `Result` so the scheduler can surface errors
+  per-task instead of calling `exit_with_error`. The existing
+  `handle_init` becomes a thin wrapper that maps the `Result` to
+  exit codes.
 - New test: crash between `create` and `append_event` leaves no
   header-only state file
 - New test: resume after simulated crash via temp-file remnants works
+- New test: `init_child_from_parent` resolves child-template
+  variables correctly when the parent template has different
+  variables
 
 **No user-visible change.** Existing `koto init` behavior is
 preserved; only the internal sequence is tightened.
 
 ### Phase 2: Schema-layer changes (Decisions 1, 3, 4, 5)
 
-Land all template-format and type changes in one PR. This is the
-big PR but the changes are mostly additive.
+Land all template-format and type changes. This is large and can be
+split into two sub-PRs if review velocity stalls (see Mitigations).
 
-**Deliverables:**
-- `TemplateState` gains `materialize_children`, `failure`,
-  `skipped_marker` fields
-- `MaterializeChildrenSpec` and `FailurePolicy` types
-- Accepts schema `VALID_FIELD_TYPES` gains `json`
-- `#[serde(deny_unknown_fields)]` on `SourceState` and `TemplateState`
-  (Decision 3); pre-merge audit confirms no templates rely on unknown
-  fields
+**Sub-phase 2a — evidence and path infra (can ship first):**
 - `StateFileHeader` gains `template_source_dir` (Decision 4)
 - `EventPayload::EvidenceSubmitted` gains `submitter_cwd` (Decision 4)
-- `CompiledTemplate::validate` extended with E1–E8 errors and W1–W2
-  warnings for `materialize_children`
 - `handle_init` captures `template_source_dir` from the canonicalized
   `--template` argument's parent directory
 - `handle_next` writes `submitter_cwd` into `EvidenceSubmitted` events
 - `--with-data @file.json` prefix added to `validate_with_data_payload`
-- Tests for each compiler rule, each field default, and round-trip
-  compat with v0.7.0 state files and templates
+- Accepts schema `VALID_FIELD_TYPES` gains `json`
+- `#[serde(deny_unknown_fields)]` on `SourceState` only (Decision 3);
+  pre-merge audit confirms no source templates rely on unknown fields
+- Tests for round-trip compat with v0.7.0 state files and templates
+
+**Sub-phase 2b — template vocabulary for batch:**
+- `TemplateState` gains `materialize_children`, `failure`,
+  `skipped_marker` fields
+- `MaterializeChildrenSpec` and `FailurePolicy` types
+- `CompiledTemplate::validate` extended with E1–E8 errors and W1–W2
+  warnings for `materialize_children`
+- Tests for each compiler rule and each field default
 
 **No batch scheduler yet.** This PR unlocks the template vocabulary
 but doesn't actually spawn children from evidence. Authors can
@@ -1086,24 +1209,53 @@ but runtime is a no-op.
 Wire up the actual scheduler and observability.
 
 **Deliverables:**
-- New module `src/engine/batch.rs` with `run_batch_scheduler`,
+- New module `src/cli/batch.rs` with `run_batch_scheduler`,
   `derive_batch_view`, `handle_retry_failed`, `classify_task`,
-  `build_dag`, DAG cycle detector
+  `build_dag`, DAG cycle detector, and `BatchError` enum
+- New `NextError::Batch` variant in `src/cli/next_types.rs` with
+  `From<BatchError>` impl for CLI response serialization
 - `handle_next` in `src/cli/mod.rs` calls `run_batch_scheduler`
   after `advance_until_stop`
-- `evaluate_children_complete` extended to accept `parent_events`
-  and emit the Decision 5 gate output schema (additive fields:
-  `success`, `failed`, `skipped`, `blocked`, per-child `outcome`,
-  `failure_mode`, `skipped_because`, `blocked_by`)
+- **Update `evaluate_children_complete`'s "no children found"
+  branch.** When the current state has a `materialize_children`
+  hook and no children exist yet, return `Failed` with
+  `total: <task_count_from_evidence>`, not an error. The function
+  also takes `parent_events` as a new argument so it can resolve
+  the batch definition.
+- `evaluate_children_complete` extended to emit the Decision 5
+  gate output schema (additive fields: `success`, `failed`,
+  `skipped`, `blocked`, per-child `outcome`, `failure_mode`,
+  `skipped_because`, `blocked_by`)
 - `koto status` extended with optional `batch` section
 - `koto workflows --children` extended with per-row batch metadata
 - `retry_failed` evidence action wired through the advance loop to
-  `handle_retry_failed`
-- `internal_rewind_to_initial(name)` helper extracted from
-  `handle_rewind` for per-child rewind
+  `handle_retry_failed`. The `null`-clearing-event idiom must be
+  documented with a prominent code comment referencing
+  `merge_epoch_evidence` semantics so future maintainers don't
+  accidentally break it.
+- **New `internal_rewind_to_initial(backend, name)` helper.** This
+  is new machinery, not an extraction from `handle_rewind` — the
+  existing rewind command rewinds one step, not back to initial
+  state. The helper writes a new `Rewound` event targeting the
+  child's initial state, creating a fresh epoch. Shares
+  fsync/atomicity semantics with `handle_rewind`.
+- New `repair_half_initialized_children` pre-pass in
+  `run_batch_scheduler`: detects any child state file with a
+  header but no events (shouldn't happen after Phase 1's atomic
+  init bundle, but defense-in-depth for crashes in the older
+  code path that ran before Phase 1 shipped). Either deletes or
+  atomically re-initializes them.
+- **Submission-time hard limit enforcement.** At evidence
+  submission, reject task lists exceeding hard caps: 1000 tasks,
+  10 `waits_on` entries per task, DAG depth of 50. Return
+  `BatchError::LimitExceeded` with actual and limit values.
+  These are hard rejections, not soft recommendations — easier
+  to loosen limits in v2 than to tighten them after users rely
+  on larger batches.
 - Integration tests for: linear batch, diamond DAG, mid-flight
   append, failure with skip-dependents, `retry_failed` recovery,
-  crash-resume walkthrough from Decision 5's section 5.5
+  crash-resume walkthrough from Decision 5's section 5.5,
+  limit-exceeded rejection
 - koto-author and koto-user skill updates covering
   `materialize_children`, the extended gate output, and the
   `retry_failed` action
@@ -1167,9 +1319,10 @@ These items are explicitly deferred:
   `deny_unknown_fields`, a new header field, a new event field.
   Reviewers have a lot to track.
 - **`deny_unknown_fields` is a one-time migration risk.** Any
-  template fixture that has ever relied on unknown fields as
+  template source file that has ever relied on unknown fields as
   free-form annotations breaks with a clear error, but still
-  breaks. The pre-merge audit must be thorough.
+  breaks. The pre-merge audit must be thorough. Scoped to
+  `SourceState` only, so the compile cache is unaffected.
 - **Batch observability has a read-time cost.** `koto status`
   with a batch section calls `backend.list()` plus per-child reads.
   For large batches (50+ children) on cloud sync, the per-call
@@ -1253,13 +1406,16 @@ spawning within that model.
 ### Resource bounds
 
 - **Task list size.** `--with-data` is capped at 1 MB of resolved
-  content. The scheduler additionally enforces soft limits on task
-  count (recommended: no more than 1000 tasks per batch) and edge
-  count (recommended: no more than 10 `waits_on` entries per task).
-  Larger batches incur quadratic-ish cost on every `koto next` tick
+  content. The scheduler additionally enforces hard limits at
+  submission time: no more than 1000 tasks per batch, no more
+  than 10 `waits_on` entries per task, and DAG depth no deeper
+  than 50. Submissions exceeding any limit are rejected with
+  `BatchError::LimitExceeded`. Limits are hard rather than soft
   because the scheduler re-classifies all tasks plus calls
-  `backend.list()` on every invocation. These limits are soft
-  self-DoS protections, not adversarial defenses.
+  `backend.list()` on every `koto next` tick, and cost is
+  quadratic-ish in task count — easier to loosen the caps in a
+  later version than to tighten them after users rely on larger
+  batches.
 
 - **Retry throttling.** `retry_failed` submissions are not rate-
   limited. Each retry appends a `Rewound` event per targeted child
