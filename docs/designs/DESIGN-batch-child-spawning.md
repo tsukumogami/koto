@@ -532,7 +532,10 @@ not yet have. Reserving the field avoids a future schema migration.
 
 ## Considered Options
 
-## Considered Options
+The decisions in this section were made during the design phase
+(`/shirabe:design`) through parallel decision agents and cross-
+validation. They build on the exploration-phase decisions above
+and are the primary new contribution of this design doc.
 
 ### Decision 1: Task list schema, template hook, and compiler validation
 
