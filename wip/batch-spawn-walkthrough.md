@@ -33,10 +33,6 @@ states:
       tasks:
         type: json
         required: true
-        description: >
-          JSON array of task objects. Each entry: { name: string
-          (required), vars: object (optional), waits_on: string[]
-          (optional). template is optional (defaults to impl-issue.md).
     materialize_children:
       from_field: tasks
       failure_policy: skip_dependents
@@ -54,8 +50,8 @@ the plan:
 2. Map dependencies to sibling task names (issue N -> "issue-N")
 3. Build a task entry: name="issue-N", vars={"ISSUE_NUMBER": "N"},
    waits_on=["issue-X", ...] for each listed dependency
-   (template defaults to impl-issue.md per the hook's default_template;
-   check the `expects.tasks.description` field for the full schema)
+   (check the `expects.tasks.item_schema` field in the response for
+   the full task entry schema; template defaults to impl-issue.md)
 
 Submit the complete task list as JSON:
 `koto next coord --with-data @tasks.json`
@@ -288,7 +284,13 @@ Note: `template` is omitted from each entry — the scheduler uses
     "tasks": {
       "type": "json",
       "required": true,
-      "description": "JSON array of task objects. Each entry: { name: string (required), vars: object (optional), waits_on: string[] (optional). template is optional (defaults to impl-issue.md)."
+      "item_schema": {
+        "name": { "type": "string", "required": true, "description": "Child workflow short name" },
+        "template": { "type": "string", "required": false, "default": "impl-issue.md" },
+        "vars": { "type": "object", "required": false },
+        "waits_on": { "type": "array", "required": false, "default": [] },
+        "trigger_rule": { "type": "string", "required": false, "default": "all_success" }
+      }
     }
   },
   "blocking_conditions": [{
