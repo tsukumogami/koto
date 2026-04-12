@@ -605,7 +605,9 @@ never see `plan` — by the time it runs, the advance loop is at
 `await`, which has no hook. Putting the hook and the gate on the
 same state guarantees the advance loop parks there until all
 children are terminal, giving the scheduler a stable place to
-run on every tick.
+run on every tick. The compiler enforces this: E10 rejects any
+state that declares `materialize_children` without also declaring
+a `children-complete` gate on the same state.
 
 **Task entry schema:**
 
@@ -617,7 +619,7 @@ run on every tick.
 | `waits_on` | array of string | no | `[]` | Sibling task names that must complete first. |
 | `trigger_rule` | string enum | no | `all_success` | Reserved for v2; only `all_success` accepted in v1. |
 
-**Compiler validation (errors E1–E8, warnings W1–W2, runtime checks
+**Compiler validation (errors E1–E10, warnings W1–W3, runtime checks
 R1–R7):**
 
 | Rule | Level | Check |
@@ -631,8 +633,10 @@ R1–R7):**
 | E7 | error | State has at least one outgoing transition |
 | E8 | error | No two states reference the same `from_field` (copy-paste guard) |
 | E9 | error | `default_template` is non-empty and resolves to a compilable template |
+| E10 | error | State with `materialize_children` must also declare a `children-complete` gate (single-state fan-out) |
 | W1 | warning | A `children-complete` gate is reachable from the declaring state |
 | W2 | warning | If `children-complete.name_filter` is set, it starts with `<parent>.` |
+| W3 | warning | Terminal state whose name contains "block", "fail", or "error" lacks `failure: true` |
 | R1–R7 | runtime | Child template compilable; vars resolve; `waits_on` is a DAG; no dangling refs; task names unique; names pass `validate_workflow_name`; no collisions with existing siblings |
 
 **`failure_policy` placement on the hook, not in the payload.** The
@@ -930,6 +934,15 @@ Preserves unified discovery via `backend.list()` — all children
 (success, failure, skipped) show up the same way. No new event
 types.
 
+**Skipped-child template identity.** The scheduler does NOT use the
+parent template for skipped children. Instead, it uses a built-in
+synthetic mini-template hardcoded in `src/cli/batch.rs` with exactly
+two states: an initial state and a `skipped_due_to_dep_failure`
+terminal state with `skipped_marker: true`. This avoids requiring
+every child template to declare a skipped-marker state. The synthetic
+template is never compiled from a file; it's constructed in code as a
+`CompiledTemplate` struct.
+
 **5.3 Extended `children-complete` gate output schema.** Additive
 changes to the existing output:
 
@@ -1025,6 +1038,15 @@ On submission, a new handler in the scheduler:
    as "unset"; this must be documented with a prominent code
    comment where the handler lives so future maintainers don't
    accidentally break it.
+
+**Interception point.** `retry_failed` is intercepted in `handle_next`
+BEFORE `advance_until_stop` runs, not routed through the advance loop.
+When `handle_next` detects `retry_failed` in the submitted evidence,
+it calls `handle_retry_failed` directly, which performs the child
+rewinds and appends the clearing event. Only after retry processing
+completes does `advance_until_stop` run on the (now-modified) parent
+state. This ordering ensures the advance loop sees the post-retry
+state of children, not the pre-retry state.
 
 Subsequent `koto next parent` calls tick the scheduler, which sees
 the rewound children as non-terminal and reclassifies them as
@@ -1344,7 +1366,7 @@ accepts; it's purely a response-side artifact.
 
 ## Decision Outcome
 
-The six decisions interlock into one coherent implementation. The
+The eight decisions interlock into one coherent implementation. The
 batch feature lands as a single atomic change set with the following
 architectural thesis:
 
@@ -1354,7 +1376,7 @@ tick, and failures route through first-class terminal-failure and
 skipped-marker states that the existing `children-complete` gate
 picks up with minimal extension.**
 
-All six decisions are consistent with the five exploration-time
+All eight decisions are consistent with the five exploration-time
 constraints (Reading A as primary, disk-derived storage, CLI-level
 scheduler tick, deterministic child naming, skip-dependents default).
 They share three cross-cutting PR landing requirements:
@@ -1415,7 +1437,7 @@ The new surface divides into three concerns:
 │                      └──> run_batch_scheduler  (NEW)         │
 │                                    │                        │
 │                                    ▼                        │
-│                          src/engine/batch.rs  (NEW)          │
+│                          src/cli/batch.rs  (NEW)             │
 │                          ┌──────────────────────────┐        │
 │                          │ run_batch_scheduler      │        │
 │                          │   1. derive_evidence     │        │
@@ -1470,7 +1492,7 @@ The new surface divides into three concerns:
 │  types.rs: accepts field type gains `tasks` variant         │
 │                                                             │
 │  compile.rs: new validator for materialize_children         │
-│    enforcing E1-E8 errors and W1-W2 warnings                │
+│    enforcing E1-E10 errors and W1-W3 warnings               │
 └─────────────────────────────────────────────────────────────┘
           ▲
           │
@@ -1560,16 +1582,27 @@ pub enum SchedulerOutcome {
     },
     Error { reason: String },
 }
+```
 
+**Response serialization.** The `scheduler` field appears as a
+top-level key in the serialized JSON response, alongside `action`,
+`state`, `directive`, `blocking_conditions`, etc. It is NOT inside any
+specific `NextResponse` enum variant. Implementation: `handle_next`
+serializes the `NextResponse` variant to JSON, then merges the
+`SchedulerOutcome` as an additional top-level `scheduler` key before
+returning. This avoids modifying every `NextResponse` variant to carry
+an optional scheduler field.
+
+```rust
 pub enum BatchError {
     /// Task list failed validation (size, cycles, unique names, refs).
     InvalidBatchDefinition { reason: String },
     /// backend.create / init_state_file failed for a specific task.
-    SpawnFailed { task: String, source: SessionError },
+    SpawnFailed { task: String, source: anyhow::Error },
     /// Resolved template path doesn't exist or fails to compile.
     TemplateResolveFailed { task: String, paths_tried: Vec<String> },
     /// Backend list/read failed during classification.
-    BackendError { source: SessionError },
+    BackendError { source: anyhow::Error },
     /// Submission exceeds hard limits (task count, edge count, depth).
     LimitExceeded { which: &'static str, limit: usize, actual: usize },
 }
@@ -1602,6 +1635,38 @@ pub fn handle_retry_failed(
     retry_set: &[String],
     include_skipped: bool,
 ) -> Result<(), BatchError>;
+
+pub struct BatchView {
+    pub summary: BatchSummary,
+    pub tasks: Vec<BatchTaskView>,
+    pub ready: Vec<String>,
+    pub blocked: Vec<String>,
+    pub skipped: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+pub struct BatchSummary {
+    pub total: usize,
+    pub success: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub pending: usize,
+    pub blocked: usize,
+}
+
+pub struct BatchTaskView {
+    pub name: String,
+    pub child: Option<String>,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waits_on: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_because: Option<String>,
+}
 ```
 
 **Task list schema** (submitted as evidence JSON):
@@ -2008,7 +2073,7 @@ split into two sub-PRs if review velocity stalls (see Mitigations).
 - `derive_expects` updated to auto-generate `item_schema` on
   accepts fields linked to a `materialize_children` hook
   (Decision 8); the schema is koto-generated, not template-authored
-- `CompiledTemplate::validate` extended with E1–E8 errors and W1–W2
+- `CompiledTemplate::validate` extended with E1–E10 errors and W1–W3
   warnings for `materialize_children`
 - Tests for each compiler rule and each field default
 
@@ -2127,7 +2192,7 @@ These items are explicitly deferred:
 ### Negative
 
 - **Schema PR is large.** Decision 2's atomicity fix is clean, but
-  Phase 2 bundles six decisions' worth of schema changes into one
+  Phase 2 bundles eight decisions' worth of schema changes into one
   PR: three new `TemplateState` fields, a new accepts field type,
   `deny_unknown_fields`, a new header field, a new event field.
   Reviewers have a lot to track.

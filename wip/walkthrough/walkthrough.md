@@ -50,7 +50,7 @@ the plan:
 2. Map dependencies to sibling task names (issue N -> "issue-N")
 3. Build a task entry: name="issue-N", vars={"ISSUE_NUMBER": "N"},
    waits_on=["issue-X", ...] for each listed dependency
-   (check the `expects.tasks.item_schema` field in the response for
+   (check the `expects.fields.tasks.item_schema` field in the response for
    the full task entry schema; template defaults to impl-issue.md)
 
 Submit the complete task list as JSON:
@@ -281,15 +281,18 @@ Note: `template` is omitted from each entry — the scheduler uses
   "directive": "Read the plan document at PLAN-batch-schema.md. For each issue outline in the plan:\n\n1. Extract the issue number, goal, files, and acceptance criteria\n2. Map dependencies to sibling task names (issue N -> \"issue-N\")\n3. Build a task entry with: name=\"issue-N\", template=\"impl-issue.md\", vars={\"ISSUE_NUMBER\": \"N\"}, waits_on=[\"issue-X\", ...] for each listed dependency\n\nSubmit the complete task list as JSON:\n`koto next coord --with-data @tasks.json`\n\nAfter submission, children will be spawned automatically. Drive each child in `scheduler.spawned` via `koto next <child-name>`. You can run independent children in parallel. After any child completes, re-check the parent with `koto next coord` to spawn newly-unblocked tasks.",
   "details": "Each child is an independent koto workflow named `coord.<task-name>`. The scheduler runs on every `koto next coord` call and spawns tasks whose `waits_on` dependencies are all terminal. You don't need to track readiness yourself -- the `scheduler` field in the response tells you what was just spawned. The `blocking_conditions[0].output` field shows per-child status.",
   "expects": {
-    "tasks": {
-      "type": "tasks",
-      "required": true,
-      "item_schema": {
-        "name": { "type": "string", "required": true, "description": "Child workflow short name" },
-        "template": { "type": "string", "required": false, "default": "impl-issue.md" },
-        "vars": { "type": "object", "required": false },
-        "waits_on": { "type": "array", "required": false, "default": [] },
-        "trigger_rule": { "type": "string", "required": false, "default": "all_success" }
+    "event_type": "evidence_submitted",
+    "fields": {
+      "tasks": {
+        "type": "tasks",
+        "required": true,
+        "item_schema": {
+          "name": { "type": "string", "required": true, "description": "Child workflow short name" },
+          "template": { "type": "string", "required": false, "default": "impl-issue.md" },
+          "vars": { "type": "object", "required": false },
+          "waits_on": { "type": "array", "required": false, "default": [] },
+          "trigger_rule": { "type": "string", "required": false, "default": "all_success" }
+        }
       }
     }
   },
@@ -393,7 +396,10 @@ The agent knows to start driving coord.issue-1.
   "state": "working",
   "directive": "Implement issue #101.\n\nRead the issue, write the code, run the tests. When finished, submit {\"status\": \"complete\"}. If you hit an unresolvable blocker, submit {\"status\": \"blocked\"}.",
   "expects": {
-    "status": { "type": "enum", "values": ["complete", "blocked"], "required": true }
+    "event_type": "evidence_submitted",
+    "fields": {
+      "status": { "type": "enum", "values": ["complete", "blocked"], "required": true }
+    }
   },
   "blocking_conditions": [],
   "scheduler": null
@@ -431,7 +437,7 @@ submit "complete", submit "blocked", or do something unexpected.)
 **Response:**
 ```json
 {
-  "action": "workflow_complete",
+  "action": "done",
   "state": "done",
   "directive": "Issue #101 implemented successfully.",
   "is_terminal": true
@@ -513,7 +519,7 @@ continues. If both succeed, the parent completes.)
 **Response:**
 ```json
 {
-  "action": "workflow_complete",
+  "action": "done",
   "state": "summarize",
   "directive": "All issues are complete. Write a summary of what was implemented.",
   "is_terminal": true
@@ -534,7 +540,7 @@ If the agent submits `{"status": "blocked"}` for coord.issue-2:
 
 ```json
 {
-  "action": "workflow_complete",
+  "action": "done",
   "state": "done_blocked",
   "directive": "Issue #102 is blocked and cannot proceed.",
   "is_terminal": true
