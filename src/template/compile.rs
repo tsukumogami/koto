@@ -325,7 +325,145 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
         .validate(strict)
         .map_err(|e| anyhow!("validation error: {}", e))?;
 
+    // Issue 8: E9 resolution check and F5 (skipped_marker reachability)
+    // on batch-eligible child templates. Both need the source path to
+    // resolve relative `default_template` references against the parent
+    // template's directory, so they live here rather than in `validate`.
+    validate_default_template_references(&template, source_path)?;
+
     Ok(template)
+}
+
+/// E9 resolution + F5 warning.
+///
+/// For every state with a `materialize_children` hook, resolve the hook's
+/// `default_template` against the compiling template's directory. The path
+/// must point to a file that itself compiles without error; any failure is
+/// surfaced as an E9 error naming the declaring state.
+///
+/// When the child template compiles, fire warning F5 on stderr if the
+/// child lacks a terminal state with `skipped_marker: true` that is
+/// reachable from its initial state. The check is intentionally permissive
+/// about "scheduler-writable transitions" (Decision 9): for now any
+/// transition counts as reachable. F5 is a warning, not an error, because
+/// batch-eligibility is not knowable when a child template is compiled in
+/// isolation.
+///
+/// Warnings are printed to stderr via `eprintln!` in the same style as
+/// D4/D5 and W1-W5.
+fn validate_default_template_references(
+    template: &CompiledTemplate,
+    source_path: &Path,
+) -> anyhow::Result<()> {
+    // Resolve the parent template's directory. Relative default_template
+    // paths anchor here. `canonicalize` may fail if the source path is a
+    // temporary with a stripped parent; fall back to the raw parent.
+    let source_dir = source_path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(|x| x.to_path_buf()))
+        .or_else(|| source_path.parent().map(|p| p.to_path_buf()));
+
+    for (state_name, state) in &template.states {
+        let hook = match &state.materialize_children {
+            Some(h) => h,
+            None => continue,
+        };
+        // E1 already caught empty from_field; E9's non-emptiness is
+        // checked in validate(). Skip empty here defensively.
+        if hook.default_template.is_empty() {
+            continue;
+        }
+
+        // Resolve default_template against source_dir. Absolute paths
+        // pass through unchanged.
+        let candidate = std::path::Path::new(&hook.default_template);
+        let resolved: std::path::PathBuf = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else if let Some(dir) = &source_dir {
+            dir.join(candidate)
+        } else {
+            candidate.to_path_buf()
+        };
+
+        // Guard against infinite recursion: a template that names itself
+        // as its own default_template would loop. Compare canonical paths
+        // when possible, raw otherwise.
+        let same_as_source = match (resolved.canonicalize(), source_path.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => resolved == source_path,
+        };
+        if same_as_source {
+            return Err(anyhow!(
+                "E9: state {:?}: default_template {:?} resolves to the parent template itself; \
+                 child templates must be distinct files\n  \
+                 remedy: point default_template at a separate child template file",
+                state_name,
+                hook.default_template
+            ));
+        }
+
+        // Compile the child. Any error is wrapped as E9.
+        let child = compile(&resolved, true).map_err(|e| {
+            anyhow!(
+                "E9: state {:?}: default_template {:?} (resolved to {}) did not compile: {}\n  \
+                 remedy: fix the child template so it compiles, or point default_template at a valid template file",
+                state_name,
+                hook.default_template,
+                resolved.display(),
+                e
+            )
+        })?;
+
+        // F5 warning: child lacks a reachable skipped_marker terminal.
+        if !child_has_reachable_skipped_marker(&child) {
+            eprintln!(
+                "warning: F5: child template {:?} (referenced by state {:?} default_template {:?}) \
+                 has no reachable terminal state with `skipped_marker: true`; \
+                 the batch scheduler will not be able to materialize skip markers for this template\n  \
+                 remedy: add a terminal state with `skipped_marker: true` reachable from the initial state",
+                child.name,
+                state_name,
+                hook.default_template
+            );
+        }
+    }
+    Ok(())
+}
+
+/// F5 helper: walk transitions from `initial_state` and return true if any
+/// reachable state is terminal with `skipped_marker: true`.
+///
+/// Decision 9 distinguishes scheduler-writable transitions from
+/// agent-submitted ones, but we conservatively treat every transition as
+/// reachable here. Narrowing to scheduler-writable transitions lands in a
+/// later phase once the transition metadata is finalized.
+// TODO(issue-8/F5): narrow reachability to scheduler-writable transitions
+// once Decision 9's metadata is exposed on `Transition`.
+fn child_has_reachable_skipped_marker(child: &CompiledTemplate) -> bool {
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut frontier: Vec<&str> = Vec::new();
+    if child.states.contains_key(child.initial_state.as_str()) {
+        frontier.push(child.initial_state.as_str());
+    }
+    while let Some(name) = frontier.pop() {
+        if !visited.insert(name) {
+            continue;
+        }
+        let state = match child.states.get(name) {
+            Some(s) => s,
+            None => continue,
+        };
+        if state.terminal && state.skipped_marker {
+            return true;
+        }
+        for transition in &state.transitions {
+            if !visited.contains(transition.target.as_str()) {
+                frontier.push(transition.target.as_str());
+            }
+        }
+    }
+    false
 }
 
 fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyhow::Result<Gate> {
@@ -549,12 +687,63 @@ fn parse_h2_heading(line: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     fn write_temp(content: &str) -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
+    }
+
+    /// Write a parent template source to `<dir>/<parent_file>` alongside a
+    /// default child template at `<dir>/<child_file>`. Returns the
+    /// `TempDir` (to keep it alive) and the parent template path.
+    ///
+    /// The child is a minimal valid template; by default it includes a
+    /// terminal state with `skipped_marker: true` so F5 does not fire.
+    /// Pass `child_src` to override with a template that should trigger F5
+    /// or exercise other child-compile behavior.
+    fn write_parent_with_child(
+        parent_src: &str,
+        parent_file: &str,
+        child_file: &str,
+        child_src: Option<&str>,
+    ) -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let child = child_src.unwrap_or(
+            r#"---
+name: child
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions:
+      - target: done
+      - target: skipped
+  done:
+    terminal: true
+  skipped:
+    terminal: true
+    skipped_marker: true
+---
+
+## start
+
+Do work.
+
+## done
+
+Complete.
+
+## skipped
+
+Skipped.
+"#,
+        );
+        std::fs::write(dir.path().join(child_file), child).unwrap();
+        let parent_path = dir.path().join(parent_file);
+        std::fs::write(&parent_path, parent_src).unwrap();
+        (dir, parent_path)
     }
 
     #[test]
@@ -1300,11 +1489,18 @@ All done.
         assert!(accepts["tasks"].required);
     }
 
-    #[test]
-    fn materialize_children_hook_parses_with_default_policy() {
-        // The hook declares from_field and default_template only; the
-        // failure_policy defaults to skip_dependents.
-        let src = r#"---
+    /// A minimal batch-parent template body that satisfies every Issue 8
+    /// E-rule: accepts `tasks` (type tasks, required), has a
+    /// children-complete gate, routes on it, and is non-terminal.
+    /// Callers override the inner fields to trip specific rules.
+    fn batch_parent_src(hook_extra: &str, gate_present: bool) -> String {
+        let gate_block = if gate_present {
+            "    gates:\n      cc:\n        type: children-complete\n"
+        } else {
+            ""
+        };
+        format!(
+            r#"---
 name: batch-parent
 version: "1.0"
 initial_state: plan_and_await
@@ -1314,13 +1510,13 @@ states:
       tasks:
         type: tasks
         required: true
-    materialize_children:
+{gate}    materialize_children:
       from_field: tasks
       default_template: child.md
-    transitions:
+{extra}    transitions:
       - target: done
         when:
-          tasks: submitted
+          gates.cc.all_complete: true
   done:
     terminal: true
 ---
@@ -1332,9 +1528,19 @@ Submit tasks.
 ## done
 
 Done.
-"#;
-        let f = write_temp(src);
-        let compiled = compile(f.path(), true).unwrap();
+"#,
+            gate = gate_block,
+            extra = hook_extra,
+        )
+    }
+
+    #[test]
+    fn materialize_children_hook_parses_with_default_policy() {
+        // The hook declares from_field and default_template only; the
+        // failure_policy defaults to skip_dependents.
+        let src = batch_parent_src("", true);
+        let (_dir, path) = write_parent_with_child(&src, "parent.md", "child.md", None);
+        let compiled = compile(&path, true).unwrap();
         let state = &compiled.states["plan_and_await"];
         let hook = state.materialize_children.as_ref().unwrap();
         assert_eq!(hook.from_field, "tasks");
@@ -1348,38 +1554,9 @@ Done.
     #[test]
     fn materialize_children_hook_accepts_continue_policy() {
         // failure_policy: continue is the explicit opt-out.
-        let src = r#"---
-name: batch-parent
-version: "1.0"
-initial_state: plan_and_await
-states:
-  plan_and_await:
-    accepts:
-      tasks:
-        type: tasks
-        required: true
-    materialize_children:
-      from_field: tasks
-      default_template: child.md
-      failure_policy: continue
-    transitions:
-      - target: done
-        when:
-          tasks: submitted
-  done:
-    terminal: true
----
-
-## plan_and_await
-
-Submit tasks.
-
-## done
-
-Done.
-"#;
-        let f = write_temp(src);
-        let compiled = compile(f.path(), true).unwrap();
+        let src = batch_parent_src("      failure_policy: continue\n", true);
+        let (_dir, path) = write_parent_with_child(&src, "parent.md", "child.md", None);
+        let compiled = compile(&path, true).unwrap();
         let hook = compiled.states["plan_and_await"]
             .materialize_children
             .as_ref()
@@ -1535,6 +1712,160 @@ Done.
             "expected unknown-field error, got: {}",
             msg
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue 8: E9 (default_template resolves) and F5 (skipped_marker
+    // reachability) live in compile.rs because they need the source path.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn issue8_e9_valid_child_path_compiles() {
+        // Positive case for E9: a valid child template next to the parent
+        // compiles without error.
+        let src = batch_parent_src("", true);
+        let (_dir, path) = write_parent_with_child(&src, "parent.md", "child.md", None);
+        compile(&path, true).expect("valid parent+child pair should compile");
+    }
+
+    #[test]
+    fn issue8_e9_missing_child_file_is_rejected() {
+        // E9 negative: child template does not exist on disk.
+        let src = batch_parent_src("", true);
+        // Write the parent without creating child.md.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("parent.md");
+        std::fs::write(&path, &src).unwrap();
+        let err = compile(&path, true).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("E9:"), "expected E9 error, got: {}", msg);
+    }
+
+    #[test]
+    fn issue8_e9_uncompilable_child_surfaces_nested_error() {
+        // E9 negative: child exists but has a compile error of its own.
+        // The E9 error wraps the child's error message so authors can
+        // trace the root cause.
+        let bad_child = r#"---
+name: broken
+version: "1.0"
+initial_state: missing
+states:
+  start:
+    terminal: true
+---
+
+## start
+
+Hi.
+"#;
+        let src = batch_parent_src("", true);
+        let (_dir, path) = write_parent_with_child(&src, "parent.md", "child.md", Some(bad_child));
+        let err = compile(&path, true).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("E9:"), "expected E9 error, got: {}", msg);
+        // The child's own error message should be in the chain.
+        assert!(
+            msg.contains("initial_state") || msg.contains("missing"),
+            "expected nested child error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn issue8_e9_self_referential_default_template_rejected() {
+        // Guard against a parent naming itself as its own default_template.
+        let src = batch_parent_src("", true);
+        // Rename so default_template (`child.md`) resolves back to the parent.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("child.md");
+        std::fs::write(&path, &src).unwrap();
+        let err = compile(&path, true).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("E9:"), "expected E9 error, got: {}", msg);
+        assert!(
+            msg.contains("parent template itself") || msg.contains("distinct"),
+            "expected self-reference hint, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn issue8_f5_child_with_skipped_marker_is_silent() {
+        // Positive F5: the default child template includes a terminal
+        // state with skipped_marker: true; compilation emits no F5 warning.
+        let src = batch_parent_src("", true);
+        let (_dir, path) = write_parent_with_child(&src, "parent.md", "child.md", None);
+        // compile returns Ok; F5 is a stderr warning only when missing.
+        compile(&path, true).expect("child with skipped_marker should compile cleanly");
+    }
+
+    #[test]
+    fn issue8_f5_child_without_skipped_marker_compiles_with_warning() {
+        // Negative F5: child lacks any skipped_marker terminal. Compile
+        // still returns Ok because F5 is a warning, not an error.
+        let child_no_marker = r#"---
+name: child
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Work.
+
+## done
+
+Done.
+"#;
+        let src = batch_parent_src("", true);
+        let (_dir, path) =
+            write_parent_with_child(&src, "parent.md", "child.md", Some(child_no_marker));
+        compile(&path, true).expect("F5 is a warning, not an error");
+    }
+
+    #[test]
+    fn issue8_f5_skipped_marker_unreachable_still_warns() {
+        // Child has a skipped_marker terminal, but it is not reachable
+        // from initial_state via any transition chain. F5 should fire,
+        // and compile still returns Ok.
+        let child_unreachable = r#"---
+name: child
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+  orphan_skip:
+    terminal: true
+    skipped_marker: true
+---
+
+## start
+
+Work.
+
+## done
+
+Done.
+
+## orphan_skip
+
+Skipped (but unreachable).
+"#;
+        let src = batch_parent_src("", true);
+        let (_dir, path) =
+            write_parent_with_child(&src, "parent.md", "child.md", Some(child_unreachable));
+        compile(&path, true).expect("F5 is a warning, not an error");
     }
 
     #[test]
