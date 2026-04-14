@@ -3127,7 +3127,7 @@ fn evaluate_children_complete(
 ///
 /// - `task_name`
 /// - `waits_on`
-/// - `reason_code` (sourced from `reason_source`)
+/// - `reason_source`
 /// - `reason`
 /// - `skip_reason`
 /// - `synthetic` (only when `true`)
@@ -3197,8 +3197,8 @@ fn annotate_children_with_batch_view(
                     "outcome".to_string(),
                     serde_json::to_value(task.outcome).unwrap_or(serde_json::Value::Null),
                 );
-                if let Some(rc) = &task.reason_code {
-                    row.insert("reason_code".to_string(), serde_json::json!(rc.clone()));
+                if let Some(rs) = &task.reason_source {
+                    row.insert("reason_source".to_string(), serde_json::json!(rs.clone()));
                 }
                 if let Some(r) = &task.reason {
                     row.insert("reason".to_string(), serde_json::json!(r.clone()));

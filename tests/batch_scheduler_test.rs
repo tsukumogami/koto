@@ -1627,7 +1627,7 @@ fn scenario_27_koto_status_batch_section_populated() {
     assert!(failed.is_empty());
 
     // `koto workflows --children parent` should expose the per-row
-    // batch metadata (task_name, waits_on, reason_code, reason,
+    // batch metadata (task_name, waits_on, reason_source, reason,
     // skip_reason).
     let (ok, children_json, stderr) = run_koto(tmp.path(), &["workflows", "--children", "parent"]);
     assert!(ok, "workflows failed: {}", stderr);
@@ -1838,7 +1838,7 @@ fn scenario_27_synthetic_marker_and_skipped_chain() {
     let (_, _, _) = run_koto(tmp.path(), &["next", "sparent"]);
 
     // status: batch.tasks[B] has synthetic:true, skipped_because=sparent.A,
-    // and skipped_because_chain=[sparent.A]. reason_code=skipped.
+    // and skipped_because_chain=[sparent.A]. reason_source=skipped.
     let (ok, status, stderr) = run_koto(tmp.path(), &["status", "sparent"]);
     assert!(ok, "status failed: {}", stderr);
     let batch = status.get("batch").expect("batch section present");
@@ -1858,7 +1858,7 @@ fn scenario_27_synthetic_marker_and_skipped_chain() {
         task_b["skipped_because_chain"],
         serde_json::json!(["sparent.A"])
     );
-    assert_eq!(task_b["reason_code"], "skipped");
+    assert_eq!(task_b["reason_source"], "skipped");
 
     // workflows --children: B's row carries the same per-task fields.
     let (ok, children_json, _) = run_koto(tmp.path(), &["workflows", "--children", "sparent"]);
@@ -1872,7 +1872,7 @@ fn scenario_27_synthetic_marker_and_skipped_chain() {
     assert_eq!(b_row["outcome"], "skipped");
     assert_eq!(b_row["synthetic"], true, "B row must carry synthetic:true");
     assert_eq!(b_row["skip_reason"], "sparent.A");
-    assert_eq!(b_row["reason_code"], "skipped");
+    assert_eq!(b_row["reason_source"], "skipped");
     assert_eq!(
         b_row["skipped_because_chain"],
         serde_json::json!(["sparent.A"])

@@ -68,6 +68,16 @@ pub enum BatchPhase {
 }
 
 /// Aggregate counts for the batch.
+///
+/// `pending` is the count of tasks classified as `Pending` (unspawned
+/// with no unmet deps, plus any spawned children still running — both
+/// fold into one "in-progress" bucket per Decision 6). In the `active`
+/// phase, it equals `ready.len()` because the two are derived from the
+/// same classification pass; the distinction is that `pending`
+/// survives into the `final` phase where the `ready` name vector is
+/// intentionally dropped. Consumers that want "how many tasks are
+/// still moving?" should read `pending` — it is the load-bearing count
+/// across both phases.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BatchViewSummary {
     pub total: usize,
@@ -107,9 +117,11 @@ pub struct TaskView {
     pub synthetic: bool,
     /// Source of the `reason` projection. One of
     /// `failure_reason | state_name | skipped | not_spawned`. Omitted
-    /// for successful or non-terminal children.
+    /// for successful or non-terminal children. Mirrors the
+    /// `reason_source` field on the children-complete gate output — the
+    /// two surfaces share the same canonical name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason_code: Option<String>,
+    pub reason_source: Option<String>,
     /// Human-readable reason string for failures. For `Failure` this
     /// is the child's terminal state name (v1 fallback) or its
     /// `failure_reason` context key when present. Omitted for
@@ -271,7 +283,7 @@ fn build_active_view(
             None => (Vec::new(), None),
         };
 
-        let reason_code = child_obj
+        let reason_source = child_obj
             .get("reason_source")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
@@ -325,7 +337,7 @@ fn build_active_view(
             waits_on,
             outcome,
             synthetic,
-            reason_code,
+            reason_source,
             reason,
             skip_reason,
             skipped_because_chain,
@@ -396,7 +408,7 @@ fn build_final_view(
                 waits_on: Vec::new(),
                 outcome: entry.outcome,
                 synthetic,
-                reason_code: entry.reason_source.clone(),
+                reason_source: entry.reason_source.clone(),
                 reason,
                 skip_reason: entry.skipped_because.clone(),
                 skipped_because_chain: entry.skipped_because_chain.clone(),
@@ -546,7 +558,7 @@ mod tests {
             waits_on: vec![],
             outcome: TaskOutcome::Success,
             synthetic: false,
-            reason_code: None,
+            reason_source: None,
             reason: None,
             skip_reason: None,
             skipped_because_chain: vec![],
@@ -559,6 +571,7 @@ mod tests {
             json.get("synthetic").is_none(),
             "synthetic false should be skipped"
         );
+        assert!(json.get("reason_source").is_none());
         assert!(json.get("reason_code").is_none());
         assert!(json.get("reason").is_none());
         assert!(json.get("skip_reason").is_none());
@@ -578,14 +591,14 @@ mod tests {
             waits_on: vec![],
             outcome: TaskOutcome::Skipped,
             synthetic: true,
-            reason_code: Some("skipped".to_string()),
+            reason_source: Some("skipped".to_string()),
             reason: None,
             skip_reason: Some("p.b".to_string()),
             skipped_because_chain: vec!["p.b".to_string()],
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["synthetic"], true);
-        assert_eq!(json["reason_code"], "skipped");
+        assert_eq!(json["reason_source"], "skipped");
         assert_eq!(json["skip_reason"], "p.b");
         assert_eq!(json["skipped_because_chain"][0], "p.b");
     }
@@ -661,10 +674,10 @@ mod tests {
         assert_eq!(view.tasks.len(), 3);
         assert_eq!(view.tasks[0].task_name, "A");
         assert_eq!(view.tasks[1].task_name, "B");
-        assert_eq!(view.tasks[1].reason_code.as_deref(), Some("state_name"));
+        assert_eq!(view.tasks[1].reason_source.as_deref(), Some("state_name"));
         assert_eq!(view.tasks[1].reason.as_deref(), Some("failed"));
         assert_eq!(view.tasks[2].task_name, "C");
-        assert_eq!(view.tasks[2].reason_code.as_deref(), Some("skipped"));
+        assert_eq!(view.tasks[2].reason_source.as_deref(), Some("skipped"));
         assert_eq!(view.tasks[2].skip_reason.as_deref(), Some("p.B"));
         assert_eq!(view.tasks[2].skipped_because_chain, vec!["p.B".to_string()]);
         assert!(view.ready.is_none());
