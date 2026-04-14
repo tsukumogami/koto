@@ -146,6 +146,13 @@ pub enum TaskOutcome {
     /// dependency is non-terminal.
     Blocked,
     /// Child exists on disk but is not terminal yet.
+    ///
+    /// `Running` IS part of the on-the-wire envelope: it is serialized
+    /// as `"running"` in the `materialized_children[*].outcome` field
+    /// (see `tests/batch_scheduler_test.rs` line 321). Downstream
+    /// agents rendering a batch view can distinguish "still in progress"
+    /// from "not yet spawned" (`Pending`/`Blocked`), so the variant is
+    /// intentionally kept distinct rather than collapsed into `Pending`.
     Running,
     /// A previous tick's `init_state_file` failed and no child state
     /// file exists. Caller treats this as a terminal per-task error
@@ -447,6 +454,10 @@ pub(crate) fn run_batch_scheduler(
 
     // Snapshot all existing children. One listing + one read_events
     // call per submitted task covers the read-side work.
+    //
+    // backend.list() is O(total sessions on backend), not O(children).
+    // Under CloudBackend this becomes a cross-host metadata listing.
+    // Acceptable for v1; revisit when batch scale tests land.
     let sessions = match backend.list() {
         Ok(s) => s,
         Err(e) => {
@@ -728,6 +739,61 @@ pub(crate) fn state_has_materialize_children(
         .get(state_name)
         .and_then(|s| s.materialize_children.as_ref())
         .is_some()
+}
+
+/// Build the `existing_children_snapshot` map for
+/// [`crate::engine::batch_validation::validate_batch_submission`].
+///
+/// The returned map keys short task names (what the agent submitted, not
+/// the composed `<parent>.<task>` workflow name) to the `spawn_entry`
+/// snapshot recorded on the child's `WorkflowInitialized` event when the
+/// child exists on disk:
+///
+/// - `Some(Some(snapshot))` — child exists and carries a canonical-form
+///   `spawn_entry`; R8 compares the submission against it.
+/// - `Some(None)` — child exists but has no `spawn_entry` (pre-feature
+///   or mid-respawn window). R8 treats this as vacuously satisfied.
+/// - key absent — child has never been spawned; R8 does not apply.
+///
+/// Note: `backend.list()` is `O(total sessions on backend)`, not
+/// `O(children)`. Under `CloudBackend` this becomes a cross-host
+/// metadata listing. Acceptable for v1; revisit when batch scale tests
+/// land.
+pub(crate) fn build_existing_children_snapshot(
+    backend: &dyn SessionBackend,
+    parent_name: &str,
+) -> HashMap<String, Option<SpawnEntrySnapshot>> {
+    let mut snapshot: HashMap<String, Option<SpawnEntrySnapshot>> = HashMap::new();
+    let sessions = match backend.list() {
+        Ok(s) => s,
+        Err(_) => return snapshot,
+    };
+    let child_prefix = format!("{}.", parent_name);
+    for info in sessions {
+        if info.parent_workflow.as_deref() != Some(parent_name) {
+            continue;
+        }
+        if !info.id.starts_with(&child_prefix) {
+            continue;
+        }
+        let task_name = info.id[child_prefix.len()..].to_string();
+        let (_, child_events) = match backend.read_events(&info.id) {
+            Ok(x) => x,
+            Err(_) => {
+                // Child exists on disk but we can't read it. Record the
+                // name with no spawn_entry so R8 is vacuous rather than
+                // silently skipping the entry.
+                snapshot.insert(task_name, None);
+                continue;
+            }
+        };
+        let spawn_entry = child_events.iter().find_map(|e| match &e.payload {
+            EventPayload::WorkflowInitialized { spawn_entry, .. } => spawn_entry.clone(),
+            _ => None,
+        });
+        snapshot.insert(task_name, spawn_entry);
+    }
+    snapshot
 }
 
 // --------- Tests ----------------------------------------------------

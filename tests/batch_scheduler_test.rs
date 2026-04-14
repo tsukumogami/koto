@@ -320,3 +320,120 @@ fn linear_three_task_batch_runs_to_all_spawned() {
     assert_eq!(outcomes.get("parent.B"), Some(&"success".to_string()));
     assert_eq!(outcomes.get("parent.C"), Some(&"running".to_string()));
 }
+
+/// Return the parent's state-file path inside the sessions base.
+fn parent_state_path(dir: &Path, name: &str) -> PathBuf {
+    sessions_base(dir)
+        .join(name)
+        .join(format!("koto-{}.state.jsonl", name))
+}
+
+/// Submitting a task list that contains a cycle (A waits_on B, B
+/// waits_on A) must be rejected PRE-APPEND by R0-R9 validation. The
+/// caller receives a `BatchError::InvalidBatchDefinition` envelope
+/// describing the cycle, and the parent's event log must remain free of
+/// the `EvidenceSubmitted` event that would otherwise carry the
+/// malformed payload. This is the "zero state on parent's event log"
+/// guarantee from Issue #9.
+#[test]
+fn cycle_rejection_before_append() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_templates(tmp.path());
+
+    // Initialize the parent.
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "parent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "parent init failed: {}", stderr);
+
+    // Capture the state-file contents as they stand pre-submission —
+    // exactly one `WorkflowInitialized` line.
+    let state_path = parent_state_path(tmp.path(), "parent");
+    let before = std::fs::read_to_string(&state_path).unwrap();
+    let before_count = before
+        .lines()
+        .filter(|l| l.contains("evidence_submitted"))
+        .count();
+    assert_eq!(
+        before_count, 0,
+        "pre-condition: no evidence_submitted events before the cycle submission"
+    );
+
+    // Submit a cyclic batch: A waits_on B, B waits_on A.
+    let payload = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": ["B"], "vars": {}},
+            {"name": "B", "waits_on": ["A"], "vars": {}},
+        ]
+    });
+    let payload_str = payload.to_string();
+    let output = koto_cmd(tmp.path())
+        .args(["next", "parent", "--with-data", &payload_str])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "cyclic batch submission must fail"
+    );
+
+    // The envelope is the batch-error shape: `{"action": "error",
+    // "batch": {"kind": "invalid_batch_definition", "reason": ...}}`.
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let last = stdout.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("");
+    let json: serde_json::Value = serde_json::from_str(last).unwrap_or(serde_json::Value::Null);
+    assert_eq!(
+        json.get("action").and_then(|v| v.as_str()),
+        Some("error"),
+        "expected batch error envelope, got: {}",
+        serde_json::to_string_pretty(&json).unwrap_or_default()
+    );
+    let batch = json
+        .get("batch")
+        .expect("batch key present on error envelope");
+    assert_eq!(
+        batch.get("kind").and_then(|v| v.as_str()),
+        Some("invalid_batch_definition"),
+        "expected invalid_batch_definition, got: {}",
+        serde_json::to_string_pretty(batch).unwrap_or_default()
+    );
+    let reason = batch.get("reason").expect("reason field present");
+    // The reason payload uses `tag = "reason"` for its discriminator
+    // (see `InvalidBatchReasonPayload` in `src/cli/batch_error.rs`);
+    // the cycle path lifts a `cycle` array of task names alongside it.
+    assert_eq!(
+        reason.get("reason").and_then(|v| v.as_str()),
+        Some("cycle"),
+        "expected cycle reason, got: {}",
+        serde_json::to_string_pretty(reason).unwrap_or_default()
+    );
+    let cycle = reason
+        .get("cycle")
+        .and_then(|v| v.as_array())
+        .expect("cycle field is an array");
+    assert!(
+        cycle.iter().any(|v| v.as_str() == Some("A"))
+            && cycle.iter().any(|v| v.as_str() == Some("B")),
+        "cycle must name both tasks A and B, got: {:?}",
+        cycle
+    );
+
+    // Post-condition: the parent's event log has no `evidence_submitted`
+    // entry (Option A guarantee — validation runs pre-append).
+    let after = std::fs::read_to_string(&state_path).unwrap();
+    let after_count = after
+        .lines()
+        .filter(|l| l.contains("evidence_submitted"))
+        .count();
+    assert_eq!(
+        after_count, 0,
+        "cycle rejection must be pre-append; no EvidenceSubmitted should land on parent's log. \
+         Log contents:\n{}",
+        after
+    );
+}

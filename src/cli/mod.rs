@@ -1763,6 +1763,55 @@ fn handle_next(
             exit_with_error_code(json, err.code.exit_code());
         }
 
+        // Batch runtime validation (R0-R9). Runs PRE-APPEND so a
+        // malformed batch submission (cycles, dangling refs, reserved
+        // names, duplicate names, oversize payload) never leaves a
+        // state footprint on the parent's event log — the "zero state
+        // on parent's event log" guarantee from Issue #9. The validator
+        // is a pure function; existing children are snapshotted from
+        // the backend so R8 can compare the submission against the
+        // canonical-form `spawn_entry` of each already-materialized
+        // child.
+        //
+        // When the current state carries no `materialize_children`
+        // hook this block is a no-op. When the hook's `from_field`
+        // does not appear in the submitted evidence (optional task
+        // list), we also skip — there's nothing to validate.
+        if let Some(hook) = template_state.materialize_children.as_ref() {
+            if let Some(raw) = data.as_object().and_then(|m| m.get(&hook.from_field)) {
+                match serde_json::from_value::<Vec<crate::engine::batch_validation::TaskEntry>>(
+                    raw.clone(),
+                ) {
+                    Ok(tasks) => {
+                        let existing =
+                            crate::cli::batch::build_existing_children_snapshot(backend, &name);
+                        if let Err(batch_err) =
+                            crate::engine::batch_validation::validate_batch_submission(
+                                &tasks, &existing,
+                            )
+                        {
+                            let code = batch_err.exit_code();
+                            exit_with_error_code(batch_err.to_envelope(), code);
+                        }
+                    }
+                    Err(e) => {
+                        // Structural check in validate_evidence guarantees
+                        // the value is an array of objects, but a deeper
+                        // parse failure (unknown field shape, etc.) should
+                        // still surface as InvalidSubmission rather than
+                        // passing through to EvidenceSubmitted.
+                        let err = NextError {
+                            code: NextErrorCode::InvalidSubmission,
+                            message: format!("batch task list failed to parse: {}", e),
+                            details: vec![],
+                        };
+                        let json = serde_json::json!({"error": err});
+                        exit_with_error_code(json, err.code.exit_code());
+                    }
+                }
+            }
+        }
+
         // Append evidence_submitted event.
         let fields: HashMap<String, serde_json::Value> = data
             .as_object()
