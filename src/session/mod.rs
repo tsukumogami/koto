@@ -64,6 +64,29 @@ pub trait SessionBackend: Send + Sync {
     fn append_event(&self, id: &str, payload: &EventPayload, timestamp: &str)
         -> anyhow::Result<()>;
 
+    /// Atomically create a session's state file with the given header and
+    /// initial events.
+    ///
+    /// Bundles the header line and all initial events into a single
+    /// tempfile-then-rename operation. The rename is "fail if exists" so
+    /// two racing callers on the same path cannot silently overwrite each
+    /// other: exactly one wins and the other receives an error whose
+    /// underlying `io::Error` has `ErrorKind::AlreadyExists`.
+    ///
+    /// A crash between the tempfile write and the rename leaves no
+    /// partially-written state file at the target path. The tempfile
+    /// itself may remain and is garbage-collected by a separate sweep.
+    ///
+    /// On Linux this uses `renameat2(RENAME_NOREPLACE)` for a single-
+    /// syscall fail-if-exists check. On other Unixes it uses POSIX
+    /// `link()` followed by `unlink()` of the tempfile.
+    fn init_state_file(
+        &self,
+        id: &str,
+        header: StateFileHeader,
+        initial_events: Vec<Event>,
+    ) -> anyhow::Result<()>;
+
     /// Read all events from the state file.
     fn read_events(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)>;
 
@@ -148,6 +171,18 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.read_header(id),
             Backend::Cloud(b) => b.read_header(id),
+        }
+    }
+
+    fn init_state_file(
+        &self,
+        id: &str,
+        header: StateFileHeader,
+        initial_events: Vec<Event>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.init_state_file(id, header, initial_events),
+            Backend::Cloud(b) => b.init_state_file(id, header, initial_events),
         }
     }
 }

@@ -483,6 +483,20 @@ impl SessionBackend for CloudBackend {
         self.sync_pull_state(id);
         self.local.read_header(id)
     }
+
+    fn init_state_file(
+        &self,
+        id: &str,
+        header: crate::engine::types::StateFileHeader,
+        initial_events: Vec<crate::engine::types::Event>,
+    ) -> anyhow::Result<()> {
+        // Delegate the atomic bundle to LocalBackend. On success, do a
+        // single S3 PUT that replaces the three pushes the old
+        // header+event sequence required.
+        self.local.init_state_file(id, header, initial_events)?;
+        self.sync_push_state(id);
+        Ok(())
+    }
 }
 
 impl ContextStore for CloudBackend {
@@ -721,6 +735,74 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = test_cloud_backend(tmp.path());
         assert!(backend.cleanup("ghost").is_ok());
+    }
+
+    // -- SessionBackend: init_state_file delegates to local, sync is non-fatal --
+
+    #[test]
+    fn init_state_file_delegates_to_local_and_tolerates_s3_failure() {
+        use crate::engine::types::{Event, EventPayload};
+
+        let tmp = TempDir::new().unwrap();
+        let backend = test_cloud_backend(tmp.path());
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: "wf".to_string(),
+            template_hash: "testhash".to_string(),
+            created_at: "2026-04-13T00:00:00Z".to_string(),
+            parent_workflow: None,
+        };
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-04-13T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/tmp/tpl.md".to_string(),
+                variables: Default::default(),
+            },
+        }];
+
+        // S3 push will fail (unreachable endpoint) but the call should
+        // still succeed because local write committed.
+        backend
+            .init_state_file("wf", header.clone(), events)
+            .unwrap();
+        assert!(backend.exists("wf"));
+
+        let got = backend.read_header("wf").unwrap();
+        assert_eq!(got.workflow, "wf");
+    }
+
+    #[test]
+    fn init_state_file_second_call_errors_already_exists() {
+        use crate::engine::types::{Event, EventPayload};
+
+        let tmp = TempDir::new().unwrap();
+        let backend = test_cloud_backend(tmp.path());
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: "wf".to_string(),
+            template_hash: "testhash".to_string(),
+            created_at: "2026-04-13T00:00:00Z".to_string(),
+            parent_workflow: None,
+        };
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-04-13T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/tmp/tpl.md".to_string(),
+                variables: Default::default(),
+            },
+        }];
+        backend
+            .init_state_file("wf", header.clone(), events.clone())
+            .unwrap();
+        let err = backend
+            .init_state_file("wf", header, events)
+            .expect_err("second init must fail");
+        let io_kind = err.downcast_ref::<std::io::Error>().map(|io| io.kind());
+        assert_eq!(io_kind, Some(std::io::ErrorKind::AlreadyExists));
     }
 
     // -- SessionBackend: list returns local sessions --

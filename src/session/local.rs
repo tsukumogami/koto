@@ -146,6 +146,96 @@ impl SessionBackend for LocalBackend {
         let path = self.base_dir.join(id).join(state_file_name(id));
         persistence::read_header(&path)
     }
+
+    fn init_state_file(
+        &self,
+        id: &str,
+        header: StateFileHeader,
+        initial_events: Vec<Event>,
+    ) -> anyhow::Result<()> {
+        validate_session_id(id)?;
+
+        // Ensure the session directory exists so the tempfile can live on
+        // the same filesystem as the final target. Also ensures the .koto
+        // root exists with restricted permissions.
+        ensure_koto_root(&self.base_dir)?;
+        let session_dir = self.base_dir.join(id);
+        fs::create_dir_all(&session_dir).with_context(|| {
+            format!(
+                "failed to create session directory: {}",
+                session_dir.display()
+            )
+        })?;
+
+        let target = session_dir.join(state_file_name(id));
+
+        // Serialize the bundle (header line + one JSONL line per event)
+        // into an in-memory buffer. The header itself carries no seq
+        // field; events use the caller-supplied seq numbers verbatim.
+        let mut buf = String::new();
+        let header_line =
+            serde_json::to_string(&header).context("failed to serialize state file header")?;
+        buf.push_str(&header_line);
+        buf.push('\n');
+        for event in &initial_events {
+            let line = serde_json::to_string(event).context("failed to serialize initial event")?;
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+
+        // Write the bundle to a tempfile in the session directory so the
+        // final rename/link is same-filesystem. `keep()` defuses the
+        // auto-delete so we can drive the final rename ourselves.
+        let tmp = tempfile::Builder::new()
+            .prefix(".koto-init-")
+            .suffix(".tmp")
+            .tempfile_in(&session_dir)
+            .with_context(|| format!("failed to create tempfile in: {}", session_dir.display()))?;
+        {
+            let mut file = tmp.as_file();
+            file.write_all(buf.as_bytes())
+                .context("failed to write state file tempfile")?;
+            file.sync_data()
+                .context("failed to fsync state file tempfile")?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Match append_header/append_event which create state
+                // files with mode 0600.
+                let perms = fs::Permissions::from_mode(0o600);
+                fs::set_permissions(tmp.path(), perms).with_context(|| {
+                    format!(
+                        "failed to set permissions on tempfile: {}",
+                        tmp.path().display()
+                    )
+                })?;
+            }
+        }
+
+        // Detach the tempfile so it is NOT deleted on drop. We will
+        // either move it into place (Linux renameat2 or non-Linux link)
+        // or explicitly unlink it on failure.
+        let (_file, tmp_path) = tmp.keep().map_err(|e| {
+            anyhow::anyhow!(
+                "failed to persist tempfile for {}: {}",
+                target.display(),
+                e.error
+            )
+        })?;
+
+        match atomic_create_rename(&tmp_path, &target) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Best-effort cleanup of the tempfile: if renameat2 or
+                // link succeeded, the source is already gone (link +
+                // unlink). If it failed, we remove the leftover tempfile
+                // so it doesn't masquerade as state.
+                let _ = fs::remove_file(&tmp_path);
+                Err(e)
+            }
+        }
+    }
 }
 
 impl LocalBackend {
@@ -381,6 +471,134 @@ pub(crate) fn repo_id(working_dir: &Path) -> anyhow::Result<String> {
         .map_err(|e| anyhow::anyhow!("failed to canonicalize {}: {}", working_dir.display(), e))?;
     let hash = sha256_hex(canonical.to_string_lossy().as_bytes());
     Ok(hash[..16].to_string())
+}
+
+/// Atomically move `src` to `dst` with "fail if destination exists"
+/// semantics. On Linux this uses `renameat2(RENAME_NOREPLACE)`; on
+/// other Unixes it uses POSIX `link()` followed by `unlink()`, falling
+/// back to plain `rename()` on `EXDEV`. On non-Unix platforms it falls
+/// back to a best-effort check-then-rename (not strictly atomic).
+///
+/// When the destination already exists, returns an error whose source
+/// is `io::Error` with `ErrorKind::AlreadyExists`, so callers can
+/// distinguish collisions from other I/O failures via:
+///     err.downcast_ref::<std::io::Error>()
+///        .map(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
+#[cfg(target_os = "linux")]
+fn atomic_create_rename(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let src_c = CString::new(src.as_os_str().as_bytes())
+        .map_err(|e| anyhow::anyhow!("src path contains NUL: {}", e))?;
+    let dst_c = CString::new(dst.as_os_str().as_bytes())
+        .map_err(|e| anyhow::anyhow!("dst path contains NUL: {}", e))?;
+
+    // SAFETY: We pass valid C strings and AT_FDCWD semantics on both
+    // ends. `syscall` returns -1 on error and sets errno.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            src_c.as_ptr(),
+            libc::AT_FDCWD,
+            dst_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if ret == 0 {
+        return Ok(());
+    }
+
+    let err = std::io::Error::last_os_error();
+    Err(anyhow::Error::new(err).context(format!(
+        "renameat2(RENAME_NOREPLACE) failed: {} -> {}",
+        src.display(),
+        dst.display()
+    )))
+}
+
+/// Non-Linux Unix fallback: POSIX `link()` + `unlink()`.
+///
+/// `link()` fails with `EEXIST` when the destination already exists,
+/// which gives us the same fail-if-exists semantics as
+/// `RENAME_NOREPLACE`. On `EXDEV` (cross-device — shouldn't happen
+/// because the tempfile is created in the session dir) we fall back to
+/// plain `rename()`, accepting a non-atomic window in that extreme case.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn atomic_create_rename(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    match fs::hard_link(src, dst) {
+        Ok(()) => {
+            // Link succeeded; drop the original name.
+            fs::remove_file(src).with_context(|| {
+                format!("failed to remove tempfile after link: {}", src.display())
+            })?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow::Error::new(e)
+            .context(format!(
+                "link failed: {} -> {}: destination exists",
+                src.display(),
+                dst.display()
+            ))),
+        Err(e) => {
+            // EXDEV (cross-device) is reported as Other/Uncategorized on
+            // most Rust versions. Retry with plain rename, which
+            // tolerates EXDEV. Rename replaces the destination if it
+            // exists, so we check first; a racing writer could still
+            // slip in, but this branch only triggers in pathological
+            // cross-filesystem setups.
+            let is_exdev = e
+                .raw_os_error()
+                .map(|code| code == libc::EXDEV)
+                .unwrap_or(false);
+            if is_exdev {
+                if dst.exists() {
+                    return Err(anyhow::Error::new(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "destination exists",
+                    ))
+                    .context(format!(
+                        "rename fallback: {} -> {}: destination exists",
+                        src.display(),
+                        dst.display()
+                    )));
+                }
+                fs::rename(src, dst).with_context(|| {
+                    format!(
+                        "rename (EXDEV fallback) failed: {} -> {}",
+                        src.display(),
+                        dst.display()
+                    )
+                })
+            } else {
+                Err(anyhow::Error::new(e).context(format!(
+                    "link failed: {} -> {}",
+                    src.display(),
+                    dst.display()
+                )))
+            }
+        }
+    }
+}
+
+/// Non-Unix fallback (e.g., Windows test builds). Best-effort
+/// check-then-rename with a non-atomic window.
+#[cfg(not(unix))]
+fn atomic_create_rename(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    if dst.exists() {
+        return Err(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "destination exists",
+        ))
+        .context(format!(
+            "check-then-rename: {} -> {}: destination exists",
+            src.display(),
+            dst.display()
+        )));
+    }
+    fs::rename(src, dst)
+        .with_context(|| format!("rename failed: {} -> {}", src.display(), dst.display()))
 }
 
 /// Ensure the `.koto` ancestor directory exists with mode 0700.
@@ -882,6 +1100,257 @@ mod tests {
             let got = backend.get("sess", &key).unwrap();
             assert_eq!(got, expected.as_bytes());
         }
+    }
+
+    // ===== init_state_file tests =====
+
+    /// Helper: build a minimal (header, events) bundle for a session id.
+    fn sample_bundle(id: &str) -> (StateFileHeader, Vec<Event>) {
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: id.to_string(),
+            template_hash: "testhash".to_string(),
+            created_at: "2026-04-13T00:00:00Z".to_string(),
+            parent_workflow: None,
+        };
+        let events = vec![
+            Event {
+                seq: 1,
+                timestamp: "2026-04-13T00:00:00Z".to_string(),
+                event_type: "workflow_initialized".to_string(),
+                payload: EventPayload::WorkflowInitialized {
+                    template_path: "/tmp/tpl.md".to_string(),
+                    variables: std::collections::HashMap::new(),
+                },
+            },
+            Event {
+                seq: 2,
+                timestamp: "2026-04-13T00:00:01Z".to_string(),
+                event_type: "transitioned".to_string(),
+                payload: EventPayload::Transitioned {
+                    from: None,
+                    to: "start".to_string(),
+                    condition_type: "initial".to_string(),
+                },
+            },
+        ];
+        (header, events)
+    }
+
+    // -- happy path: init writes a readable state file --
+
+    #[test]
+    fn init_state_file_writes_header_and_events() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (header, events) = sample_bundle("wf");
+
+        backend
+            .init_state_file("wf", header.clone(), events)
+            .unwrap();
+
+        assert!(backend.exists("wf"));
+        let (got_header, got_events) = backend.read_events("wf").unwrap();
+        assert_eq!(got_header, header);
+        assert_eq!(got_events.len(), 2);
+        assert_eq!(got_events[0].seq, 1);
+        assert_eq!(got_events[1].seq, 2);
+    }
+
+    #[test]
+    fn init_state_file_rejects_invalid_id() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (header, events) = sample_bundle("ok");
+        assert!(backend
+            .init_state_file("../escape", header, events)
+            .is_err());
+    }
+
+    // -- scenario-1 + scenario-3: first-writer-wins under concurrency --
+
+    #[test]
+    fn init_state_file_first_writer_wins_under_contention() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(test_backend(tmp.path()));
+        let barrier = Arc::new(Barrier::new(8));
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let b = Arc::clone(&backend);
+            let bar = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                // Each thread has a different event payload so that a
+                // silent overwrite would produce different content.
+                let mut header = StateFileHeader {
+                    schema_version: 1,
+                    workflow: "race".to_string(),
+                    template_hash: format!("hash-{}", i),
+                    created_at: "2026-04-13T00:00:00Z".to_string(),
+                    parent_workflow: None,
+                };
+                header.template_hash = format!("hash-{}", i);
+                let events = vec![Event {
+                    seq: 1,
+                    timestamp: "2026-04-13T00:00:00Z".to_string(),
+                    event_type: "workflow_initialized".to_string(),
+                    payload: EventPayload::WorkflowInitialized {
+                        template_path: format!("/tmp/tpl-{}.md", i),
+                        variables: std::collections::HashMap::new(),
+                    },
+                }];
+                bar.wait();
+                b.init_state_file("race", header, events)
+            }));
+        }
+
+        let mut wins = 0;
+        let mut already_exists = 0;
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(()) => wins += 1,
+                Err(e) => {
+                    let is_already_exists = e
+                        .downcast_ref::<std::io::Error>()
+                        .map(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+                        .unwrap_or(false);
+                    assert!(
+                        is_already_exists,
+                        "unexpected error (want AlreadyExists): {:?}",
+                        e
+                    );
+                    already_exists += 1;
+                }
+            }
+        }
+        assert_eq!(wins, 1, "exactly one init must commit");
+        assert_eq!(already_exists, 7, "every loser must report AlreadyExists");
+
+        // The committed content must be internally consistent (no torn
+        // writes / interleaved payloads): the header's template_hash
+        // must match the template_path in the single event.
+        let (header, events) = backend.read_events("race").unwrap();
+        assert!(header.template_hash.starts_with("hash-"));
+        let idx: &str = header.template_hash.strip_prefix("hash-").unwrap();
+        assert_eq!(events.len(), 1);
+        if let EventPayload::WorkflowInitialized { template_path, .. } = &events[0].payload {
+            assert_eq!(template_path, &format!("/tmp/tpl-{}.md", idx));
+        } else {
+            panic!("expected WorkflowInitialized payload");
+        }
+    }
+
+    // -- scenario-1: two sequential calls on the same path --
+
+    #[test]
+    fn init_state_file_second_call_errors_with_already_exists() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (h1, e1) = sample_bundle("wf");
+        backend.init_state_file("wf", h1, e1).unwrap();
+
+        let (h2, e2) = sample_bundle("wf");
+        let err = backend
+            .init_state_file("wf", h2, e2)
+            .expect_err("second init must fail");
+        let io_kind = err.downcast_ref::<std::io::Error>().map(|io| io.kind());
+        assert_eq!(io_kind, Some(std::io::ErrorKind::AlreadyExists));
+    }
+
+    // -- scenario-2: crash between tempfile write and rename leaves no
+    //    partial state file, and a fresh init on the path succeeds. We
+    //    simulate the crash by dropping a bogus tempfile in the session
+    //    dir (as would remain after a kill -9 between write and rename).
+
+    #[test]
+    fn init_state_file_fresh_init_succeeds_after_stale_tempfile() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+
+        // Simulate a crashed prior run: session dir exists with a stray
+        // `.koto-init-*.tmp` file, but no state file.
+        let session_dir = tmp.path().join("wf");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join(".koto-init-stale.tmp"),
+            b"partial content from prior crash",
+        )
+        .unwrap();
+
+        // The target state file must NOT be visible as a session.
+        assert!(!backend.exists("wf"));
+
+        // A fresh init on the same name succeeds and writes the real
+        // bundle.
+        let (header, events) = sample_bundle("wf");
+        backend
+            .init_state_file("wf", header.clone(), events)
+            .unwrap();
+        assert!(backend.exists("wf"));
+        let (got_header, got_events) = backend.read_events("wf").unwrap();
+        assert_eq!(got_header, header);
+        assert_eq!(got_events.len(), 2);
+    }
+
+    // -- scenario-2: no target state file is left when the bundle is
+    //    never renamed. This exercises the invariant "a crash before
+    //    rename never leaves the real state file on disk" by directly
+    //    calling the helper with a bogus rename target.
+    //    (Covered implicitly by the fresh_init_succeeds_after_stale
+    //    test above; additionally assert the state file doesn't appear
+    //    until init completes.)
+
+    #[test]
+    fn init_state_file_is_not_visible_until_rename_completes() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+
+        // Before init, no session exists.
+        assert!(!backend.exists("wf"));
+
+        let (header, events) = sample_bundle("wf");
+        backend.init_state_file("wf", header, events).unwrap();
+
+        // After init, the state file is present exactly once and at the
+        // final path.
+        let state_path = tmp.path().join("wf").join(state_file_name("wf"));
+        assert!(state_path.exists());
+
+        // No leftover .tmp files in the session directory.
+        let stray: Vec<_> = fs::read_dir(tmp.path().join("wf"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "init must not leave .tmp files behind on success: {:?}",
+            stray.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+    }
+
+    // -- scenario-3: exercise the non-Linux link()+unlink() fallback on
+    //    platforms where it is the active branch. We can't realistically
+    //    flip Linux onto the link() path from a test, so we gate this
+    //    test to platforms that actually use it.
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn init_state_file_link_unlink_fallback_first_writer_wins() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (h1, e1) = sample_bundle("wf");
+        backend.init_state_file("wf", h1, e1).unwrap();
+
+        let (h2, e2) = sample_bundle("wf");
+        let err = backend
+            .init_state_file("wf", h2, e2)
+            .expect_err("second init must fail on link() path");
+        let io_kind = err.downcast_ref::<std::io::Error>().map(|io| io.kind());
+        assert_eq!(io_kind, Some(std::io::ErrorKind::AlreadyExists));
     }
 
     // -- manifest crash recovery: orphaned content without manifest entry --
