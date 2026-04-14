@@ -50,7 +50,7 @@ use crate::engine::persistence::derive_state_from_log;
 use crate::engine::scheduler_warning::SchedulerWarning;
 use crate::engine::types::{Event, EventPayload, SpawnEntrySnapshot};
 use crate::session::SessionBackend;
-use crate::template::types::{CompiledTemplate, MaterializeChildrenSpec};
+use crate::template::types::{CompiledTemplate, FailurePolicy, MaterializeChildrenSpec};
 
 // --------- Public types (wire-level) ---------------------------------
 
@@ -92,6 +92,13 @@ pub enum SchedulerOutcome {
         /// Non-fatal warnings the scheduler emitted this tick
         /// (Decision 14). Path-resolution warnings land here.
         warnings: Vec<SchedulerWarning>,
+        /// True when at least one child's classification changed during
+        /// this tick (stale skip marker respawned, running child
+        /// respawned as skip marker, or pending task moved to Ready).
+        /// Agents use this as a cheap signal that dispatch state may
+        /// have shifted — `false` means the scheduler was a pure no-op.
+        /// Issue #13 Round-3 polish.
+        reclassified_this_tick: bool,
     },
 
     /// Tick-wide failure that prevents classification of any task
@@ -124,6 +131,86 @@ pub struct MaterializedChild {
     /// agents rendering a batch view. Always present; an empty list
     /// means "no dependencies".
     pub waits_on: Vec<String>,
+    /// Dispatch gate: `true` only when every `waits_on` entry is
+    /// terminal (done / done_blocked / skipped) AND the child's own
+    /// outcome is not `spawn_failed`. Workers filter
+    /// `materialized_children` by `ready_to_drive: true AND
+    /// outcome != spawn_failed` before picking up tasks (Decision 9;
+    /// DESIGN-batch-child-spawning.md:1070-1086).
+    ///
+    /// Freshly-respawned children whose upstream deps have not yet
+    /// settled remain `ready_to_drive: false` until the next tick's
+    /// classification confirms their dependencies are terminal.
+    pub ready_to_drive: bool,
+}
+
+/// Per-entry feedback discriminator (Decision 10 —
+/// DESIGN-batch-child-spawning.md:1916). Reserved for the
+/// `SchedulerOutcome::Scheduled.feedback` map that lands in a later
+/// issue; Issue #13 defines the enum so the R8-vacuous `Respawning`
+/// window has a named variant and so future wire-level feedback lands
+/// on a stable shape.
+///
+/// Variants are keyed by the agent-submitted short task name. `Round-3`
+/// polish (Issue #13) pins the documentation so each `Already*` variant
+/// has an unambiguous meaning:
+///
+/// - [`AlreadyRunning`](Self::AlreadyRunning): child state file exists
+///   on disk and its current state is **non-terminal**. The variant
+///   says nothing about whether a worker is *actively driving* the
+///   child right now — it is a disk-state assertion, not a liveness
+///   probe.
+/// - [`AlreadyTerminalSuccess`](Self::AlreadyTerminalSuccess): child
+///   state file exists on disk, current state is terminal, and the
+///   template does NOT flag `failure: true` or `skipped_marker: true`.
+///   The normal "task completed successfully" outcome.
+/// - [`AlreadyTerminalFailure`](Self::AlreadyTerminalFailure): child
+///   state file exists on disk, current state is terminal, and the
+///   template flags `failure: true`. Kept distinct from
+///   `AlreadyTerminalSuccess` so agents don't need to peek at the
+///   child's template flags to tell the two apart.
+/// - [`AlreadySkipped`](Self::AlreadySkipped): child state file exists
+///   on disk, current state is terminal, and the template flags
+///   `skipped_marker: true`. A stale skip marker (upstream has since
+///   flipped to success) is detected and respawned within the same
+///   tick; by the time feedback is emitted the outcome has already
+///   transitioned away from `AlreadySkipped`.
+/// - [`Respawning`](Self::Respawning): the target child is mid-respawn
+///   in **this** tick. R8 comparison is vacuous during this window
+///   (the on-disk `spawn_entry` is transiently absent), so the
+///   submission is accepted; the next tick re-evaluates against the
+///   committed new `spawn_entry`. See
+///   DESIGN-batch-child-spawning.md:1960-1972.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum EntryOutcome {
+    /// Task entry accepted; the scheduler spawned (or already has
+    /// spawned) a matching child.
+    Accepted,
+    /// Child exists on disk and is non-terminal. This is a pure
+    /// disk-state assertion; it does NOT imply a worker is actively
+    /// driving the child.
+    AlreadyRunning,
+    /// Child exists on disk at a terminal, non-failure, non-skip state.
+    AlreadyTerminalSuccess,
+    /// Child exists on disk at a terminal state whose template flags
+    /// `failure: true`.
+    AlreadyTerminalFailure,
+    /// Child exists on disk at a terminal state whose template flags
+    /// `skipped_marker: true`.
+    AlreadySkipped,
+    /// A dependency of this entry is non-terminal (or failed under
+    /// `skip_dependents`). The entry is deferred; the same tick's
+    /// `materialized_children` ledger reports `outcome: blocked`.
+    Blocked { waits_on: Vec<String> },
+    /// Spawn failure (compile error, collision, I/O). Mirrors
+    /// `TaskSpawnError.kind` so agents can key off a single string.
+    Errored { kind: String },
+    /// Target child is mid-respawn **this tick**. R8 comparison is
+    /// vacuous for this entry; the next tick re-evaluates against the
+    /// new `spawn_entry`.
+    Respawning,
 }
 
 /// Shared per-task outcome discriminator.
@@ -293,12 +380,10 @@ pub(crate) enum TaskClassification {
     /// Child exists on disk and is terminal-skipped (template flagged
     /// `skipped_marker: true`).
     Skipped,
-    /// A dependency of this task is in `Failure` and the batch's
-    /// `failure_policy` is `SkipDependents`. Issue #12 does not spawn
-    /// skip markers — that's Issue #13 — but classification still
-    /// reports the state so the materialized_children ledger is
-    /// accurate.
-    #[allow(dead_code)]
+    /// A dependency of this task is in `Failure` (or transitively in
+    /// `ShouldBeSkipped`) and the batch's `failure_policy` is
+    /// `SkipDependents`. Issue #13 spawns a terminal skip marker for
+    /// these tasks so the `children-complete` gate can tally them.
     ShouldBeSkipped,
 }
 
@@ -306,9 +391,16 @@ impl TaskClassification {
     fn to_outcome(&self) -> TaskOutcome {
         match self {
             TaskClassification::Ready => TaskOutcome::Pending,
-            TaskClassification::BlockedByDep | TaskClassification::ShouldBeSkipped => {
-                TaskOutcome::Blocked
-            }
+            TaskClassification::BlockedByDep => TaskOutcome::Blocked,
+            // `ShouldBeSkipped` in the `materialized_children` ledger
+            // means the task has been classified as needing a skip
+            // marker but has not yet been spawned this tick. The
+            // scheduler's outer loop spawns it and rewrites the
+            // ledger entry to `Skipped` via the fresh read-back; this
+            // arm is only hit when the spawn itself failed, in which
+            // case the `errored` vector carries the detail and the
+            // outcome is overridden to `SpawnFailed` upstream.
+            TaskClassification::ShouldBeSkipped => TaskOutcome::Skipped,
             TaskClassification::Running => TaskOutcome::Running,
             TaskClassification::Success => TaskOutcome::Success,
             TaskClassification::Failure => TaskOutcome::Failure,
@@ -362,6 +454,7 @@ pub(crate) fn classify_task(
     task: &TaskEntry,
     existing: Option<&ChildSnapshot>,
     classifications: &HashMap<String, TaskClassification>,
+    failure_policy: FailurePolicy,
 ) -> TaskClassification {
     if let Some(snap) = existing {
         if snap.terminal {
@@ -376,14 +469,34 @@ pub(crate) fn classify_task(
         return TaskClassification::Running;
     }
 
-    // Not yet spawned — check dependencies.
+    // Not yet spawned — check dependencies against the prior sweep's
+    // classifications. Under `SkipDependents`, a failed or
+    // transitively-skipped upstream yields `ShouldBeSkipped`; the
+    // scheduler spawns a skip-marker child in that case. Under
+    // `Continue`, dependents still block on non-success but never
+    // inherit a failure.
+    let mut should_skip = false;
     for dep in &task.waits_on {
         match classifications.get(dep.as_str()) {
             Some(TaskClassification::Success) => {}
+            Some(TaskClassification::Failure) | Some(TaskClassification::Skipped)
+                if matches!(failure_policy, FailurePolicy::SkipDependents) =>
+            {
+                should_skip = true;
+            }
+            Some(TaskClassification::ShouldBeSkipped)
+                if matches!(failure_policy, FailurePolicy::SkipDependents) =>
+            {
+                should_skip = true;
+            }
             _ => return TaskClassification::BlockedByDep,
         }
     }
-    TaskClassification::Ready
+    if should_skip {
+        TaskClassification::ShouldBeSkipped
+    } else {
+        TaskClassification::Ready
+    }
 }
 
 // --------- Scheduler entry point ------------------------------------
@@ -442,6 +555,7 @@ pub(crate) fn run_batch_scheduler(
                 materialized_children: Vec::new(),
                 errored: Vec::new(),
                 warnings: Vec::new(),
+                reclassified_this_tick: false,
             });
         }
     };
@@ -452,31 +566,267 @@ pub(crate) fn run_batch_scheduler(
     let name_to_task: HashMap<&str, &TaskEntry> =
         tasks.iter().map(|t| (t.name.as_str(), t)).collect();
 
-    // Snapshot all existing children. One listing + one read_events
-    // call per submitted task covers the read-side work.
-    //
-    // backend.list() is O(total sessions on backend), not O(children).
-    // Under CloudBackend this becomes a cross-host metadata listing.
-    // Acceptable for v1; revisit when batch scale tests land.
-    let sessions = match backend.list() {
+    // Snapshot all existing children on disk. One backend.list() +
+    // one read_events per child is the read-side cost per tick.
+    let mut snapshots = match snapshot_existing_children(backend, parent_name, &name_to_task) {
         Ok(s) => s,
-        Err(e) => {
-            return Ok(SchedulerOutcome::Error {
-                reason: format!("failed to list sessions: {}", e),
-            });
-        }
+        Err(reason) => return Ok(SchedulerOutcome::Error { reason }),
     };
+
+    let failure_policy = hook.failure_policy;
+
+    // Classify every task in topological order so dependency
+    // outcomes are known when we classify a downstream task. This is
+    // the "current" classification — based on what is on disk right
+    // now. Reclassification below compares against the "ideal"
+    // classification (what the task SHOULD be given the current
+    // upstream outcomes, regardless of what's on disk).
+    let mut classifications: HashMap<String, TaskClassification> =
+        HashMap::with_capacity(tasks.len());
+    for name in &dag.topological_order {
+        let task = match name_to_task.get(*name) {
+            Some(t) => *t,
+            None => continue,
+        };
+        let c = classify_task(task, snapshots.get(*name), &classifications, failure_policy);
+        classifications.insert(task.name.clone(), c);
+    }
+
+    // Spawn ready tasks and reclassify-and-respawn mismatched
+    // children. Per-child accumulation: failures land in `errored`
+    // but never halt the tick — subsequent tasks still spawn.
+    let mut spawned_this_tick: Vec<String> = Vec::new();
+    let mut errored: Vec<TaskSpawnError> = Vec::new();
+    let mut warnings: Vec<SchedulerWarning> = Vec::new();
+    let mut cache = TemplateCompileCache::new();
+    let mut reclassified_this_tick = false;
+
+    // Resolve the parent's template source dir + submitter cwd once.
+    let (template_source_dir, submitter_cwd) = resolution_context(backend, parent_name, events);
+
+    // Iterate tasks in topological order so a respawn that updates a
+    // downstream's upstream outcome propagates within the same tick.
+    for name in dag.topological_order.clone() {
+        let task = match name_to_task.get(name) {
+            Some(t) => *t,
+            None => continue,
+        };
+
+        let current_class = classifications
+            .get(task.name.as_str())
+            .cloned()
+            .unwrap_or(TaskClassification::BlockedByDep);
+
+        // Derive the "ideal" classification from current upstream
+        // outcomes: what WOULD we classify this task as if no child
+        // existed on disk? Compare against the actual on-disk state
+        // to detect stale skip markers (upstream recovered) and
+        // running children whose upstream flipped to failure.
+        let ideal_class = classify_task(task, None, &classifications, failure_policy);
+
+        // Decide whether this child needs to be respawned.
+        // - Skipped on disk but upstream now suggests Ready → stale
+        //   skip marker, respawn as real child.
+        // - Running on disk but upstream now suggests ShouldBeSkipped
+        //   → respawn as skip marker.
+        // - No other terminal-on-disk triggers reclassification:
+        //   terminal Success / Failure stay put.
+        let respawn_as = match (&current_class, &ideal_class) {
+            (TaskClassification::Skipped, TaskClassification::Ready) => Some(RespawnTarget::Real),
+            (TaskClassification::Running, TaskClassification::ShouldBeSkipped) => {
+                Some(RespawnTarget::SkipMarker)
+            }
+            _ => None,
+        };
+
+        if let Some(target) = respawn_as {
+            // Delete the existing child state file and respawn with
+            // the current submission entry. The transient window
+            // between delete and re-init is the R8-vacuous
+            // `EntryOutcome::Respawning` window — any concurrent
+            // submission for the same task name observes `Some(None)`
+            // in `existing_children_snapshot` and defers R8.
+            let child_name = format!("{}.{}", parent_name, task.name);
+            if let Err(e) = backend.cleanup(&child_name) {
+                errored.push(TaskSpawnError::new(
+                    &child_name,
+                    crate::cli::task_spawn_error::SpawnErrorKind::IoError,
+                    format!(
+                        "failed to delete stale child during reclassification: {}",
+                        e
+                    ),
+                ));
+                // Record the spawn_failed outcome and continue with
+                // the next task. The next tick will retry.
+                classifications.insert(task.name.clone(), TaskClassification::Failure);
+                continue;
+            }
+            // Drop the stale on-disk snapshot so downstream
+            // ready_to_drive computation uses the post-respawn view.
+            snapshots.remove(task.name.as_str());
+            reclassified_this_tick = true;
+
+            // Fall through: the classification is updated to the
+            // ideal so the spawn path below treats it like a fresh
+            // task.
+            classifications.insert(
+                task.name.clone(),
+                match target {
+                    RespawnTarget::Real => TaskClassification::Ready,
+                    RespawnTarget::SkipMarker => TaskClassification::ShouldBeSkipped,
+                },
+            );
+        }
+
+        // Re-read the classification after possible reclassification
+        // override.
+        let effective = classifications
+            .get(task.name.as_str())
+            .cloned()
+            .unwrap_or(TaskClassification::BlockedByDep);
+
+        match effective {
+            TaskClassification::Ready => {
+                spawn_ready_task(
+                    backend,
+                    parent_name,
+                    task,
+                    hook,
+                    template_source_dir.as_deref(),
+                    submitter_cwd.as_deref(),
+                    &mut cache,
+                    &mut spawned_this_tick,
+                    &mut errored,
+                    &mut warnings,
+                    &mut classifications,
+                );
+            }
+            TaskClassification::ShouldBeSkipped => {
+                spawn_skip_marker_task(
+                    backend,
+                    parent_name,
+                    task,
+                    hook,
+                    template_source_dir.as_deref(),
+                    submitter_cwd.as_deref(),
+                    &mut cache,
+                    &mut spawned_this_tick,
+                    &mut errored,
+                    &mut warnings,
+                    &mut classifications,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Build materialized_children ledger covering every submitted
+    // task, regardless of whether it has a child file on disk.
+    let mut materialized_children: Vec<MaterializedChild> = Vec::with_capacity(tasks.len());
+    for task in &tasks {
+        let name = format!("{}.{}", parent_name, task.name);
+        let class = classifications
+            .get(task.name.as_str())
+            .cloned()
+            .unwrap_or(TaskClassification::BlockedByDep);
+        let task_errored = errored.iter().any(|e| e.task == name);
+        let outcome = if task_errored {
+            TaskOutcome::SpawnFailed
+        } else {
+            class.to_outcome()
+        };
+        let state = if spawned_this_tick.iter().any(|n| n == &name) {
+            // A freshly-spawned child's state is its initial state;
+            // read it back for honesty.
+            backend
+                .read_events(&name)
+                .ok()
+                .and_then(|(_, evts)| derive_state_from_log(&evts))
+        } else {
+            snapshots
+                .get(task.name.as_str())
+                .map(|s| s.current_state.clone())
+        };
+
+        // `ready_to_drive` is the dispatch gate. True iff:
+        //   - outcome is not `spawn_failed`, AND
+        //   - every `waits_on` entry resolves to a terminal
+        //     classification (success / failure / skipped).
+        // A child that has not yet been spawned (outcome Pending /
+        // Blocked) is never `ready_to_drive: true` even when its
+        // deps are terminal — the dispatch gate is for already-on-
+        // disk non-terminal children, and a Pending task has no
+        // child file for a worker to drive.
+        let all_deps_terminal = task.waits_on.iter().all(|dep| {
+            matches!(
+                classifications.get(dep.as_str()),
+                Some(
+                    TaskClassification::Success
+                        | TaskClassification::Failure
+                        | TaskClassification::Skipped
+                )
+            )
+        });
+        let ready_to_drive =
+            !task_errored && matches!(outcome, TaskOutcome::Running) && all_deps_terminal;
+
+        materialized_children.push(MaterializedChild {
+            name,
+            task: task.name.clone(),
+            outcome,
+            state,
+            waits_on: task.waits_on.clone(),
+            ready_to_drive,
+        });
+    }
+
+    // `reclassified_this_tick` also flips true whenever any task
+    // transitioned from not-yet-spawned to spawned in this tick: the
+    // classification map was mutated, which is what the flag signals
+    // to agents.
+    if !spawned_this_tick.is_empty() {
+        reclassified_this_tick = true;
+    }
+
+    Ok(SchedulerOutcome::Scheduled {
+        spawned_this_tick,
+        materialized_children,
+        errored,
+        warnings,
+        reclassified_this_tick,
+    })
+}
+
+/// Which shape to respawn a reclassified child into.
+#[derive(Debug, Clone, Copy)]
+enum RespawnTarget {
+    /// Spawn the child with its real template at the normal initial
+    /// state. Used when a stale skip marker's upstream has since
+    /// flipped back to success.
+    Real,
+    /// Spawn the child directly into its `skipped_marker: true`
+    /// terminal. Used when a running child's upstream flipped to
+    /// failure.
+    SkipMarker,
+}
+
+/// Walk `backend.list()` and return a map from short task name to
+/// [`ChildSnapshot`] for every child of `parent_name` that matches a
+/// submitted task.
+fn snapshot_existing_children(
+    backend: &dyn SessionBackend,
+    parent_name: &str,
+    name_to_task: &HashMap<&str, &TaskEntry>,
+) -> Result<HashMap<String, ChildSnapshot>, String> {
+    let sessions = backend
+        .list()
+        .map_err(|e| format!("failed to list sessions: {}", e))?;
     let child_prefix = format!("{}.", parent_name);
     let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
     for info in sessions {
         if info.parent_workflow.as_deref() != Some(parent_name) {
             continue;
         }
-        // Skip children that are not part of this batch by naming
-        // convention. The parent_workflow header is authoritative but
-        // a future sub-parent of the same parent (Decision 12 Q8)
-        // could land here. Name-prefix filtering keeps the scheduler
-        // scoped to its own batch.
         if !info.id.starts_with(&child_prefix) {
             continue;
         }
@@ -492,8 +842,6 @@ pub(crate) fn run_batch_scheduler(
             Some(s) => s,
             None => continue,
         };
-        // Load the child's compiled template to read terminal /
-        // failure / skipped_marker flags.
         let (terminal, failure, skipped_marker) =
             child_state_flags(&child_events, &current).unwrap_or((false, false, false));
         let spawn_entry = child_events.iter().find_map(|e| match &e.payload {
@@ -511,145 +859,196 @@ pub(crate) fn run_batch_scheduler(
             },
         );
     }
+    Ok(snapshots)
+}
 
-    // Classify every task in topological order so dependency
-    // outcomes are known when we classify a downstream task.
-    let mut classifications: HashMap<String, TaskClassification> =
-        HashMap::with_capacity(tasks.len());
-    for name in &dag.topological_order {
-        let task = match name_to_task.get(*name) {
-            Some(t) => *t,
-            None => continue,
-        };
-        let c = classify_task(task, snapshots.get(*name), &classifications);
-        classifications.insert(task.name.clone(), c);
+/// Spawn a freshly-classified `Ready` task. Updates the classification
+/// map to `Running` on success or `Failure` on error so downstream
+/// ready/blocked decisions are consistent within the same tick.
+#[allow(clippy::too_many_arguments)]
+fn spawn_ready_task(
+    backend: &dyn SessionBackend,
+    parent_name: &str,
+    task: &TaskEntry,
+    hook: &MaterializeChildrenSpec,
+    template_source_dir: Option<&std::path::Path>,
+    submitter_cwd: Option<&std::path::Path>,
+    cache: &mut TemplateCompileCache,
+    spawned_this_tick: &mut Vec<String>,
+    errored: &mut Vec<TaskSpawnError>,
+    warnings: &mut Vec<SchedulerWarning>,
+    classifications: &mut HashMap<String, TaskClassification>,
+) {
+    let raw_template = task
+        .template
+        .clone()
+        .unwrap_or_else(|| hook.default_template.clone());
+    let resolution = crate::engine::path_resolution::resolve_template_path(
+        &raw_template,
+        template_source_dir,
+        submitter_cwd,
+    );
+    accumulate_resolution_warnings(&resolution.warnings, warnings);
+
+    let child_name = format!("{}.{}", parent_name, task.name);
+    let vars = vars_to_cli_args(&task.vars);
+    let snapshot = build_spawn_entry_snapshot(task, &raw_template);
+
+    match crate::cli::init_child_from_parent(
+        backend,
+        Some(parent_name),
+        &child_name,
+        &resolution.resolved,
+        &vars,
+        cache,
+        Some(snapshot),
+    ) {
+        Ok(()) => {
+            spawned_this_tick.push(child_name);
+            classifications.insert(task.name.clone(), TaskClassification::Running);
+        }
+        Err(err) => {
+            errored.push(err);
+            classifications.insert(task.name.clone(), TaskClassification::Failure);
+        }
     }
+}
 
-    // Spawn ready tasks. Collect per-task errors; do not halt on
-    // first failure.
-    let mut spawned_this_tick: Vec<String> = Vec::new();
-    let mut errored: Vec<TaskSpawnError> = Vec::new();
-    let mut warnings: Vec<SchedulerWarning> = Vec::new();
-    let mut cache = TemplateCompileCache::new();
+/// Spawn a `ShouldBeSkipped` task directly into its terminal
+/// `skipped_marker: true` state. Requires compiling the child template
+/// to find the skipped-marker state name — that happens via
+/// [`find_skipped_state_name`].
+#[allow(clippy::too_many_arguments)]
+fn spawn_skip_marker_task(
+    backend: &dyn SessionBackend,
+    parent_name: &str,
+    task: &TaskEntry,
+    hook: &MaterializeChildrenSpec,
+    template_source_dir: Option<&std::path::Path>,
+    submitter_cwd: Option<&std::path::Path>,
+    cache: &mut TemplateCompileCache,
+    spawned_this_tick: &mut Vec<String>,
+    errored: &mut Vec<TaskSpawnError>,
+    warnings: &mut Vec<SchedulerWarning>,
+    classifications: &mut HashMap<String, TaskClassification>,
+) {
+    let raw_template = task
+        .template
+        .clone()
+        .unwrap_or_else(|| hook.default_template.clone());
+    let resolution = crate::engine::path_resolution::resolve_template_path(
+        &raw_template,
+        template_source_dir,
+        submitter_cwd,
+    );
+    accumulate_resolution_warnings(&resolution.warnings, warnings);
 
-    // Resolve the parent's template source dir + submitter cwd once.
-    let (template_source_dir, submitter_cwd) = resolution_context(backend, parent_name, events);
+    let child_name = format!("{}.{}", parent_name, task.name);
+    let skipped_state = match find_skipped_state_name(&resolution.resolved) {
+        Ok(name) => name,
+        Err(msg) => {
+            errored.push(TaskSpawnError::new(
+                &child_name,
+                crate::cli::task_spawn_error::SpawnErrorKind::TemplateCompileFailed,
+                msg,
+            ));
+            classifications.insert(task.name.clone(), TaskClassification::Failure);
+            return;
+        }
+    };
 
-    for task in &tasks {
-        if !matches!(
-            classifications.get(task.name.as_str()),
-            Some(TaskClassification::Ready)
-        ) {
+    let vars = vars_to_cli_args(&task.vars);
+    let snapshot = build_spawn_entry_snapshot(task, &raw_template);
+
+    match crate::cli::init_child::init_child_as_skip_marker_from_parent(
+        backend,
+        Some(parent_name),
+        &child_name,
+        &resolution.resolved,
+        &vars,
+        cache,
+        Some(snapshot),
+        &skipped_state,
+    ) {
+        Ok(()) => {
+            spawned_this_tick.push(child_name);
+            classifications.insert(task.name.clone(), TaskClassification::Skipped);
+        }
+        Err(err) => {
+            errored.push(err);
+            classifications.insert(task.name.clone(), TaskClassification::Failure);
+        }
+    }
+}
+
+/// Compile the child template at `template_path` (via the on-disk
+/// cache) and return the name of a state declaring `skipped_marker:
+/// true`. F5 guarantees at least one such state exists on any
+/// batch-eligible child template; if none is found, return an error
+/// message the caller surfaces as `TaskSpawnError`.
+fn find_skipped_state_name(template_path: &std::path::Path) -> Result<String, String> {
+    let canonical = std::fs::canonicalize(template_path).map_err(|e| {
+        format!(
+            "failed to resolve template {}: {}",
+            template_path.display(),
+            e
+        )
+    })?;
+    let (cache_path, _) = crate::cache::compile_cached(&canonical, false)
+        .map_err(|e| format!("failed to compile template {}: {}", canonical.display(), e))?;
+    let bytes = std::fs::read(&cache_path).map_err(|e| {
+        format!(
+            "failed to read compiled template {}: {}",
+            cache_path.display(),
+            e
+        )
+    })?;
+    let compiled: CompiledTemplate = serde_json::from_slice(&bytes).map_err(|e| {
+        format!(
+            "failed to parse compiled template {}: {}",
+            cache_path.display(),
+            e
+        )
+    })?;
+    for (name, state) in &compiled.states {
+        if state.terminal && state.skipped_marker {
+            return Ok(name.clone());
+        }
+    }
+    Err(format!(
+        "template {} has no terminal state with `skipped_marker: true` (F5 violation)",
+        canonical.display()
+    ))
+}
+
+/// Build the `spawn_entry` snapshot recorded on a child's
+/// `WorkflowInitialized` event. The stored template string is the raw
+/// submitted path (or inherited default), not the resolved absolute
+/// path, matching Decision 10's canonical-form rule.
+fn build_spawn_entry_snapshot(task: &TaskEntry, raw_template: &str) -> SpawnEntrySnapshot {
+    let mut vars_map: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (k, v) in &task.vars {
+        vars_map.insert(k.clone(), v.clone());
+    }
+    SpawnEntrySnapshot::new(raw_template.to_string(), vars_map, task.waits_on.clone())
+}
+
+/// Dedup `MissingTemplateSourceDir` (per-tick warning, not per-task)
+/// and append the remaining warnings verbatim.
+fn accumulate_resolution_warnings(
+    resolution_warnings: &[SchedulerWarning],
+    warnings: &mut Vec<SchedulerWarning>,
+) {
+    for w in resolution_warnings {
+        if matches!(w, SchedulerWarning::MissingTemplateSourceDir)
+            && warnings
+                .iter()
+                .any(|existing| matches!(existing, SchedulerWarning::MissingTemplateSourceDir))
+        {
             continue;
         }
-
-        // Resolve the template path. Relative paths resolve against
-        // `template_source_dir`, falling back to `submitter_cwd` per
-        // Decision 14.
-        let raw_template = task
-            .template
-            .clone()
-            .unwrap_or_else(|| hook.default_template.clone());
-        let resolution = crate::engine::path_resolution::resolve_template_path(
-            &raw_template,
-            template_source_dir.as_deref(),
-            submitter_cwd.as_deref(),
-        );
-        for w in &resolution.warnings {
-            // Dedup MissingTemplateSourceDir — it's per-tick, not
-            // per-task.
-            if matches!(w, SchedulerWarning::MissingTemplateSourceDir)
-                && warnings
-                    .iter()
-                    .any(|existing| matches!(existing, SchedulerWarning::MissingTemplateSourceDir))
-            {
-                continue;
-            }
-            warnings.push(w.clone());
-        }
-
-        let child_name = format!("{}.{}", parent_name, task.name);
-        let vars = vars_to_cli_args(&task.vars);
-
-        // Record a spawn_entry snapshot so later ticks can R8-compare
-        // against the canonical form. The template string stored is
-        // the raw submitted path (or inherited default), not the
-        // resolved absolute path, to match the design (snapshot is a
-        // byte-level copy of the submitted entry; path resolution is
-        // per-tick).
-        let mut vars_map: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-        for (k, v) in &task.vars {
-            vars_map.insert(k.clone(), v.clone());
-        }
-        let snapshot =
-            SpawnEntrySnapshot::new(raw_template.clone(), vars_map, task.waits_on.clone());
-
-        match crate::cli::init_child_from_parent(
-            backend,
-            Some(parent_name),
-            &child_name,
-            &resolution.resolved,
-            &vars,
-            &mut cache,
-            Some(snapshot),
-        ) {
-            Ok(()) => {
-                spawned_this_tick.push(child_name.clone());
-                // Update classification so downstream tasks that
-                // might have been ready after this spawn see the new
-                // state next tick. For this tick, they remain
-                // blocked because the freshly-spawned child has not
-                // reached a terminal state yet.
-                classifications.insert(task.name.clone(), TaskClassification::Running);
-            }
-            Err(err) => {
-                errored.push(err);
-                classifications.insert(task.name.clone(), TaskClassification::Failure);
-            }
-        }
+        warnings.push(w.clone());
     }
-
-    // Build materialized_children ledger covering every submitted
-    // task, regardless of whether it has a child file on disk.
-    let mut materialized_children: Vec<MaterializedChild> = Vec::with_capacity(tasks.len());
-    for task in &tasks {
-        let name = format!("{}.{}", parent_name, task.name);
-        let class = classifications
-            .get(task.name.as_str())
-            .cloned()
-            .unwrap_or(TaskClassification::BlockedByDep);
-        let outcome = if errored.iter().any(|e| e.task == name) {
-            TaskOutcome::SpawnFailed
-        } else {
-            class.to_outcome()
-        };
-        let state = if spawned_this_tick.iter().any(|n| n == &name) {
-            // A freshly-spawned child's state is its initial state;
-            // read it back for honesty.
-            backend
-                .read_events(&name)
-                .ok()
-                .and_then(|(_, evts)| derive_state_from_log(&evts))
-        } else {
-            snapshots
-                .get(task.name.as_str())
-                .map(|s| s.current_state.clone())
-        };
-        materialized_children.push(MaterializedChild {
-            name,
-            task: task.name.clone(),
-            outcome,
-            state,
-            waits_on: task.waits_on.clone(),
-        });
-    }
-
-    Ok(SchedulerOutcome::Scheduled {
-        spawned_this_tick,
-        materialized_children,
-        errored,
-        warnings,
-    })
 }
 
 // --------- Helpers ---------------------------------------------------
@@ -855,7 +1254,7 @@ mod tests {
         let t = task("a", &[]);
         let classifications = HashMap::new();
         assert_eq!(
-            classify_task(&t, None, &classifications),
+            classify_task(&t, None, &classifications, FailurePolicy::SkipDependents),
             TaskClassification::Ready
         );
     }
@@ -866,7 +1265,7 @@ mod tests {
         let mut classifications = HashMap::new();
         classifications.insert("a".to_string(), TaskClassification::Running);
         assert_eq!(
-            classify_task(&t, None, &classifications),
+            classify_task(&t, None, &classifications, FailurePolicy::SkipDependents),
             TaskClassification::BlockedByDep
         );
     }
@@ -877,7 +1276,7 @@ mod tests {
         let mut classifications = HashMap::new();
         classifications.insert("a".to_string(), TaskClassification::Success);
         assert_eq!(
-            classify_task(&t, None, &classifications),
+            classify_task(&t, None, &classifications, FailurePolicy::SkipDependents),
             TaskClassification::Ready
         );
     }
@@ -894,7 +1293,12 @@ mod tests {
         };
         let classifications = HashMap::new();
         assert_eq!(
-            classify_task(&t, Some(&snap), &classifications),
+            classify_task(
+                &t,
+                Some(&snap),
+                &classifications,
+                FailurePolicy::SkipDependents
+            ),
             TaskClassification::Running
         );
     }
@@ -911,7 +1315,12 @@ mod tests {
         };
         let classifications = HashMap::new();
         assert_eq!(
-            classify_task(&t, Some(&snap), &classifications),
+            classify_task(
+                &t,
+                Some(&snap),
+                &classifications,
+                FailurePolicy::SkipDependents
+            ),
             TaskClassification::Success
         );
     }
@@ -928,7 +1337,12 @@ mod tests {
         };
         let classifications = HashMap::new();
         assert_eq!(
-            classify_task(&t, Some(&snap), &classifications),
+            classify_task(
+                &t,
+                Some(&snap),
+                &classifications,
+                FailurePolicy::SkipDependents
+            ),
             TaskClassification::Failure
         );
     }
@@ -945,7 +1359,12 @@ mod tests {
         };
         let classifications = HashMap::new();
         assert_eq!(
-            classify_task(&t, Some(&snap), &classifications),
+            classify_task(
+                &t,
+                Some(&snap),
+                &classifications,
+                FailurePolicy::SkipDependents
+            ),
             TaskClassification::Skipped
         );
     }

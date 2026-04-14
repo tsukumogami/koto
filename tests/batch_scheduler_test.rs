@@ -121,6 +121,56 @@ Do the work.
 Done.
 "#;
 
+/// A child template with three terminal outcomes: `done` (success),
+/// `failed` (failure), and `skipped_via_upstream_failure` (skip
+/// marker). Used by reclassification scenarios 18 and 19 where the
+/// scheduler must route a ShouldBeSkipped task directly into the
+/// skip-marker terminal and later respawn it as a real child.
+const CHILD_TEMPLATE_WITH_SKIP: &str = r#"---
+name: batch-child-with-skip
+version: "1.0"
+initial_state: work
+states:
+  work:
+    accepts:
+      marker:
+        type: enum
+        required: true
+        values: [done, fail]
+    transitions:
+      - target: done
+        when:
+          marker: done
+      - target: failed
+        when:
+          marker: fail
+  done:
+    terminal: true
+  failed:
+    terminal: true
+    failure: true
+  skipped_via_upstream_failure:
+    terminal: true
+    skipped_marker: true
+---
+
+## work
+
+Do the work.
+
+## done
+
+Done.
+
+## failed
+
+Failed.
+
+## skipped_via_upstream_failure
+
+Skipped because an upstream task failed.
+"#;
+
 fn write_templates(dir: &Path) -> PathBuf {
     std::fs::write(dir.join("child.md"), CHILD_TEMPLATE).unwrap();
     let parent = dir.join("parent.md");
@@ -435,5 +485,538 @@ fn cycle_rejection_before_append() {
         "cycle rejection must be pre-append; no EvidenceSubmitted should land on parent's log. \
          Log contents:\n{}",
         after
+    );
+}
+
+/// Parent template that references the skip-aware child template. Used
+/// by scenarios 18 and 19 which exercise runtime reclassification.
+const PARENT_TEMPLATE_SKIP_AWARE: &str = r#"---
+name: batch-parent-skip-aware
+version: "1.0"
+initial_state: plan
+states:
+  plan:
+    accepts:
+      tasks:
+        type: tasks
+        required: true
+      finalize:
+        type: enum
+        required: false
+        values: [yes]
+    gates:
+      done:
+        type: children-complete
+    materialize_children:
+      from_field: tasks
+      default_template: child_with_skip.md
+    transitions:
+      - target: summarize
+        when:
+          finalize: yes
+  summarize:
+    terminal: true
+---
+
+## plan
+
+Plan the batch.
+
+## summarize
+
+Summarize results.
+"#;
+
+fn write_skip_aware_templates(dir: &Path) -> PathBuf {
+    std::fs::write(dir.join("child_with_skip.md"), CHILD_TEMPLATE_WITH_SKIP).unwrap();
+    let parent = dir.join("parent_skip.md");
+    std::fs::write(&parent, PARENT_TEMPLATE_SKIP_AWARE).unwrap();
+    parent
+}
+
+/// Drive a skip-aware child through its `work` → `done` path.
+fn drive_skip_child_to_done(dir: &Path, name: &str) {
+    let (ok, json, stderr) = run_koto(
+        dir,
+        &[
+            "next",
+            name,
+            "--no-cleanup",
+            "--with-data",
+            r#"{"marker": "done"}"#,
+        ],
+    );
+    assert!(
+        ok,
+        "drive child {} to done failed. stderr={} json={}",
+        name,
+        stderr,
+        serde_json::to_string_pretty(&json).unwrap_or_default()
+    );
+}
+
+/// Drive a skip-aware child through its `work` → `failed` path.
+fn drive_skip_child_to_fail(dir: &Path, name: &str) {
+    let (ok, json, stderr) = run_koto(
+        dir,
+        &[
+            "next",
+            name,
+            "--no-cleanup",
+            "--with-data",
+            r#"{"marker": "fail"}"#,
+        ],
+    );
+    assert!(
+        ok,
+        "drive child {} to fail failed. stderr={} json={}",
+        name,
+        stderr,
+        serde_json::to_string_pretty(&json).unwrap_or_default()
+    );
+}
+
+/// Return the path of a child's state file under the sessions base.
+fn child_state_path(dir: &Path, name: &str) -> PathBuf {
+    sessions_base(dir)
+        .join(name)
+        .join(format!("koto-{}.state.jsonl", name))
+}
+
+/// scenario-17: `ready_to_drive` gates worker dispatch. A linear batch
+/// A → B → C must report `ready_to_drive: true` only on children whose
+/// upstream deps are all terminal-success (or empty, for A). After
+/// tick 1 spawns A, B and C remain pending — they have no child file
+/// on disk and therefore `ready_to_drive: false`; A itself is Running
+/// with no deps, so `ready_to_drive: true`.
+#[test]
+fn scenario_17_ready_to_drive_gates_worker_dispatch() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_templates(tmp.path());
+
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "parent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "parent init failed: {}", stderr);
+
+    // Submit a linear three-task batch: only A is ready on tick 1.
+    let payload = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+            {"name": "B", "waits_on": ["A"], "vars": {}},
+            {"name": "C", "waits_on": ["B"], "vars": {}},
+        ]
+    });
+    let (_, json, _) = run_koto(
+        tmp.path(),
+        &["next", "parent", "--with-data", &payload.to_string()],
+    );
+    let sched = json.get("scheduler").expect("scheduler key attached");
+
+    // `reclassified_this_tick` is true when a spawn (or respawn) lands.
+    assert_eq!(
+        sched
+            .get("reclassified_this_tick")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "scheduler must report reclassified_this_tick=true on a tick that spawned A"
+    );
+
+    let ledger = sched
+        .get("materialized_children")
+        .and_then(|v| v.as_array())
+        .expect("materialized_children array present");
+    assert_eq!(ledger.len(), 3);
+
+    let by_name: std::collections::BTreeMap<String, &serde_json::Value> = ledger
+        .iter()
+        .map(|e| (e["name"].as_str().unwrap_or("").to_string(), e))
+        .collect();
+
+    // A is Running (just spawned) with no deps — ready_to_drive is
+    // true.
+    let a = by_name.get("parent.A").expect("parent.A in ledger");
+    assert_eq!(a["outcome"].as_str(), Some("running"));
+    assert_eq!(
+        a["ready_to_drive"].as_bool(),
+        Some(true),
+        "A has no deps and is Running; ready_to_drive must be true. got: {}",
+        a
+    );
+
+    // B depends on A, which is not terminal yet. ready_to_drive is
+    // false because (a) A is still Running and (b) B has no child
+    // file on disk.
+    let b = by_name.get("parent.B").expect("parent.B in ledger");
+    assert_eq!(b["outcome"].as_str(), Some("blocked"));
+    assert_eq!(
+        b["ready_to_drive"].as_bool(),
+        Some(false),
+        "B blocked on non-terminal A; ready_to_drive must be false. got: {}",
+        b
+    );
+
+    // C depends on B; same reasoning.
+    let c = by_name.get("parent.C").expect("parent.C in ledger");
+    assert_eq!(c["outcome"].as_str(), Some("blocked"));
+    assert_eq!(
+        c["ready_to_drive"].as_bool(),
+        Some(false),
+        "C blocked on non-terminal B; ready_to_drive must be false. got: {}",
+        c
+    );
+
+    // After driving A to done, the next tick spawns B. B now has a
+    // Running child file with a terminal-success upstream, so it
+    // reports ready_to_drive: true.
+    drive_child_to_done(tmp.path(), "parent.A");
+    let (_, json, _) = run_koto(tmp.path(), &["next", "parent"]);
+    let sched = json.get("scheduler").expect("scheduler key present");
+    let ledger = sched
+        .get("materialized_children")
+        .and_then(|v| v.as_array())
+        .expect("materialized_children array present");
+    let by_name: std::collections::BTreeMap<String, &serde_json::Value> = ledger
+        .iter()
+        .map(|e| (e["name"].as_str().unwrap_or("").to_string(), e))
+        .collect();
+    let a2 = by_name.get("parent.A").expect("A in ledger");
+    assert_eq!(a2["outcome"].as_str(), Some("success"));
+    // Terminal children are not dispatchable — they've already run.
+    assert_eq!(a2["ready_to_drive"].as_bool(), Some(false));
+    let b2 = by_name.get("parent.B").expect("B in ledger");
+    assert_eq!(b2["outcome"].as_str(), Some("running"));
+    assert_eq!(
+        b2["ready_to_drive"].as_bool(),
+        Some(true),
+        "B should be ready_to_drive now that A is terminal-success. got: {}",
+        b2
+    );
+}
+
+/// scenario-18: runtime reclassification — stale skip marker respawns
+/// as a real child when upstream no longer reports failure.
+///
+/// Sequence:
+/// 1. Submit batch {A, D (waits_on A)}.
+/// 2. Tick 1: A spawns.
+/// 3. Drive A → failed.
+/// 4. Tick 2: D spawns as skip marker (terminal, skipped_marker:
+///    true); classification of D is Skipped.
+/// 5. Manually delete A's state file (simulates a retry clearing the
+///    failed A so the stale-skip reclassification path can fire;
+///    `retry_failed` lands in Issue #14).
+/// 6. Tick 3: scheduler reclassifies. A respawns as a real child
+///    (currently no A on disk + all deps resolved trivially);
+///    reclassified_this_tick is true.
+/// 7. Drive A → done.
+/// 8. Tick 4: scheduler sees D as Skipped on disk but the ideal
+///    classification is Ready (A succeeded, no other deps). Delete-
+///    and-respawn D as a real child. reclassified_this_tick is true;
+///    D's ledger entry shows outcome: running.
+#[test]
+fn scenario_18_stale_skip_marker_respawns_as_real_child() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_skip_aware_templates(tmp.path());
+
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "parent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "parent init failed: {}", stderr);
+
+    // 1. Submit the batch: A has no deps; D waits on A.
+    let payload = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+            {"name": "D", "waits_on": ["A"], "vars": {}},
+        ]
+    });
+    let (_, json, _) = run_koto(
+        tmp.path(),
+        &["next", "parent", "--with-data", &payload.to_string()],
+    );
+    let sched = json.get("scheduler").expect("scheduler key attached");
+    let spawned: Vec<String> = sched["spawned_this_tick"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(spawned, vec!["parent.A".to_string()]);
+
+    // 2. Drive A to failed.
+    drive_skip_child_to_fail(tmp.path(), "parent.A");
+
+    // 3. Tick: D should spawn as a terminal skip marker.
+    let (_, json, _) = run_koto(tmp.path(), &["next", "parent"]);
+    let sched = json.get("scheduler").expect("scheduler key present");
+    let ledger = sched
+        .get("materialized_children")
+        .and_then(|v| v.as_array())
+        .expect("materialized_children present");
+    let by_name: std::collections::BTreeMap<String, &serde_json::Value> = ledger
+        .iter()
+        .map(|e| (e["name"].as_str().unwrap_or("").to_string(), e))
+        .collect();
+    let d = by_name.get("parent.D").expect("D in ledger");
+    assert_eq!(
+        d["outcome"].as_str(),
+        Some("skipped"),
+        "D should be skipped (A failed under skip_dependents). got: {}",
+        d
+    );
+
+    // Verify D's on-disk state file is a terminal skipped_marker state.
+    let d_state_path = child_state_path(tmp.path(), "parent.D");
+    let d_state_contents = std::fs::read_to_string(&d_state_path).unwrap();
+    assert!(
+        d_state_contents.contains("skipped_via_upstream_failure"),
+        "D's state file should route to the skipped_marker state. contents:\n{}",
+        d_state_contents
+    );
+
+    // 4. Simulate a successful retry of A: remove A's state file.
+    // `retry_failed` handling lands in Issue #14; here we simulate
+    // the post-retry state by deleting A directly.
+    let a_dir = sessions_base(tmp.path()).join("parent.A");
+    std::fs::remove_dir_all(&a_dir).unwrap();
+
+    // 5. Tick: scheduler should respawn A (no child on disk, no deps).
+    // The resubmission needs the same task list to re-enter the
+    // scheduler; since the scheduler runs every tick regardless of
+    // whether new evidence arrived, a bare `koto next parent` tick
+    // suffices.
+    let (_, json, _) = run_koto(tmp.path(), &["next", "parent"]);
+    let sched = json.get("scheduler").expect("scheduler key present");
+    let spawned: Vec<String> = sched["spawned_this_tick"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        spawned.contains(&"parent.A".to_string()),
+        "A must respawn as a real child after its state file was cleared. got: {:?}",
+        spawned
+    );
+    assert_eq!(
+        sched
+            .get("reclassified_this_tick")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "reclassified_this_tick=true when A respawns"
+    );
+
+    // 6. Drive A to done.
+    drive_skip_child_to_done(tmp.path(), "parent.A");
+
+    // 7. Tick: D is currently a terminal skip marker on disk but the
+    // ideal classification is Ready (A succeeded, no deps remain
+    // unmet). The scheduler must delete-and-respawn D as a real
+    // child. reclassified_this_tick is true.
+    let (_, json, _) = run_koto(tmp.path(), &["next", "parent"]);
+    let sched = json.get("scheduler").expect("scheduler key present");
+    assert_eq!(
+        sched
+            .get("reclassified_this_tick")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "reclassified_this_tick=true when D is respawned from stale skip marker"
+    );
+    let spawned: Vec<String> = sched["spawned_this_tick"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        spawned.contains(&"parent.D".to_string()),
+        "D must be respawned as a real child. got: {:?}",
+        spawned
+    );
+    let ledger = sched
+        .get("materialized_children")
+        .and_then(|v| v.as_array())
+        .expect("materialized_children present");
+    let by_name: std::collections::BTreeMap<String, &serde_json::Value> = ledger
+        .iter()
+        .map(|e| (e["name"].as_str().unwrap_or("").to_string(), e))
+        .collect();
+    let d2 = by_name.get("parent.D").expect("D in ledger");
+    assert_eq!(
+        d2["outcome"].as_str(),
+        Some("running"),
+        "D now has a running real child after respawn. got: {}",
+        d2
+    );
+
+    // D's on-disk state should now be the work state (initial state),
+    // not the skipped_marker state.
+    let d_state_contents = std::fs::read_to_string(&d_state_path).unwrap();
+    // The respawned D must carry a WorkflowInitialized event with the
+    // work-state target; the old skip-marker line is gone because
+    // init_state_file writes a fresh file.
+    assert!(
+        !d_state_contents.contains("skipped_via_upstream_failure"),
+        "After respawn, D's state file should no longer reference the skip-marker state. contents:\n{}",
+        d_state_contents
+    );
+}
+
+/// scenario-19: runtime reclassification — a running real-template
+/// child is respawned as a skip marker after its upstream flips to
+/// failure.
+///
+/// Sequence:
+/// 1. Submit batch {A, B (waits_on A)}.
+/// 2. Tick 1: A spawns.
+/// 3. Drive A → done (so B becomes Ready).
+/// 4. Tick 2: B spawns as a real child (Running, non-terminal).
+/// 5. Delete A's state file and replace it with a new one driven to
+///    failed state (simulates `rewind` + re-drive, which Issue #14
+///    will formalize).
+/// 6. Tick 3: scheduler sees B as Running on disk but the ideal
+///    classification is ShouldBeSkipped (A is now Failure under
+///    skip_dependents). Respawn B as a skip marker.
+#[test]
+fn scenario_19_running_child_respawns_as_skip_marker_after_upstream_fails() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_skip_aware_templates(tmp.path());
+
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "parent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "parent init failed: {}", stderr);
+
+    // 1. Submit the batch.
+    let payload = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+            {"name": "B", "waits_on": ["A"], "vars": {}},
+        ]
+    });
+    let (_, _, _) = run_koto(
+        tmp.path(),
+        &["next", "parent", "--with-data", &payload.to_string()],
+    );
+
+    // 2. Drive A to done.
+    drive_skip_child_to_done(tmp.path(), "parent.A");
+
+    // 3. Tick: B spawns as a real child (Running).
+    let (_, json, _) = run_koto(tmp.path(), &["next", "parent"]);
+    let sched = json.get("scheduler").expect("scheduler key present");
+    let spawned: Vec<String> = sched["spawned_this_tick"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(spawned, vec!["parent.B".to_string()]);
+
+    // Verify B's on-disk state is the work state, not the skip
+    // marker.
+    let b_state_path = child_state_path(tmp.path(), "parent.B");
+    let b_before = std::fs::read_to_string(&b_state_path).unwrap();
+    assert!(
+        !b_before.contains("skipped_via_upstream_failure"),
+        "B should start as a real child, not a skip marker"
+    );
+
+    // 4. Retroactively fail A: remove its state file and drive a
+    // fresh A to failed. Issue #14's `rewind`/`retry_failed` will
+    // provide a typed path for this; Issue #13 only needs the
+    // end-state to exercise the reclassification path.
+    let a_dir = sessions_base(tmp.path()).join("parent.A");
+    std::fs::remove_dir_all(&a_dir).unwrap();
+    // Tick the parent so A respawns.
+    let (_, json, _) = run_koto(tmp.path(), &["next", "parent"]);
+    let sched = json.get("scheduler").expect("scheduler key present");
+    let spawned: Vec<String> = sched["spawned_this_tick"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(spawned.contains(&"parent.A".to_string()));
+    drive_skip_child_to_fail(tmp.path(), "parent.A");
+
+    // 5. Tick: B is Running on disk but its upstream A is now
+    // Failure. Under skip_dependents (default), B's ideal
+    // classification is ShouldBeSkipped. The scheduler respawns B
+    // as a skip marker.
+    let (_, json, _) = run_koto(tmp.path(), &["next", "parent"]);
+    let sched = json.get("scheduler").expect("scheduler key present");
+    assert_eq!(
+        sched
+            .get("reclassified_this_tick")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "reclassified_this_tick=true when B is respawned as a skip marker"
+    );
+    let spawned: Vec<String> = sched["spawned_this_tick"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        spawned.contains(&"parent.B".to_string()),
+        "B must be respawned after upstream flipped to failure. got: {:?}",
+        spawned
+    );
+    let ledger = sched
+        .get("materialized_children")
+        .and_then(|v| v.as_array())
+        .expect("materialized_children present");
+    let by_name: std::collections::BTreeMap<String, &serde_json::Value> = ledger
+        .iter()
+        .map(|e| (e["name"].as_str().unwrap_or("").to_string(), e))
+        .collect();
+    let b = by_name.get("parent.B").expect("B in ledger");
+    assert_eq!(
+        b["outcome"].as_str(),
+        Some("skipped"),
+        "B's outcome is skipped after reclassification. got: {}",
+        b
+    );
+
+    // Verify B's on-disk state is now the skip marker.
+    let b_after = std::fs::read_to_string(&b_state_path).unwrap();
+    assert!(
+        b_after.contains("skipped_via_upstream_failure"),
+        "B's state file should route to the skipped_marker state after reclassification. \
+         contents:\n{}",
+        b_after
     );
 }

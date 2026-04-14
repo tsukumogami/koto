@@ -343,6 +343,69 @@ pub fn init_child_from_parent(
     cache: &mut TemplateCompileCache,
     spawn_entry: Option<SpawnEntrySnapshot>,
 ) -> Result<(), TaskSpawnError> {
+    init_child_core(
+        backend,
+        parent_name,
+        child_name,
+        template_path,
+        vars,
+        cache,
+        spawn_entry,
+        None,
+    )
+}
+
+/// Spawn a child directly into its terminal `skipped_marker: true`
+/// state. Used by the batch scheduler when a task's upstream dependency
+/// has failed and the batch `failure_policy` is `skip_dependents`
+/// (Decision 9 Part 5 — see DESIGN-batch-child-spawning.md:3615-3620).
+///
+/// The child's real template is still compiled (so `spawn_entry` values
+/// bind to the same variable space), but the initial `Transitioned`
+/// event routes straight to `skipped_state_name` rather than the
+/// template's `initial_state`. F5 (compile rule) guarantees every
+/// batch-eligible child template declares a reachable
+/// `skipped_marker: true` state; callers pass the skip state name they
+/// discovered when deciding to skip.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+pub fn init_child_as_skip_marker_from_parent(
+    backend: &dyn SessionBackend,
+    parent_name: Option<&str>,
+    child_name: &str,
+    template_path: &Path,
+    vars: &[String],
+    cache: &mut TemplateCompileCache,
+    spawn_entry: Option<SpawnEntrySnapshot>,
+    skipped_state_name: &str,
+) -> Result<(), TaskSpawnError> {
+    init_child_core(
+        backend,
+        parent_name,
+        child_name,
+        template_path,
+        vars,
+        cache,
+        spawn_entry,
+        Some(skipped_state_name),
+    )
+}
+
+/// Shared implementation. When `override_initial_state` is `Some`, the
+/// first `Transitioned` event routes to that state instead of the
+/// template's `initial_state`; this is the skip-marker spawn path.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+fn init_child_core(
+    backend: &dyn SessionBackend,
+    parent_name: Option<&str>,
+    child_name: &str,
+    template_path: &Path,
+    vars: &[String],
+    cache: &mut TemplateCompileCache,
+    spawn_entry: Option<SpawnEntrySnapshot>,
+    override_initial_state: Option<&str>,
+) -> Result<(), TaskSpawnError> {
     let cached = compile_with_cache(template_path, cache).map_err(|info| {
         let mut err = TaskSpawnError::new(child_name, info.kind, info.message);
         // Forward the resolved template path when resolution
@@ -372,7 +435,10 @@ pub fn init_child_from_parent(
             .with_path(cached.source_path.clone())
         })?;
 
-    let initial_state = cached.compiled.initial_state.clone();
+    let initial_state = match override_initial_state {
+        Some(s) => s.to_string(),
+        None => cached.compiled.initial_state.clone(),
+    };
     let ts = now_iso8601();
     let cache_path_str = cached.cache_path.to_string_lossy().to_string();
 
