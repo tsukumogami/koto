@@ -1148,6 +1148,7 @@ mod tests {
                 payload: EventPayload::WorkflowInitialized {
                     template_path: "/tmp/tpl.md".to_string(),
                     variables: std::collections::HashMap::new(),
+                    spawn_entry: None,
                 },
             },
             Event {
@@ -1226,6 +1227,7 @@ mod tests {
                     payload: EventPayload::WorkflowInitialized {
                         template_path: format!("/tmp/tpl-{}.md", i),
                         variables: std::collections::HashMap::new(),
+                        spawn_entry: None,
                     },
                 }];
                 bar.wait();

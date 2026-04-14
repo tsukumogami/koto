@@ -782,6 +782,7 @@ mod tests {
             payload: EventPayload::WorkflowInitialized {
                 template_path: "/tmp/tpl.md".to_string(),
                 variables: Default::default(),
+                spawn_entry: None,
             },
         }];
 
@@ -816,6 +817,7 @@ mod tests {
             payload: EventPayload::WorkflowInitialized {
                 template_path: "/tmp/tpl.md".to_string(),
                 variables: Default::default(),
+                spawn_entry: None,
             },
         }];
         backend
@@ -853,6 +855,7 @@ mod tests {
             payload: EventPayload::WorkflowInitialized {
                 template_path: "/tmp/tpl.md".to_string(),
                 variables: Default::default(),
+                spawn_entry: None,
             },
         }];
         backend.init_state_file("wf", header, events).unwrap();

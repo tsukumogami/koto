@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cache::compile_cached;
 use crate::cli::task_spawn_error::{SpawnErrorKind, TaskSpawnError};
-use crate::engine::types::{now_iso8601, Event, EventPayload, StateFileHeader};
+use crate::engine::types::{now_iso8601, Event, EventPayload, SpawnEntrySnapshot, StateFileHeader};
 use crate::session::{SessionBackend, SessionError};
 use crate::template::types::CompiledTemplate;
 
@@ -285,6 +285,12 @@ fn classify_session_error(task: &str, err: SessionError) -> TaskSpawnError {
 /// supplied [`TemplateCompileCache`], and resolves `vars` against the
 /// child template's variable declarations.
 ///
+/// `spawn_entry` is the canonical-form batch task entry (Decision 10 /
+/// 2 amendment). Callers that spawn a child on behalf of a batch
+/// scheduler pass `Some(..)` so later ticks can R8-compare against the
+/// recorded entry. The top-level `koto init` path and direct CLI
+/// callers pass `None` — no batch exists to compare against.
+///
 /// On success a single atomic `init_state_file` call commits the
 /// header plus the `WorkflowInitialized` and initial `Transitioned`
 /// events. Every failure path returns a [`TaskSpawnError`] whose
@@ -309,6 +315,7 @@ pub fn init_child_from_parent(
     template_path: &Path,
     vars: &[String],
     cache: &mut TemplateCompileCache,
+    spawn_entry: Option<SpawnEntrySnapshot>,
 ) -> Result<(), TaskSpawnError> {
     let cached = compile_with_cache(template_path, cache).map_err(|info| {
         TaskSpawnError::new(child_name, info.kind, info.message)
@@ -341,6 +348,7 @@ pub fn init_child_from_parent(
     let init_payload = EventPayload::WorkflowInitialized {
         template_path: cache_path_str,
         variables,
+        spawn_entry,
     };
     let transition_payload = EventPayload::Transitioned {
         from: None,
@@ -474,6 +482,7 @@ Done.
             payload: EventPayload::WorkflowInitialized {
                 template_path: "/tmp/unused.json".to_string(),
                 variables: HashMap::new(),
+                spawn_entry: None,
             },
         }];
         backend
@@ -499,6 +508,7 @@ Done.
             &template,
             &["TASK_ID=42".to_string()],
             &mut cache,
+            None,
         )
         .expect("init child");
 
@@ -549,6 +559,7 @@ Done.
             &template,
             &["TASK_ID=1".to_string()],
             &mut cache,
+            None,
         )
         .expect("first spawn");
 
@@ -559,6 +570,7 @@ Done.
             &template,
             &["TASK_ID=2".to_string()],
             &mut cache,
+            None,
         )
         .expect("second spawn");
 
@@ -587,6 +599,7 @@ Done.
             &template,
             &["TASK_ID=1".to_string()],
             &mut cache,
+            None,
         )
         .expect("first spawn");
 
@@ -598,6 +611,7 @@ Done.
             &template,
             &["TASK_ID=1".to_string()],
             &mut cache2,
+            None,
         )
         .expect_err("second spawn must collide");
 
@@ -622,6 +636,7 @@ Done.
             &missing,
             &[],
             &mut cache,
+            None,
         )
         .expect_err("missing template must error");
 
@@ -649,10 +664,11 @@ Done.
             &template,
             &["TASK_ID=1".to_string()],
             &mut cache,
+            None,
         )
         .expect("root init");
 
-        let (header, _events) = backend
+        let (header, events) = backend
             .read_events("root-workflow")
             .expect("read root events");
         assert_eq!(
@@ -660,5 +676,70 @@ Done.
             "root init must leave parent_workflow unset"
         );
         assert_eq!(header.workflow, "root-workflow");
+
+        // Top-level init (parent_name=None) must leave spawn_entry None
+        // on the WorkflowInitialized event — the snapshot is meaningful
+        // only when a batch scheduler populates it.
+        match &events[0].payload {
+            EventPayload::WorkflowInitialized { spawn_entry, .. } => assert!(
+                spawn_entry.is_none(),
+                "top-level koto init must leave spawn_entry None"
+            ),
+            other => panic!("expected WorkflowInitialized, got {:?}", other),
+        }
+    }
+
+    /// When the caller supplies a `spawn_entry` (the batch-scheduler
+    /// hot path), the helper must record it verbatim on the child's
+    /// `WorkflowInitialized` event so later ticks can R8-compare
+    /// against the snapshot.
+    #[test]
+    fn spawn_entry_is_persisted_on_workflow_initialized_event() {
+        use std::collections::BTreeMap;
+
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let tpl_dir = TempDir::new().expect("templates dir");
+        let backend = backend_in(sessions.path());
+        seed_parent(&backend, "parent");
+
+        let template = write_template(tpl_dir.path(), "child.md", SIMPLE_TEMPLATE);
+
+        let mut vars_map = BTreeMap::new();
+        vars_map.insert(
+            "TASK_ID".to_string(),
+            serde_json::Value::String("42".to_string()),
+        );
+        let snapshot = SpawnEntrySnapshot {
+            template: "child.md".to_string(),
+            vars: vars_map,
+            waits_on: vec!["sibling-a".to_string()],
+        };
+
+        let mut cache = TemplateCompileCache::new();
+        init_child_from_parent(
+            &backend,
+            Some("parent"),
+            "parent.child-snap",
+            &template,
+            &["TASK_ID=42".to_string()],
+            &mut cache,
+            Some(snapshot.clone()),
+        )
+        .expect("child init with snapshot");
+
+        let (_header, events) = backend
+            .read_events("parent.child-snap")
+            .expect("read child events");
+        match &events[0].payload {
+            EventPayload::WorkflowInitialized { spawn_entry, .. } => {
+                assert_eq!(
+                    spawn_entry.as_ref(),
+                    Some(&snapshot),
+                    "spawn_entry must round-trip through init_state_file"
+                );
+            }
+            other => panic!("expected WorkflowInitialized, got {:?}", other),
+        }
     }
 }

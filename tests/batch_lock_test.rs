@@ -52,6 +52,7 @@ fn init_backend(dir: &std::path::Path, id: &str) -> LocalBackend {
         payload: EventPayload::WorkflowInitialized {
             template_path: "/tmp/unused-template.json".to_string(),
             variables: std::collections::HashMap::new(),
+            spawn_entry: None,
         },
     }];
     backend

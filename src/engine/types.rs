@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Header line written as the first line of a state file.
 ///
@@ -24,6 +24,41 @@ pub struct StateFileHeader {
     pub parent_workflow: Option<String>,
 }
 
+/// Canonical-form snapshot of the batch task entry that spawned a
+/// child workflow.
+///
+/// Recorded on a child's `WorkflowInitialized` event at spawn time so
+/// later ticks can compare a fresh submission against the entry the
+/// child was actually created under (see Decision 10 / R8 spawn-time
+/// immutability). The snapshot captures exactly three fields — the
+/// resolved template path, the variable bindings, and the `waits_on`
+/// dependency list — in a deterministic shape:
+///
+/// * `template` is the canonical path string of the resolved
+///   template. For entries that inherited from the parent's
+///   `default_template`, this is the resolved value AS IT STOOD AT
+///   THE SPAWNING TICK (not a `None` inherited marker).
+/// * `vars` uses a [`BTreeMap`] so the serialized key order is
+///   lexicographic and stable — two snapshots with the same bindings
+///   serialize byte-identically, which is what R8 needs for
+///   spawn-time comparison.
+/// * `waits_on` preserves insertion order as it appeared in the
+///   submission.
+///
+/// The struct is only read/written via `WorkflowInitialized` events,
+/// never on its own row, so it does not need its own type_name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpawnEntrySnapshot {
+    /// Canonical template path as resolved at spawn time.
+    pub template: String,
+    /// Variable bindings in canonical (sorted) form.
+    #[serde(default)]
+    pub vars: BTreeMap<String, serde_json::Value>,
+    /// `waits_on` dependency list as submitted.
+    #[serde(default)]
+    pub waits_on: Vec<String>,
+}
+
 /// Type-specific payload for each event variant.
 ///
 /// Each variant's inner fields are serialized directly as the `payload`
@@ -36,6 +71,15 @@ pub enum EventPayload {
         template_path: String,
         #[serde(default)]
         variables: HashMap<String, String>,
+        /// Canonical-form task entry recorded when the workflow was
+        /// spawned by a batch scheduler (Decision 10 / 2 amendment).
+        /// `None` for top-level `koto init`; `Some` for children
+        /// materialized by `init_child_from_parent` with a parent.
+        ///
+        /// Additive field: `#[serde(default, skip_serializing_if = ...)]`
+        /// keeps pre-feature state files round-tripping unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spawn_entry: Option<SpawnEntrySnapshot>,
     },
     Transitioned {
         from: Option<String>,
@@ -181,6 +225,7 @@ impl<'de> Deserialize<'de> for Event {
                 EventPayload::WorkflowInitialized {
                     template_path: p.template_path,
                     variables: p.variables,
+                    spawn_entry: p.spawn_entry,
                 }
             }
             "transitioned" => {
@@ -298,6 +343,8 @@ struct WorkflowInitializedPayload {
     template_path: String,
     #[serde(default)]
     variables: HashMap<String, String>,
+    #[serde(default)]
+    spawn_entry: Option<SpawnEntrySnapshot>,
 }
 
 #[derive(Deserialize)]
@@ -563,6 +610,7 @@ mod tests {
             payload: EventPayload::WorkflowInitialized {
                 template_path: "path/to/template.json".to_string(),
                 variables: HashMap::new(),
+                spawn_entry: None,
             },
         };
         let json = serde_json::to_string(&e).unwrap();
@@ -571,6 +619,110 @@ mod tests {
         assert!(json.contains("\"template_path\":\"path/to/template.json\""));
         // payload should be flat (no variant wrapper)
         assert!(!json.contains("\"workflow_initialized\":{"));
+        // spawn_entry is omitted when None.
+        assert!(
+            !json.contains("spawn_entry"),
+            "spawn_entry must be omitted when None, got {}",
+            json
+        );
+    }
+
+    #[test]
+    fn workflow_initialized_without_spawn_entry_round_trip_omits_key() {
+        // Simulates a pre-feature WorkflowInitialized event that never
+        // carried a `spawn_entry` key. Parsing must succeed, and
+        // re-serializing must NOT add a `spawn_entry` key (the feature
+        // is additive and opt-in for batch-spawned children).
+        let json = r#"{"seq":1,"timestamp":"2026-01-01T00:00:00Z","type":"workflow_initialized","payload":{"template_path":"/cache/abc.json","variables":{}}}"#;
+        let parsed: Event = serde_json::from_str(json).expect("parse pre-feature event");
+        match &parsed.payload {
+            EventPayload::WorkflowInitialized { spawn_entry, .. } => {
+                assert!(
+                    spawn_entry.is_none(),
+                    "pre-feature event must deserialize with spawn_entry=None"
+                );
+            }
+            _ => panic!("expected WorkflowInitialized payload"),
+        }
+        let reserialized = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            !reserialized.contains("spawn_entry"),
+            "round-tripped pre-feature event must not introduce a spawn_entry key, got {}",
+            reserialized
+        );
+    }
+
+    #[test]
+    fn workflow_initialized_with_spawn_entry_round_trip() {
+        // With-snapshot path: a WorkflowInitialized event that carries a
+        // canonical-form `spawn_entry`. Must round-trip byte-for-byte and
+        // the serialized form must include the snapshot.
+        let snapshot = SpawnEntrySnapshot {
+            template: "impl-issue.md".to_string(),
+            vars: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "ISSUE_NUMBER".to_string(),
+                    serde_json::Value::String("303".to_string()),
+                );
+                m
+            },
+            waits_on: vec!["B".to_string()],
+        };
+        let e = Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: HashMap::new(),
+                spawn_entry: Some(snapshot.clone()),
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(
+            json.contains("\"spawn_entry\""),
+            "with-snapshot event must serialize a spawn_entry key, got {}",
+            json
+        );
+        assert!(json.contains("\"template\":\"impl-issue.md\""));
+        assert!(json.contains("\"ISSUE_NUMBER\":\"303\""));
+        assert!(json.contains("\"waits_on\":[\"B\"]"));
+
+        let parsed: Event = serde_json::from_str(&json).expect("parse with-snapshot event");
+        match &parsed.payload {
+            EventPayload::WorkflowInitialized { spawn_entry, .. } => {
+                assert_eq!(spawn_entry.as_ref(), Some(&snapshot));
+            }
+            _ => panic!("expected WorkflowInitialized payload"),
+        }
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn spawn_entry_snapshot_vars_serialize_in_sorted_order() {
+        // BTreeMap guarantees lexicographic key order on serialization.
+        // R8 spawn-time comparison depends on this so two snapshots
+        // with the same bindings produce byte-identical JSON.
+        let mut vars = BTreeMap::new();
+        vars.insert("ZEBRA".to_string(), serde_json::json!("z"));
+        vars.insert("APPLE".to_string(), serde_json::json!("a"));
+        vars.insert("MANGO".to_string(), serde_json::json!("m"));
+
+        let snapshot = SpawnEntrySnapshot {
+            template: "t.md".to_string(),
+            vars,
+            waits_on: vec![],
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let apple_pos = json.find("APPLE").expect("APPLE present");
+        let mango_pos = json.find("MANGO").expect("MANGO present");
+        let zebra_pos = json.find("ZEBRA").expect("ZEBRA present");
+        assert!(
+            apple_pos < mango_pos && mango_pos < zebra_pos,
+            "vars must serialize in sorted key order, got {}",
+            json
+        );
     }
 
     #[test]

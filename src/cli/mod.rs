@@ -1099,7 +1099,13 @@ fn handle_init(
     // across multiple `init_child_from_parent` invocations.
     let mut cache = TemplateCompileCache::new();
     let template_path = Path::new(template);
-    if let Err(err) = init_child_from_parent(backend, parent, name, template_path, vars, &mut cache)
+    // `None` for spawn_entry: the top-level `koto init` path (even with
+    // `--parent`) is a manual workflow creation, not a batch spawn. The
+    // R8 spawn-time immutability snapshot is populated only by the
+    // future batch scheduler, which calls this helper directly with
+    // `Some(..)`.
+    if let Err(err) =
+        init_child_from_parent(backend, parent, name, template_path, vars, &mut cache, None)
     {
         match err.kind {
             SpawnErrorKind::Collision => {
