@@ -369,10 +369,36 @@ Under normal operation, `koto next` auto-cleans on terminal state unless `--no-c
 ## koto session resolve (cloud backend only)
 
 ```
-koto session resolve <name> --keep <local|remote>
+koto session resolve <name> --keep <local|remote> [--children <auto|skip|accept-remote|accept-local>]
 ```
 
 Resolves a version conflict when using the cloud session backend. Only valid when `session.backend = "cloud"` is configured; fails with an error on the local backend.
+
+`--children` (default `auto`) controls how the parent's direct children reconcile alongside the parent log:
+
+| Value | Behavior |
+|---|---|
+| `auto` | Apply the strict-prefix rule per child: if one side is a byte-prefix of the other, the longer side wins. Divergent logs surface as a `conflict` entry and the command exits non-zero so the caller runs `koto session resolve <child>` on each flagged child. |
+| `skip` | Leave child state files untouched. The parent reconciles alone. |
+| `accept-remote` | Unconditionally overwrite local child state with remote. |
+| `accept-local` | Unconditionally overwrite remote child state with local. |
+
+Response shape (cloud backend only — `sync_status` and `machine_id` are elided under the local backend, which rejects the command anyway):
+
+```json
+{
+  "name": "parent",
+  "keep": "remote",
+  "children_policy": "auto",
+  "sync_status": "fresh",
+  "machine_id": "a1b2c3d4",
+  "children": [
+    {"name": "parent.task-1", "action": "identical"},
+    {"name": "parent.task-2", "action": "accepted_remote"},
+    {"name": "parent.task-3", "action": "conflict"}
+  ]
+}
+```
 
 ---
 

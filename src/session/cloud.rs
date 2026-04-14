@@ -22,6 +22,36 @@ use crate::session::local::{repo_id, LocalBackend};
 use crate::session::sync::{self, ManifestCache};
 use crate::session::{state_file_name, SessionBackend, SessionError, SessionInfo, SessionLock};
 
+/// Per-child outcome emitted by [`CloudBackend::reconcile_child`].
+///
+/// Each variant corresponds to a concrete action or a refusal, and is
+/// serialized into the JSON response body produced by `koto session
+/// resolve --children`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "action")]
+pub enum ChildResolution {
+    /// Local and remote were identical. No action taken.
+    Identical,
+    /// Remote bytes extended local via the strict-prefix rule; local
+    /// was updated (or the explicit `accept-remote` policy was used).
+    AcceptedRemote,
+    /// Local bytes extended remote via the strict-prefix rule; remote
+    /// was updated (or the explicit `accept-local` policy was used).
+    AcceptedLocal,
+    /// The `skip` policy was applied — neither side was touched.
+    Skipped,
+    /// Strict-prefix classification saw divergence on both sides. A
+    /// per-child `koto session resolve <child>` is required.
+    Conflict,
+    /// An I/O or network failure prevented reconciliation for this
+    /// child. Other children still process.
+    Errored {
+        /// Human-readable error describing why this child could not be
+        /// reconciled.
+        message: String,
+    },
+}
+
 /// S3-backed session storage that delegates to `LocalBackend` for all
 /// filesystem operations and syncs state to an S3-compatible bucket.
 ///
@@ -318,6 +348,166 @@ impl CloudBackend {
         }
 
         Ok(())
+    }
+
+    /// Read the local state file bytes for a session, if present.
+    fn read_local_state_bytes(&self, id: &str) -> Option<Vec<u8>> {
+        let path = self.local.session_dir(id).join(state_file_name(id));
+        std::fs::read(&path).ok()
+    }
+
+    /// Fetch the remote state file bytes for a session, if present.
+    /// Returns `None` on any non-success response or network failure so
+    /// callers can treat "remote absent" and "remote unreachable" the
+    /// same way (both yield the `OneSideMissing` outcome, surfaced as a
+    /// per-child warning rather than a hard failure).
+    fn fetch_remote_state_bytes(&self, id: &str) -> Option<Vec<u8>> {
+        let key = self.state_key(id);
+        let response = self.bucket.get_object(&key).ok()?;
+        if response.status_code() != 200 {
+            return None;
+        }
+        Some(response.bytes().to_vec())
+    }
+
+    /// Classify a reconciliation decision from already-fetched bytes.
+    ///
+    /// Split out of [`reconcile_child`] so tests can cover every branch
+    /// of the strict-prefix rule without needing a reachable S3
+    /// endpoint. The I/O-touching public method reads local and remote
+    /// bytes, then hands them to this pure classifier. Returns the
+    /// intended action (`Identical`, `AcceptedRemote`, `AcceptedLocal`,
+    /// `Skipped`, `Conflict`) or a placeholder `Errored { .. }` for
+    /// unknown policy strings. Callers still execute the action — this
+    /// function never touches disk or S3.
+    pub fn classify_reconciliation(
+        local: Option<&[u8]>,
+        remote: Option<&[u8]>,
+        policy: &str,
+    ) -> ChildResolution {
+        use crate::session::version::{strict_prefix_classify, StrictPrefixOutcome};
+
+        match policy {
+            "skip" => ChildResolution::Skipped,
+            "accept-remote" => match remote {
+                Some(_) => ChildResolution::AcceptedRemote,
+                None => ChildResolution::Errored {
+                    message: "remote state not found or unreachable".to_string(),
+                },
+            },
+            "accept-local" => match local {
+                Some(_) => ChildResolution::AcceptedLocal,
+                None => ChildResolution::Errored {
+                    message: "local state not found".to_string(),
+                },
+            },
+            "auto" => match strict_prefix_classify(local, remote) {
+                StrictPrefixOutcome::Identical => ChildResolution::Identical,
+                StrictPrefixOutcome::AcceptLocal => ChildResolution::AcceptedLocal,
+                StrictPrefixOutcome::AcceptRemote => ChildResolution::AcceptedRemote,
+                StrictPrefixOutcome::Conflict => ChildResolution::Conflict,
+                StrictPrefixOutcome::OneSideMissing => match (local.is_some(), remote.is_some()) {
+                    (true, false) => ChildResolution::AcceptedLocal,
+                    (false, true) => ChildResolution::AcceptedRemote,
+                    _ => ChildResolution::Identical,
+                },
+            },
+            other => ChildResolution::Errored {
+                message: format!("unknown children policy: '{}'", other),
+            },
+        }
+    }
+
+    /// Reconcile a single child's state file using the strict-prefix
+    /// rule and the provided policy, returning the action taken.
+    ///
+    /// Intended for use by `session resolve --children=<policy>`. The
+    /// parent's lock/version reconciliation happens in
+    /// `resolve_conflict`; this helper handles the per-child leg so
+    /// callers can iterate over the parent's direct children.
+    ///
+    /// `policy` maps directly to the `--children` flag:
+    /// * `"auto"` — apply the strict-prefix classification and act on
+    ///   the result. `Conflict` surfaces as `ChildResolution::Conflict`
+    ///   without touching either side.
+    /// * `"accept-remote"` — pull remote over local unconditionally.
+    /// * `"accept-local"` — push local over remote unconditionally.
+    /// * `"skip"` — return `ChildResolution::Skipped` without touching
+    ///   either side.
+    pub fn reconcile_child(&self, id: &str, policy: &str) -> ChildResolution {
+        let local = self.read_local_state_bytes(id);
+        let remote = self.fetch_remote_state_bytes(id);
+        let decision = Self::classify_reconciliation(local.as_deref(), remote.as_deref(), policy);
+
+        // Execute the classified action. `classify_reconciliation`
+        // returned the *intent*; this block performs the matching I/O.
+        // Any per-child I/O failure converts to `Errored` so sibling
+        // reconciliations still process.
+        match decision {
+            ChildResolution::Identical
+            | ChildResolution::Skipped
+            | ChildResolution::Conflict
+            | ChildResolution::Errored { .. } => decision,
+            ChildResolution::AcceptedRemote => match remote {
+                Some(bytes) => match self.write_local_state_bytes(id, &bytes) {
+                    Ok(()) => ChildResolution::AcceptedRemote,
+                    Err(e) => ChildResolution::Errored {
+                        message: format!("failed to write local state: {}", e),
+                    },
+                },
+                None => ChildResolution::Errored {
+                    message: "accept-remote classified but remote bytes were unavailable"
+                        .to_string(),
+                },
+            },
+            ChildResolution::AcceptedLocal => match self.push_local_state_bytes(id) {
+                Ok(()) => ChildResolution::AcceptedLocal,
+                Err(e) => ChildResolution::Errored {
+                    message: format!("failed to push local state: {}", e),
+                },
+            },
+        }
+    }
+
+    /// Overwrite the local state file with the given bytes, creating
+    /// the session directory if needed.
+    fn write_local_state_bytes(&self, id: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        let dir = self.local.session_dir(id);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(state_file_name(id));
+        std::fs::write(&path, bytes)?;
+        Ok(())
+    }
+
+    /// PUT the local state file to S3. Unlike `sync_push_state` this
+    /// surfaces a `Result` so the caller can distinguish success from
+    /// silent failure — `session resolve --children` needs the typed
+    /// outcome to report `accepted-local` vs `errored` per child.
+    fn push_local_state_bytes(&self, id: &str) -> anyhow::Result<()> {
+        let path = self.local.session_dir(id).join(state_file_name(id));
+        let data = std::fs::read(&path)
+            .with_context(|| format!("reading local state file: {}", path.display()))?;
+        let key = self.state_key(id);
+        self.put_object(&key, &data)
+    }
+
+    /// Return true if cloud sync is available for callers that want to
+    /// gate a feature (e.g., `sync_status` / `machine_id` response
+    /// fields) on the backend being `Cloud`.
+    #[inline]
+    pub fn is_cloud(&self) -> bool {
+        true
+    }
+
+    /// Best-effort probe: does this session's state file exist on S3?
+    ///
+    /// Used by `session resolve` to decide whether the post-resolve
+    /// parent state is `"fresh"` (local and remote both present after
+    /// reconciliation) or `"local_only"` (we wrote locally but S3 was
+    /// unreachable during the final push). Returns `false` on any
+    /// network or non-success response.
+    pub fn remote_state_exists(&self, id: &str) -> bool {
+        self.s3_session_exists(id)
     }
 
     /// Force-upload the entire local session directory to S3.
@@ -1105,5 +1295,147 @@ mod tests {
             &backend.manifest_cache,
         );
         assert!(result.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    //  scenario-29: classify_reconciliation covers the three non-conflict
+    //  auto paths plus the conflict path (Issue #19).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn classify_auto_local_extends_remote_is_accept_local() {
+        let remote = b"header\nevt1\n";
+        let local = b"header\nevt1\nevt2\n";
+        assert_eq!(
+            CloudBackend::classify_reconciliation(Some(local), Some(remote), "auto"),
+            ChildResolution::AcceptedLocal
+        );
+    }
+
+    #[test]
+    fn classify_auto_remote_extends_local_is_accept_remote() {
+        let local = b"header\nevt1\n";
+        let remote = b"header\nevt1\nevt2\n";
+        assert_eq!(
+            CloudBackend::classify_reconciliation(Some(local), Some(remote), "auto"),
+            ChildResolution::AcceptedRemote
+        );
+    }
+
+    #[test]
+    fn classify_auto_equal_is_identical() {
+        let bytes = b"header\nevt1\n";
+        assert_eq!(
+            CloudBackend::classify_reconciliation(Some(bytes), Some(bytes), "auto"),
+            ChildResolution::Identical
+        );
+    }
+
+    #[test]
+    fn classify_auto_divergent_is_conflict() {
+        let local = b"header\nevtA\n";
+        let remote = b"header\nevtB\n";
+        assert_eq!(
+            CloudBackend::classify_reconciliation(Some(local), Some(remote), "auto"),
+            ChildResolution::Conflict
+        );
+    }
+
+    #[test]
+    fn classify_skip_never_touches_bytes() {
+        let a = b"aaa";
+        let b = b"bbb";
+        // skip must ignore bytes entirely — divergent, identical, and
+        // missing all collapse to Skipped.
+        assert_eq!(
+            CloudBackend::classify_reconciliation(Some(a), Some(b), "skip"),
+            ChildResolution::Skipped
+        );
+        assert_eq!(
+            CloudBackend::classify_reconciliation(None, None, "skip"),
+            ChildResolution::Skipped
+        );
+    }
+
+    #[test]
+    fn classify_accept_remote_requires_remote_bytes() {
+        assert_eq!(
+            CloudBackend::classify_reconciliation(Some(b"l"), Some(b"r"), "accept-remote"),
+            ChildResolution::AcceptedRemote
+        );
+        assert!(matches!(
+            CloudBackend::classify_reconciliation(Some(b"l"), None, "accept-remote"),
+            ChildResolution::Errored { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_accept_local_requires_local_bytes() {
+        assert_eq!(
+            CloudBackend::classify_reconciliation(Some(b"l"), Some(b"r"), "accept-local"),
+            ChildResolution::AcceptedLocal
+        );
+        assert!(matches!(
+            CloudBackend::classify_reconciliation(None, Some(b"r"), "accept-local"),
+            ChildResolution::Errored { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_unknown_policy_errors() {
+        assert!(matches!(
+            CloudBackend::classify_reconciliation(Some(b"x"), Some(b"y"), "nonsense"),
+            ChildResolution::Errored { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_auto_one_side_missing_mirrors_the_other() {
+        assert_eq!(
+            CloudBackend::classify_reconciliation(Some(b"x"), None, "auto"),
+            ChildResolution::AcceptedLocal
+        );
+        assert_eq!(
+            CloudBackend::classify_reconciliation(None, Some(b"x"), "auto"),
+            ChildResolution::AcceptedRemote
+        );
+        assert_eq!(
+            CloudBackend::classify_reconciliation(None, None, "auto"),
+            ChildResolution::Identical
+        );
+    }
+
+    // ------------------------------------------------------------------
+    //  reconcile_child: skip policy is the only path that doesn't need
+    //  a reachable S3 endpoint. Other paths either depend on remote
+    //  bytes (which the test backend cannot fetch) or on pushing, which
+    //  the test backend cannot complete. For the full matrix see the
+    //  classify_* tests above.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn reconcile_child_skip_never_touches_files_or_network() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_cloud_backend(tmp.path());
+        write_state_file(tmp.path(), "child", "2026-01-01T00:00:00Z");
+        let before =
+            std::fs::read(tmp.path().join("child").join(state_file_name("child"))).unwrap();
+
+        let outcome = backend.reconcile_child("child", "skip");
+        assert_eq!(outcome, ChildResolution::Skipped);
+
+        let after = std::fs::read(tmp.path().join("child").join(state_file_name("child"))).unwrap();
+        assert_eq!(before, after, "skip policy must leave local bytes intact");
+    }
+
+    #[test]
+    fn reconcile_child_unknown_policy_errors() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_cloud_backend(tmp.path());
+        write_state_file(tmp.path(), "child", "2026-01-01T00:00:00Z");
+        assert!(matches!(
+            backend.reconcile_child("child", "garbage"),
+            ChildResolution::Errored { .. }
+        ));
     }
 }

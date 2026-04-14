@@ -246,7 +246,31 @@ pub enum SessionCommand {
         /// Which version to keep: "local" or "remote"
         #[arg(long)]
         keep: String,
+        /// Child reconciliation policy. Default `auto` applies the
+        /// strict-prefix rule to each child state file: if one side is
+        /// a byte-exact prefix of the other, the longer side wins; any
+        /// other divergence is reported as a conflict requiring a
+        /// per-child `koto session resolve`.
+        #[arg(long, value_enum, default_value_t = ChildrenPolicy::Auto)]
+        children: ChildrenPolicy,
     },
+}
+
+/// Policy for reconciling a parent's children during `session resolve`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ChildrenPolicy {
+    /// Apply the strict-prefix rule per child (accept the longer side
+    /// when one is a byte-prefix of the other), surface a conflict
+    /// otherwise.
+    Auto,
+    /// Leave child state files untouched.
+    Skip,
+    /// Overwrite local child state with remote.
+    #[clap(name = "accept-remote")]
+    AcceptRemote,
+    /// Overwrite remote child state with local.
+    #[clap(name = "accept-local")]
+    AcceptLocal,
 }
 
 #[derive(Subcommand)]
@@ -849,9 +873,11 @@ pub fn run(app: App) -> Result<()> {
                     );
                     Ok(())
                 }
-                SessionCommand::Resolve { name, keep } => {
-                    session::handle_resolve(&backend, &name, &keep)
-                }
+                SessionCommand::Resolve {
+                    name,
+                    keep,
+                    children,
+                } => session::handle_resolve(&backend, &name, &keep, children),
             }
         }
         Command::Context { subcommand } => {
