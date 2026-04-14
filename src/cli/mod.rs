@@ -2055,11 +2055,24 @@ fn handle_next(
     };
 
     // Build the children-complete gate evaluator closure. It captures the
-    // session backend to call list() and read_events() for child discovery.
+    // session backend to call list() and read_events() for child discovery,
+    // plus parent events / compiled template / current state so the
+    // extended gate output (Issue #15) can reason about batch task
+    // classifications (blocked/skipped attribution, derived booleans).
     let workflow_name_for_children = name.clone();
+    let compiled_for_children = compiled.clone();
+    let events_for_children = current_events.clone();
+    let current_state_for_children = machine_state.current_state.clone();
     let children_eval =
         move |gate: &crate::template::types::Gate| -> crate::gate::StructuredGateResult {
-            evaluate_children_complete(backend, &workflow_name_for_children, gate)
+            evaluate_children_complete(
+                backend,
+                &workflow_name_for_children,
+                &events_for_children,
+                &compiled_for_children,
+                &current_state_for_children,
+                gate,
+            )
         };
 
     let vars_for_gates = runtime_vars.clone();
@@ -2921,118 +2934,38 @@ fn handle_status(backend: &dyn SessionBackend, name: &str) -> Result<()> {
 fn evaluate_children_complete(
     backend: &dyn SessionBackend,
     workflow_name: &str,
+    parent_events: &[Event],
+    template: &CompiledTemplate,
+    current_state: &str,
     gate: &crate::template::types::Gate,
 ) -> crate::gate::StructuredGateResult {
     use crate::gate::{GateOutcome, StructuredGateResult};
 
-    let sessions = match backend.list() {
-        Ok(s) => s,
-        Err(e) => {
-            return StructuredGateResult {
-                outcome: GateOutcome::Error,
-                output: serde_json::json!({
-                    "total": 0,
-                    "completed": 0,
-                    "pending": 0,
-                    "all_complete": false,
-                    "children": [],
-                    "error": format!("failed to list sessions: {}", e)
-                }),
-            };
-        }
-    };
+    let (all_complete, output) = crate::cli::batch::build_children_complete_output(
+        backend,
+        workflow_name,
+        parent_events,
+        template,
+        current_state,
+        gate.name_filter.as_deref(),
+    );
 
-    // Filter to direct children of this workflow.
-    let mut children: Vec<_> = sessions
-        .into_iter()
-        .filter(|s| s.parent_workflow.as_deref() == Some(workflow_name))
-        .collect();
-
-    // Apply optional name_filter prefix.
-    if let Some(ref prefix) = gate.name_filter {
-        children.retain(|s| s.id.starts_with(prefix.as_str()));
-    }
-
-    // Zero children: fail (no vacuous pass).
-    if children.is_empty() {
-        return StructuredGateResult {
-            outcome: GateOutcome::Failed,
-            output: serde_json::json!({
-                "total": 0,
-                "completed": 0,
-                "pending": 0,
-                "all_complete": false,
-                "children": [],
-                "error": "no matching children found"
-            }),
-        };
-    }
-
-    let total = children.len();
-    let mut completed = 0usize;
-    let mut child_details = Vec::new();
-
-    for child in &children {
-        let (child_header, child_events) = match backend.read_events(&child.id) {
-            Ok(result) => result,
-            Err(_) => {
-                child_details.push(serde_json::json!({
-                    "name": child.id,
-                    "state": "",
-                    "complete": false
-                }));
-                continue;
-            }
-        };
-
-        let machine_state = derive_machine_state(&child_header, &child_events);
-        let current_state = machine_state
-            .as_ref()
-            .map(|ms| ms.current_state.as_str())
-            .unwrap_or("");
-
-        // Determine if the child is complete (terminal state).
-        let is_complete = if let Some(ref ms) = machine_state {
-            // Load the child's compiled template to check terminal status.
-            std::fs::read(&ms.template_path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<CompiledTemplate>(&bytes).ok())
-                .and_then(|tmpl| tmpl.states.get(&ms.current_state).map(|s| s.terminal))
-                .unwrap_or(false)
-        } else {
-            false
-        };
-
-        if is_complete {
-            completed += 1;
-        }
-
-        child_details.push(serde_json::json!({
-            "name": child.id,
-            "state": current_state,
-            "complete": is_complete
-        }));
-    }
-
-    let pending = total - completed;
-    let all_complete = pending == 0;
-    let outcome = if all_complete {
+    // Distinguish the `Error` outcome from the normal `Passed/Failed`
+    // path by checking for a non-empty error string when total == 0.
+    // The helper reports backend-list failures via a non-empty
+    // `error` plus `total: 0`; the empty-children case reports the
+    // "no matching children found" sentinel.
+    let error_str = output.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    let total = output.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+    let outcome = if total == 0 && error_str.starts_with("failed to list sessions") {
+        GateOutcome::Error
+    } else if all_complete {
         GateOutcome::Passed
     } else {
         GateOutcome::Failed
     };
 
-    StructuredGateResult {
-        outcome,
-        output: serde_json::json!({
-            "total": total,
-            "completed": completed,
-            "pending": pending,
-            "all_complete": all_complete,
-            "children": child_details,
-            "error": ""
-        }),
-    }
+    StructuredGateResult { outcome, output }
 }
 
 fn query_children(backend: &dyn SessionBackend, parent_name: &str) -> Vec<serde_json::Value> {

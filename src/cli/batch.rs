@@ -1195,6 +1195,549 @@ pub(crate) fn build_existing_children_snapshot(
     snapshot
 }
 
+// --------- children-complete gate output -----------------------------
+
+/// Per-child entry in the extended `children-complete` gate output.
+///
+/// Carries the outcome enum, derived attribution fields, and
+/// `reason_source` projection that agents use to route on batch
+/// outcomes. See DESIGN-batch-child-spawning.md Decision 5 and the
+/// `reason_source` projection section for the full schema.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChildGateEntry {
+    /// Full composed workflow name (`<parent>.<task>`).
+    pub name: String,
+    /// Current state of the child on disk, or empty when the task has
+    /// not yet been spawned.
+    pub state: String,
+    /// True when the child's current state is terminal.
+    pub complete: bool,
+    /// Per-child outcome. Matches [`TaskOutcome`] serialization: one of
+    /// `success | failure | skipped | pending | blocked | spawn_failed`.
+    pub outcome: TaskOutcome,
+    /// Failure mode string for failed children: `"state_name"` or
+    /// `"state_name:failure_reason"`. Omitted for non-failed outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_mode: Option<String>,
+    /// Direct upstream blocker name for skipped children. Omitted when
+    /// not skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_because: Option<String>,
+    /// Non-terminal `waits_on` entries that are keeping a blocked
+    /// child from spawning. Omitted when not blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<Vec<String>>,
+    /// Full attribution path for skipped children — unique failed
+    /// ancestors in topological order (closest-first, root-failure
+    /// last). Empty when not skipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_because_chain: Vec<String>,
+    /// Source of the failure/skip `reason` projection. One of
+    /// `failure_reason | state_name | skipped | not_spawned`. Omitted
+    /// for successful or non-terminal children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_source: Option<String>,
+}
+
+/// Build the extended `children-complete` gate output.
+///
+/// Classifies every submitted task (via the `materialize_children`
+/// hook) plus any on-disk child that matches the `parent.` prefix, then
+/// assembles the aggregate counts, derived booleans, and per-child
+/// entries. Returns a `serde_json::Value` ready to splice into the
+/// gate `output` field.
+///
+/// When the current state carries no `materialize_children` hook,
+/// falls back to the legacy shape: every on-disk child is classified
+/// from its template's `terminal` flag alone.
+#[allow(clippy::too_many_arguments)]
+pub fn build_children_complete_output(
+    backend: &dyn SessionBackend,
+    parent_name: &str,
+    events: &[Event],
+    template: &CompiledTemplate,
+    current_state: &str,
+    name_filter: Option<&str>,
+) -> (bool, serde_json::Value) {
+    // Resolve the materialize_children hook for the current state, if any.
+    let hook_opt: Option<&MaterializeChildrenSpec> = template
+        .states
+        .get(current_state)
+        .and_then(|s| s.materialize_children.as_ref());
+
+    // Pull the task list from the latest EvidenceSubmitted event for the
+    // state, if a hook is declared.
+    let tasks: Vec<TaskEntry> = match hook_opt {
+        Some(hook) => {
+            extract_tasks(events, current_state, hook.from_field.as_str()).unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+    let failure_policy = hook_opt
+        .map(|h| h.failure_policy)
+        .unwrap_or(FailurePolicy::SkipDependents);
+
+    // Snapshot every on-disk child of this parent, keyed by short task
+    // name (the piece after `parent.`). Used for both the task-driven
+    // classification path (hook present) and the fallback path
+    // (hook absent).
+    let mut on_disk: HashMap<String, ChildSnapshot> = HashMap::new();
+    let mut on_disk_order: Vec<String> = Vec::new();
+    // Map from short task name (post-`<parent>.` prefix) to the raw
+    // session id. Non-composed children (legacy `koto init --parent`
+    // without a batch hook) key both fields to the raw id.
+    let mut task_to_session_id: HashMap<String, String> = HashMap::new();
+    match backend.list() {
+        Ok(sessions) => {
+            let child_prefix = format!("{}.", parent_name);
+            for info in sessions {
+                if info.parent_workflow.as_deref() != Some(parent_name) {
+                    continue;
+                }
+                if let Some(filter) = name_filter {
+                    if !info.id.starts_with(filter) {
+                        continue;
+                    }
+                }
+                let task_name = if info.id.starts_with(&child_prefix) {
+                    info.id[child_prefix.len()..].to_string()
+                } else {
+                    info.id.clone()
+                };
+                task_to_session_id.insert(task_name.clone(), info.id.clone());
+                let (_, child_events) = match backend.read_events(&info.id) {
+                    Ok(x) => x,
+                    Err(_) => {
+                        // Treat unreadable child as a non-terminal placeholder.
+                        on_disk_order.push(task_name.clone());
+                        on_disk.insert(
+                            task_name,
+                            ChildSnapshot {
+                                current_state: String::new(),
+                                terminal: false,
+                                failure: false,
+                                skipped_marker: false,
+                                spawn_entry: None,
+                            },
+                        );
+                        continue;
+                    }
+                };
+                let current = derive_state_from_log(&child_events).unwrap_or_default();
+                let (terminal, failure, skipped_marker) =
+                    child_state_flags(&child_events, &current).unwrap_or((false, false, false));
+                let spawn_entry = child_events.iter().find_map(|e| match &e.payload {
+                    EventPayload::WorkflowInitialized { spawn_entry, .. } => spawn_entry.clone(),
+                    _ => None,
+                });
+                on_disk_order.push(task_name.clone());
+                on_disk.insert(
+                    task_name,
+                    ChildSnapshot {
+                        current_state: current,
+                        terminal,
+                        failure,
+                        skipped_marker,
+                        spawn_entry,
+                    },
+                );
+            }
+        }
+        Err(e) => {
+            return (
+                false,
+                serde_json::json!({
+                    "total": 0,
+                    "completed": 0,
+                    "pending": 0,
+                    "success": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                    "blocked": 0,
+                    "spawn_failed": 0,
+                    "all_complete": false,
+                    "all_success": false,
+                    "any_failed": false,
+                    "any_skipped": false,
+                    "any_spawn_failed": false,
+                    "needs_attention": false,
+                    "children": [],
+                    "error": format!("failed to list sessions: {}", e),
+                }),
+            );
+        }
+    }
+
+    // If we have a task list, classify each task in topological order
+    // and build per-task entries. Otherwise, fall back to the on-disk
+    // enumeration.
+    let (mut entries, error_message) = if !tasks.is_empty() {
+        build_entries_from_tasks(
+            &tasks,
+            &on_disk,
+            parent_name,
+            failure_policy,
+            events,
+            template,
+        )
+    } else if !on_disk_order.is_empty() {
+        (
+            build_entries_from_disk(&on_disk_order, &on_disk, &task_to_session_id),
+            String::new(),
+        )
+    } else {
+        (Vec::new(), "no matching children found".to_string())
+    };
+
+    // For the gate output, `Running` children are not a distinct
+    // outcome — the design's outcome enum is
+    // `success | failure | skipped | pending | blocked | spawn_failed`.
+    // Running children (spawned but not terminal) fold into `pending`
+    // so agents see a single "in-progress" bucket. The per-child
+    // `outcome` field projects Running → "pending" via the mapping
+    // below.
+    let total = entries.len();
+    let mut success = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
+    let mut pending = 0usize;
+    let mut blocked = 0usize;
+    let mut spawn_failed_count = 0usize;
+    for entry in &mut entries {
+        // Project Running → Pending for the wire-level outcome.
+        if matches!(entry.outcome, TaskOutcome::Running) {
+            entry.outcome = TaskOutcome::Pending;
+        }
+        match entry.outcome {
+            TaskOutcome::Success => success += 1,
+            TaskOutcome::Failure => failed += 1,
+            TaskOutcome::Skipped => skipped += 1,
+            TaskOutcome::Pending => pending += 1,
+            TaskOutcome::Blocked => blocked += 1,
+            TaskOutcome::SpawnFailed => spawn_failed_count += 1,
+            TaskOutcome::Running => unreachable!(),
+        }
+    }
+    let completed = success + failed + skipped;
+    let all_complete = total > 0 && pending == 0 && blocked == 0 && spawn_failed_count == 0;
+    let all_success = all_complete && failed == 0 && skipped == 0 && spawn_failed_count == 0;
+    let any_failed = failed > 0;
+    let any_skipped = skipped > 0;
+    let any_spawn_failed = spawn_failed_count > 0;
+    let needs_attention = any_failed || any_skipped || any_spawn_failed;
+
+    let children_json: Vec<serde_json::Value> = entries.iter().map(child_entry_to_json).collect();
+
+    (
+        all_complete,
+        serde_json::json!({
+            "total": total,
+            "completed": completed,
+            "pending": pending,
+            "success": success,
+            "failed": failed,
+            "skipped": skipped,
+            "blocked": blocked,
+            "spawn_failed": spawn_failed_count,
+            "all_complete": all_complete,
+            "all_success": all_success,
+            "any_failed": any_failed,
+            "any_skipped": any_skipped,
+            "any_spawn_failed": any_spawn_failed,
+            "needs_attention": needs_attention,
+            "children": children_json,
+            "error": error_message,
+        }),
+    )
+}
+
+/// Render a `ChildGateEntry` as a JSON object, omitting absent optional
+/// fields (matching the serde `skip_serializing_if` directives).
+fn child_entry_to_json(entry: &ChildGateEntry) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("name".to_string(), serde_json::json!(entry.name));
+    obj.insert("state".to_string(), serde_json::json!(entry.state));
+    obj.insert("complete".to_string(), serde_json::json!(entry.complete));
+    obj.insert(
+        "outcome".to_string(),
+        serde_json::to_value(entry.outcome).unwrap_or(serde_json::Value::Null),
+    );
+    if let Some(fm) = &entry.failure_mode {
+        obj.insert("failure_mode".to_string(), serde_json::json!(fm));
+    }
+    if let Some(sb) = &entry.skipped_because {
+        obj.insert("skipped_because".to_string(), serde_json::json!(sb));
+    }
+    if let Some(bb) = &entry.blocked_by {
+        obj.insert("blocked_by".to_string(), serde_json::json!(bb));
+    }
+    if !entry.skipped_because_chain.is_empty() {
+        obj.insert(
+            "skipped_because_chain".to_string(),
+            serde_json::json!(entry.skipped_because_chain),
+        );
+    }
+    if let Some(rs) = &entry.reason_source {
+        obj.insert("reason_source".to_string(), serde_json::json!(rs));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Classify every submitted task and build a `ChildGateEntry` for
+/// each. Preserves submission order so the gate output is deterministic.
+fn build_entries_from_tasks(
+    tasks: &[TaskEntry],
+    on_disk: &HashMap<String, ChildSnapshot>,
+    parent_name: &str,
+    failure_policy: FailurePolicy,
+    _parent_events: &[Event],
+    _template: &CompiledTemplate,
+) -> (Vec<ChildGateEntry>, String) {
+    let dag = build_dag(tasks);
+    let name_to_task: HashMap<&str, &TaskEntry> =
+        tasks.iter().map(|t| (t.name.as_str(), t)).collect();
+
+    // Step 1: classify in topological order so dependent tasks observe
+    // upstream outcomes.
+    let mut classifications: HashMap<String, TaskClassification> = HashMap::new();
+    for name in &dag.topological_order {
+        let task = match name_to_task.get(*name) {
+            Some(t) => *t,
+            None => continue,
+        };
+        let c = classify_task(task, on_disk.get(*name), &classifications, failure_policy);
+        classifications.insert(task.name.clone(), c);
+    }
+
+    // Step 2: for skipped-class tasks, walk waits_on upstream through
+    // failed/skipped ancestors so we can build skipped_because and the
+    // chain. Submission order matters for tie-breaks.
+    let submission_index: HashMap<&str, usize> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.name.as_str(), i))
+        .collect();
+
+    // Step 3: emit entries in submission order.
+    let mut entries = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let class = classifications
+            .get(task.name.as_str())
+            .cloned()
+            .unwrap_or(TaskClassification::BlockedByDep);
+        let outcome = class.to_outcome();
+        let composed = format!("{}.{}", parent_name, task.name);
+        let snap = on_disk.get(task.name.as_str());
+        let state = snap.map(|s| s.current_state.clone()).unwrap_or_default();
+        let complete = snap.map(|s| s.terminal).unwrap_or(false);
+
+        let mut entry = ChildGateEntry {
+            name: composed,
+            state,
+            complete,
+            outcome,
+            failure_mode: None,
+            skipped_because: None,
+            blocked_by: None,
+            skipped_because_chain: Vec::new(),
+            reason_source: None,
+        };
+
+        match outcome {
+            TaskOutcome::Failure => {
+                // failure_mode projection: state_name only (v1 does not
+                // peek into the child's failure_reason context key from
+                // the gate evaluator path).
+                if let Some(s) = snap {
+                    entry.failure_mode = Some(s.current_state.clone());
+                }
+                entry.reason_source = Some("state_name".to_string());
+            }
+            TaskOutcome::Skipped => {
+                let (direct, chain) = compute_skip_attribution(
+                    task,
+                    tasks,
+                    &classifications,
+                    &submission_index,
+                    parent_name,
+                );
+                entry.skipped_because = direct;
+                entry.skipped_because_chain = chain;
+                entry.reason_source = Some("skipped".to_string());
+            }
+            TaskOutcome::Blocked => {
+                // blocked_by lists the non-terminal waits_on entries.
+                let bb: Vec<String> = task
+                    .waits_on
+                    .iter()
+                    .filter(|dep| {
+                        !matches!(
+                            classifications.get(dep.as_str()),
+                            Some(
+                                TaskClassification::Success
+                                    | TaskClassification::Failure
+                                    | TaskClassification::Skipped
+                                    | TaskClassification::ShouldBeSkipped,
+                            )
+                        )
+                    })
+                    .map(|d| format!("{}.{}", parent_name, d))
+                    .collect();
+                if !bb.is_empty() {
+                    entry.blocked_by = Some(bb);
+                }
+            }
+            TaskOutcome::SpawnFailed => {
+                entry.reason_source = Some("not_spawned".to_string());
+            }
+            _ => {}
+        }
+
+        entries.push(entry);
+    }
+
+    (entries, String::new())
+}
+
+/// Walk `task.waits_on` upstream through failed/skipped ancestors to
+/// assemble the `skipped_because_chain` (closest-first). Also returns
+/// the earliest-in-submission-order failed ancestor for singular
+/// `skipped_because`.
+fn compute_skip_attribution(
+    task: &TaskEntry,
+    tasks: &[TaskEntry],
+    classifications: &HashMap<String, TaskClassification>,
+    submission_index: &HashMap<&str, usize>,
+    parent_name: &str,
+) -> (Option<String>, Vec<String>) {
+    // Collect all unique failed ancestors reachable via waits_on
+    // through failed/skipped nodes. BFS preserves closest-first order.
+    let name_to_task: HashMap<&str, &TaskEntry> =
+        tasks.iter().map(|t| (t.name.as_str(), t)).collect();
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut chain: Vec<String> = Vec::new();
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    for dep in &task.waits_on {
+        queue.push_back(dep.clone());
+    }
+    while let Some(name) = queue.pop_front() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let cls = classifications.get(name.as_str());
+        match cls {
+            Some(TaskClassification::Failure) => {
+                // Terminal failed ancestor — add to chain but do not
+                // continue past it (its own deps are not part of the
+                // skip attribution for this task).
+                chain.push(name.clone());
+            }
+            Some(TaskClassification::Skipped | TaskClassification::ShouldBeSkipped) => {
+                // Walk further: a skipped ancestor's own failed
+                // ancestors are the root causes we care about.
+                if let Some(upstream_task) = name_to_task.get(name.as_str()) {
+                    for dep in &upstream_task.waits_on {
+                        queue.push_back(dep.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Direct blocker — the waits_on entry of `task` that is itself
+    // failed or (transitively) skipped, selected by earliest submission
+    // order. This matches the design's `skipped_because` tie-break.
+    let mut direct: Option<String> = None;
+    let mut direct_idx: usize = usize::MAX;
+    for dep in &task.waits_on {
+        let cls = classifications.get(dep.as_str());
+        if matches!(
+            cls,
+            Some(
+                TaskClassification::Failure
+                    | TaskClassification::Skipped
+                    | TaskClassification::ShouldBeSkipped,
+            )
+        ) {
+            let idx = submission_index
+                .get(dep.as_str())
+                .copied()
+                .unwrap_or(usize::MAX);
+            if idx < direct_idx {
+                direct_idx = idx;
+                direct = Some(format!("{}.{}", parent_name, dep));
+            }
+        }
+    }
+
+    // Project the chain names to composed `<parent>.<name>` form.
+    let chain_composed: Vec<String> = chain
+        .into_iter()
+        .map(|n| format!("{}.{}", parent_name, n))
+        .collect();
+
+    (direct, chain_composed)
+}
+
+/// Fallback path: no `materialize_children` hook on the current state.
+/// Enumerate on-disk children directly and classify by template flags
+/// alone. Preserves the legacy `children-complete` shape for
+/// non-batch parents that rely on the gate.
+fn build_entries_from_disk(
+    order: &[String],
+    on_disk: &HashMap<String, ChildSnapshot>,
+    task_to_session_id: &HashMap<String, String>,
+) -> Vec<ChildGateEntry> {
+    let mut entries = Vec::with_capacity(order.len());
+    for task_name in order {
+        let Some(snap) = on_disk.get(task_name) else {
+            continue;
+        };
+        let outcome = if snap.terminal {
+            if snap.failure {
+                TaskOutcome::Failure
+            } else if snap.skipped_marker {
+                TaskOutcome::Skipped
+            } else {
+                TaskOutcome::Success
+            }
+        } else if snap.current_state.is_empty() {
+            TaskOutcome::Pending
+        } else {
+            TaskOutcome::Running
+        };
+        let session_id = task_to_session_id
+            .get(task_name)
+            .cloned()
+            .unwrap_or_else(|| task_name.clone());
+        let mut entry = ChildGateEntry {
+            name: session_id,
+            state: snap.current_state.clone(),
+            complete: snap.terminal,
+            outcome,
+            failure_mode: None,
+            skipped_because: None,
+            blocked_by: None,
+            skipped_because_chain: Vec::new(),
+            reason_source: None,
+        };
+        match outcome {
+            TaskOutcome::Failure => {
+                entry.failure_mode = Some(snap.current_state.clone());
+                entry.reason_source = Some("state_name".to_string());
+            }
+            TaskOutcome::Skipped => {
+                entry.reason_source = Some("skipped".to_string());
+            }
+            _ => {}
+        }
+        entries.push(entry);
+    }
+    entries
+}
+
 // --------- Tests ----------------------------------------------------
 
 #[cfg(test)]
@@ -1406,5 +1949,515 @@ mod tests {
         });
         compiled.states.insert("s".to_string(), state);
         assert!(state_has_materialize_children(&compiled, "s"));
+    }
+
+    // --- children-complete gate output (Issue #15) ---------------------
+    //
+    // The following tests exercise the new aggregate counters, derived
+    // booleans, per-child outcome projection, and skip-attribution via
+    // the internal helpers (`build_entries_from_tasks`,
+    // `build_entries_from_disk`) so they can run without a session
+    // backend. End-to-end coverage (backend.list → full JSON) lives in
+    // `tests/integration_test.rs`.
+
+    /// Build a synthesized `ChildSnapshot` for a given `TaskOutcome`-ish
+    /// state. Used by gate-output tests that don't need a real backend.
+    fn snap(
+        current_state: &str,
+        terminal: bool,
+        failure: bool,
+        skipped_marker: bool,
+    ) -> ChildSnapshot {
+        ChildSnapshot {
+            current_state: current_state.to_string(),
+            terminal,
+            failure,
+            skipped_marker,
+            spawn_entry: None,
+        }
+    }
+
+    /// Aggregate snapshot returned by [`aggregates`] for the gate
+    /// output tests below. Fields mirror the JSON gate output.
+    #[derive(Debug)]
+    struct GateAgg {
+        total: usize,
+        success: usize,
+        failed: usize,
+        skipped: usize,
+        pending: usize,
+        blocked: usize,
+        spawn_failed: usize,
+        all_complete: bool,
+        all_success: bool,
+        any_failed: bool,
+        any_skipped: bool,
+        any_spawn_failed: bool,
+        needs_attention: bool,
+    }
+
+    /// Compute aggregates + derived booleans the same way
+    /// `build_children_complete_output` does, given a pre-built list
+    /// of entries.
+    fn aggregates(entries: &mut [ChildGateEntry]) -> GateAgg {
+        let total = entries.len();
+        let mut success = 0;
+        let mut failed = 0;
+        let mut skipped = 0;
+        let mut pending = 0;
+        let mut blocked = 0;
+        let mut spawn_failed = 0;
+        for e in entries.iter_mut() {
+            if matches!(e.outcome, TaskOutcome::Running) {
+                e.outcome = TaskOutcome::Pending;
+            }
+            match e.outcome {
+                TaskOutcome::Success => success += 1,
+                TaskOutcome::Failure => failed += 1,
+                TaskOutcome::Skipped => skipped += 1,
+                TaskOutcome::Pending => pending += 1,
+                TaskOutcome::Blocked => blocked += 1,
+                TaskOutcome::SpawnFailed => spawn_failed += 1,
+                TaskOutcome::Running => unreachable!(),
+            }
+        }
+        let all_complete = total > 0 && pending == 0 && blocked == 0 && spawn_failed == 0;
+        let all_success = all_complete && failed == 0 && skipped == 0 && spawn_failed == 0;
+        let any_failed = failed > 0;
+        let any_skipped = skipped > 0;
+        let any_spawn_failed = spawn_failed > 0;
+        let needs_attention = any_failed || any_skipped || any_spawn_failed;
+        GateAgg {
+            total,
+            success,
+            failed,
+            skipped,
+            pending,
+            blocked,
+            spawn_failed,
+            all_complete,
+            all_success,
+            any_failed,
+            any_skipped,
+            any_spawn_failed,
+            needs_attention,
+        }
+    }
+
+    #[test]
+    fn gate_output_all_success_sets_all_complete_and_all_success() {
+        // Three tasks, all terminal-success on disk.
+        let tasks = vec![task("a", &[]), task("b", &[]), task("c", &[])];
+        let mut on_disk: HashMap<String, ChildSnapshot> = HashMap::new();
+        for name in ["a", "b", "c"] {
+            on_disk.insert(name.to_string(), snap("done", true, false, false));
+        }
+        let compiled = CompiledTemplate {
+            format_version: 1,
+            name: "p".to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            initial_state: "s".to_string(),
+            variables: BTreeMap::new(),
+            states: BTreeMap::new(),
+        };
+        let (mut entries, _err) = build_entries_from_tasks(
+            &tasks,
+            &on_disk,
+            "parent",
+            FailurePolicy::SkipDependents,
+            &[],
+            &compiled,
+        );
+        let agg = aggregates(&mut entries);
+        assert_eq!(agg.total, 3);
+        assert_eq!(agg.success, 3);
+        assert!(agg.all_complete);
+        assert!(agg.all_success);
+        assert!(!agg.any_failed);
+        assert!(!agg.needs_attention);
+        assert!(entries
+            .iter()
+            .all(|e| matches!(e.outcome, TaskOutcome::Success)));
+    }
+
+    #[test]
+    fn gate_output_mixed_success_failed_skipped_blocked() {
+        // Chain: a (success) -> b (failure) -> c (skipped, via b fail) ;
+        // plus d with waits_on=[e] where e is still running so d is
+        // blocked.
+        let tasks = vec![
+            task("a", &[]),
+            task("b", &["a"]),
+            task("c", &["b"]),
+            task("d", &["e"]),
+            task("e", &[]),
+        ];
+        let mut on_disk: HashMap<String, ChildSnapshot> = HashMap::new();
+        on_disk.insert("a".to_string(), snap("done", true, false, false));
+        on_disk.insert("b".to_string(), snap("failed", true, true, false));
+        // c and d not spawned yet; e is running (non-terminal).
+        on_disk.insert("e".to_string(), snap("work", false, false, false));
+
+        let compiled = CompiledTemplate {
+            format_version: 1,
+            name: "p".to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            initial_state: "s".to_string(),
+            variables: BTreeMap::new(),
+            states: BTreeMap::new(),
+        };
+        let (mut entries, _) = build_entries_from_tasks(
+            &tasks,
+            &on_disk,
+            "parent",
+            FailurePolicy::SkipDependents,
+            &[],
+            &compiled,
+        );
+        let agg = aggregates(&mut entries);
+        // total=5: a success, b failure, c ShouldBeSkipped → skipped,
+        // d blocked (waits on Running e), e Running → pending.
+        assert_eq!(agg.total, 5);
+        assert_eq!(agg.success, 1, "success");
+        assert_eq!(agg.failed, 1, "failed");
+        assert_eq!(agg.skipped, 1, "skipped");
+        assert_eq!(agg.pending, 1, "pending (running e folds in)");
+        assert_eq!(agg.blocked, 1, "blocked (d)");
+        assert_eq!(agg.spawn_failed, 0, "spawn_failed");
+        assert!(
+            !agg.all_complete,
+            "all_complete should be false (pending/blocked)"
+        );
+        assert!(
+            !agg.all_success,
+            "all_success should be false (has failures)"
+        );
+        assert!(agg.any_failed, "any_failed");
+        assert!(agg.any_skipped, "any_skipped");
+        assert!(!agg.any_spawn_failed, "any_spawn_failed");
+        assert!(agg.needs_attention, "needs_attention");
+    }
+
+    #[test]
+    fn gate_output_spawn_failed_blocks_all_complete() {
+        // Synthesize an entry with TaskOutcome::SpawnFailed directly
+        // (the classification path doesn't naturally produce it — the
+        // scheduler does — but the aggregator must treat it correctly).
+        let mut entries = vec![
+            ChildGateEntry {
+                name: "parent.a".to_string(),
+                state: "done".to_string(),
+                complete: true,
+                outcome: TaskOutcome::Success,
+                failure_mode: None,
+                skipped_because: None,
+                blocked_by: None,
+                skipped_because_chain: Vec::new(),
+                reason_source: None,
+            },
+            ChildGateEntry {
+                name: "parent.b".to_string(),
+                state: String::new(),
+                complete: false,
+                outcome: TaskOutcome::SpawnFailed,
+                failure_mode: None,
+                skipped_because: None,
+                blocked_by: None,
+                skipped_because_chain: Vec::new(),
+                reason_source: Some("not_spawned".to_string()),
+            },
+        ];
+        let agg = aggregates(&mut entries);
+        assert_eq!(agg.spawn_failed, 1, "spawn_failed count");
+        assert!(
+            !agg.all_complete,
+            "all_complete must be false when spawn_failed > 0"
+        );
+        assert!(agg.any_spawn_failed, "any_spawn_failed");
+        assert!(
+            agg.needs_attention,
+            "needs_attention folds in any_spawn_failed"
+        );
+    }
+
+    #[test]
+    fn gate_output_needs_attention_on_any_failed() {
+        let mut entries = vec![
+            ChildGateEntry {
+                name: "parent.a".to_string(),
+                state: "done".to_string(),
+                complete: true,
+                outcome: TaskOutcome::Success,
+                failure_mode: None,
+                skipped_because: None,
+                blocked_by: None,
+                skipped_because_chain: Vec::new(),
+                reason_source: None,
+            },
+            ChildGateEntry {
+                name: "parent.b".to_string(),
+                state: "failed".to_string(),
+                complete: true,
+                outcome: TaskOutcome::Failure,
+                failure_mode: Some("failed".to_string()),
+                skipped_because: None,
+                blocked_by: None,
+                skipped_because_chain: Vec::new(),
+                reason_source: Some("state_name".to_string()),
+            },
+        ];
+        let agg = aggregates(&mut entries);
+        assert!(agg.all_complete, "all_complete true (all terminal)");
+        assert!(!agg.all_success, "all_success false (one failed)");
+        assert!(agg.any_failed, "any_failed");
+        assert!(agg.needs_attention, "needs_attention");
+    }
+
+    #[test]
+    fn gate_output_diamond_skip_chain_collects_both_failed_ancestors() {
+        // Submission order: A, B, C, D, E.
+        //   A -> C, B -> D, C -> E, D -> E.
+        // A fails, B fails (earliest-in-submission-order is A, but E's
+        // direct waits_on are C and D — both skipped because of
+        // failed ancestors A/B). The chain for E must contain both
+        // A and B (unique failed ancestors) in topological order.
+        let tasks = vec![
+            task("A", &[]),
+            task("B", &[]),
+            task("C", &["A"]),
+            task("D", &["B"]),
+            task("E", &["C", "D"]),
+        ];
+        let mut on_disk: HashMap<String, ChildSnapshot> = HashMap::new();
+        on_disk.insert("A".to_string(), snap("failed", true, true, false));
+        on_disk.insert("B".to_string(), snap("failed", true, true, false));
+        let compiled = CompiledTemplate {
+            format_version: 1,
+            name: "p".to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            initial_state: "s".to_string(),
+            variables: BTreeMap::new(),
+            states: BTreeMap::new(),
+        };
+        let (entries, _) = build_entries_from_tasks(
+            &tasks,
+            &on_disk,
+            "parent",
+            FailurePolicy::SkipDependents,
+            &[],
+            &compiled,
+        );
+        let e_entry = entries
+            .iter()
+            .find(|e| e.name == "parent.E")
+            .expect("E entry present");
+        assert!(matches!(e_entry.outcome, TaskOutcome::Skipped));
+        // Both root failures A and B appear in the chain.
+        assert!(
+            e_entry
+                .skipped_because_chain
+                .contains(&"parent.A".to_string()),
+            "chain must contain parent.A: {:?}",
+            e_entry.skipped_because_chain
+        );
+        assert!(
+            e_entry
+                .skipped_because_chain
+                .contains(&"parent.B".to_string()),
+            "chain must contain parent.B: {:?}",
+            e_entry.skipped_because_chain
+        );
+        assert_eq!(e_entry.reason_source.as_deref(), Some("skipped"));
+    }
+
+    #[test]
+    fn gate_output_blocked_by_lists_non_terminal_deps() {
+        // a is not terminal (still running); b depends on a; b should
+        // be Blocked with blocked_by = ["parent.a"].
+        let tasks = vec![task("a", &[]), task("b", &["a"])];
+        let mut on_disk: HashMap<String, ChildSnapshot> = HashMap::new();
+        on_disk.insert("a".to_string(), snap("work", false, false, false));
+        let compiled = CompiledTemplate {
+            format_version: 1,
+            name: "p".to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            initial_state: "s".to_string(),
+            variables: BTreeMap::new(),
+            states: BTreeMap::new(),
+        };
+        let (entries, _) = build_entries_from_tasks(
+            &tasks,
+            &on_disk,
+            "parent",
+            FailurePolicy::SkipDependents,
+            &[],
+            &compiled,
+        );
+        let b = entries
+            .iter()
+            .find(|e| e.name == "parent.b")
+            .expect("b entry present");
+        assert!(matches!(b.outcome, TaskOutcome::Blocked));
+        assert_eq!(
+            b.blocked_by.as_deref(),
+            Some(&["parent.a".to_string()][..]),
+            "blocked_by names the composed upstream"
+        );
+    }
+
+    #[test]
+    fn gate_output_skipped_because_direct_vs_chain_distinction() {
+        // A → B → C. A fails, B skipped, C skipped.
+        // - B: skipped_because = parent.A, chain = [parent.A].
+        // - C: skipped_because = parent.B (direct), chain contains
+        //   parent.A (root failure ancestor).
+        let tasks = vec![task("A", &[]), task("B", &["A"]), task("C", &["B"])];
+        let mut on_disk: HashMap<String, ChildSnapshot> = HashMap::new();
+        on_disk.insert("A".to_string(), snap("failed", true, true, false));
+        let compiled = CompiledTemplate {
+            format_version: 1,
+            name: "p".to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            initial_state: "s".to_string(),
+            variables: BTreeMap::new(),
+            states: BTreeMap::new(),
+        };
+        let (entries, _) = build_entries_from_tasks(
+            &tasks,
+            &on_disk,
+            "parent",
+            FailurePolicy::SkipDependents,
+            &[],
+            &compiled,
+        );
+        let b = entries
+            .iter()
+            .find(|e| e.name == "parent.B")
+            .expect("B entry present");
+        assert_eq!(b.skipped_because.as_deref(), Some("parent.A"));
+        assert_eq!(b.skipped_because_chain, vec!["parent.A".to_string()]);
+
+        let c = entries
+            .iter()
+            .find(|e| e.name == "parent.C")
+            .expect("C entry present");
+        // Direct blocker is B (the waits_on of C), but the chain
+        // walks through the skipped B to reach the root failure A.
+        assert_eq!(c.skipped_because.as_deref(), Some("parent.B"));
+        assert!(
+            c.skipped_because_chain.contains(&"parent.A".to_string()),
+            "chain walks upstream through skipped ancestors to the root failure: {:?}",
+            c.skipped_because_chain
+        );
+    }
+
+    #[test]
+    fn gate_output_reason_source_vocabulary_complete() {
+        // Each of the four reason_source enum values lands in at least
+        // one per-child entry under the right conditions.
+        // - failed: state_name
+        // - skipped: skipped
+        // - spawn_failed: not_spawned
+        // - (failure_reason variant is populated by the scheduler/
+        //   batch view path, not the gate-output path in v1; the
+        //   vocabulary is pinned by the design so agents can route on
+        //   it deterministically.)
+        let entry_state_name = ChildGateEntry {
+            name: "p.a".to_string(),
+            state: "failed".to_string(),
+            complete: true,
+            outcome: TaskOutcome::Failure,
+            failure_mode: Some("failed".to_string()),
+            skipped_because: None,
+            blocked_by: None,
+            skipped_because_chain: Vec::new(),
+            reason_source: Some("state_name".to_string()),
+        };
+        let entry_skipped = ChildGateEntry {
+            name: "p.b".to_string(),
+            state: "skipped".to_string(),
+            complete: true,
+            outcome: TaskOutcome::Skipped,
+            failure_mode: None,
+            skipped_because: Some("p.a".to_string()),
+            blocked_by: None,
+            skipped_because_chain: vec!["p.a".to_string()],
+            reason_source: Some("skipped".to_string()),
+        };
+        let entry_not_spawned = ChildGateEntry {
+            name: "p.c".to_string(),
+            state: String::new(),
+            complete: false,
+            outcome: TaskOutcome::SpawnFailed,
+            failure_mode: None,
+            skipped_because: None,
+            blocked_by: None,
+            skipped_because_chain: Vec::new(),
+            reason_source: Some("not_spawned".to_string()),
+        };
+        for (entry, want) in [
+            (&entry_state_name, "state_name"),
+            (&entry_skipped, "skipped"),
+            (&entry_not_spawned, "not_spawned"),
+        ] {
+            let json = child_entry_to_json(entry);
+            assert_eq!(
+                json["reason_source"].as_str(),
+                Some(want),
+                "reason_source projection for {}",
+                entry.name
+            );
+        }
+        // The failure_reason variant is a documented value the scheduler
+        // path emits; verify its JSON round-trip through ChildGateEntry.
+        let entry_failure_reason = ChildGateEntry {
+            reason_source: Some("failure_reason".to_string()),
+            ..entry_state_name.clone()
+        };
+        let j = child_entry_to_json(&entry_failure_reason);
+        assert_eq!(j["reason_source"].as_str(), Some("failure_reason"));
+    }
+
+    #[test]
+    fn task_outcome_spawn_failed_round_trip() {
+        // Issue #15 AC3: ChildOutcome/TaskOutcome enum round-trips
+        // `spawn_failed` through serde.
+        let outcome = TaskOutcome::SpawnFailed;
+        let s = serde_json::to_string(&outcome).unwrap();
+        assert_eq!(s, "\"spawn_failed\"");
+        let back: TaskOutcome = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, TaskOutcome::SpawnFailed);
+    }
+
+    #[test]
+    fn gate_output_fallback_from_disk_no_hook() {
+        // With no hook (no task list), children are enumerated from
+        // disk. Non-terminal children project to Pending (legacy
+        // behavior); terminal-success to Success; failure/skipped
+        // templates to Failure/Skipped.
+        let order = vec!["x".to_string(), "y".to_string(), "z".to_string()];
+        let mut on_disk: HashMap<String, ChildSnapshot> = HashMap::new();
+        on_disk.insert("x".to_string(), snap("done", true, false, false));
+        on_disk.insert("y".to_string(), snap("failed", true, true, false));
+        on_disk.insert("z".to_string(), snap("work", false, false, false));
+        let task_to_session: HashMap<String, String> =
+            order.iter().map(|n| (n.clone(), n.clone())).collect();
+        let entries = build_entries_from_disk(&order, &on_disk, &task_to_session);
+        assert_eq!(entries.len(), 3);
+        let x = entries.iter().find(|e| e.name == "x").unwrap();
+        assert!(matches!(x.outcome, TaskOutcome::Success));
+        let y = entries.iter().find(|e| e.name == "y").unwrap();
+        assert!(matches!(y.outcome, TaskOutcome::Failure));
+        assert_eq!(y.failure_mode.as_deref(), Some("failed"));
+        assert_eq!(y.reason_source.as_deref(), Some("state_name"));
+        let z = entries.iter().find(|e| e.name == "z").unwrap();
+        // Running collapses to Pending in the wire-level aggregation
+        // step; the pre-aggregation outcome is Running here.
+        assert!(matches!(z.outcome, TaskOutcome::Running));
     }
 }

@@ -143,7 +143,7 @@ koto next <name>
 
 The overridden gate is now treated as passed.
 
-For `children-complete` gates, the override pretends all children are done (the default value is `{"total":0, "completed":0, "pending":0, "all_complete":true, "children":[], "error":""}`). Use this when you know children are finished but the gate hasn't picked it up, or when you need to proceed regardless.
+For `children-complete` gates, the override pretends all children are done. The default value mirrors the extended gate output schema: all aggregate counters are zero, `all_complete` and `all_success` are `true`, the `any_*` and `needs_attention` booleans are `false`, and `children` is empty. Use this when you know children are finished but the gate hasn't picked it up, or when you need to proceed regardless.
 
 When `agent_actionable` is `false`, the gate has no override mechanism. Don't call `koto overrides record` for it — the command will fail. Escalate to the user instead.
 
@@ -216,21 +216,43 @@ koto context get <child-name> <key>
 
 ### Temporal blocking
 
-When a parent has a `children-complete` gate, `koto next` returns `gate_blocked` or `evidence_required` with a blocking condition whose `category` is `"temporal"`. The `output` field shows per-child status:
+When a parent has a `children-complete` gate, `koto next` returns `gate_blocked` or `evidence_required` with a blocking condition whose `category` is `"temporal"`. The `output` field carries aggregate counters, derived booleans, and per-child entries:
 
 ```json
 {
-  "total": 3, "completed": 2, "pending": 1, "all_complete": false,
+  "total": 3,
+  "completed": 2,
+  "pending": 1,
+  "success": 2,
+  "failed": 0,
+  "skipped": 0,
+  "blocked": 0,
+  "spawn_failed": 0,
+  "all_complete": false,
+  "all_success": false,
+  "any_failed": false,
+  "any_skipped": false,
+  "any_spawn_failed": false,
+  "needs_attention": false,
   "children": [
-    {"name": "plan.issue-1", "state": "done", "complete": true},
-    {"name": "plan.issue-2", "state": "done", "complete": true},
-    {"name": "plan.issue-3", "state": "implement", "complete": false}
+    {"name": "plan.issue-1", "state": "done", "complete": true, "outcome": "success"},
+    {"name": "plan.issue-2", "state": "done", "complete": true, "outcome": "success"},
+    {"name": "plan.issue-3", "state": "implement", "complete": false, "outcome": "pending"}
   ],
   "error": ""
 }
 ```
 
-Temporal blocks resolve on their own — children will finish without your intervention. Poll `koto next` periodically rather than trying to fix anything. Once all children reach their completion condition, the gate passes and the parent advances.
+Route on the derived booleans rather than raw counts:
+
+- `all_complete` — `pending == 0 AND blocked == 0 AND spawn_failed == 0`. Passes the gate.
+- `all_success` — every child finished successfully; the clean "no retries needed" branch.
+- `any_failed`, `any_skipped`, `any_spawn_failed` — individual signals for templates that need finer control.
+- `needs_attention` — `any_failed OR any_skipped OR any_spawn_failed`. One boolean routes the parent into its retry/escalation branch.
+
+Per-child entries carry an `outcome` enum (`success | failure | skipped | pending | blocked | spawn_failed`). Failed children include a `failure_mode` string; skipped children include a `skipped_because` name and `skipped_because_chain` listing the failed ancestors; blocked children include `blocked_by` with the non-terminal `waits_on` names. A `reason_source` field (`failure_reason | state_name | skipped | not_spawned`) tells agents where the failure explanation came from.
+
+Temporal blocks with `needs_attention: false` resolve on their own — poll `koto next` periodically. When `needs_attention: true` the parent's template typically routes to a retry or analysis state.
 
 ### Advisory lifecycle
 

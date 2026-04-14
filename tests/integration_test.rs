@@ -7098,6 +7098,101 @@ fn children_complete_category_temporal_in_output() {
     assert_eq!(conditions[0]["category"], "temporal");
 }
 
+/// Issue #15 snapshot test: pins the extended `children-complete` gate
+/// output shape for a non-batch parent with a single pending child.
+///
+/// This locks the aggregate counters + derived booleans surface so a
+/// future change to the gate output schema is caught as a breaking
+/// change rather than silently drifting behind the design.
+#[test]
+fn children_complete_gate_output_snapshot_extended_fields() {
+    let dir = TempDir::new().unwrap();
+    let parent_compiled = write_and_compile_template(
+        dir.path(),
+        parent_with_children_gate_template(),
+        "parent.md",
+    );
+    let child_compiled = write_template_source(dir.path())
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    koto_cmd(dir.path())
+        .args(["init", "parent-wf", "--template", &parent_compiled])
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-1",
+            "--template",
+            &child_compiled,
+            "--parent",
+            "parent-wf",
+        ])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "parent-wf"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let conditions = json["blocking_conditions"].as_array().unwrap();
+    let gate_output = &conditions[0]["output"];
+
+    // Pin the schema: every aggregate + derived boolean is present.
+    for key in [
+        "total",
+        "completed",
+        "pending",
+        "success",
+        "failed",
+        "skipped",
+        "blocked",
+        "spawn_failed",
+        "all_complete",
+        "all_success",
+        "any_failed",
+        "any_skipped",
+        "any_spawn_failed",
+        "needs_attention",
+        "children",
+        "error",
+    ] {
+        assert!(
+            gate_output.get(key).is_some(),
+            "gate output missing field '{}': {}",
+            key,
+            serde_json::to_string_pretty(gate_output).unwrap()
+        );
+    }
+
+    // Value-level assertions for the "one pending child" scenario.
+    assert_eq!(gate_output["total"], 1);
+    assert_eq!(gate_output["success"], 0);
+    assert_eq!(gate_output["failed"], 0);
+    assert_eq!(gate_output["skipped"], 0);
+    assert_eq!(gate_output["blocked"], 0);
+    assert_eq!(gate_output["spawn_failed"], 0);
+    assert_eq!(gate_output["pending"], 1);
+    assert_eq!(gate_output["all_complete"], false);
+    assert_eq!(gate_output["all_success"], false);
+    assert_eq!(gate_output["any_failed"], false);
+    assert_eq!(gate_output["any_skipped"], false);
+    assert_eq!(gate_output["any_spawn_failed"], false);
+    assert_eq!(gate_output["needs_attention"], false);
+
+    let children = gate_output["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0]["name"], "child-1");
+    assert_eq!(children[0]["complete"], false);
+    // The per-child outcome for a not-yet-terminal child folds Running
+    // into "pending" for the wire-level outcome.
+    assert_eq!(children[0]["outcome"], "pending");
+}
+
 #[test]
 fn existing_gates_emit_corrective_category() {
     let dir = TempDir::new().unwrap();

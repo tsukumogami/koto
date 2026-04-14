@@ -213,7 +213,7 @@ actionable (the agent can record an override).
 - `output` carries the structured result from the gate runner:
   - `command` gates: `{"exit_code": <int>, "error": "<string>"}`
   - `context-exists` gates: `{"exists": false, "error": "<string>"}`
-  - `children-complete` gates: `{"total": <int>, "completed": <int>, "pending": <int>, "all_complete": <bool>, "children": [...], "error": "<string>"}`
+  - `children-complete` gates: `{"total": <int>, "completed": <int>, "pending": <int>, "success": <int>, "failed": <int>, "skipped": <int>, "blocked": <int>, "spawn_failed": <int>, "all_complete": <bool>, "all_success": <bool>, "any_failed": <bool>, "any_skipped": <bool>, "any_spawn_failed": <bool>, "needs_attention": <bool>, "children": [...], "error": "<string>"}`. Each `children[]` entry has `{"name", "state", "complete", "outcome"}`; failed children add `failure_mode` and `reason_source`; skipped children add `skipped_because`, `skipped_because_chain`, `reason_source`; blocked children add `blocked_by`.
 - `blocking_conditions` only includes gates that failed; passing gates are excluded.
 
 ---
@@ -410,11 +410,21 @@ finished yet. This is a temporal condition — it resolves on its own as childre
         "total": 3,
         "completed": 2,
         "pending": 1,
+        "success": 2,
+        "failed": 0,
+        "skipped": 0,
+        "blocked": 0,
+        "spawn_failed": 0,
         "all_complete": false,
+        "all_success": false,
+        "any_failed": false,
+        "any_skipped": false,
+        "any_spawn_failed": false,
+        "needs_attention": false,
         "children": [
-          {"name": "explore.r1", "state": "done", "complete": true},
-          {"name": "explore.r2", "state": "done", "complete": true},
-          {"name": "explore.r3", "state": "research", "complete": false}
+          {"name": "explore.r1", "state": "done", "complete": true, "outcome": "success"},
+          {"name": "explore.r2", "state": "done", "complete": true, "outcome": "success"},
+          {"name": "explore.r3", "state": "research", "complete": false, "outcome": "pending"}
         ],
         "error": ""
       }

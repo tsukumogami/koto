@@ -321,10 +321,20 @@ Each gate type produces structured output that the engine injects into the evide
 | `context-matches` | `matches` | boolean | `true` if the content at `key` matches `pattern`. |
 | `context-matches` | `error` | string | Empty on normal pass or fail. Error message when the store is unavailable or the pattern is invalid. |
 | `children-complete` | `total` | number | Total number of matching children. |
-| `children-complete` | `completed` | number | Children that meet the completion condition. |
-| `children-complete` | `pending` | number | Children that haven't completed yet. |
-| `children-complete` | `all_complete` | boolean | `true` when every child meets the completion condition. |
-| `children-complete` | `children` | array | Per-child detail: `[{"name": "...", "state": "...", "complete": true/false}]`. |
+| `children-complete` | `completed` | number | Children in a terminal state (success + failure + skipped). |
+| `children-complete` | `pending` | number | Children not yet terminal (covers both "not yet spawned" and "spawned and running"). |
+| `children-complete` | `success` | number | Terminal children whose final state is not flagged `failure: true` or `skipped_marker: true`. |
+| `children-complete` | `failed` | number | Terminal children whose final state carries `failure: true`. |
+| `children-complete` | `skipped` | number | Terminal children whose final state carries `skipped_marker: true` (synthesized when a dependency failed). |
+| `children-complete` | `blocked` | number | Tasks that declare `waits_on` dependencies whose upstream children are non-terminal. |
+| `children-complete` | `spawn_failed` | number | Tasks the scheduler could not spawn (template resolve errors, collisions, I/O). |
+| `children-complete` | `all_complete` | boolean | `pending == 0 AND blocked == 0 AND spawn_failed == 0`. Gate passes when true. |
+| `children-complete` | `all_success` | boolean | `all_complete AND failed == 0 AND skipped == 0 AND spawn_failed == 0`. The clean-completion route guard. |
+| `children-complete` | `any_failed` | boolean | `failed > 0`. |
+| `children-complete` | `any_skipped` | boolean | `skipped > 0`. |
+| `children-complete` | `any_spawn_failed` | boolean | `spawn_failed > 0`. |
+| `children-complete` | `needs_attention` | boolean | `any_failed OR any_skipped OR any_spawn_failed`. Route to retry / analysis states on this boolean. |
+| `children-complete` | `children` | array | Per-child detail: `[{"name", "state", "complete", "outcome", ...}]`. Each entry carries `outcome` (`success \| failure \| skipped \| pending \| blocked \| spawn_failed`); failed entries add `failure_mode` + `reason_source: "state_name"`; skipped entries add `skipped_because` (direct blocker), `skipped_because_chain` (all unique failed ancestors, closest-first), and `reason_source: "skipped"`; blocked entries add `blocked_by` (non-terminal `waits_on` entries). |
 | `children-complete` | `error` | string | Empty on normal evaluation. Error message on backend failures. |
 
 `passed` is not a field name in any gate type. Don't use it in `when` conditions.
@@ -406,7 +416,7 @@ Built-in defaults for all three gate types:
 | `command` | `{"exit_code": 0, "error": ""}` |
 | `context-exists` | `{"exists": true, "error": ""}` |
 | `context-matches` | `{"matches": true, "error": ""}` |
-| `children-complete` | `{"total": 0, "completed": 0, "pending": 0, "all_complete": true, "children": [], "error": ""}` |
+| `children-complete` | `{"total": 0, "completed": 0, "pending": 0, "success": 0, "failed": 0, "skipped": 0, "blocked": 0, "spawn_failed": 0, "all_complete": true, "all_success": true, "any_failed": false, "any_skipped": false, "any_spawn_failed": false, "needs_attention": false, "children": [], "error": ""}` |
 
 All four built-in types always have a built-in default, so `koto overrides record` always succeeds for them without `--with-data` or `override_default`. Setting `override_default` is useful when you want a specific non-passing value injected (for example, a known exit code that triggers a particular routing branch).
 
