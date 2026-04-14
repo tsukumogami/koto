@@ -5,8 +5,9 @@ use anyhow::{anyhow, Context};
 use serde::Deserialize;
 
 use super::types::{
-    ActionDecl, CompiledTemplate, FieldSchema, Gate, PollingConfig, TemplateState, Transition,
-    VariableDecl, GATE_TYPE_CHILDREN_COMPLETE, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS,
+    default_failure_policy, ActionDecl, CompiledTemplate, FailurePolicy, FieldSchema, Gate,
+    MaterializeChildrenSpec, PollingConfig, TemplateState, Transition, VariableDecl,
+    GATE_TYPE_CHILDREN_COMPLETE, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS,
     GATE_TYPE_CONTEXT_MATCHES,
 };
 
@@ -37,7 +38,14 @@ struct SourceVariable {
     default: String,
 }
 
+/// YAML front-matter view of a single state.
+///
+/// `#[serde(deny_unknown_fields)]` is applied here (but NOT on
+/// `CompiledTemplate::TemplateState`) so that typos or unknown keys in
+/// template source are caught at compile time, while the compile cache
+/// remains forward-compatible with newer binaries that may add fields.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct SourceState {
     #[serde(default)]
     transitions: Vec<SourceTransition>,
@@ -51,6 +59,24 @@ struct SourceState {
     integration: Option<String>,
     #[serde(default)]
     default_action: Option<SourceActionDecl>,
+    #[serde(default)]
+    materialize_children: Option<SourceMaterializeChildrenSpec>,
+    #[serde(default)]
+    failure: bool,
+    #[serde(default)]
+    skipped_marker: bool,
+}
+
+/// YAML front-matter view of a `materialize_children` hook.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceMaterializeChildrenSpec {
+    #[serde(default)]
+    from_field: String,
+    #[serde(default)]
+    default_template: String,
+    #[serde(default = "default_failure_policy")]
+    failure_policy: FailurePolicy,
 }
 
 /// Action declaration in source YAML.
@@ -219,6 +245,16 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
             }),
         });
 
+        let compiled_materialize_children =
+            source_state
+                .materialize_children
+                .as_ref()
+                .map(|sm| MaterializeChildrenSpec {
+                    from_field: sm.from_field.clone(),
+                    default_template: sm.default_template.clone(),
+                    failure_policy: sm.failure_policy,
+                });
+
         compiled_states.insert(
             state_name.clone(),
             TemplateState {
@@ -230,6 +266,9 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
                 accepts: compiled_accepts,
                 integration: source_state.integration.clone(),
                 default_action: compiled_action,
+                materialize_children: compiled_materialize_children,
+                failure: source_state.failure,
+                skipped_marker: source_state.skipped_marker,
             },
         );
     }
@@ -1215,5 +1254,312 @@ Done.
         let f = write_temp(src);
         // strict=false: warning to stderr, but compile returns Ok.
         compile(f.path(), false).unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Issue 7 — tasks accepts type, materialize_children hook, and the
+    // narrow deny_unknown_fields on SourceState.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn tasks_typed_accepts_field_compiles() {
+        // Minimal batch parent template: plan_and_await has a tasks-typed
+        // accepts field and transitions out on a structured condition. The
+        // compiler must accept `type: tasks`.
+        let src = r#"---
+name: batch-parent
+version: "1.0"
+initial_state: plan_and_await
+states:
+  plan_and_await:
+    accepts:
+      tasks:
+        type: tasks
+        required: true
+    transitions:
+      - target: done
+        when:
+          tasks: submitted
+  done:
+    terminal: true
+---
+
+## plan_and_await
+
+Submit the task list.
+
+## done
+
+All done.
+"#;
+        let f = write_temp(src);
+        let compiled = compile(f.path(), true).unwrap();
+        let state = &compiled.states["plan_and_await"];
+        let accepts = state.accepts.as_ref().unwrap();
+        assert_eq!(accepts["tasks"].field_type, "tasks");
+        assert!(accepts["tasks"].required);
+    }
+
+    #[test]
+    fn materialize_children_hook_parses_with_default_policy() {
+        // The hook declares from_field and default_template only; the
+        // failure_policy defaults to skip_dependents.
+        let src = r#"---
+name: batch-parent
+version: "1.0"
+initial_state: plan_and_await
+states:
+  plan_and_await:
+    accepts:
+      tasks:
+        type: tasks
+        required: true
+    materialize_children:
+      from_field: tasks
+      default_template: child.md
+    transitions:
+      - target: done
+        when:
+          tasks: submitted
+  done:
+    terminal: true
+---
+
+## plan_and_await
+
+Submit tasks.
+
+## done
+
+Done.
+"#;
+        let f = write_temp(src);
+        let compiled = compile(f.path(), true).unwrap();
+        let state = &compiled.states["plan_and_await"];
+        let hook = state.materialize_children.as_ref().unwrap();
+        assert_eq!(hook.from_field, "tasks");
+        assert_eq!(hook.default_template, "child.md");
+        assert_eq!(
+            hook.failure_policy,
+            crate::template::types::FailurePolicy::SkipDependents
+        );
+    }
+
+    #[test]
+    fn materialize_children_hook_accepts_continue_policy() {
+        // failure_policy: continue is the explicit opt-out.
+        let src = r#"---
+name: batch-parent
+version: "1.0"
+initial_state: plan_and_await
+states:
+  plan_and_await:
+    accepts:
+      tasks:
+        type: tasks
+        required: true
+    materialize_children:
+      from_field: tasks
+      default_template: child.md
+      failure_policy: continue
+    transitions:
+      - target: done
+        when:
+          tasks: submitted
+  done:
+    terminal: true
+---
+
+## plan_and_await
+
+Submit tasks.
+
+## done
+
+Done.
+"#;
+        let f = write_temp(src);
+        let compiled = compile(f.path(), true).unwrap();
+        let hook = compiled.states["plan_and_await"]
+            .materialize_children
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            hook.failure_policy,
+            crate::template::types::FailurePolicy::Continue
+        );
+    }
+
+    #[test]
+    fn template_without_materialize_children_has_none() {
+        // A plain (non-batch) template compiles with materialize_children
+        // set to None on every state.
+        let src = r#"---
+name: plain
+version: "1.0"
+initial_state: work
+states:
+  work:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## work
+
+Work.
+
+## done
+
+Done.
+"#;
+        let f = write_temp(src);
+        let compiled = compile(f.path(), true).unwrap();
+        assert!(compiled.states["work"].materialize_children.is_none());
+        assert!(compiled.states["done"].materialize_children.is_none());
+    }
+
+    #[test]
+    fn failure_and_skipped_marker_flags_parse() {
+        // failure: true and skipped_marker: true are set on a terminal state.
+        // Runtime validation of "meaningful only when terminal" lives with
+        // compile rules (Issue 8); here we only verify the parse.
+        let src = r#"---
+name: parent
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions:
+      - target: failed_marker
+      - target: skipped
+  failed_marker:
+    terminal: true
+    failure: true
+  skipped:
+    terminal: true
+    skipped_marker: true
+---
+
+## start
+
+Start.
+
+## failed_marker
+
+Failed.
+
+## skipped
+
+Skipped.
+"#;
+        let f = write_temp(src);
+        let compiled = compile(f.path(), true).unwrap();
+        assert!(compiled.states["failed_marker"].failure);
+        assert!(!compiled.states["failed_marker"].skipped_marker);
+        assert!(compiled.states["skipped"].skipped_marker);
+        assert!(!compiled.states["skipped"].failure);
+        // The non-terminal entry state leaves both flags false.
+        assert!(!compiled.states["start"].failure);
+        assert!(!compiled.states["start"].skipped_marker);
+    }
+
+    #[test]
+    fn source_state_rejects_unknown_fields() {
+        // deny_unknown_fields on SourceState catches typos at compile time.
+        let src = r#"---
+name: parent
+version: "1.0"
+initial_state: start
+states:
+  start:
+    terminal: true
+    materialize_childern: {}
+---
+
+## start
+
+Hello.
+"#;
+        let f = write_temp(src);
+        let err = compile(f.path(), true).unwrap_err();
+        // Use the full Debug/chain format — the underlying serde unknown-field
+        // error lives in the error chain beneath the "invalid YAML" wrapper.
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("unknown field") || msg.contains("materialize_childern"),
+            "expected unknown-field error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn source_materialize_children_rejects_unknown_fields() {
+        // Inner spec also uses deny_unknown_fields.
+        let src = r#"---
+name: parent
+version: "1.0"
+initial_state: plan_and_await
+states:
+  plan_and_await:
+    accepts:
+      tasks:
+        type: tasks
+        required: true
+    materialize_children:
+      from_field: tasks
+      default_template: child.md
+      unknown_knob: 7
+    transitions:
+      - target: done
+        when:
+          tasks: submitted
+  done:
+    terminal: true
+---
+
+## plan_and_await
+
+Submit.
+
+## done
+
+Done.
+"#;
+        let f = write_temp(src);
+        let err = compile(f.path(), true).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("unknown field") || msg.contains("unknown_knob"),
+            "expected unknown-field error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn compiled_template_not_deny_unknown_fields() {
+        // Decision 3 in the design: deny_unknown_fields is applied to
+        // SourceState, NOT CompiledTemplate/TemplateState. A compile-cache
+        // JSON with an extra field must still deserialize so that newer
+        // binaries remain cache-compatible with older readers. This test
+        // guards the invariant by directly constructing JSON with a future
+        // field and deserializing.
+        let json = serde_json::json!({
+            "format_version": 1,
+            "name": "future",
+            "version": "9.9",
+            "initial_state": "start",
+            "states": {
+                "start": {
+                    "directive": "hi",
+                    "terminal": true,
+                    "some_future_field": ["yes"]
+                }
+            }
+        });
+        // If deny_unknown_fields were on CompiledTemplate/TemplateState this
+        // would error; the test is that it does not.
+        let _: CompiledTemplate = serde_json::from_value(json).unwrap();
     }
 }

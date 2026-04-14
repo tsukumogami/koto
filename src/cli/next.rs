@@ -143,6 +143,9 @@ mod tests {
             accepts,
             integration,
             default_action: None,
+            materialize_children: None,
+            failure: false,
+            skipped_marker: false,
         }
     }
 

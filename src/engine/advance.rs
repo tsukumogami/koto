@@ -649,6 +649,9 @@ mod tests {
             accepts: None,
             integration: None,
             default_action: None,
+            materialize_children: None,
+            failure: false,
+            skipped_marker: false,
         }
     }
 
@@ -1115,6 +1118,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1128,6 +1134,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1144,6 +1153,9 @@ mod tests {
                     accepts: make_accepts(vec!["decision"]),
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1157,6 +1169,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -1220,6 +1235,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -1274,6 +1292,9 @@ mod tests {
                 accepts: make_accepts(vec!["decision"]),
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -1318,6 +1339,9 @@ mod tests {
                 accepts: make_accepts(vec!["decision"]),
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -1383,6 +1407,9 @@ mod tests {
                 accepts: make_accepts(vec!["result"]),
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -1479,6 +1506,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1492,6 +1522,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1505,6 +1538,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -1589,6 +1625,9 @@ mod tests {
                     accepts: make_accepts(vec!["override"]),
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1602,6 +1641,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1615,6 +1657,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -1698,6 +1743,9 @@ mod tests {
                     accepts: make_accepts(vec!["decision"]),
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1711,6 +1759,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -1792,6 +1843,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1805,6 +1859,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -1965,6 +2022,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1978,6 +2038,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -2023,6 +2086,9 @@ mod tests {
                 accepts: None,
                 integration: Some("my-runner".to_string()),
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -2075,6 +2141,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ));
         }
@@ -2090,6 +2159,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         ));
 
@@ -2127,6 +2199,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -2165,6 +2240,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2178,6 +2256,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2191,6 +2272,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -2233,6 +2317,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2246,6 +2333,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2259,6 +2349,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -2323,6 +2416,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: Some(make_action_decl("echo hello")),
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -2374,6 +2470,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -2414,6 +2513,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: Some(make_action_decl("create-pr")),
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -2488,6 +2590,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: Some(make_action_decl("echo skip-me")),
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -2546,6 +2651,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: Some(make_action_decl("echo ok")),
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2559,6 +2667,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -2614,6 +2725,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: Some(make_action_decl("echo check")),
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2627,6 +2741,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -2735,6 +2852,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2748,6 +2868,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -2819,6 +2942,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2832,6 +2958,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -2946,6 +3075,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2959,6 +3091,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -3058,6 +3193,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -3071,6 +3209,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -3148,6 +3289,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -3161,6 +3305,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -3263,6 +3410,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             ("complete", {
@@ -3347,6 +3497,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             ("complete", {

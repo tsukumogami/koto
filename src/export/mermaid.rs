@@ -106,6 +106,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         states.insert(
@@ -119,6 +122,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         CompiledTemplate {
@@ -172,6 +178,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         let t = CompiledTemplate {
@@ -226,6 +235,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         states.insert(
@@ -239,6 +251,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         states.insert(
@@ -252,6 +267,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
 
@@ -336,6 +354,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
 
@@ -364,6 +385,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         states.insert(
@@ -380,6 +404,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         states.insert(
@@ -396,6 +423,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         states.insert(
@@ -409,6 +439,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
 

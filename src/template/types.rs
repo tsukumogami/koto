@@ -43,7 +43,14 @@ pub struct VariableDecl {
 }
 
 /// A state declaration in a compiled template.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// Note: `#[serde(deny_unknown_fields)]` is intentionally NOT applied here.
+/// `CompiledTemplate` is loaded from the compile cache, which may be written
+/// by a newer binary than the reader. Adding new fields to `CompiledTemplate`
+/// must remain non-breaking for older binaries during version churn.
+/// The strict unknown-field check lives on `SourceState` (the YAML
+/// front-matter intermediate) instead — see `src/template/compile.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct TemplateState {
     pub directive: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -60,6 +67,62 @@ pub struct TemplateState {
     pub integration: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_action: Option<ActionDecl>,
+    /// Declares that this state spawns child workflows from a task-list
+    /// evidence field when entered. Runtime behavior is implemented by the
+    /// batch scheduler; this field is purely the compile-time contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialize_children: Option<MaterializeChildrenSpec>,
+    /// When true and the state is terminal, marks this state as a failure
+    /// outcome (propagated by the batch scheduler to the parent's
+    /// `children-complete` gate output). Meaningful only when `terminal` is
+    /// true.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub failure: bool,
+    /// When true, the scheduler can synthesize child markers that land
+    /// directly in this state to represent "skipped" children. Meaningful
+    /// only when `terminal` is true.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skipped_marker: bool,
+}
+
+/// Template-level declaration that a state fans out child workflows from an
+/// agent-submitted task list.
+///
+/// Placed on `TemplateState` alongside `gates`, `accepts`, and
+/// `default_action`. The compiler validates the hook at load time; the
+/// scheduler (lands in a later phase) reads the hook at runtime to
+/// materialize children.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializeChildrenSpec {
+    /// Name of the `accepts` field on this state that carries the task
+    /// list. The field's declared type must be `tasks`.
+    pub from_field: String,
+    /// Path to the default child template to use when a task entry omits
+    /// `template`. The compiler validates that the path resolves.
+    pub default_template: String,
+    /// Policy for propagating failures to dependent tasks within the batch.
+    /// Defaults to `SkipDependents`.
+    #[serde(default = "default_failure_policy")]
+    pub failure_policy: FailurePolicy,
+}
+
+/// Policy controlling how a batch handles failures of upstream tasks.
+///
+/// - `SkipDependents` (default): tasks whose `waits_on` chain transitively
+///   includes a failed task are synthesized as terminal skip markers.
+/// - `Continue`: a failure of one task does not prevent dependents from
+///   running; each task is judged independently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum FailurePolicy {
+    SkipDependents,
+    Continue,
+}
+
+/// Serde default helper: `FailurePolicy::SkipDependents`.
+pub fn default_failure_policy() -> FailurePolicy {
+    FailurePolicy::SkipDependents
 }
 
 /// A structured transition with an optional condition.
@@ -290,7 +353,16 @@ fn json_value_matches_schema_type(value: &serde_json::Value, t: &GateSchemaField
 }
 
 /// Valid field types for FieldSchema.
-const VALID_FIELD_TYPES: &[&str] = &["enum", "string", "number", "boolean"];
+///
+/// `"tasks"` is a structured array type used by the batch child spawning
+/// feature; the compiler knows its exact shape (see `item_schema` generation
+/// in `src/cli/next_types.rs::derive_expects`), so templates declare
+/// `type: tasks` without writing any schema by hand.
+const VALID_FIELD_TYPES: &[&str] = &["enum", "string", "number", "boolean", "tasks"];
+
+/// Field type marker for structured task-list evidence fields consumed by
+/// the `materialize_children` hook.
+pub const FIELD_TYPE_TASKS: &str = "tasks";
 
 /// Runtime-injected variable names that are valid in templates but not
 /// declared in the variables block. These are provided by the engine at
@@ -500,7 +572,7 @@ impl CompiledTemplate {
                     if !VALID_FIELD_TYPES.contains(&schema.field_type.as_str()) {
                         return Err(format!(
                             "state {:?} accepts field {:?}: invalid field_type {:?}, \
-                             must be one of: enum, string, number, boolean",
+                             must be one of: enum, string, number, boolean, tasks",
                             state_name, field_name, schema.field_type
                         ));
                     }
@@ -948,6 +1020,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         states.insert(
@@ -961,6 +1036,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         CompiledTemplate {
@@ -1180,6 +1258,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         assert!(
@@ -1332,6 +1413,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -1390,6 +1474,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -1439,6 +1526,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -1486,6 +1576,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -2582,6 +2675,9 @@ command: "./check.sh"
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         t
@@ -2694,6 +2790,9 @@ command: "./check.sh"
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -2804,6 +2903,9 @@ command: "./check.sh"
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -2939,5 +3041,174 @@ command: "./check.sh"
         assert!(t.validate(true).is_err(), "strict=true must return Err");
         // Permissive: no error.
         assert!(t.validate(false).is_ok(), "strict=false must return Ok");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 7: tasks accepts type, materialize_children hook, new TemplateState
+    // fields, and narrow deny_unknown_fields.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn template_state_defaults_for_new_fields() {
+        // Default construction leaves the three Issue-7 fields at their zero
+        // values: None, false, false.
+        let state = TemplateState::default();
+        assert!(state.materialize_children.is_none());
+        assert!(!state.failure);
+        assert!(!state.skipped_marker);
+    }
+
+    #[test]
+    fn failure_policy_serializes_as_snake_case() {
+        // skip_dependents / continue, matching the design's Key Interfaces.
+        let v = serde_json::to_value(FailurePolicy::SkipDependents).unwrap();
+        assert_eq!(v, serde_json::json!("skip_dependents"));
+        let v = serde_json::to_value(FailurePolicy::Continue).unwrap();
+        assert_eq!(v, serde_json::json!("continue"));
+
+        // Round-trip via JSON.
+        let decoded: FailurePolicy = serde_json::from_str("\"skip_dependents\"").unwrap();
+        assert_eq!(decoded, FailurePolicy::SkipDependents);
+        let decoded: FailurePolicy = serde_json::from_str("\"continue\"").unwrap();
+        assert_eq!(decoded, FailurePolicy::Continue);
+    }
+
+    #[test]
+    fn default_failure_policy_is_skip_dependents() {
+        assert_eq!(default_failure_policy(), FailurePolicy::SkipDependents);
+    }
+
+    #[test]
+    fn materialize_children_spec_deserializes_with_default_policy() {
+        // When failure_policy is omitted, the serde default kicks in.
+        let json = serde_json::json!({
+            "from_field": "tasks",
+            "default_template": "child.md"
+        });
+        let spec: MaterializeChildrenSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.from_field, "tasks");
+        assert_eq!(spec.default_template, "child.md");
+        assert_eq!(spec.failure_policy, FailurePolicy::SkipDependents);
+    }
+
+    #[test]
+    fn materialize_children_spec_rejects_unknown_fields() {
+        // deny_unknown_fields is applied to MaterializeChildrenSpec — a typo
+        // like `default_tempalte` must be rejected at deserialization.
+        let json = serde_json::json!({
+            "from_field": "tasks",
+            "default_template": "child.md",
+            "unknown_field": 42,
+        });
+        let err = serde_json::from_value::<MaterializeChildrenSpec>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn tasks_field_type_passes_validation() {
+        // A tasks-typed accepts field compiles and validates successfully.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "tasks".to_string(),
+            FieldSchema {
+                field_type: "tasks".to_string(),
+                required: true,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+        state.accepts = Some(accepts);
+        t.validate(true).unwrap();
+    }
+
+    #[test]
+    fn invalid_field_type_error_lists_tasks() {
+        // The error message enumerating valid field types must include
+        // "tasks" so template authors see it as an option.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "bad".to_string(),
+            FieldSchema {
+                field_type: "nonsense".to_string(),
+                required: false,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+        state.accepts = Some(accepts);
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("tasks"),
+            "expected tasks in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn template_state_deserializes_without_new_fields_for_cache_compat() {
+        // CompiledTemplate is loaded from the compile cache. Older binaries
+        // wrote state files that do not include materialize_children,
+        // failure, or skipped_marker — those must parse unchanged thanks to
+        // serde(default) on each field.
+        let json = serde_json::json!({
+            "directive": "do a thing",
+        });
+        let state: TemplateState = serde_json::from_value(json).unwrap();
+        assert_eq!(state.directive, "do a thing");
+        assert!(state.materialize_children.is_none());
+        assert!(!state.failure);
+        assert!(!state.skipped_marker);
+    }
+
+    #[test]
+    fn template_state_tolerates_unknown_fields_for_forward_compat() {
+        // deny_unknown_fields is NOT on TemplateState: a compile cache
+        // written by a newer binary that added a new field must still parse
+        // cleanly with the current binary. This is the mirror test of
+        // SourceState's stricter behavior.
+        let json = serde_json::json!({
+            "directive": "do a thing",
+            "some_future_field": "surprise",
+        });
+        let state: TemplateState = serde_json::from_value(json).unwrap();
+        assert_eq!(state.directive, "do a thing");
+    }
+
+    #[test]
+    fn template_state_round_trips_with_new_fields_set() {
+        // failure: true and skipped_marker: true round-trip through JSON.
+        let state = TemplateState {
+            directive: "done".to_string(),
+            terminal: true,
+            failure: true,
+            skipped_marker: true,
+            ..TemplateState::default()
+        };
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["failure"], serde_json::json!(true));
+        assert_eq!(json["skipped_marker"], serde_json::json!(true));
+        let restored: TemplateState = serde_json::from_value(json).unwrap();
+        assert_eq!(state, restored);
+    }
+
+    #[test]
+    fn materialize_children_spec_serializes_skip_dependents_by_default() {
+        let spec = MaterializeChildrenSpec {
+            from_field: "tasks".to_string(),
+            default_template: "child.md".to_string(),
+            failure_policy: FailurePolicy::SkipDependents,
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["from_field"], "tasks");
+        assert_eq!(json["default_template"], "child.md");
+        assert_eq!(json["failure_policy"], "skip_dependents");
     }
 }
