@@ -230,6 +230,24 @@ pub const GATE_TYPE_CHILDREN_COMPLETE: &str = "children-complete";
 /// All `gates.*` key checks in advance.rs and types.rs use this constant.
 pub const GATES_EVIDENCE_NAMESPACE: &str = "gates";
 
+/// Prefix used in when-clause keys to match on the presence of an agent-submitted
+/// evidence field. Paired with the sentinel value [`PRESENT_MATCHER_VALUE`] to form
+/// expressions like `evidence.retry_failed: present` that fire when the named field
+/// appears in any event since the last state transition (Issue #11).
+pub const EVIDENCE_NAMESPACE: &str = "evidence";
+
+/// Sentinel string value that, when it appears as the value of a when-clause entry
+/// under the `evidence.<field>` key, triggers the presence matcher instead of the
+/// default scalar-equality check.
+pub const PRESENT_MATCHER_VALUE: &str = "present";
+
+/// Returns true if `value` is the JSON string `"present"` used as the presence-matcher
+/// sentinel. The check is case-sensitive so literal values like `"Present"` continue
+/// to route via the value-equality path.
+pub fn is_present_matcher(value: &serde_json::Value) -> bool {
+    value.as_str() == Some(PRESENT_MATCHER_VALUE)
+}
+
 /// The JSON value type of a gate output field.
 ///
 /// Used by [`gate_type_schema`] to describe the expected type of each field
@@ -720,6 +738,13 @@ impl CompiledTemplate {
             eprintln!("warning: {}", warning);
         }
 
+        // Issue #11: emit non-fatal warning W6 when the present-matcher sentinel
+        // is used against a non-evidence path (e.g. `context.foo: present` or a
+        // flat agent-evidence key). Same convention as W1-W5.
+        for warning in self.collect_when_clause_warnings() {
+            eprintln!("warning: {}", warning);
+        }
+
         Ok(())
     }
 
@@ -1050,6 +1075,47 @@ impl CompiledTemplate {
         warnings
     }
 
+    /// Collect non-fatal warnings tied to when-clause matcher usage.
+    ///
+    /// | Rule | Trigger |
+    /// |------|---------|
+    /// | W6 | The string `"present"` appears as a when-clause value under a key that is not in the `evidence.<field>` namespace. The present matcher is only meaningful when checking whether an agent-submitted evidence field exists. A flat agent-evidence key, a `gates.*` path, or any other prefix with value `"present"` almost certainly means the template author intended presence matching but used the wrong path. |
+    ///
+    /// Warnings are returned as formatted strings; callers emit them via
+    /// stderr (`validate`) or collect them for tests.
+    pub fn collect_when_clause_warnings(&self) -> Vec<String> {
+        let mut warnings: Vec<String> = Vec::new();
+        let evidence_prefix = format!("{}.", EVIDENCE_NAMESPACE);
+
+        for (state_name, state) in &self.states {
+            for transition in &state.transitions {
+                let when = match &transition.when {
+                    Some(w) => w,
+                    None => continue,
+                };
+                for (field, value) in when {
+                    if !is_present_matcher(value) {
+                        continue;
+                    }
+                    if field.starts_with(&evidence_prefix) {
+                        continue;
+                    }
+                    warnings.push(format!(
+                        "W6: state {:?} transition to {:?}: when value {:?} is the presence-matcher \
+                         sentinel but key {:?} is not in the evidence.<field> namespace\n  \
+                         remedy: rewrite the key as evidence.<field> to check for field presence, or replace the value with the intended scalar for equality matching",
+                        state_name,
+                        transition.target,
+                        PRESENT_MATCHER_VALUE,
+                        field,
+                    ));
+                }
+            }
+        }
+
+        warnings
+    }
+
     /// Validate that every state with pure-gate-only transitions can fire at least
     /// one transition when all gates use their declared (or builtin) override defaults.
     ///
@@ -1188,25 +1254,56 @@ impl CompiledTemplate {
                 ));
             }
 
-            // Separate gates.* keys (engine-injected gate output) from agent evidence keys.
-            // gates.* keys bypass the accepts block requirement and field-presence checks
-            // because they are populated automatically by the advance loop, not by agents.
-            let agent_fields: Vec<(&String, &serde_json::Value)> = when
-                .iter()
-                .filter(|(k, _)| !k.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)))
-                .collect();
+            // Separate gates.* keys (engine-injected gate output), evidence.<field>
+            // presence keys (Issue #11), and flat agent evidence keys. gates.* keys
+            // bypass the accepts block requirement and field-presence checks because
+            // they are populated automatically by the advance loop, not by agents.
+            // evidence.<field>: present checks only that the field appeared in any
+            // submission since the last transition — it does not compare values,
+            // so the field is not required to be declared in accepts.
+            let gates_prefix = format!("{}.", GATES_EVIDENCE_NAMESPACE);
+            let evidence_prefix = format!("{}.", EVIDENCE_NAMESPACE);
             let gate_fields: Vec<(&String, &serde_json::Value)> = when
                 .iter()
-                .filter(|(k, _)| k.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)))
+                .filter(|(k, _)| k.starts_with(&gates_prefix))
+                .collect();
+            let evidence_presence_fields: Vec<(&String, &serde_json::Value)> = when
+                .iter()
+                .filter(|(k, _)| k.starts_with(&evidence_prefix))
+                .collect();
+            let agent_fields: Vec<(&String, &serde_json::Value)> = when
+                .iter()
+                .filter(|(k, _)| !k.starts_with(&gates_prefix) && !k.starts_with(&evidence_prefix))
                 .collect();
 
             // Rule 5: when conditions that reference agent evidence require an accepts block.
-            // Pure gates.* conditions are allowed without an accepts block.
+            // Pure gates.* and evidence.<field>: present conditions are allowed without
+            // an accepts block (presence checks do not reference declared schema).
             if !agent_fields.is_empty() && !has_accepts {
                 return Err(format!(
                     "state {:?} transition to {:?}: when conditions require an accepts block on the state",
                     state_name, transition.target
                 ));
+            }
+
+            // Issue #11: validate evidence.<field> entries use the present matcher.
+            // Any other value on an evidence.* key is an error — the namespace is
+            // reserved for presence matching and has no equality semantics.
+            for (field, value) in &evidence_presence_fields {
+                let segments: Vec<&str> = field.splitn(3, '.').collect();
+                if segments.len() != 2 || segments[1].is_empty() {
+                    return Err(format!(
+                        "state {:?}: when clause key {:?} has invalid format; expected \"evidence.<field>\"",
+                        state_name, field.as_str()
+                    ));
+                }
+                if !is_present_matcher(value) {
+                    return Err(format!(
+                        "state {:?} transition to {:?}: when value for evidence key {:?} must be {:?}; \
+                         the evidence.<field> namespace only supports presence matching",
+                        state_name, transition.target, field, PRESENT_MATCHER_VALUE
+                    ));
+                }
             }
 
             // Rule 6 applied to gates.* fields: values must be JSON scalars.
@@ -4056,6 +4153,181 @@ command: "./check.sh"
         assert!(
             !warnings.iter().any(|w| w.starts_with("W5:")),
             "W5 should be quiet when failure_reason is in accepts; got: {:?}",
+            warnings
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #11: when-clause evidence.<field>: present matcher (compile)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn is_present_matcher_case_sensitive() {
+        assert!(is_present_matcher(&serde_json::json!("present")));
+        assert!(!is_present_matcher(&serde_json::json!("Present")));
+        assert!(!is_present_matcher(&serde_json::json!("PRESENT")));
+        assert!(!is_present_matcher(&serde_json::json!("presence")));
+        // Non-string values never match the sentinel.
+        assert!(!is_present_matcher(&serde_json::json!(true)));
+        assert!(!is_present_matcher(&serde_json::json!(0)));
+        assert!(!is_present_matcher(&serde_json::json!(null)));
+    }
+
+    #[test]
+    fn evidence_present_when_clause_accepted() {
+        // A transition using `evidence.retry_failed: present` should validate
+        // without an accepts block — presence matching does not depend on the
+        // declared schema.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert(
+            "evidence.retry_failed".to_string(),
+            serde_json::json!("present"),
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        assert!(
+            t.validate(true).is_ok(),
+            "evidence.<field>: present should validate without an accepts block"
+        );
+    }
+
+    #[test]
+    fn evidence_non_present_value_is_rejected() {
+        // `evidence.<field>` is reserved for presence matching; any other value
+        // is a hard error.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert(
+            "evidence.retry_failed".to_string(),
+            serde_json::json!("done"),
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("only supports presence matching"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn evidence_empty_field_name_is_rejected() {
+        // `evidence.` with nothing after the dot is not a valid path.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert("evidence.".to_string(), serde_json::json!("present"));
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("invalid format") && err.contains("evidence.<field>"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn w6_warns_on_present_outside_evidence_namespace() {
+        // `context.foo: present` is not a legal placement of the present matcher.
+        // Compile should surface W6 without failing.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "decision".to_string(),
+            FieldSchema {
+                field_type: "string".to_string(),
+                required: true,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+        state.accepts = Some(accepts);
+        let mut when = BTreeMap::new();
+        // Use a flat agent-evidence key that is declared in accepts so the
+        // transition passes D* rules; the only non-standard thing is the
+        // `"present"` value on a non-evidence.* path.
+        when.insert("decision".to_string(), serde_json::json!("present"));
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+
+        // Validation succeeds (W6 is non-fatal).
+        t.validate(true).unwrap();
+
+        // But the collected warnings must include W6.
+        let warnings = t.collect_when_clause_warnings();
+        assert!(
+            warnings.iter().any(|w| w.starts_with("W6:")),
+            "expected W6 warning when \"present\" appears outside evidence.<field>; got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn w6_silent_for_evidence_present_and_value_equality() {
+        // No W6 warning should fire when "present" is used correctly under
+        // evidence.<field>, and none for ordinary value-equality matchers.
+        // Build two separate templates so mutual-exclusivity rules don't
+        // entangle the two cases.
+
+        // Case 1: evidence.<field>: present used correctly.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert(
+            "evidence.retry_failed".to_string(),
+            serde_json::json!("present"),
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        t.validate(true).unwrap();
+        let warnings = t.collect_when_clause_warnings();
+        assert!(
+            warnings.is_empty(),
+            "expected no W6 warnings for correct evidence.<field>: present usage; got: {:?}",
+            warnings
+        );
+
+        // Case 2: value-equality matcher on a flat agent-evidence field.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "decision".to_string(),
+            FieldSchema {
+                field_type: "string".to_string(),
+                required: true,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+        state.accepts = Some(accepts);
+        let mut when = BTreeMap::new();
+        when.insert("decision".to_string(), serde_json::json!("approve"));
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        t.validate(true).unwrap();
+        let warnings = t.collect_when_clause_warnings();
+        assert!(
+            warnings.is_empty(),
+            "expected no W6 warnings for value-equality matchers; got: {:?}",
             warnings
         );
     }
