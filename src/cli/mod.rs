@@ -551,6 +551,62 @@ fn evidence_has_reserved_gates_key(data: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve a `--with-data` argument into the JSON string to be parsed.
+///
+/// If the argument begins with `@`, the remainder is treated as a file path
+/// and the file's contents are returned. Otherwise the argument is returned
+/// unchanged for inline parsing.
+///
+/// Errors:
+/// - File does not exist or is unreadable: `InvalidSubmission` naming the path.
+/// - File size exceeds `MAX_WITH_DATA_BYTES`: `InvalidSubmission` naming the
+///   cap and the actual file size in bytes.
+///
+/// Empty paths (`@` with nothing after it) are rejected with a clear message.
+pub(super) fn resolve_with_data_source(
+    raw: &str,
+) -> Result<String, crate::cli::next_types::NextError> {
+    use crate::cli::next_types::{NextError, NextErrorCode};
+
+    let Some(path_str) = raw.strip_prefix('@') else {
+        // No prefix: caller will parse `raw` directly as inline JSON.
+        return Ok(raw.to_string());
+    };
+
+    if path_str.is_empty() {
+        return Err(NextError {
+            code: NextErrorCode::InvalidSubmission,
+            message: "--with-data @ requires a file path after '@'".to_string(),
+            details: vec![],
+        });
+    }
+
+    let path = std::path::Path::new(path_str);
+    let metadata = std::fs::metadata(path).map_err(|e| NextError {
+        code: NextErrorCode::InvalidSubmission,
+        message: format!("--with-data: cannot read file '{}': {}", path_str, e),
+        details: vec![],
+    })?;
+
+    let actual_bytes = metadata.len();
+    if actual_bytes > MAX_WITH_DATA_BYTES as u64 {
+        return Err(NextError {
+            code: NextErrorCode::InvalidSubmission,
+            message: format!(
+                "--with-data: file '{}' is {} bytes, exceeds maximum of {} bytes",
+                path_str, actual_bytes, MAX_WITH_DATA_BYTES
+            ),
+            details: vec![],
+        });
+    }
+
+    std::fs::read_to_string(path).map_err(|e| NextError {
+        code: NextErrorCode::InvalidSubmission,
+        message: format!("--with-data: cannot read file '{}': {}", path_str, e),
+        details: vec![],
+    })
+}
+
 /// Parse a `--with-data` JSON string and check for the reserved `"gates"` key.
 ///
 /// Returns the parsed `Value` on success, or a `NextError` with code
@@ -1365,21 +1421,34 @@ fn handle_next(
         exit_with_error_code(json, err.code.exit_code());
     }
 
-    // 2. Payload size limit
-    if let Some(ref data_str) = with_data {
-        if data_str.len() > MAX_WITH_DATA_BYTES {
-            let err = NextError {
-                code: NextErrorCode::InvalidSubmission,
-                message: format!(
-                    "--with-data payload exceeds maximum size of {} bytes",
-                    MAX_WITH_DATA_BYTES
-                ),
-                details: vec![],
+    // 2. Resolve --with-data source (inline JSON or @file.json) and apply the
+    //    payload size limit. The file path is read here so the rest of the
+    //    handler operates on the resolved JSON string regardless of source.
+    let with_data: Option<String> = match with_data {
+        Some(raw) => {
+            let resolved = match resolve_with_data_source(&raw) {
+                Ok(s) => s,
+                Err(err) => {
+                    let json = serde_json::json!({"error": err});
+                    exit_with_error_code(json, err.code.exit_code());
+                }
             };
-            let json = serde_json::json!({"error": err});
-            exit_with_error_code(json, err.code.exit_code());
+            if resolved.len() > MAX_WITH_DATA_BYTES {
+                let err = NextError {
+                    code: NextErrorCode::InvalidSubmission,
+                    message: format!(
+                        "--with-data payload exceeds maximum size of {} bytes",
+                        MAX_WITH_DATA_BYTES
+                    ),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": err});
+                exit_with_error_code(json, err.code.exit_code());
+            }
+            Some(resolved)
         }
-    }
+        None => None,
+    };
 
     // 3. Load state file and template
     let current_dir = std::env::current_dir()?;
@@ -2943,6 +3012,99 @@ mod tests {
     // ---------------------------------------------------------------------------
     // validate_with_data_payload — reserved "gates" key returns InvalidSubmission
     // ---------------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------------
+    // resolve_with_data_source — @file.json prefix handling
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn resolve_with_data_source_inline_json_unchanged() {
+        // No @ prefix: returns the raw string for inline JSON parsing.
+        let raw = r#"{"decision": "proceed"}"#;
+        let result = resolve_with_data_source(raw).unwrap();
+        assert_eq!(result, raw);
+    }
+
+    #[test]
+    fn resolve_with_data_source_at_file_reads_contents() {
+        use crate::cli::next_types::NextErrorCode;
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evidence.json");
+        let contents = r#"{"decision": "proceed", "notes": "from file"}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+
+        let arg = format!("@{}", path.display());
+        let result = resolve_with_data_source(&arg).unwrap();
+        assert_eq!(result, contents);
+
+        // Sanity: ensure we didn't accidentally classify this as an error.
+        let err: Result<String, crate::cli::next_types::NextError> = resolve_with_data_source(&arg);
+        assert!(err.is_ok(), "happy-path file read should not error");
+        let _: NextErrorCode = NextErrorCode::InvalidSubmission; // type tag only
+    }
+
+    #[test]
+    fn resolve_with_data_source_missing_file_errors() {
+        use crate::cli::next_types::NextErrorCode;
+
+        let arg = "@/nonexistent/path/that/should/not/exist.json";
+        let err = resolve_with_data_source(arg).unwrap_err();
+        assert_eq!(err.code, NextErrorCode::InvalidSubmission);
+        assert!(
+            err.message
+                .contains("/nonexistent/path/that/should/not/exist.json"),
+            "error should name the missing path: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn resolve_with_data_source_oversize_file_errors() {
+        use crate::cli::next_types::NextErrorCode;
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Write 2 MB of bytes (well over the 1 MB cap).
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..32 {
+            f.write_all(&chunk).unwrap();
+        }
+        f.flush().unwrap();
+        drop(f);
+
+        let arg = format!("@{}", path.display());
+        let err = resolve_with_data_source(&arg).unwrap_err();
+        assert_eq!(err.code, NextErrorCode::InvalidSubmission);
+        // Cap reference (1048576) and the actual size in bytes should appear.
+        assert!(
+            err.message.contains("1048576"),
+            "error should name the cap (1048576): {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("2097152"),
+            "error should name the actual file size: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn resolve_with_data_source_empty_path_errors() {
+        use crate::cli::next_types::NextErrorCode;
+
+        let err = resolve_with_data_source("@").unwrap_err();
+        assert_eq!(err.code, NextErrorCode::InvalidSubmission);
+        assert!(
+            err.message.contains("file path"),
+            "error should mention missing file path: {}",
+            err.message
+        );
+    }
 
     #[cfg(unix)]
     #[test]

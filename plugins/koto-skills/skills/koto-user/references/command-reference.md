@@ -78,7 +78,7 @@ Gets the current state directive. Submits evidence when `--with-data` is provide
 
 | Flag | Description |
 |---|---|
-| `--with-data <json>` | Submit evidence as a JSON object. Must conform to the state's `accepts` schema. Max 1 MB. The `"gates"` key is reserved and rejected. Mutually exclusive with `--to`. |
+| `--with-data <json>` | Submit evidence as a JSON object. Must conform to the state's `accepts` schema. Max 1 MB. The `"gates"` key is reserved and rejected. Mutually exclusive with `--to`. Prefix with `@` to read the payload from a file (e.g. `--with-data @evidence.json`); the file is also capped at 1 MB. |
 | `--to <state>` | Force a directed transition to a named state. Must be a valid transition target from the current state. Mutually exclusive with `--with-data`. |
 | `--no-cleanup` | Skip automatic session cleanup when the workflow reaches a terminal state. Useful for debugging artifacts after a workflow ends. |
 | `--full` | Always include the `details` field, even on repeat visits to a state. By default `details` is omitted after the first visit. |

@@ -94,6 +94,14 @@ Example: if `expects.fields` contains `{"outcome": {"type": "enum", "required": 
 koto next <name> --with-data '{"outcome": "success"}'
 ```
 
+For large or pre-built JSON payloads, prefix the value with `@` to read from a file:
+
+```bash
+koto next <name> --with-data @evidence.json
+```
+
+The file must contain the JSON payload directly (no shell quoting needed) and must be at most 1 MB.
+
 ### Sub-case B: Gates failed, evidence fallback available
 
 **Signals:** `blocking_conditions` is non-empty, `expects.fields` is non-empty

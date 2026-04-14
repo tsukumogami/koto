@@ -7145,3 +7145,133 @@ All done.
         "command gates should have corrective category"
     );
 }
+
+// ---------------------------------------------------------------------------
+// scenario-9: --with-data @file.json read and 1MB cap rejection
+// ---------------------------------------------------------------------------
+
+/// `koto next --with-data @<path>` reads JSON from the file and processes it
+/// the same way as inline JSON.
+#[test]
+fn next_with_data_at_file_reads_evidence_from_file() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "atfile-wf", &template_with_accepts());
+
+    // Write evidence JSON to a file in the temp dir.
+    let evidence_path = dir.path().join("evidence.json");
+    std::fs::write(
+        &evidence_path,
+        r#"{"decision":"proceed","notes":"from file"}"#,
+    )
+    .unwrap();
+
+    let arg = format!("@{}", evidence_path.display());
+    let output = koto_cmd(dir.path())
+        .args(["next", "atfile-wf", "--with-data", &arg, "--no-cleanup"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "@file evidence submission should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    // Same auto-advancement as the inline-evidence test:
+    // start -> implement (unconditional) -> done (terminal).
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "auto-advancement should reach terminal state after @file evidence"
+    );
+    assert_eq!(json["advanced"], true, "advanced should be true");
+
+    // Verify the state file recorded the evidence_submitted event.
+    let state_path = session_state_path(dir.path(), "atfile-wf");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    assert!(
+        content.lines().any(|l| l.contains("evidence_submitted")),
+        "state file should contain evidence_submitted event"
+    );
+}
+
+/// `koto next --with-data @<path>` rejects files larger than the 1 MB cap
+/// with an error that names both the cap and the actual file size.
+#[test]
+fn next_with_data_at_file_rejects_oversize_file() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "oversize-wf", &template_with_accepts());
+
+    // Write a 2 MB file (well over the 1 MB cap).
+    let big_path = dir.path().join("big.json");
+    let big = vec![b'x'; 2 * 1024 * 1024];
+    std::fs::write(&big_path, &big).unwrap();
+
+    let arg = format!("@{}", big_path.display());
+    let output = koto_cmd(dir.path())
+        .args(["next", "oversize-wf", "--with-data", &arg])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "oversize file should fail with caller-error exit code"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("invalid_submission"),
+        "error code should be invalid_submission"
+    );
+    let msg = json["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("1048576"),
+        "error message should name the 1 MB cap (1048576): {}",
+        msg
+    );
+    assert!(
+        msg.contains("2097152"),
+        "error message should name the actual file size (2097152): {}",
+        msg
+    );
+}
+
+/// `koto next --with-data @<path>` produces a clear error when the file does
+/// not exist, naming the path the agent supplied.
+#[test]
+fn next_with_data_at_file_missing_returns_clear_error() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "missing-wf", &template_with_accepts());
+
+    let missing = dir.path().join("does-not-exist.json");
+    let arg = format!("@{}", missing.display());
+    let output = koto_cmd(dir.path())
+        .args(["next", "missing-wf", "--with-data", &arg])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "missing file should fail with caller-error exit code"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("invalid_submission"),
+        "error code should be invalid_submission"
+    );
+    let msg = json["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains(missing.to_str().unwrap()),
+        "error message should name the missing path: {}",
+        msg
+    );
+}
