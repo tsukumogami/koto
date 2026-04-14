@@ -431,6 +431,26 @@ pub fn handle_retry_failed(
             retryable: false,
         })?;
 
+    // Step 3b: strict parent push probe (Decision 12 Q6). The
+    // CloudBackend's append_event auto-push swallows S3 errors as
+    // warnings so the single-writer happy path stays responsive; that
+    // laxity is unsafe here because it would let child writes race
+    // ahead of a stale parent log on S3. `ensure_pushed` re-runs the
+    // push with strict error propagation. Under LocalBackend it's a
+    // no-op (filesystem writes are already durable), so this probe
+    // adds cost only where it matters.
+    backend
+        .ensure_pushed(parent_name)
+        .map_err(|e| BatchError::BackendError {
+            message: format!(
+                "parent state push failed; aborting before any child write: {}",
+                e
+            ),
+            // Remote storage failures are transient from the caller's
+            // perspective — a retry is legitimate once S3 returns.
+            retryable: true,
+        })?;
+
     // Step 4: per-child dispatch. The submitted_entries slice is the
     // CURRENT submission's task list, parsed fresh upstream; respawn
     // paths read it for the entry to re-init.

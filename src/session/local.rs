@@ -294,6 +294,12 @@ impl SessionBackend for LocalBackend {
             "lock_state_file is only supported on Unix platforms"
         )))
     }
+
+    fn ensure_pushed(&self, _id: &str) -> Result<(), SessionError> {
+        // Local storage has no remote half: append_event already made
+        // the write durable on disk, so there is nothing left to push.
+        Ok(())
+    }
 }
 
 impl LocalBackend {

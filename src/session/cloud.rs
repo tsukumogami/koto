@@ -86,8 +86,11 @@ impl CloudBackend {
     /// Construct a `CloudBackend` with an explicit `LocalBackend` and bucket.
     ///
     /// Intended for tests that need to control both the local storage
-    /// location and the S3 bucket.
-    #[cfg(test)]
+    /// location and the S3 bucket. Exposed to integration tests (not
+    /// just unit tests) so the `tests/batch_session_resolve_test.rs`
+    /// fixture can stand up a cloud backend pointed at an unreachable
+    /// endpoint without duplicating internal plumbing.
+    #[doc(hidden)]
     pub fn with_parts(local: LocalBackend, bucket: Box<Bucket>, prefix: String) -> Self {
         Self {
             local,
@@ -109,21 +112,30 @@ impl CloudBackend {
 
     /// Upload the state file to S3. Non-fatal on failure.
     fn sync_push_state(&self, id: &str) {
-        let state_path = self.local.session_dir(id).join(state_file_name(id));
-        if !state_path.exists() {
-            return;
-        }
-        let data = match std::fs::read(&state_path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("warning: cloud sync: failed to read state file: {}", e);
-                return;
-            }
-        };
-        let key = self.state_key(id);
-        if let Err(e) = self.put_object(&key, &data) {
+        if let Err(e) = self.strict_push_state(id) {
             eprintln!("warning: cloud sync failed for state upload: {}", e);
         }
+    }
+
+    /// Strict variant of [`sync_push_state`] that surfaces the `Result`.
+    ///
+    /// Used by [`CloudBackend::ensure_pushed`] to enforce "push parent
+    /// before child mutation" ordering (Decision 12 Q6). Callers that
+    /// cannot tolerate a swallowed S3 error must use this path; the
+    /// best-effort `sync_push_state` is retained for the single-writer
+    /// happy path.
+    fn strict_push_state(&self, id: &str) -> anyhow::Result<()> {
+        let state_path = self.local.session_dir(id).join(state_file_name(id));
+        if !state_path.exists() {
+            // Nothing to push; mirrors the old no-op behavior. Callers
+            // relying on ordering ensure the append happened before the
+            // probe, so this path is reachable only in degenerate tests.
+            return Ok(());
+        }
+        let data = std::fs::read(&state_path)
+            .with_context(|| format!("reading local state file: {}", state_path.display()))?;
+        let key = self.state_key(id);
+        self.put_object(&key, &data)
     }
 
     /// Download the state file from S3 to the local session directory.
@@ -356,18 +368,48 @@ impl CloudBackend {
         std::fs::read(&path).ok()
     }
 
-    /// Fetch the remote state file bytes for a session, if present.
-    /// Returns `None` on any non-success response or network failure so
-    /// callers can treat "remote absent" and "remote unreachable" the
-    /// same way (both yield the `OneSideMissing` outcome, surfaced as a
-    /// per-child warning rather than a hard failure).
-    fn fetch_remote_state_bytes(&self, id: &str) -> Option<Vec<u8>> {
+    /// Fetch the remote state file bytes for a session.
+    ///
+    /// Distinguishes three outcomes so callers can avoid treating a
+    /// transient S3 failure as "remote absent" (which would let the
+    /// strict-prefix classifier silently overwrite remote state under
+    /// `auto`):
+    ///
+    /// * `Ok(Some(bytes))` — remote object exists and was fetched.
+    /// * `Ok(None)` — remote object is confirmed absent (HTTP 404).
+    /// * `Err(..)` — transient / unknown failure. Callers MUST NOT treat
+    ///   this as "absent"; under `auto` they should surface an
+    ///   [`ChildResolution::Errored`] rather than run the AcceptedLocal
+    ///   branch and risk overwriting a remote object we simply couldn't
+    ///   reach.
+    ///
+    /// A non-404 non-200 status is treated as transient — we only trust
+    /// 404 as a positive "absent" signal because some S3-compatible
+    /// endpoints return 403 or 5xx for objects that actually exist when
+    /// auth is misconfigured or the backend is briefly unhealthy.
+    fn fetch_remote_state_bytes(&self, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let key = self.state_key(id);
-        let response = self.bucket.get_object(&key).ok()?;
-        if response.status_code() != 200 {
-            return None;
+        match self.bucket.get_object(&key) {
+            Ok(response) => {
+                let status = response.status_code();
+                if status == 200 {
+                    Ok(Some(response.bytes().to_vec()))
+                } else if status == 404 {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "remote state fetch returned unexpected status {} for key {}",
+                        status,
+                        key
+                    ))
+                }
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "remote state fetch failed for key {}: {}",
+                key,
+                e
+            )),
         }
-        Some(response.bytes().to_vec())
     }
 
     /// Classify a reconciliation decision from already-fetched bytes.
@@ -436,7 +478,26 @@ impl CloudBackend {
     ///   either side.
     pub fn reconcile_child(&self, id: &str, policy: &str) -> ChildResolution {
         let local = self.read_local_state_bytes(id);
-        let remote = self.fetch_remote_state_bytes(id);
+
+        // `skip` is a pure decision with no I/O: short-circuit so a
+        // transient S3 fetch error cannot convert an explicit skip into
+        // an Errored outcome.
+        if policy == "skip" {
+            return ChildResolution::Skipped;
+        }
+
+        // Probe remote. `Ok(None)` is a confirmed 404 (safe to treat as
+        // absent); `Err(..)` is transient/unknown and MUST short-circuit
+        // to Errored so `auto` never fires AcceptedLocal over a remote
+        // object we couldn't reach.
+        let remote = match self.fetch_remote_state_bytes(id) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return ChildResolution::Errored {
+                    message: format!("remote state unreachable: {}", e),
+                };
+            }
+        };
         let decision = Self::classify_reconciliation(local.as_deref(), remote.as_deref(), policy);
 
         // Execute the classified action. `classify_reconciliation`
@@ -709,6 +770,17 @@ impl SessionBackend for CloudBackend {
         // on the same developer machine, or a scheduler tick racing a
         // manual CLI call.
         self.local.lock_state_file(id)
+    }
+
+    fn ensure_pushed(&self, id: &str) -> Result<(), SessionError> {
+        // Strict variant of the cloud sync: fail fast on any S3 error
+        // so callers enforcing "push parent before child mutation" can
+        // abort before any child write commits. The plain append_event
+        // path still uses the warning-only sync_push_state; only the
+        // retry-failed dispatcher (and similar ordering-sensitive call
+        // sites) route through this probe.
+        self.strict_push_state(id)
+            .map_err(|e| SessionError::Other(e.context("strict parent state push failed")))
     }
 }
 
@@ -1435,6 +1507,50 @@ mod tests {
         write_state_file(tmp.path(), "child", "2026-01-01T00:00:00Z");
         assert!(matches!(
             backend.reconcile_child("child", "garbage"),
+            ChildResolution::Errored { .. }
+        ));
+    }
+
+    // Regression for Issue #19 Blocker 3: a transient remote fetch
+    // failure must surface as ChildResolution::Errored under `auto`, not
+    // silently classify as AcceptedLocal and overwrite the remote.
+    // test_cloud_backend points at an unreachable endpoint so the fetch
+    // always Errs, letting us stand in for the transient-failure case.
+    #[test]
+    fn reconcile_child_auto_errors_on_transient_fetch_failure() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_cloud_backend(tmp.path());
+        write_state_file(tmp.path(), "child", "2026-01-01T00:00:00Z");
+        let before =
+            std::fs::read(tmp.path().join("child").join(state_file_name("child"))).unwrap();
+
+        let outcome = backend.reconcile_child("child", "auto");
+        match outcome {
+            ChildResolution::Errored { .. } => {}
+            other => panic!(
+                "transient fetch failure must not produce AcceptedLocal under auto; got {:?}",
+                other
+            ),
+        }
+
+        // Local bytes are untouched; no AcceptedLocal write happened.
+        let after = std::fs::read(tmp.path().join("child").join(state_file_name("child"))).unwrap();
+        assert_eq!(
+            before, after,
+            "transient fetch failure must not mutate local state"
+        );
+    }
+
+    // Blocker 3 companion: the same guarantee under `accept-remote`.
+    // A transient fetch error must not appear to "succeed" via a
+    // misclassified absent remote.
+    #[test]
+    fn reconcile_child_accept_remote_errors_on_transient_fetch_failure() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_cloud_backend(tmp.path());
+        write_state_file(tmp.path(), "child", "2026-01-01T00:00:00Z");
+        assert!(matches!(
+            backend.reconcile_child("child", "accept-remote"),
             ChildResolution::Errored { .. }
         ));
     }

@@ -213,6 +213,33 @@ pub trait SessionBackend: Send + Sync {
     /// Read just the header from the state file.
     fn read_header(&self, id: &str) -> anyhow::Result<StateFileHeader>;
 
+    /// Push any pending local state for `id` to durable remote storage
+    /// and fail if the push cannot be confirmed.
+    ///
+    /// This exists so batch operations that must enforce "push parent
+    /// before child mutation" ordering (see Decision 12 Q6 in the
+    /// batch-child-spawning design) have a strict fail-fast probe. The
+    /// default `append_event` path on `CloudBackend` treats S3 errors as
+    /// warnings so single-writer workflows stay responsive when the
+    /// network flaps; the retry-failed dispatcher cannot tolerate that
+    /// laxity because a silently-dropped parent push lets child writes
+    /// race ahead of a stale parent log on S3.
+    ///
+    /// # Semantics
+    ///
+    /// * `LocalBackend`: no-op. Returns `Ok(())` because the local
+    ///   `append_event` write is already durable on the filesystem by
+    ///   the time the caller reaches this method.
+    /// * `CloudBackend`: performs a synchronous PUT of the local state
+    ///   file to S3 and returns `Err(SessionError::Io)` /
+    ///   `Err(SessionError::Other)` on any transport or non-success
+    ///   response.
+    ///
+    /// Callers that do NOT care about cross-host ordering should
+    /// continue to use `append_event`; this method is specifically for
+    /// the narrow retry-failed / batch-resolve paths.
+    fn ensure_pushed(&self, id: &str) -> Result<(), SessionError>;
+
     /// Acquire a non-blocking advisory `flock(LOCK_EX | LOCK_NB)` on
     /// the session's state file.
     ///
@@ -351,6 +378,13 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.lock_state_file(id),
             Backend::Cloud(b) => b.lock_state_file(id),
+        }
+    }
+
+    fn ensure_pushed(&self, id: &str) -> Result<(), SessionError> {
+        match self {
+            Backend::Local(b) => b.ensure_pushed(id),
+            Backend::Cloud(b) => b.ensure_pushed(id),
         }
     }
 }

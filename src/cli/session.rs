@@ -65,7 +65,7 @@ pub fn handle_resolve(
     let children_result = apply_children_policy(cloud, backend, name, children);
 
     let machine_id = crate::session::version::get_or_create_machine_id()?;
-    let sync_status = parent_sync_status_label(cloud, name);
+    let sync_status = parent_remote_presence_label(cloud, name);
 
     let response = serde_json::json!({
         "name": name,
@@ -123,6 +123,18 @@ fn apply_children_policy(
 ) -> Vec<ChildResolutionRow> {
     let policy_str = children_policy_label(policy);
 
+    // Known v1 limitation: `Backend::list()` on CloudBackend merges
+    // remote-only session IDs into the returned `Vec<SessionInfo>`, but
+    // the placeholder entries it produces have an empty
+    // `parent_workflow` (the remote state file isn't downloaded here).
+    // That means the `filter` below drops any child that exists only
+    // on S3 (e.g., initialized on another host that hasn't yet synced
+    // back locally) because its parent_workflow cannot be recovered.
+    // Running `session resolve --children` therefore reconciles only
+    // children this host has already observed. A future revision
+    // should either (a) HEAD the remote state header to populate
+    // parent_workflow, or (b) add a dedicated `list_children(parent)`
+    // on the backend so we can enumerate S3 prefixes directly.
     let sessions = match backend.list() {
         Ok(s) => s,
         Err(e) => {
@@ -158,14 +170,19 @@ fn children_policy_label(p: ChildrenPolicy) -> &'static str {
     }
 }
 
-/// Best-effort summary of the parent's post-reconciliation sync state.
+/// Probe whether the parent's state file is visible on the remote
+/// after reconciliation.
 ///
-/// After `resolve_conflict` succeeds, local and remote converge on the
-/// same version, so the expected label is `"fresh"`. We still probe
-/// remote to detect the narrow case where S3 is unreachable after the
-/// parent leg wrote locally; in that case we surface `"local_only"` so
-/// the caller doesn't mistake an offline push-back for a clean sync.
-fn parent_sync_status_label(cloud: &CloudBackend, name: &str) -> &'static str {
+/// The returned label (`"fresh"` or `"local_only"`) describes only
+/// whether a HEAD on the remote state object succeeded; it does NOT
+/// compare bytes or versions. After `resolve_conflict` succeeds, local
+/// and remote normally converge on the same content, so the expected
+/// label is `"fresh"`. `"local_only"` surfaces the narrow case where
+/// S3 was unreachable when the parent leg wrote locally, so the caller
+/// doesn't mistake an offline push-back for a clean sync. Downstream
+/// machinery that needs byte-level parity must perform its own
+/// reconciliation — this label exists purely to flag a missing remote.
+fn parent_remote_presence_label(cloud: &CloudBackend, name: &str) -> &'static str {
     if cloud.remote_state_exists(name) {
         "fresh"
     } else {

@@ -395,10 +395,22 @@ Response shape (cloud backend only — `sync_status` and `machine_id` are elided
   "children": [
     {"name": "parent.task-1", "action": "identical"},
     {"name": "parent.task-2", "action": "accepted_remote"},
-    {"name": "parent.task-3", "action": "conflict"}
+    {"name": "parent.task-3", "action": "conflict"},
+    {"name": "parent.task-4", "action": "errored", "message": "remote state unreachable: ..."}
   ]
 }
 ```
+
+Per-child `action` values:
+
+| Value | Meaning |
+|---|---|
+| `identical` | Local and remote bytes matched; nothing touched. |
+| `accepted_local` | Local was pushed to remote (either by strict-prefix rule under `auto` or by the explicit `accept-local` policy). |
+| `accepted_remote` | Remote was pulled to local (either by strict-prefix rule under `auto` or by the explicit `accept-remote` policy). |
+| `skipped` | `skip` policy was applied — neither side was touched. |
+| `conflict` | Both sides diverged under `auto`. Run `koto session resolve <child>` on this child. |
+| `errored` | A per-child I/O or network failure prevented reconciliation. Sibling children still processed. The `message` field explains the specific failure. This includes the case where remote S3 was unreachable under `auto` — `auto` refuses to overwrite remote when it cannot confirm the remote state, so a transient fetch failure surfaces here rather than silently applying `accepted_local`. |
 
 ---
 
