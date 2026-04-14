@@ -33,10 +33,6 @@ pub enum SessionError {
     /// inspect its `kind()` for retry decisions.
     Io(std::io::Error),
 
-    /// A serialization failure (serde, JSON formatting, etc.). String
-    /// payload because `serde_json::Error` doesn't round-trip cleanly.
-    Serialization(String),
-
     /// Fallback for failures that don't fit the variants above.
     Other(anyhow::Error),
 }
@@ -48,7 +44,6 @@ impl fmt::Display for SessionError {
                 write!(f, "state file already exists at the target path")
             }
             SessionError::Io(e) => write!(f, "session I/O error: {}", e),
-            SessionError::Serialization(s) => write!(f, "session serialization error: {}", s),
             SessionError::Other(e) => write!(f, "session error: {}", e),
         }
     }
@@ -59,7 +54,7 @@ impl std::error::Error for SessionError {
         match self {
             SessionError::Io(e) => Some(e),
             SessionError::Other(e) => Some(e.as_ref()),
-            _ => None,
+            SessionError::Collision => None,
         }
     }
 }
@@ -75,26 +70,6 @@ impl From<std::io::Error> for SessionError {
         } else {
             SessionError::Io(e)
         }
-    }
-}
-
-impl From<serde_json::Error> for SessionError {
-    fn from(e: serde_json::Error) -> Self {
-        SessionError::Serialization(e.to_string())
-    }
-}
-
-impl From<anyhow::Error> for SessionError {
-    fn from(e: anyhow::Error) -> Self {
-        // If the underlying cause is an io::Error, preserve the typed
-        // variant so `?` through `anyhow` chains in implementation code
-        // still surfaces Collision correctly.
-        if let Some(io) = e.downcast_ref::<std::io::Error>() {
-            if io.kind() == std::io::ErrorKind::AlreadyExists {
-                return SessionError::Collision;
-            }
-        }
-        SessionError::Other(e)
     }
 }
 
@@ -166,9 +141,10 @@ pub trait SessionBackend: Send + Sync {
     /// itself may remain and is garbage-collected by a separate sweep.
     ///
     /// Implementations store the tempfile in the same directory as the
-    /// target with the prefix `.koto-init-` and the suffix `.tmp` (for
-    /// example `.koto-init-aBcDeF.tmp`). Sweep tooling that cleans up
-    /// crashed initialisations relies on this convention.
+    /// target using the filename convention defined by
+    /// `INIT_TMP_PREFIX` / `INIT_TMP_SUFFIX` in `session::local`. Sweep
+    /// tooling that cleans up crashed initialisations relies on this
+    /// convention.
     ///
     /// On Linux this uses `renameat2(RENAME_NOREPLACE)` for a single-
     /// syscall fail-if-exists check. On other Unixes it uses POSIX

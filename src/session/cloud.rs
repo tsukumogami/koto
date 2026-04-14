@@ -784,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn init_state_file_second_call_errors_already_exists() {
+    fn init_state_file_second_call_returns_collision() {
         use crate::engine::types::{Event, EventPayload};
 
         let tmp = TempDir::new().unwrap();

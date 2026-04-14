@@ -11,6 +11,17 @@ use crate::session::context::{ContextStore, KeyMeta, Manifest};
 use crate::session::validate::{validate_context_key, validate_session_id};
 use crate::session::{state_file_name, SessionBackend, SessionError, SessionInfo};
 
+/// Filename prefix for `init_state_file` tempfiles.
+///
+/// The full tempfile name is `<prefix><random><suffix>`, for example
+/// `.koto-init-aBcDeF.tmp`. Sweep tooling that garbage-collects crashed
+/// initialisations relies on this exact prefix+suffix pair.
+pub(crate) const INIT_TMP_PREFIX: &str = ".koto-init-";
+
+/// Filename suffix for `init_state_file` tempfiles. Paired with
+/// [`INIT_TMP_PREFIX`].
+pub(crate) const INIT_TMP_SUFFIX: &str = ".tmp";
+
 /// Filesystem-backed session storage.
 ///
 /// Stores sessions at `<base_dir>/<id>/` where `base_dir` is typically
@@ -161,7 +172,7 @@ impl SessionBackend for LocalBackend {
         // Ensure the session directory exists so the tempfile can live on
         // the same filesystem as the final target. Also ensures the .koto
         // root exists with restricted permissions.
-        ensure_koto_root(&self.base_dir).map_err(SessionError::from)?;
+        ensure_koto_root(&self.base_dir).map_err(SessionError::Other)?;
         let session_dir = self.base_dir.join(id);
         fs::create_dir_all(&session_dir).map_err(|e| {
             SessionError::Io(std::io::Error::new(
@@ -179,24 +190,31 @@ impl SessionBackend for LocalBackend {
         // Serialize the bundle (header line + one JSONL line per event)
         // into an in-memory buffer. The header itself carries no seq
         // field; events use the caller-supplied seq numbers verbatim.
+        //
+        // `StateFileHeader` and `Event` are crate-owned types whose fields
+        // are all straightforward JSON-representable primitives (no maps
+        // with non-string keys, no floats that could be NaN, no custom
+        // serializers that error). `serde_json::to_string` on them cannot
+        // fail in practice, so we expect() rather than propagate.
         let mut buf = String::new();
-        let header_line = serde_json::to_string(&header)?;
+        let header_line =
+            serde_json::to_string(&header).expect("StateFileHeader serialize is infallible");
         buf.push_str(&header_line);
         buf.push('\n');
         for event in &initial_events {
-            let line = serde_json::to_string(event)?;
+            let line = serde_json::to_string(event).expect("Event serialize is infallible");
             buf.push_str(&line);
             buf.push('\n');
         }
 
         // Write the bundle to a tempfile in the session directory so the
-        // final rename/link is same-filesystem. The prefix
-        // `.koto-init-` is intentional: sweep tooling for crashed
-        // initialisations relies on this glob. `keep()` defuses the
-        // auto-delete so we can drive the final rename ourselves.
+        // final rename/link is same-filesystem. The prefix/suffix come
+        // from `INIT_TMP_PREFIX` / `INIT_TMP_SUFFIX` so sweep tooling and
+        // tests agree on the glob. `keep()` defuses the auto-delete so we
+        // can drive the final rename ourselves.
         let tmp = tempfile::Builder::new()
-            .prefix(".koto-init-")
-            .suffix(".tmp")
+            .prefix(INIT_TMP_PREFIX)
+            .suffix(INIT_TMP_SUFFIX)
             .tempfile_in(&session_dir)
             .map_err(SessionError::Io)?;
         {
@@ -222,10 +240,9 @@ impl SessionBackend for LocalBackend {
         match atomic_create_rename(&tmp_path, &target) {
             Ok(()) => Ok(()),
             Err(e) => {
-                // Best-effort cleanup of the tempfile: if renameat2 or
-                // link succeeded, the source is already gone (link +
-                // unlink). If it failed, we remove the leftover tempfile
-                // so it doesn't masquerade as state.
+                // On every error path the tempfile is still at `tmp_path`
+                // (renameat2/link/rename leave the source untouched on
+                // failure), so unconditional removal is safe.
                 let _ = fs::remove_file(&tmp_path);
                 Err(e)
             }
@@ -1149,14 +1166,13 @@ mod tests {
             handles.push(thread::spawn(move || {
                 // Each thread has a different event payload so that a
                 // silent overwrite would produce different content.
-                let mut header = StateFileHeader {
+                let header = StateFileHeader {
                     schema_version: 1,
                     workflow: "race".to_string(),
                     template_hash: format!("hash-{}", i),
                     created_at: "2026-04-13T00:00:00Z".to_string(),
                     parent_workflow: None,
                 };
-                header.template_hash = format!("hash-{}", i);
                 let events = vec![Event {
                     seq: 1,
                     timestamp: "2026-04-13T00:00:00Z".to_string(),
@@ -1200,7 +1216,7 @@ mod tests {
     // -- scenario-1: two sequential calls on the same path --
 
     #[test]
-    fn init_state_file_second_call_errors_with_already_exists() {
+    fn init_state_file_second_call_returns_collision() {
         let tmp = TempDir::new().unwrap();
         let backend = test_backend(tmp.path());
         let (h1, e1) = sample_bundle("wf");
