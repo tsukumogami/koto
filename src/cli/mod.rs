@@ -3027,7 +3027,6 @@ mod tests {
 
     #[test]
     fn resolve_with_data_source_at_file_reads_contents() {
-        use crate::cli::next_types::NextErrorCode;
         use std::io::Write as _;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3039,11 +3038,6 @@ mod tests {
         let arg = format!("@{}", path.display());
         let result = resolve_with_data_source(&arg).unwrap();
         assert_eq!(result, contents);
-
-        // Sanity: ensure we didn't accidentally classify this as an error.
-        let err: Result<String, crate::cli::next_types::NextError> = resolve_with_data_source(&arg);
-        assert!(err.is_ok(), "happy-path file read should not error");
-        let _: NextErrorCode = NextErrorCode::InvalidSubmission; // type tag only
     }
 
     #[test]
