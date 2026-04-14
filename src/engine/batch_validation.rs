@@ -35,7 +35,7 @@
 //! mixed-failure submissions. `DESIGN-batch-child-spawning.md:1956`
 //! spells out `R0, R3, R4, R5, R6, R8, R9`. R4-before-R8 matters in
 //! particular: a typoed dependency name should surface as
-//! [`InvalidBatchReason::UnknownWaitsOn`] rather than a spurious
+//! [`InvalidBatchReason::DanglingRefs`] rather than a spurious
 //! [`InvalidBatchReason::SpawnedTaskMutated`] on an unrelated entry.
 //!
 //! # Return shape
@@ -53,7 +53,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::cli::batch_error::{BatchError, InvalidBatchReason, InvalidNameDetail, LimitKind};
+use crate::cli::batch_error::{
+    BatchError, DanglingRef, InvalidBatchReason, InvalidNameDetail, LimitKind, MutatedField,
+};
 use crate::engine::types::SpawnEntrySnapshot;
 
 /// Hard limit on the number of tasks in one submission (R6).
@@ -149,8 +151,8 @@ pub fn validate_batch_submission(
     for task in tasks {
         if !seen.insert(task.name.as_str()) {
             return Err(BatchError::InvalidBatchDefinition {
-                reason: InvalidBatchReason::DuplicateTaskName {
-                    task: task.name.clone(),
+                reason: InvalidBatchReason::DuplicateNames {
+                    duplicates: vec![task.name.clone()],
                 },
             });
         }
@@ -175,9 +177,11 @@ pub fn validate_batch_submission(
         for dep in &task.waits_on {
             if !name_set.contains(dep.as_str()) {
                 return Err(BatchError::InvalidBatchDefinition {
-                    reason: InvalidBatchReason::UnknownWaitsOn {
-                        task: task.name.clone(),
-                        unknown: dep.clone(),
+                    reason: InvalidBatchReason::DanglingRefs {
+                        entries: vec![DanglingRef {
+                            task: task.name.clone(),
+                            unknown: dep.clone(),
+                        }],
                     },
                 });
             }
@@ -211,11 +215,12 @@ pub fn validate_batch_submission(
         // `Some(None)` means the child is mid-respawn — R8-vacuous.
         // `None` (key absent) means the child has never been spawned.
         if let Some(Some(snapshot)) = existing_children.get(task.name.as_str()) {
-            if let Some(diff) = spawn_entry_diff(task, snapshot) {
+            let changed_fields = spawn_entry_diff_fields(task, snapshot);
+            if !changed_fields.is_empty() {
                 return Err(BatchError::InvalidBatchDefinition {
                     reason: InvalidBatchReason::SpawnedTaskMutated {
                         task: task.name.clone(),
-                        diff,
+                        changed_fields,
                     },
                 });
             }
@@ -228,17 +233,39 @@ pub fn validate_batch_submission(
     // known to be legal.
     let name_re = name_regex();
     for task in tasks {
-        if let Some(detail) = check_name(&task.name, &name_re) {
-            return Err(BatchError::InvalidBatchDefinition {
-                reason: InvalidBatchReason::InvalidName {
-                    task: task.name.clone(),
-                    kind: detail,
-                },
-            });
+        match check_name(&task.name, &name_re) {
+            NameCheck::Valid => {}
+            NameCheck::Reserved(name) => {
+                return Err(BatchError::InvalidBatchDefinition {
+                    reason: InvalidBatchReason::ReservedNameCollision {
+                        task: task.name.clone(),
+                        reserved: name,
+                    },
+                });
+            }
+            NameCheck::Invalid(detail) => {
+                return Err(BatchError::InvalidBatchDefinition {
+                    reason: InvalidBatchReason::InvalidName {
+                        task: task.name.clone(),
+                        name_rule: detail,
+                    },
+                });
+            }
         }
     }
 
     Ok(())
+}
+
+/// Result of `check_name`: valid, a regex/length violation, or a
+/// reserved-name collision. Split from `InvalidNameDetail` so the R9
+/// dispatcher can emit the correct typed variant
+/// (`ReservedNameCollision` is a sibling of `InvalidName` in the
+/// `InvalidBatchReason` enum, not a nested detail).
+enum NameCheck {
+    Valid,
+    Invalid(InvalidNameDetail),
+    Reserved(String),
 }
 
 /// Build the R9 regex. Compiled once per call; the pattern is tiny
@@ -247,22 +274,22 @@ fn name_regex() -> Regex {
     Regex::new(r"^[A-Za-z0-9_-]+$").expect("R9 regex is a constant and always parses")
 }
 
-/// Run the R9 checks against one name. Returns `None` when the name
-/// is valid, or the specific [`InvalidNameDetail`] describing why it
-/// was rejected.
-fn check_name(name: &str, name_re: &Regex) -> Option<InvalidNameDetail> {
+/// Run the R9 checks against one name. Returns [`NameCheck::Valid`]
+/// when the name passes, or a typed rejection describing why it
+/// failed.
+fn check_name(name: &str, name_re: &Regex) -> NameCheck {
     // Length band is checked first so an empty string reports
     // `LengthOutOfRange(0)` instead of `RegexMismatch`.
     if name.is_empty() || name.len() > 64 {
-        return Some(InvalidNameDetail::LengthOutOfRange(name.len()));
+        return NameCheck::Invalid(InvalidNameDetail::LengthOutOfRange(name.len()));
     }
     if !name_re.is_match(name) {
-        return Some(InvalidNameDetail::RegexMismatch);
+        return NameCheck::Invalid(InvalidNameDetail::RegexMismatch);
     }
     if RESERVED_NAMES.contains(&name) {
-        return Some(InvalidNameDetail::Reserved(name.to_string()));
+        return NameCheck::Reserved(name.to_string());
     }
-    None
+    NameCheck::Valid
 }
 
 /// Find a cycle in the `waits_on` graph, returning the task names
@@ -416,24 +443,29 @@ fn longest_path_node_count(tasks: &[TaskEntry]) -> u32 {
 /// `changed_fields: Vec<{field, spawned_value, submitted_value}>`
 /// shape so the error envelope can render richer output and honor
 /// the `"[REDACTED]"` sentinel described in the design.
-fn spawn_entry_diff(task: &TaskEntry, snapshot: &SpawnEntrySnapshot) -> Option<String> {
-    let mut diffs: Vec<String> = Vec::new();
+/// Collect every `spawn_entry` field whose submitted value disagrees
+/// with the recorded snapshot. Returns an empty vec when the entry
+/// matches. The field names (`template`, `vars`, `waits_on`) match
+/// the dotted paths the design doc's R8 section pins.
+fn spawn_entry_diff_fields(task: &TaskEntry, snapshot: &SpawnEntrySnapshot) -> Vec<MutatedField> {
+    let mut diffs: Vec<MutatedField> = Vec::new();
 
     if let Some(submitted_tpl) = &task.template {
         if submitted_tpl != &snapshot.template {
-            diffs.push(format!(
-                "template: spawned={:?}, submitted={:?}",
-                snapshot.template, submitted_tpl
-            ));
+            diffs.push(MutatedField {
+                field: "template".into(),
+                spawned_value: serde_json::Value::String(snapshot.template.clone()),
+                submitted_value: serde_json::Value::String(submitted_tpl.clone()),
+            });
         }
     }
 
     if task.vars != snapshot.vars {
-        diffs.push(format!(
-            "vars: spawned={}, submitted={}",
-            render_vars(&snapshot.vars),
-            render_vars(&task.vars),
-        ));
+        diffs.push(MutatedField {
+            field: "vars".into(),
+            spawned_value: serde_json::to_value(&snapshot.vars).unwrap_or(serde_json::Value::Null),
+            submitted_value: serde_json::to_value(&task.vars).unwrap_or(serde_json::Value::Null),
+        });
     }
 
     // waits_on comparison uses canonical (sorted) order so the caller
@@ -442,22 +474,16 @@ fn spawn_entry_diff(task: &TaskEntry, snapshot: &SpawnEntrySnapshot) -> Option<S
     let mut submitted_waits = task.waits_on.clone();
     submitted_waits.sort();
     if submitted_waits != snapshot.waits_on {
-        diffs.push(format!(
-            "waits_on: spawned={:?}, submitted={:?}",
-            snapshot.waits_on, submitted_waits
-        ));
+        diffs.push(MutatedField {
+            field: "waits_on".into(),
+            spawned_value: serde_json::to_value(&snapshot.waits_on)
+                .unwrap_or(serde_json::Value::Null),
+            submitted_value: serde_json::to_value(&submitted_waits)
+                .unwrap_or(serde_json::Value::Null),
+        });
     }
 
-    if diffs.is_empty() {
-        None
-    } else {
-        Some(diffs.join("; "))
-    }
-}
-
-fn render_vars(vars: &BTreeMap<String, serde_json::Value>) -> String {
-    // Stable serde ordering because BTreeMap iterates in key order.
-    serde_json::to_string(vars).unwrap_or_else(|_| "<unserializable>".to_string())
+    diffs
 }
 
 #[cfg(test)]
@@ -553,12 +579,13 @@ mod tests {
         let err = validate_batch_submission(&tasks, &HashMap::new()).unwrap_err();
         match err {
             BatchError::InvalidBatchDefinition {
-                reason: InvalidBatchReason::UnknownWaitsOn { task, unknown },
+                reason: InvalidBatchReason::DanglingRefs { entries },
             } => {
-                assert_eq!(task, "a");
-                assert_eq!(unknown, "ghost");
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].task, "a");
+                assert_eq!(entries[0].unknown, "ghost");
             }
-            other => panic!("expected UnknownWaitsOn, got {:?}", other),
+            other => panic!("expected DanglingRefs, got {:?}", other),
         }
     }
 
@@ -576,9 +603,11 @@ mod tests {
         let err = validate_batch_submission(&tasks, &HashMap::new()).unwrap_err();
         match err {
             BatchError::InvalidBatchDefinition {
-                reason: InvalidBatchReason::DuplicateTaskName { task },
-            } => assert_eq!(task, "a"),
-            other => panic!("expected DuplicateTaskName, got {:?}", other),
+                reason: InvalidBatchReason::DuplicateNames { duplicates },
+            } => {
+                assert_eq!(duplicates, vec!["a".to_string()]);
+            }
+            other => panic!("expected DuplicateNames, got {:?}", other),
         }
     }
 
@@ -786,10 +815,18 @@ mod tests {
         let err = validate_batch_submission(&[submitted], &existing).unwrap_err();
         match err {
             BatchError::InvalidBatchDefinition {
-                reason: InvalidBatchReason::SpawnedTaskMutated { task, diff },
+                reason:
+                    InvalidBatchReason::SpawnedTaskMutated {
+                        task,
+                        changed_fields,
+                    },
             } => {
                 assert_eq!(task, "a");
-                assert!(diff.contains("vars"), "expected vars in diff, got {}", diff);
+                assert!(
+                    changed_fields.iter().any(|f| f.field == "vars"),
+                    "expected vars in changed_fields, got {:?}",
+                    changed_fields
+                );
             }
             other => panic!("expected SpawnedTaskMutated, got {:?}", other),
         }
@@ -861,7 +898,7 @@ mod tests {
                 reason:
                     InvalidBatchReason::InvalidName {
                         task,
-                        kind: InvalidNameDetail::RegexMismatch,
+                        name_rule: InvalidNameDetail::RegexMismatch,
                     },
             } => assert_eq!(task, "bad name"),
             other => panic!("expected InvalidName(RegexMismatch), got {:?}", other),
@@ -879,7 +916,7 @@ mod tests {
             BatchError::InvalidBatchDefinition {
                 reason:
                     InvalidBatchReason::InvalidName {
-                        kind: InvalidNameDetail::LengthOutOfRange(len),
+                        name_rule: InvalidNameDetail::LengthOutOfRange(len),
                         ..
                     },
             } => assert_eq!(len, 0),
@@ -896,7 +933,7 @@ mod tests {
             BatchError::InvalidBatchDefinition {
                 reason:
                     InvalidBatchReason::InvalidName {
-                        kind: InvalidNameDetail::LengthOutOfRange(len),
+                        name_rule: InvalidNameDetail::LengthOutOfRange(len),
                         ..
                     },
             } => assert_eq!(len, 65),
@@ -917,13 +954,15 @@ mod tests {
         let err = validate_batch_submission(&tasks, &HashMap::new()).unwrap_err();
         match err {
             BatchError::InvalidBatchDefinition {
-                reason:
-                    InvalidBatchReason::InvalidName {
-                        kind: InvalidNameDetail::Reserved(name),
-                        ..
-                    },
-            } => assert_eq!(name, "retry_failed"),
-            other => panic!("expected Reserved(retry_failed), got {:?}", other),
+                reason: InvalidBatchReason::ReservedNameCollision { task, reserved },
+            } => {
+                assert_eq!(task, "retry_failed");
+                assert_eq!(reserved, "retry_failed");
+            }
+            other => panic!(
+                "expected ReservedNameCollision(retry_failed), got {:?}",
+                other
+            ),
         }
     }
 
@@ -934,10 +973,7 @@ mod tests {
         assert!(matches!(
             err,
             BatchError::InvalidBatchDefinition {
-                reason: InvalidBatchReason::InvalidName {
-                    kind: InvalidNameDetail::Reserved(_),
-                    ..
-                }
+                reason: InvalidBatchReason::ReservedNameCollision { .. }
             }
         ));
     }
@@ -963,7 +999,7 @@ mod tests {
         assert!(matches!(
             err,
             BatchError::InvalidBatchDefinition {
-                reason: InvalidBatchReason::UnknownWaitsOn { .. }
+                reason: InvalidBatchReason::DanglingRefs { .. }
             }
         ));
     }
@@ -977,7 +1013,7 @@ mod tests {
         assert!(matches!(
             err,
             BatchError::InvalidBatchDefinition {
-                reason: InvalidBatchReason::DuplicateTaskName { .. }
+                reason: InvalidBatchReason::DuplicateNames { .. }
             }
         ));
     }

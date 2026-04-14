@@ -87,15 +87,102 @@ pub enum TemplateSource {
 /// Populating it is the scheduler's job; Issue #3 leaves
 /// `TaskSpawnError.compile_error` as `None` and stuffs the compile
 /// message into the top-level `message` field instead.
+///
+/// `kind` is a typed [`CompileErrorKind`] rather than a free string so
+/// agents can branch on rule identity without string-parsing. The
+/// `Other` variant covers compiler failure modes that don't carry a
+/// stable rule tag (internal errors, YAML parse errors).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompileError {
-    /// Short machine-parseable discriminator (e.g. `yaml_parse`,
-    /// `missing_field`, `state_reference`).
-    pub kind: String,
+    /// Typed rule-tag discriminator (e.g. `E1`, `W4`, `F5`) or
+    /// `Other` for compiler failures without a canonical rule.
+    pub kind: CompileErrorKind,
     /// Human-readable message from the compiler.
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<CompileErrorLocation>,
+}
+
+/// Typed discriminator for [`CompileError::kind`].
+///
+/// The materialize-children compile rules (E1..E10, W1..W5, F5) are
+/// first-class variants. Compiler failures without a documented rule
+/// (YAML parse errors, internal compiler bugs, legacy diagnostics)
+/// surface through [`CompileErrorKind::Other`] with a free-string
+/// tag. Serializes to the snake_case rule tag (e.g. `"e1"`, `"w4"`)
+/// so the JSON surface matches the design doc's rule-identity
+/// convention.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompileErrorKind {
+    /// `from_field` is non-empty.
+    E1,
+    /// `from_field` names a declared accepts field.
+    E2,
+    /// Referenced field has `type: tasks`.
+    E3,
+    /// Referenced field has `required: true`.
+    E4,
+    /// Declaring state is not terminal.
+    E5,
+    /// `failure_policy` is `skip_dependents` or `continue`.
+    E6,
+    /// State has at least one outgoing transition.
+    E7,
+    /// No two states reference the same `from_field`.
+    E8,
+    /// `default_template` is non-empty and resolves.
+    E9,
+    /// State with `materialize_children` declares a `children-complete`
+    /// gate.
+    E10,
+    /// W1..W5: compile-time warnings surface through this aggregate.
+    /// The specific warning is carried in the human-readable
+    /// `message`; agents that need the exact rule can branch on the
+    /// `W1`..`W5` prefix of the message body.
+    W1,
+    W2,
+    W3,
+    W4,
+    W5,
+    /// F5: skipped_marker reachability advisory.
+    F5,
+    /// Catch-all for compiler failures that don't map to a rule (YAML
+    /// parse, missing field, internal error). `tag` carries the
+    /// best-effort discriminator the compiler produced; the human
+    /// message lives in `CompileError.message`.
+    Other {
+        tag: String,
+    },
+}
+
+impl CompileErrorKind {
+    /// Classify a rule tag string produced by
+    /// `parse_compile_rule_tag` (or hand-assembled) into its typed
+    /// variant. Unknown tags become [`CompileErrorKind::Other`].
+    pub fn from_rule_tag(tag: &str) -> Self {
+        match tag {
+            "E1" => Self::E1,
+            "E2" => Self::E2,
+            "E3" => Self::E3,
+            "E4" => Self::E4,
+            "E5" => Self::E5,
+            "E6" => Self::E6,
+            "E7" => Self::E7,
+            "E8" => Self::E8,
+            "E9" => Self::E9,
+            "E10" => Self::E10,
+            "W1" => Self::W1,
+            "W2" => Self::W2,
+            "W3" => Self::W3,
+            "W4" => Self::W4,
+            "W5" => Self::W5,
+            "F5" => Self::F5,
+            other => Self::Other {
+                tag: other.to_string(),
+            },
+        }
+    }
 }
 
 /// Optional source-location detail on a compile error.
@@ -124,8 +211,9 @@ impl CompileError {
     /// helper is the minimum wiring needed so the rule tag round-trips
     /// through `CompileError.kind` until then.
     pub fn from_rule_tag(rule_tag: impl Into<String>, message: impl Into<String>) -> Self {
+        let tag_str: String = rule_tag.into();
         Self {
-            kind: rule_tag.into(),
+            kind: CompileErrorKind::from_rule_tag(&tag_str),
             message: message.into(),
             location: None,
         }
@@ -292,9 +380,47 @@ mod tests {
     #[test]
     fn compile_error_from_rule_tag_populates_kind() {
         let err = CompileError::from_rule_tag("E1", "state \"plan\": from_field must not be empty");
-        assert_eq!(err.kind, "E1");
+        assert_eq!(err.kind, CompileErrorKind::E1);
         assert!(err.message.starts_with("state "));
         assert!(err.location.is_none());
+    }
+
+    #[test]
+    fn compile_error_kind_serializes_to_snake_case() {
+        let v = serde_json::to_value(CompileErrorKind::E10).unwrap();
+        assert_eq!(v, serde_json::Value::String("e10".into()));
+        let v = serde_json::to_value(CompileErrorKind::W4).unwrap();
+        assert_eq!(v, serde_json::Value::String("w4".into()));
+        let v = serde_json::to_value(CompileErrorKind::F5).unwrap();
+        assert_eq!(v, serde_json::Value::String("f5".into()));
+    }
+
+    #[test]
+    fn compile_error_kind_other_preserves_tag() {
+        let k = CompileErrorKind::from_rule_tag("Z42");
+        assert_eq!(
+            k,
+            CompileErrorKind::Other {
+                tag: "Z42".to_string()
+            }
+        );
+        let v = serde_json::to_value(&k).unwrap();
+        assert_eq!(v, serde_json::json!({"other": {"tag": "Z42"}}));
+    }
+
+    #[test]
+    fn compile_error_kind_round_trips_through_serde() {
+        for k in [
+            CompileErrorKind::E1,
+            CompileErrorKind::E10,
+            CompileErrorKind::W4,
+            CompileErrorKind::F5,
+            CompileErrorKind::Other { tag: "X1".into() },
+        ] {
+            let v = serde_json::to_value(&k).unwrap();
+            let round: CompileErrorKind = serde_json::from_value(v).unwrap();
+            assert_eq!(round, k);
+        }
     }
 
     #[test]

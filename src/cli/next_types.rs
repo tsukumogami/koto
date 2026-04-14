@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::ser::SerializeMap;
 use serde::Serialize;
 
+use crate::cli::batch_error::BatchError;
 use crate::gate::{built_in_default, GateOutcome, StructuredGateResult};
 use crate::template::types::{Gate, TemplateState, FIELD_TYPE_TASKS};
 
@@ -66,6 +67,45 @@ pub enum NextResponse {
         action_output: ActionOutput,
         expects: Option<ExpectsSchema>,
     },
+    /// Rejected submission — typed error envelope with optional
+    /// batch-specific context. Emits `action: "error"`. Carries the
+    /// typed `NextError` alongside an optional [`BatchErrorContext`]
+    /// that re-emits the same JSON payload under `error.batch` so
+    /// agents parse the batch shape from the same place regardless of
+    /// whether the error is domain- or batch-scoped.
+    Error {
+        state: String,
+        advanced: bool,
+        error: NextError,
+        batch: Option<BatchErrorContext>,
+        blocking_conditions: Vec<BlockingCondition>,
+    },
+}
+
+/// Sibling payload attached to `NextResponse::Error` when the underlying
+/// failure originates from batch machinery (Decision 11). Carries the
+/// exact JSON payload [`BatchError::to_batch_payload`] produces so
+/// downstream agents see the same shape whether the error comes in via
+/// the top-level `{"action": "error", "batch": ...}` envelope or nested
+/// under `error.batch` in a typed-NextError response.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct BatchErrorContext {
+    /// Raw JSON payload — opaque from this layer's perspective. Use
+    /// [`BatchErrorContext::from_batch_error`] to build one from a
+    /// typed [`BatchError`] so the payload stays in sync.
+    pub payload: serde_json::Value,
+}
+
+impl BatchErrorContext {
+    /// Build a [`BatchErrorContext`] from a typed [`BatchError`]. The
+    /// payload matches what `BatchError::to_envelope()["batch"]` would
+    /// produce, keeping one source of truth for the `batch` key shape.
+    pub fn from_batch_error(err: &BatchError) -> Self {
+        Self {
+            payload: err.to_batch_payload(),
+        }
+    }
 }
 
 impl NextResponse {
@@ -136,6 +176,8 @@ impl NextResponse {
                 integration,
             },
             terminal @ NextResponse::Terminal { .. } => terminal,
+            // `Error` carries no directive to substitute; return as-is.
+            err @ NextResponse::Error { .. } => err,
             NextResponse::ActionRequiresConfirmation {
                 state,
                 directive,
@@ -274,6 +316,44 @@ impl Serialize for NextResponse {
                 map.serialize_entry("action_output", action_output)?;
                 map.serialize_entry("expects", expects)?;
                 map.serialize_entry("error", &None::<()>)?;
+                map.end()
+            }
+            NextResponse::Error {
+                state,
+                advanced,
+                error,
+                batch,
+                blocking_conditions,
+            } => {
+                // Emit the error payload as a single object containing
+                // the typed NextError fields plus an optional `batch`
+                // sibling carrying the typed batch context.
+                let error_value = {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert(
+                        "code".into(),
+                        serde_json::to_value(&error.code).expect("NextErrorCode serializable"),
+                    );
+                    obj.insert(
+                        "message".into(),
+                        serde_json::Value::String(error.message.clone()),
+                    );
+                    obj.insert(
+                        "details".into(),
+                        serde_json::to_value(&error.details).expect("ErrorDetail serializable"),
+                    );
+                    if let Some(ctx) = batch {
+                        obj.insert("batch".into(), ctx.payload.clone());
+                    }
+                    serde_json::Value::Object(obj)
+                };
+                let mut map = serializer.serialize_map(Some(6))?;
+                map.serialize_entry("action", "error")?;
+                map.serialize_entry("state", state)?;
+                map.serialize_entry("advanced", advanced)?;
+                map.serialize_entry("expects", &None::<()>)?;
+                map.serialize_entry("blocking_conditions", blocking_conditions)?;
+                map.serialize_entry("error", &error_value)?;
                 map.end()
             }
         }
@@ -1675,5 +1755,75 @@ mod tests {
             json["fields"]["tasks"]["item_schema"]["template"]["default"],
             "child.md"
         );
+    }
+
+    // --- NextResponse::Error serialization ---------------------------
+
+    #[test]
+    fn serialize_error_variant_without_batch_context() {
+        let resp = NextResponse::Error {
+            state: "plan".into(),
+            advanced: false,
+            error: NextError {
+                code: NextErrorCode::InvalidSubmission,
+                message: "bad input".into(),
+                details: vec![ErrorDetail {
+                    field: "tasks".into(),
+                    reason: "empty".into(),
+                }],
+            },
+            batch: None,
+            blocking_conditions: vec![],
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["action"], "error");
+        assert_eq!(v["state"], "plan");
+        assert_eq!(v["advanced"], false);
+        assert_eq!(v["error"]["code"], "invalid_submission");
+        assert_eq!(v["error"]["message"], "bad input");
+        assert_eq!(v["error"]["details"][0]["field"], "tasks");
+        assert!(v["error"].get("batch").is_none());
+        assert!(v["expects"].is_null());
+        assert_eq!(v["blocking_conditions"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn serialize_error_variant_with_batch_context_embeds_payload() {
+        use crate::cli::batch_error::{BatchError, InvalidBatchReason};
+
+        let batch_err = BatchError::InvalidBatchDefinition {
+            reason: InvalidBatchReason::EmptyTaskList,
+        };
+        let resp = NextResponse::Error {
+            state: "plan".into(),
+            advanced: false,
+            error: NextError {
+                code: NextErrorCode::InvalidSubmission,
+                message: "batch rejected".into(),
+                details: vec![],
+            },
+            batch: Some(BatchErrorContext::from_batch_error(&batch_err)),
+            blocking_conditions: vec![],
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["action"], "error");
+        assert_eq!(v["error"]["batch"]["kind"], "invalid_batch_definition");
+        assert_eq!(v["error"]["batch"]["reason"]["reason"], "empty_task_list");
+    }
+
+    #[test]
+    fn error_variant_batch_context_matches_to_envelope_shape() {
+        use crate::cli::batch_error::BatchError;
+
+        // The payload nested under `error.batch` must equal the `batch`
+        // payload of `BatchError::to_envelope()` byte-for-byte — one
+        // source of truth for the batch shape.
+        let err = BatchError::ConcurrentTick {
+            holder_pid: Some(42),
+        };
+        let expected_batch = err.to_envelope()["batch"].clone();
+
+        let ctx = BatchErrorContext::from_batch_error(&err);
+        assert_eq!(ctx.payload, expected_batch);
     }
 }
