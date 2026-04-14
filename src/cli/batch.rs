@@ -39,6 +39,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -618,6 +619,142 @@ pub(crate) fn classify_task(
     }
 }
 
+// --------- Pre-classification repair pass ---------------------------
+
+/// Tempfile sweep age threshold.
+///
+/// Tempfiles left over from a crashed `init_state_file` are removed
+/// only once they are older than this threshold. The 60-second window
+/// keeps in-flight initialisations on concurrent ticks safe: even a
+/// slow write-and-rename cannot exceed this bound in practice, so an
+/// in-progress tempfile is never collected mid-flight.
+///
+/// Documented in DESIGN-batch-child-spawning.md Decision 12 Q7.
+const TEMPFILE_SWEEP_MIN_AGE: Duration = Duration::from_secs(60);
+
+/// Pre-classification repair of half-initialised children and stale
+/// tempfiles from crashed `init_state_file` calls.
+///
+/// Runs first inside [`run_batch_scheduler`] — before classification
+/// inspects any child state file. Two responsibilities:
+///
+/// 1. **Half-init detection.** For every submitted task, probe the
+///    child's state file. If the file exists but contains only the
+///    header (no events), delete the child session via
+///    [`SessionBackend::cleanup`]. Classification then sees the task
+///    as "not yet spawned" and the normal Ready path re-initialises
+///    cleanly on this same tick. Phase 1's atomic `init_state_file`
+///    makes header-only files unreachable from new code, but pre-
+///    Phase-1 artifacts on disk (and any future bypass) are handled
+///    defensively here.
+///
+/// 2. **Tempfile sweep.** Walks the parent's own session directory
+///    and each submitted child's session directory, removing any
+///    `.koto-*.tmp` file whose modification time is older than
+///    [`TEMPFILE_SWEEP_MIN_AGE`]. Tempfiles younger than the
+///    threshold are left alone so a concurrent `init_state_file`
+///    cannot have its in-flight tempfile yanked out from under it.
+///
+/// All repair actions are best-effort: individual I/O failures are
+/// silently ignored. A scheduler tick must not be halted by a
+/// tempfile sweep failure on an unrelated child directory, and the
+/// next tick will retry any lingering work.
+///
+/// See DESIGN-batch-child-spawning.md Decision 12 Q7 for the full
+/// rationale and Issue #20 in PLAN-batch-child-spawning.md for the
+/// per-criterion acceptance mapping.
+fn repair_half_initialized_children(
+    backend: &dyn SessionBackend,
+    parent_name: &str,
+    submitted_task_names: &[&str],
+) {
+    // --- (1) Half-init detection ------------------------------------
+    //
+    // A child's state file is "half-initialised" when it has a header
+    // line but no event lines. `read_events` returns `Ok((_, vec![]))`
+    // in that case (it only errors on malformed / empty / sequence-
+    // gap files, not on "header but no events"). Any such child is
+    // deleted so classification treats the task as unspawned.
+    for short_name in submitted_task_names {
+        let child_name = format!("{}.{}", parent_name, short_name);
+        if !backend.exists(&child_name) {
+            continue;
+        }
+        match backend.read_events(&child_name) {
+            Ok((_, events)) if events.is_empty() => {
+                // Header-only file: delete and let the scheduler
+                // respawn it as a fresh Ready task later in the tick.
+                let _ = backend.cleanup(&child_name);
+            }
+            _ => {
+                // Either fully-initialised (events present) or
+                // unreadable (corrupted/truncated) — either way, not
+                // our business here. Corruption surfaces through the
+                // normal classification path as a read error.
+            }
+        }
+    }
+
+    // --- (2) Tempfile sweep -----------------------------------------
+    //
+    // Scope: the parent's own session directory plus each submitted
+    // child's session directory. `backend.session_dir` is pure path
+    // computation, so missing directories are cheap to probe.
+    let now = SystemTime::now();
+    sweep_stale_tempfiles(&backend.session_dir(parent_name), now);
+    for short_name in submitted_task_names {
+        let child_name = format!("{}.{}", parent_name, short_name);
+        sweep_stale_tempfiles(&backend.session_dir(&child_name), now);
+    }
+}
+
+/// Remove `.koto-*.tmp` files inside `dir` whose modification time is
+/// older than [`TEMPFILE_SWEEP_MIN_AGE`] relative to `now`.
+///
+/// Best-effort: missing directories, unreadable entries, and failed
+/// removals are silently ignored. A stale tempfile that survives one
+/// tick is swept on the next.
+fn sweep_stale_tempfiles(dir: &std::path::Path, now: SystemTime) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = match file_name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        // Match the `.koto-*.tmp` glob documented in the design. This
+        // subsumes the current `.koto-init-*.tmp` prefix and any
+        // future koto-owned tempfile that conforms to the contract.
+        if !(name.starts_with(".koto-") && name.ends_with(".tmp")) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let mtime = match metadata.modified() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let age = match now.duration_since(mtime) {
+            Ok(d) => d,
+            // mtime is in the future (clock skew or filesystem
+            // anomaly): leave the file alone.
+            Err(_) => continue,
+        };
+        if age >= TEMPFILE_SWEEP_MIN_AGE {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 // --------- Scheduler entry point ------------------------------------
 
 /// Run one scheduler tick.
@@ -686,6 +823,15 @@ pub(crate) fn run_batch_scheduler(
             });
         }
     };
+
+    // Pre-classification repair pass: remove any half-initialised
+    // child state files (header, no events) left behind by a crash
+    // in the pre-atomic-init code path, and sweep stale `.koto-*.tmp`
+    // tempfiles from the parent's directory and each child's
+    // directory. Runs BEFORE classification so the repaired state is
+    // what classification observes. See Decision 12 Q7.
+    let submitted_task_names: Vec<&str> = tasks.iter().map(|t| t.name.as_str()).collect();
+    repair_half_initialized_children(backend, parent_name, &submitted_task_names);
 
     // Build the DAG once per tick. Validated upstream, so build_dag
     // is safe to call unconditionally here.
@@ -3514,5 +3660,231 @@ mod tests {
         let json = serde_json::to_string(&view).unwrap();
         let back: BatchFinalView = serde_json::from_str(&json).unwrap();
         assert_eq!(view, back);
+    }
+
+    // --- Issue #20: repair_half_initialized_children + tempfile sweep ---
+    //
+    // These tests exercise `sweep_stale_tempfiles` and
+    // `repair_half_initialized_children` directly against a
+    // `LocalBackend` on a tempdir. The sweep helper takes `now` as an
+    // explicit parameter so tests can simulate age windows without
+    // touching filesystem mtimes.
+
+    use crate::engine::persistence;
+    use crate::engine::types::StateFileHeader;
+    use crate::session::state_file_name;
+    use tempfile::TempDir;
+
+    /// Write a header-only state file for `id` under `base_dir`.
+    /// Produces the "half-initialised" shape: the header line is
+    /// present but no events follow.
+    fn write_half_init_state_file(base_dir: &std::path::Path, id: &str) {
+        let session_dir = base_dir.join(id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let state_path = session_dir.join(state_file_name(id));
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: id.to_string(),
+            template_hash: "testhash".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: Some("p".to_string()),
+            template_source_dir: None,
+        };
+        persistence::append_header(&state_path, &header).unwrap();
+    }
+
+    #[test]
+    fn sweep_keeps_tempfile_younger_than_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let young = dir.join(".koto-init-young.tmp");
+        std::fs::write(&young, b"pending").unwrap();
+
+        // `now` equals the file's mtime ± a few ms -> age is well
+        // under 60 seconds. The file must survive.
+        sweep_stale_tempfiles(dir, SystemTime::now());
+        assert!(
+            young.exists(),
+            "young tempfile must not be swept (< 60s old)"
+        );
+    }
+
+    #[test]
+    fn sweep_removes_tempfile_older_than_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let old = dir.join(".koto-init-old.tmp");
+        std::fs::write(&old, b"stale from crash").unwrap();
+
+        // Advance `now` by 61 seconds to push the file over the
+        // threshold without touching filesystem mtimes. This matches
+        // what would happen naturally after a minute of uptime.
+        let future_now = SystemTime::now() + Duration::from_secs(61);
+        sweep_stale_tempfiles(dir, future_now);
+        assert!(
+            !old.exists(),
+            "tempfile older than 60s must be removed by the sweep"
+        );
+    }
+
+    #[test]
+    fn sweep_ignores_non_koto_tempfiles() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let unrelated = dir.join("random.tmp");
+        std::fs::write(&unrelated, b"not ours").unwrap();
+        let also_unrelated = dir.join(".koto-something-else.json");
+        std::fs::write(&also_unrelated, b"wrong suffix").unwrap();
+
+        let future_now = SystemTime::now() + Duration::from_secs(300);
+        sweep_stale_tempfiles(dir, future_now);
+
+        assert!(
+            unrelated.exists(),
+            "files without the .koto- prefix must not be swept"
+        );
+        assert!(
+            also_unrelated.exists(),
+            "files without the .tmp suffix must not be swept"
+        );
+    }
+
+    #[test]
+    fn sweep_handles_missing_directory_silently() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        // Must not panic on a non-existent directory.
+        sweep_stale_tempfiles(&missing, SystemTime::now());
+    }
+
+    #[test]
+    fn repair_deletes_half_initialized_child_state_file() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        // Pre-Phase-1-style crash: parent spawned child "a" but
+        // crashed after writing the header and before any event. The
+        // session directory has a header-only state file.
+        write_half_init_state_file(tmp.path(), "p.a");
+        assert!(backend.exists("p.a"));
+        let (_, events) = backend.read_events("p.a").unwrap();
+        assert!(events.is_empty(), "precondition: header but no events");
+
+        repair_half_initialized_children(&backend, "p", &["a"]);
+
+        // After repair, the half-init child is gone. The scheduler
+        // will classify the task as unspawned and re-initialise it on
+        // the same tick via the normal Ready path.
+        assert!(
+            !backend.exists("p.a"),
+            "half-init child must be deleted by repair"
+        );
+    }
+
+    #[test]
+    fn repair_preserves_fully_initialized_child_state_file() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        // Write a header AND an event so the file looks like a
+        // successfully-initialised child.
+        let session_dir = tmp.path().join("p.b");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let state_path = session_dir.join(state_file_name("p.b"));
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: "p.b".to_string(),
+            template_hash: "h".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: Some("p".to_string()),
+            template_source_dir: None,
+        };
+        persistence::append_header(&state_path, &header).unwrap();
+        // Append a WorkflowInitialized event so the file is
+        // non-empty on the event dimension.
+        backend
+            .append_event(
+                "p.b",
+                &EventPayload::WorkflowInitialized {
+                    template_path: "child.md".to_string(),
+                    variables: std::collections::HashMap::new(),
+                    spawn_entry: None,
+                },
+                "2026-01-01T00:00:01Z",
+            )
+            .unwrap();
+
+        repair_half_initialized_children(&backend, "p", &["b"]);
+
+        assert!(
+            backend.exists("p.b"),
+            "fully-initialised child must NOT be deleted"
+        );
+        let (_, events) = backend.read_events("p.b").unwrap();
+        assert_eq!(events.len(), 1, "event must still be present");
+    }
+
+    #[test]
+    fn repair_sweeps_tempfiles_in_parent_and_child_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        // Parent session dir with a stale tempfile (simulate via age
+        // by patching mtime). Also drop one in a submitted child's
+        // session dir so we prove the sweep walks both scopes.
+        std::fs::create_dir_all(tmp.path().join("p")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("p.c")).unwrap();
+        let parent_tmp = tmp.path().join("p").join(".koto-init-parent.tmp");
+        let child_tmp = tmp.path().join("p.c").join(".koto-init-child.tmp");
+        std::fs::write(&parent_tmp, b"stale").unwrap();
+        std::fs::write(&child_tmp, b"stale").unwrap();
+
+        // Age the files out of the protection window by setting their
+        // mtime to well in the past. `set_modified` is stable since
+        // Rust 1.75 and lets us do this without pulling in filetime.
+        let long_ago = SystemTime::now() - Duration::from_secs(300);
+        std::fs::File::options()
+            .write(true)
+            .open(&parent_tmp)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&child_tmp)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        repair_half_initialized_children(&backend, "p", &["c"]);
+
+        assert!(
+            !parent_tmp.exists(),
+            "stale tempfile in parent dir must be swept"
+        );
+        assert!(
+            !child_tmp.exists(),
+            "stale tempfile in child dir must be swept"
+        );
+    }
+
+    #[test]
+    fn repair_leaves_fresh_tempfiles_alone_during_concurrent_init() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        // A concurrent `init_state_file` in a sibling tick is
+        // represented by a very-recent `.koto-init-*.tmp` in the
+        // child's session dir. The sweep must leave it alone.
+        std::fs::create_dir_all(tmp.path().join("p.d")).unwrap();
+        let in_flight = tmp.path().join("p.d").join(".koto-init-in-flight.tmp");
+        std::fs::write(&in_flight, b"mid-write").unwrap();
+
+        repair_half_initialized_children(&backend, "p", &["d"]);
+
+        assert!(
+            in_flight.exists(),
+            "in-flight tempfile must survive the sweep (< 60s old)"
+        );
     }
 }
