@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Planned
 problem: |
   Koto v0.7.0 lets a parent workflow spawn and wait for children, but the
   consumer has to run the spawn loop themselves: query which children are
@@ -65,7 +65,7 @@ rationale: |
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
