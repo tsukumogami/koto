@@ -80,6 +80,11 @@ struct CachedTemplate {
     compiled: CompiledTemplate,
     cache_path: PathBuf,
     hash: String,
+    /// Canonical *source* template path (not the cache artifact).
+    /// Retained so post-compile error paths (e.g. variable resolution)
+    /// can forward it into `TaskSpawnError.path` for parity with
+    /// `BatchError::TemplateCompileFailed.path`.
+    source_path: PathBuf,
 }
 
 impl TemplateCompileCache {
@@ -128,6 +133,13 @@ pub(crate) struct CompileErrorInfo {
     /// it into `paths_tried` unchanged.
     #[allow(dead_code)]
     pub path: PathBuf,
+    /// Resolved (canonicalized) template path, when path resolution
+    /// succeeded. `None` means the input path never resolved — for
+    /// example `TemplateNotFound` (the file did not exist) or a
+    /// canonicalize failure on `PermissionDenied` / generic I/O. The
+    /// caller forwards this verbatim into [`TaskSpawnError::path`] so
+    /// the JSON surface mirrors `BatchError::TemplateCompileFailed.path`.
+    pub resolved_path: Option<PathBuf>,
 }
 
 /// Compile `template_path` once per cache, returning the cached
@@ -162,6 +174,10 @@ fn compile_with_cache(
                 kind: SpawnErrorKind::TemplateNotFound,
                 message: format!("template not found: {} ({})", template_path.display(), e),
                 path: template_path.to_path_buf(),
+                // Resolution failed — the file didn't exist. Leave the
+                // resolved path `None` so agents can distinguish "never
+                // resolved" from "resolved then compile-failed".
+                resolved_path: None,
             });
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -173,6 +189,7 @@ fn compile_with_cache(
                     e
                 ),
                 path: template_path.to_path_buf(),
+                resolved_path: None,
             });
         }
         Err(e) => {
@@ -184,6 +201,7 @@ fn compile_with_cache(
                     e
                 ),
                 path: template_path.to_path_buf(),
+                resolved_path: None,
             });
         }
     };
@@ -196,6 +214,11 @@ fn compile_with_cache(
         kind: SpawnErrorKind::TemplateCompileFailed,
         message: format!("failed to compile template {}: {}", canonical.display(), e),
         path: canonical.clone(),
+        // Source template resolved successfully; carry the canonical
+        // source path (not the cache-artifact path) so downstream
+        // consumers see the same shape `BatchError::TemplateCompileFailed`
+        // exposes.
+        resolved_path: Some(canonical.clone()),
     })?;
 
     let content = std::fs::read_to_string(&cache_path).map_err(|e| CompileErrorInfo {
@@ -206,6 +229,7 @@ fn compile_with_cache(
             e
         ),
         path: cache_path.clone(),
+        resolved_path: Some(canonical.clone()),
     })?;
     let compiled: CompiledTemplate =
         serde_json::from_str(&content).map_err(|e| CompileErrorInfo {
@@ -216,12 +240,14 @@ fn compile_with_cache(
                 e
             ),
             path: cache_path.clone(),
+            resolved_path: Some(canonical.clone()),
         })?;
 
     let entry = CachedTemplate {
         compiled,
         cache_path,
         hash,
+        source_path: canonical.clone(),
     };
     cache.entries.insert(canonical, entry.clone());
     Ok(entry)
@@ -318,7 +344,15 @@ pub fn init_child_from_parent(
     spawn_entry: Option<SpawnEntrySnapshot>,
 ) -> Result<(), TaskSpawnError> {
     let cached = compile_with_cache(template_path, cache).map_err(|info| {
-        TaskSpawnError::new(child_name, info.kind, info.message)
+        let mut err = TaskSpawnError::new(child_name, info.kind, info.message);
+        // Forward the resolved template path when resolution
+        // succeeded. Advisory #10: keep parity with
+        // `BatchError::TemplateCompileFailed.path` so agents rendering
+        // per-task errors see the same shape regardless of envelope.
+        if let Some(resolved) = info.resolved_path {
+            err = err.with_path(resolved);
+        }
+        err
         // NOTE: when Issue #5 / #8 land, this is where a richer
         // TaskSpawnError (paths_tried, template_source, compile_error)
         // would be composed from `info.path` plus caller-side context.
@@ -326,11 +360,16 @@ pub fn init_child_from_parent(
 
     let variables =
         crate::cli::resolve_variables(vars, &cached.compiled.variables).map_err(|msg| {
+            // Variable resolution runs *after* a successful compile, so
+            // the cache entry carries a valid resolved path. Plumb it
+            // through to keep parity with other post-resolution failure
+            // paths.
             TaskSpawnError::new(
                 child_name,
                 SpawnErrorKind::TemplateCompileFailed,
                 format!("{}{}", VAR_RESOLUTION_MSG_PREFIX, msg),
             )
+            .with_path(cached.source_path.clone())
         })?;
 
     let initial_state = cached.compiled.initial_state.clone();
@@ -403,11 +442,12 @@ pub fn init_child_from_parent(
                 child_name, e
             ),
         )
+        .with_path(cached.source_path.clone())
     })?;
 
     backend
         .init_state_file(child_name, header, initial_events)
-        .map_err(|e| classify_session_error(child_name, e))?;
+        .map_err(|e| classify_session_error(child_name, e).with_path(cached.source_path.clone()))?;
 
     Ok(())
 }

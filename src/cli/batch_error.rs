@@ -95,6 +95,10 @@ pub enum BatchError {
     /// `backend.create` / `init_state_file` failed for a specific
     /// task. Promoted to a typed variant so per-task spawn errors
     /// surface through the same envelope as the tick-wide ones.
+    ///
+    /// Serialized as `spawn_kind` (not `kind`) to avoid collision with
+    /// the outer envelope's `kind` discriminator. Mirrors the
+    /// `name_rule` rename on `InvalidName`'s inner kind.
     SpawnFailed {
         task: String,
         kind: SpawnErrorKind,

@@ -33,6 +33,8 @@
 //! them `None` without a breaking change when later issues populate
 //! them.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// Discriminator for the reason a single task's spawn failed.
@@ -297,6 +299,18 @@ pub struct TaskSpawnError {
     /// Populated by Issue #8 (typed compile-error plumbing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compile_error: Option<CompileError>,
+
+    /// Resolved template path for the task, when known. Mirrors the
+    /// `path` field on `BatchError::TemplateCompileFailed` so agents
+    /// rendering per-task errors see the same shape regardless of which
+    /// envelope they arrive on.
+    ///
+    /// Populated whenever template resolution succeeded (the file
+    /// existed and could be canonicalized). `None` when the path was
+    /// never resolved — for example, `TemplateNotFound` errors where
+    /// the source file did not exist in the first place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 impl TaskSpawnError {
@@ -313,7 +327,17 @@ impl TaskSpawnError {
             paths_tried: None,
             template_source: None,
             compile_error: None,
+            path: None,
         }
+    }
+
+    /// Builder-style setter for the resolved template `path`. Callers
+    /// that know the resolved path (template resolution succeeded)
+    /// chain this onto [`TaskSpawnError::new`] to avoid spreading the
+    /// struct with `..err`.
+    pub fn with_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.path = Some(path.into());
+        self
     }
 }
 
@@ -435,5 +459,51 @@ mod tests {
                 "message": "already exists",
             })
         );
+    }
+
+    #[test]
+    fn path_field_round_trips_when_some() {
+        let err = TaskSpawnError::new("issue-1", SpawnErrorKind::TemplateCompileFailed, "boom")
+            .with_path(PathBuf::from("/tmp/templates/issue.md"));
+
+        let v = serde_json::to_value(&err).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "task": "issue-1",
+                "kind": "template_compile_failed",
+                "message": "boom",
+                "path": "/tmp/templates/issue.md",
+            }),
+            "path must serialize under the `path` key"
+        );
+
+        let round: TaskSpawnError = serde_json::from_value(v).unwrap();
+        assert_eq!(round, err, "path round-trips through serde");
+        assert_eq!(
+            round.path.as_deref(),
+            Some(std::path::Path::new("/tmp/templates/issue.md"))
+        );
+    }
+
+    #[test]
+    fn path_field_omitted_when_none() {
+        let err = TaskSpawnError::new(
+            "issue-1",
+            SpawnErrorKind::TemplateNotFound,
+            "missing template",
+        );
+        assert!(err.path.is_none());
+
+        let v = serde_json::to_value(&err).unwrap();
+        let obj = v.as_object().expect("object");
+        assert!(
+            !obj.contains_key("path"),
+            "None path must be omitted from the JSON surface: {}",
+            v
+        );
+
+        let round: TaskSpawnError = serde_json::from_value(v).unwrap();
+        assert_eq!(round.path, None);
     }
 }
