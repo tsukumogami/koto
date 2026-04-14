@@ -38,6 +38,14 @@ pub struct PathResolution {
     /// (absolute path, or relative path resolved cleanly via the base
     /// directory). Populated when the resolver had to skip step (b)
     /// because `template_source_dir` was absent or stale.
+    ///
+    /// Caller-side dedup contract: `MissingTemplateSourceDir` is a
+    /// per-tick condition (the parent header either has the field or
+    /// it does not), so callers aggregating warnings across multiple
+    /// task entries in a single scheduler tick should dedup it to at
+    /// most one occurrence per tick. `StaleTemplateSourceDir` and
+    /// `OmittedPriorTask` carry payload that distinguishes instances,
+    /// and callers should preserve each occurrence.
     pub warnings: Vec<SchedulerWarning>,
 }
 
@@ -45,29 +53,29 @@ pub struct PathResolution {
 /// [`SchedulerWarning::StaleTemplateSourceDir`].
 ///
 /// Reads `/etc/machine-id` on Linux for a stable per-host string. Falls
-/// back to the `HOSTNAME` environment variable, then to the literal
-/// string `"unknown"`. The exact source is not important — Decision 14
-/// only requires that the warning carry *something* identifying the
-/// machine where the staleness was detected so cross-machine drift
-/// reports are attributable.
+/// back to the `HOSTNAME` environment variable. Returns `None` when no
+/// usable identifier can be derived — a warning without a `machine_id`
+/// is more honest than one carrying a fabricated `"unknown"` value, and
+/// the design's `Option<String>` shape with `skip_serializing_if`
+/// expresses this directly.
 ///
 /// TODO: a future revision may swap this for the same identifier the
 /// cloud-sync layer attaches to state files (Decision 12 Q5), so a
 /// session migrated between machines surfaces matching IDs across the
 /// `sync_status` and `StaleTemplateSourceDir` channels.
-pub fn current_machine_id() -> String {
+pub(crate) fn current_machine_id() -> Option<String> {
     if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
         let trimmed = id.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return Some(trimmed.to_string());
         }
     }
     if let Ok(host) = std::env::var("HOSTNAME") {
         if !host.is_empty() {
-            return host;
+            return Some(host);
         }
     }
-    "unknown".to_string()
+    None
 }
 
 /// Resolve `target` against the configured base directories.
@@ -123,11 +131,19 @@ pub fn resolve_template_path(
                 // The recorded base directory is gone (typically a
                 // cross-machine migration). Emit StaleTemplateSourceDir
                 // and fall through to submitter_cwd.
-                let fallback = submitter_cwd.unwrap_or(target_path).to_path_buf();
+                //
+                // F3: when there is no `submitter_cwd` to fall back to,
+                // there is nothing meaningful to point `falling_back_to`
+                // at. Use the original (relative) target path so the
+                // warning records the actual resolved value rather than
+                // pretending we fell back to the stale base.
+                let fallback = submitter_cwd
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| target_path.to_path_buf());
                 warnings.push(SchedulerWarning::StaleTemplateSourceDir {
-                    path: base.to_path_buf(),
+                    path: base.to_string_lossy().into_owned(),
                     machine_id: current_machine_id(),
-                    falling_back_to: fallback.clone(),
+                    falling_back_to: fallback,
                 });
             } else {
                 let candidate = base.join(target_path);
@@ -146,10 +162,10 @@ pub fn resolve_template_path(
         }
         None => {
             // No base configured (pre-feature state file). Skip step
-            // (b) and emit MissingTemplateSourceDir.
-            warnings.push(SchedulerWarning::MissingTemplateSourceDir {
-                path: target_path.to_path_buf(),
-            });
+            // (b) and emit MissingTemplateSourceDir. The variant is a
+            // unit value; the affected task is identifiable from the
+            // surrounding scheduler context.
+            warnings.push(SchedulerWarning::MissingTemplateSourceDir);
         }
     }
 
@@ -242,12 +258,10 @@ mod tests {
         let res = resolve_template_path("child.md", None, Some(cwd.path()));
         assert_eq!(res.resolved, cwd.path().join("child.md"));
         assert_eq!(res.warnings.len(), 1);
-        match &res.warnings[0] {
-            SchedulerWarning::MissingTemplateSourceDir { path } => {
-                assert_eq!(path, &PathBuf::from("child.md"));
-            }
-            other => panic!("expected MissingTemplateSourceDir, got {:?}", other),
-        }
+        assert!(matches!(
+            res.warnings[0],
+            SchedulerWarning::MissingTemplateSourceDir
+        ));
     }
 
     #[test]
@@ -270,9 +284,46 @@ mod tests {
                 machine_id,
                 falling_back_to,
             } => {
-                assert_eq!(path, &stale);
-                assert!(!machine_id.is_empty(), "machine_id must be populated");
+                assert_eq!(path, &stale.to_string_lossy().into_owned());
+                // machine_id is best-effort: Some when /etc/machine-id
+                // or HOSTNAME is available, None otherwise. We only
+                // check that, when populated, it is non-empty.
+                if let Some(id) = machine_id {
+                    assert!(!id.is_empty(), "machine_id, when Some, must be non-empty");
+                }
                 assert_eq!(falling_back_to, &cwd.path().to_path_buf());
+            }
+            other => panic!("expected StaleTemplateSourceDir, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stale_base_without_cwd_falls_back_to_target_path() {
+        // F3: when both base is stale and there is no submitter_cwd,
+        // `falling_back_to` should record the original (relative)
+        // target rather than the stale base — we did not actually fall
+        // back to the stale base.
+        let stale = PathBuf::from("/definitely/does/not/exist/anywhere/koto-test");
+        assert!(
+            !stale.exists(),
+            "test precondition: stale path must not exist"
+        );
+
+        let res = resolve_template_path("child.md", Some(&stale), None);
+        assert_eq!(res.resolved, PathBuf::from("child.md"));
+        assert_eq!(res.warnings.len(), 1);
+        match &res.warnings[0] {
+            SchedulerWarning::StaleTemplateSourceDir {
+                path,
+                falling_back_to,
+                ..
+            } => {
+                assert_eq!(path, &stale.to_string_lossy().into_owned());
+                assert_eq!(
+                    falling_back_to,
+                    &PathBuf::from("child.md"),
+                    "without cwd, falling_back_to should record the original target"
+                );
             }
             other => panic!("expected StaleTemplateSourceDir, got {:?}", other),
         }
@@ -285,13 +336,17 @@ mod tests {
         assert_eq!(res.warnings.len(), 1);
         assert!(matches!(
             res.warnings[0],
-            SchedulerWarning::MissingTemplateSourceDir { .. }
+            SchedulerWarning::MissingTemplateSourceDir
         ));
     }
 
     #[test]
-    fn current_machine_id_returns_non_empty() {
-        let id = current_machine_id();
-        assert!(!id.is_empty());
+    fn current_machine_id_returns_some_or_none_consistently() {
+        // The value depends on the environment (CI vs. dev box); we
+        // only check that the call doesn't panic and, when Some, the
+        // string is non-empty.
+        if let Some(id) = current_machine_id() {
+            assert!(!id.is_empty());
+        }
     }
 }
