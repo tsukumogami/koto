@@ -5,6 +5,7 @@ pub mod init_child;
 pub mod next;
 pub mod next_types;
 pub mod overrides;
+pub mod retry;
 pub mod session;
 pub mod task_spawn_error;
 pub mod vars;
@@ -35,6 +36,18 @@ use crate::template::types::CompiledTemplate;
 
 /// Maximum payload size for --with-data (1 MB).
 pub(super) const MAX_WITH_DATA_BYTES: usize = 1_048_576;
+
+// Issue #14: thread-local stash for the retry outcome. `handle_next`
+// writes this after intercepting a `retry_failed` submission so the
+// response envelope can splice in per-child `retry_dispatched` and
+// `retry_errored` sibling keys after the advance loop returns. A
+// thread-local keeps the plumbing out of the advance-loop signatures
+// without regressing the single-threaded invocation model.
+thread_local! {
+    #[allow(clippy::missing_docs_in_private_items)]
+    static RETRY_OUTCOME: std::cell::RefCell<Option<crate::cli::retry::RetryOutcome>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Maximum size of captured stdout/stderr from action execution (64 KB).
 const MAX_ACTION_OUTPUT_BYTES: usize = 64 * 1024;
@@ -1744,102 +1757,220 @@ fn handle_next(
             }
         };
 
-        // Validate evidence against schema.
-        if let Err(validation_err) = validate_evidence(&data, accepts) {
-            let details: Vec<ErrorDetail> = validation_err
-                .field_errors
-                .iter()
-                .map(|fe| ErrorDetail {
-                    field: fe.field.clone(),
-                    reason: fe.reason.clone(),
-                })
-                .collect();
-            let err = NextError {
-                code: NextErrorCode::InvalidSubmission,
-                message: "evidence validation failed".to_string(),
-                details,
-            };
-            let json = serde_json::json!({"error": err});
-            exit_with_error_code(json, err.code.exit_code());
-        }
-
-        // Batch runtime validation (R0-R9). Runs PRE-APPEND so a
-        // malformed batch submission (cycles, dangling refs, reserved
-        // names, duplicate names, oversize payload) never leaves a
-        // state footprint on the parent's event log — the "zero state
-        // on parent's event log" guarantee from Issue #9. The validator
-        // is a pure function; existing children are snapshotted from
-        // the backend so R8 can compare the submission against the
-        // canonical-form `spawn_entry` of each already-materialized
-        // child.
+        // Issue #14: intercept `retry_failed` BEFORE the evidence
+        // validator runs. `retry_failed` is a reserved top-level
+        // evidence key (like `gates`) — it must not round-trip through
+        // the template's `accepts` schema because the schema rejects
+        // unknown fields. The retry handler writes its own
+        // EvidenceSubmitted events and returns; control then falls
+        // through to the advance loop, which observes the new evidence
+        // on its next read (`derive_evidence` + `merge_epoch_evidence`)
+        // and fires the template transition on
+        // `when: evidence.retry_failed: present`.
         //
-        // When the current state carries no `materialize_children`
-        // hook this block is a no-op. When the hook's `from_field`
-        // does not appear in the submitted evidence (optional task
-        // list), we also skip — there's nothing to validate.
-        if let Some(hook) = template_state.materialize_children.as_ref() {
-            if let Some(raw) = data.as_object().and_then(|m| m.get(&hook.from_field)) {
-                match serde_json::from_value::<Vec<crate::engine::batch_validation::TaskEntry>>(
-                    raw.clone(),
+        // Precedence for the retry flow:
+        // 1. Reject malformed payloads with a typed `InvalidRetryReason`.
+        // 2. Validate the retry set against the on-disk children.
+        // 3. Append parent events, dispatch per-child paths.
+        match crate::cli::retry::parse_retry_failed(&data) {
+            Ok(Some(payload)) => {
+                // The payload is well-formed; continue into
+                // handle_retry_failed. Parse any companion `tasks`
+                // field so retry-respawn can use the CURRENT submission
+                // entry; absence is fine (respawn falls back to the
+                // child's recorded spawn_entry).
+                let submitted_entries: Vec<crate::engine::batch_validation::TaskEntry> = data
+                    .as_object()
+                    .and_then(|m| {
+                        template_state
+                            .materialize_children
+                            .as_ref()
+                            .and_then(|hook| m.get(&hook.from_field))
+                    })
+                    .and_then(|raw| {
+                        serde_json::from_value::<Vec<crate::engine::batch_validation::TaskEntry>>(
+                            raw.clone(),
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_default();
+
+                // Enumerate extra top-level evidence keys so R10 can
+                // flag `MixedWithOtherEvidence`. Reserved keys the
+                // runtime injects itself (`gates`) are already rejected
+                // above; `tasks` accompanying a retry is technically a
+                // mixed payload under R10, but the companion task list
+                // is explicitly allowed so the retry entry can update
+                // template/vars. We filter that field out too.
+                let extra_top_level: Vec<String> = data
+                    .as_object()
+                    .map(|obj| {
+                        obj.keys()
+                            .filter(|k| {
+                                let k = k.as_str();
+                                if k == "retry_failed" {
+                                    return false;
+                                }
+                                // Exclude the batch hook's task-list
+                                // field when present; it's the
+                                // companion for retry-respawn.
+                                if let Some(hook) = template_state.materialize_children.as_ref() {
+                                    if k == hook.from_field {
+                                        return false;
+                                    }
+                                }
+                                true
+                            })
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let submitter_cwd = std::env::current_dir().ok();
+                let outcome = match crate::cli::retry::handle_retry_failed(
+                    backend,
+                    &name,
+                    current_state,
+                    &payload,
+                    &extra_top_level,
+                    submitter_cwd,
+                    &submitted_entries,
                 ) {
-                    Ok(tasks) => {
-                        let existing =
-                            crate::cli::batch::build_existing_children_snapshot(backend, &name);
-                        if let Err(batch_err) =
-                            crate::engine::batch_validation::validate_batch_submission(
-                                &tasks, &existing,
-                            )
-                        {
-                            let code = batch_err.exit_code();
-                            exit_with_error_code(batch_err.to_envelope(), code);
-                        }
+                    Ok(o) => o,
+                    Err(batch_err) => {
+                        let code = batch_err.exit_code();
+                        exit_with_error_code(batch_err.to_envelope(), code);
                     }
-                    Err(e) => {
-                        // Structural check in validate_evidence guarantees
-                        // the value is an array of objects, but a deeper
-                        // parse failure (unknown field shape, etc.) should
-                        // still surface as InvalidSubmission rather than
-                        // passing through to EvidenceSubmitted.
-                        let err = NextError {
-                            code: NextErrorCode::InvalidSubmission,
-                            message: format!("batch task list failed to parse: {}", e),
-                            details: vec![],
-                        };
-                        let json = serde_json::json!({"error": err});
-                        exit_with_error_code(json, err.code.exit_code());
-                    }
-                }
+                };
+
+                // Stash the outcome for later (response sibling).
+                RETRY_OUTCOME.with(|cell| {
+                    *cell.borrow_mut() = Some(outcome);
+                });
+                // Skip the remainder of the with-data block (evidence
+                // validator, batch R0-R9, generic EvidenceSubmitted).
+                // Fall through to the rest of `handle_next` so the
+                // advance loop runs on the fresh parent log.
+            }
+            Ok(None) => {
+                // No retry_failed key — proceed with the normal
+                // evidence-validation path below.
+            }
+            Err(reason) => {
+                let batch_err = crate::cli::batch_error::BatchError::InvalidRetryRequest { reason };
+                let code = batch_err.exit_code();
+                exit_with_error_code(batch_err.to_envelope(), code);
             }
         }
 
-        // Append evidence_submitted event.
-        let fields: HashMap<String, serde_json::Value> = data
+        // Skip the rest of the --with-data block if retry_failed was
+        // consumed above: those paths are mutually exclusive under
+        // R10's MixedWithOtherEvidence rule. The retry handler already
+        // wrote the parent's EvidenceSubmitted events directly, so we
+        // must not fall through to validate_evidence (which would
+        // reject the reserved key) or the generic EvidenceSubmitted
+        // append (which would duplicate the handler's write).
+        let retry_consumed = data
             .as_object()
-            .expect("validate_evidence guarantees object input")
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+            .is_some_and(|m| m.contains_key("retry_failed"));
+        if !retry_consumed {
+            // Validate evidence against schema.
+            if let Err(validation_err) = validate_evidence(&data, accepts) {
+                let details: Vec<ErrorDetail> = validation_err
+                    .field_errors
+                    .iter()
+                    .map(|fe| ErrorDetail {
+                        field: fe.field.clone(),
+                        reason: fe.reason.clone(),
+                    })
+                    .collect();
+                let err = NextError {
+                    code: NextErrorCode::InvalidSubmission,
+                    message: "evidence validation failed".to_string(),
+                    details,
+                };
+                let json = serde_json::json!({"error": err});
+                exit_with_error_code(json, err.code.exit_code());
+            }
 
-        // Capture the submitter's working directory so the batch
-        // scheduler's path resolver (Decision 4 / 14 in
-        // DESIGN-batch-child-spawning.md) can use it as the final
-        // fallback for relative child-template paths. Best-effort:
-        // a failure here (deleted cwd, permission issues) leaves the
-        // field `None` and the resolver tolerates the absence.
-        let submitter_cwd = std::env::current_dir().ok();
-        let payload = EventPayload::EvidenceSubmitted {
-            state: current_state.clone(),
-            fields,
-            submitter_cwd,
-        };
-        if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
-            let ne = NextError {
-                code: NextErrorCode::PersistenceError,
-                message: e.to_string(),
-                details: vec![],
+            // Batch runtime validation (R0-R9). Runs PRE-APPEND so a
+            // malformed batch submission (cycles, dangling refs, reserved
+            // names, duplicate names, oversize payload) never leaves a
+            // state footprint on the parent's event log — the "zero state
+            // on parent's event log" guarantee from Issue #9. The validator
+            // is a pure function; existing children are snapshotted from
+            // the backend so R8 can compare the submission against the
+            // canonical-form `spawn_entry` of each already-materialized
+            // child.
+            //
+            // When the current state carries no `materialize_children`
+            // hook this block is a no-op. When the hook's `from_field`
+            // does not appear in the submitted evidence (optional task
+            // list), we also skip — there's nothing to validate.
+            if let Some(hook) = template_state.materialize_children.as_ref() {
+                if let Some(raw) = data.as_object().and_then(|m| m.get(&hook.from_field)) {
+                    match serde_json::from_value::<Vec<crate::engine::batch_validation::TaskEntry>>(
+                        raw.clone(),
+                    ) {
+                        Ok(tasks) => {
+                            let existing =
+                                crate::cli::batch::build_existing_children_snapshot(backend, &name);
+                            if let Err(batch_err) =
+                                crate::engine::batch_validation::validate_batch_submission(
+                                    &tasks, &existing,
+                                )
+                            {
+                                let code = batch_err.exit_code();
+                                exit_with_error_code(batch_err.to_envelope(), code);
+                            }
+                        }
+                        Err(e) => {
+                            // Structural check in validate_evidence guarantees
+                            // the value is an array of objects, but a deeper
+                            // parse failure (unknown field shape, etc.) should
+                            // still surface as InvalidSubmission rather than
+                            // passing through to EvidenceSubmitted.
+                            let err = NextError {
+                                code: NextErrorCode::InvalidSubmission,
+                                message: format!("batch task list failed to parse: {}", e),
+                                details: vec![],
+                            };
+                            let json = serde_json::json!({"error": err});
+                            exit_with_error_code(json, err.code.exit_code());
+                        }
+                    }
+                }
+            }
+
+            // Append evidence_submitted event.
+            let fields: HashMap<String, serde_json::Value> = data
+                .as_object()
+                .expect("validate_evidence guarantees object input")
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            // Capture the submitter's working directory so the batch
+            // scheduler's path resolver (Decision 4 / 14 in
+            // DESIGN-batch-child-spawning.md) can use it as the final
+            // fallback for relative child-template paths. Best-effort:
+            // a failure here (deleted cwd, permission issues) leaves the
+            // field `None` and the resolver tolerates the absence.
+            let submitter_cwd = std::env::current_dir().ok();
+            let payload = EventPayload::EvidenceSubmitted {
+                state: current_state.clone(),
+                fields,
+                submitter_cwd,
             };
-            let json = serde_json::json!({"error": ne});
-            exit_with_error_code(json, ne.code.exit_code());
+            if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
+                let ne = NextError {
+                    code: NextErrorCode::PersistenceError,
+                    message: e.to_string(),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": ne});
+                exit_with_error_code(json, ne.code.exit_code());
+            }
         }
     }
 
@@ -2300,11 +2431,62 @@ fn handle_next(
                     map
                 }
             };
-            if let Some(outcome) = scheduler_outcome {
+            if let Some(outcome) = &scheduler_outcome {
                 if !matches!(outcome, crate::cli::batch::SchedulerOutcome::NoBatch) {
-                    envelope.insert("scheduler".to_string(), serde_json::to_value(&outcome)?);
+                    envelope.insert("scheduler".to_string(), serde_json::to_value(outcome)?);
                 }
             }
+
+            // Issue #14: attach `reserved_actions` when the scheduler's
+            // gate vocabulary signals retryable children. The list is
+            // the set of short task names whose current outcome is
+            // failure, skipped, or spawn_failed — exactly the subset
+            // R10 accepts for retry.
+            let retryable_children: Vec<String> = match &scheduler_outcome {
+                Some(crate::cli::batch::SchedulerOutcome::Scheduled {
+                    materialized_children,
+                    ..
+                }) => materialized_children
+                    .iter()
+                    .filter(|mc| {
+                        matches!(
+                            mc.outcome,
+                            crate::cli::batch::TaskOutcome::Failure
+                                | crate::cli::batch::TaskOutcome::Skipped
+                                | crate::cli::batch::TaskOutcome::SpawnFailed
+                        )
+                    })
+                    .map(|mc| mc.task.clone())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if !retryable_children.is_empty() {
+                let actions =
+                    crate::cli::retry::synthesize_reserved_actions(&name, &retryable_children);
+                envelope.insert(
+                    "reserved_actions".to_string(),
+                    serde_json::to_value(&actions)?,
+                );
+            }
+
+            // Issue #14: splice retry outcome siblings onto the response
+            // envelope when a retry_failed submission was intercepted
+            // earlier this tick. Agents observe `retry_dispatched`
+            // alongside the advance-loop's normal fields.
+            let retry_outcome = RETRY_OUTCOME.with(|cell| cell.borrow_mut().take());
+            if let Some(outcome) = retry_outcome {
+                envelope.insert(
+                    "retry_dispatched".to_string(),
+                    serde_json::to_value(&outcome.dispatched)?,
+                );
+                if !outcome.errored.is_empty() {
+                    envelope.insert(
+                        "retry_errored".to_string(),
+                        serde_json::to_value(&outcome.errored)?,
+                    );
+                }
+            }
+
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::Value::Object(envelope))?
