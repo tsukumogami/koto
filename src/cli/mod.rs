@@ -1,9 +1,18 @@
+pub mod batch;
+pub mod batch_error;
+pub mod batch_view;
 pub mod context;
+pub mod init_child;
 pub mod next;
 pub mod next_types;
 pub mod overrides;
+pub mod retry;
 pub mod session;
+pub mod task_spawn_error;
 pub mod vars;
+
+pub use init_child::{init_child_from_parent, TemplateCompileCache};
+pub use task_spawn_error::{SpawnErrorKind, TaskSpawnError};
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
@@ -20,14 +29,26 @@ use crate::cache::{compile_cached, sha256_hex};
 use crate::discover::find_workflows_with_metadata;
 use crate::engine::errors::EngineError;
 use crate::engine::persistence::{derive_decisions, derive_machine_state, derive_state_from_log};
-use crate::engine::types::{now_iso8601, EventPayload, StateFileHeader};
+use crate::engine::types::{now_iso8601, Event, EventPayload};
 use crate::session::context::ContextStore;
 use crate::session::local::LocalBackend;
-use crate::session::{state_file_name, Backend, SessionBackend};
+use crate::session::{Backend, SessionBackend, SessionError};
 use crate::template::types::CompiledTemplate;
 
 /// Maximum payload size for --with-data (1 MB).
 pub(super) const MAX_WITH_DATA_BYTES: usize = 1_048_576;
+
+// Issue #14: thread-local stash for the retry outcome. `handle_next`
+// writes this after intercepting a `retry_failed` submission so the
+// response envelope can splice in per-child `retry_dispatched` and
+// `retry_errored` sibling keys after the advance loop returns. A
+// thread-local keeps the plumbing out of the advance-loop signatures
+// without regressing the single-threaded invocation model.
+thread_local! {
+    #[allow(clippy::missing_docs_in_private_items)]
+    static RETRY_OUTCOME: std::cell::RefCell<Option<crate::cli::retry::RetryOutcome>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Maximum size of captured stdout/stderr from action execution (64 KB).
 const MAX_ACTION_OUTPUT_BYTES: usize = 64 * 1024;
@@ -225,7 +246,31 @@ pub enum SessionCommand {
         /// Which version to keep: "local" or "remote"
         #[arg(long)]
         keep: String,
+        /// Child reconciliation policy. Default `auto` applies the
+        /// strict-prefix rule to each child state file: if one side is
+        /// a byte-exact prefix of the other, the longer side wins; any
+        /// other divergence is reported as a conflict requiring a
+        /// per-child `koto session resolve`.
+        #[arg(long, value_enum, default_value_t = ChildrenPolicy::Auto)]
+        children: ChildrenPolicy,
     },
+}
+
+/// Policy for reconciling a parent's children during `session resolve`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ChildrenPolicy {
+    /// Apply the strict-prefix rule per child (accept the longer side
+    /// when one is a byte-prefix of the other), surface a conflict
+    /// otherwise.
+    Auto,
+    /// Leave child state files untouched.
+    Skip,
+    /// Overwrite local child state with remote.
+    #[clap(name = "accept-remote")]
+    AcceptRemote,
+    /// Overwrite remote child state with local.
+    #[clap(name = "accept-local")]
+    AcceptLocal,
 }
 
 #[derive(Subcommand)]
@@ -456,7 +501,7 @@ fn build_local_backend() -> Result<LocalBackend> {
 /// Validate and resolve `--var KEY=VALUE` arguments against the template's
 /// variable declarations. Returns a map of resolved variable bindings ready
 /// for storage in the WorkflowInitialized event.
-fn resolve_variables(
+pub(crate) fn resolve_variables(
     raw_vars: &[String],
     declarations: &BTreeMap<String, VariableDecl>,
 ) -> std::result::Result<HashMap<String, String>, String> {
@@ -543,6 +588,62 @@ fn evidence_has_reserved_gates_key(data: &serde_json::Value) -> bool {
     data.as_object()
         .map(|o| o.contains_key("gates"))
         .unwrap_or(false)
+}
+
+/// Resolve a `--with-data` argument into the JSON string to be parsed.
+///
+/// If the argument begins with `@`, the remainder is treated as a file path
+/// and the file's contents are returned. Otherwise the argument is returned
+/// unchanged for inline parsing.
+///
+/// Errors:
+/// - File does not exist or is unreadable: `InvalidSubmission` naming the path.
+/// - File size exceeds `MAX_WITH_DATA_BYTES`: `InvalidSubmission` naming the
+///   cap and the actual file size in bytes.
+///
+/// Empty paths (`@` with nothing after it) are rejected with a clear message.
+pub(super) fn resolve_with_data_source(
+    raw: &str,
+) -> Result<String, crate::cli::next_types::NextError> {
+    use crate::cli::next_types::{NextError, NextErrorCode};
+
+    let Some(path_str) = raw.strip_prefix('@') else {
+        // No prefix: caller will parse `raw` directly as inline JSON.
+        return Ok(raw.to_string());
+    };
+
+    if path_str.is_empty() {
+        return Err(NextError {
+            code: NextErrorCode::InvalidSubmission,
+            message: "--with-data @ requires a file path after '@'".to_string(),
+            details: vec![],
+        });
+    }
+
+    let path = std::path::Path::new(path_str);
+    let metadata = std::fs::metadata(path).map_err(|e| NextError {
+        code: NextErrorCode::InvalidSubmission,
+        message: format!("--with-data: cannot read file '{}': {}", path_str, e),
+        details: vec![],
+    })?;
+
+    let actual_bytes = metadata.len();
+    if actual_bytes > MAX_WITH_DATA_BYTES as u64 {
+        return Err(NextError {
+            code: NextErrorCode::InvalidSubmission,
+            message: format!(
+                "--with-data: file '{}' is {} bytes, exceeds maximum of {} bytes",
+                path_str, actual_bytes, MAX_WITH_DATA_BYTES
+            ),
+            details: vec![],
+        });
+    }
+
+    std::fs::read_to_string(path).map_err(|e| NextError {
+        code: NextErrorCode::InvalidSubmission,
+        message: format!("--with-data: cannot read file '{}': {}", path_str, e),
+        details: vec![],
+    })
 }
 
 /// Parse a `--with-data` JSON string and check for the reserved `"gates"` key.
@@ -717,28 +818,40 @@ pub fn run(app: App) -> Result<()> {
                     }));
                 }
             };
-            let filtered: Vec<_> = if roots {
-                metadata
+            if roots {
+                let filtered: Vec<_> = metadata
                     .into_iter()
                     .filter(|wf| wf.parent_workflow.is_none())
-                    .collect()
-            } else if let Some(ref parent_name) = children {
-                metadata
-                    .into_iter()
-                    .filter(|wf| wf.parent_workflow.as_deref() == Some(parent_name.as_str()))
-                    .collect()
-            } else if orphaned {
-                metadata
+                    .collect();
+                println!("{}", serde_json::to_string(&filtered)?);
+                return Ok(());
+            }
+            if orphaned {
+                let filtered: Vec<_> = metadata
                     .into_iter()
                     .filter(|wf| match &wf.parent_workflow {
                         Some(parent) => !backend.exists(parent),
                         None => false,
                     })
-                    .collect()
-            } else {
-                metadata
-            };
-            println!("{}", serde_json::to_string(&filtered)?);
+                    .collect();
+                println!("{}", serde_json::to_string(&filtered)?);
+                return Ok(());
+            }
+            if let Some(ref parent_name) = children {
+                // When the parent is batch-scoped, augment each row
+                // with the per-task metadata derived from the shared
+                // `derive_batch_view` helper — keeping the output in
+                // lock step with `koto status <parent>`'s batch
+                // section.
+                let filtered: Vec<_> = metadata
+                    .into_iter()
+                    .filter(|wf| wf.parent_workflow.as_deref() == Some(parent_name.as_str()))
+                    .collect();
+                let augmented = annotate_children_with_batch_view(&backend, parent_name, filtered);
+                println!("{}", serde_json::to_string(&augmented)?);
+                return Ok(());
+            }
+            println!("{}", serde_json::to_string(&metadata)?);
             Ok(())
         }
         Command::Session { subcommand } => {
@@ -760,9 +873,11 @@ pub fn run(app: App) -> Result<()> {
                     );
                     Ok(())
                 }
-                SessionCommand::Resolve { name, keep } => {
-                    session::handle_resolve(&backend, &name, &keep)
-                }
+                SessionCommand::Resolve {
+                    name,
+                    keep,
+                    children,
+                } => session::handle_resolve(&backend, &name, &keep, children),
             }
         }
         Command::Context { subcommand } => {
@@ -1026,6 +1141,25 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
 }
 
 /// Handle the `koto init` command.
+///
+/// Thin wrapper over [`init_child_from_parent`]: performs the CLI-only
+/// validations (workflow name, parent existence, best-effort collision
+/// pre-check) and then delegates the actual compile + resolve + atomic
+/// state-file write to the helper. Any [`TaskSpawnError`] returned by
+/// the helper is mapped back onto the CLI's existing exit codes:
+///
+/// - `SpawnErrorKind::Collision` → "workflow already exists" at exit 1.
+/// - variable-resolution failures (messages prefixed with
+///   [`init_child::VAR_RESOLUTION_MSG_PREFIX`]) → exit 2, matching the
+///   legacy behavior where malformed / unknown / missing vars were
+///   classified as caller errors.
+/// - every other kind → exit 1 with the helper's message verbatim.
+///
+/// The helper re-reads the template from the compile cache and
+/// re-resolves `--var` bindings; `handle_init` no longer duplicates
+/// that work. The initial state is recovered from the on-disk header
+/// after a successful spawn so the JSON `{ name, state }` stdout line
+/// stays byte-compatible with the previous implementation.
 fn handle_init(
     backend: &dyn SessionBackend,
     name: &str,
@@ -1055,7 +1189,12 @@ fn handle_init(
         }
     }
 
-    // Check if session already exists (state file present).
+    // Best-effort pre-check for "already exists". The atomic
+    // `init_state_file` inside the helper is the authoritative
+    // collision detector (handles the racers case), but emitting the
+    // pre-check error here keeps the error message identical in the
+    // common path and avoids paying compile cost when we already know
+    // the session exists.
     if backend.exists(name) {
         exit_with_error(serde_json::json!({
             "error": format!("workflow '{}' already exists", name),
@@ -1063,91 +1202,77 @@ fn handle_init(
         }));
     }
 
-    // Create the session directory.
-    if let Err(e) = backend.create(name) {
-        exit_with_error(serde_json::json!({
-            "error": e.to_string(),
-            "command": "init"
-        }));
-    }
-
-    let (cache_path, hash) = match compile_cached(Path::new(template), false) {
-        Ok(result) => result,
-        Err(e) => {
-            exit_with_error(serde_json::json!({
-                "error": e.to_string(),
-                "command": "init"
-            }));
-        }
-    };
-
-    let cache_path_str = cache_path.to_string_lossy().to_string();
-    let compiled: CompiledTemplate = match load_compiled_template(&cache_path_str) {
-        Ok(t) => t,
-        Err(e) => {
-            exit_with_error(serde_json::json!({
-                "error": e.to_string(),
-                "command": "init"
-            }));
-        }
-    };
-
-    // Resolve --var flags against template variable declarations.
-    let variables = match resolve_variables(vars, &compiled.variables) {
-        Ok(v) => v,
-        Err(e) => {
-            exit_with_error_code(
-                serde_json::json!({
-                    "error": e,
+    // Delegate to the shared helper. We allocate a fresh cache for
+    // this one call since the CLI path never spawns siblings — the
+    // scheduler is the only caller that benefits from reusing a cache
+    // across multiple `init_child_from_parent` invocations.
+    let mut cache = TemplateCompileCache::new();
+    let template_path = Path::new(template);
+    // `None` for spawn_entry: the top-level `koto init` path (even with
+    // `--parent`) is a manual workflow creation, not a batch spawn. The
+    // R8 spawn-time immutability snapshot is populated only by the
+    // future batch scheduler, which calls this helper directly with
+    // `Some(..)`.
+    if let Err(err) =
+        init_child_from_parent(backend, parent, name, template_path, vars, &mut cache, None)
+    {
+        match err.kind {
+            SpawnErrorKind::Collision => {
+                // Match the pre-check's error text so callers can rely
+                // on a stable "already exists" string regardless of
+                // which detector fired.
+                exit_with_error(serde_json::json!({
+                    "error": format!("workflow '{}' already exists", name),
                     "command": "init"
-                }),
-                2,
-            );
+                }));
+            }
+            _ => {
+                // Variable-resolution failures are caller errors (exit
+                // 2); everything else is a runtime/IO/compile failure
+                // (exit 1), matching the legacy implementation.
+                let is_var_error = matches!(err.kind, SpawnErrorKind::TemplateCompileFailed)
+                    && err
+                        .message
+                        .starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
+                let body = serde_json::json!({
+                    "error": if is_var_error {
+                        err.message
+                            .strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
+                            .unwrap_or(&err.message)
+                            .to_string()
+                    } else {
+                        err.message.clone()
+                    },
+                    "command": "init"
+                });
+                if is_var_error {
+                    exit_with_error_code(body, 2);
+                } else {
+                    exit_with_error(body);
+                }
+            }
         }
-    };
-
-    let initial_state = compiled.initial_state.clone();
-    let ts = now_iso8601();
-
-    // Write header line
-    let header = StateFileHeader {
-        schema_version: 1,
-        workflow: name.to_string(),
-        template_hash: hash,
-        created_at: ts.clone(),
-        parent_workflow: parent.map(|s| s.to_string()),
-    };
-    if let Err(e) = backend.append_header(name, &header) {
-        exit_with_error(serde_json::json!({
-            "error": e.to_string(),
-            "command": "init"
-        }));
     }
 
-    // Write workflow_initialized event (seq 1)
-    let init_payload = EventPayload::WorkflowInitialized {
-        template_path: cache_path_str,
-        variables,
-    };
-    if let Err(e) = backend.append_event(name, &init_payload, &ts) {
-        exit_with_error(serde_json::json!({
-            "error": e.to_string(),
-            "command": "init"
-        }));
-    }
-
-    // Write initial transitioned event (seq 2, from: null)
-    let transition_payload = EventPayload::Transitioned {
-        from: None,
-        to: initial_state.clone(),
-        condition_type: "auto".to_string(),
-    };
-    if let Err(e) = backend.append_event(name, &transition_payload, &ts) {
-        exit_with_error(serde_json::json!({
-            "error": e.to_string(),
-            "command": "init"
-        }));
-    }
+    // Recover the initial state by reading back the header/events we
+    // just wrote. This keeps the CLI's JSON output (`{name, state}`)
+    // byte-compatible with the previous implementation without
+    // extending the helper's return type just for this one consumer.
+    let (_header, events) = backend
+        .read_events(name)
+        .map_err(|e| anyhow::anyhow!("failed to read newly initialized workflow: {}", e))?;
+    let initial_state = events
+        .iter()
+        .find_map(|e| match &e.payload {
+            EventPayload::Transitioned { to, .. } => Some(to.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "newly initialized workflow {:?} has no Transitioned event",
+                name
+            )
+        })?;
 
     println!(
         "{}",
@@ -1236,6 +1361,56 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Decide whether a workflow state's entry into `handle_next` must be
+/// serialized behind an advisory flock on the parent state file.
+///
+/// The "batch-scoped parent" concept lives in the batch-child-spawning
+/// design (Decision 12): when a parent state materializes children, two
+/// concurrent `koto next` ticks on the same parent can race the
+/// scheduler's read-decide-write cycle and spawn duplicate children or
+/// double-count completions. Such states must serialize ticks; all
+/// other states are free to skip the lock so the happy path is
+/// unchanged.
+///
+/// # Current detection rules
+///
+/// The authoritative signals planned by the design are:
+///
+/// 1. A `materialize_children` hook on the current state's template
+///    (introduced by Issue #7).
+/// 2. A `SchedulerRan` or `BatchFinalized` event in the state log
+///    (introduced by Issues #16 / #17).
+///
+/// Neither signal exists in the codebase yet. This helper therefore
+/// currently returns `false` in every case, which keeps the lock path
+/// cold until the hook machinery lands. Issues #7 / #16 / #17 will
+/// extend this function to inspect the relevant fields; call sites in
+/// `handle_next` do not need to change when that happens.
+///
+/// # Parameters
+///
+/// - `_compiled`: the compiled template for the workflow. When hook
+///   metadata lands, implementations will read
+///   `_compiled.states[state_name]` to check for the hook.
+/// - `_state_name`: the current state name; used as the lookup key in
+///   the compiled template.
+/// - `_events`: the full event log for the workflow. When batch event
+///   types land, implementations will scan this for
+///   `SchedulerRan` / `BatchFinalized` entries.
+///
+/// All parameters are prefixed with `_` today because none of them are
+/// inspected yet; they are threaded through now so the helper's
+/// signature does not change when the real detection logic lands.
+// TODO(#16, #17): scan `events` for SchedulerRan / BatchFinalized once
+// those event payloads exist. Issue #12 wires the first of the two
+// signals — a `materialize_children` hook on the current state — so
+// parents that spawn children serialize ticks under the advisory
+// flock. The event-based check lands with Issues #16/#17.
+#[cfg(unix)]
+fn state_is_batch_scoped(compiled: &CompiledTemplate, state_name: &str, _events: &[Event]) -> bool {
+    crate::cli::batch::state_has_materialize_children(compiled, state_name)
+}
+
 /// Handle the `koto next` command with full output contract support.
 ///
 /// Flow:
@@ -1246,7 +1421,8 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
 ///    state, dispatch on new state (single-shot, no advancement loop)
 /// 5. If --with-data: validate evidence against accepts schema, append
 ///    evidence_submitted event
-/// 6. Acquire advisory flock on state file (non-blocking)
+/// 6. If the current state is a batch-scoped parent, acquire an advisory
+///    flock on the state file (non-blocking). Non-batch states skip this.
 /// 7. Register SIGTERM/SIGINT signal handlers
 /// 8. Merge evidence from current epoch
 /// 9. Run advancement loop (advance_until_stop)
@@ -1255,6 +1431,9 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
 /// NOTE: This handler uses structured `NextError` for domain errors (per the
 /// output contract). Other commands (init, rewind, etc.) use a flat
 /// `{"error": "string", "command": "..."}` format. Do not mix the two styles.
+/// The batch-scoped lock path produces a third envelope shape --
+/// `BatchError::ConcurrentTick` (see `cli::batch_error`) -- which Issue #10
+/// will extend with additional variants.
 #[cfg(unix)]
 fn handle_next(
     backend: &dyn SessionBackend,
@@ -1292,21 +1471,34 @@ fn handle_next(
         exit_with_error_code(json, err.code.exit_code());
     }
 
-    // 2. Payload size limit
-    if let Some(ref data_str) = with_data {
-        if data_str.len() > MAX_WITH_DATA_BYTES {
-            let err = NextError {
-                code: NextErrorCode::InvalidSubmission,
-                message: format!(
-                    "--with-data payload exceeds maximum size of {} bytes",
-                    MAX_WITH_DATA_BYTES
-                ),
-                details: vec![],
+    // 2. Resolve --with-data source (inline JSON or @file.json) and apply the
+    //    payload size limit. The file path is read here so the rest of the
+    //    handler operates on the resolved JSON string regardless of source.
+    let with_data: Option<String> = match with_data {
+        Some(raw) => {
+            let resolved = match resolve_with_data_source(&raw) {
+                Ok(s) => s,
+                Err(err) => {
+                    let json = serde_json::json!({"error": err});
+                    exit_with_error_code(json, err.code.exit_code());
+                }
             };
-            let json = serde_json::json!({"error": err});
-            exit_with_error_code(json, err.code.exit_code());
+            if resolved.len() > MAX_WITH_DATA_BYTES {
+                let err = NextError {
+                    code: NextErrorCode::InvalidSubmission,
+                    message: format!(
+                        "--with-data payload exceeds maximum size of {} bytes",
+                        MAX_WITH_DATA_BYTES
+                    ),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": err});
+                exit_with_error_code(json, err.code.exit_code());
+            }
+            Some(resolved)
         }
-    }
+        None => None,
+    };
 
     // 3. Load state file and template
     let current_dir = std::env::current_dir()?;
@@ -1604,77 +1796,267 @@ fn handle_next(
             }
         };
 
-        // Validate evidence against schema.
-        if let Err(validation_err) = validate_evidence(&data, accepts) {
-            let details: Vec<ErrorDetail> = validation_err
-                .field_errors
-                .iter()
-                .map(|fe| ErrorDetail {
-                    field: fe.field.clone(),
-                    reason: fe.reason.clone(),
-                })
-                .collect();
-            let err = NextError {
-                code: NextErrorCode::InvalidSubmission,
-                message: "evidence validation failed".to_string(),
-                details,
-            };
-            let json = serde_json::json!({"error": err});
-            exit_with_error_code(json, err.code.exit_code());
+        // Issue #14: intercept `retry_failed` BEFORE the evidence
+        // validator runs. `retry_failed` is a reserved top-level
+        // evidence key (like `gates`) — it must not round-trip through
+        // the template's `accepts` schema because the schema rejects
+        // unknown fields. The retry handler writes its own
+        // EvidenceSubmitted events and returns; control then falls
+        // through to the advance loop, which observes the new evidence
+        // on its next read (`derive_evidence` + `merge_epoch_evidence`)
+        // and fires the template transition on
+        // `when: evidence.retry_failed: present`.
+        //
+        // Precedence for the retry flow:
+        // 1. Reject malformed payloads with a typed `InvalidRetryReason`.
+        // 2. Validate the retry set against the on-disk children.
+        // 3. Append parent events, dispatch per-child paths.
+        match crate::cli::retry::parse_retry_failed(&data) {
+            Ok(Some(payload)) => {
+                // The payload is well-formed; continue into
+                // handle_retry_failed. Parse any companion `tasks`
+                // field so retry-respawn can use the CURRENT submission
+                // entry; absence is fine (respawn falls back to the
+                // child's recorded spawn_entry).
+                let submitted_entries: Vec<crate::engine::batch_validation::TaskEntry> = data
+                    .as_object()
+                    .and_then(|m| {
+                        template_state
+                            .materialize_children
+                            .as_ref()
+                            .and_then(|hook| m.get(&hook.from_field))
+                    })
+                    .and_then(|raw| {
+                        serde_json::from_value::<Vec<crate::engine::batch_validation::TaskEntry>>(
+                            raw.clone(),
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_default();
+
+                // Enumerate extra top-level evidence keys so R10 can
+                // flag `MixedWithOtherEvidence`. Reserved keys the
+                // runtime injects itself (`gates`) are already rejected
+                // above; `tasks` accompanying a retry is technically a
+                // mixed payload under R10, but the companion task list
+                // is explicitly allowed so the retry entry can update
+                // template/vars. We filter that field out too.
+                let extra_top_level: Vec<String> = data
+                    .as_object()
+                    .map(|obj| {
+                        obj.keys()
+                            .filter(|k| {
+                                let k = k.as_str();
+                                if k == "retry_failed" {
+                                    return false;
+                                }
+                                // Exclude the batch hook's task-list
+                                // field when present; it's the
+                                // companion for retry-respawn.
+                                if let Some(hook) = template_state.materialize_children.as_ref() {
+                                    if k == hook.from_field {
+                                        return false;
+                                    }
+                                }
+                                true
+                            })
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let submitter_cwd = std::env::current_dir().ok();
+                let outcome = match crate::cli::retry::handle_retry_failed(
+                    backend,
+                    &name,
+                    current_state,
+                    &payload,
+                    &extra_top_level,
+                    submitter_cwd,
+                    &submitted_entries,
+                ) {
+                    Ok(o) => o,
+                    Err(batch_err) => {
+                        let code = batch_err.exit_code();
+                        exit_with_error_code(batch_err.to_envelope(), code);
+                    }
+                };
+
+                // Stash the outcome for later (response sibling).
+                RETRY_OUTCOME.with(|cell| {
+                    *cell.borrow_mut() = Some(outcome);
+                });
+                // Skip the remainder of the with-data block (evidence
+                // validator, batch R0-R9, generic EvidenceSubmitted).
+                // Fall through to the rest of `handle_next` so the
+                // advance loop runs on the fresh parent log.
+            }
+            Ok(None) => {
+                // No retry_failed key — proceed with the normal
+                // evidence-validation path below.
+            }
+            Err(reason) => {
+                let batch_err = crate::cli::batch_error::BatchError::InvalidRetryRequest { reason };
+                let code = batch_err.exit_code();
+                exit_with_error_code(batch_err.to_envelope(), code);
+            }
         }
 
-        // Append evidence_submitted event.
-        let fields: HashMap<String, serde_json::Value> = data
+        // Skip the rest of the --with-data block if retry_failed was
+        // consumed above: those paths are mutually exclusive under
+        // R10's MixedWithOtherEvidence rule. The retry handler already
+        // wrote the parent's EvidenceSubmitted events directly, so we
+        // must not fall through to validate_evidence (which would
+        // reject the reserved key) or the generic EvidenceSubmitted
+        // append (which would duplicate the handler's write).
+        let retry_consumed = data
             .as_object()
-            .expect("validate_evidence guarantees object input")
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+            .is_some_and(|m| m.contains_key("retry_failed"));
+        if !retry_consumed {
+            // Validate evidence against schema.
+            if let Err(validation_err) = validate_evidence(&data, accepts) {
+                let details: Vec<ErrorDetail> = validation_err
+                    .field_errors
+                    .iter()
+                    .map(|fe| ErrorDetail {
+                        field: fe.field.clone(),
+                        reason: fe.reason.clone(),
+                    })
+                    .collect();
+                let err = NextError {
+                    code: NextErrorCode::InvalidSubmission,
+                    message: "evidence validation failed".to_string(),
+                    details,
+                };
+                let json = serde_json::json!({"error": err});
+                exit_with_error_code(json, err.code.exit_code());
+            }
 
-        let payload = EventPayload::EvidenceSubmitted {
-            state: current_state.clone(),
-            fields,
+            // Batch runtime validation (R0-R9). Runs PRE-APPEND so a
+            // malformed batch submission (cycles, dangling refs, reserved
+            // names, duplicate names, oversize payload) never leaves a
+            // state footprint on the parent's event log — the "zero state
+            // on parent's event log" guarantee from Issue #9. The validator
+            // is a pure function; existing children are snapshotted from
+            // the backend so R8 can compare the submission against the
+            // canonical-form `spawn_entry` of each already-materialized
+            // child.
+            //
+            // When the current state carries no `materialize_children`
+            // hook this block is a no-op. When the hook's `from_field`
+            // does not appear in the submitted evidence (optional task
+            // list), we also skip — there's nothing to validate.
+            if let Some(hook) = template_state.materialize_children.as_ref() {
+                if let Some(raw) = data.as_object().and_then(|m| m.get(&hook.from_field)) {
+                    match serde_json::from_value::<Vec<crate::engine::batch_validation::TaskEntry>>(
+                        raw.clone(),
+                    ) {
+                        Ok(tasks) => {
+                            let existing =
+                                crate::cli::batch::build_existing_children_snapshot(backend, &name);
+                            if let Err(batch_err) =
+                                crate::engine::batch_validation::validate_batch_submission(
+                                    &tasks, &existing,
+                                )
+                            {
+                                let code = batch_err.exit_code();
+                                exit_with_error_code(batch_err.to_envelope(), code);
+                            }
+                        }
+                        Err(e) => {
+                            // Structural check in validate_evidence guarantees
+                            // the value is an array of objects, but a deeper
+                            // parse failure (unknown field shape, etc.) should
+                            // still surface as InvalidSubmission rather than
+                            // passing through to EvidenceSubmitted.
+                            let err = NextError {
+                                code: NextErrorCode::InvalidSubmission,
+                                message: format!("batch task list failed to parse: {}", e),
+                                details: vec![],
+                            };
+                            let json = serde_json::json!({"error": err});
+                            exit_with_error_code(json, err.code.exit_code());
+                        }
+                    }
+                }
+            }
+
+            // Append evidence_submitted event.
+            let fields: HashMap<String, serde_json::Value> = data
+                .as_object()
+                .expect("validate_evidence guarantees object input")
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            // Capture the submitter's working directory so the batch
+            // scheduler's path resolver (Decision 4 / 14 in
+            // DESIGN-batch-child-spawning.md) can use it as the final
+            // fallback for relative child-template paths. Best-effort:
+            // a failure here (deleted cwd, permission issues) leaves the
+            // field `None` and the resolver tolerates the absence.
+            let submitter_cwd = std::env::current_dir().ok();
+            let payload = EventPayload::EvidenceSubmitted {
+                state: current_state.clone(),
+                fields,
+                submitter_cwd,
+            };
+            if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
+                let ne = NextError {
+                    code: NextErrorCode::PersistenceError,
+                    message: e.to_string(),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": ne});
+                exit_with_error_code(json, ne.code.exit_code());
+            }
+        }
+    }
+
+    // 6. For batch-scoped parents only: acquire an advisory flock on
+    // the state file (non-blocking) and hold it for the rest of the
+    // tick. The RAII guard released on drop keeps lock lifetime tied
+    // to this function's scope.
+    //
+    // Non-batch workflows intentionally skip the lock. The parent-
+    // lock requirement comes from the batch-child-spawning design
+    // (Decision 12) where concurrent ticks on a parent state can
+    // race the scheduler's read-decide-write cycle. Ordinary
+    // workflows never run a scheduler, so no ordering is needed and
+    // two concurrent ticks would at worst append-compete at the
+    // state file level -- which the engine's existing single-writer
+    // semantics handle.
+    //
+    // On lock contention we translate `SessionError::Locked` into
+    // `BatchError::ConcurrentTick` rather than reusing
+    // `NextErrorCode::ConcurrentAccess`. The batch envelope lives
+    // alongside the existing `NextError` envelope on purpose: Issue
+    // #10 will extend `BatchError` with additional batch-specific
+    // variants, and agents need to discriminate batch errors from
+    // per-state ones. `_batch_lock` is kept alive across the advance
+    // loop; its field is intentionally unused.
+    let _batch_lock: Option<crate::session::SessionLock> =
+        if state_is_batch_scoped(&compiled, current_state, &events) {
+            match backend.lock_state_file(&name) {
+                Ok(guard) => Some(guard),
+                Err(SessionError::Locked { holder_pid }) => {
+                    let err = crate::cli::batch_error::BatchError::ConcurrentTick { holder_pid };
+                    let code = err.exit_code();
+                    exit_with_error_code(err.to_envelope(), code);
+                }
+                Err(e) => {
+                    let ne = NextError {
+                        code: NextErrorCode::PersistenceError,
+                        message: format!("failed to acquire state file lock: {}", e),
+                        details: vec![],
+                    };
+                    let json = serde_json::json!({"error": ne});
+                    exit_with_error_code(json, ne.code.exit_code());
+                }
+            }
+        } else {
+            None
         };
-        if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
-            let ne = NextError {
-                code: NextErrorCode::PersistenceError,
-                message: e.to_string(),
-                details: vec![],
-            };
-            let json = serde_json::json!({"error": ne});
-            exit_with_error_code(json, ne.code.exit_code());
-        }
-    }
-
-    // 6. Acquire advisory flock on state file (non-blocking).
-    // Prevents concurrent koto next calls from interleaving writes.
-    let state_path = backend.session_dir(&name).join(state_file_name(&name));
-    let lock_file = match std::fs::File::open(&state_path) {
-        Ok(f) => f,
-        Err(e) => {
-            let ne = NextError {
-                code: NextErrorCode::PersistenceError,
-                message: format!("failed to open state file for locking: {}", e),
-                details: vec![],
-            };
-            let json = serde_json::json!({"error": ne});
-            exit_with_error_code(json, ne.code.exit_code());
-        }
-    };
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = lock_file.as_raw_fd();
-        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if ret != 0 {
-            let err = NextError {
-                code: NextErrorCode::ConcurrentAccess,
-                message: "another koto next is already running for this workflow".to_string(),
-                details: vec![],
-            };
-            let json = serde_json::json!({"error": err});
-            exit_with_error_code(json, err.code.exit_code());
-        }
-    }
 
     // 7. Register signal handlers for clean shutdown.
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1712,11 +2094,24 @@ fn handle_next(
     };
 
     // Build the children-complete gate evaluator closure. It captures the
-    // session backend to call list() and read_events() for child discovery.
+    // session backend to call list() and read_events() for child discovery,
+    // plus parent events / compiled template / current state so the
+    // extended gate output (Issue #15) can reason about batch task
+    // classifications (blocked/skipped attribution, derived booleans).
     let workflow_name_for_children = name.clone();
+    let compiled_for_children = compiled.clone();
+    let events_for_children = current_events.clone();
+    let current_state_for_children = machine_state.current_state.clone();
     let children_eval =
         move |gate: &crate::template::types::Gate| -> crate::gate::StructuredGateResult {
-            evaluate_children_complete(backend, &workflow_name_for_children, gate)
+            evaluate_children_complete(
+                backend,
+                &workflow_name_for_children,
+                &events_for_children,
+                &compiled_for_children,
+                &current_state_for_children,
+                gate,
+            )
         };
 
     let vars_for_gates = runtime_vars.clone();
@@ -2040,7 +2435,235 @@ fn handle_next(
                 let d = crate::cli::vars::substitute_vars(d, &runtime_vars);
                 variables.substitute(&d)
             });
-            println!("{}", serde_json::to_string(&resp)?);
+
+            // Run the batch scheduler when the final state carries a
+            // `materialize_children` hook. Fresh events reflect any
+            // transitions appended during the advance loop. The
+            // scheduler is pure disk-state — re-running on a
+            // fully-spawned batch is a no-op.
+            let scheduler_outcome =
+                if crate::cli::batch::state_has_materialize_children(&compiled, final_state) {
+                    let (_, post_events) = backend
+                        .read_events(&name)
+                        .unwrap_or((header.clone(), Vec::new()));
+                    match crate::cli::batch::run_batch_scheduler(
+                        backend,
+                        &compiled,
+                        final_state,
+                        &name,
+                        &post_events,
+                    ) {
+                        Ok(outcome) => Some(outcome),
+                        Err(err) => {
+                            // Issue #12 scope: batch errors here are a
+                            // tick-wide failure (e.g., backend list
+                            // unreachable). Surface via the existing
+                            // BatchError envelope so the scheduler does
+                            // not corrupt the advance response.
+                            let code = err.exit_code();
+                            exit_with_error_code(err.to_envelope(), code);
+                        }
+                    }
+                } else {
+                    None
+                };
+
+            // Issue #16: append a `SchedulerRan` event to the parent
+            // log on every non-trivial tick so `koto query --events`
+            // shows per-tick audit alongside `EvidenceSubmitted` /
+            // `Transitioned`. No-op ticks (nothing spawned, nothing
+            // errored, classification unchanged) deliberately skip
+            // the append to prevent log bloat.
+            //
+            // The predicate must look ONLY at tick-scoped signals:
+            // `spawned_this_tick` (includes skip-marker spawns — see
+            // `spawn_skip_marker_task`), `errored` (tick-local spawn
+            // errors), and `reclassified_this_tick`. The persistent
+            // "skipped" count in `materialized_children` is NOT a
+            // tick-scoped signal — skip markers persist across ticks,
+            // so using their count would bloat the log with a
+            // `SchedulerRan` event on every subsequent no-op tick
+            // after any skip materialized.
+            if let Some(crate::cli::batch::SchedulerOutcome::Scheduled {
+                spawned_this_tick,
+                errored,
+                materialized_children,
+                reclassified_this_tick,
+                ..
+            }) = &scheduler_outcome
+            {
+                let is_non_trivial =
+                    !spawned_this_tick.is_empty() || !errored.is_empty() || *reclassified_this_tick;
+                if is_non_trivial {
+                    let skipped_count = materialized_children
+                        .iter()
+                        .filter(|mc| matches!(mc.outcome, crate::cli::batch::TaskOutcome::Skipped))
+                        .count();
+                    let ts = crate::engine::types::now_iso8601();
+                    let payload = crate::engine::types::EventPayload::SchedulerRan {
+                        state: final_state.to_string(),
+                        tick_summary: crate::engine::types::SchedulerTickSummary {
+                            spawned_count: spawned_this_tick.len(),
+                            errored_count: errored.len(),
+                            skipped_count,
+                            reclassified: *reclassified_this_tick,
+                        },
+                        timestamp: ts.clone(),
+                    };
+                    if let Err(e) = backend.append_event(&name, &payload, &ts) {
+                        eprintln!("warning: failed to append SchedulerRan event: {}", e);
+                    }
+                }
+            }
+
+            // Issue #17: append a `BatchFinalized` event when the
+            // `children-complete` gate on the current state first
+            // reports `all_complete: true`. The predicate in
+            // `should_append_batch_finalized` ensures the event
+            // appends at most once per finalization pass; a retry
+            // (retry_failed evidence / Rewound) invalidates the prior
+            // event and the next all-complete tick appends a fresh
+            // BatchFinalized. The view freezes the current gate output
+            // so subsequent `koto status` and terminal `done`
+            // responses can replay the final batch shape.
+            if scheduler_outcome.is_some()
+                && crate::cli::batch::state_has_materialize_children(&compiled, final_state)
+            {
+                let (_, post_events) = backend
+                    .read_events(&name)
+                    .unwrap_or((header.clone(), Vec::new()));
+                let (all_complete, gate_output) = crate::cli::batch::build_children_complete_output(
+                    backend,
+                    &name,
+                    &post_events,
+                    &compiled,
+                    final_state,
+                    None,
+                );
+                if crate::cli::batch::should_append_batch_finalized(&post_events, all_complete) {
+                    if let Some(view) =
+                        crate::cli::batch::BatchFinalView::from_gate_output(&gate_output)
+                    {
+                        let ts = crate::engine::types::now_iso8601();
+                        let payload = crate::engine::types::EventPayload::BatchFinalized {
+                            state: final_state.to_string(),
+                            view: serde_json::to_value(&view).unwrap_or(serde_json::Value::Null),
+                            timestamp: ts.clone(),
+                            superseded_by: None,
+                        };
+                        if let Err(e) = backend.append_event(&name, &payload, &ts) {
+                            eprintln!("warning: failed to append BatchFinalized event: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // Emit the response JSON. When the scheduler ran, splice
+            // a `scheduler` sibling key onto the envelope so callers
+            // observe it alongside the advance-loop response. Issue
+            // #12 does this only for `SchedulerOutcome::Scheduled`
+            // and `Error`; `NoBatch` is swallowed as the no-op it
+            // signals.
+            let json_value = serde_json::to_value(&resp)?;
+            let mut envelope = match json_value {
+                serde_json::Value::Object(m) => m,
+                other => {
+                    let mut map = serde_json::Map::new();
+                    map.insert("response".to_string(), other);
+                    map
+                }
+            };
+            if let Some(outcome) = &scheduler_outcome {
+                if !matches!(outcome, crate::cli::batch::SchedulerOutcome::NoBatch) {
+                    envelope.insert("scheduler".to_string(), serde_json::to_value(outcome)?);
+                }
+            }
+
+            // Issue #17: attach `batch.phase` and (on terminal
+            // responses) `batch_final_view` from the most recent
+            // `BatchFinalized` event in the log. The phase is sticky
+            // to `"final"` once a `BatchFinalized` has appended —
+            // retries do not revert the phase; the prior view simply
+            // carries a derived `superseded_by` marker for replay
+            // tools. Terminal `done` responses embed the full view so
+            // agents writing a summary directive do not need a second
+            // `koto status` call.
+            let bf_post_events = backend
+                .read_events(&name)
+                .map(|(_, evts)| evts)
+                .unwrap_or_default();
+            let latest_bf =
+                crate::cli::batch::find_most_recent_batch_finalized(&bf_post_events).cloned();
+            if latest_bf.is_some() {
+                let phase = crate::cli::batch::derive_batch_phase(&bf_post_events);
+                let mut batch_obj = serde_json::Map::new();
+                batch_obj.insert("phase".to_string(), serde_json::json!(phase));
+                envelope.insert("batch".to_string(), serde_json::Value::Object(batch_obj));
+            }
+            if matches!(resp, NextResponse::Terminal { .. }) {
+                if let Some(ref ev) = latest_bf {
+                    if let crate::engine::types::EventPayload::BatchFinalized { view, .. } =
+                        &ev.payload
+                    {
+                        envelope.insert("batch_final_view".to_string(), view.clone());
+                    }
+                }
+            }
+
+            // Issue #14: attach `reserved_actions` when the scheduler's
+            // gate vocabulary signals retryable children. The list is
+            // the set of short task names whose current outcome is
+            // failure, skipped, or spawn_failed — exactly the subset
+            // R10 accepts for retry.
+            let retryable_children: Vec<String> = match &scheduler_outcome {
+                Some(crate::cli::batch::SchedulerOutcome::Scheduled {
+                    materialized_children,
+                    ..
+                }) => materialized_children
+                    .iter()
+                    .filter(|mc| {
+                        matches!(
+                            mc.outcome,
+                            crate::cli::batch::TaskOutcome::Failure
+                                | crate::cli::batch::TaskOutcome::Skipped
+                                | crate::cli::batch::TaskOutcome::SpawnFailed
+                        )
+                    })
+                    .map(|mc| mc.task.clone())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if !retryable_children.is_empty() {
+                let actions =
+                    crate::cli::retry::synthesize_reserved_actions(&name, &retryable_children);
+                envelope.insert(
+                    "reserved_actions".to_string(),
+                    serde_json::to_value(&actions)?,
+                );
+            }
+
+            // Issue #14: splice retry outcome siblings onto the response
+            // envelope when a retry_failed submission was intercepted
+            // earlier this tick. Agents observe `retry_dispatched`
+            // alongside the advance-loop's normal fields.
+            let retry_outcome = RETRY_OUTCOME.with(|cell| cell.borrow_mut().take());
+            if let Some(outcome) = retry_outcome {
+                envelope.insert(
+                    "retry_dispatched".to_string(),
+                    serde_json::to_value(&outcome.dispatched)?,
+                );
+                if !outcome.errored.is_empty() {
+                    envelope.insert(
+                        "retry_errored".to_string(),
+                        serde_json::to_value(&outcome.errored)?,
+                    );
+                }
+            }
+
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::Value::Object(envelope))?
+            );
             // Auto-cleanup after output when reaching a terminal state.
             if matches!(resp, NextResponse::Terminal { .. }) && !no_cleanup {
                 if let Err(e) = backend.cleanup(&name) {
@@ -2439,13 +3062,29 @@ fn handle_status(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         .get(&machine_state.current_state)
         .is_some_and(|s| s.terminal);
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "name": name,
         "current_state": machine_state.current_state,
         "template_path": machine_state.template_path,
         "template_hash": machine_state.template_hash,
         "is_terminal": is_terminal,
     });
+
+    // Optional `batch` section — populated when the parent is
+    // batch-scoped (current state has a `materialize_children` hook)
+    // or has previously finalized a batch (a `BatchFinalized` event is
+    // in the log). Shared helper keeps this output byte-identical to
+    // the per-row metadata added to `koto workflows --children`.
+    if let Some(batch_view) = crate::cli::batch_view::derive_batch_view(
+        backend,
+        &events,
+        &compiled,
+        &machine_state.current_state,
+        name,
+    ) {
+        let batch_json = crate::cli::batch_view::batch_view_to_json(&batch_view);
+        response["batch"] = batch_json;
+    }
 
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
@@ -2471,118 +3110,141 @@ fn handle_status(backend: &dyn SessionBackend, name: &str) -> Result<()> {
 fn evaluate_children_complete(
     backend: &dyn SessionBackend,
     workflow_name: &str,
+    parent_events: &[Event],
+    template: &CompiledTemplate,
+    current_state: &str,
     gate: &crate::template::types::Gate,
 ) -> crate::gate::StructuredGateResult {
     use crate::gate::{GateOutcome, StructuredGateResult};
 
-    let sessions = match backend.list() {
-        Ok(s) => s,
-        Err(e) => {
-            return StructuredGateResult {
-                outcome: GateOutcome::Error,
-                output: serde_json::json!({
-                    "total": 0,
-                    "completed": 0,
-                    "pending": 0,
-                    "all_complete": false,
-                    "children": [],
-                    "error": format!("failed to list sessions: {}", e)
-                }),
-            };
-        }
-    };
+    let (all_complete, output) = crate::cli::batch::build_children_complete_output(
+        backend,
+        workflow_name,
+        parent_events,
+        template,
+        current_state,
+        gate.name_filter.as_deref(),
+    );
 
-    // Filter to direct children of this workflow.
-    let mut children: Vec<_> = sessions
-        .into_iter()
-        .filter(|s| s.parent_workflow.as_deref() == Some(workflow_name))
-        .collect();
-
-    // Apply optional name_filter prefix.
-    if let Some(ref prefix) = gate.name_filter {
-        children.retain(|s| s.id.starts_with(prefix.as_str()));
-    }
-
-    // Zero children: fail (no vacuous pass).
-    if children.is_empty() {
-        return StructuredGateResult {
-            outcome: GateOutcome::Failed,
-            output: serde_json::json!({
-                "total": 0,
-                "completed": 0,
-                "pending": 0,
-                "all_complete": false,
-                "children": [],
-                "error": "no matching children found"
-            }),
-        };
-    }
-
-    let total = children.len();
-    let mut completed = 0usize;
-    let mut child_details = Vec::new();
-
-    for child in &children {
-        let (child_header, child_events) = match backend.read_events(&child.id) {
-            Ok(result) => result,
-            Err(_) => {
-                child_details.push(serde_json::json!({
-                    "name": child.id,
-                    "state": "",
-                    "complete": false
-                }));
-                continue;
-            }
-        };
-
-        let machine_state = derive_machine_state(&child_header, &child_events);
-        let current_state = machine_state
-            .as_ref()
-            .map(|ms| ms.current_state.as_str())
-            .unwrap_or("");
-
-        // Determine if the child is complete (terminal state).
-        let is_complete = if let Some(ref ms) = machine_state {
-            // Load the child's compiled template to check terminal status.
-            std::fs::read(&ms.template_path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<CompiledTemplate>(&bytes).ok())
-                .and_then(|tmpl| tmpl.states.get(&ms.current_state).map(|s| s.terminal))
-                .unwrap_or(false)
-        } else {
-            false
-        };
-
-        if is_complete {
-            completed += 1;
-        }
-
-        child_details.push(serde_json::json!({
-            "name": child.id,
-            "state": current_state,
-            "complete": is_complete
-        }));
-    }
-
-    let pending = total - completed;
-    let all_complete = pending == 0;
-    let outcome = if all_complete {
+    // Distinguish the `Error` outcome from the normal `Passed/Failed`
+    // path by checking for a non-empty error string when total == 0.
+    // The helper reports backend-list failures via a non-empty
+    // `error` plus `total: 0`; the empty-children case reports the
+    // "no matching children found" sentinel.
+    let error_str = output.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    let total = output.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+    let outcome = if total == 0 && error_str.starts_with("failed to list sessions") {
+        GateOutcome::Error
+    } else if all_complete {
         GateOutcome::Passed
     } else {
         GateOutcome::Failed
     };
 
-    StructuredGateResult {
-        outcome,
-        output: serde_json::json!({
-            "total": total,
-            "completed": completed,
-            "pending": pending,
-            "all_complete": all_complete,
-            "children": child_details,
-            "error": ""
-        }),
-    }
+    StructuredGateResult { outcome, output }
+}
+
+/// Augment each row of `koto workflows --children <parent>` with
+/// per-task batch metadata when the parent is batch-scoped.
+///
+/// For each child `WorkflowMetadata` entry, look up the corresponding
+/// [`crate::cli::batch_view::TaskView`] by composed name and splice
+/// the following fields onto the output row:
+///
+/// - `task_name`
+/// - `waits_on`
+/// - `reason_source`
+/// - `reason`
+/// - `skip_reason`
+/// - `synthetic` (only when `true`)
+/// - `outcome`
+/// - `skipped_because_chain` (only when non-empty)
+///
+/// Rows that do not correspond to a submitted batch task (e.g., a
+/// non-batch child of the same parent) pass through unchanged. Rows
+/// are returned as raw JSON values so the unknown shape is acceptable
+/// at serialization time.
+fn annotate_children_with_batch_view(
+    backend: &dyn SessionBackend,
+    parent_name: &str,
+    children: Vec<crate::engine::types::WorkflowMetadata>,
+) -> Vec<serde_json::Value> {
+    // Attempt to derive the batch view for the parent. If the parent
+    // doesn't exist or isn't batch-scoped, return the rows unchanged.
+    let view = if backend.exists(parent_name) {
+        match backend.read_events(parent_name) {
+            Ok((header, events)) => match derive_machine_state(&header, &events) {
+                Some(machine_state) => {
+                    let compiled_opt: Option<CompiledTemplate> =
+                        std::fs::read(&machine_state.template_path)
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+                    compiled_opt.and_then(|compiled| {
+                        crate::cli::batch_view::derive_batch_view(
+                            backend,
+                            &events,
+                            &compiled,
+                            &machine_state.current_state,
+                            parent_name,
+                        )
+                    })
+                }
+                None => None,
+            },
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let task_by_name: std::collections::HashMap<String, &crate::cli::batch_view::TaskView> =
+        match &view {
+            Some(v) => v.tasks.iter().map(|t| (t.name.clone(), t)).collect(),
+            None => std::collections::HashMap::new(),
+        };
+
+    children
+        .into_iter()
+        .map(|wf| {
+            let mut row = match serde_json::to_value(&wf) {
+                Ok(serde_json::Value::Object(m)) => m,
+                _ => return serde_json::Value::Null,
+            };
+            if let Some(task) = task_by_name.get(&wf.name) {
+                row.insert(
+                    "task_name".to_string(),
+                    serde_json::json!(task.task_name.clone()),
+                );
+                row.insert(
+                    "waits_on".to_string(),
+                    serde_json::json!(task.waits_on.clone()),
+                );
+                row.insert(
+                    "outcome".to_string(),
+                    serde_json::to_value(task.outcome).unwrap_or(serde_json::Value::Null),
+                );
+                if let Some(rs) = &task.reason_source {
+                    row.insert("reason_source".to_string(), serde_json::json!(rs.clone()));
+                }
+                if let Some(r) = &task.reason {
+                    row.insert("reason".to_string(), serde_json::json!(r.clone()));
+                }
+                if let Some(sr) = &task.skip_reason {
+                    row.insert("skip_reason".to_string(), serde_json::json!(sr.clone()));
+                }
+                if task.synthetic {
+                    row.insert("synthetic".to_string(), serde_json::json!(true));
+                }
+                if !task.skipped_because_chain.is_empty() {
+                    row.insert(
+                        "skipped_because_chain".to_string(),
+                        serde_json::json!(task.skipped_because_chain.clone()),
+                    );
+                }
+            }
+            serde_json::Value::Object(row)
+        })
+        .collect()
 }
 
 fn query_children(backend: &dyn SessionBackend, parent_name: &str) -> Vec<serde_json::Value> {
@@ -2847,6 +3509,93 @@ mod tests {
     // ---------------------------------------------------------------------------
     // validate_with_data_payload — reserved "gates" key returns InvalidSubmission
     // ---------------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------------
+    // resolve_with_data_source — @file.json prefix handling
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn resolve_with_data_source_inline_json_unchanged() {
+        // No @ prefix: returns the raw string for inline JSON parsing.
+        let raw = r#"{"decision": "proceed"}"#;
+        let result = resolve_with_data_source(raw).unwrap();
+        assert_eq!(result, raw);
+    }
+
+    #[test]
+    fn resolve_with_data_source_at_file_reads_contents() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evidence.json");
+        let contents = r#"{"decision": "proceed", "notes": "from file"}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+
+        let arg = format!("@{}", path.display());
+        let result = resolve_with_data_source(&arg).unwrap();
+        assert_eq!(result, contents);
+    }
+
+    #[test]
+    fn resolve_with_data_source_missing_file_errors() {
+        use crate::cli::next_types::NextErrorCode;
+
+        let arg = "@/nonexistent/path/that/should/not/exist.json";
+        let err = resolve_with_data_source(arg).unwrap_err();
+        assert_eq!(err.code, NextErrorCode::InvalidSubmission);
+        assert!(
+            err.message
+                .contains("/nonexistent/path/that/should/not/exist.json"),
+            "error should name the missing path: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn resolve_with_data_source_oversize_file_errors() {
+        use crate::cli::next_types::NextErrorCode;
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Write 2 MB of bytes (well over the 1 MB cap).
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..32 {
+            f.write_all(&chunk).unwrap();
+        }
+        f.flush().unwrap();
+        drop(f);
+
+        let arg = format!("@{}", path.display());
+        let err = resolve_with_data_source(&arg).unwrap_err();
+        assert_eq!(err.code, NextErrorCode::InvalidSubmission);
+        // Cap reference (1048576) and the actual size in bytes should appear.
+        assert!(
+            err.message.contains("1048576"),
+            "error should name the cap (1048576): {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("2097152"),
+            "error should name the actual file size: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn resolve_with_data_source_empty_path_errors() {
+        use crate::cli::next_types::NextErrorCode;
+
+        let err = resolve_with_data_source("@").unwrap_err();
+        assert_eq!(err.code, NextErrorCode::InvalidSubmission);
+        assert!(
+            err.message.contains("file path"),
+            "error should mention missing file path: {}",
+            err.message
+        );
+    }
 
     #[cfg(unix)]
     #[test]

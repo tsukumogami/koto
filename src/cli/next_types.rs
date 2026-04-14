@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use serde::ser::SerializeMap;
 use serde::Serialize;
 
+use crate::cli::batch_error::BatchError;
 use crate::gate::{built_in_default, GateOutcome, StructuredGateResult};
-use crate::template::types::{Gate, TemplateState};
+use crate::template::types::{Gate, TemplateState, FIELD_TYPE_TASKS};
 
 /// Summary of a recorded decision, used in `koto decisions list` responses.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -66,6 +67,45 @@ pub enum NextResponse {
         action_output: ActionOutput,
         expects: Option<ExpectsSchema>,
     },
+    /// Rejected submission — typed error envelope with optional
+    /// batch-specific context. Emits `action: "error"`. Carries the
+    /// typed `NextError` alongside an optional [`BatchErrorContext`]
+    /// that re-emits the same JSON payload under `error.batch` so
+    /// agents parse the batch shape from the same place regardless of
+    /// whether the error is domain- or batch-scoped.
+    Error {
+        state: String,
+        advanced: bool,
+        error: NextError,
+        batch: Option<BatchErrorContext>,
+        blocking_conditions: Vec<BlockingCondition>,
+    },
+}
+
+/// Sibling payload attached to `NextResponse::Error` when the underlying
+/// failure originates from batch machinery (Decision 11). Carries the
+/// exact JSON payload [`BatchError::to_batch_payload`] produces so
+/// downstream agents see the same shape whether the error comes in via
+/// the top-level `{"action": "error", "batch": ...}` envelope or nested
+/// under `error.batch` in a typed-NextError response.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct BatchErrorContext {
+    /// Raw JSON payload — opaque from this layer's perspective. Use
+    /// [`BatchErrorContext::from_batch_error`] to build one from a
+    /// typed [`BatchError`] so the payload stays in sync.
+    pub payload: serde_json::Value,
+}
+
+impl BatchErrorContext {
+    /// Build a [`BatchErrorContext`] from a typed [`BatchError`]. The
+    /// payload matches what `BatchError::to_envelope()["batch"]` would
+    /// produce, keeping one source of truth for the `batch` key shape.
+    pub fn from_batch_error(err: &BatchError) -> Self {
+        Self {
+            payload: err.to_batch_payload(),
+        }
+    }
 }
 
 impl NextResponse {
@@ -136,6 +176,8 @@ impl NextResponse {
                 integration,
             },
             terminal @ NextResponse::Terminal { .. } => terminal,
+            // `Error` carries no directive to substitute; return as-is.
+            err @ NextResponse::Error { .. } => err,
             NextResponse::ActionRequiresConfirmation {
                 state,
                 directive,
@@ -276,6 +318,44 @@ impl Serialize for NextResponse {
                 map.serialize_entry("error", &None::<()>)?;
                 map.end()
             }
+            NextResponse::Error {
+                state,
+                advanced,
+                error,
+                batch,
+                blocking_conditions,
+            } => {
+                // Emit the error payload as a single object containing
+                // the typed NextError fields plus an optional `batch`
+                // sibling carrying the typed batch context.
+                let error_value = {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert(
+                        "code".into(),
+                        serde_json::to_value(&error.code).expect("NextErrorCode serializable"),
+                    );
+                    obj.insert(
+                        "message".into(),
+                        serde_json::Value::String(error.message.clone()),
+                    );
+                    obj.insert(
+                        "details".into(),
+                        serde_json::to_value(&error.details).expect("ErrorDetail serializable"),
+                    );
+                    if let Some(ctx) = batch {
+                        obj.insert("batch".into(), ctx.payload.clone());
+                    }
+                    serde_json::Value::Object(obj)
+                };
+                let mut map = serializer.serialize_map(Some(6))?;
+                map.serialize_entry("action", "error")?;
+                map.serialize_entry("state", state)?;
+                map.serialize_entry("advanced", advanced)?;
+                map.serialize_entry("expects", &None::<()>)?;
+                map.serialize_entry("blocking_conditions", blocking_conditions)?;
+                map.serialize_entry("error", &error_value)?;
+                map.end()
+            }
         }
     }
 }
@@ -334,6 +414,12 @@ pub struct ExpectsSchema {
 }
 
 /// Schema for a single evidence field.
+///
+/// `item_schema` is auto-generated for `tasks`-typed fields and describes the
+/// expected shape of each task-list entry. It is always `None` for other field
+/// types. The template author never writes this — it is synthesized by
+/// `derive_expects` from the fixed task-entry contract defined by koto
+/// itself. See DESIGN-batch-child-spawning.md Decision 8.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ExpectsFieldSchema {
     #[serde(rename = "type")]
@@ -341,6 +427,8 @@ pub struct ExpectsFieldSchema {
     pub required: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_schema: Option<serde_json::Value>,
 }
 
 /// A transition option surfaced to the agent.
@@ -446,24 +534,84 @@ pub fn blocking_conditions_from_gates(
         .collect()
 }
 
+/// Build the auto-generated `item_schema` object for a `tasks`-typed field.
+///
+/// The shape is fixed by koto — template authors never author or override it.
+/// When the enclosing state declares a `materialize_children` hook whose
+/// `from_field` matches, the hook's `default_template` becomes the
+/// `template.default` value; otherwise `template.default` is omitted.
+///
+/// See DESIGN-batch-child-spawning.md Decision 8 and Decision E7 for the full
+/// rationale.
+fn tasks_item_schema(state: &TemplateState, field_name: &str) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+
+    let default_template = state
+        .materialize_children
+        .as_ref()
+        .filter(|hook| hook.from_field == field_name)
+        .map(|hook| hook.default_template.clone());
+
+    let mut template_entry = Map::new();
+    template_entry.insert("type".to_string(), Value::String("string".to_string()));
+    template_entry.insert("required".to_string(), Value::Bool(false));
+    if let Some(default) = default_template {
+        template_entry.insert("default".to_string(), Value::String(default));
+    }
+
+    json!({
+        "name": {
+            "type": "string",
+            "required": true,
+            "description": "Child workflow short name"
+        },
+        "template": Value::Object(template_entry),
+        "vars": {
+            "type": "object",
+            "required": false
+        },
+        "waits_on": {
+            "type": "array",
+            "required": false,
+            "default": []
+        },
+        "trigger_rule": {
+            "type": "string",
+            "required": false,
+            "default": "all_success"
+        }
+    })
+}
+
 /// Derive an `ExpectsSchema` from a template state's `accepts` block and transitions.
 ///
 /// Returns `None` when the state has no `accepts` block. When present, maps each
 /// `FieldSchema` to `ExpectsFieldSchema` and populates `options` from transitions
 /// that have `when` conditions. Options are omitted entirely when no transitions
 /// have `when`.
+///
+/// For fields whose type is `tasks`, an auto-generated `item_schema` object is
+/// attached describing the task-entry contract (name, template, vars,
+/// waits_on, trigger_rule). The template author does not — and cannot —
+/// customize this schema; see Decision E7 in DESIGN-batch-child-spawning.md.
 pub fn derive_expects(state: &TemplateState) -> Option<ExpectsSchema> {
     let accepts = state.accepts.as_ref()?;
 
     let fields: BTreeMap<String, ExpectsFieldSchema> = accepts
         .iter()
         .map(|(name, schema)| {
+            let item_schema = if schema.field_type == FIELD_TYPE_TASKS {
+                Some(tasks_item_schema(state, name))
+            } else {
+                None
+            };
             (
                 name.clone(),
                 ExpectsFieldSchema {
                     field_type: schema.field_type.clone(),
                     required: schema.required,
                     values: schema.values.clone(),
+                    item_schema,
                 },
             )
         })
@@ -502,6 +650,7 @@ mod tests {
                 field_type: "enum".to_string(),
                 required: true,
                 values: vec!["proceed".to_string(), "escalate".to_string()],
+                item_schema: None,
             },
         );
 
@@ -563,6 +712,7 @@ mod tests {
                 field_type: "string".to_string(),
                 required: false,
                 values: vec![],
+                item_schema: None,
             },
         );
 
@@ -679,6 +829,7 @@ mod tests {
                 field_type: "boolean".to_string(),
                 required: true,
                 values: vec![],
+                item_schema: None,
             },
         );
 
@@ -741,6 +892,7 @@ mod tests {
                 field_type: "string".to_string(),
                 required: true,
                 values: vec![],
+                item_schema: None,
             },
         );
 
@@ -921,6 +1073,7 @@ mod tests {
             field_type: "string".to_string(),
             required: true,
             values: vec![],
+            item_schema: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&schema).unwrap();
@@ -938,6 +1091,7 @@ mod tests {
             field_type: "enum".to_string(),
             required: true,
             values: vec!["a".to_string(), "b".to_string()],
+            item_schema: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&schema).unwrap();
@@ -1014,6 +1168,9 @@ mod tests {
             accepts,
             integration: None,
             default_action: None,
+            materialize_children: None,
+            failure: false,
+            skipped_marker: false,
         }
     }
 
@@ -1458,5 +1615,215 @@ mod tests {
             !conditions[0].agent_actionable,
             "unknown gate type with no override_default must have agent_actionable false"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue 7: tasks-typed accepts field auto-generates item_schema.
+    // -----------------------------------------------------------------
+
+    use crate::template::types::{FailurePolicy, MaterializeChildrenSpec};
+
+    fn tasks_accepts(field: &str, required: bool) -> BTreeMap<String, FieldSchema> {
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            field.to_string(),
+            FieldSchema {
+                field_type: "tasks".to_string(),
+                required,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+        accepts
+    }
+
+    #[test]
+    fn tasks_field_gets_auto_generated_item_schema() {
+        // A tasks-typed accepts field on a state with a materialize_children
+        // hook produces an item_schema whose shape matches the design's
+        // Decision 8 (name, template, vars, waits_on, trigger_rule).
+        let mut state = make_template_state(Some(tasks_accepts("tasks", true)), vec![]);
+        state.materialize_children = Some(MaterializeChildrenSpec {
+            from_field: "tasks".to_string(),
+            default_template: "impl-issue.md".to_string(),
+            failure_policy: FailurePolicy::SkipDependents,
+        });
+        let expects = derive_expects(&state).unwrap();
+        let tasks_field = expects.fields.get("tasks").expect("tasks field");
+        assert_eq!(tasks_field.field_type, "tasks");
+        let item_schema = tasks_field
+            .item_schema
+            .as_ref()
+            .expect("item_schema must be auto-generated for tasks fields");
+
+        // Fixed shape.
+        assert_eq!(item_schema["name"]["type"], "string");
+        assert_eq!(item_schema["name"]["required"], true);
+        assert!(item_schema["name"]
+            .get("description")
+            .map(|d| d.is_string())
+            .unwrap_or(false));
+
+        assert_eq!(item_schema["template"]["type"], "string");
+        assert_eq!(item_schema["template"]["required"], false);
+        // default_template flows through as template.default.
+        assert_eq!(item_schema["template"]["default"], "impl-issue.md");
+
+        assert_eq!(item_schema["vars"]["type"], "object");
+        assert_eq!(item_schema["vars"]["required"], false);
+
+        assert_eq!(item_schema["waits_on"]["type"], "array");
+        assert_eq!(item_schema["waits_on"]["required"], false);
+        assert_eq!(item_schema["waits_on"]["default"], serde_json::json!([]));
+
+        assert_eq!(item_schema["trigger_rule"]["type"], "string");
+        assert_eq!(item_schema["trigger_rule"]["required"], false);
+        assert_eq!(item_schema["trigger_rule"]["default"], "all_success");
+    }
+
+    #[test]
+    fn tasks_field_without_hook_omits_template_default() {
+        // When there is no materialize_children hook, the template.default
+        // entry is absent from item_schema — agents receive no default.
+        let state = make_template_state(Some(tasks_accepts("tasks", true)), vec![]);
+        let expects = derive_expects(&state).unwrap();
+        let item_schema = expects.fields["tasks"]
+            .item_schema
+            .as_ref()
+            .expect("item_schema present even without hook");
+        let template_entry = item_schema["template"].as_object().unwrap();
+        assert!(
+            !template_entry.contains_key("default"),
+            "template.default must be omitted when no materialize_children hook exists"
+        );
+    }
+
+    #[test]
+    fn tasks_field_hook_with_mismatched_from_field_omits_default() {
+        // The default_template pulls through only when the hook's from_field
+        // matches this accepts field's name. A mismatch is unusual (Issue 8
+        // will fail the template at validation) but the response-side must
+        // behave sanely in the meantime.
+        let mut state = make_template_state(Some(tasks_accepts("tasks", true)), vec![]);
+        state.materialize_children = Some(MaterializeChildrenSpec {
+            from_field: "other".to_string(),
+            default_template: "ignored.md".to_string(),
+            failure_policy: FailurePolicy::SkipDependents,
+        });
+        let expects = derive_expects(&state).unwrap();
+        let template_entry = expects.fields["tasks"].item_schema.as_ref().unwrap()["template"]
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!template_entry.contains_key("default"));
+    }
+
+    #[test]
+    fn non_tasks_fields_have_no_item_schema() {
+        // Only tasks-typed fields get item_schema — enum/string/number/boolean
+        // still serialize without the field.
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "name".to_string(),
+            FieldSchema {
+                field_type: "string".to_string(),
+                required: false,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+        let state = make_template_state(Some(accepts), vec![]);
+        let expects = derive_expects(&state).unwrap();
+        assert!(expects.fields["name"].item_schema.is_none());
+    }
+
+    #[test]
+    fn tasks_item_schema_serializes_cleanly_over_json() {
+        // The auto-generated schema serializes with `item_schema` as a
+        // sibling of `type`, `required`, and `values`.
+        let mut state = make_template_state(Some(tasks_accepts("tasks", true)), vec![]);
+        state.materialize_children = Some(MaterializeChildrenSpec {
+            from_field: "tasks".to_string(),
+            default_template: "child.md".to_string(),
+            failure_policy: FailurePolicy::SkipDependents,
+        });
+        let expects = derive_expects(&state).unwrap();
+        let json = serde_json::to_value(&expects).unwrap();
+        assert_eq!(json["fields"]["tasks"]["type"], "tasks");
+        assert!(json["fields"]["tasks"]["item_schema"].is_object());
+        assert_eq!(
+            json["fields"]["tasks"]["item_schema"]["template"]["default"],
+            "child.md"
+        );
+    }
+
+    // --- NextResponse::Error serialization ---------------------------
+
+    #[test]
+    fn serialize_error_variant_without_batch_context() {
+        let resp = NextResponse::Error {
+            state: "plan".into(),
+            advanced: false,
+            error: NextError {
+                code: NextErrorCode::InvalidSubmission,
+                message: "bad input".into(),
+                details: vec![ErrorDetail {
+                    field: "tasks".into(),
+                    reason: "empty".into(),
+                }],
+            },
+            batch: None,
+            blocking_conditions: vec![],
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["action"], "error");
+        assert_eq!(v["state"], "plan");
+        assert_eq!(v["advanced"], false);
+        assert_eq!(v["error"]["code"], "invalid_submission");
+        assert_eq!(v["error"]["message"], "bad input");
+        assert_eq!(v["error"]["details"][0]["field"], "tasks");
+        assert!(v["error"].get("batch").is_none());
+        assert!(v["expects"].is_null());
+        assert_eq!(v["blocking_conditions"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn serialize_error_variant_with_batch_context_embeds_payload() {
+        use crate::cli::batch_error::{BatchError, InvalidBatchReason};
+
+        let batch_err = BatchError::InvalidBatchDefinition {
+            reason: InvalidBatchReason::EmptyTaskList,
+        };
+        let resp = NextResponse::Error {
+            state: "plan".into(),
+            advanced: false,
+            error: NextError {
+                code: NextErrorCode::InvalidSubmission,
+                message: "batch rejected".into(),
+                details: vec![],
+            },
+            batch: Some(BatchErrorContext::from_batch_error(&batch_err)),
+            blocking_conditions: vec![],
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["action"], "error");
+        assert_eq!(v["error"]["batch"]["kind"], "invalid_batch_definition");
+        assert_eq!(v["error"]["batch"]["reason"]["reason"], "empty_task_list");
+    }
+
+    #[test]
+    fn error_variant_batch_context_matches_to_envelope_shape() {
+        use crate::cli::batch_error::BatchError;
+
+        // The payload nested under `error.batch` must equal the `batch`
+        // payload of `BatchError::to_envelope()` byte-for-byte — one
+        // source of truth for the batch shape.
+        let err = BatchError::ConcurrentTick {
+            holder_pid: Some(42),
+        };
+        let expected_batch = err.to_envelope()["batch"].clone();
+
+        let ctx = BatchErrorContext::from_batch_error(&err);
+        assert_eq!(ctx.payload, expected_batch);
     }
 }

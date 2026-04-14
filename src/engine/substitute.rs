@@ -266,6 +266,7 @@ mod tests {
                     ("OWNER".to_string(), "acme".to_string()),
                     ("REPO".to_string(), "widgets".to_string()),
                 ]),
+                spawn_entry: None,
             },
         }];
 
@@ -289,6 +290,7 @@ mod tests {
             payload: EventPayload::WorkflowInitialized {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::from([("BAD".to_string(), "has spaces".to_string())]),
+                spawn_entry: None,
             },
         }];
 
@@ -305,6 +307,7 @@ mod tests {
             payload: EventPayload::WorkflowInitialized {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::from([("PATH".to_string(), "org/repo-name_v1.2".to_string())]),
+                spawn_entry: None,
             },
         }];
 

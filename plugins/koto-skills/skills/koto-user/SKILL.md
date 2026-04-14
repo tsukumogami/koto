@@ -94,6 +94,14 @@ Example: if `expects.fields` contains `{"outcome": {"type": "enum", "required": 
 koto next <name> --with-data '{"outcome": "success"}'
 ```
 
+For large or pre-built JSON payloads, prefix the value with `@` to read from a file:
+
+```bash
+koto next <name> --with-data @evidence.json
+```
+
+The file must contain the JSON payload directly (no shell quoting needed) and must be at most 1 MB.
+
 ### Sub-case B: Gates failed, evidence fallback available
 
 **Signals:** `blocking_conditions` is non-empty, `expects.fields` is non-empty
@@ -135,7 +143,7 @@ koto next <name>
 
 The overridden gate is now treated as passed.
 
-For `children-complete` gates, the override pretends all children are done (the default value is `{"total":0, "completed":0, "pending":0, "all_complete":true, "children":[], "error":""}`). Use this when you know children are finished but the gate hasn't picked it up, or when you need to proceed regardless.
+For `children-complete` gates, the override pretends all children are done. The default value mirrors the extended gate output schema: all aggregate counters are zero, `all_complete` and `all_success` are `true`, the `any_*` and `needs_attention` booleans are `false`, and `children` is empty. Use this when you know children are finished but the gate hasn't picked it up, or when you need to proceed regardless.
 
 When `agent_actionable` is `false`, the gate has no override mechanism. Don't call `koto overrides record` for it — the command will fail. Escalate to the user instead.
 
@@ -208,25 +216,67 @@ koto context get <child-name> <key>
 
 ### Temporal blocking
 
-When a parent has a `children-complete` gate, `koto next` returns `gate_blocked` or `evidence_required` with a blocking condition whose `category` is `"temporal"`. The `output` field shows per-child status:
+When a parent has a `children-complete` gate, `koto next` returns `gate_blocked` or `evidence_required` with a blocking condition whose `category` is `"temporal"`. The `output` field carries aggregate counters, derived booleans, and per-child entries:
 
 ```json
 {
-  "total": 3, "completed": 2, "pending": 1, "all_complete": false,
+  "total": 3,
+  "completed": 2,
+  "pending": 1,
+  "success": 2,
+  "failed": 0,
+  "skipped": 0,
+  "blocked": 0,
+  "spawn_failed": 0,
+  "all_complete": false,
+  "all_success": false,
+  "any_failed": false,
+  "any_skipped": false,
+  "any_spawn_failed": false,
+  "needs_attention": false,
   "children": [
-    {"name": "plan.issue-1", "state": "done", "complete": true},
-    {"name": "plan.issue-2", "state": "done", "complete": true},
-    {"name": "plan.issue-3", "state": "implement", "complete": false}
+    {"name": "plan.issue-1", "state": "done", "complete": true, "outcome": "success"},
+    {"name": "plan.issue-2", "state": "done", "complete": true, "outcome": "success"},
+    {"name": "plan.issue-3", "state": "implement", "complete": false, "outcome": "pending"}
   ],
   "error": ""
 }
 ```
 
-Temporal blocks resolve on their own — children will finish without your intervention. Poll `koto next` periodically rather than trying to fix anything. Once all children reach their completion condition, the gate passes and the parent advances.
+Route on the derived booleans rather than raw counts:
+
+- `all_complete` — `pending == 0 AND blocked == 0 AND spawn_failed == 0`. Passes the gate.
+- `all_success` — every child finished successfully; the clean "no retries needed" branch.
+- `any_failed`, `any_skipped`, `any_spawn_failed` — individual signals for templates that need finer control.
+- `needs_attention` — `any_failed OR any_skipped OR any_spawn_failed`. One boolean routes the parent into its retry/escalation branch.
+
+Per-child entries carry an `outcome` enum (`success | failure | skipped | pending | blocked | spawn_failed`). Failed children include a `failure_mode` string; skipped children include a `skipped_because` name and `skipped_because_chain` listing the failed ancestors; blocked children include `blocked_by` with the non-terminal `waits_on` names. A `reason_source` field (`failure_reason | state_name | skipped | not_spawned`) tells agents where the failure explanation came from.
+
+Temporal blocks with `needs_attention: false` resolve on their own — poll `koto next` periodically. When `needs_attention: true` the parent's template typically routes to a retry or analysis state.
 
 ### Advisory lifecycle
 
 When you cancel, clean up, or rewind a parent, the response includes a `children` array listing affected child workflows. koto doesn't cascade these operations — it tells you which children exist so you can decide what to do with them.
+
+## Batch workflows
+
+A batch workflow is a hierarchy variant where the parent submits a structured task list once, and koto's scheduler materializes and tracks per-task children automatically. The parent declares a `materialize_children` hook plus a `children-complete` gate; each `koto next <parent>` tick runs the scheduler, reports per-task feedback, and aggregates child outcomes for the gate.
+
+The response shape includes batch-specific fields:
+
+- `scheduler.materialized_children` — the per-child dispatch ledger (use this for idempotent dispatch, not `spawned_this_tick`).
+- `scheduler.feedback.entries` — per-task outcome keyed by short name (`accepted`, `blocked`, `errored`, `already_running`, etc.).
+- `reserved_actions` — ready-to-run retry invocations, synthesized when the gate reports `any_failed`, `any_skipped`, or `any_spawn_failed`.
+- `batch_final_view` — frozen snapshot attached to the terminal `done` response.
+- `synthetic: true` — marker on skip-marker children whose state was materialized directly (no worker ran).
+
+Cloud-backend freshness indicators (`sync_status`, `machine_id`) are **not** attached to batch `koto next` responses. They surface only on `koto session resolve` output — use that command when you need to check or reconcile cross-machine divergence.
+
+The canonical rule for worker dispatch:
+
+> Dispatch a worker for every entry in `scheduler.materialized_children` where `ready_to_drive == true AND outcome != "spawn_failed"`, excluding children already dispatched this session.
+
+Full coverage lives in [**batch-workflows.md**](references/batch-workflows.md). Read it when the SKILL.md you're following mentions `materialize_children`, task submission via `--with-data @tasks.json`, or `retry_failed`.
 
 ## Recording decisions
 
@@ -245,6 +295,7 @@ Read these on demand, not upfront. The sections above cover the common path. Con
 - [**Command reference**](references/command-reference.md) — full CLI syntax, flags, and output shapes for all subcommands. Follow this when you need exact flag names or want to check an unfamiliar command.
 - [**Response shapes**](references/response-shapes.md) — annotated JSON examples for every `action` value, sub-object schemas for `expects` and `blocking_conditions`, and field-level annotations. Follow this when a field's presence or shape is unclear.
 - [**Error handling**](references/error-handling.md) — exit code table, error code meanings, and agent actions for each error type. Follow this when a command fails or returns a non-zero exit code.
+- [**Batch workflows**](references/batch-workflows.md) — coordinator/worker partition, `materialized_children` dispatch, `retry_failed` mechanics, `reserved_actions`, `batch_final_view`, cloud `sync_status`, and skip-marker `synthetic: true`. Follow this when the workflow uses `materialize_children` or the response carries a `scheduler` field.
 
 ## Troubleshooting
 

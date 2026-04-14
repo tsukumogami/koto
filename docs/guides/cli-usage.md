@@ -67,6 +67,18 @@ koto next <name> [--with-data <json>] [--to <target>] [--no-cleanup]
 
 The `--with-data` and `--to` flags are mutually exclusive. Passing both produces a `precondition_failed` error with exit code 2. The `--with-data` payload is capped at 1 MB.
 
+The `--with-data` value can be either inline JSON or a file reference. Prefix a path with `@` to read the payload from disk — useful for batch task lists and any payload large enough to be awkward on the command line:
+
+```bash
+# Inline JSON
+koto next task-42 --with-data '{"decision":"proceed"}'
+
+# Read from file
+koto next coord --with-data @tasks.json
+```
+
+The 1 MB cap applies to both forms (file size is checked before reading). Use `@-` is **not** supported; only file paths are accepted after `@`.
+
 - `--full` -- Include the `details` field in the response regardless of visit count. By default, `details` is included on first visit to a state and omitted on subsequent visits. This flag forces inclusion every time.
 - `--no-cleanup` -- Skip automatic session directory cleanup when the workflow reaches a terminal state. Useful for debugging or when you need to inspect session artifacts after completion. Without this flag, koto removes the session directory once it outputs the terminal response.
 
@@ -650,6 +662,13 @@ koto session resolve <name> --keep remote
 **Required flag:**
 - `--keep` -- Which version to keep: `local` (discard the remote version) or `remote` (discard local changes and pull the remote version).
 
+**Optional flag:**
+- `--children` -- How to reconcile the parent's children during the same call. One of four modes:
+  - `auto` (default) — apply the strict-prefix rule to each child's state file. When one side is a byte-exact prefix of the other, the longer side wins; any other divergence surfaces as a conflict that needs its own `koto session resolve <child>`.
+  - `skip` — leave child state files untouched.
+  - `accept-remote` — overwrite local child state with remote.
+  - `accept-local` — overwrite remote child state with local.
+
 After resolving, normal operations resume.
 
 ### version
@@ -716,3 +735,44 @@ To roll back after an unexpected result:
 ```bash
 koto rewind task-42
 ```
+
+## Batch workflows
+
+A batch workflow has one coordinator (parent) that submits a task list, and many workers (children) that drive their own state machines independently. Templates with a `materialize_children` hook expose batch surface through existing commands.
+
+### Batch surface on existing commands
+
+- **`koto next <parent> --with-data @tasks.json`** — submit the task list. Responses from a batch-scoped parent carry a `scheduler` object with `materialized_children`, `spawned_this_tick`, and per-task `feedback.entries`. Dispatch workers based on `materialized_children`, not `spawned_this_tick`.
+- **`koto workflows --children <parent>`** — list every child for a parent, with per-row batch metadata (short task name, outcome, waits-on dependencies).
+- **`koto status <parent>`** — read-only view of the parent's current state. For batch parents, the response includes the materialized-children ledger so you can check progress without advancing state.
+
+### Worked example: 3-task linear batch
+
+Given a coordinator that declares `tasks` as an accepts field and routes on `children-complete` gate output, a minimal dependency chain (`task-1` → `task-2` → `task-3`) flows like this:
+
+```bash
+# 1. Parent is on the submission state — coordinator submits the task list
+koto next coord --with-data @tasks.json
+# => action: "gate_blocked" (children-complete waiting),
+#    scheduler.materialized_children: [
+#      {"name": "coord.task-1", "outcome": "running", "ready_to_drive": true, ...},
+#      {"name": "coord.task-2", "outcome": "blocked", "ready_to_drive": false, "waits_on": ["task-1"]},
+#      {"name": "coord.task-3", "outcome": "blocked", "ready_to_drive": false, "waits_on": ["task-2"]}
+#    ]
+
+# 2. For each entry where ready_to_drive == true, dispatch a worker:
+koto next coord.task-1                      # worker drives the child
+# ... worker submits evidence for each state until child reaches terminal ...
+
+# 3. Coordinator re-ticks to observe progress:
+koto next coord
+# => materialized_children updated; task-2 is now ready_to_drive: true
+
+# 4. Dispatch the next worker, re-tick, repeat until all children terminal.
+
+# 5. Final coordinator tick fires the success route:
+koto next coord
+# => action: "evidence_required" or "done" (depending on post-batch template states)
+```
+
+Each coordinator tick re-derives the ledger from disk, so resume after a crash just means running `koto next coord` again. For the full runner surface (failure routing, `retry_failed`, typed error envelopes), see `docs/designs/DESIGN-batch-child-spawning.md` and the `koto-user` skill's batch references.

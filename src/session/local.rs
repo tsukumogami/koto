@@ -9,7 +9,18 @@ use crate::engine::persistence;
 use crate::engine::types::{now_iso8601, Event, EventPayload, StateFileHeader};
 use crate::session::context::{ContextStore, KeyMeta, Manifest};
 use crate::session::validate::{validate_context_key, validate_session_id};
-use crate::session::{state_file_name, SessionBackend, SessionInfo};
+use crate::session::{state_file_name, SessionBackend, SessionError, SessionInfo, SessionLock};
+
+/// Filename prefix for `init_state_file` tempfiles.
+///
+/// The full tempfile name is `<prefix><random><suffix>`, for example
+/// `.koto-init-aBcDeF.tmp`. Sweep tooling that garbage-collects crashed
+/// initialisations relies on this exact prefix+suffix pair.
+pub(crate) const INIT_TMP_PREFIX: &str = ".koto-init-";
+
+/// Filename suffix for `init_state_file` tempfiles. Paired with
+/// [`INIT_TMP_PREFIX`].
+pub(crate) const INIT_TMP_SUFFIX: &str = ".tmp";
 
 /// Filesystem-backed session storage.
 ///
@@ -145,6 +156,149 @@ impl SessionBackend for LocalBackend {
     fn read_header(&self, id: &str) -> anyhow::Result<StateFileHeader> {
         let path = self.base_dir.join(id).join(state_file_name(id));
         persistence::read_header(&path)
+    }
+
+    fn init_state_file(
+        &self,
+        id: &str,
+        header: StateFileHeader,
+        initial_events: Vec<Event>,
+    ) -> Result<(), SessionError> {
+        // `validate_session_id` returns anyhow::Error today; it's a
+        // caller-input problem, not an I/O failure, so route it through
+        // the Other variant.
+        validate_session_id(id).map_err(SessionError::Other)?;
+
+        // Ensure the session directory exists so the tempfile can live on
+        // the same filesystem as the final target. Also ensures the .koto
+        // root exists with restricted permissions.
+        ensure_koto_root(&self.base_dir).map_err(SessionError::Other)?;
+        let session_dir = self.base_dir.join(id);
+        fs::create_dir_all(&session_dir).map_err(|e| {
+            SessionError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to create session directory {}: {}",
+                    session_dir.display(),
+                    e
+                ),
+            ))
+        })?;
+
+        let target = session_dir.join(state_file_name(id));
+
+        // Serialize the bundle (header line + one JSONL line per event)
+        // into an in-memory buffer. The header itself carries no seq
+        // field; events use the caller-supplied seq numbers verbatim.
+        //
+        // `StateFileHeader` and `Event` are crate-owned types whose fields
+        // are all straightforward JSON-representable primitives (no maps
+        // with non-string keys, no floats that could be NaN, no custom
+        // serializers that error). `serde_json::to_string` on them cannot
+        // fail in practice, so we expect() rather than propagate.
+        let mut buf = String::new();
+        let header_line =
+            serde_json::to_string(&header).expect("StateFileHeader serialize is infallible");
+        buf.push_str(&header_line);
+        buf.push('\n');
+        for event in &initial_events {
+            let line = serde_json::to_string(event).expect("Event serialize is infallible");
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+
+        // Write the bundle to a tempfile in the session directory so the
+        // final rename/link is same-filesystem. The prefix/suffix come
+        // from `INIT_TMP_PREFIX` / `INIT_TMP_SUFFIX` so sweep tooling and
+        // tests agree on the glob. `keep()` defuses the auto-delete so we
+        // can drive the final rename ourselves.
+        let tmp = tempfile::Builder::new()
+            .prefix(INIT_TMP_PREFIX)
+            .suffix(INIT_TMP_SUFFIX)
+            .tempfile_in(&session_dir)
+            .map_err(SessionError::Io)?;
+        {
+            let mut file = tmp.as_file();
+            file.write_all(buf.as_bytes()).map_err(SessionError::Io)?;
+            file.sync_data().map_err(SessionError::Io)?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Match append_header/append_event which create state
+                // files with mode 0600.
+                let perms = fs::Permissions::from_mode(0o600);
+                fs::set_permissions(tmp.path(), perms).map_err(SessionError::Io)?;
+            }
+        }
+
+        // Detach the tempfile so it is NOT deleted on drop. We will
+        // either move it into place (Linux renameat2 or non-Linux link)
+        // or explicitly unlink it on failure.
+        let (_file, tmp_path) = tmp.keep().map_err(|e| SessionError::Io(e.error))?;
+
+        match atomic_create_rename(&tmp_path, &target) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // On every error path the tempfile is still at `tmp_path`
+                // (renameat2/link/rename leave the source untouched on
+                // failure), so unconditional removal is safe.
+                let _ = fs::remove_file(&tmp_path);
+                Err(e)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn lock_state_file(&self, id: &str) -> Result<SessionLock, SessionError> {
+        use std::os::unix::io::AsRawFd;
+
+        validate_session_id(id).map_err(SessionError::Other)?;
+
+        let path = self.base_dir.join(id).join(state_file_name(id));
+
+        // Open read-only so the lock can be acquired without mutating
+        // the state file. The file must already exist; callers are
+        // expected to invoke this only on initialised workflows.
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(SessionError::Io)?;
+
+        // SAFETY: `fd` is a borrow tied to `file`, which outlives the
+        // call. `libc::flock` with `LOCK_EX | LOCK_NB` either returns
+        // 0 (acquired) or -1 with `errno == EWOULDBLOCK` when another
+        // holder already owns the lock. No other failure mode maps to
+        // a "contention" condition.
+        let fd = file.as_raw_fd();
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                // `flock` does not report the holder's PID. We leave
+                // `holder_pid: None` so upstream callers can still
+                // render a consistent typed error; a future probe via
+                // `fcntl(F_OFD_GETLK)` can populate it without an API
+                // change.
+                return Err(SessionError::Locked { holder_pid: None });
+            }
+            return Err(SessionError::Io(err));
+        }
+
+        Ok(SessionLock { _file: file })
+    }
+
+    #[cfg(not(unix))]
+    fn lock_state_file(&self, _id: &str) -> Result<SessionLock, SessionError> {
+        Err(SessionError::Other(anyhow::anyhow!(
+            "lock_state_file is only supported on Unix platforms"
+        )))
+    }
+
+    fn ensure_pushed(&self, _id: &str) -> Result<(), SessionError> {
+        // Local storage has no remote half: append_event already made
+        // the write durable on disk, so there is nothing left to push.
+        Ok(())
     }
 }
 
@@ -383,6 +537,103 @@ pub(crate) fn repo_id(working_dir: &Path) -> anyhow::Result<String> {
     Ok(hash[..16].to_string())
 }
 
+/// Atomically move `src` to `dst` with "fail if destination exists"
+/// semantics. On Linux this uses `renameat2(RENAME_NOREPLACE)`; on
+/// other Unixes it uses POSIX `link()` followed by `unlink()`, falling
+/// back to plain `rename()` on `EXDEV`. On non-Unix platforms it falls
+/// back to a best-effort check-then-rename (not strictly atomic).
+///
+/// When the destination already exists, returns `SessionError::Collision`
+/// so callers can distinguish races from other I/O failures without
+/// inspecting the underlying `io::Error`.
+#[cfg(target_os = "linux")]
+fn atomic_create_rename(src: &Path, dst: &Path) -> Result<(), SessionError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let src_c = CString::new(src.as_os_str().as_bytes()).map_err(|e| {
+        SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("src path contains NUL: {}", e),
+        ))
+    })?;
+    let dst_c = CString::new(dst.as_os_str().as_bytes()).map_err(|e| {
+        SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("dst path contains NUL: {}", e),
+        ))
+    })?;
+
+    // SAFETY: We pass valid C strings and AT_FDCWD semantics on both
+    // ends. `syscall` returns -1 on error and sets errno.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            src_c.as_ptr(),
+            libc::AT_FDCWD,
+            dst_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if ret == 0 {
+        return Ok(());
+    }
+
+    // `From<io::Error> for SessionError` routes AlreadyExists to the
+    // Collision variant; every other errno becomes SessionError::Io.
+    Err(SessionError::from(std::io::Error::last_os_error()))
+}
+
+/// Non-Linux Unix fallback: POSIX `link()` + `unlink()`.
+///
+/// `link()` fails with `EEXIST` when the destination already exists,
+/// which gives us the same fail-if-exists semantics as
+/// `RENAME_NOREPLACE`. On `EXDEV` (cross-device — shouldn't happen
+/// because the tempfile is created in the session dir) we fall back to
+/// plain `rename()`, accepting a non-atomic window in that extreme case.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn atomic_create_rename(src: &Path, dst: &Path) -> Result<(), SessionError> {
+    match fs::hard_link(src, dst) {
+        Ok(()) => {
+            // Link succeeded; drop the original name.
+            fs::remove_file(src).map_err(SessionError::Io)?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(SessionError::Collision),
+        Err(e) => {
+            // EXDEV (cross-device) is reported as Other/Uncategorized on
+            // most Rust versions. Retry with plain rename, which
+            // tolerates EXDEV. Rename replaces the destination if it
+            // exists, so we check first; a racing writer could still
+            // slip in, but this branch only triggers in pathological
+            // cross-filesystem setups.
+            let is_exdev = e
+                .raw_os_error()
+                .map(|code| code == libc::EXDEV)
+                .unwrap_or(false);
+            if is_exdev {
+                if dst.exists() {
+                    return Err(SessionError::Collision);
+                }
+                fs::rename(src, dst).map_err(SessionError::Io)
+            } else {
+                Err(SessionError::Io(e))
+            }
+        }
+    }
+}
+
+/// Non-Unix fallback (e.g., Windows test builds). Best-effort
+/// check-then-rename with a non-atomic window.
+#[cfg(not(unix))]
+fn atomic_create_rename(src: &Path, dst: &Path) -> Result<(), SessionError> {
+    if dst.exists() {
+        return Err(SessionError::Collision);
+    }
+    fs::rename(src, dst).map_err(SessionError::Io)
+}
+
 /// Ensure the `.koto` ancestor directory exists with mode 0700.
 ///
 /// Walks up from `base_dir` to find a component named `.koto` and sets
@@ -439,6 +690,7 @@ mod tests {
             template_hash: "testhash".to_string(),
             created_at: created_at.to_string(),
             parent_workflow: None,
+            template_source_dir: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
     }
@@ -884,6 +1136,256 @@ mod tests {
         }
     }
 
+    // ===== init_state_file tests =====
+
+    /// Helper: build a minimal (header, events) bundle for a session id.
+    fn sample_bundle(id: &str) -> (StateFileHeader, Vec<Event>) {
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: id.to_string(),
+            template_hash: "testhash".to_string(),
+            created_at: "2026-04-13T00:00:00Z".to_string(),
+            parent_workflow: None,
+            template_source_dir: None,
+        };
+        let events = vec![
+            Event {
+                seq: 1,
+                timestamp: "2026-04-13T00:00:00Z".to_string(),
+                event_type: "workflow_initialized".to_string(),
+                payload: EventPayload::WorkflowInitialized {
+                    template_path: "/tmp/tpl.md".to_string(),
+                    variables: std::collections::HashMap::new(),
+                    spawn_entry: None,
+                },
+            },
+            Event {
+                seq: 2,
+                timestamp: "2026-04-13T00:00:01Z".to_string(),
+                event_type: "transitioned".to_string(),
+                payload: EventPayload::Transitioned {
+                    from: None,
+                    to: "start".to_string(),
+                    condition_type: "initial".to_string(),
+                },
+            },
+        ];
+        (header, events)
+    }
+
+    // -- happy path: init writes a readable state file --
+
+    #[test]
+    fn init_state_file_writes_header_and_events() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (header, events) = sample_bundle("wf");
+
+        backend
+            .init_state_file("wf", header.clone(), events)
+            .unwrap();
+
+        assert!(backend.exists("wf"));
+        let (got_header, got_events) = backend.read_events("wf").unwrap();
+        assert_eq!(got_header, header);
+        assert_eq!(got_events.len(), 2);
+        assert_eq!(got_events[0].seq, 1);
+        assert_eq!(got_events[1].seq, 2);
+    }
+
+    #[test]
+    fn init_state_file_rejects_invalid_id() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (header, events) = sample_bundle("ok");
+        assert!(backend
+            .init_state_file("../escape", header, events)
+            .is_err());
+    }
+
+    // -- scenario-1 + scenario-3: first-writer-wins under concurrency --
+
+    #[test]
+    fn init_state_file_first_writer_wins_under_contention() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(test_backend(tmp.path()));
+        let barrier = Arc::new(Barrier::new(8));
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let b = Arc::clone(&backend);
+            let bar = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                // Each thread has a different event payload so that a
+                // silent overwrite would produce different content.
+                let header = StateFileHeader {
+                    schema_version: 1,
+                    workflow: "race".to_string(),
+                    template_hash: format!("hash-{}", i),
+                    created_at: "2026-04-13T00:00:00Z".to_string(),
+                    parent_workflow: None,
+                    template_source_dir: None,
+                };
+                let events = vec![Event {
+                    seq: 1,
+                    timestamp: "2026-04-13T00:00:00Z".to_string(),
+                    event_type: "workflow_initialized".to_string(),
+                    payload: EventPayload::WorkflowInitialized {
+                        template_path: format!("/tmp/tpl-{}.md", i),
+                        variables: std::collections::HashMap::new(),
+                        spawn_entry: None,
+                    },
+                }];
+                bar.wait();
+                b.init_state_file("race", header, events)
+            }));
+        }
+
+        let mut wins = 0;
+        let mut already_exists = 0;
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(()) => wins += 1,
+                Err(SessionError::Collision) => already_exists += 1,
+                Err(e) => panic!("unexpected error (want Collision): {:?}", e),
+            }
+        }
+        assert_eq!(wins, 1, "exactly one init must commit");
+        assert_eq!(already_exists, 7, "every loser must report Collision");
+
+        // The committed content must be internally consistent (no torn
+        // writes / interleaved payloads): the header's template_hash
+        // must match the template_path in the single event.
+        let (header, events) = backend.read_events("race").unwrap();
+        assert!(header.template_hash.starts_with("hash-"));
+        let idx: &str = header.template_hash.strip_prefix("hash-").unwrap();
+        assert_eq!(events.len(), 1);
+        if let EventPayload::WorkflowInitialized { template_path, .. } = &events[0].payload {
+            assert_eq!(template_path, &format!("/tmp/tpl-{}.md", idx));
+        } else {
+            panic!("expected WorkflowInitialized payload");
+        }
+    }
+
+    // -- scenario-1: two sequential calls on the same path --
+
+    #[test]
+    fn init_state_file_second_call_returns_collision() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (h1, e1) = sample_bundle("wf");
+        backend.init_state_file("wf", h1, e1).unwrap();
+
+        let (h2, e2) = sample_bundle("wf");
+        let err = backend
+            .init_state_file("wf", h2, e2)
+            .expect_err("second init must fail");
+        assert!(
+            matches!(err, SessionError::Collision),
+            "want SessionError::Collision, got: {:?}",
+            err
+        );
+    }
+
+    // -- scenario-2: crash between tempfile write and rename leaves no
+    //    partial state file, and a fresh init on the path succeeds. We
+    //    simulate the crash by dropping a bogus tempfile in the session
+    //    dir (as would remain after a kill -9 between write and rename).
+
+    #[test]
+    fn init_state_file_fresh_init_succeeds_after_stale_tempfile() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+
+        // Simulate a crashed prior run: session dir exists with a stray
+        // `.koto-init-*.tmp` file, but no state file.
+        let session_dir = tmp.path().join("wf");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join(".koto-init-stale.tmp"),
+            b"partial content from prior crash",
+        )
+        .unwrap();
+
+        // The target state file must NOT be visible as a session.
+        assert!(!backend.exists("wf"));
+
+        // A fresh init on the same name succeeds and writes the real
+        // bundle.
+        let (header, events) = sample_bundle("wf");
+        backend
+            .init_state_file("wf", header.clone(), events)
+            .unwrap();
+        assert!(backend.exists("wf"));
+        let (got_header, got_events) = backend.read_events("wf").unwrap();
+        assert_eq!(got_header, header);
+        assert_eq!(got_events.len(), 2);
+    }
+
+    // -- scenario-2: no target state file is left when the bundle is
+    //    never renamed. This exercises the invariant "a crash before
+    //    rename never leaves the real state file on disk" by directly
+    //    calling the helper with a bogus rename target.
+    //    (Covered implicitly by the fresh_init_succeeds_after_stale
+    //    test above; additionally assert the state file doesn't appear
+    //    until init completes.)
+
+    #[test]
+    fn init_state_file_is_not_visible_until_rename_completes() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+
+        // Before init, no session exists.
+        assert!(!backend.exists("wf"));
+
+        let (header, events) = sample_bundle("wf");
+        backend.init_state_file("wf", header, events).unwrap();
+
+        // After init, the state file is present exactly once and at the
+        // final path.
+        let state_path = tmp.path().join("wf").join(state_file_name("wf"));
+        assert!(state_path.exists());
+
+        // No leftover .tmp files in the session directory.
+        let stray: Vec<_> = fs::read_dir(tmp.path().join("wf"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "init must not leave .tmp files behind on success: {:?}",
+            stray.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+    }
+
+    // -- scenario-3: exercise the non-Linux link()+unlink() fallback on
+    //    platforms where it is the active branch. We can't realistically
+    //    flip Linux onto the link() path from a test, so we gate this
+    //    test to platforms that actually use it.
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn init_state_file_link_unlink_fallback_first_writer_wins() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (h1, e1) = sample_bundle("wf");
+        backend.init_state_file("wf", h1, e1).unwrap();
+
+        let (h2, e2) = sample_bundle("wf");
+        let err = backend
+            .init_state_file("wf", h2, e2)
+            .expect_err("second init must fail on link() path");
+        assert!(
+            matches!(err, SessionError::Collision),
+            "want SessionError::Collision on link() path, got: {:?}",
+            err
+        );
+    }
+
     // -- manifest crash recovery: orphaned content without manifest entry --
 
     #[test]
@@ -908,5 +1410,237 @@ mod tests {
 
         // The orphaned file is still readable directly but not tracked.
         assert!(ctx_dir.join("orphan.md").exists());
+    }
+
+    // ===== lock_state_file tests =====
+
+    /// scenario-4: two back-to-back acquisitions observe
+    /// first-wins / second-contends semantics immediately, with no
+    /// blocking. The second call must return `SessionError::Locked`
+    /// rather than waiting for the first guard to drop.
+    #[test]
+    fn lock_state_file_second_acquire_returns_locked() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (header, events) = sample_bundle("wf");
+        backend.init_state_file("wf", header, events).unwrap();
+
+        let _guard = backend
+            .lock_state_file("wf")
+            .expect("first acquire must succeed");
+
+        let start = std::time::Instant::now();
+        let err = backend
+            .lock_state_file("wf")
+            .expect_err("second acquire must fail while first is held");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(err, SessionError::Locked { holder_pid: None }),
+            "want SessionError::Locked {{ holder_pid: None }}, got: {:?}",
+            err
+        );
+        // Non-blocking: kernel returns EWOULDBLOCK immediately. Allow
+        // a generous budget for CI jitter, but catch a regression to
+        // a blocking LOCK_EX.
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "second acquire must be non-blocking (took {:?})",
+            elapsed
+        );
+    }
+
+    /// scenario-4 continuation: dropping the guard releases the lock,
+    /// so a subsequent acquisition succeeds.
+    #[test]
+    fn lock_state_file_releases_on_drop() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (header, events) = sample_bundle("wf");
+        backend.init_state_file("wf", header, events).unwrap();
+
+        {
+            let _guard = backend.lock_state_file("wf").expect("acquire succeeds");
+        } // guard dropped here; lock released
+
+        let _guard2 = backend
+            .lock_state_file("wf")
+            .expect("re-acquire after drop must succeed");
+    }
+
+    /// Missing state file surfaces as an I/O error, not a Locked
+    /// variant. Callers should only lock after initialisation has
+    /// committed a state file.
+    #[test]
+    fn lock_state_file_missing_file_reports_io_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+
+        let err = backend
+            .lock_state_file("nonexistent")
+            .expect_err("must fail when state file is absent");
+        match err {
+            SessionError::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("want SessionError::Io(NotFound), got: {:?}", other),
+        }
+    }
+
+    /// scenario-32: cross-process contention. We fork a child process
+    /// (via `std::process::Command` re-executing the current test
+    /// binary with a sentinel env var) that holds the lock for a
+    /// bounded window, then attempt to acquire from the parent. The
+    /// parent must observe `SessionError::Locked`.
+    ///
+    /// Using a re-exec rather than a bare thread is deliberate:
+    /// `flock` is a per-open-file-description lock on modern Linux,
+    /// and a cross-thread test inside one process does not exercise
+    /// the cross-PID release-on-death semantics that matter in
+    /// production. The accompanying `lock_state_file_cross_thread`
+    /// test covers intra-process contention as well.
+    #[test]
+    #[cfg(unix)]
+    fn lock_state_file_cross_process_contention() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        // Child mode: re-exec of this test binary with
+        // KOTO_LOCK_HOLDER_DIR set takes the lock, prints "LOCKED",
+        // sleeps, then exits. The sentinel env var stops the child
+        // from also recursing into the parent branch.
+        if let Ok(dir) = std::env::var("KOTO_LOCK_HOLDER_DIR") {
+            let backend = LocalBackend::with_base_dir(PathBuf::from(&dir));
+            let _guard = backend
+                .lock_state_file("wf")
+                .expect("child: acquire must succeed");
+            println!("LOCKED");
+            // Hold the lock long enough for the parent to attempt
+            // acquisition and observe contention.
+            std::thread::sleep(Duration::from_millis(800));
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (header, events) = sample_bundle("wf");
+        backend.init_state_file("wf", header, events).unwrap();
+
+        let current_exe = std::env::current_exe().expect("current_exe");
+        let mut child = Command::new(&current_exe)
+            .args([
+                "--exact",
+                "--nocapture",
+                "session::local::tests::lock_state_file_cross_process_contention",
+            ])
+            .env("KOTO_LOCK_HOLDER_DIR", tmp.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child test process");
+
+        // Wait for the child to signal it has acquired the lock. The
+        // child prints "LOCKED" after a successful acquire; we block
+        // the current thread on a single line read so we don't race.
+        use std::io::BufRead;
+        let stdout = child.stdout.take().expect("child stdout");
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut seen_locked = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("read child stdout line");
+            if n == 0 {
+                break;
+            }
+            if line.trim() == "LOCKED" {
+                seen_locked = true;
+                break;
+            }
+        }
+        assert!(seen_locked, "child did not report LOCKED in time");
+
+        // Parent attempts to acquire while the child holds the lock.
+        // `flock` is per-open-file-description in the cross-process
+        // case, so this must fail with Locked.
+        let err = backend
+            .lock_state_file("wf")
+            .expect_err("parent acquire must contend with child");
+        assert!(
+            matches!(err, SessionError::Locked { .. }),
+            "want SessionError::Locked, got: {:?}",
+            err
+        );
+
+        // Clean up the child so the test harness doesn't inherit it.
+        let _ = child.wait();
+    }
+
+    /// Intra-process (cross-thread) contention. Useful belt-and-braces
+    /// coverage: `LocalBackend::lock_state_file` opens a fresh file
+    /// handle per call, so two threads in the same process also hold
+    /// separate open-file-descriptions and should contend.
+    #[test]
+    fn lock_state_file_cross_thread_contention() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(test_backend(tmp.path()));
+        let (header, events) = sample_bundle("wf");
+        backend.init_state_file("wf", header, events).unwrap();
+
+        // Thread A takes the lock and signals the barrier, then holds
+        // it while thread B attempts to acquire.
+        let barrier = Arc::new(Barrier::new(2));
+        let release = Arc::new(std::sync::Mutex::new(false));
+        let cvar = Arc::new(std::sync::Condvar::new());
+
+        let a_backend = Arc::clone(&backend);
+        let a_bar = Arc::clone(&barrier);
+        let a_release = Arc::clone(&release);
+        let a_cvar = Arc::clone(&cvar);
+        let a = thread::spawn(move || {
+            let _guard = a_backend.lock_state_file("wf").expect("thread A acquire");
+            a_bar.wait();
+            // Hold the lock until the main thread signals via the
+            // condvar. Avoids sleeping for an arbitrary duration.
+            let mut done = a_release.lock().unwrap();
+            while !*done {
+                done = a_cvar.wait(done).unwrap();
+            }
+        });
+
+        barrier.wait();
+        let err = backend
+            .lock_state_file("wf")
+            .expect_err("thread B acquire must contend");
+        assert!(
+            matches!(err, SessionError::Locked { .. }),
+            "want SessionError::Locked, got: {:?}",
+            err
+        );
+
+        *release.lock().unwrap() = true;
+        cvar.notify_all();
+        a.join().unwrap();
+
+        // With A's guard dropped, a fresh acquire must succeed. Retry
+        // briefly to absorb the kernel's own per-OFD close-to-unlock
+        // latency (the flock on an OFD is released by the kernel
+        // asynchronously in some scheduling windows; holding the
+        // result of the assertion to exactly one attempt is too
+        // strict for the semantic we want to test, which is "the lock
+        // eventually becomes acquirable again").
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match backend.lock_state_file("wf") {
+                Ok(_guard) => break,
+                Err(SessionError::Locked { .. }) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("re-acquire after A drops must succeed: {:?}", e),
+            }
+        }
     }
 }

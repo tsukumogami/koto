@@ -43,7 +43,14 @@ pub struct VariableDecl {
 }
 
 /// A state declaration in a compiled template.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// Note: `#[serde(deny_unknown_fields)]` is intentionally NOT applied here.
+/// `CompiledTemplate` is loaded from the compile cache, which may be written
+/// by a newer binary than the reader. Adding new fields to `CompiledTemplate`
+/// must remain non-breaking for older binaries during version churn.
+/// The strict unknown-field check lives on `SourceState` (the YAML
+/// front-matter intermediate) instead — see `src/template/compile.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct TemplateState {
     pub directive: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -60,6 +67,62 @@ pub struct TemplateState {
     pub integration: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_action: Option<ActionDecl>,
+    /// Declares that this state spawns child workflows from a task-list
+    /// evidence field when entered. Runtime behavior is implemented by the
+    /// batch scheduler; this field is purely the compile-time contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialize_children: Option<MaterializeChildrenSpec>,
+    /// When true and the state is terminal, marks this state as a failure
+    /// outcome (propagated by the batch scheduler to the parent's
+    /// `children-complete` gate output). Meaningful only when `terminal` is
+    /// true.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub failure: bool,
+    /// When true, the scheduler can synthesize child markers that land
+    /// directly in this state to represent "skipped" children. Meaningful
+    /// only when `terminal` is true.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skipped_marker: bool,
+}
+
+/// Template-level declaration that a state fans out child workflows from an
+/// agent-submitted task list.
+///
+/// Placed on `TemplateState` alongside `gates`, `accepts`, and
+/// `default_action`. The compiler validates the hook at load time; the
+/// scheduler (lands in a later phase) reads the hook at runtime to
+/// materialize children.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializeChildrenSpec {
+    /// Name of the `accepts` field on this state that carries the task
+    /// list. The field's declared type must be `tasks`.
+    pub from_field: String,
+    /// Path to the default child template to use when a task entry omits
+    /// `template`. The compiler validates that the path resolves.
+    pub default_template: String,
+    /// Policy for propagating failures to dependent tasks within the batch.
+    /// Defaults to `SkipDependents`.
+    #[serde(default = "default_failure_policy")]
+    pub failure_policy: FailurePolicy,
+}
+
+/// Policy controlling how a batch handles failures of upstream tasks.
+///
+/// - `SkipDependents` (default): tasks whose `waits_on` chain transitively
+///   includes a failed task are synthesized as terminal skip markers.
+/// - `Continue`: a failure of one task does not prevent dependents from
+///   running; each task is judged independently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum FailurePolicy {
+    SkipDependents,
+    Continue,
+}
+
+/// Serde default helper: `FailurePolicy::SkipDependents`.
+pub fn default_failure_policy() -> FailurePolicy {
+    FailurePolicy::SkipDependents
 }
 
 /// A structured transition with an optional condition.
@@ -167,6 +230,24 @@ pub const GATE_TYPE_CHILDREN_COMPLETE: &str = "children-complete";
 /// All `gates.*` key checks in advance.rs and types.rs use this constant.
 pub const GATES_EVIDENCE_NAMESPACE: &str = "gates";
 
+/// Prefix used in when-clause keys to match on the presence of an agent-submitted
+/// evidence field. Paired with the sentinel value [`PRESENT_MATCHER_VALUE`] to form
+/// expressions like `evidence.retry_failed: present` that fire when the named field
+/// appears in any event since the last state transition (Issue #11).
+pub const EVIDENCE_NAMESPACE: &str = "evidence";
+
+/// Sentinel string value that, when it appears as the value of a when-clause entry
+/// under the `evidence.<field>` key, triggers the presence matcher instead of the
+/// default scalar-equality check.
+pub const PRESENT_MATCHER_VALUE: &str = "present";
+
+/// Returns true if `value` is the JSON string `"present"` used as the presence-matcher
+/// sentinel. The check is case-sensitive so literal values like `"Present"` continue
+/// to route via the value-equality path.
+pub fn is_present_matcher(value: &serde_json::Value) -> bool {
+    value.as_str() == Some(PRESENT_MATCHER_VALUE)
+}
+
 /// The JSON value type of a gate output field.
 ///
 /// Used by [`gate_type_schema`] to describe the expected type of each field
@@ -224,7 +305,17 @@ pub fn gate_type_builtin_default(gate_type: &str) -> Option<serde_json::Value> {
             "total": 0,
             "completed": 0,
             "pending": 0,
+            "success": 0,
+            "failed": 0,
+            "skipped": 0,
+            "blocked": 0,
+            "spawn_failed": 0,
             "all_complete": true,
+            "all_success": true,
+            "any_failed": false,
+            "any_skipped": false,
+            "any_spawn_failed": false,
+            "needs_attention": false,
             "children": [],
             "error": ""
         })),
@@ -290,7 +381,16 @@ fn json_value_matches_schema_type(value: &serde_json::Value, t: &GateSchemaField
 }
 
 /// Valid field types for FieldSchema.
-const VALID_FIELD_TYPES: &[&str] = &["enum", "string", "number", "boolean"];
+///
+/// `"tasks"` is a structured array type used by the batch child spawning
+/// feature; the compiler knows its exact shape (see `item_schema` generation
+/// in `src/cli/next_types.rs::derive_expects`), so templates declare
+/// `type: tasks` without writing any schema by hand.
+const VALID_FIELD_TYPES: &[&str] = &["enum", "string", "number", "boolean", "tasks"];
+
+/// Field type marker for structured task-list evidence fields consumed by
+/// the `materialize_children` hook.
+pub const FIELD_TYPE_TASKS: &str = "tasks";
 
 /// Runtime-injected variable names that are valid in templates but not
 /// declared in the variables block. These are provided by the engine at
@@ -500,7 +600,7 @@ impl CompiledTemplate {
                     if !VALID_FIELD_TYPES.contains(&schema.field_type.as_str()) {
                         return Err(format!(
                             "state {:?} accepts field {:?}: invalid field_type {:?}, \
-                             must be one of: enum, string, number, boolean",
+                             must be one of: enum, string, number, boolean, tasks",
                             state_name, field_name, schema.field_type
                         ));
                     }
@@ -591,6 +691,14 @@ impl CompiledTemplate {
             }
         }
 
+        // Issue 8: compile rules for materialize_children (E1-E10) run
+        // before D5/D4 so failures in the hook surface with rule-specific
+        // messages rather than generic legacy-gate diagnostics. E9's
+        // "resolves to a compilable template" check and F5 live in
+        // `compile()` because they need the source path to resolve
+        // relative template references.
+        self.validate_materialize_children_errors()?;
+
         // D5: legacy gate detection. A state with gates but no `gates.*`
         // when-clause references uses the legacy boolean pass/block path. In
         // strict mode this is an error; in permissive mode it is a stderr
@@ -633,7 +741,389 @@ impl CompiledTemplate {
             self.validate_gate_reachability(state_name, state, strict)?;
         }
 
+        // Issue 8: emit non-fatal warnings W1-W5. These never fail
+        // compilation regardless of `strict`; they surface on stderr via
+        // the same `eprintln!("warning: ...")` convention as D4/D5.
+        for warning in self.collect_materialize_children_warnings() {
+            eprintln!("warning: {}", warning);
+        }
+
+        // Issue #11: emit non-fatal warning W6 when the present-matcher sentinel
+        // is used against a non-evidence path (e.g. `context.foo: present` or a
+        // flat agent-evidence key). Same convention as W1-W5.
+        for warning in self.collect_when_clause_warnings() {
+            eprintln!("warning: {}", warning);
+        }
+
         Ok(())
+    }
+
+    /// Validate compile-time error rules E1-E10 tied to the
+    /// `materialize_children` hook.
+    ///
+    /// | Rule | Check |
+    /// |------|-------|
+    /// | E1   | `from_field` is non-empty |
+    /// | E2   | `from_field` names a declared accepts field |
+    /// | E3   | Referenced field has `type: tasks` |
+    /// | E4   | Referenced field has `required: true` |
+    /// | E5   | Declaring state is not terminal |
+    /// | E6   | `failure_policy` is `skip_dependents` or `continue` (enforced by serde enum) |
+    /// | E7   | State has at least one outgoing transition |
+    /// | E8   | No two states reference the same `from_field` |
+    /// | E9   | `default_template` is non-empty (resolution check lives in `compile()`) |
+    /// | E10  | State with `materialize_children` must declare a `children-complete` gate |
+    ///
+    /// Returns on the first violation with an error message that names the
+    /// offending state and a one-line remedy.
+    fn validate_materialize_children_errors(&self) -> Result<(), String> {
+        // E8 requires cross-state correlation of `from_field` values.
+        let mut seen_from_fields: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        // Deterministic iteration order: states are stored in a BTreeMap so
+        // errors are reproducible across runs.
+        for (state_name, state) in &self.states {
+            let hook = match &state.materialize_children {
+                Some(h) => h,
+                None => continue,
+            };
+
+            // E1: from_field is non-empty.
+            if hook.from_field.is_empty() {
+                return Err(format!(
+                    "E1: state {:?}: materialize_children.from_field must not be empty\n  \
+                     remedy: set from_field to the name of a `tasks`-typed accepts field on this state",
+                    state_name
+                ));
+            }
+
+            // E5: Declaring state is not terminal.
+            if state.terminal {
+                return Err(format!(
+                    "E5: state {:?}: materialize_children cannot be declared on a terminal state\n  \
+                     remedy: move the hook to a non-terminal state that awaits evidence submission",
+                    state_name
+                ));
+            }
+
+            // E7: State has at least one outgoing transition.
+            if state.transitions.is_empty() {
+                return Err(format!(
+                    "E7: state {:?}: materialize_children state must declare at least one outgoing transition\n  \
+                     remedy: add a transition that fires when the children-complete gate completes",
+                    state_name
+                ));
+            }
+
+            // E2/E3/E4: from_field must be declared in accepts with
+            // `type: tasks` and `required: true`.
+            let accepts = state.accepts.as_ref().ok_or_else(|| {
+                format!(
+                    "E2: state {:?}: materialize_children.from_field {:?} is not declared in an accepts block\n  \
+                     remedy: add an accepts block with field {:?} of type `tasks`",
+                    state_name, hook.from_field, hook.from_field
+                )
+            })?;
+
+            let schema = accepts.get(&hook.from_field).ok_or_else(|| {
+                format!(
+                    "E2: state {:?}: materialize_children.from_field {:?} is not a declared accepts field\n  \
+                     remedy: declare {:?} in the accepts block with type `tasks`",
+                    state_name, hook.from_field, hook.from_field
+                )
+            })?;
+
+            // E3: Referenced field has type: tasks.
+            if schema.field_type != FIELD_TYPE_TASKS {
+                return Err(format!(
+                    "E3: state {:?}: accepts field {:?} has type {:?}, expected \"tasks\"\n  \
+                     remedy: change the field's type to \"tasks\" (structured task list)",
+                    state_name, hook.from_field, schema.field_type
+                ));
+            }
+
+            // E4: Referenced field has required: true.
+            if !schema.required {
+                return Err(format!(
+                    "E4: state {:?}: accepts field {:?} must be required: true\n  \
+                     remedy: set `required: true` on the accepts field backing the task list",
+                    state_name, hook.from_field
+                ));
+            }
+
+            // E6: failure_policy is skip_dependents or continue. The
+            // `FailurePolicy` enum with `#[serde(rename_all = "snake_case")]`
+            // already rejects unknown values at deserialization; matching
+            // exhaustively here documents the contract for future variants.
+            match hook.failure_policy {
+                FailurePolicy::SkipDependents | FailurePolicy::Continue => {}
+            }
+
+            // E8: No two states share the same from_field.
+            if let Some(prior) = seen_from_fields.get(&hook.from_field) {
+                return Err(format!(
+                    "E8: states {:?} and {:?} both reference from_field {:?}; \
+                     a task-list field can back at most one materialize_children hook\n  \
+                     remedy: use distinct accepts field names per hook (likely a copy-paste bug)",
+                    prior, state_name, hook.from_field
+                ));
+            }
+            seen_from_fields.insert(hook.from_field.clone(), state_name.clone());
+
+            // E9 (partial): default_template is non-empty. The "resolves
+            // to a compilable template" check lives in `compile()` because
+            // it needs the source path to resolve relative references.
+            if hook.default_template.is_empty() {
+                return Err(format!(
+                    "E9: state {:?}: materialize_children.default_template must not be empty\n  \
+                     remedy: set default_template to a path (relative to the parent template's directory) of the child template",
+                    state_name
+                ));
+            }
+
+            // E10: State must also declare a children-complete gate.
+            let has_children_complete_gate = state
+                .gates
+                .values()
+                .any(|g| g.gate_type == GATE_TYPE_CHILDREN_COMPLETE);
+            if !has_children_complete_gate {
+                return Err(format!(
+                    "E10: state {:?}: materialize_children requires a children-complete gate on the same state\n  \
+                     remedy: add a gate with type `children-complete` so the state can observe child completion",
+                    state_name
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Collect non-fatal warnings W1-W5 tied to `materialize_children`,
+    /// `failure`, and `skipped_marker` usage.
+    ///
+    /// | Rule | Trigger |
+    /// |------|---------|
+    /// | W1 | State with `materialize_children` routes to a state reachable from the declaring state that does not observe the `children-complete` gate |
+    /// | W2 | `children-complete.name_filter` is set but does not end with `.` (ergo not scoped to one parent) |
+    /// | W3 | Terminal state whose name matches /block|fail|error/ lacks `failure: true` |
+    /// | W4 | State with `materialize_children` routes only on `all_complete: true` without a second transition handling failures |
+    /// | W5 | Terminal state with `failure: true` has no path writing `failure_reason` to context (v1 only checks the accepts-field path; templates relying on `default_action` or `context_assignments` may see false positives until those surfaces are checked) |
+    ///
+    /// Warnings are returned as formatted strings; callers emit them via
+    /// stderr (`validate`) or collect them for tests.
+    pub fn collect_materialize_children_warnings(&self) -> Vec<String> {
+        let mut warnings: Vec<String> = Vec::new();
+
+        // W1: children-complete gate reachable from the declaring state.
+        //
+        // In the single-state fan-out shape (E10 enforces the gate lives on
+        // the declaring state itself), the gate is trivially reachable from
+        // the declaring state. W1 still catches the degenerate case where
+        // the hook is declared but no gate on this state evaluates
+        // `children-complete` via a `when` clause — meaning the gate output
+        // is never observed by any transition.
+        for (state_name, state) in &self.states {
+            if state.materialize_children.is_none() {
+                continue;
+            }
+            let gate_names: Vec<&String> = state
+                .gates
+                .iter()
+                .filter_map(|(n, g)| (g.gate_type == GATE_TYPE_CHILDREN_COMPLETE).then_some(n))
+                .collect();
+            if gate_names.is_empty() {
+                // E10 already fired; no W1 noise.
+                continue;
+            }
+            let any_referenced = gate_names.iter().any(|gn| {
+                let prefix = format!("{}.{}.", GATES_EVIDENCE_NAMESPACE, gn);
+                state.transitions.iter().any(|t| {
+                    t.when
+                        .as_ref()
+                        .is_some_and(|w| w.keys().any(|k| k.starts_with(&prefix)))
+                })
+            });
+            if !any_referenced {
+                warnings.push(format!(
+                    "W1: state {:?}: children-complete gate is declared but no transition's when clause observes it\n  \
+                     remedy: add a transition with a when clause referencing gates.<gate_name>.all_complete (or any children-complete output field)",
+                    state_name
+                ));
+            }
+        }
+
+        // W2: children-complete.name_filter should end with `.` to scope
+        // matching to children of a single parent (children are named
+        // `<parent>.<task>`). We cannot know the parent name at compile
+        // time, but a filter that lacks the trailing `.` would match by
+        // prefix across parents and is almost certainly a bug.
+        for (state_name, state) in &self.states {
+            for (gate_name, gate) in &state.gates {
+                if gate.gate_type != GATE_TYPE_CHILDREN_COMPLETE {
+                    continue;
+                }
+                if let Some(filter) = &gate.name_filter {
+                    if !filter.is_empty() && !filter.ends_with('.') {
+                        warnings.push(format!(
+                            "W2: state {:?} gate {:?}: name_filter {:?} does not end with \".\"; \
+                             children-complete gates scope to one parent by matching the \"<parent>.\" prefix\n  \
+                             remedy: append \".\" to the filter (e.g. {:?})",
+                            state_name,
+                            gate_name,
+                            filter,
+                            format!("{}.", filter)
+                        ));
+                    }
+                }
+            }
+        }
+
+        // W3: terminal state whose name contains "block"/"fail"/"error"
+        // lacks `failure: true`.
+        for (state_name, state) in &self.states {
+            if !state.terminal {
+                continue;
+            }
+            if state.failure {
+                continue;
+            }
+            let lower = state_name.to_lowercase();
+            let looks_failureish =
+                lower.contains("block") || lower.contains("fail") || lower.contains("error");
+            if looks_failureish {
+                warnings.push(format!(
+                    "W3: state {:?}: terminal state name suggests a failure outcome but `failure: true` is not set\n  \
+                     remedy: set `failure: true` if this state represents a failure, or rename it if it represents a success",
+                    state_name
+                ));
+            }
+        }
+
+        // W4: materialize_children state routes only on `all_complete: true`
+        // without a second transition handling `any_failed > 0` or
+        // `any_skipped > 0`. Failed or skipped children would silently
+        // take the success branch.
+        //
+        // We look for transitions whose `when` clause references any of
+        // the derived booleans `any_failed`, `any_skipped`,
+        // `any_spawn_failed`, or `needs_attention` against any gate.
+        for (state_name, state) in &self.states {
+            if state.materialize_children.is_none() {
+                continue;
+            }
+            let mut routes_on_all_complete = false;
+            let mut has_failure_branch = false;
+            for transition in &state.transitions {
+                let when = match &transition.when {
+                    Some(w) => w,
+                    None => continue,
+                };
+                for key in when.keys() {
+                    if !key.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)) {
+                        continue;
+                    }
+                    // Key shape: gates.<gate>.<field>
+                    let segments: Vec<&str> = key.splitn(3, '.').collect();
+                    if segments.len() != 3 {
+                        continue;
+                    }
+                    let field = segments[2];
+                    match field {
+                        "all_complete" | "all_success" => routes_on_all_complete = true,
+                        "any_failed" | "any_skipped" | "any_spawn_failed" | "needs_attention" => {
+                            has_failure_branch = true
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if routes_on_all_complete && !has_failure_branch {
+                warnings.push(format!(
+                    "W4: state {:?}: materialize_children routes only on all_complete/all_success \
+                     with no branch handling failed or skipped children\n  \
+                     remedy: add a transition guarded by gates.<gate>.any_failed or gates.<gate>.needs_attention to route failures somewhere meaningful",
+                    state_name
+                ));
+            }
+        }
+
+        // W5: terminal state with `failure: true` has no path writing
+        // `failure_reason` to context. The design calls out three ways the
+        // context key can land:
+        //   (a) the state's `accepts` block declares a `failure_reason` field
+        //   (b) the state's `default_action` writes `failure_reason`
+        //   (c) an upstream transition carries a `context_assignments`
+        //       entry writing `failure_reason`
+        //
+        // Neither `default_action` nor `context_assignments` carry schema
+        // metadata today (the runtime context-assignment surface lands
+        // in a later phase), so for now we check (a) only. A future PR
+        // extends this check once (b)/(c) have stable representations;
+        // until then W5 over-warns on templates that rely on (b)/(c).
+        //
+        // TODO(issue-8/W5): widen the check once default_action and
+        // context_assignments expose a writable-keys surface.
+        for (state_name, state) in &self.states {
+            if !(state.terminal && state.failure) {
+                continue;
+            }
+            let has_failure_reason_accepts = state
+                .accepts
+                .as_ref()
+                .is_some_and(|a| a.contains_key("failure_reason"));
+            if !has_failure_reason_accepts {
+                warnings.push(format!(
+                    "W5: state {:?}: `failure: true` terminal state has no declared path writing the `failure_reason` context key; \
+                     the batch view's per-child `reason` will fall back to the state name\n  \
+                     remedy: add `failure_reason` to the state's accepts block (or write it via default_action / context_assignments)",
+                    state_name
+                ));
+            }
+        }
+
+        warnings
+    }
+
+    /// Collect non-fatal warnings tied to when-clause matcher usage.
+    ///
+    /// | Rule | Trigger |
+    /// |------|---------|
+    /// | W6 | The string `"present"` appears as a when-clause value under a key that is not in the `evidence.<field>` namespace. The present matcher is only meaningful when checking whether an agent-submitted evidence field exists. A flat agent-evidence key, a `gates.*` path, or any other prefix with value `"present"` almost certainly means the template author intended presence matching but used the wrong path. |
+    ///
+    /// Warnings are returned as formatted strings; callers emit them via
+    /// stderr (`validate`) or collect them for tests.
+    pub fn collect_when_clause_warnings(&self) -> Vec<String> {
+        let mut warnings: Vec<String> = Vec::new();
+        let evidence_prefix = format!("{}.", EVIDENCE_NAMESPACE);
+
+        for (state_name, state) in &self.states {
+            for transition in &state.transitions {
+                let when = match &transition.when {
+                    Some(w) => w,
+                    None => continue,
+                };
+                for (field, value) in when {
+                    if !is_present_matcher(value) {
+                        continue;
+                    }
+                    if field.starts_with(&evidence_prefix) {
+                        continue;
+                    }
+                    warnings.push(format!(
+                        "W6: state {:?} transition to {:?}: when value {:?} is the presence-matcher \
+                         sentinel but key {:?} is not in the evidence.<field> namespace\n  \
+                         remedy: rewrite the key as evidence.<field> to check for field presence, or replace the value with the intended scalar for equality matching",
+                        state_name,
+                        transition.target,
+                        PRESENT_MATCHER_VALUE,
+                        field,
+                    ));
+                }
+            }
+        }
+
+        warnings
     }
 
     /// Validate that every state with pure-gate-only transitions can fire at least
@@ -774,25 +1264,56 @@ impl CompiledTemplate {
                 ));
             }
 
-            // Separate gates.* keys (engine-injected gate output) from agent evidence keys.
-            // gates.* keys bypass the accepts block requirement and field-presence checks
-            // because they are populated automatically by the advance loop, not by agents.
-            let agent_fields: Vec<(&String, &serde_json::Value)> = when
-                .iter()
-                .filter(|(k, _)| !k.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)))
-                .collect();
+            // Separate gates.* keys (engine-injected gate output), evidence.<field>
+            // presence keys (Issue #11), and flat agent evidence keys. gates.* keys
+            // bypass the accepts block requirement and field-presence checks because
+            // they are populated automatically by the advance loop, not by agents.
+            // evidence.<field>: present checks only that the field appeared in any
+            // submission since the last transition — it does not compare values,
+            // so the field is not required to be declared in accepts.
+            let gates_prefix = format!("{}.", GATES_EVIDENCE_NAMESPACE);
+            let evidence_prefix = format!("{}.", EVIDENCE_NAMESPACE);
             let gate_fields: Vec<(&String, &serde_json::Value)> = when
                 .iter()
-                .filter(|(k, _)| k.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)))
+                .filter(|(k, _)| k.starts_with(&gates_prefix))
+                .collect();
+            let evidence_presence_fields: Vec<(&String, &serde_json::Value)> = when
+                .iter()
+                .filter(|(k, _)| k.starts_with(&evidence_prefix))
+                .collect();
+            let agent_fields: Vec<(&String, &serde_json::Value)> = when
+                .iter()
+                .filter(|(k, _)| !k.starts_with(&gates_prefix) && !k.starts_with(&evidence_prefix))
                 .collect();
 
             // Rule 5: when conditions that reference agent evidence require an accepts block.
-            // Pure gates.* conditions are allowed without an accepts block.
+            // Pure gates.* and evidence.<field>: present conditions are allowed without
+            // an accepts block (presence checks do not reference declared schema).
             if !agent_fields.is_empty() && !has_accepts {
                 return Err(format!(
                     "state {:?} transition to {:?}: when conditions require an accepts block on the state",
                     state_name, transition.target
                 ));
+            }
+
+            // Issue #11: validate evidence.<field> entries use the present matcher.
+            // Any other value on an evidence.* key is an error — the namespace is
+            // reserved for presence matching and has no equality semantics.
+            for (field, value) in &evidence_presence_fields {
+                let segments: Vec<&str> = field.splitn(3, '.').collect();
+                if segments.len() != 2 || segments[1].is_empty() {
+                    return Err(format!(
+                        "state {:?}: when clause key {:?} has invalid format; expected \"evidence.<field>\"",
+                        state_name, field.as_str()
+                    ));
+                }
+                if !is_present_matcher(value) {
+                    return Err(format!(
+                        "state {:?} transition to {:?}: when value for evidence key {:?} must be {:?}; \
+                         the evidence.<field> namespace only supports presence matching",
+                        state_name, transition.target, field, PRESENT_MATCHER_VALUE
+                    ));
+                }
             }
 
             // Rule 6 applied to gates.* fields: values must be JSON scalars.
@@ -948,6 +1469,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         states.insert(
@@ -961,6 +1485,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         CompiledTemplate {
@@ -1180,6 +1707,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         assert!(
@@ -1332,6 +1862,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -1390,6 +1923,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -1439,6 +1975,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -1486,6 +2025,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -2582,6 +3124,9 @@ command: "./check.sh"
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         t
@@ -2694,6 +3239,9 @@ command: "./check.sh"
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -2804,6 +3352,9 @@ command: "./check.sh"
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -2939,5 +3490,855 @@ command: "./check.sh"
         assert!(t.validate(true).is_err(), "strict=true must return Err");
         // Permissive: no error.
         assert!(t.validate(false).is_ok(), "strict=false must return Ok");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 7: tasks accepts type, materialize_children hook, new TemplateState
+    // fields, and narrow deny_unknown_fields.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn template_state_defaults_for_new_fields() {
+        // Default construction leaves the three Issue-7 fields at their zero
+        // values: None, false, false.
+        let state = TemplateState::default();
+        assert!(state.materialize_children.is_none());
+        assert!(!state.failure);
+        assert!(!state.skipped_marker);
+    }
+
+    #[test]
+    fn failure_policy_serializes_as_snake_case() {
+        // skip_dependents / continue, matching the design's Key Interfaces.
+        let v = serde_json::to_value(FailurePolicy::SkipDependents).unwrap();
+        assert_eq!(v, serde_json::json!("skip_dependents"));
+        let v = serde_json::to_value(FailurePolicy::Continue).unwrap();
+        assert_eq!(v, serde_json::json!("continue"));
+
+        // Round-trip via JSON.
+        let decoded: FailurePolicy = serde_json::from_str("\"skip_dependents\"").unwrap();
+        assert_eq!(decoded, FailurePolicy::SkipDependents);
+        let decoded: FailurePolicy = serde_json::from_str("\"continue\"").unwrap();
+        assert_eq!(decoded, FailurePolicy::Continue);
+    }
+
+    #[test]
+    fn default_failure_policy_is_skip_dependents() {
+        assert_eq!(default_failure_policy(), FailurePolicy::SkipDependents);
+    }
+
+    #[test]
+    fn materialize_children_spec_deserializes_with_default_policy() {
+        // When failure_policy is omitted, the serde default kicks in.
+        let json = serde_json::json!({
+            "from_field": "tasks",
+            "default_template": "child.md"
+        });
+        let spec: MaterializeChildrenSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.from_field, "tasks");
+        assert_eq!(spec.default_template, "child.md");
+        assert_eq!(spec.failure_policy, FailurePolicy::SkipDependents);
+    }
+
+    #[test]
+    fn materialize_children_spec_rejects_unknown_fields() {
+        // deny_unknown_fields is applied to MaterializeChildrenSpec — a typo
+        // like `default_tempalte` must be rejected at deserialization.
+        let json = serde_json::json!({
+            "from_field": "tasks",
+            "default_template": "child.md",
+            "unknown_field": 42,
+        });
+        let err = serde_json::from_value::<MaterializeChildrenSpec>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn tasks_field_type_passes_validation() {
+        // A tasks-typed accepts field compiles and validates successfully.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "tasks".to_string(),
+            FieldSchema {
+                field_type: "tasks".to_string(),
+                required: true,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+        state.accepts = Some(accepts);
+        t.validate(true).unwrap();
+    }
+
+    #[test]
+    fn invalid_field_type_error_lists_tasks() {
+        // The error message enumerating valid field types must include
+        // "tasks" so template authors see it as an option.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "bad".to_string(),
+            FieldSchema {
+                field_type: "nonsense".to_string(),
+                required: false,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+        state.accepts = Some(accepts);
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("tasks"),
+            "expected tasks in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn template_state_deserializes_without_new_fields_for_cache_compat() {
+        // CompiledTemplate is loaded from the compile cache. Older binaries
+        // wrote state files that do not include materialize_children,
+        // failure, or skipped_marker — those must parse unchanged thanks to
+        // serde(default) on each field.
+        let json = serde_json::json!({
+            "directive": "do a thing",
+        });
+        let state: TemplateState = serde_json::from_value(json).unwrap();
+        assert_eq!(state.directive, "do a thing");
+        assert!(state.materialize_children.is_none());
+        assert!(!state.failure);
+        assert!(!state.skipped_marker);
+    }
+
+    #[test]
+    fn template_state_tolerates_unknown_fields_for_forward_compat() {
+        // deny_unknown_fields is NOT on TemplateState: a compile cache
+        // written by a newer binary that added a new field must still parse
+        // cleanly with the current binary. This is the mirror test of
+        // SourceState's stricter behavior.
+        let json = serde_json::json!({
+            "directive": "do a thing",
+            "some_future_field": "surprise",
+        });
+        let state: TemplateState = serde_json::from_value(json).unwrap();
+        assert_eq!(state.directive, "do a thing");
+    }
+
+    #[test]
+    fn template_state_round_trips_with_new_fields_set() {
+        // failure: true and skipped_marker: true round-trip through JSON.
+        let state = TemplateState {
+            directive: "done".to_string(),
+            terminal: true,
+            failure: true,
+            skipped_marker: true,
+            ..TemplateState::default()
+        };
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["failure"], serde_json::json!(true));
+        assert_eq!(json["skipped_marker"], serde_json::json!(true));
+        let restored: TemplateState = serde_json::from_value(json).unwrap();
+        assert_eq!(state, restored);
+    }
+
+    #[test]
+    fn materialize_children_spec_serializes_skip_dependents_by_default() {
+        let spec = MaterializeChildrenSpec {
+            from_field: "tasks".to_string(),
+            default_template: "child.md".to_string(),
+            failure_policy: FailurePolicy::SkipDependents,
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["from_field"], "tasks");
+        assert_eq!(json["default_template"], "child.md");
+        assert_eq!(json["failure_policy"], "skip_dependents");
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue 8: compile rules E1-E10 (errors) and W1-W5 (warnings).
+    //
+    // These tests exercise validate() directly on a handwritten
+    // CompiledTemplate so each rule can fire in isolation without relying
+    // on the YAML parser. E9's "resolves to a compilable template" check
+    // and F5 (skipped_marker reachability) live in `compile::tests`
+    // because they need the source path.
+    // ---------------------------------------------------------------------
+
+    /// Build a minimum batch-parent template: one non-terminal declaring
+    /// state with `materialize_children` and a children-complete gate,
+    /// plus a terminal `done` state. Callers mutate the result to trip
+    /// individual rules.
+    ///
+    /// Intentionally omits a failure-branch transition so W4-negative
+    /// coverage has something to fire on. Add a second transition on
+    /// `gates.cc.any_failed` for a W4-silent fixture.
+    fn minimal_batch_parent() -> CompiledTemplate {
+        let mut accepts: BTreeMap<String, FieldSchema> = BTreeMap::new();
+        accepts.insert(
+            "tasks".to_string(),
+            FieldSchema {
+                field_type: FIELD_TYPE_TASKS.to_string(),
+                required: true,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+        let mut gates: BTreeMap<String, Gate> = BTreeMap::new();
+        gates.insert(
+            "cc".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CHILDREN_COMPLETE.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+        let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        when.insert("gates.cc.all_complete".to_string(), serde_json::json!(true));
+        let plan = TemplateState {
+            directive: "Plan.".to_string(),
+            details: String::new(),
+            transitions: vec![Transition {
+                target: "done".to_string(),
+                when: Some(when),
+            }],
+            terminal: false,
+            gates,
+            accepts: Some(accepts),
+            integration: None,
+            default_action: None,
+            materialize_children: Some(MaterializeChildrenSpec {
+                from_field: "tasks".to_string(),
+                default_template: "child.md".to_string(),
+                failure_policy: FailurePolicy::SkipDependents,
+            }),
+            failure: false,
+            skipped_marker: false,
+        };
+        let done = TemplateState {
+            directive: "Done.".to_string(),
+            details: String::new(),
+            transitions: vec![],
+            terminal: true,
+            gates: BTreeMap::new(),
+            accepts: None,
+            integration: None,
+            default_action: None,
+            materialize_children: None,
+            failure: false,
+            skipped_marker: false,
+        };
+        let mut states = BTreeMap::new();
+        states.insert("plan".to_string(), plan);
+        states.insert("done".to_string(), done);
+        CompiledTemplate {
+            format_version: 1,
+            name: "batch-parent".to_string(),
+            version: "1.0".to_string(),
+            description: String::new(),
+            initial_state: "plan".to_string(),
+            variables: BTreeMap::new(),
+            states,
+        }
+    }
+
+    /// Positive baseline: a valid batch parent passes validate() cleanly.
+    #[test]
+    fn issue8_minimal_batch_parent_passes() {
+        let t = minimal_batch_parent();
+        t.validate(true)
+            .expect("valid batch parent should validate");
+    }
+
+    #[test]
+    fn issue8_e1_empty_from_field_rejected() {
+        let mut t = minimal_batch_parent();
+        t.states
+            .get_mut("plan")
+            .unwrap()
+            .materialize_children
+            .as_mut()
+            .unwrap()
+            .from_field = String::new();
+        let err = t.validate(true).unwrap_err();
+        assert!(err.starts_with("E1:"), "got: {}", err);
+        assert!(err.contains("plan"), "error mentions state name: {}", err);
+    }
+
+    #[test]
+    fn issue8_e2_unknown_from_field_rejected() {
+        let mut t = minimal_batch_parent();
+        t.states
+            .get_mut("plan")
+            .unwrap()
+            .materialize_children
+            .as_mut()
+            .unwrap()
+            .from_field = "not_a_field".to_string();
+        let err = t.validate(true).unwrap_err();
+        assert!(err.starts_with("E2:"), "got: {}", err);
+        assert!(
+            err.contains("not_a_field"),
+            "error mentions bad field: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn issue8_e3_wrong_field_type_rejected() {
+        let mut t = minimal_batch_parent();
+        let accepts = t.states.get_mut("plan").unwrap().accepts.as_mut().unwrap();
+        accepts.get_mut("tasks").unwrap().field_type = "string".to_string();
+        let err = t.validate(true).unwrap_err();
+        assert!(err.starts_with("E3:"), "got: {}", err);
+    }
+
+    #[test]
+    fn issue8_e4_not_required_field_rejected() {
+        let mut t = minimal_batch_parent();
+        t.states
+            .get_mut("plan")
+            .unwrap()
+            .accepts
+            .as_mut()
+            .unwrap()
+            .get_mut("tasks")
+            .unwrap()
+            .required = false;
+        let err = t.validate(true).unwrap_err();
+        assert!(err.starts_with("E4:"), "got: {}", err);
+    }
+
+    #[test]
+    fn issue8_e5_terminal_declaring_state_rejected() {
+        let mut t = minimal_batch_parent();
+        t.states.get_mut("plan").unwrap().terminal = true;
+        let err = t.validate(true).unwrap_err();
+        assert!(err.starts_with("E5:"), "got: {}", err);
+    }
+
+    #[test]
+    fn issue8_e6_valid_policies_pass() {
+        // Positive test: both enum values are accepted.
+        let mut t = minimal_batch_parent();
+        t.states
+            .get_mut("plan")
+            .unwrap()
+            .materialize_children
+            .as_mut()
+            .unwrap()
+            .failure_policy = FailurePolicy::Continue;
+        t.validate(true).expect("continue policy should validate");
+    }
+
+    #[test]
+    fn issue8_e7_no_outgoing_transition_rejected() {
+        let mut t = minimal_batch_parent();
+        t.states.get_mut("plan").unwrap().transitions.clear();
+        let err = t.validate(true).unwrap_err();
+        assert!(err.starts_with("E7:"), "got: {}", err);
+    }
+
+    #[test]
+    fn issue8_e8_duplicate_from_field_rejected() {
+        let mut t = minimal_batch_parent();
+        // Add a second state referencing the same from_field.
+        let mut accepts2: BTreeMap<String, FieldSchema> = BTreeMap::new();
+        accepts2.insert(
+            "tasks".to_string(),
+            FieldSchema {
+                field_type: FIELD_TYPE_TASKS.to_string(),
+                required: true,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+        let mut gates2: BTreeMap<String, Gate> = BTreeMap::new();
+        gates2.insert(
+            "cc2".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CHILDREN_COMPLETE.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+        let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        when.insert(
+            "gates.cc2.all_complete".to_string(),
+            serde_json::json!(true),
+        );
+        let plan2 = TemplateState {
+            directive: "Second plan.".to_string(),
+            details: String::new(),
+            transitions: vec![Transition {
+                target: "done".to_string(),
+                when: Some(when),
+            }],
+            terminal: false,
+            gates: gates2,
+            accepts: Some(accepts2),
+            integration: None,
+            default_action: None,
+            materialize_children: Some(MaterializeChildrenSpec {
+                from_field: "tasks".to_string(),
+                default_template: "child.md".to_string(),
+                failure_policy: FailurePolicy::SkipDependents,
+            }),
+            failure: false,
+            skipped_marker: false,
+        };
+        t.states.insert("plan2".to_string(), plan2);
+        let err = t.validate(true).unwrap_err();
+        assert!(err.starts_with("E8:"), "got: {}", err);
+    }
+
+    #[test]
+    fn issue8_e9_empty_default_template_rejected() {
+        let mut t = minimal_batch_parent();
+        t.states
+            .get_mut("plan")
+            .unwrap()
+            .materialize_children
+            .as_mut()
+            .unwrap()
+            .default_template = String::new();
+        let err = t.validate(true).unwrap_err();
+        assert!(err.starts_with("E9:"), "got: {}", err);
+    }
+
+    #[test]
+    fn issue8_e10_missing_children_complete_gate_rejected() {
+        let mut t = minimal_batch_parent();
+        t.states.get_mut("plan").unwrap().gates.clear();
+        // Without the gate, the transition's when clause references a
+        // gate that isn't declared — that's a D3 error that fires before
+        // E10. Rewrite the transition to drop the gate reference so E10
+        // is the first error encountered.
+        t.states.get_mut("plan").unwrap().transitions = vec![Transition {
+            target: "done".to_string(),
+            when: None,
+        }];
+        let err = t.validate(true).unwrap_err();
+        assert!(err.starts_with("E10:"), "got: {}", err);
+    }
+
+    // ----- Warnings --------------------------------------------------
+
+    #[test]
+    fn issue8_w1_no_gate_observed_emits_warning() {
+        // Drop the when clause so no transition observes the
+        // children-complete gate. D5 (legacy-gate) would fire in strict
+        // mode because of the untouched gate; W1 is an independent
+        // Issue-8 warning that we surface via direct collection here to
+        // exercise the W1 rule in isolation.
+        let mut t = minimal_batch_parent();
+        t.states.get_mut("plan").unwrap().transitions = vec![Transition {
+            target: "done".to_string(),
+            when: None,
+        }];
+        let warnings = t.collect_materialize_children_warnings();
+        assert!(
+            warnings.iter().any(|w| w.starts_with("W1:")),
+            "expected W1 warning, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn issue8_w1_not_fired_when_gate_observed() {
+        // Positive: when the gate is observed via a when clause, W1 is silent.
+        let t = minimal_batch_parent();
+        let warnings = t.collect_materialize_children_warnings();
+        assert!(
+            !warnings.iter().any(|w| w.starts_with("W1:")),
+            "W1 should be quiet; got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn issue8_w2_name_filter_missing_dot_emits_warning() {
+        let mut t = minimal_batch_parent();
+        t.states
+            .get_mut("plan")
+            .unwrap()
+            .gates
+            .get_mut("cc")
+            .unwrap()
+            .name_filter = Some("myparent".to_string());
+        t.validate(true).expect("W2 should not fail validation");
+        let warnings = t.collect_materialize_children_warnings();
+        assert!(
+            warnings.iter().any(|w| w.starts_with("W2:")),
+            "expected W2 warning, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn issue8_w2_name_filter_with_dot_is_silent() {
+        let mut t = minimal_batch_parent();
+        t.states
+            .get_mut("plan")
+            .unwrap()
+            .gates
+            .get_mut("cc")
+            .unwrap()
+            .name_filter = Some("myparent.".to_string());
+        let warnings = t.collect_materialize_children_warnings();
+        assert!(
+            !warnings.iter().any(|w| w.starts_with("W2:")),
+            "W2 should be quiet; got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn issue8_w3_failureish_name_without_failure_flag_warns() {
+        let mut t = minimal_batch_parent();
+        // Add a terminal state named "blocked" without failure: true.
+        let blocked = TemplateState {
+            directive: "Blocked.".to_string(),
+            details: String::new(),
+            transitions: vec![],
+            terminal: true,
+            gates: BTreeMap::new(),
+            accepts: None,
+            integration: None,
+            default_action: None,
+            materialize_children: None,
+            failure: false,
+            skipped_marker: false,
+        };
+        t.states.insert("blocked".to_string(), blocked);
+        let warnings = t.collect_materialize_children_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("W3:") && w.contains("blocked")),
+            "expected W3 for \"blocked\", got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn issue8_w3_failure_flag_silences_warning() {
+        let mut t = minimal_batch_parent();
+        let failed = TemplateState {
+            directive: "Failed.".to_string(),
+            details: String::new(),
+            transitions: vec![],
+            terminal: true,
+            gates: BTreeMap::new(),
+            accepts: None,
+            integration: None,
+            default_action: None,
+            materialize_children: None,
+            failure: true,
+            skipped_marker: false,
+        };
+        t.states.insert("failed".to_string(), failed);
+        let warnings = t.collect_materialize_children_warnings();
+        assert!(
+            !warnings.iter().any(|w| w.starts_with("W3:")),
+            "W3 should be quiet when failure: true is set; got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn issue8_w4_only_all_complete_without_failure_branch_warns() {
+        // The baseline minimal_batch_parent routes only on all_complete: true
+        // with no failure branch. W4 should fire.
+        let t = minimal_batch_parent();
+        let warnings = t.collect_materialize_children_warnings();
+        assert!(
+            warnings.iter().any(|w| w.starts_with("W4:")),
+            "expected W4 from all_complete-only routing, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn issue8_w4_with_failure_branch_silent() {
+        // Positive-negative coverage for W4: when a materialize_children
+        // state pairs its `gates.<gate>.all_complete` transition with a
+        // second transition guarded by `gates.<gate>.any_failed`, W4 must
+        // stay silent.
+        //
+        // We call `collect_materialize_children_warnings()` directly
+        // rather than `validate()`, so D3's when-clause field validator
+        // (which would reject `any_failed` because it isn't in the
+        // children-complete gate schema today) never runs. The BTreeMap
+        // is built by hand so we control the exact keys W4 inspects.
+        let mut t = minimal_batch_parent();
+        let mut failure_when: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        failure_when.insert("gates.cc.any_failed".to_string(), serde_json::json!(true));
+        t.states
+            .get_mut("plan")
+            .unwrap()
+            .transitions
+            .push(Transition {
+                target: "done".to_string(),
+                when: Some(failure_when),
+            });
+        let warnings = t.collect_materialize_children_warnings();
+        assert!(
+            !warnings.iter().any(|w| w.starts_with("W4:")),
+            "W4 should be silent when a failure branch on gates.cc.any_failed is present; got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn issue8_w5_failure_terminal_without_failure_reason_warns() {
+        let mut t = minimal_batch_parent();
+        // Add a terminal failure state with no failure_reason writer.
+        let failed = TemplateState {
+            directive: "Failed.".to_string(),
+            details: String::new(),
+            transitions: vec![],
+            terminal: true,
+            gates: BTreeMap::new(),
+            accepts: None,
+            integration: None,
+            default_action: None,
+            materialize_children: None,
+            failure: true,
+            skipped_marker: false,
+        };
+        t.states.insert("failed".to_string(), failed);
+        let warnings = t.collect_materialize_children_warnings();
+        assert!(
+            warnings.iter().any(|w| w.starts_with("W5:")),
+            "expected W5, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn issue8_w5_failure_reason_in_accepts_silences_warning() {
+        let mut t = minimal_batch_parent();
+        let mut failure_accepts: BTreeMap<String, FieldSchema> = BTreeMap::new();
+        failure_accepts.insert(
+            "failure_reason".to_string(),
+            FieldSchema {
+                field_type: "string".to_string(),
+                required: false,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+        let failed = TemplateState {
+            directive: "Failed.".to_string(),
+            details: String::new(),
+            transitions: vec![],
+            terminal: true,
+            gates: BTreeMap::new(),
+            accepts: Some(failure_accepts),
+            integration: None,
+            default_action: None,
+            materialize_children: None,
+            failure: true,
+            skipped_marker: false,
+        };
+        t.states.insert("failed".to_string(), failed);
+        let warnings = t.collect_materialize_children_warnings();
+        assert!(
+            !warnings.iter().any(|w| w.starts_with("W5:")),
+            "W5 should be quiet when failure_reason is in accepts; got: {:?}",
+            warnings
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #11: when-clause evidence.<field>: present matcher (compile)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn is_present_matcher_case_sensitive() {
+        assert!(is_present_matcher(&serde_json::json!("present")));
+        assert!(!is_present_matcher(&serde_json::json!("Present")));
+        assert!(!is_present_matcher(&serde_json::json!("PRESENT")));
+        assert!(!is_present_matcher(&serde_json::json!("presence")));
+        // Non-string values never match the sentinel.
+        assert!(!is_present_matcher(&serde_json::json!(true)));
+        assert!(!is_present_matcher(&serde_json::json!(0)));
+        assert!(!is_present_matcher(&serde_json::json!(null)));
+    }
+
+    #[test]
+    fn evidence_present_when_clause_accepted() {
+        // A transition using `evidence.retry_failed: present` should validate
+        // without an accepts block — presence matching does not depend on the
+        // declared schema.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert(
+            "evidence.retry_failed".to_string(),
+            serde_json::json!("present"),
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        assert!(
+            t.validate(true).is_ok(),
+            "evidence.<field>: present should validate without an accepts block"
+        );
+    }
+
+    #[test]
+    fn evidence_non_present_value_is_rejected() {
+        // `evidence.<field>` is reserved for presence matching; any other value
+        // is a hard error.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert(
+            "evidence.retry_failed".to_string(),
+            serde_json::json!("done"),
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("only supports presence matching"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn evidence_empty_field_name_is_rejected() {
+        // `evidence.` with nothing after the dot is not a valid path.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert("evidence.".to_string(), serde_json::json!("present"));
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("invalid format") && err.contains("evidence.<field>"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn w6_warns_on_present_outside_evidence_namespace() {
+        // `context.foo: present` is not a legal placement of the present matcher.
+        // Compile should surface W6 without failing.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "decision".to_string(),
+            FieldSchema {
+                field_type: "string".to_string(),
+                required: true,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+        state.accepts = Some(accepts);
+        let mut when = BTreeMap::new();
+        // Use a flat agent-evidence key that is declared in accepts so the
+        // transition passes D* rules; the only non-standard thing is the
+        // `"present"` value on a non-evidence.* path.
+        when.insert("decision".to_string(), serde_json::json!("present"));
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+
+        // Validation succeeds (W6 is non-fatal).
+        t.validate(true).unwrap();
+
+        // But the collected warnings must include W6.
+        let warnings = t.collect_when_clause_warnings();
+        assert!(
+            warnings.iter().any(|w| w.starts_with("W6:")),
+            "expected W6 warning when \"present\" appears outside evidence.<field>; got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn w6_silent_for_evidence_present_and_value_equality() {
+        // No W6 warning should fire when "present" is used correctly under
+        // evidence.<field>, and none for ordinary value-equality matchers.
+        // Build two separate templates so mutual-exclusivity rules don't
+        // entangle the two cases.
+
+        // Case 1: evidence.<field>: present used correctly.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert(
+            "evidence.retry_failed".to_string(),
+            serde_json::json!("present"),
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        t.validate(true).unwrap();
+        let warnings = t.collect_when_clause_warnings();
+        assert!(
+            warnings.is_empty(),
+            "expected no W6 warnings for correct evidence.<field>: present usage; got: {:?}",
+            warnings
+        );
+
+        // Case 2: value-equality matcher on a flat agent-evidence field.
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        let mut accepts = BTreeMap::new();
+        accepts.insert(
+            "decision".to_string(),
+            FieldSchema {
+                field_type: "string".to_string(),
+                required: true,
+                values: vec![],
+                description: String::new(),
+            },
+        );
+        state.accepts = Some(accepts);
+        let mut when = BTreeMap::new();
+        when.insert("decision".to_string(), serde_json::json!("approve"));
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        t.validate(true).unwrap();
+        let warnings = t.collect_when_clause_warnings();
+        assert!(
+            warnings.is_empty(),
+            "expected no W6 warnings for value-equality matchers; got: {:?}",
+            warnings
+        );
     }
 }

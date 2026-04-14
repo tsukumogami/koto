@@ -78,7 +78,7 @@ Gets the current state directive. Submits evidence when `--with-data` is provide
 
 | Flag | Description |
 |---|---|
-| `--with-data <json>` | Submit evidence as a JSON object. Must conform to the state's `accepts` schema. Max 1 MB. The `"gates"` key is reserved and rejected. Mutually exclusive with `--to`. |
+| `--with-data <json>` | Submit evidence as a JSON object. Must conform to the state's `accepts` schema. Max 1 MB. The `"gates"` key is reserved and rejected. Mutually exclusive with `--to`. Prefix with `@` to read the payload from a file (e.g. `--with-data @evidence.json`); the file is also capped at 1 MB. |
 | `--to <state>` | Force a directed transition to a named state. Must be a valid transition target from the current state. Mutually exclusive with `--with-data`. |
 | `--no-cleanup` | Skip automatic session cleanup when the workflow reaches a terminal state. Useful for debugging artifacts after a workflow ends. |
 | `--full` | Always include the `details` field, even on repeat visits to a state. By default `details` is omitted after the first visit. |
@@ -369,10 +369,48 @@ Under normal operation, `koto next` auto-cleans on terminal state unless `--no-c
 ## koto session resolve (cloud backend only)
 
 ```
-koto session resolve <name> --keep <local|remote>
+koto session resolve <name> --keep <local|remote> [--children <auto|skip|accept-remote|accept-local>]
 ```
 
 Resolves a version conflict when using the cloud session backend. Only valid when `session.backend = "cloud"` is configured; fails with an error on the local backend.
+
+`--children` (default `auto`) controls how the parent's direct children reconcile alongside the parent log:
+
+| Value | Behavior |
+|---|---|
+| `auto` | Apply the strict-prefix rule per child: if one side is a byte-prefix of the other, the longer side wins. Divergent logs surface as a `conflict` entry and the command exits non-zero so the caller runs `koto session resolve <child>` on each flagged child. |
+| `skip` | Leave child state files untouched. The parent reconciles alone. |
+| `accept-remote` | Unconditionally overwrite local child state with remote. |
+| `accept-local` | Unconditionally overwrite remote child state with local. |
+
+Response shape (cloud backend only — `sync_status` and `machine_id` are elided under the local backend, which rejects the command anyway):
+
+```json
+{
+  "name": "parent",
+  "keep": "remote",
+  "children_policy": "auto",
+  "sync_status": "fresh",
+  "machine_id": "a1b2c3d4",
+  "children": [
+    {"name": "parent.task-1", "action": "identical"},
+    {"name": "parent.task-2", "action": "accepted_remote"},
+    {"name": "parent.task-3", "action": "conflict"},
+    {"name": "parent.task-4", "action": "errored", "message": "remote state unreachable: ..."}
+  ]
+}
+```
+
+Per-child `action` values:
+
+| Value | Meaning |
+|---|---|
+| `identical` | Local and remote bytes matched; nothing touched. |
+| `accepted_local` | Local was pushed to remote (either by strict-prefix rule under `auto` or by the explicit `accept-local` policy). |
+| `accepted_remote` | Remote was pulled to local (either by strict-prefix rule under `auto` or by the explicit `accept-remote` policy). |
+| `skipped` | `skip` policy was applied — neither side was touched. |
+| `conflict` | Both sides diverged under `auto`. Run `koto session resolve <child>` on this child. |
+| `errored` | A per-child I/O or network failure prevented reconciliation. Sibling children still processed. The `message` field explains the specific failure. This includes the case where remote S3 was unreachable under `auto` — `auto` refuses to overwrite remote when it cannot confirm the remote state, so a transient fetch failure surfaces here rather than silently applying `accepted_local`. |
 
 ---
 

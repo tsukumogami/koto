@@ -9,7 +9,8 @@ use crate::engine::persistence::derive_overrides;
 use crate::engine::types::{now_iso8601, Event, EventPayload};
 use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::template::types::{
-    ActionDecl, CompiledTemplate, TemplateState, GATES_EVIDENCE_NAMESPACE,
+    is_present_matcher, ActionDecl, CompiledTemplate, TemplateState, EVIDENCE_NAMESPACE,
+    GATES_EVIDENCE_NAMESPACE,
 };
 
 /// Maximum number of transitions per invocation. Defense-in-depth against
@@ -574,13 +575,26 @@ pub fn resolve_transition(
     let mut unconditional_target: Option<String> = None;
     let mut has_conditional = false;
 
+    let evidence_prefix = format!("{}.", EVIDENCE_NAMESPACE);
     for transition in &template_state.transitions {
         match &transition.when {
             Some(conditions) => {
                 has_conditional = true;
-                let all_match = conditions
-                    .iter()
-                    .all(|(field, expected)| resolve_value(evidence, field) == Some(expected));
+                let all_match = conditions.iter().all(|(field, expected)| {
+                    // Issue #11: `evidence.<field>: present` matches when the
+                    // agent-submitted evidence map contains `<field>` as a
+                    // top-level key. The resolver's evidence map is built from
+                    // the events since the last Transitioned event, so this
+                    // reflects "any event since the last state transition".
+                    if is_present_matcher(expected) && field.starts_with(&evidence_prefix) {
+                        let inner = &field[evidence_prefix.len()..];
+                        return !inner.is_empty()
+                            && evidence
+                                .as_object()
+                                .is_some_and(|obj| obj.contains_key(inner));
+                    }
+                    resolve_value(evidence, field) == Some(expected)
+                });
                 if all_match {
                     conditional_matches.push(transition.target.clone());
                 }
@@ -649,6 +663,9 @@ mod tests {
             accepts: None,
             integration: None,
             default_action: None,
+            materialize_children: None,
+            failure: false,
+            skipped_marker: false,
         }
     }
 
@@ -1000,6 +1017,100 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Issue #11: evidence.<field>: present matcher
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn present_matcher_fires_when_field_submitted() {
+        // Template routes on evidence.retry_failed: present and should transition
+        // only when the field is submitted.
+        let state = make_state(vec![
+            conditional(
+                "retry",
+                vec![("evidence.retry_failed", serde_json::json!("present"))],
+            ),
+            conditional("complete", vec![("status", serde_json::json!("done"))]),
+        ]);
+
+        // retry_failed submitted (value irrelevant to the matcher) -> routes to retry.
+        let evidence = serde_json::json!({ "retry_failed": ["task-1"] });
+        assert_eq!(
+            resolve_transition(&state, &evidence, false),
+            TransitionResolution::Resolved("retry".to_string())
+        );
+
+        // retry_failed with a different payload shape still fires.
+        let evidence_bool = serde_json::json!({ "retry_failed": true });
+        assert_eq!(
+            resolve_transition(&state, &evidence_bool, false),
+            TransitionResolution::Resolved("retry".to_string())
+        );
+    }
+
+    #[test]
+    fn present_matcher_does_not_fire_without_field() {
+        // Same template — but only an unrelated evidence key is submitted. The
+        // present matcher must not fire, and no other conditional matches, so
+        // the result is NeedsEvidence.
+        let state = make_state(vec![
+            conditional(
+                "retry",
+                vec![("evidence.retry_failed", serde_json::json!("present"))],
+            ),
+            conditional("complete", vec![("status", serde_json::json!("done"))]),
+        ]);
+
+        let evidence = serde_json::json!({ "status": "pending" });
+        assert_eq!(
+            resolve_transition(&state, &evidence, false),
+            TransitionResolution::NeedsEvidence
+        );
+    }
+
+    #[test]
+    fn present_matcher_empty_field_name_does_not_match() {
+        // `evidence.` (empty suffix) must not spuriously match any submission.
+        let state = make_state(vec![conditional(
+            "target",
+            vec![("evidence.", serde_json::json!("present"))],
+        )]);
+
+        let evidence = serde_json::json!({ "retry_failed": ["task-1"] });
+        assert_eq!(
+            resolve_transition(&state, &evidence, false),
+            TransitionResolution::NeedsEvidence
+        );
+    }
+
+    #[test]
+    fn value_equality_matchers_still_work_after_present_added() {
+        // Regression guard: the classic scalar-equality path must still resolve
+        // when the evaluator encounters a non-"present" value, even alongside a
+        // transition that uses the new present matcher.
+        let state = make_state(vec![
+            conditional(
+                "retry",
+                vec![("evidence.retry_failed", serde_json::json!("present"))],
+            ),
+            conditional("complete", vec![("status", serde_json::json!("done"))]),
+        ]);
+
+        // Only the value-equality branch matches.
+        let evidence = serde_json::json!({ "status": "done" });
+        assert_eq!(
+            resolve_transition(&state, &evidence, false),
+            TransitionResolution::Resolved("complete".to_string())
+        );
+
+        // Value-equality miss still returns NeedsEvidence.
+        let evidence_miss = serde_json::json!({ "status": "pending" });
+        assert_eq!(
+            resolve_transition(&state, &evidence_miss, false),
+            TransitionResolution::NeedsEvidence
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // merge_epoch_evidence tests
     // -----------------------------------------------------------------------
 
@@ -1017,6 +1128,7 @@ mod tests {
                         m.insert("decision".to_string(), serde_json::json!("reject"));
                         m
                     },
+                    submitter_cwd: None,
                 },
             },
             Event {
@@ -1030,6 +1142,7 @@ mod tests {
                         m.insert("decision".to_string(), serde_json::json!("approve"));
                         m
                     },
+                    submitter_cwd: None,
                 },
             },
         ];
@@ -1052,6 +1165,7 @@ mod tests {
                         m.insert("quality".to_string(), serde_json::json!("good"));
                         m
                     },
+                    submitter_cwd: None,
                 },
             },
             Event {
@@ -1065,6 +1179,7 @@ mod tests {
                         m.insert("coverage".to_string(), serde_json::json!(85));
                         m
                     },
+                    submitter_cwd: None,
                 },
             },
         ];
@@ -1111,6 +1226,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1124,6 +1242,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1140,6 +1261,9 @@ mod tests {
                     accepts: make_accepts(vec!["decision"]),
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1153,6 +1277,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -1216,6 +1343,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -1270,6 +1400,9 @@ mod tests {
                 accepts: make_accepts(vec!["decision"]),
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -1314,6 +1447,9 @@ mod tests {
                 accepts: make_accepts(vec!["decision"]),
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -1379,6 +1515,9 @@ mod tests {
                 accepts: make_accepts(vec!["result"]),
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -1475,6 +1614,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1488,6 +1630,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1501,6 +1646,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -1585,6 +1733,9 @@ mod tests {
                     accepts: make_accepts(vec!["override"]),
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1598,6 +1749,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1611,6 +1765,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -1694,6 +1851,9 @@ mod tests {
                     accepts: make_accepts(vec!["decision"]),
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1707,6 +1867,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -1788,6 +1951,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1801,6 +1967,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -1961,6 +2130,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -1974,6 +2146,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -2019,6 +2194,9 @@ mod tests {
                 accepts: None,
                 integration: Some("my-runner".to_string()),
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -2071,6 +2249,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ));
         }
@@ -2086,6 +2267,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         ));
 
@@ -2123,6 +2307,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -2161,6 +2348,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2174,6 +2364,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2187,6 +2380,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -2229,6 +2425,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2242,6 +2441,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2255,6 +2457,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -2319,6 +2524,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: Some(make_action_decl("echo hello")),
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -2370,6 +2578,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: None,
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -2410,6 +2621,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: Some(make_action_decl("create-pr")),
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -2484,6 +2698,9 @@ mod tests {
                 accepts: None,
                 integration: None,
                 default_action: Some(make_action_decl("echo skip-me")),
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
             },
         )]);
 
@@ -2542,6 +2759,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: Some(make_action_decl("echo ok")),
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2555,6 +2775,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -2610,6 +2833,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: Some(make_action_decl("echo check")),
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2623,6 +2849,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -2731,6 +2960,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2744,6 +2976,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -2815,6 +3050,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2828,6 +3066,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -2942,6 +3183,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -2955,6 +3199,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -3054,6 +3301,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -3067,6 +3317,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -3144,6 +3397,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             (
@@ -3157,6 +3413,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
         ]);
@@ -3259,6 +3518,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             ("complete", {
@@ -3343,6 +3605,9 @@ mod tests {
                     accepts: None,
                     integration: None,
                     default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
                 },
             ),
             ("complete", {

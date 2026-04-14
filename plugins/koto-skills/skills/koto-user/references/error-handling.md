@@ -159,4 +159,69 @@ not an error. Exit 1 from `koto next` means the `error.code` field explains why.
 
 ---
 
+## Typed error envelope (batch tick errors)
+
+Batch-scoped ticks (a parent state with `materialize_children`, or a `retry_failed` submission) can fail with a structured envelope that sits alongside the six domain codes above. The wire shape uses a dedicated `action: "error"` variant with a sibling `error.batch` field:
+
+```json
+{
+  "action": "error",
+  "error": {
+    "code": "invalid_submission",
+    "message": "...",
+    "batch": {
+      "kind": "invalid_batch_definition",
+      "reason": {"reason": "duplicate_names", "duplicates": ["task-1"]}
+    }
+  }
+}
+```
+
+`error.batch` carries a typed `BatchError` variant — agents can dispatch on `batch.kind` instead of string-matching on `message`. All variants use snake_case discriminators.
+
+### Top-level enum families
+
+| Family | Shape | Purpose |
+|---|---|---|
+| `BatchError` | `{kind, ...}` under `error.batch` | Top-level variant — one of `concurrent_tick`, `invalid_batch_definition`, `limit_exceeded`, `template_not_found`, `template_compile_failed`, `backend_error`, `spawn_failed`, `invalid_retry_request` |
+| `InvalidBatchReason` | nested under `invalid_batch_definition.reason` | Structural rejection: `empty_task_list`, `cycle`, `dangling_refs`, `duplicate_names`, `spawned_task_mutated`, `invalid_name`, `reserved_name_collision` |
+| `InvalidRetryReason` | nested under `invalid_retry_request.reason` | Retry-submission rejection: `no_batch_materialized`, `empty_child_list`, `child_not_eligible`, `unknown_children`, `child_is_batch_parent`, `retry_already_in_progress`, `mixed_with_other_evidence`, `multiple_reasons` |
+| `LimitKind` | under `limit_exceeded.which` | Hard limit that tripped: `tasks`, `waits_on`, `depth`, `payload_bytes` |
+| `SpawnErrorKind` | under `spawn_failed.spawn_kind` | Per-task scheduler spawn error classification |
+| `CompileErrorKind` | under `template_compile_failed.compile_error` | Typed child-template compile failure |
+| `ChildOutcome` | under `child_not_eligible.children[*].current_outcome` | Retryability classification — `failure`, `skipped`, `spawn_failed`, `pending`, `success`, `blocked` |
+
+### InvalidRetryReason precedence
+
+When a `retry_failed` submission violates more than one rule, the engine aggregates them into `multiple_reasons` ordered by this pinned precedence:
+
+1. `unknown_children`
+2. `child_is_batch_parent`
+3. `child_not_eligible`
+4. `mixed_with_other_evidence`
+5. `retry_already_in_progress`
+
+`no_batch_materialized` and `empty_child_list` short-circuit before aggregation. The precedence is stable across releases so agents can dispatch on the first reason.
+
+### R0-R9 pre-append validation (summary)
+
+The scheduler runs ten runtime rules on every task-list submission **before** appending any event — rejected submissions leave zero state on the parent's event log. A one-line summary per rule:
+
+| Rule | Summary |
+|---|---|
+| R0 | Task list is non-empty. |
+| R1 | Per-task: child template resolvable and compilable (failures become `spawn_failed`). |
+| R2 | Per-task: `vars` resolve against the child template (failures become `spawn_failed`). |
+| R3 | `waits_on` graph is a DAG — no cycles. Rejects the whole submission. |
+| R4 | No dangling `waits_on` references to names absent from the submission. |
+| R5 | Task names are unique within the submission. |
+| R6 | Hard limits: `tasks.len() <= 1000`, `waits_on.len() <= 10` per task, DAG depth `<= 50`, payload `<= 1 MB`. |
+| R7 | No collision with existing sibling children (enforced at init via `renameat2`). |
+| R8 | Spawn-time immutability: for already-spawned tasks, submitted `template` / `vars` / `waits_on` must match the recorded `spawn_entry`. |
+| R9 | Task name matches `^[A-Za-z0-9_-]+$`, 1-64 chars, not in the reserved set (`retry_failed`, `cancel_tasks`). |
+
+See [batch-workflows.md](batch-workflows.md) for how the runner dispatches on each rejection, and `docs/designs/DESIGN-batch-child-spawning.md` in the koto repository for the full rule definitions and rationale.
+
+---
+
 For the complete error taxonomy and exit code reference, see `docs/guides/cli-usage.md`.

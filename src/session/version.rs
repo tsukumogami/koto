@@ -141,6 +141,59 @@ pub fn resolved_version(
     }
 }
 
+/// Outcome of applying the strict-prefix rule to a pair of state-file
+/// byte streams (local and remote copies of the same session's append-
+/// only JSONL log).
+///
+/// State files are strictly append-only after the header, so byte-prefix
+/// comparison on the raw file contents is equivalent to prefix
+/// comparison on the event sequence. If one side is a byte-prefix of the
+/// other, the longer side is a linear extension of the shorter and can
+/// be safely chosen as the winner. Any other divergence indicates two
+/// machines appended independent events after a shared base — the
+/// classic "both sides advanced" case, which requires human or
+/// per-child judgement to reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrictPrefixOutcome {
+    /// Local and remote bytes are identical. No reconciliation needed.
+    Identical,
+    /// Remote is a strict byte-prefix of local. Local has extra events;
+    /// accept-local (push local to remote) is the trivial resolution.
+    AcceptLocal,
+    /// Local is a strict byte-prefix of remote. Remote has extra events;
+    /// accept-remote (pull remote over local) is the trivial resolution.
+    AcceptRemote,
+    /// Neither side is a prefix of the other. The logs diverged after a
+    /// shared base; auto-reconciliation refuses to pick a winner.
+    Conflict,
+    /// One or both sides are absent. The caller decides what that means
+    /// (typically: accept whichever side exists; `Conflict` when both
+    /// are absent is impossible by construction, so this maps to
+    /// `Identical`).
+    OneSideMissing,
+}
+
+/// Classify a pair of state-file byte streams under the strict-prefix
+/// rule documented by Decision 12 Q4 in the batch-child-spawning
+/// design. See [`StrictPrefixOutcome`] for the return shape.
+pub fn strict_prefix_classify(local: Option<&[u8]>, remote: Option<&[u8]>) -> StrictPrefixOutcome {
+    match (local, remote) {
+        (None, None) => StrictPrefixOutcome::Identical,
+        (Some(_), None) | (None, Some(_)) => StrictPrefixOutcome::OneSideMissing,
+        (Some(l), Some(r)) => {
+            if l == r {
+                StrictPrefixOutcome::Identical
+            } else if l.len() > r.len() && l.starts_with(r) {
+                StrictPrefixOutcome::AcceptLocal
+            } else if r.len() > l.len() && r.starts_with(l) {
+                StrictPrefixOutcome::AcceptRemote
+            } else {
+                StrictPrefixOutcome::Conflict
+            }
+        }
+    }
+}
+
 /// Generate a machine ID by hashing the hostname.
 ///
 /// Uses the first 8 characters of the SHA-256 hex digest of the hostname.
@@ -411,6 +464,87 @@ mod tests {
         assert_eq!(id.len(), 8);
         // All hex chars.
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // -- Strict-prefix reconciliation --
+
+    #[test]
+    fn strict_prefix_identical_bytes() {
+        let b = b"header\nevt1\nevt2\n";
+        assert_eq!(
+            strict_prefix_classify(Some(b), Some(b)),
+            StrictPrefixOutcome::Identical
+        );
+    }
+
+    #[test]
+    fn strict_prefix_local_extends_remote() {
+        let remote = b"header\nevt1\n";
+        let local = b"header\nevt1\nevt2\n";
+        assert_eq!(
+            strict_prefix_classify(Some(local), Some(remote)),
+            StrictPrefixOutcome::AcceptLocal
+        );
+    }
+
+    #[test]
+    fn strict_prefix_remote_extends_local() {
+        let local = b"header\nevt1\n";
+        let remote = b"header\nevt1\nevt2\n";
+        assert_eq!(
+            strict_prefix_classify(Some(local), Some(remote)),
+            StrictPrefixOutcome::AcceptRemote
+        );
+    }
+
+    #[test]
+    fn strict_prefix_true_conflict_neither_is_prefix() {
+        let local = b"header\nevtA\n";
+        let remote = b"header\nevtB\n";
+        assert_eq!(
+            strict_prefix_classify(Some(local), Some(remote)),
+            StrictPrefixOutcome::Conflict
+        );
+    }
+
+    #[test]
+    fn strict_prefix_equal_length_but_different_is_conflict() {
+        // Same length, different content → neither is a prefix of the
+        // other (a strict prefix requires len(shorter) < len(longer)).
+        let local = b"xxxx";
+        let remote = b"yyyy";
+        assert_eq!(
+            strict_prefix_classify(Some(local), Some(remote)),
+            StrictPrefixOutcome::Conflict
+        );
+    }
+
+    #[test]
+    fn strict_prefix_empty_local_full_remote_is_accept_remote() {
+        assert_eq!(
+            strict_prefix_classify(Some(b""), Some(b"header\n")),
+            StrictPrefixOutcome::AcceptRemote
+        );
+    }
+
+    #[test]
+    fn strict_prefix_one_side_missing_reports_missing() {
+        assert_eq!(
+            strict_prefix_classify(None, Some(b"x")),
+            StrictPrefixOutcome::OneSideMissing
+        );
+        assert_eq!(
+            strict_prefix_classify(Some(b"x"), None),
+            StrictPrefixOutcome::OneSideMissing
+        );
+    }
+
+    #[test]
+    fn strict_prefix_both_missing_is_identical() {
+        assert_eq!(
+            strict_prefix_classify(None, None),
+            StrictPrefixOutcome::Identical
+        );
     }
 
     #[test]

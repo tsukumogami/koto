@@ -321,10 +321,20 @@ Each gate type produces structured output that the engine injects into the evide
 | `context-matches` | `matches` | boolean | `true` if the content at `key` matches `pattern`. |
 | `context-matches` | `error` | string | Empty on normal pass or fail. Error message when the store is unavailable or the pattern is invalid. |
 | `children-complete` | `total` | number | Total number of matching children. |
-| `children-complete` | `completed` | number | Children that meet the completion condition. |
-| `children-complete` | `pending` | number | Children that haven't completed yet. |
-| `children-complete` | `all_complete` | boolean | `true` when every child meets the completion condition. |
-| `children-complete` | `children` | array | Per-child detail: `[{"name": "...", "state": "...", "complete": true/false}]`. |
+| `children-complete` | `completed` | number | Children in a terminal state (success + failure + skipped). |
+| `children-complete` | `pending` | number | Children not yet terminal (covers both "not yet spawned" and "spawned and running"). |
+| `children-complete` | `success` | number | Terminal children whose final state is not flagged `failure: true` or `skipped_marker: true`. |
+| `children-complete` | `failed` | number | Terminal children whose final state carries `failure: true`. |
+| `children-complete` | `skipped` | number | Terminal children whose final state carries `skipped_marker: true` (synthesized when a dependency failed). |
+| `children-complete` | `blocked` | number | Tasks that declare `waits_on` dependencies whose upstream children are non-terminal. |
+| `children-complete` | `spawn_failed` | number | Tasks the scheduler could not spawn (template resolve errors, collisions, I/O). |
+| `children-complete` | `all_complete` | boolean | `pending == 0 AND blocked == 0 AND spawn_failed == 0`. Gate passes when true. |
+| `children-complete` | `all_success` | boolean | `all_complete AND failed == 0 AND skipped == 0 AND spawn_failed == 0`. The clean-completion route guard. |
+| `children-complete` | `any_failed` | boolean | `failed > 0`. |
+| `children-complete` | `any_skipped` | boolean | `skipped > 0`. |
+| `children-complete` | `any_spawn_failed` | boolean | `spawn_failed > 0`. |
+| `children-complete` | `needs_attention` | boolean | `any_failed OR any_skipped OR any_spawn_failed`. Route to retry / analysis states on this boolean. |
+| `children-complete` | `children` | array | Per-child detail: `[{"name", "state", "complete", "outcome", ...}]`. Each entry carries `outcome` (`success \| failure \| skipped \| pending \| blocked \| spawn_failed`); failed entries add `failure_mode` + `reason_source: "state_name"`; skipped entries add `skipped_because` (direct blocker), `skipped_because_chain` (all unique failed ancestors, closest-first), and `reason_source: "skipped"`; blocked entries add `blocked_by` (non-terminal `waits_on` entries). |
 | `children-complete` | `error` | string | Empty on normal evaluation. Error message on backend failures. |
 
 `passed` is not a field name in any gate type. Don't use it in `when` conditions.
@@ -406,7 +416,7 @@ Built-in defaults for all three gate types:
 | `command` | `{"exit_code": 0, "error": ""}` |
 | `context-exists` | `{"exists": true, "error": ""}` |
 | `context-matches` | `{"matches": true, "error": ""}` |
-| `children-complete` | `{"total": 0, "completed": 0, "pending": 0, "all_complete": true, "children": [], "error": ""}` |
+| `children-complete` | `{"total": 0, "completed": 0, "pending": 0, "success": 0, "failed": 0, "skipped": 0, "blocked": 0, "spawn_failed": 0, "all_complete": true, "all_success": true, "any_failed": false, "any_skipped": false, "any_spawn_failed": false, "needs_attention": false, "children": [], "error": ""}` |
 
 All four built-in types always have a built-in default, so `koto overrides record` always succeeds for them without `--with-data` or `override_default`. Setting `override_default` is useful when you want a specific non-passing value injected (for example, a known exit code that triggers a particular routing branch).
 
@@ -617,8 +627,51 @@ Koto performs `{{VARIABLE}}` substitution in `command` gate strings before passi
 
 Prefer `context-exists` gates over `command` gates when checking paths or files that come from variable interpolation. The `context-exists` and `context-matches` gate types don't invoke a shell and aren't vulnerable to injection.
 
+## Batch template primitives
+
+The batch child-spawning release added a small set of template primitives. The summary here is deliberately thin — see [batch-authoring.md](batch-authoring.md) for the authoring walkthrough, compile rules, and worked examples.
+
+### New accepts field type and state fields
+
+| Primitive | Where | Purpose |
+|---|---|---|
+| `type: tasks` on an accepts field | state's `accepts` block | Structured task-list field consumed by `materialize_children`. The compiler auto-generates `item_schema` on the response so agents don't hand-write the entry shape. |
+| `materialize_children` | `TemplateState` | Binds a `tasks` accepts field to a child template and declares the batch `failure_policy` (`skip_dependents` default, or `continue`). |
+| `failure: true` | terminal `TemplateState` | Marks a terminal state as a failure outcome. `children-complete` counts these in `failed` and flips `any_failed` / `needs_attention`. |
+| `skipped_marker: true` | terminal `TemplateState` | The target the scheduler writes directly when `failure_policy: skip_dependents` materializes a skip for a dependent. `children-complete` counts these in `skipped`. |
+
+### The `present` matcher in `when` clauses
+
+A `when` clause value of the string `"present"` fires when the named field exists in the evidence map, regardless of value. It's only valid under the `evidence.<field>` namespace:
+
+```yaml
+transitions:
+  - target: handle_retry
+    when:
+      evidence.retry_failed: present
+```
+
+The compiler emits **W6** (non-fatal) when `"present"` appears against any other path (a flat agent-evidence key, a `gates.*` path, `context.*`, etc.) — it almost always means the author meant presence matching but used the wrong prefix.
+
+### `deny_unknown_fields` narrowed to source templates
+
+`#[serde(deny_unknown_fields)]` applies only to `SourceState` (the YAML-frontmatter surface). Compiled template JSON files no longer reject unknown fields, so adding a new compiled-template field in a release doesn't brick state files created by earlier versions. Template authors still get strict rejection at compile time.
+
+### Compile and runtime rule vocabulary
+
+Batch authoring introduces error (E), warning (W), and runtime (R) rule IDs used in compiler and `koto next` error messages.
+
+| Prefix | Range | Scope | Details |
+|---|---|---|---|
+| E | E1-E10 | Compile-time errors on `materialize_children` | See [batch-authoring.md](batch-authoring.md) for the full table |
+| W | W1-W5 | Compile-time warnings on `materialize_children` / `failure` / `skipped_marker` | See [batch-authoring.md](batch-authoring.md) |
+| W | W6 | Compile-time warning on `present` matcher misuse | Fires when `"present"` appears outside `evidence.<field>` paths |
+| F | F5 | Compile-time warning on child template reachability | Child template has no reachable `skipped_marker: true` terminal. See [batch-authoring.md](batch-authoring.md) |
+| R | R0-R9 | Pre-append runtime rules on a submitted task list | Validated in `koto next`. See [batch-workflows.md](../../koto-user/references/batch-workflows.md) |
+
 ## References
 
 - **Evidence routing example**: [evidence-routing-workflow.md](examples/evidence-routing-workflow.md) -- branching with accepts/when
 - **Advanced example**: [complex-workflow.md](examples/complex-workflow.md) -- gates, self-loops, split topology
+- **Batch authoring**: [batch-authoring.md](batch-authoring.md) -- `materialize_children`, E/W/F/R rules, worked examples
 - **SKILL.md conventions**: [Custom skill authoring guide](../../../../../docs/guides/custom-skill-authoring.md)

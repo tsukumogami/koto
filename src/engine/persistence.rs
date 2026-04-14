@@ -443,6 +443,7 @@ mod tests {
             template_hash: "deadbeef".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
+            template_source_dir: None,
         }
     }
 
@@ -486,6 +487,7 @@ mod tests {
                 EventPayload::WorkflowInitialized {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
+                    spawn_entry: None,
                 },
             ),
             make_event(
@@ -521,6 +523,7 @@ mod tests {
             EventPayload::WorkflowInitialized {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::new(),
+                spawn_entry: None,
             },
         );
         // Seq jumps from 1 to 3 (gap at seq 2)
@@ -575,6 +578,7 @@ mod tests {
             EventPayload::WorkflowInitialized {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::new(),
+                spawn_entry: None,
             },
         );
 
@@ -603,6 +607,7 @@ mod tests {
                 EventPayload::WorkflowInitialized {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
+                    spawn_entry: None,
                 },
             ),
             make_event(
@@ -633,6 +638,7 @@ mod tests {
                 EventPayload::WorkflowInitialized {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
+                    spawn_entry: None,
                 },
             ),
             make_event(
@@ -674,6 +680,7 @@ mod tests {
             EventPayload::WorkflowInitialized {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::new(),
+                spawn_entry: None,
             },
         )];
         assert_eq!(derive_state_from_log(&events), None);
@@ -691,6 +698,7 @@ mod tests {
                 EventPayload::WorkflowInitialized {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
+                    spawn_entry: None,
                 },
             ),
             make_event(
@@ -710,6 +718,7 @@ mod tests {
                         m.insert("file".to_string(), serde_json::json!("old.txt"));
                         m
                     },
+                    submitter_cwd: None,
                 },
             ),
             make_event(
@@ -737,6 +746,7 @@ mod tests {
                         m.insert("file".to_string(), serde_json::json!("new.txt"));
                         m
                     },
+                    submitter_cwd: None,
                 },
             ),
         ];
@@ -756,6 +766,7 @@ mod tests {
                 EventPayload::WorkflowInitialized {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
+                    spawn_entry: None,
                 },
             ),
             make_event(
@@ -775,6 +786,7 @@ mod tests {
                         m.insert("data".to_string(), serde_json::json!("stale"));
                         m
                     },
+                    submitter_cwd: None,
                 },
             ),
             make_event(
@@ -819,6 +831,7 @@ mod tests {
             &EventPayload::WorkflowInitialized {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::new(),
+                spawn_entry: None,
             },
             "2026-01-01T00:00:00Z",
         )
@@ -893,6 +906,7 @@ mod tests {
                 EventPayload::WorkflowInitialized {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
+                    spawn_entry: None,
                 },
             ),
             make_event(
@@ -925,6 +939,7 @@ mod tests {
             EventPayload::WorkflowInitialized {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::new(),
+                spawn_entry: None,
             },
         )];
         // Only init event, no transitioned -- no current state derivable
@@ -943,6 +958,7 @@ mod tests {
                 EventPayload::WorkflowInitialized {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
+                    spawn_entry: None,
                 },
             ),
             make_event(
@@ -989,6 +1005,7 @@ mod tests {
                 EventPayload::WorkflowInitialized {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
+                    spawn_entry: None,
                 },
             ),
             make_event(
@@ -1041,6 +1058,7 @@ mod tests {
                 EventPayload::WorkflowInitialized {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
+                    spawn_entry: None,
                 },
             ),
             make_event(
@@ -1476,6 +1494,7 @@ mod tests {
                 EventPayload::WorkflowInitialized {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
+                    spawn_entry: None,
                 },
             ),
             make_event(
@@ -1491,6 +1510,7 @@ mod tests {
                 EventPayload::EvidenceSubmitted {
                     state: "gather".to_string(),
                     fields: HashMap::new(),
+                    submitter_cwd: None,
                 },
             ),
             make_event(
@@ -1530,6 +1550,7 @@ mod tests {
                 EventPayload::WorkflowInitialized {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
+                    spawn_entry: None,
                 },
             ),
             make_event(
@@ -1537,6 +1558,7 @@ mod tests {
                 EventPayload::EvidenceSubmitted {
                     state: "gather".to_string(),
                     fields: HashMap::new(),
+                    submitter_cwd: None,
                 },
             ),
             make_event(

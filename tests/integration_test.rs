@@ -168,6 +168,49 @@ fn init_creates_state_file() {
 }
 
 #[test]
+fn init_succeeds_with_stale_tempfile_in_session_dir() {
+    // Crash recovery test: if a prior `koto init` crashed between
+    // writing the tempfile and renaming it into place, a stale
+    // `.koto-init-*.tmp` file will still be present in the session
+    // directory. A fresh `koto init` on the same workflow name must
+    // still succeed (proving `handle_init` now goes through the
+    // atomic `init_state_file` path, which tolerates leftover tmp
+    // files — the old three-call sequence had no such recovery
+    // guarantee).
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    // Plant a stale tempfile that mimics the crashed-init shape.
+    let session_dir = sessions_base(dir.path()).join("recover-wf");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join(".koto-init-stale.tmp"),
+        b"partial content from prior crash",
+    )
+    .unwrap();
+
+    // No state file yet, so `exists()` is false and init must run.
+    let state_path = session_state_path(dir.path(), "recover-wf");
+    assert!(
+        !state_path.exists(),
+        "state file must not exist before init"
+    );
+
+    let output = koto_cmd(dir.path())
+        .args(["init", "recover-wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "init must succeed with stale tempfile present: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(state_path.exists(), "state file must be written");
+}
+
+#[test]
 fn init_fails_if_file_exists() {
     let dir = TempDir::new().unwrap();
     let src = write_template_source(dir.path());
@@ -1551,54 +1594,61 @@ fn evidence_triggers_auto_advance_chain() {
 }
 
 // ---------------------------------------------------------------------------
-// scenario-37: Concurrent koto next fails with flock contention
+// scenario-37: Non-batch koto next ignores external flocks
 // ---------------------------------------------------------------------------
+//
+// Early revisions of the batch-child-spawning work unconditionally
+// acquired a parent flock inside `handle_next`. That behavior was
+// narrowed (Issue #2) to apply only to batch-scoped parents so the
+// happy path for ordinary workflows stays lock-free.
+//
+// This test pins that narrowed contract: an external flock on a
+// non-batch workflow's state file must not block `koto next`. The
+// batch-scoped lock path is covered by `tests/batch_lock_test.rs`.
 
 #[cfg(unix)]
 #[test]
-fn concurrent_next_fails_with_lock_contention() {
+fn concurrent_next_on_non_batch_workflow_ignores_external_flock() {
     use std::os::unix::io::AsRawFd;
 
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "lock-wf", &template_with_accepts());
 
-    // The state file is named koto-<name>.state.jsonl.
     let state_path = session_state_path(dir.path(), "lock-wf");
     assert!(state_path.exists(), "state file should exist after init");
 
-    // Hold an exclusive flock on the state file, simulating a concurrent koto next.
+    // Hold an exclusive flock on the state file from the test harness.
+    // For a non-batch workflow this must NOT block `koto next`.
     let lock_file = std::fs::File::open(&state_path).unwrap();
     let fd = lock_file.as_raw_fd();
     let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     assert_eq!(ret, 0, "test should acquire flock successfully");
 
-    // Now run koto next -- it should fail because it can't acquire the lock.
     let output = koto_cmd(dir.path())
         .args(["next", "lock-wf"])
         .output()
         .unwrap();
 
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "concurrent next should fail with exit 1, stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
+    // The command should not fail with ConcurrentAccess or BatchError.
+    // Non-batch workflows skip the lock entirely, so the external flock
+    // is irrelevant. The command either succeeds or stops for an
+    // unrelated reason (evidence_required on template_with_accepts),
+    // but never with a concurrent-access envelope.
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
-    assert_eq!(
-        json["error"]["code"].as_str(),
-        Some("concurrent_access"),
-        "error code should be concurrent_access"
-    );
+
+    if let Some(code) = json["error"]["code"].as_str() {
+        assert_ne!(
+            code, "concurrent_access",
+            "non-batch workflow must not surface concurrent_access; stdout={}",
+            stdout
+        );
+    }
     assert!(
-        json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("already running"),
-        "error message should mention already running"
+        json.get("batch").is_none(),
+        "non-batch workflow must not surface a batch envelope; stdout={}",
+        stdout
     );
 
     // Release the lock explicitly.
@@ -7048,6 +7098,101 @@ fn children_complete_category_temporal_in_output() {
     assert_eq!(conditions[0]["category"], "temporal");
 }
 
+/// Issue #15 snapshot test: pins the extended `children-complete` gate
+/// output shape for a non-batch parent with a single pending child.
+///
+/// This locks the aggregate counters + derived booleans surface so a
+/// future change to the gate output schema is caught as a breaking
+/// change rather than silently drifting behind the design.
+#[test]
+fn children_complete_gate_output_snapshot_extended_fields() {
+    let dir = TempDir::new().unwrap();
+    let parent_compiled = write_and_compile_template(
+        dir.path(),
+        parent_with_children_gate_template(),
+        "parent.md",
+    );
+    let child_compiled = write_template_source(dir.path())
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    koto_cmd(dir.path())
+        .args(["init", "parent-wf", "--template", &parent_compiled])
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "child-1",
+            "--template",
+            &child_compiled,
+            "--parent",
+            "parent-wf",
+        ])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "parent-wf"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let conditions = json["blocking_conditions"].as_array().unwrap();
+    let gate_output = &conditions[0]["output"];
+
+    // Pin the schema: every aggregate + derived boolean is present.
+    for key in [
+        "total",
+        "completed",
+        "pending",
+        "success",
+        "failed",
+        "skipped",
+        "blocked",
+        "spawn_failed",
+        "all_complete",
+        "all_success",
+        "any_failed",
+        "any_skipped",
+        "any_spawn_failed",
+        "needs_attention",
+        "children",
+        "error",
+    ] {
+        assert!(
+            gate_output.get(key).is_some(),
+            "gate output missing field '{}': {}",
+            key,
+            serde_json::to_string_pretty(gate_output).unwrap()
+        );
+    }
+
+    // Value-level assertions for the "one pending child" scenario.
+    assert_eq!(gate_output["total"], 1);
+    assert_eq!(gate_output["success"], 0);
+    assert_eq!(gate_output["failed"], 0);
+    assert_eq!(gate_output["skipped"], 0);
+    assert_eq!(gate_output["blocked"], 0);
+    assert_eq!(gate_output["spawn_failed"], 0);
+    assert_eq!(gate_output["pending"], 1);
+    assert_eq!(gate_output["all_complete"], false);
+    assert_eq!(gate_output["all_success"], false);
+    assert_eq!(gate_output["any_failed"], false);
+    assert_eq!(gate_output["any_skipped"], false);
+    assert_eq!(gate_output["any_spawn_failed"], false);
+    assert_eq!(gate_output["needs_attention"], false);
+
+    let children = gate_output["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0]["name"], "child-1");
+    assert_eq!(children[0]["complete"], false);
+    // The per-child outcome for a not-yet-terminal child folds Running
+    // into "pending" for the wire-level outcome.
+    assert_eq!(children[0]["outcome"], "pending");
+}
+
 #[test]
 fn existing_gates_emit_corrective_category() {
     let dir = TempDir::new().unwrap();
@@ -7093,5 +7238,135 @@ All done.
     assert_eq!(
         conditions[0]["category"], "corrective",
         "command gates should have corrective category"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// scenario-9: --with-data @file.json read and 1MB cap rejection
+// ---------------------------------------------------------------------------
+
+/// `koto next --with-data @<path>` reads JSON from the file and processes it
+/// the same way as inline JSON.
+#[test]
+fn next_with_data_at_file_reads_evidence_from_file() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "atfile-wf", &template_with_accepts());
+
+    // Write evidence JSON to a file in the temp dir.
+    let evidence_path = dir.path().join("evidence.json");
+    std::fs::write(
+        &evidence_path,
+        r#"{"decision":"proceed","notes":"from file"}"#,
+    )
+    .unwrap();
+
+    let arg = format!("@{}", evidence_path.display());
+    let output = koto_cmd(dir.path())
+        .args(["next", "atfile-wf", "--with-data", &arg, "--no-cleanup"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "@file evidence submission should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    // Same auto-advancement as the inline-evidence test:
+    // start -> implement (unconditional) -> done (terminal).
+    assert_eq!(
+        json["state"].as_str(),
+        Some("done"),
+        "auto-advancement should reach terminal state after @file evidence"
+    );
+    assert_eq!(json["advanced"], true, "advanced should be true");
+
+    // Verify the state file recorded the evidence_submitted event.
+    let state_path = session_state_path(dir.path(), "atfile-wf");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    assert!(
+        content.lines().any(|l| l.contains("evidence_submitted")),
+        "state file should contain evidence_submitted event"
+    );
+}
+
+/// `koto next --with-data @<path>` rejects files larger than the 1 MB cap
+/// with an error that names both the cap and the actual file size.
+#[test]
+fn next_with_data_at_file_rejects_oversize_file() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "oversize-wf", &template_with_accepts());
+
+    // Write a 2 MB file (well over the 1 MB cap).
+    let big_path = dir.path().join("big.json");
+    let big = vec![b'x'; 2 * 1024 * 1024];
+    std::fs::write(&big_path, &big).unwrap();
+
+    let arg = format!("@{}", big_path.display());
+    let output = koto_cmd(dir.path())
+        .args(["next", "oversize-wf", "--with-data", &arg])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "oversize file should fail with caller-error exit code"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("invalid_submission"),
+        "error code should be invalid_submission"
+    );
+    let msg = json["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("1048576"),
+        "error message should name the 1 MB cap (1048576): {}",
+        msg
+    );
+    assert!(
+        msg.contains("2097152"),
+        "error message should name the actual file size (2097152): {}",
+        msg
+    );
+}
+
+/// `koto next --with-data @<path>` produces a clear error when the file does
+/// not exist, naming the path the agent supplied.
+#[test]
+fn next_with_data_at_file_missing_returns_clear_error() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "missing-wf", &template_with_accepts());
+
+    let missing = dir.path().join("does-not-exist.json");
+    let arg = format!("@{}", missing.display());
+    let output = koto_cmd(dir.path())
+        .args(["next", "missing-wf", "--with-data", &arg])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "missing file should fail with caller-error exit code"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("invalid_submission"),
+        "error code should be invalid_submission"
+    );
+    let msg = json["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains(missing.to_str().unwrap()),
+        "error message should name the missing path: {}",
+        msg
     );
 }

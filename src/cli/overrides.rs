@@ -459,6 +459,7 @@ mod tests {
                 payload: EventPayload::WorkflowInitialized {
                     template_path: "/tmp/test.json".to_string(),
                     variables: HashMap::new(),
+                    spawn_entry: None,
                 },
             },
             Event {
@@ -491,6 +492,7 @@ mod tests {
                 payload: EventPayload::WorkflowInitialized {
                     template_path: "/tmp/test.json".to_string(),
                     variables: HashMap::new(),
+                    spawn_entry: None,
                 },
             },
             Event {
