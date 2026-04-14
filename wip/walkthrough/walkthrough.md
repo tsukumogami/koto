@@ -4,8 +4,10 @@ This walkthrough demonstrates the end-to-end interaction between an
 agent and koto for a 3-issue batch with a diamond dependency pattern.
 It shows every `koto next` call and response, explaining what happens
 inside koto and how the agent decides what to do next. Every JSON
-example matches the revised (round-1) design committed in
-`docs/designs/DESIGN-batch-child-spawning.md`.
+example matches the shapes on the current `docs/batch-child-spawning`
+branch: `SchedulerOutcome::Scheduled`, `MaterializedChild`,
+`SchedulerFeedback`, `ReservedAction`, `BatchFinalView`, and the
+cloud-backend `sync_status` envelope.
 
 ## Artifacts
 
@@ -78,21 +80,23 @@ Submit the complete task list:
 `koto next coord --with-data @tasks.json`
 
 Once submitted, drive each child listed in
-`scheduler.spawned_this_tick` via `koto next <child-name>`. Keep your
-dispatched-set aligned with `scheduler.materialized_children` so you
-don't double-dispatch under concurrent ticks. After any child
-completes, re-call `koto next coord` to unblock newly-ready tasks.
+`scheduler.materialized_children` with `ready_to_drive: true AND
+outcome != spawn_failed`. Use the ledger as the dispatch source of
+truth — `spawned_this_tick` is a per-tick observation, not a
+contract. After any child completes, re-call `koto next coord` to
+unblock newly-ready dependents.
 
 <!-- details -->
 Each child is an independent koto workflow named `coord.<task-name>`.
 The scheduler runs on every `koto next coord` tick and creates
 children whose `waits_on` dependencies are all terminal. The
 `scheduler.feedback.entries` map tells you how every submitted task
-was handled (`accepted`, `already_running`, `already_skipped`,
-`already_terminal`, `blocked`, `errored`, or `respawning`). The
-`blocking_conditions[0].output` field carries per-child status plus
-the aggregate booleans (`all_complete`, `all_success`, `any_failed`,
-`any_skipped`, `any_spawn_failed`, `needs_attention`).
+was handled (`accepted`, `already_running`, `already_terminal_success`,
+`already_terminal_failure`, `already_skipped`, `blocked`, `errored`,
+or `respawning`). The `blocking_conditions[0].output` field carries
+per-child status plus the aggregate booleans (`all_complete`,
+`all_success`, `any_failed`, `any_skipped`, `any_spawn_failed`,
+`needs_attention`).
 <!-- /details -->
 
 ## analyze_failures
@@ -155,7 +159,7 @@ states:
     gates:
       tests:
         type: command
-        run: "cargo test"
+        command: "cargo test"
   done:
     terminal: true
   done_blocked:
@@ -190,14 +194,20 @@ action required — the scheduler materialized this child directly
 into its terminal skip state.
 ```
 
-Three things the child template carries for round 1:
+Three things the child template carries:
 
 - `done_blocked` is terminal-with-`failure: true`. The scheduler and
   the gate both read this boolean rather than matching on state names.
 - `default_action.context_assignments` writes `failure_reason` when
-  the child enters `done_blocked`. Without it, W5 fires at compile
-  time and the batch view's `reason` falls back to the state name
-  (see `reason_source: "state_name"`).
+  the child enters `done_blocked`. Without any path writing
+  `failure_reason` (accepts field, `default_action`, or
+  `context_assignments` on an inbound transition), W5 fires at
+  compile time and the batch view's `reason` falls back to the state
+  name (`reason_source: "state_name"`). Today's W5 check only observes
+  the accepts path; templates that rely on `default_action` or
+  `context_assignments` may see false-positive W5 warnings until
+  those surfaces are wired up, but the runtime behavior lands
+  `failure_reason` correctly either way.
 - `skipped_due_to_dep_failure` carries `skipped_marker: true`. F5
   requires every batch-eligible child template to declare at least
   one `skipped_marker` terminal state; the scheduler routes skip
@@ -356,8 +366,8 @@ Drive it with `koto next coord`.
 {
   "action": "evidence_required",
   "state": "plan_and_await",
-  "directive": "Read the plan document at PLAN-batch-schema.md. For each issue outline in the plan:\n\n1. Extract the issue number, goal, files, and acceptance criteria.\n2. Map dependencies to sibling task names (issue N -> \"issue-N\").\n3. Build a task entry: name=\"issue-N\", vars={\"ISSUE_NUMBER\": \"N\"}, waits_on=[\"issue-X\", ...] for each listed dependency. Check expects.fields.tasks.item_schema in the response for the full task entry shape; template defaults to impl-issue.md.\n\nSubmit the complete task list:\n`koto next coord --with-data @tasks.json`\n\nOnce submitted, drive each child listed in scheduler.spawned_this_tick via `koto next <child-name>`. Keep your dispatched-set aligned with scheduler.materialized_children so you don't double-dispatch under concurrent ticks. After any child completes, re-call `koto next coord` to unblock newly-ready tasks.",
-  "details": "Each child is an independent koto workflow named `coord.<task-name>`. The scheduler runs on every `koto next coord` tick and creates children whose `waits_on` dependencies are all terminal. The `scheduler.feedback.entries` map tells you how every submitted task was handled (accepted, already, blocked, or errored). The `blocking_conditions[0].output` field carries per-child status plus the aggregate booleans (all_complete, all_success, any_failed, any_skipped, needs_attention).",
+  "directive": "Read the plan document at PLAN-batch-schema.md. For each issue outline in the plan:\n\n1. Extract the issue number, goal, files, and acceptance criteria.\n2. Map dependencies to sibling task names (issue N -> \"issue-N\").\n3. Build a task entry: name=\"issue-N\", vars={\"ISSUE_NUMBER\": \"N\"}, waits_on=[\"issue-X\", ...] for each listed dependency. Check expects.fields.tasks.item_schema in the response for the full task entry shape; template defaults to impl-issue.md.\n\nSubmit the complete task list:\n`koto next coord --with-data @tasks.json`\n\nOnce submitted, drive each child in scheduler.materialized_children with `ready_to_drive: true AND outcome != spawn_failed`. After any child completes, re-call `koto next coord` to unblock newly-ready dependents.",
+  "details": "Each child is an independent koto workflow named `coord.<task-name>`. The scheduler runs on every `koto next coord` tick and creates children whose `waits_on` dependencies are all terminal. The `scheduler.feedback.entries` map tells you how every submitted task was handled (accepted, already_running, already_terminal_success, already_terminal_failure, already_skipped, blocked, errored, respawning). The `blocking_conditions[0].output` field carries per-child status plus the aggregate booleans (all_complete, all_success, any_failed, any_skipped, any_spawn_failed, needs_attention).",
   "expects": {
     "event_type": "evidence_submitted",
     "fields": {
@@ -467,13 +477,9 @@ outlines, maps dependencies to `waits_on`, and writes `tasks.json`.
   "scheduler": {
     "spawned_this_tick": ["coord.issue-1"],
     "materialized_children": [
-      {"name": "coord.issue-1", "outcome": "pending", "state": "working", "ready_to_drive": true}
+      {"name": "coord.issue-1", "task": "issue-1", "outcome": "pending", "state": "working", "waits_on": [], "ready_to_drive": true, "role": "worker"}
     ],
-    "already": [],
-    "blocked": ["coord.issue-2", "coord.issue-3"],
-    "skipped": [],
-    "errored": [],
-    "warnings": [],
+    "reclassified_this_tick": true,
     "feedback": {
       "entries": {
         "issue-1": {"outcome": "accepted"},
@@ -481,7 +487,9 @@ outlines, maps dependencies to `waits_on`, and writes `tasks.json`.
         "issue-3": {"outcome": "blocked", "waits_on": ["issue-1"]}
       },
       "orphan_candidates": []
-    }
+    },
+    "errored": [],
+    "warnings": []
   }
 }
 ```
@@ -495,6 +503,11 @@ outlines, maps dependencies to `waits_on`, and writes `tasks.json`.
 - `scheduler.feedback.entries.issue-1.outcome: "accepted"` confirms
   the task was spawned; `issue-2` and `issue-3` report `blocked`
   with their `waits_on`. No silent no-ops.
+- `reclassified_this_tick: true` confirms dispatch state shifted this
+  tick — worth another ledger read.
+- `role: "worker"` on `coord.issue-1` signals the child is a plain
+  worker (no nested batch). Coordinators-of-sub-batches would report
+  `role: "coordinator"` with a `subbatch_status` summary.
 - `needs_attention` is false, so no `reserved_actions` block.
 
 The agent starts driving `coord.issue-1`.
@@ -602,23 +615,21 @@ is not a batch parent.
   "scheduler": {
     "spawned_this_tick": ["coord.issue-2", "coord.issue-3"],
     "materialized_children": [
-      {"name": "coord.issue-1", "outcome": "success", "state": "done", "ready_to_drive": false},
-      {"name": "coord.issue-2", "outcome": "pending", "state": "working", "ready_to_drive": true},
-      {"name": "coord.issue-3", "outcome": "pending", "state": "working", "ready_to_drive": true}
+      {"name": "coord.issue-1", "task": "issue-1", "outcome": "success", "state": "done", "waits_on": [], "ready_to_drive": false, "role": "worker"},
+      {"name": "coord.issue-2", "task": "issue-2", "outcome": "pending", "state": "working", "waits_on": ["issue-1"], "ready_to_drive": true, "role": "worker"},
+      {"name": "coord.issue-3", "task": "issue-3", "outcome": "pending", "state": "working", "waits_on": ["issue-1"], "ready_to_drive": true, "role": "worker"}
     ],
-    "already": ["coord.issue-1"],
-    "blocked": [],
-    "skipped": [],
-    "errored": [],
-    "warnings": [],
+    "reclassified_this_tick": true,
     "feedback": {
       "entries": {
-        "issue-1": {"outcome": "already_terminal"},
+        "issue-1": {"outcome": "already_terminal_success"},
         "issue-2": {"outcome": "accepted"},
         "issue-3": {"outcome": "accepted"}
       },
       "orphan_candidates": []
-    }
+    },
+    "errored": [],
+    "warnings": []
   }
 }
 ```
@@ -628,8 +639,8 @@ is not a batch parent.
 - `spawned_this_tick: ["coord.issue-2", "coord.issue-3"]` — both
   just materialized. They have no dependency on each other, so the
   agent can dispatch them in parallel.
-- `feedback.entries.issue-1.outcome: "already_terminal"` confirms the
-  resubmission is a no-op on that row (issue-1 already finished).
+- `feedback.entries.issue-1.outcome: "already_terminal_success"` confirms the
+  resubmission is a no-op on that row (issue-1 already finished successfully).
 
 The agent dispatches two workers for the new children.
 
@@ -672,26 +683,27 @@ Each exits with a `done` response analogous to Interaction 5.
   "state": "summarize",
   "directive": "Write a summary covering which issues succeeded, which failed, and why. The batch_final_view field in this response carries the full snapshot so you don't need a second command.",
   "is_terminal": true,
+  "batch": {"phase": "final"},
   "batch_final_view": {
-    "phase": "final",
-    "summary": {
-      "total": 3,
-      "success": 3,
-      "failed": 0,
-      "skipped": 0,
-      "pending": 0,
-      "blocked": 0,
-      "spawn_failed": 0
-    },
-    "tasks": [
-      {"name": "issue-1", "child": "coord.issue-1", "outcome": "success"},
-      {"name": "issue-2", "child": "coord.issue-2", "outcome": "success"},
-      {"name": "issue-3", "child": "coord.issue-3", "outcome": "success"}
-    ],
-    "ready": [],
-    "blocked": [],
-    "skipped": [],
-    "failed": []
+    "total": 3,
+    "completed": 3,
+    "pending": 0,
+    "success": 3,
+    "failed": 0,
+    "skipped": 0,
+    "blocked": 0,
+    "spawn_failed": 0,
+    "all_complete": true,
+    "all_success": true,
+    "any_failed": false,
+    "any_skipped": false,
+    "any_spawn_failed": false,
+    "needs_attention": false,
+    "children": [
+      {"name": "coord.issue-1", "state": "done", "complete": true, "outcome": "success"},
+      {"name": "coord.issue-2", "state": "done", "complete": true, "outcome": "success"},
+      {"name": "coord.issue-3", "state": "done", "complete": true, "outcome": "success"}
+    ]
   }
 }
 ```
@@ -776,21 +788,18 @@ falling back to the state name.
       "needs_attention": true,
       "children": [
         {"name": "coord.issue-1", "state": "done", "complete": true, "outcome": "success"},
-        {"name": "coord.issue-2", "state": "done_blocked", "complete": true, "outcome": "failure", "failure_mode": true, "reason": "Issue 102 hit an unresolvable blocker during implementation.", "reason_source": "failure_reason"},
+        {"name": "coord.issue-2", "state": "done_blocked", "complete": true, "outcome": "failure", "failure_mode": "done_blocked:failure_reason", "reason": "Issue 102 hit an unresolvable blocker during implementation.", "reason_source": "failure_reason"},
         {"name": "coord.issue-3", "state": "done", "complete": true, "outcome": "success"}
       ]
     }
   }],
   "reserved_actions": [
     {
-      "name": "retry_failed",
-      "description": "Re-queue failed and skipped children. Dependents are included by default.",
-      "payload_schema": {
-        "children": {"type": "array<string>", "required": true},
-        "include_skipped": {"type": "boolean", "required": false, "default": true}
-      },
-      "applies_to": ["coord.issue-2"],
-      "invocation": "koto next coord --with-data '{\"retry_failed\": {\"children\": [\"coord.issue-2\"]}}'"
+      "action": "retry_failed",
+      "label": "Retry failed children",
+      "description": "Re-run children whose outcome is failure, skipped, or spawn_failed.",
+      "applies_to": ["issue-2"],
+      "invocation": "koto next 'coord' --with-data '{\"retry_failed\":{\"children\":[\"issue-2\"]}}'"
     }
   ],
   "scheduler": null
@@ -806,22 +815,23 @@ falling back to the state name.
   reason came from the child's context key, not from the state
   name.
 
-### Interaction F2: `koto next coord --with-data '{"retry_failed": {"children": ["coord.issue-2"]}}'`
+### Interaction F2: `koto next coord --with-data '{"retry_failed":{"children":["issue-2"]}}'`
 
 **What happens inside koto:**
 - Advisory flock acquired. `handle_retry_failed` intercepts in
   `handle_next` *before* `advance_until_stop` runs.
-- R10 validates the payload: non-empty `children`, each exists on
-  disk, each has outcome `failure` or `skipped`. `include_skipped`
-  defaults to `true`. `coord.issue-2` qualifies. Mixed payloads
-  (retry_failed plus other keys) would reject with
+- R10 validates the payload: non-empty `children` (short task names,
+  not composed `<parent>.<task>` names), each exists on disk, each
+  has outcome `failure` or `skipped`. `include_skipped` defaults to
+  `true`. `issue-2` qualifies. Mixed payloads (retry_failed plus
+  other keys) would reject with
   `InvalidRetryReason::MixedWithOtherEvidence`.
 - Validation passes → canonical retry sequence:
   1. Append `EvidenceSubmitted { retry_failed: {...} }` to coord.
   2. Append the clearing `EvidenceSubmitted { retry_failed: null }`
      to coord (under `CloudBackend`, `sync_push_state` here; Decision
      12 Q6's push-parent-first eliminates phantom child epochs).
-  3. For each child in the downward closure of `coord.issue-2`:
+  3. For each child in the downward closure of `issue-2`:
      `coord.issue-2` has outcome `failure` → append `Rewound`
      targeting `working` (the initial state). No skipped dependents,
      so nothing else changes.
@@ -869,16 +879,14 @@ falling back to the state name.
   "scheduler": {
     "spawned_this_tick": [],
     "materialized_children": [
-      {"name": "coord.issue-1", "outcome": "success", "state": "done", "ready_to_drive": false},
-      {"name": "coord.issue-2", "outcome": "pending", "state": "working", "ready_to_drive": true},
-      {"name": "coord.issue-3", "outcome": "success", "state": "done", "ready_to_drive": false}
+      {"name": "coord.issue-1", "task": "issue-1", "outcome": "success", "state": "done", "waits_on": [], "ready_to_drive": false, "role": "worker"},
+      {"name": "coord.issue-2", "task": "issue-2", "outcome": "pending", "state": "working", "waits_on": ["issue-1"], "ready_to_drive": true, "role": "worker"},
+      {"name": "coord.issue-3", "task": "issue-3", "outcome": "success", "state": "done", "waits_on": ["issue-1"], "ready_to_drive": false, "role": "worker"}
     ],
-    "already": ["coord.issue-1", "coord.issue-2", "coord.issue-3"],
-    "blocked": [],
-    "skipped": [],
+    "reclassified_this_tick": true,
+    "feedback": {"entries": {}, "orphan_candidates": []},
     "errored": [],
-    "warnings": [],
-    "feedback": {"entries": {}, "orphan_candidates": []}
+    "warnings": []
   }
 }
 ```
@@ -893,7 +901,7 @@ The agent drives `coord.issue-2` through to `done`, then ticks the
 parent again. The gate then evaluates to `all_success: true`; the
 advance loop appends a fresh `BatchFinalized` (superseding the
 prior one) and transitions to `summarize`. Terminal response shape
-is identical to Interaction 8 with `batch_final_view.summary.success: 3`.
+is identical to Interaction 8 with `batch_final_view.success: 3`.
 
 ---
 
@@ -938,7 +946,7 @@ context carries `skipped_because: coord.issue-1`.
       "any_spawn_failed": false,
       "needs_attention": true,
       "children": [
-        {"name": "coord.issue-1", "state": "done_blocked", "complete": true, "outcome": "failure", "failure_mode": true, "reason": "Issue 101 hit an unresolvable blocker during implementation.", "reason_source": "failure_reason"},
+        {"name": "coord.issue-1", "state": "done_blocked", "complete": true, "outcome": "failure", "failure_mode": "done_blocked:failure_reason", "reason": "Issue 101 hit an unresolvable blocker during implementation.", "reason_source": "failure_reason"},
         {"name": "coord.issue-2", "state": "skipped_due_to_dep_failure", "complete": true, "outcome": "skipped", "skipped_because": "coord.issue-1", "skipped_because_chain": ["coord.issue-1"], "reason_source": "skipped"},
         {"name": "coord.issue-3", "state": "skipped_due_to_dep_failure", "complete": true, "outcome": "skipped", "skipped_because": "coord.issue-1", "skipped_because_chain": ["coord.issue-1"], "reason_source": "skipped"}
       ]
@@ -946,14 +954,11 @@ context carries `skipped_because: coord.issue-1`.
   }],
   "reserved_actions": [
     {
-      "name": "retry_failed",
-      "description": "Re-queue failed and skipped children. Dependents are included by default.",
-      "payload_schema": {
-        "children": {"type": "array<string>", "required": true},
-        "include_skipped": {"type": "boolean", "required": false, "default": true}
-      },
-      "applies_to": ["coord.issue-1", "coord.issue-2", "coord.issue-3"],
-      "invocation": "koto next coord --with-data '{\"retry_failed\": {\"children\": [\"coord.issue-1\"]}}'"
+      "action": "retry_failed",
+      "label": "Retry failed children",
+      "description": "Re-run children whose outcome is failure, skipped, or spawn_failed.",
+      "applies_to": ["issue-1", "issue-2", "issue-3"],
+      "invocation": "koto next 'coord' --with-data '{\"retry_failed\":{\"children\":[\"issue-1\"]}}'"
     }
   ],
   "scheduler": null
@@ -964,9 +969,9 @@ context carries `skipped_because: coord.issue-1`.
 - `any_failed` and `any_skipped` are both true.
 - `skipped_because_chain: ["coord.issue-1"]` on the skipped
   children points the agent at the root cause directly.
-- `reserved_actions[0].applies_to` lists all retryable children.
-  Naming just `coord.issue-1` in the submission propagates the
-  retry downward to `coord.issue-2` and `coord.issue-3` via
+- `reserved_actions[0].applies_to` lists all retryable children by
+  short task name. Naming just `issue-1` in the submission propagates
+  the retry downward to `issue-2` and `issue-3` via
   `include_skipped: true` (the default).
 
 ### `koto status coord.issue-2` on a skip marker
@@ -1095,21 +1100,11 @@ without aborting the others:
   "scheduler": {
     "spawned_this_tick": ["coord.issue-1", "coord.issue-3"],
     "materialized_children": [
-      {"name": "coord.issue-1", "outcome": "pending", "state": "working", "ready_to_drive": true},
-      {"name": "coord.issue-3", "outcome": "pending", "state": "working", "ready_to_drive": true}
+      {"name": "coord.issue-1", "task": "issue-1", "outcome": "pending", "state": "working", "waits_on": [], "ready_to_drive": true, "role": "worker"},
+      {"name": "coord.issue-2", "task": "issue-2", "outcome": "spawn_failed", "waits_on": [], "ready_to_drive": false},
+      {"name": "coord.issue-3", "task": "issue-3", "outcome": "pending", "state": "working", "waits_on": [], "ready_to_drive": true, "role": "worker"}
     ],
-    "already": [],
-    "blocked": [],
-    "skipped": [],
-    "errored": [
-      {
-        "task": "issue-2",
-        "kind": "template_not_found",
-        "paths_tried": ["/home/dan/src/tsuku/impl-missing.md", "/home/dan/src/tsuku/impl-missing.md"],
-        "message": "Template not found at any configured base"
-      }
-    ],
-    "warnings": [],
+    "reclassified_this_tick": true,
     "feedback": {
       "entries": {
         "issue-1": {"outcome": "accepted"},
@@ -1117,7 +1112,17 @@ without aborting the others:
         "issue-3": {"outcome": "accepted"}
       },
       "orphan_candidates": []
-    }
+    },
+    "errored": [
+      {
+        "task": "issue-2",
+        "kind": "template_not_found",
+        "message": "Template not found at any configured base",
+        "paths_tried": ["/home/dan/src/tsuku/impl-missing.md"],
+        "template_source": "override"
+      }
+    ],
+    "warnings": []
   }
 }
 ```
@@ -1140,19 +1145,17 @@ tick but still attempts `submitter_cwd`:
   "scheduler": {
     "spawned_this_tick": ["coord.issue-1"],
     "materialized_children": [
-      {"name": "coord.issue-1", "outcome": "pending", "state": "working", "ready_to_drive": true}
+      {"name": "coord.issue-1", "task": "issue-1", "outcome": "pending", "state": "working", "waits_on": [], "ready_to_drive": true, "role": "worker"}
     ],
-    "already": [],
-    "blocked": [],
-    "skipped": [],
-    "errored": [],
-    "warnings": [
-      {"kind": "missing_template_source_dir"}
-    ],
+    "reclassified_this_tick": true,
     "feedback": {
       "entries": {"issue-1": {"outcome": "accepted"}},
       "orphan_candidates": []
-    }
+    },
+    "errored": [],
+    "warnings": [
+      {"kind": "missing_template_source_dir"}
+    ]
   }
 }
 ```
@@ -1216,6 +1219,29 @@ workflows and child ticks are unlocked.
 
 ---
 
+## Canonical source per question
+
+Every batch tick exposes the same state through several surfaces.
+The table below pins which surface is authoritative for which
+question — route agent logic off the canonical source, not an
+incidental field that happens to carry the same data.
+
+| Question | Canonical source | Why |
+|---|---|---|
+| "Which children should a worker dispatch next?" | `scheduler.materialized_children` filtered by `ready_to_drive == true AND outcome != "spawn_failed"` | Re-derived from disk every tick; `spawned_this_tick` is a per-tick observation that double-reports across concurrent ticks and silently drops on resume. |
+| "How did the scheduler handle each submitted task?" | `scheduler.feedback.entries` (keyed by short task name) | Every submitted entry gets exactly one outcome per tick; no silent no-ops. |
+| "Did this task's spawn fail, and why?" | `scheduler.errored[]` (typed `TaskSpawnError`) and `materialized_children[*].outcome == "spawn_failed"` | Structured per-task detail lives under `errored`; the ledger mirrors the failure so the dispatch filter can see it. |
+| "Is the gate passing? Should the parent advance?" | `blocking_conditions[0].output.all_complete` (gate pass) and the aggregate booleans for routing | Gate output is what the transition guards read; the engine's routing decision reads these fields. |
+| "What reason should I render for a failed child?" | `blocking_conditions[0].output.children[*].reason` with `reason_source` as provenance | `reason_source` tells the agent whether `reason` came from `failure_reason`, the state name, a skip marker, or a never-spawned task. |
+| "Which children are eligible for retry, and how do I invoke it?" | `reserved_actions[0].applies_to` (short names) and `reserved_actions[0].invocation` | `reserved_actions` is the discovery surface; `invocation` is a ready-to-run POSIX-safe command. |
+| "Is this the final outcome of the batch?" | `batch_final_view` on the terminal `done` response | Frozen at finalization time; survives past the active phase so summary states can read it without a second `koto status` call. |
+| "Are there children on disk I forgot about?" | `scheduler.feedback.orphan_candidates` | Flags disk children whose short name is not in the current submission — detects accidental rename or drop. |
+| "Is this child itself a sub-batch coordinator?" | `materialized_children[*].role == "coordinator"` with `subbatch_status` for inner-batch counts | Sticky once a `SchedulerRan` observes the role; gives outer agents nested-batch visibility without recursion. |
+
+Non-canonical surfaces useful for logging only: `spawned_this_tick`,
+`reclassified_this_tick`, and the `warnings` array. Don't key
+dispatch or completion logic on them.
+
 ## Reading guide
 
 - **Per-tick observation vs ledger.** `spawned_this_tick` can
@@ -1266,10 +1292,18 @@ workflows and child ticks are unlocked.
   re-attempts `init_state_file` using the current submission's
   entry (retry-respawn).
 - **Cross-level retry is rejected in v1.** If any child named in
-  `retry_failed.children` is itself a batch parent (a nested Reading B
+  `retry_failed.children` is itself a batch parent (a nested
   coordinator), the submission rejects with
   `InvalidRetryReason::ChildIsBatchParent`. Retry at the level where
   the failure happened, then bubble up.
+- **Delete-and-respawn silently drops uncommitted work.** When
+  `retry_failed` propagates to a skipped dependent, the scheduler
+  deletes the skip-marker state file and respawns the child from
+  scratch. Skip markers never have an active worker, so the write
+  loss is theoretical there. The hazard applies to any delete-and-
+  respawn path: if a worker was mid-driving a child and had not yet
+  committed evidence, that work is lost without warning. Avoid
+  retrying children whose workers are still actively writing.
 - **Two-hat intermediate children.** When `MaterializedChild.role`
   reports `"coordinator"` on a child, the child is itself running a
   sub-batch. Its `subbatch_status` summarizes the inner batch state;

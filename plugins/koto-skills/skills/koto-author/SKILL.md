@@ -18,6 +18,7 @@ Use this skill when you want **structured, resumable workflows** in your skills.
 - Phases have conditional branching (different paths based on agent decisions)
 - You want resumability if a session is interrupted
 - You want to separate workflow mechanics (ordering, branching, gating) from domain logic
+- Your skill fans out a dynamic list of subtasks to child workers (batch workflows) — see the batch authoring reference
 
 If your skill is a single linear task with no decision points, koto adds unnecessary overhead. A plain SKILL.md is simpler.
 
@@ -97,9 +98,11 @@ The workflow has 8 states:
 The skill bundles reference material, loaded during specific states:
 
 - **Template format guide** (`${CLAUDE_SKILL_DIR}/references/template-format.md`) -- read during state_design and template_drafting. Covers structure (Layer 1), evidence routing (Layer 2), and advanced features (Layer 3). Read only the layers you need.
+- **Batch authoring guide** (`${CLAUDE_SKILL_DIR}/references/batch-authoring.md`) -- read when your workflow fans out a dynamic task list to child workers. Covers `materialize_children`, the `failure_reason` convention (W5), the `skipped_marker` child-template requirement (F5), aggregate-boolean routing (W4), and two-hat coordinators.
 - **Example templates** (`${CLAUDE_SKILL_DIR}/references/examples/`) -- read during state_design. Pick the one matching your complexity:
   - Branching workflows? `evidence-routing-workflow.md`
   - Gates, retries, split topology? `complex-workflow.md`
+  - Batch fan-out with dependent tasks? `batch-coordinator.md` + `batch-worker.md` (parent/child pair)
   - Simple linear flow? This skill's own template is a good mid-complexity reference
 
 Additional guides are available at https://github.com/tsukumogami/koto/tree/main/docs/guides. To list them:

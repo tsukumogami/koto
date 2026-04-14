@@ -258,6 +258,25 @@ Temporal blocks with `needs_attention: false` resolve on their own — poll `kot
 
 When you cancel, clean up, or rewind a parent, the response includes a `children` array listing affected child workflows. koto doesn't cascade these operations — it tells you which children exist so you can decide what to do with them.
 
+## Batch workflows
+
+A batch workflow is a hierarchy variant where the parent submits a structured task list once, and koto's scheduler materializes and tracks per-task children automatically. The parent declares a `materialize_children` hook plus a `children-complete` gate; each `koto next <parent>` tick runs the scheduler, reports per-task feedback, and aggregates child outcomes for the gate.
+
+The response shape includes batch-specific fields:
+
+- `scheduler.materialized_children` — the per-child dispatch ledger (use this for idempotent dispatch, not `spawned_this_tick`).
+- `scheduler.feedback.entries` — per-task outcome keyed by short name (`accepted`, `blocked`, `errored`, `already_running`, etc.).
+- `reserved_actions` — ready-to-run retry invocations, synthesized when the gate reports `any_failed`, `any_skipped`, or `any_spawn_failed`.
+- `batch_final_view` — frozen snapshot attached to the terminal `done` response.
+- `synthetic: true` — marker on skip-marker children whose state was materialized directly (no worker ran).
+- `sync_status` — cloud-backend freshness indicator (`fresh`, `stale`, `local_only`, `diverged`).
+
+The canonical rule for worker dispatch:
+
+> Dispatch a worker for every entry in `scheduler.materialized_children` where `ready_to_drive == true AND outcome != "spawn_failed"`, excluding children already dispatched this session.
+
+Full coverage lives in [**batch-workflows.md**](references/batch-workflows.md). Read it when the SKILL.md you're following mentions `materialize_children`, task submission via `--with-data @tasks.json`, or `retry_failed`.
+
 ## Recording decisions
 
 Use `koto decisions record` to capture key choices mid-workflow. This doesn't advance the state — it just appends a decision record.
@@ -275,6 +294,7 @@ Read these on demand, not upfront. The sections above cover the common path. Con
 - [**Command reference**](references/command-reference.md) — full CLI syntax, flags, and output shapes for all subcommands. Follow this when you need exact flag names or want to check an unfamiliar command.
 - [**Response shapes**](references/response-shapes.md) — annotated JSON examples for every `action` value, sub-object schemas for `expects` and `blocking_conditions`, and field-level annotations. Follow this when a field's presence or shape is unclear.
 - [**Error handling**](references/error-handling.md) — exit code table, error code meanings, and agent actions for each error type. Follow this when a command fails or returns a non-zero exit code.
+- [**Batch workflows**](references/batch-workflows.md) — coordinator/worker partition, `materialized_children` dispatch, `retry_failed` mechanics, `reserved_actions`, `batch_final_view`, cloud `sync_status`, and skip-marker `synthetic: true`. Follow this when the workflow uses `materialize_children` or the response carries a `scheduler` field.
 
 ## Troubleshooting
 
