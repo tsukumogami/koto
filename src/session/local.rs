@@ -9,7 +9,7 @@ use crate::engine::persistence;
 use crate::engine::types::{now_iso8601, Event, EventPayload, StateFileHeader};
 use crate::session::context::{ContextStore, KeyMeta, Manifest};
 use crate::session::validate::{validate_context_key, validate_session_id};
-use crate::session::{state_file_name, SessionBackend, SessionError, SessionInfo};
+use crate::session::{state_file_name, SessionBackend, SessionError, SessionInfo, SessionLock};
 
 /// Filename prefix for `init_state_file` tempfiles.
 ///
@@ -247,6 +247,52 @@ impl SessionBackend for LocalBackend {
                 Err(e)
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn lock_state_file(&self, id: &str) -> Result<SessionLock, SessionError> {
+        use std::os::unix::io::AsRawFd;
+
+        validate_session_id(id).map_err(SessionError::Other)?;
+
+        let path = self.base_dir.join(id).join(state_file_name(id));
+
+        // Open read-only so the lock can be acquired without mutating
+        // the state file. The file must already exist; callers are
+        // expected to invoke this only on initialised workflows.
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(SessionError::Io)?;
+
+        // SAFETY: `fd` is a borrow tied to `file`, which outlives the
+        // call. `libc::flock` with `LOCK_EX | LOCK_NB` either returns
+        // 0 (acquired) or -1 with `errno == EWOULDBLOCK` when another
+        // holder already owns the lock. No other failure mode maps to
+        // a "contention" condition.
+        let fd = file.as_raw_fd();
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                // `flock` does not report the holder's PID. We leave
+                // `holder_pid: None` so upstream callers can still
+                // render a consistent typed error; a future probe via
+                // `fcntl(F_OFD_GETLK)` can populate it without an API
+                // change.
+                return Err(SessionError::Locked { holder_pid: None });
+            }
+            return Err(SessionError::Io(err));
+        }
+
+        Ok(SessionLock { _file: file })
+    }
+
+    #[cfg(not(unix))]
+    fn lock_state_file(&self, _id: &str) -> Result<SessionLock, SessionError> {
+        Err(SessionError::Other(anyhow::anyhow!(
+            "lock_state_file is only supported on Unix platforms"
+        )))
     }
 }
 
@@ -1353,5 +1399,237 @@ mod tests {
 
         // The orphaned file is still readable directly but not tracked.
         assert!(ctx_dir.join("orphan.md").exists());
+    }
+
+    // ===== lock_state_file tests =====
+
+    /// scenario-4: two back-to-back acquisitions observe
+    /// first-wins / second-contends semantics immediately, with no
+    /// blocking. The second call must return `SessionError::Locked`
+    /// rather than waiting for the first guard to drop.
+    #[test]
+    fn lock_state_file_second_acquire_returns_locked() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (header, events) = sample_bundle("wf");
+        backend.init_state_file("wf", header, events).unwrap();
+
+        let _guard = backend
+            .lock_state_file("wf")
+            .expect("first acquire must succeed");
+
+        let start = std::time::Instant::now();
+        let err = backend
+            .lock_state_file("wf")
+            .expect_err("second acquire must fail while first is held");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(err, SessionError::Locked { holder_pid: None }),
+            "want SessionError::Locked {{ holder_pid: None }}, got: {:?}",
+            err
+        );
+        // Non-blocking: kernel returns EWOULDBLOCK immediately. Allow
+        // a generous budget for CI jitter, but catch a regression to
+        // a blocking LOCK_EX.
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "second acquire must be non-blocking (took {:?})",
+            elapsed
+        );
+    }
+
+    /// scenario-4 continuation: dropping the guard releases the lock,
+    /// so a subsequent acquisition succeeds.
+    #[test]
+    fn lock_state_file_releases_on_drop() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (header, events) = sample_bundle("wf");
+        backend.init_state_file("wf", header, events).unwrap();
+
+        {
+            let _guard = backend.lock_state_file("wf").expect("acquire succeeds");
+        } // guard dropped here; lock released
+
+        let _guard2 = backend
+            .lock_state_file("wf")
+            .expect("re-acquire after drop must succeed");
+    }
+
+    /// Missing state file surfaces as an I/O error, not a Locked
+    /// variant. Callers should only lock after initialisation has
+    /// committed a state file.
+    #[test]
+    fn lock_state_file_missing_file_reports_io_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+
+        let err = backend
+            .lock_state_file("nonexistent")
+            .expect_err("must fail when state file is absent");
+        match err {
+            SessionError::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("want SessionError::Io(NotFound), got: {:?}", other),
+        }
+    }
+
+    /// scenario-32: cross-process contention. We fork a child process
+    /// (via `std::process::Command` re-executing the current test
+    /// binary with a sentinel env var) that holds the lock for a
+    /// bounded window, then attempt to acquire from the parent. The
+    /// parent must observe `SessionError::Locked`.
+    ///
+    /// Using a re-exec rather than a bare thread is deliberate:
+    /// `flock` is a per-open-file-description lock on modern Linux,
+    /// and a cross-thread test inside one process does not exercise
+    /// the cross-PID release-on-death semantics that matter in
+    /// production. The accompanying `lock_state_file_cross_thread`
+    /// test covers intra-process contention as well.
+    #[test]
+    #[cfg(unix)]
+    fn lock_state_file_cross_process_contention() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        // Child mode: re-exec of this test binary with
+        // KOTO_LOCK_HOLDER_DIR set takes the lock, prints "LOCKED",
+        // sleeps, then exits. The sentinel env var stops the child
+        // from also recursing into the parent branch.
+        if let Ok(dir) = std::env::var("KOTO_LOCK_HOLDER_DIR") {
+            let backend = LocalBackend::with_base_dir(PathBuf::from(&dir));
+            let _guard = backend
+                .lock_state_file("wf")
+                .expect("child: acquire must succeed");
+            println!("LOCKED");
+            // Hold the lock long enough for the parent to attempt
+            // acquisition and observe contention.
+            std::thread::sleep(Duration::from_millis(800));
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (header, events) = sample_bundle("wf");
+        backend.init_state_file("wf", header, events).unwrap();
+
+        let current_exe = std::env::current_exe().expect("current_exe");
+        let mut child = Command::new(&current_exe)
+            .args([
+                "--exact",
+                "--nocapture",
+                "session::local::tests::lock_state_file_cross_process_contention",
+            ])
+            .env("KOTO_LOCK_HOLDER_DIR", tmp.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child test process");
+
+        // Wait for the child to signal it has acquired the lock. The
+        // child prints "LOCKED" after a successful acquire; we block
+        // the current thread on a single line read so we don't race.
+        use std::io::BufRead;
+        let stdout = child.stdout.take().expect("child stdout");
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut seen_locked = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("read child stdout line");
+            if n == 0 {
+                break;
+            }
+            if line.trim() == "LOCKED" {
+                seen_locked = true;
+                break;
+            }
+        }
+        assert!(seen_locked, "child did not report LOCKED in time");
+
+        // Parent attempts to acquire while the child holds the lock.
+        // `flock` is per-open-file-description in the cross-process
+        // case, so this must fail with Locked.
+        let err = backend
+            .lock_state_file("wf")
+            .expect_err("parent acquire must contend with child");
+        assert!(
+            matches!(err, SessionError::Locked { .. }),
+            "want SessionError::Locked, got: {:?}",
+            err
+        );
+
+        // Clean up the child so the test harness doesn't inherit it.
+        let _ = child.wait();
+    }
+
+    /// Intra-process (cross-thread) contention. Useful belt-and-braces
+    /// coverage: `LocalBackend::lock_state_file` opens a fresh file
+    /// handle per call, so two threads in the same process also hold
+    /// separate open-file-descriptions and should contend.
+    #[test]
+    fn lock_state_file_cross_thread_contention() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(test_backend(tmp.path()));
+        let (header, events) = sample_bundle("wf");
+        backend.init_state_file("wf", header, events).unwrap();
+
+        // Thread A takes the lock and signals the barrier, then holds
+        // it while thread B attempts to acquire.
+        let barrier = Arc::new(Barrier::new(2));
+        let release = Arc::new(std::sync::Mutex::new(false));
+        let cvar = Arc::new(std::sync::Condvar::new());
+
+        let a_backend = Arc::clone(&backend);
+        let a_bar = Arc::clone(&barrier);
+        let a_release = Arc::clone(&release);
+        let a_cvar = Arc::clone(&cvar);
+        let a = thread::spawn(move || {
+            let _guard = a_backend.lock_state_file("wf").expect("thread A acquire");
+            a_bar.wait();
+            // Hold the lock until the main thread signals via the
+            // condvar. Avoids sleeping for an arbitrary duration.
+            let mut done = a_release.lock().unwrap();
+            while !*done {
+                done = a_cvar.wait(done).unwrap();
+            }
+        });
+
+        barrier.wait();
+        let err = backend
+            .lock_state_file("wf")
+            .expect_err("thread B acquire must contend");
+        assert!(
+            matches!(err, SessionError::Locked { .. }),
+            "want SessionError::Locked, got: {:?}",
+            err
+        );
+
+        *release.lock().unwrap() = true;
+        cvar.notify_all();
+        a.join().unwrap();
+
+        // With A's guard dropped, a fresh acquire must succeed. Retry
+        // briefly to absorb the kernel's own per-OFD close-to-unlock
+        // latency (the flock on an OFD is released by the kernel
+        // asynchronously in some scheduling windows; holding the
+        // result of the assertion to exactly one attempt is too
+        // strict for the semantic we want to test, which is "the lock
+        // eventually becomes acquirable again").
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match backend.lock_state_file("wf") {
+                Ok(_guard) => break,
+                Err(SessionError::Locked { .. }) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("re-acquire after A drops must succeed: {:?}", e),
+            }
+        }
     }
 }

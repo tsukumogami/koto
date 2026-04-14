@@ -28,6 +28,18 @@ pub enum SessionError {
     /// atomic create-or-fail rename sees the destination occupied.
     Collision,
 
+    /// Another process or thread already holds the advisory flock on
+    /// the target state file. Emitted when
+    /// `SessionBackend::lock_state_file` attempts a non-blocking
+    /// `LOCK_EX | LOCK_NB` and the kernel reports `EWOULDBLOCK`.
+    ///
+    /// `holder_pid` is populated on a best-effort basis. Today this
+    /// variant is surfaced directly by the flock `EWOULDBLOCK` path
+    /// which carries no peer-pid information, so the field is always
+    /// `None`; it is reserved so a future `F_OFD_GETLK`-based probe can
+    /// attach the holder's PID without a breaking change to the API.
+    Locked { holder_pid: Option<u32> },
+
     /// An I/O error from the underlying storage backend that isn't a
     /// collision. Preserves the original `io::Error` so callers can
     /// inspect its `kind()` for retry decisions.
@@ -43,6 +55,12 @@ impl fmt::Display for SessionError {
             SessionError::Collision => {
                 write!(f, "state file already exists at the target path")
             }
+            SessionError::Locked { holder_pid } => match holder_pid {
+                Some(pid) => {
+                    write!(f, "state file is already locked by pid {}", pid)
+                }
+                None => write!(f, "state file is already locked by another process"),
+            },
             SessionError::Io(e) => write!(f, "session I/O error: {}", e),
             SessionError::Other(e) => write!(f, "session error: {}", e),
         }
@@ -54,7 +72,7 @@ impl std::error::Error for SessionError {
         match self {
             SessionError::Io(e) => Some(e),
             SessionError::Other(e) => Some(e.as_ref()),
-            SessionError::Collision => None,
+            SessionError::Collision | SessionError::Locked { .. } => None,
         }
     }
 }
@@ -71,6 +89,39 @@ impl From<std::io::Error> for SessionError {
             SessionError::Io(e)
         }
     }
+}
+
+/// RAII guard for an advisory `flock(LOCK_EX)` held on a session's
+/// state file.
+///
+/// Acquired via [`SessionBackend::lock_state_file`]. The lock is
+/// released automatically when the guard is dropped (the underlying
+/// file handle closes, which the kernel converts into a `LOCK_UN`).
+/// Process death also releases the lock through the same kernel
+/// mechanism, so a crash between acquisition and drop cannot strand
+/// the parent state file.
+///
+/// The guard owns the open `File`. Callers should hold it for the
+/// duration of the critical section and let it drop at the end of
+/// scope; there is no explicit `release` method because the guard's
+/// entire job is to tie the lock lifetime to the Rust scope.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct SessionLock {
+    // The field is intentionally read-only and unused outside the
+    // Drop impl: its sole purpose is to keep the file descriptor open
+    // so the kernel-level flock remains held.
+    _file: std::fs::File,
+}
+
+/// Non-Unix fallback. koto does not support Windows today; this stub
+/// lets downstream code reference the type without a `cfg(unix)` gate
+/// everywhere, while `lock_state_file` itself returns
+/// `SessionError::Other` on non-Unix targets.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct SessionLock {
+    _private: (),
 }
 
 /// Information about an existing session.
@@ -161,6 +212,47 @@ pub trait SessionBackend: Send + Sync {
 
     /// Read just the header from the state file.
     fn read_header(&self, id: &str) -> anyhow::Result<StateFileHeader>;
+
+    /// Acquire a non-blocking advisory `flock(LOCK_EX | LOCK_NB)` on
+    /// the session's state file.
+    ///
+    /// Intended for batch parents that must serialize concurrent tick
+    /// calls (see Decision 12 in the batch-child-spawning design).
+    /// Non-batch workflows never invoke this method -- the happy path
+    /// is unchanged for them.
+    ///
+    /// # Semantics
+    ///
+    /// - On success, returns a [`SessionLock`] RAII guard. Dropping the
+    ///   guard releases the lock. Process death releases the lock via
+    ///   the kernel's `flock` semantics, so a crashed holder cannot
+    ///   permanently strand the state file.
+    /// - On contention, returns `SessionError::Locked { holder_pid }`
+    ///   immediately -- this is a non-blocking acquisition, so callers
+    ///   can surface a typed `ConcurrentTick` error without spinning.
+    ///   `holder_pid` is best-effort; today it is always `None`.
+    /// - If the state file does not yet exist, the method returns a
+    ///   `SessionError::Io` with `ErrorKind::NotFound`. Callers are
+    ///   expected to acquire the lock only after initialisation has
+    ///   committed a state file.
+    ///
+    /// # Cloud backend
+    ///
+    /// `flock` is local-to-the-host. On `CloudBackend`, two processes
+    /// running on different hosts both see the same remote state file
+    /// in S3, but neither sees the other's file-descriptor lock.
+    /// `lock_state_file` therefore only serializes intra-host
+    /// contention under `CloudBackend`. Cross-host coordination is
+    /// handled by the broader "push parent before child mutation"
+    /// ordering described in the design's Decision 12 (Q6), not by
+    /// this lock.
+    ///
+    /// # Windows
+    ///
+    /// Not supported. koto targets Unix-like systems; on non-Unix
+    /// targets this method returns a `SessionError::Other` describing
+    /// the platform limitation.
+    fn lock_state_file(&self, id: &str) -> Result<SessionLock, SessionError>;
 }
 
 /// Unified backend that dispatches to either `LocalBackend` or
@@ -252,6 +344,13 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.init_state_file(id, header, initial_events),
             Backend::Cloud(b) => b.init_state_file(id, header, initial_events),
+        }
+    }
+
+    fn lock_state_file(&self, id: &str) -> Result<SessionLock, SessionError> {
+        match self {
+            Backend::Local(b) => b.lock_state_file(id),
+            Backend::Cloud(b) => b.lock_state_file(id),
         }
     }
 }

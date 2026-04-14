@@ -20,7 +20,7 @@ use crate::config::CloudConfig;
 use crate::session::context::ContextStore;
 use crate::session::local::{repo_id, LocalBackend};
 use crate::session::sync::{self, ManifestCache};
-use crate::session::{state_file_name, SessionBackend, SessionError, SessionInfo};
+use crate::session::{state_file_name, SessionBackend, SessionError, SessionInfo, SessionLock};
 
 /// S3-backed session storage that delegates to `LocalBackend` for all
 /// filesystem operations and syncs state to an S3-compatible bucket.
@@ -507,6 +507,19 @@ impl SessionBackend for CloudBackend {
         self.sync_push_state(id);
         Ok(())
     }
+
+    fn lock_state_file(&self, id: &str) -> Result<SessionLock, SessionError> {
+        // `flock` is strictly a local, per-host primitive. Cloud
+        // instances running on different hosts cannot observe each
+        // other's locks; the design's cross-host coordination story
+        // relies on "push parent before child mutation" ordering
+        // (Decision 12 Q6) rather than on this lock. Here we simply
+        // delegate to the local backend so intra-host contention is
+        // still serialized cleanly -- e.g., two `koto next` invocations
+        // on the same developer machine, or a scheduler tick racing a
+        // manual CLI call.
+        self.local.lock_state_file(id)
+    }
 }
 
 impl ContextStore for CloudBackend {
@@ -814,6 +827,46 @@ mod tests {
         assert!(
             matches!(err, SessionError::Collision),
             "want SessionError::Collision, got: {:?}",
+            err
+        );
+    }
+
+    // -- SessionBackend: lock_state_file delegates to local --
+
+    #[test]
+    fn lock_state_file_delegates_to_local() {
+        use crate::engine::types::{Event, EventPayload};
+
+        let tmp = TempDir::new().unwrap();
+        let backend = test_cloud_backend(tmp.path());
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: "wf".to_string(),
+            template_hash: "testhash".to_string(),
+            created_at: "2026-04-13T00:00:00Z".to_string(),
+            parent_workflow: None,
+        };
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-04-13T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/tmp/tpl.md".to_string(),
+                variables: Default::default(),
+            },
+        }];
+        backend.init_state_file("wf", header, events).unwrap();
+
+        // First acquire succeeds; second observes contention. This
+        // exercises the intra-host serialization guarantee that
+        // CloudBackend is documented to provide.
+        let _guard = backend.lock_state_file("wf").expect("first acquire");
+        let err = backend
+            .lock_state_file("wf")
+            .expect_err("second acquire must contend");
+        assert!(
+            matches!(err, SessionError::Locked { .. }),
+            "want SessionError::Locked, got: {:?}",
             err
         );
     }
