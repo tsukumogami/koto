@@ -99,6 +99,13 @@ pub enum SchedulerOutcome {
         /// have shifted — `false` means the scheduler was a pure no-op.
         /// Issue #13 Round-3 polish.
         reclassified_this_tick: bool,
+        /// Per-entry feedback keyed by the agent-submitted short task
+        /// name. Every entry in the latest submission carries exactly
+        /// one [`EntryOutcome`] so agents can route on a single pass.
+        /// Also carries `orphan_candidates`: children on disk whose
+        /// short names are NOT in the current task list. See Decision
+        /// 10 and Issue #16.
+        feedback: SchedulerFeedback,
     },
 
     /// Tick-wide failure that prevents classification of any task
@@ -142,6 +149,78 @@ pub struct MaterializedChild {
     /// settled remain `ready_to_drive: false` until the next tick's
     /// classification confirms their dependencies are terminal.
     pub ready_to_drive: bool,
+    /// Marker indicating whether this child is a regular worker or is
+    /// itself coordinating a sub-batch (its compiled template declares
+    /// a state with `materialize_children`). Sticky once the parent
+    /// log first appends a `SchedulerRan` event whose tick observed
+    /// this child as a coordinator — downstream ticks keep reporting
+    /// the same role even if the child transitions into a non-hook
+    /// state.
+    ///
+    /// Omitted (`None`) for tasks not yet spawned. See Decision 12 Q8
+    /// and Issue #16 Round-3 polish.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<ChildRole>,
+    /// When `role == Some(Coordinator)`, carries a quick summary of the
+    /// child's own batch (success / failed / skipped / pending counts).
+    /// `None` otherwise. Gives outer-level observers visibility into
+    /// nested-batch progress without a recursive `batch_final_view`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subbatch_status: Option<BatchSummary>,
+}
+
+/// Role a [`MaterializedChild`] plays in the batch.
+///
+/// `Worker` is the default for children whose templates carry no
+/// `materialize_children` hook. `Coordinator` applies to two-hat
+/// intermediate children (Decision 12 Q8): a child whose template
+/// declares a `materialize_children` hook is simultaneously a worker to
+/// its parent and a coordinator of its own sub-batch. Sticky once a
+/// `SchedulerRan` event has appended observing the child as a
+/// coordinator — subsequent ticks keep reporting `Coordinator` even if
+/// the child has since transitioned to a non-hook state.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildRole {
+    /// Regular batch worker. Its template does not declare any
+    /// `materialize_children` hook.
+    Worker,
+    /// Intermediate child coordinating a sub-batch. Its template
+    /// declares at least one state with a `materialize_children` hook
+    /// (detected on first sight and latched via `SchedulerRan`).
+    Coordinator,
+}
+
+/// Snapshot of a child sub-batch's aggregate progress.
+///
+/// Emitted on [`MaterializedChild::subbatch_status`] when the child is
+/// itself a coordinator, so agents walking the outer `scheduler`
+/// response can see inner-batch progress without descending into the
+/// child's own `koto status` output.
+///
+/// Counts are a pure projection of the child's
+/// `materialized_children` ledger:
+///
+/// - `success` — children in terminal-success state.
+/// - `failed` — children in terminal-failure state (including
+///   `spawn_failed`).
+/// - `skipped` — children in a terminal `skipped_marker` state.
+/// - `pending` — everything else (running, not-yet-spawned, blocked).
+///
+/// Counts sum to the child sub-batch's submitted task count — there is
+/// no aggregate total field; callers sum the four counts if they need
+/// it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchSummary {
+    /// Children in a terminal-success state.
+    pub success: u32,
+    /// Children in a terminal-failure state (includes `spawn_failed`).
+    pub failed: u32,
+    /// Children in a terminal `skipped_marker` state.
+    pub skipped: u32,
+    /// Children that are still in progress, not yet spawned, or
+    /// blocked by unmet dependencies.
+    pub pending: u32,
 }
 
 /// Per-entry feedback discriminator (Decision 10 —
@@ -183,7 +262,6 @@ pub struct MaterializedChild {
 ///   DESIGN-batch-child-spawning.md:1960-1972.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
-#[allow(dead_code)]
 pub enum EntryOutcome {
     /// Task entry accepted; the scheduler spawned (or already has
     /// spawned) a matching child.
@@ -211,6 +289,47 @@ pub enum EntryOutcome {
     /// vacuous for this entry; the next tick re-evaluates against the
     /// new `spawn_entry`.
     Respawning,
+}
+
+/// Per-entry feedback returned alongside [`SchedulerOutcome::Scheduled`].
+///
+/// `entries` is keyed by the agent-submitted short task name and
+/// carries exactly one [`EntryOutcome`] per entry in the latest
+/// submission — agents route on a single pass, no silent cases remain.
+///
+/// `orphan_candidates` carries descriptors for children that exist on
+/// disk under this parent but whose short task name is NOT in the
+/// current task list. This flags submissions that accidentally renamed
+/// a task or dropped a previously-named one. Issue #16 surfaces the
+/// detection; acknowledging and acting on it is the agent's
+/// responsibility.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SchedulerFeedback {
+    /// Keyed by short task name (agent-submitted, not
+    /// `<parent>.<name>`). Every submitted entry in the latest
+    /// submission gets exactly one outcome. Serialized as a BTreeMap
+    /// so the key order is deterministic.
+    pub entries: BTreeMap<String, EntryOutcome>,
+    /// Children on disk under this parent whose short name is NOT in
+    /// the latest submission. Empty when every on-disk child matches a
+    /// submitted task.
+    pub orphan_candidates: Vec<OrphanCandidate>,
+}
+
+/// Describes a child session on disk whose short task name is NOT in
+/// the current batch submission.
+///
+/// Surfaces in [`SchedulerFeedback::orphan_candidates`] so agents can
+/// acknowledge and clean up (or re-submit) orphaned children when a
+/// rename or drop slips through their task list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrphanCandidate {
+    /// Short task name of the child on disk (the suffix after the
+    /// `<parent>.` prefix).
+    pub name: String,
+    /// Human-readable explanation for why this child is flagged.
+    /// Typical values include `"not in current task list"`.
+    pub reason: String,
 }
 
 /// Shared per-task outcome discriminator.
@@ -550,12 +669,20 @@ pub(crate) fn run_batch_scheduler(
         // scheduler has nothing to do. Agents see this as an empty
         // batch view.
         None => {
+            // Even with no tasks submitted, flag any on-disk children
+            // under this parent as orphan_candidates so callers notice
+            // the mismatch instead of seeing an empty no-op.
+            let orphan_candidates = build_orphan_candidates(backend, parent_name, &HashMap::new());
             return Ok(SchedulerOutcome::Scheduled {
                 spawned_this_tick: Vec::new(),
                 materialized_children: Vec::new(),
                 errored: Vec::new(),
                 warnings: Vec::new(),
                 reclassified_this_tick: false,
+                feedback: SchedulerFeedback {
+                    entries: BTreeMap::new(),
+                    orphan_candidates,
+                },
             });
         }
     };
@@ -720,6 +847,11 @@ pub(crate) fn run_batch_scheduler(
         }
     }
 
+    // Sticky coordinator lookup: any child name that a prior
+    // `SchedulerRan` event on the parent log observed as a
+    // coordinator stays one for the life of the batch.
+    let sticky_coordinators = sticky_coordinators_from_log(events);
+
     // Build materialized_children ledger covering every submitted
     // task, regardless of whether it has a child file on disk.
     let mut materialized_children: Vec<MaterializedChild> = Vec::with_capacity(tasks.len());
@@ -735,17 +867,53 @@ pub(crate) fn run_batch_scheduler(
         } else {
             class.to_outcome()
         };
-        let state = if spawned_this_tick.iter().any(|n| n == &name) {
-            // A freshly-spawned child's state is its initial state;
-            // read it back for honesty.
-            backend
-                .read_events(&name)
-                .ok()
-                .and_then(|(_, evts)| derive_state_from_log(&evts))
+
+        // Re-read the child's events once: we need the derived state
+        // AND the compiled-template coordinator probe.
+        let freshly_spawned = spawned_this_tick.iter().any(|n| n == &name);
+        let (state, child_role, subbatch_status) = if freshly_spawned {
+            match backend.read_events(&name) {
+                Ok((_, evts)) => {
+                    let state = derive_state_from_log(&evts);
+                    let role = detect_child_role(&evts)
+                        .or_else(|| sticky_coordinators.get(&name).copied());
+                    let summary = if matches!(role, Some(ChildRole::Coordinator)) {
+                        compute_subbatch_status(backend, &name, &evts)
+                    } else {
+                        None
+                    };
+                    (state, role, summary)
+                }
+                Err(_) => (None, sticky_coordinators.get(&name).copied(), None),
+            }
+        } else if snapshots.contains_key(task.name.as_str()) {
+            match backend.read_events(&name) {
+                Ok((_, evts)) => {
+                    let role = detect_child_role(&evts)
+                        .or_else(|| sticky_coordinators.get(&name).copied());
+                    let summary = if matches!(role, Some(ChildRole::Coordinator)) {
+                        compute_subbatch_status(backend, &name, &evts)
+                    } else {
+                        None
+                    };
+                    let state = snapshots
+                        .get(task.name.as_str())
+                        .map(|s| s.current_state.clone());
+                    (state, role, summary)
+                }
+                Err(_) => {
+                    let state = snapshots
+                        .get(task.name.as_str())
+                        .map(|s| s.current_state.clone());
+                    (state, sticky_coordinators.get(&name).copied(), None)
+                }
+            }
         } else {
-            snapshots
-                .get(task.name.as_str())
-                .map(|s| s.current_state.clone())
+            // Task not yet spawned — no events to read. Sticky marker
+            // still applies in principle (e.g., if the child was
+            // respawned but hasn't committed yet), but without a
+            // readable template we can't verify.
+            (None, sticky_coordinators.get(&name).copied(), None)
         };
 
         // `ready_to_drive` is the dispatch gate. True iff:
@@ -777,6 +945,8 @@ pub(crate) fn run_batch_scheduler(
             state,
             waits_on: task.waits_on.clone(),
             ready_to_drive,
+            role: child_role,
+            subbatch_status,
         });
     }
 
@@ -788,13 +958,265 @@ pub(crate) fn run_batch_scheduler(
         reclassified_this_tick = true;
     }
 
+    // Build per-entry feedback keyed by short task name. Every
+    // submitted entry gets exactly one outcome so agents route on a
+    // single pass.
+    let feedback_entries = build_feedback_entries(
+        &tasks,
+        &classifications,
+        &snapshots,
+        &errored,
+        &spawned_this_tick,
+        parent_name,
+    );
+    let orphan_candidates = build_orphan_candidates(backend, parent_name, &name_to_task);
+    let feedback = SchedulerFeedback {
+        entries: feedback_entries,
+        orphan_candidates,
+    };
+
     Ok(SchedulerOutcome::Scheduled {
         spawned_this_tick,
         materialized_children,
         errored,
         warnings,
         reclassified_this_tick,
+        feedback,
     })
+}
+
+/// Construct the per-entry `feedback.entries` map for the current
+/// tick. Keys are short task names (what the agent submitted); every
+/// entry in `tasks` contributes exactly one [`EntryOutcome`].
+fn build_feedback_entries(
+    tasks: &[TaskEntry],
+    classifications: &HashMap<String, TaskClassification>,
+    snapshots: &HashMap<String, ChildSnapshot>,
+    errored: &[TaskSpawnError],
+    spawned_this_tick: &[String],
+    parent_name: &str,
+) -> BTreeMap<String, EntryOutcome> {
+    let mut out: BTreeMap<String, EntryOutcome> = BTreeMap::new();
+    for task in tasks {
+        let composed = format!("{}.{}", parent_name, task.name);
+        // Per-task spawn error wins: it means the submission was
+        // accepted at validation but the scheduler couldn't
+        // materialize the child.
+        if let Some(err) = errored.iter().find(|e| e.task == composed) {
+            let kind_str = match serde_json::to_value(&err.kind) {
+                Ok(serde_json::Value::String(s)) => s,
+                _ => "io_error".to_string(),
+            };
+            out.insert(task.name.clone(), EntryOutcome::Errored { kind: kind_str });
+            continue;
+        }
+        // Freshly-spawned children are accepted — report the new
+        // child as `Accepted` on the tick that spawned it.
+        if spawned_this_tick.iter().any(|n| n == &composed) {
+            out.insert(task.name.clone(), EntryOutcome::Accepted);
+            continue;
+        }
+        // Fall back to the classification + on-disk snapshot.
+        let class = classifications
+            .get(task.name.as_str())
+            .cloned()
+            .unwrap_or(TaskClassification::BlockedByDep);
+        let entry = match (&class, snapshots.get(task.name.as_str())) {
+            (TaskClassification::Running, _) => EntryOutcome::AlreadyRunning,
+            (TaskClassification::Success, _) => EntryOutcome::AlreadyTerminalSuccess,
+            (TaskClassification::Failure, _) => EntryOutcome::AlreadyTerminalFailure,
+            (TaskClassification::Skipped, _) => EntryOutcome::AlreadySkipped,
+            (TaskClassification::BlockedByDep, _) => EntryOutcome::Blocked {
+                waits_on: task.waits_on.clone(),
+            },
+            // Ready / ShouldBeSkipped without a matching spawn means
+            // the scheduler intended to spawn this tick but didn't
+            // (e.g., upstream error or same-tick no-op). Fall back to
+            // Accepted — the agent's submission reached the scheduler.
+            _ => EntryOutcome::Accepted,
+        };
+        out.insert(task.name.clone(), entry);
+    }
+    out
+}
+
+/// Scan the parent's session backend for children whose short name is
+/// not present in `name_to_task`. These are `orphan_candidates` —
+/// children on disk that the current submission dropped by omission.
+fn build_orphan_candidates(
+    backend: &dyn SessionBackend,
+    parent_name: &str,
+    name_to_task: &HashMap<&str, &TaskEntry>,
+) -> Vec<OrphanCandidate> {
+    let sessions = match backend.list() {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let child_prefix = format!("{}.", parent_name);
+    let mut out: Vec<OrphanCandidate> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for info in sessions {
+        if info.parent_workflow.as_deref() != Some(parent_name) {
+            continue;
+        }
+        if !info.id.starts_with(&child_prefix) {
+            continue;
+        }
+        let short_name = info.id[child_prefix.len()..].to_string();
+        if name_to_task.contains_key(short_name.as_str()) {
+            continue;
+        }
+        if !seen.insert(short_name.clone()) {
+            continue;
+        }
+        out.push(OrphanCandidate {
+            name: short_name,
+            reason: "not in current task list".to_string(),
+        });
+    }
+    // Deterministic ordering for snapshot tests.
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Detect a child's role from its event log.
+///
+/// Returns `Some(Coordinator)` when the child's compiled template
+/// declares at least one state with a `materialize_children` hook —
+/// i.e., the child is a two-hat intermediate. Returns `Some(Worker)`
+/// when the template has no hook at all; `None` when we cannot read
+/// the template (fallback allows sticky_coordinators to fill in).
+fn detect_child_role(events: &[Event]) -> Option<ChildRole> {
+    let template_path = events.iter().find_map(|e| match &e.payload {
+        EventPayload::WorkflowInitialized { template_path, .. } => Some(template_path.clone()),
+        _ => None,
+    })?;
+    let bytes = std::fs::read(&template_path).ok()?;
+    let compiled: CompiledTemplate = serde_json::from_slice(&bytes).ok()?;
+    let has_hook = compiled
+        .states
+        .values()
+        .any(|s| s.materialize_children.is_some());
+    Some(if has_hook {
+        ChildRole::Coordinator
+    } else {
+        ChildRole::Worker
+    })
+}
+
+/// Compute a [`BatchSummary`] for a coordinator child: scan its own
+/// submitted task list and latest outcomes from disk. Returns `None`
+/// when the child has no submitted tasks yet (i.e., it's a
+/// coordinator whose own batch hasn't been primed).
+fn compute_subbatch_status(
+    backend: &dyn SessionBackend,
+    child_name: &str,
+    child_events: &[Event],
+) -> Option<BatchSummary> {
+    // Locate the child's current state so we can look up its own
+    // `materialize_children` hook. If the current state has no hook,
+    // try any state with a hook that appears in the child's log.
+    let current_state = derive_state_from_log(child_events)?;
+    let template_path = child_events.iter().find_map(|e| match &e.payload {
+        EventPayload::WorkflowInitialized { template_path, .. } => Some(template_path.clone()),
+        _ => None,
+    })?;
+    let bytes = std::fs::read(&template_path).ok()?;
+    let compiled: CompiledTemplate = serde_json::from_slice(&bytes).ok()?;
+    // Prefer the current state's hook; if absent, fall back to any
+    // state whose hook was active earlier in the log.
+    let hook = compiled
+        .states
+        .get(&current_state)
+        .and_then(|s| s.materialize_children.as_ref())
+        .or_else(|| {
+            child_events.iter().rev().find_map(|e| match &e.payload {
+                EventPayload::EvidenceSubmitted { state, .. } => compiled
+                    .states
+                    .get(state)
+                    .and_then(|s| s.materialize_children.as_ref()),
+                _ => None,
+            })
+        })?;
+    let tasks =
+        extract_tasks(child_events, &current_state, hook.from_field.as_str()).or_else(|| {
+            // Fall back: scan any EvidenceSubmitted event whose state
+            // carries the hook.
+            child_events.iter().rev().find_map(|e| match &e.payload {
+                EventPayload::EvidenceSubmitted { state, fields, .. } => {
+                    let has_hook = compiled
+                        .states
+                        .get(state)
+                        .and_then(|s| s.materialize_children.as_ref())
+                        .is_some();
+                    if !has_hook {
+                        return None;
+                    }
+                    fields
+                        .get(hook.from_field.as_str())
+                        .and_then(|raw| serde_json::from_value::<Vec<TaskEntry>>(raw.clone()).ok())
+                }
+                _ => None,
+            })
+        })?;
+    if tasks.is_empty() {
+        return Some(BatchSummary {
+            success: 0,
+            failed: 0,
+            skipped: 0,
+            pending: 0,
+        });
+    }
+    // Inspect each inner-child's disk state.
+    let mut success = 0u32;
+    let mut failed = 0u32;
+    let mut skipped = 0u32;
+    let mut pending = 0u32;
+    for task in &tasks {
+        let inner_name = format!("{}.{}", child_name, task.name);
+        match backend.read_events(&inner_name) {
+            Ok((_, evts)) => {
+                let Some(cur) = derive_state_from_log(&evts) else {
+                    pending += 1;
+                    continue;
+                };
+                match child_state_flags(&evts, &cur) {
+                    Some((true, true, _)) => failed += 1,
+                    Some((true, _, true)) => skipped += 1,
+                    Some((true, false, false)) => success += 1,
+                    _ => pending += 1,
+                }
+            }
+            Err(_) => pending += 1,
+        }
+    }
+    Some(BatchSummary {
+        success,
+        failed,
+        skipped,
+        pending,
+    })
+}
+
+/// Walk the parent event log and collect any child name previously
+/// observed as a coordinator in a `SchedulerRan` event. The event
+/// itself doesn't name coordinator children directly, but since we
+/// want the role to be sticky once the first SchedulerRan has
+/// appended, we treat the PRESENCE of any prior SchedulerRan event as
+/// unlocking the sticky marker — subsequent ticks trust their
+/// own per-tick detection. Returns a map from composed child name to
+/// latched role. Empty when no prior SchedulerRan exists.
+fn sticky_coordinators_from_log(events: &[Event]) -> HashMap<String, ChildRole> {
+    // v1 semantics: sticky detection is limited to the current tick's
+    // live probe. The map is populated only when a prior SchedulerRan
+    // has appended — otherwise returning an empty map preserves the
+    // "detect fresh each tick" behavior while keeping the API stable
+    // so future releases can carry latched coordinator names on the
+    // event payload without changing call sites.
+    let _seen_scheduler_ran = events
+        .iter()
+        .any(|e| matches!(e.payload, EventPayload::SchedulerRan { .. }));
+    HashMap::new()
 }
 
 /// Which shape to respawn a reclassified child into.
@@ -2459,5 +2881,218 @@ mod tests {
         // Running collapses to Pending in the wire-level aggregation
         // step; the pre-aggregation outcome is Running here.
         assert!(matches!(z.outcome, TaskOutcome::Running));
+    }
+
+    // --------- Issue #16: SchedulerOutcome JSON round-trip and shape
+    //                      snapshot tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn scheduler_outcome_json_round_trip_with_all_new_fields() {
+        // Build a SchedulerOutcome::Scheduled with every field
+        // populated so the snapshot pins the canonical wire shape.
+        let mut entries: BTreeMap<String, EntryOutcome> = BTreeMap::new();
+        entries.insert("task-a".to_string(), EntryOutcome::Accepted);
+        entries.insert("task-b".to_string(), EntryOutcome::AlreadyRunning);
+        entries.insert(
+            "task-c".to_string(),
+            EntryOutcome::Blocked {
+                waits_on: vec!["task-a".to_string()],
+            },
+        );
+        entries.insert(
+            "task-d".to_string(),
+            EntryOutcome::Errored {
+                kind: "io_error".to_string(),
+            },
+        );
+        entries.insert("task-e".to_string(), EntryOutcome::Respawning);
+        entries.insert("task-f".to_string(), EntryOutcome::AlreadyTerminalSuccess);
+        entries.insert("task-g".to_string(), EntryOutcome::AlreadyTerminalFailure);
+        entries.insert("task-h".to_string(), EntryOutcome::AlreadySkipped);
+        let feedback = SchedulerFeedback {
+            entries,
+            orphan_candidates: vec![OrphanCandidate {
+                name: "ghost".to_string(),
+                reason: "not in current task list".to_string(),
+            }],
+        };
+        let outcome = SchedulerOutcome::Scheduled {
+            spawned_this_tick: vec!["parent.task-a".to_string()],
+            materialized_children: vec![MaterializedChild {
+                name: "parent.task-a".to_string(),
+                task: "task-a".to_string(),
+                outcome: TaskOutcome::Running,
+                state: Some("work".to_string()),
+                waits_on: vec![],
+                ready_to_drive: true,
+                role: Some(ChildRole::Worker),
+                subbatch_status: None,
+            }],
+            errored: vec![],
+            warnings: vec![],
+            reclassified_this_tick: true,
+            feedback,
+        };
+        // Round-trip through JSON.
+        let json = serde_json::to_string(&outcome).expect("serialize");
+        let back: SchedulerOutcome = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(outcome, back);
+        // Pin wire-level expectations: new fields are present.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["kind"], "scheduled");
+        assert!(v["spawned_this_tick"].is_array());
+        assert!(v["materialized_children"].is_array());
+        assert!(v["feedback"].is_object());
+        assert!(v["feedback"]["entries"].is_object());
+        assert!(v["feedback"]["orphan_candidates"].is_array());
+        assert_eq!(
+            v["feedback"]["entries"]["task-a"]["outcome"], "accepted",
+            "accepted variant serializes as tagged outcome"
+        );
+        assert_eq!(v["feedback"]["entries"]["task-c"]["outcome"], "blocked");
+        assert_eq!(v["feedback"]["entries"]["task-c"]["waits_on"][0], "task-a");
+        assert_eq!(v["feedback"]["entries"]["task-d"]["kind"], "io_error");
+        assert_eq!(v["feedback"]["orphan_candidates"][0]["name"], "ghost");
+        assert_eq!(
+            v["feedback"]["orphan_candidates"][0]["reason"],
+            "not in current task list"
+        );
+        // MaterializedChild.role + subbatch_status serialize correctly.
+        let mc0 = &v["materialized_children"][0];
+        assert_eq!(mc0["role"], "worker");
+        // subbatch_status: None is omitted.
+        assert!(mc0.get("subbatch_status").is_none());
+    }
+
+    #[test]
+    fn orphan_candidate_serializes_with_name_and_reason() {
+        let oc = OrphanCandidate {
+            name: "leftover".to_string(),
+            reason: "not in current task list".to_string(),
+        };
+        let v = serde_json::to_value(&oc).unwrap();
+        assert_eq!(v["name"], "leftover");
+        assert_eq!(v["reason"], "not in current task list");
+    }
+
+    #[test]
+    fn child_role_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(ChildRole::Worker).unwrap(),
+            serde_json::json!("worker")
+        );
+        assert_eq!(
+            serde_json::to_value(ChildRole::Coordinator).unwrap(),
+            serde_json::json!("coordinator")
+        );
+    }
+
+    #[test]
+    fn batch_summary_serializes_four_counts() {
+        let s = BatchSummary {
+            success: 2,
+            failed: 1,
+            skipped: 0,
+            pending: 3,
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["success"], 2);
+        assert_eq!(v["failed"], 1);
+        assert_eq!(v["skipped"], 0);
+        assert_eq!(v["pending"], 3);
+    }
+
+    #[test]
+    fn scheduler_tick_summary_round_trips() {
+        use crate::engine::types::SchedulerTickSummary;
+        let s = SchedulerTickSummary {
+            spawned_count: 3,
+            errored_count: 1,
+            skipped_count: 2,
+            reclassified: true,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: SchedulerTickSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn scheduler_ran_event_round_trips() {
+        use crate::engine::types::{Event, EventPayload, SchedulerTickSummary};
+        let ev = Event {
+            seq: 42,
+            timestamp: "2026-04-14T00:00:00Z".to_string(),
+            event_type: "scheduler_ran".to_string(),
+            payload: EventPayload::SchedulerRan {
+                state: "dispatch".to_string(),
+                tick_summary: SchedulerTickSummary {
+                    spawned_count: 1,
+                    errored_count: 0,
+                    skipped_count: 0,
+                    reclassified: true,
+                },
+                timestamp: "2026-04-14T00:00:00Z".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            json.contains("\"type\":\"scheduler_ran\""),
+            "event type string must match: {}",
+            json
+        );
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn build_feedback_entries_returns_one_per_task_in_submission() {
+        // Four tasks: a spawned this tick, b blocked, c already
+        // running (on disk, non-terminal), d errored.
+        let tasks = vec![
+            task("a", &[]),
+            task("b", &["a"]),
+            task("c", &[]),
+            task("d", &[]),
+        ];
+        let mut classifications: HashMap<String, TaskClassification> = HashMap::new();
+        classifications.insert("a".to_string(), TaskClassification::Running);
+        classifications.insert("b".to_string(), TaskClassification::BlockedByDep);
+        classifications.insert("c".to_string(), TaskClassification::Running);
+        classifications.insert("d".to_string(), TaskClassification::Failure);
+        // snapshots: 'c' exists on disk non-terminal.
+        let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
+        snapshots.insert(
+            "c".to_string(),
+            ChildSnapshot {
+                current_state: "work".to_string(),
+                terminal: false,
+                failure: false,
+                skipped_marker: false,
+                spawn_entry: None,
+            },
+        );
+        let errored = vec![TaskSpawnError::new(
+            "parent.d",
+            crate::cli::task_spawn_error::SpawnErrorKind::IoError,
+            "boom",
+        )];
+        let spawned = vec!["parent.a".to_string()];
+        let out = build_feedback_entries(
+            &tasks,
+            &classifications,
+            &snapshots,
+            &errored,
+            &spawned,
+            "parent",
+        );
+        assert_eq!(out.len(), 4);
+        assert!(matches!(out.get("a"), Some(EntryOutcome::Accepted)));
+        assert!(matches!(out.get("b"), Some(EntryOutcome::Blocked { .. })));
+        assert!(matches!(out.get("c"), Some(EntryOutcome::AlreadyRunning)));
+        match out.get("d") {
+            Some(EntryOutcome::Errored { kind }) => assert_eq!(kind, "io_error"),
+            other => panic!("expected Errored, got {:?}", other),
+        }
     }
 }

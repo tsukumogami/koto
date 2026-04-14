@@ -1020,3 +1020,197 @@ fn scenario_19_running_child_respawns_as_skip_marker_after_upstream_fails() {
         b_after
     );
 }
+
+// ---- Issue #16 integration tests -----------------------------------
+//
+// Covered:
+// - `scheduler.feedback.entries` surfaces one outcome per submitted
+//   task on every Scheduled tick.
+// - `scheduler.feedback.orphan_candidates` surfaces any on-disk child
+//   whose short name is absent from the current submission.
+// - `MaterializedChild.role` reports `worker` for normal children.
+// - SchedulerRan events append to the parent log on non-trivial ticks
+//   (spawn / reclassify) and NOT on pure no-op ticks.
+
+#[test]
+fn scheduler_response_carries_feedback_entries_and_role() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_templates(tmp.path());
+
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "parent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "parent init failed: {}", stderr);
+
+    // Submit one task. After the tick, `feedback.entries` must contain
+    // exactly one entry keyed by the short task name ("A"), with an
+    // outcome. `materialized_children[0].role` should be `"worker"`.
+    let payload = serde_json::json!({
+        "tasks": [{"name": "A", "waits_on": [], "vars": {}}]
+    });
+    let payload_str = payload.to_string();
+    let (_, json, _) = run_koto(tmp.path(), &["next", "parent", "--with-data", &payload_str]);
+    let sched = json.get("scheduler").expect("scheduler key present");
+    let feedback = sched
+        .get("feedback")
+        .expect("feedback object attached to Scheduled outcome");
+    let entries = feedback
+        .get("entries")
+        .and_then(|v| v.as_object())
+        .expect("feedback.entries is an object");
+    assert_eq!(entries.len(), 1, "one entry per submitted task");
+    let a = entries.get("A").expect("entry for task A");
+    let outcome_tag = a
+        .get("outcome")
+        .and_then(|v| v.as_str())
+        .expect("entry outcome is a string");
+    assert!(
+        outcome_tag == "accepted" || outcome_tag == "already_running",
+        "freshly-spawned task A must be accepted or already_running, got {}",
+        outcome_tag
+    );
+    let orphans = feedback
+        .get("orphan_candidates")
+        .and_then(|v| v.as_array())
+        .expect("feedback.orphan_candidates is an array");
+    assert!(
+        orphans.is_empty(),
+        "no orphan candidates when submission matches disk. got: {:?}",
+        orphans
+    );
+    let ledger = sched
+        .get("materialized_children")
+        .and_then(|v| v.as_array())
+        .expect("materialized_children array");
+    let a_entry = &ledger[0];
+    assert_eq!(
+        a_entry["role"].as_str(),
+        Some("worker"),
+        "normal child renders role=worker"
+    );
+    assert!(
+        a_entry.get("subbatch_status").is_none() || a_entry["subbatch_status"].is_null(),
+        "worker children carry no subbatch_status"
+    );
+}
+
+#[test]
+fn orphan_candidate_detected_when_disk_child_not_in_submission() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_templates(tmp.path());
+    let (ok, _, _) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "parent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok);
+    // Tick 1: submit tasks A and B — both get spawned.
+    let payload1 = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+            {"name": "B", "waits_on": [], "vars": {}},
+        ]
+    });
+    let (_, _, _) = run_koto(
+        tmp.path(),
+        &["next", "parent", "--with-data", &payload1.to_string()],
+    );
+    // Tick 2: re-submit with ONLY A (+B is now an orphan on disk).
+    // Per Decision 10, omission is not a cancellation, but the
+    // scheduler still surfaces B as an orphan candidate so agents
+    // notice the mismatch. A and B share spawn_entry with their
+    // originals so R8 stays satisfied.
+    let payload2 = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+        ]
+    });
+    let (_, json, _) = run_koto(
+        tmp.path(),
+        &["next", "parent", "--with-data", &payload2.to_string()],
+    );
+    let sched = json
+        .get("scheduler")
+        .expect("scheduler key on batch parent tick");
+    let orphans = sched["feedback"]["orphan_candidates"]
+        .as_array()
+        .expect("orphan_candidates present");
+    let names: Vec<String> = orphans
+        .iter()
+        .filter_map(|o| o.get("name").and_then(|v| v.as_str()).map(String::from))
+        .collect();
+    assert!(
+        names.contains(&"B".to_string()),
+        "B must appear as orphan_candidate. got: {:?}",
+        names
+    );
+}
+
+#[test]
+fn scheduler_ran_event_appends_on_non_trivial_tick_and_skips_noop() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_templates(tmp.path());
+    let (ok, _, _) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "parent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok);
+    // First tick with a spawn — non-trivial, SchedulerRan must append.
+    let payload = serde_json::json!({
+        "tasks": [{"name": "A", "waits_on": [], "vars": {}}]
+    });
+    let (_, _, _) = run_koto(
+        tmp.path(),
+        &["next", "parent", "--with-data", &payload.to_string()],
+    );
+    let state_path = parent_state_path(tmp.path(), "parent");
+    let before = std::fs::read_to_string(&state_path).unwrap();
+    let count_before = before
+        .lines()
+        .filter(|l| l.contains("\"type\":\"scheduler_ran\""))
+        .count();
+    assert_eq!(
+        count_before, 1,
+        "SchedulerRan event must append on non-trivial tick (A spawned). got log:\n{}",
+        before
+    );
+    // Second tick with no new evidence — scheduler tick is a pure
+    // no-op (A still running, no reclassification). Run `koto next`
+    // again; the SchedulerRan count must NOT increase.
+    let (_, _, _) = run_koto(tmp.path(), &["next", "parent"]);
+    let after = std::fs::read_to_string(&state_path).unwrap();
+    let count_after = after
+        .lines()
+        .filter(|l| l.contains("\"type\":\"scheduler_ran\""))
+        .count();
+    assert_eq!(
+        count_after, count_before,
+        "SchedulerRan must NOT append on a no-op re-tick. log:\n{}",
+        after
+    );
+    // Sanity check: the SchedulerRan payload carries a tick_summary
+    // with the expected counts.
+    let sr_line = before
+        .lines()
+        .find(|l| l.contains("\"type\":\"scheduler_ran\""))
+        .expect("scheduler_ran line present");
+    let ev: serde_json::Value = serde_json::from_str(sr_line).expect("parse event");
+    assert_eq!(ev["type"], "scheduler_ran");
+    assert_eq!(ev["payload"]["tick_summary"]["spawned_count"], 1);
+    assert_eq!(ev["payload"]["tick_summary"]["errored_count"], 0);
+}

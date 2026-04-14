@@ -2429,6 +2429,47 @@ fn handle_next(
                     None
                 };
 
+            // Issue #16: append a `SchedulerRan` event to the parent
+            // log on every non-trivial tick so `koto query --events`
+            // shows per-tick audit alongside `EvidenceSubmitted` /
+            // `Transitioned`. No-op ticks (nothing spawned, nothing
+            // errored, nothing newly skipped, classification
+            // unchanged) deliberately skip the append to prevent log
+            // bloat.
+            if let Some(crate::cli::batch::SchedulerOutcome::Scheduled {
+                spawned_this_tick,
+                errored,
+                materialized_children,
+                reclassified_this_tick,
+                ..
+            }) = &scheduler_outcome
+            {
+                let skipped_count = materialized_children
+                    .iter()
+                    .filter(|mc| matches!(mc.outcome, crate::cli::batch::TaskOutcome::Skipped))
+                    .count();
+                let is_non_trivial = !spawned_this_tick.is_empty()
+                    || !errored.is_empty()
+                    || *reclassified_this_tick
+                    || skipped_count > 0;
+                if is_non_trivial {
+                    let ts = crate::engine::types::now_iso8601();
+                    let payload = crate::engine::types::EventPayload::SchedulerRan {
+                        state: final_state.to_string(),
+                        tick_summary: crate::engine::types::SchedulerTickSummary {
+                            spawned_count: spawned_this_tick.len(),
+                            errored_count: errored.len(),
+                            skipped_count,
+                            reclassified: *reclassified_this_tick,
+                        },
+                        timestamp: ts.clone(),
+                    };
+                    if let Err(e) = backend.append_event(&name, &payload, &ts) {
+                        eprintln!("warning: failed to append SchedulerRan event: {}", e);
+                    }
+                }
+            }
+
             // Emit the response JSON. When the scheduler ran, splice
             // a `scheduler` sibling key onto the envelope so callers
             // observe it alongside the advance-loop response. Issue

@@ -198,6 +198,43 @@ pub enum EventPayload {
         actual_output: serde_json::Value,
         timestamp: String,
     },
+    /// Per-tick audit record emitted by the batch scheduler on
+    /// non-trivial ticks (Decision 11 / Issue #16). `tick_summary`
+    /// carries per-tick counts (spawned, errored, skipped) and a
+    /// `reclassified` flag; non-trivial means any of these non-zero /
+    /// true. Pure no-op ticks deliberately skip the append to prevent
+    /// log bloat.
+    SchedulerRan {
+        /// Parent state the scheduler ran against.
+        state: String,
+        /// Per-tick outcome summary — see [`SchedulerTickSummary`].
+        tick_summary: SchedulerTickSummary,
+        /// RFC 3339 UTC timestamp mirroring [`Event::timestamp`]. Kept
+        /// inside the payload so downstream consumers reading just the
+        /// payload don't need to pair it with the outer envelope.
+        timestamp: String,
+    },
+}
+
+/// Per-tick counts recorded on a [`EventPayload::SchedulerRan`] event.
+///
+/// Mirrors the non-trivial-tick summary captured in
+/// `SchedulerOutcome::Scheduled`; emitted as the `tick_summary` body
+/// of the event so `koto query --events` can surface per-tick audit
+/// without re-running the scheduler.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchedulerTickSummary {
+    /// Number of children whose state file was created during this
+    /// tick.
+    pub spawned_count: usize,
+    /// Number of per-task spawn errors recorded during this tick.
+    pub errored_count: usize,
+    /// Number of children that moved to `Skipped` during this tick
+    /// (fresh skip-marker spawns, not pre-existing skip markers).
+    pub skipped_count: usize,
+    /// True when at least one child's classification changed during
+    /// this tick.
+    pub reclassified: bool,
 }
 
 impl EventPayload {
@@ -215,6 +252,7 @@ impl EventPayload {
             EventPayload::DecisionRecorded { .. } => "decision_recorded",
             EventPayload::GateEvaluated { .. } => "gate_evaluated",
             EventPayload::GateOverrideRecorded { .. } => "gate_override_recorded",
+            EventPayload::SchedulerRan { .. } => "scheduler_ran",
         }
     }
 }
@@ -386,6 +424,15 @@ impl<'de> Deserialize<'de> for Event {
                     timestamp: p.timestamp,
                 }
             }
+            "scheduler_ran" => {
+                let p: SchedulerRanPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::SchedulerRan {
+                    state: p.state,
+                    tick_summary: p.tick_summary,
+                    timestamp: p.timestamp,
+                }
+            }
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown event type: {}",
@@ -484,6 +531,13 @@ struct GateOverrideRecordedPayload {
     rationale: String,
     override_applied: serde_json::Value,
     actual_output: serde_json::Value,
+    timestamp: String,
+}
+
+#[derive(Deserialize)]
+struct SchedulerRanPayload {
+    state: String,
+    tick_summary: SchedulerTickSummary,
     timestamp: String,
 }
 
