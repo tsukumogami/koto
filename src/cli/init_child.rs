@@ -19,12 +19,12 @@
 //!   [`SpawnErrorKind::Collision`], preserving the race-winner
 //!   semantics `handle_init` already relies on.
 //!
-//! - **Per-tick compile cache.** The caller passes an optional
-//!   `&mut TemplateCompileCache`. When present, the same template path
-//!   is compiled once per tick and reused for every task that points at
-//!   it. When absent (direct callers, tests), the helper allocates a
-//!   throwaway cache for the one call so the public surface stays
-//!   identical.
+//! - **Per-tick compile cache.** The caller passes a
+//!   `&mut TemplateCompileCache`. The same template path is compiled
+//!   once per tick and reused for every task that points at it. Callers
+//!   that don't already hold a cache (direct CLI init, tests) allocate
+//!   a throwaway one at the call site; the helper itself never
+//!   allocates a cache.
 //!
 //! - **Per-template `resolve_variables`.** Each child template may
 //!   declare a different set of variables from its parent. The helper
@@ -46,6 +46,18 @@ use crate::cli::task_spawn_error::{SpawnErrorKind, TaskSpawnError};
 use crate::engine::types::{now_iso8601, Event, EventPayload, StateFileHeader};
 use crate::session::{SessionBackend, SessionError};
 use crate::template::types::CompiledTemplate;
+
+/// Prefix applied to `TaskSpawnError.message` when the underlying
+/// failure is a `--var` resolution error (unknown key, missing
+/// required, malformed `KEY=VALUE`, etc.).
+///
+/// `handle_init` uses this prefix to map the error back onto the
+/// CLI's existing exit code 2 (caller-error) rather than the generic
+/// exit code 1 used for compile / I/O / collision failures. Keeping
+/// the prefix as a named constant ensures producer and consumer stay
+/// in sync — a test below asserts the prefix appears on the error
+/// message when variable resolution fails.
+pub(crate) const VAR_RESOLUTION_MSG_PREFIX: &str = "variable resolution failed: ";
 
 /// Per-tick cache keyed by the *canonical* template source path.
 ///
@@ -92,6 +104,32 @@ impl TemplateCompileCache {
     }
 }
 
+/// Task-agnostic compile-failure detail.
+///
+/// `compile_with_cache` runs before the caller knows which task this
+/// failure belongs to (in the scheduler case the caller decides as it
+/// iterates entries; in the root-init case there is no task). Returning
+/// this struct lets the caller construct the full [`TaskSpawnError`]
+/// explicitly with the right `task`, `paths_tried`, `template_source`,
+/// and (future) `compile_error` fields filled in — without smuggling a
+/// sentinel `task = ""` through a field-spread `..e` update.
+///
+/// Keep this in sync with [`TaskSpawnError`]'s non-`task` fields if new
+/// compile-context fields land.
+#[derive(Debug)]
+pub(crate) struct CompileErrorInfo {
+    /// Discriminator for how to classify the eventual `TaskSpawnError`.
+    pub kind: SpawnErrorKind,
+    /// Human-readable message describing what went wrong.
+    pub message: String,
+    /// Source template path the caller asked about. Callers that know
+    /// the resolved / canonicalized form may prefer to log that
+    /// separately; this is the *input* path so the scheduler can plumb
+    /// it into `paths_tried` unchanged.
+    #[allow(dead_code)]
+    pub path: PathBuf,
+}
+
 /// Compile `template_path` once per cache, returning the cached
 /// [`CompiledTemplate`], its on-disk cache path (used as the stored
 /// `template_path` on the `WorkflowInitialized` event), and its hash
@@ -100,19 +138,19 @@ impl TemplateCompileCache {
 /// A hit returns the previously compiled bundle verbatim. A miss
 /// canonicalizes the source path, compiles via [`compile_cached`], and
 /// records the result before returning.
-//
-// clippy::result_large_err: `TaskSpawnError` is intentionally rich — its
-// shape is fixed by the design doc's Key Interfaces section so the
-// future batch scheduler can emit `paths_tried`, `template_source`, and
-// a typed `compile_error` on the same envelope. Boxing it here would
-// force the scheduler to unwrap Box every time it accumulates an
-// error into `SchedulerOutcome::Scheduled.errored`. The struct still
-// fits comfortably on the stack for the call depths this helper sees.
-#[allow(clippy::result_large_err)]
+///
+/// Errors are returned as [`CompileErrorInfo`] — a *partial* envelope
+/// with no `task` field — so the caller can construct the final
+/// [`TaskSpawnError`] with the right task name (or whatever root-init
+/// placeholder it prefers). Previous revisions used a sentinel
+/// `TaskSpawnError { task: "" }` plus `..e` field-spread to rewrite
+/// `task` at the call site; that pattern would silently drop any new
+/// field future issues (#5 / #8) add to [`TaskSpawnError`], so it's
+/// been replaced with this explicit construction.
 fn compile_with_cache(
     template_path: &Path,
     cache: &mut TemplateCompileCache,
-) -> Result<CachedTemplate, TaskSpawnError> {
+) -> Result<CachedTemplate, CompileErrorInfo> {
     // Canonicalize *before* looking up so two relative paths that point
     // at the same file share a cache slot. `canonicalize` also fails
     // with `NotFound` when the source doesn't exist, which is exactly
@@ -120,33 +158,33 @@ fn compile_with_cache(
     let canonical = match std::fs::canonicalize(template_path) {
         Ok(p) => p,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(TaskSpawnError::new(
-                "",
-                SpawnErrorKind::TemplateNotFound,
-                format!("template not found: {} ({})", template_path.display(), e),
-            ));
+            return Err(CompileErrorInfo {
+                kind: SpawnErrorKind::TemplateNotFound,
+                message: format!("template not found: {} ({})", template_path.display(), e),
+                path: template_path.to_path_buf(),
+            });
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(TaskSpawnError::new(
-                "",
-                SpawnErrorKind::PermissionDenied,
-                format!(
+            return Err(CompileErrorInfo {
+                kind: SpawnErrorKind::PermissionDenied,
+                message: format!(
                     "permission denied reading template {}: {}",
                     template_path.display(),
                     e
                 ),
-            ));
+                path: template_path.to_path_buf(),
+            });
         }
         Err(e) => {
-            return Err(TaskSpawnError::new(
-                "",
-                SpawnErrorKind::IoError,
-                format!(
+            return Err(CompileErrorInfo {
+                kind: SpawnErrorKind::IoError,
+                message: format!(
                     "failed to access template {}: {}",
                     template_path.display(),
                     e
                 ),
-            ));
+                path: template_path.to_path_buf(),
+            });
         }
     };
 
@@ -154,36 +192,31 @@ fn compile_with_cache(
         return Ok(hit.clone());
     }
 
-    let (cache_path, hash) = compile_cached(&canonical, false).map_err(|e| {
-        TaskSpawnError::new(
-            "",
-            SpawnErrorKind::TemplateCompileFailed,
-            format!("failed to compile template {}: {}", canonical.display(), e),
-        )
+    let (cache_path, hash) = compile_cached(&canonical, false).map_err(|e| CompileErrorInfo {
+        kind: SpawnErrorKind::TemplateCompileFailed,
+        message: format!("failed to compile template {}: {}", canonical.display(), e),
+        path: canonical.clone(),
     })?;
 
-    let content = std::fs::read_to_string(&cache_path).map_err(|e| {
-        TaskSpawnError::new(
-            "",
-            SpawnErrorKind::IoError,
-            format!(
-                "failed to read cached template {}: {}",
-                cache_path.display(),
-                e
-            ),
-        )
+    let content = std::fs::read_to_string(&cache_path).map_err(|e| CompileErrorInfo {
+        kind: SpawnErrorKind::IoError,
+        message: format!(
+            "failed to read cached template {}: {}",
+            cache_path.display(),
+            e
+        ),
+        path: cache_path.clone(),
     })?;
-    let compiled: CompiledTemplate = serde_json::from_str(&content).map_err(|e| {
-        TaskSpawnError::new(
-            "",
-            SpawnErrorKind::TemplateCompileFailed,
-            format!(
+    let compiled: CompiledTemplate =
+        serde_json::from_str(&content).map_err(|e| CompileErrorInfo {
+            kind: SpawnErrorKind::TemplateCompileFailed,
+            message: format!(
                 "failed to parse cached template {}: {}",
                 cache_path.display(),
                 e
             ),
-        )
-    })?;
+            path: cache_path.clone(),
+        })?;
 
     let entry = CachedTemplate {
         compiled,
@@ -233,18 +266,24 @@ fn classify_session_error(task: &str, err: SessionError) -> TaskSpawnError {
     }
 }
 
-/// Initialize a child workflow underneath `parent_name`.
+/// Initialize a workflow on disk, optionally linked to a parent.
+///
+/// `parent_name` is `Some(parent)` for a child spawn (the batch
+/// scheduler's hot path), threading `parent_workflow` through to the
+/// state-file header. When `None`, this is a root (top-level) init:
+/// the header's `parent_workflow` is `None` and the caller has
+/// typically arrived through `handle_init`'s CLI path.
 ///
 /// `child_name` is the full composed workflow name the caller wants on
-/// disk (e.g., `parent.issue-1`). The helper does not prepend the
+/// disk (e.g., `parent.issue-1` when `parent_name` is `Some`, or just
+/// `root-name` when it is `None`). The helper does not prepend the
 /// parent name itself — the scheduler composes that upstream so the
 /// composition rules live in one place.
 ///
 /// `template_path` is the source template (markdown with YAML
 /// frontmatter). The helper canonicalizes it, runs it through the
-/// supplied [`TemplateCompileCache`] (or a one-shot cache when `None`)
-/// and resolves `vars` against the child template's variable
-/// declarations.
+/// supplied [`TemplateCompileCache`], and resolves `vars` against the
+/// child template's variable declarations.
 ///
 /// On success a single atomic `init_state_file` call commits the
 /// header plus the `WorkflowInitialized` and initial `Transitioned`
@@ -253,32 +292,29 @@ fn classify_session_error(task: &str, err: SessionError) -> TaskSpawnError {
 /// straight into `SchedulerOutcome::Scheduled.errored` without extra
 /// bookkeeping.
 //
-// clippy::result_large_err: see the note on `compile_with_cache` above —
-// the error shape is dictated by the design doc and is intentionally
-// rich; boxing would only shift the cost to every caller in
-// `SchedulerOutcome::Scheduled.errored`.
+// clippy::result_large_err: `TaskSpawnError` is intentionally rich — its
+// shape is fixed by the design doc's Key Interfaces section so the
+// future batch scheduler can emit `paths_tried` (#5), `template_source`
+// (#5), and a typed `compile_error` (#8) on the same envelope. Current
+// size is roughly 6 * usize + 1 enum tag (~56 bytes today, ~120 bytes
+// once the Option fields are populated). Boxing it would force the
+// scheduler to unwrap `Box` every time it accumulates an error into
+// `SchedulerOutcome::Scheduled.errored`; we accept the warning here
+// rather than pushing that cost onto every caller.
 #[allow(clippy::result_large_err)]
 pub fn init_child_from_parent(
     backend: &dyn SessionBackend,
+    parent_name: Option<&str>,
     child_name: &str,
-    parent_name: &str,
     template_path: &Path,
     vars: &[String],
-    cache: Option<&mut TemplateCompileCache>,
+    cache: &mut TemplateCompileCache,
 ) -> Result<(), TaskSpawnError> {
-    // Use the caller-supplied cache when available so multiple spawns
-    // in one tick share compile work; otherwise allocate a throwaway
-    // cache with a single entry so the rest of this function stays
-    // uniform.
-    let mut local_cache = TemplateCompileCache::new();
-    let cache_ref: &mut TemplateCompileCache = match cache {
-        Some(c) => c,
-        None => &mut local_cache,
-    };
-
-    let cached = compile_with_cache(template_path, cache_ref).map_err(|e| TaskSpawnError {
-        task: child_name.to_string(),
-        ..e
+    let cached = compile_with_cache(template_path, cache).map_err(|info| {
+        TaskSpawnError::new(child_name, info.kind, info.message)
+        // NOTE: when Issue #5 / #8 land, this is where a richer
+        // TaskSpawnError (paths_tried, template_source, compile_error)
+        // would be composed from `info.path` plus caller-side context.
     })?;
 
     let variables =
@@ -286,7 +322,7 @@ pub fn init_child_from_parent(
             TaskSpawnError::new(
                 child_name,
                 SpawnErrorKind::TemplateCompileFailed,
-                format!("variable resolution failed: {}", msg),
+                format!("{}{}", VAR_RESOLUTION_MSG_PREFIX, msg),
             )
         })?;
 
@@ -299,7 +335,7 @@ pub fn init_child_from_parent(
         workflow: child_name.to_string(),
         template_hash: cached.hash.clone(),
         created_at: ts.clone(),
-        parent_workflow: Some(parent_name.to_string()),
+        parent_workflow: parent_name.map(|s| s.to_string()),
     };
 
     let init_payload = EventPayload::WorkflowInitialized {
@@ -455,13 +491,14 @@ Done.
 
         let template = write_template(tpl_dir.path(), "child.md", SIMPLE_TEMPLATE);
 
+        let mut cache = TemplateCompileCache::new();
         init_child_from_parent(
             &backend,
+            Some("parent"),
             "parent.child-1",
-            "parent",
             &template,
             &["TASK_ID=42".to_string()],
-            None,
+            &mut cache,
         )
         .expect("init child");
 
@@ -507,21 +544,21 @@ Done.
 
         init_child_from_parent(
             &backend,
+            Some("parent"),
             "parent.child-a",
-            "parent",
             &template,
             &["TASK_ID=1".to_string()],
-            Some(&mut cache),
+            &mut cache,
         )
         .expect("first spawn");
 
         init_child_from_parent(
             &backend,
+            Some("parent"),
             "parent.child-b",
-            "parent",
             &template,
             &["TASK_ID=2".to_string()],
-            Some(&mut cache),
+            &mut cache,
         )
         .expect("second spawn");
 
@@ -542,23 +579,25 @@ Done.
 
         let template = write_template(tpl_dir.path(), "child.md", SIMPLE_TEMPLATE);
 
+        let mut cache = TemplateCompileCache::new();
         init_child_from_parent(
             &backend,
+            Some("parent"),
             "parent.child-dup",
-            "parent",
             &template,
             &["TASK_ID=1".to_string()],
-            None,
+            &mut cache,
         )
         .expect("first spawn");
 
+        let mut cache2 = TemplateCompileCache::new();
         let err = init_child_from_parent(
             &backend,
+            Some("parent"),
             "parent.child-dup",
-            "parent",
             &template,
             &["TASK_ID=1".to_string()],
-            None,
+            &mut cache2,
         )
         .expect_err("second spawn must collide");
 
@@ -575,10 +614,51 @@ Done.
 
         let missing = sessions.path().join("does-not-exist.md");
 
-        let err = init_child_from_parent(&backend, "parent.child-x", "parent", &missing, &[], None)
-            .expect_err("missing template must error");
+        let mut cache = TemplateCompileCache::new();
+        let err = init_child_from_parent(
+            &backend,
+            Some("parent"),
+            "parent.child-x",
+            &missing,
+            &[],
+            &mut cache,
+        )
+        .expect_err("missing template must error");
 
         assert_eq!(err.kind, SpawnErrorKind::TemplateNotFound, "err={:?}", err);
         assert_eq!(err.task, "parent.child-x");
+    }
+
+    /// `parent_name = None` is the root-init path `handle_init` takes.
+    /// The resulting state-file header must record `parent_workflow =
+    /// None` so it stays a top-level workflow on disk, not a child.
+    #[test]
+    fn root_init_leaves_parent_workflow_none() {
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let tpl_dir = TempDir::new().expect("templates dir");
+        let backend = backend_in(sessions.path());
+
+        let template = write_template(tpl_dir.path(), "root.md", SIMPLE_TEMPLATE);
+
+        let mut cache = TemplateCompileCache::new();
+        init_child_from_parent(
+            &backend,
+            None,
+            "root-workflow",
+            &template,
+            &["TASK_ID=1".to_string()],
+            &mut cache,
+        )
+        .expect("root init");
+
+        let (header, _events) = backend
+            .read_events("root-workflow")
+            .expect("read root events");
+        assert_eq!(
+            header.parent_workflow, None,
+            "root init must leave parent_workflow unset"
+        );
+        assert_eq!(header.workflow, "root-workflow");
     }
 }

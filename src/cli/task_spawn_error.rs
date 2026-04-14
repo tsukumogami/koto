@@ -129,17 +129,23 @@ pub struct TaskSpawnError {
     /// Absolute paths the scheduler probed during template resolution,
     /// canonicalized. `None` on the direct-init path where resolution
     /// is a single lookup.
+    ///
+    /// Populated by Issue #5 (template path resolution).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paths_tried: Option<Vec<String>>,
 
     /// Whether the template path came from an agent override or the
     /// hook's default. Populated by the scheduler when it knows.
+    ///
+    /// Populated by Issue #5 (template path resolution).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_source: Option<TemplateSource>,
 
     /// Typed compile-error detail when `kind == TemplateCompileFailed`.
     /// Populated by the scheduler; Issue #3's direct-init helper leaves
     /// it `None` and relies on `message` for compile failures.
+    ///
+    /// Populated by Issue #8 (typed compile-error plumbing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compile_error: Option<CompileError>,
 }

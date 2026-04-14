@@ -26,7 +26,7 @@ use crate::cache::{compile_cached, sha256_hex};
 use crate::discover::find_workflows_with_metadata;
 use crate::engine::errors::EngineError;
 use crate::engine::persistence::{derive_decisions, derive_machine_state, derive_state_from_log};
-use crate::engine::types::{now_iso8601, Event, EventPayload, StateFileHeader};
+use crate::engine::types::{now_iso8601, Event, EventPayload};
 use crate::session::context::ContextStore;
 use crate::session::local::LocalBackend;
 use crate::session::{Backend, SessionBackend, SessionError};
@@ -1032,6 +1032,25 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
 }
 
 /// Handle the `koto init` command.
+///
+/// Thin wrapper over [`init_child_from_parent`]: performs the CLI-only
+/// validations (workflow name, parent existence, best-effort collision
+/// pre-check) and then delegates the actual compile + resolve + atomic
+/// state-file write to the helper. Any [`TaskSpawnError`] returned by
+/// the helper is mapped back onto the CLI's existing exit codes:
+///
+/// - `SpawnErrorKind::Collision` → "workflow already exists" at exit 1.
+/// - variable-resolution failures (messages prefixed with
+///   [`init_child::VAR_RESOLUTION_MSG_PREFIX`]) → exit 2, matching the
+///   legacy behavior where malformed / unknown / missing vars were
+///   classified as caller errors.
+/// - every other kind → exit 1 with the helper's message verbatim.
+///
+/// The helper re-reads the template from the compile cache and
+/// re-resolves `--var` bindings; `handle_init` no longer duplicates
+/// that work. The initial state is recovered from the on-disk header
+/// after a successful spawn so the JSON `{ name, state }` stdout line
+/// stays byte-compatible with the previous implementation.
 fn handle_init(
     backend: &dyn SessionBackend,
     name: &str,
@@ -1061,10 +1080,12 @@ fn handle_init(
         }
     }
 
-    // Check if session already exists (state file present). This is a
-    // best-effort pre-check; the atomic `init_state_file` call below is
-    // the authoritative collision detector (it handles concurrent
-    // racers where two callers both see `exists() == false`).
+    // Best-effort pre-check for "already exists". The atomic
+    // `init_state_file` inside the helper is the authoritative
+    // collision detector (handles the racers case), but emitting the
+    // pre-check error here keeps the error message identical in the
+    // common path and avoids paying compile cost when we already know
+    // the session exists.
     if backend.exists(name) {
         exit_with_error(serde_json::json!({
             "error": format!("workflow '{}' already exists", name),
@@ -1072,99 +1093,71 @@ fn handle_init(
         }));
     }
 
-    let (cache_path, hash) = match compile_cached(Path::new(template), false) {
-        Ok(result) => result,
-        Err(e) => {
-            exit_with_error(serde_json::json!({
-                "error": e.to_string(),
-                "command": "init"
-            }));
-        }
-    };
-
-    let cache_path_str = cache_path.to_string_lossy().to_string();
-    let compiled: CompiledTemplate = match load_compiled_template(&cache_path_str) {
-        Ok(t) => t,
-        Err(e) => {
-            exit_with_error(serde_json::json!({
-                "error": e.to_string(),
-                "command": "init"
-            }));
-        }
-    };
-
-    // Resolve --var flags against template variable declarations.
-    let variables = match resolve_variables(vars, &compiled.variables) {
-        Ok(v) => v,
-        Err(e) => {
-            exit_with_error_code(
-                serde_json::json!({
-                    "error": e,
+    // Delegate to the shared helper. We allocate a fresh cache for
+    // this one call since the CLI path never spawns siblings — the
+    // scheduler is the only caller that benefits from reusing a cache
+    // across multiple `init_child_from_parent` invocations.
+    let mut cache = TemplateCompileCache::new();
+    let template_path = Path::new(template);
+    if let Err(err) = init_child_from_parent(backend, parent, name, template_path, vars, &mut cache)
+    {
+        match err.kind {
+            SpawnErrorKind::Collision => {
+                // Match the pre-check's error text so callers can rely
+                // on a stable "already exists" string regardless of
+                // which detector fired.
+                exit_with_error(serde_json::json!({
+                    "error": format!("workflow '{}' already exists", name),
                     "command": "init"
-                }),
-                2,
-            );
-        }
-    };
-
-    let initial_state = compiled.initial_state.clone();
-    let ts = now_iso8601();
-
-    // Build the atomic bundle: one header + two initial events. The
-    // bundle shape matches what the old three-step sequence produced
-    // (append_header, then append_event for WorkflowInitialized with
-    // seq 1, then append_event for Transitioned with seq 2).
-    let header = StateFileHeader {
-        schema_version: 1,
-        workflow: name.to_string(),
-        template_hash: hash,
-        created_at: ts.clone(),
-        parent_workflow: parent.map(|s| s.to_string()),
-    };
-
-    let init_payload = EventPayload::WorkflowInitialized {
-        template_path: cache_path_str,
-        variables,
-    };
-    let transition_payload = EventPayload::Transitioned {
-        from: None,
-        to: initial_state.clone(),
-        condition_type: "auto".to_string(),
-    };
-    let initial_events = vec![
-        Event {
-            seq: 1,
-            timestamp: ts.clone(),
-            event_type: init_payload.type_name().to_string(),
-            payload: init_payload,
-        },
-        Event {
-            seq: 2,
-            timestamp: ts.clone(),
-            event_type: transition_payload.type_name().to_string(),
-            payload: transition_payload,
-        },
-    ];
-
-    // One atomic create-or-fail rename commits the header and both
-    // events together. A collision (another writer won the race)
-    // surfaces the same "already exists" caller-facing error the
-    // pre-check above would have emitted.
-    match backend.init_state_file(name, header, initial_events) {
-        Ok(()) => {}
-        Err(SessionError::Collision) => {
-            exit_with_error(serde_json::json!({
-                "error": format!("workflow '{}' already exists", name),
-                "command": "init"
-            }));
-        }
-        Err(e) => {
-            exit_with_error(serde_json::json!({
-                "error": e.to_string(),
-                "command": "init"
-            }));
+                }));
+            }
+            _ => {
+                // Variable-resolution failures are caller errors (exit
+                // 2); everything else is a runtime/IO/compile failure
+                // (exit 1), matching the legacy implementation.
+                let is_var_error = matches!(err.kind, SpawnErrorKind::TemplateCompileFailed)
+                    && err
+                        .message
+                        .starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
+                let body = serde_json::json!({
+                    "error": if is_var_error {
+                        err.message
+                            .strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
+                            .unwrap_or(&err.message)
+                            .to_string()
+                    } else {
+                        err.message.clone()
+                    },
+                    "command": "init"
+                });
+                if is_var_error {
+                    exit_with_error_code(body, 2);
+                } else {
+                    exit_with_error(body);
+                }
+            }
         }
     }
+
+    // Recover the initial state by reading back the header/events we
+    // just wrote. This keeps the CLI's JSON output (`{name, state}`)
+    // byte-compatible with the previous implementation without
+    // extending the helper's return type just for this one consumer.
+    let (_header, events) = backend
+        .read_events(name)
+        .map_err(|e| anyhow::anyhow!("failed to read newly initialized workflow: {}", e))?;
+    let initial_state = events
+        .iter()
+        .find_map(|e| match &e.payload {
+            EventPayload::Transitioned { to, .. } => Some(to.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "newly initialized workflow {:?} has no Transitioned event",
+                name
+            )
+        })?;
 
     println!(
         "{}",
