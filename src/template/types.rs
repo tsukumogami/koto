@@ -873,7 +873,7 @@ impl CompiledTemplate {
     /// | W2 | `children-complete.name_filter` is set but does not end with `.` (ergo not scoped to one parent) |
     /// | W3 | Terminal state whose name matches /block|fail|error/ lacks `failure: true` |
     /// | W4 | State with `materialize_children` routes only on `all_complete: true` without a second transition handling failures |
-    /// | W5 | Terminal state with `failure: true` has no path writing `failure_reason` to context |
+    /// | W5 | Terminal state with `failure: true` has no path writing `failure_reason` to context (v1 only checks the accepts-field path; templates relying on `default_action` or `context_assignments` may see false positives until those surfaces are checked) |
     ///
     /// Warnings are returned as formatted strings; callers emit them via
     /// stderr (`validate`) or collect them for tests.
@@ -3564,11 +3564,15 @@ command: "./check.sh"
     // because they need the source path.
     // ---------------------------------------------------------------------
 
-    /// Build a minimum valid batch-parent template: one non-terminal
-    /// declaring state with `materialize_children` and a children-complete
-    /// gate, plus a terminal `done` state. Callers mutate the result to
-    /// trip individual rules.
-    fn valid_batch_parent() -> CompiledTemplate {
+    /// Build a minimum batch-parent template: one non-terminal declaring
+    /// state with `materialize_children` and a children-complete gate,
+    /// plus a terminal `done` state. Callers mutate the result to trip
+    /// individual rules.
+    ///
+    /// Intentionally omits a failure-branch transition so W4-negative
+    /// coverage has something to fire on. Add a second transition on
+    /// `gates.cc.any_failed` for a W4-silent fixture.
+    fn minimal_batch_parent() -> CompiledTemplate {
         let mut accepts: BTreeMap<String, FieldSchema> = BTreeMap::new();
         accepts.insert(
             "tasks".to_string(),
@@ -3644,15 +3648,15 @@ command: "./check.sh"
 
     /// Positive baseline: a valid batch parent passes validate() cleanly.
     #[test]
-    fn issue8_valid_batch_parent_passes() {
-        let t = valid_batch_parent();
+    fn issue8_minimal_batch_parent_passes() {
+        let t = minimal_batch_parent();
         t.validate(true)
             .expect("valid batch parent should validate");
     }
 
     #[test]
     fn issue8_e1_empty_from_field_rejected() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         t.states
             .get_mut("plan")
             .unwrap()
@@ -3667,7 +3671,7 @@ command: "./check.sh"
 
     #[test]
     fn issue8_e2_unknown_from_field_rejected() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         t.states
             .get_mut("plan")
             .unwrap()
@@ -3686,7 +3690,7 @@ command: "./check.sh"
 
     #[test]
     fn issue8_e3_wrong_field_type_rejected() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         let accepts = t.states.get_mut("plan").unwrap().accepts.as_mut().unwrap();
         accepts.get_mut("tasks").unwrap().field_type = "string".to_string();
         let err = t.validate(true).unwrap_err();
@@ -3695,7 +3699,7 @@ command: "./check.sh"
 
     #[test]
     fn issue8_e4_not_required_field_rejected() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         t.states
             .get_mut("plan")
             .unwrap()
@@ -3711,7 +3715,7 @@ command: "./check.sh"
 
     #[test]
     fn issue8_e5_terminal_declaring_state_rejected() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         t.states.get_mut("plan").unwrap().terminal = true;
         let err = t.validate(true).unwrap_err();
         assert!(err.starts_with("E5:"), "got: {}", err);
@@ -3720,7 +3724,7 @@ command: "./check.sh"
     #[test]
     fn issue8_e6_valid_policies_pass() {
         // Positive test: both enum values are accepted.
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         t.states
             .get_mut("plan")
             .unwrap()
@@ -3733,7 +3737,7 @@ command: "./check.sh"
 
     #[test]
     fn issue8_e7_no_outgoing_transition_rejected() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         t.states.get_mut("plan").unwrap().transitions.clear();
         let err = t.validate(true).unwrap_err();
         assert!(err.starts_with("E7:"), "got: {}", err);
@@ -3741,7 +3745,7 @@ command: "./check.sh"
 
     #[test]
     fn issue8_e8_duplicate_from_field_rejected() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         // Add a second state referencing the same from_field.
         let mut accepts2: BTreeMap<String, FieldSchema> = BTreeMap::new();
         accepts2.insert(
@@ -3799,7 +3803,7 @@ command: "./check.sh"
 
     #[test]
     fn issue8_e9_empty_default_template_rejected() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         t.states
             .get_mut("plan")
             .unwrap()
@@ -3813,7 +3817,7 @@ command: "./check.sh"
 
     #[test]
     fn issue8_e10_missing_children_complete_gate_rejected() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         t.states.get_mut("plan").unwrap().gates.clear();
         // Without the gate, the transition's when clause references a
         // gate that isn't declared — that's a D3 error that fires before
@@ -3836,7 +3840,7 @@ command: "./check.sh"
         // mode because of the untouched gate; W1 is an independent
         // Issue-8 warning that we surface via direct collection here to
         // exercise the W1 rule in isolation.
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         t.states.get_mut("plan").unwrap().transitions = vec![Transition {
             target: "done".to_string(),
             when: None,
@@ -3852,7 +3856,7 @@ command: "./check.sh"
     #[test]
     fn issue8_w1_not_fired_when_gate_observed() {
         // Positive: when the gate is observed via a when clause, W1 is silent.
-        let t = valid_batch_parent();
+        let t = minimal_batch_parent();
         let warnings = t.collect_materialize_children_warnings();
         assert!(
             !warnings.iter().any(|w| w.starts_with("W1:")),
@@ -3863,7 +3867,7 @@ command: "./check.sh"
 
     #[test]
     fn issue8_w2_name_filter_missing_dot_emits_warning() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         t.states
             .get_mut("plan")
             .unwrap()
@@ -3882,7 +3886,7 @@ command: "./check.sh"
 
     #[test]
     fn issue8_w2_name_filter_with_dot_is_silent() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         t.states
             .get_mut("plan")
             .unwrap()
@@ -3900,7 +3904,7 @@ command: "./check.sh"
 
     #[test]
     fn issue8_w3_failureish_name_without_failure_flag_warns() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         // Add a terminal state named "blocked" without failure: true.
         let blocked = TemplateState {
             directive: "Blocked.".to_string(),
@@ -3928,7 +3932,7 @@ command: "./check.sh"
 
     #[test]
     fn issue8_w3_failure_flag_silences_warning() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         let failed = TemplateState {
             directive: "Failed.".to_string(),
             details: String::new(),
@@ -3953,9 +3957,9 @@ command: "./check.sh"
 
     #[test]
     fn issue8_w4_only_all_complete_without_failure_branch_warns() {
-        // The baseline valid_batch_parent routes only on all_complete: true
+        // The baseline minimal_batch_parent routes only on all_complete: true
         // with no failure branch. W4 should fire.
-        let t = valid_batch_parent();
+        let t = minimal_batch_parent();
         let warnings = t.collect_materialize_children_warnings();
         assert!(
             warnings.iter().any(|w| w.starts_with("W4:")),
@@ -3966,39 +3970,38 @@ command: "./check.sh"
 
     #[test]
     fn issue8_w4_with_failure_branch_silent() {
-        let mut t = valid_batch_parent();
-        // Add a second transition guarded by any_failed. The gate-field
-        // reachability check (D4) only runs over fields in gate_type_schema
-        // and any_failed isn't in the children-complete schema today, so
-        // D4 emits an eprintln but does not error. The D3 when-clause
-        // validator rejects unknown fields — so to exercise W4 cleanly we
-        // route via needs_attention, which is also not in the current
-        // schema and would be rejected. Instead, drop the D3 check by
-        // bypassing the gate namespace: use a non-gate second branch
-        // keyed on agent evidence. W4 looks for gates.<gate>.any_* fields
-        // on the declaring state's transitions, so we craft the second
-        // transition with a synthesized gates.cc.any_failed key. Since
-        // the current D3 validator rejects unknown gate fields, we
-        // instead verify the negative branch by asserting only the
-        // negative condition: with a single gates.cc.all_success
-        // transition replacing all_complete, W4 still triggers because
-        // all_success is also in the set that counts as "success route".
+        // Positive-negative coverage for W4: when a materialize_children
+        // state pairs its `gates.<gate>.all_complete` transition with a
+        // second transition guarded by `gates.<gate>.any_failed`, W4 must
+        // stay silent.
         //
-        // Cleanest negative coverage: the positive case already exercises
-        // W4 firing. Here we confirm that absence of materialize_children
-        // silences W4 entirely.
-        t.states.get_mut("plan").unwrap().materialize_children = None;
+        // We call `collect_materialize_children_warnings()` directly
+        // rather than `validate()`, so D3's when-clause field validator
+        // (which would reject `any_failed` because it isn't in the
+        // children-complete gate schema today) never runs. The BTreeMap
+        // is built by hand so we control the exact keys W4 inspects.
+        let mut t = minimal_batch_parent();
+        let mut failure_when: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        failure_when.insert("gates.cc.any_failed".to_string(), serde_json::json!(true));
+        t.states
+            .get_mut("plan")
+            .unwrap()
+            .transitions
+            .push(Transition {
+                target: "done".to_string(),
+                when: Some(failure_when),
+            });
         let warnings = t.collect_materialize_children_warnings();
         assert!(
             !warnings.iter().any(|w| w.starts_with("W4:")),
-            "W4 should be quiet without materialize_children; got: {:?}",
+            "W4 should be silent when a failure branch on gates.cc.any_failed is present; got: {:?}",
             warnings
         );
     }
 
     #[test]
     fn issue8_w5_failure_terminal_without_failure_reason_warns() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         // Add a terminal failure state with no failure_reason writer.
         let failed = TemplateState {
             directive: "Failed.".to_string(),
@@ -4024,7 +4027,7 @@ command: "./check.sh"
 
     #[test]
     fn issue8_w5_failure_reason_in_accepts_silences_warning() {
-        let mut t = valid_batch_parent();
+        let mut t = minimal_batch_parent();
         let mut failure_accepts: BTreeMap<String, FieldSchema> = BTreeMap::new();
         failure_accepts.insert(
             "failure_reason".to_string(),

@@ -105,6 +105,67 @@ pub struct CompileErrorLocation {
     pub column: u32,
 }
 
+impl CompileError {
+    /// Build a `CompileError` from a rule-tag prefix and message.
+    ///
+    /// The v1 `validate_materialize_children_errors` path returns
+    /// `Result<(), String>` where each error string is prefixed with its
+    /// rule tag (for example `"E1: state \"plan\": ..."`). Callers that
+    /// want a structured envelope can split the prefix off and feed both
+    /// halves to this helper rather than re-encoding the convention.
+    ///
+    /// `rule_tag` should be a short identifier such as `"E1"`, `"E10"`,
+    /// or `"W4"`. It is stored verbatim in `CompileError.kind` so
+    /// downstream consumers (scenario-11 in the functional tests, the
+    /// scheduler envelope in Issue #12) can assert against the rule
+    /// identifier without re-parsing the message.
+    ///
+    /// Issue #10 will introduce the full typed error envelope; this
+    /// helper is the minimum wiring needed so the rule tag round-trips
+    /// through `CompileError.kind` until then.
+    pub fn from_rule_tag(rule_tag: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: rule_tag.into(),
+            message: message.into(),
+            location: None,
+        }
+    }
+}
+
+/// Extract a compile-rule tag (e.g., `"E1"`, `"W4"`) from the prefix of
+/// an error or warning message produced by
+/// `validate_materialize_children_errors` or
+/// `collect_materialize_children_warnings`.
+///
+/// Both surfaces format messages as `"<TAG>: <rest>"` where `<TAG>` is
+/// `E1`..`E10` for compile errors and `W1`..`W5` / `F5` for warnings.
+/// Returns `Some("E1")` / `Some("W4")` / etc. when the message begins
+/// with that shape, otherwise `None`.
+///
+/// This is the v1 bridge between the string-based validator output and
+/// the structured `CompileError.kind` field. Issue #10 replaces it with
+/// a typed enum pipeline end-to-end; until then scenario-11 uses this
+/// helper to assert rule identity without coupling to message wording.
+pub fn parse_compile_rule_tag(msg: &str) -> Option<&str> {
+    let colon = msg.find(':')?;
+    let tag = &msg[..colon];
+    if tag.is_empty() {
+        return None;
+    }
+    let mut chars = tag.chars();
+    let first = chars.next()?;
+    // Tag must start with E/W/F and have at least one digit after.
+    if !matches!(first, 'E' | 'W' | 'F') {
+        return None;
+    }
+    let rest_is_digits = chars.clone().count() > 0 && chars.all(|c| c.is_ascii_digit());
+    if rest_is_digits {
+        Some(tag)
+    } else {
+        None
+    }
+}
+
 /// Per-task spawn error. Collected per-tick by the batch scheduler
 /// (Issue #12) and surfaced via `SchedulerOutcome::Scheduled.errored`.
 ///
@@ -202,6 +263,38 @@ mod tests {
                 kind
             );
         }
+    }
+
+    #[test]
+    fn parse_compile_rule_tag_accepts_documented_shapes() {
+        assert_eq!(
+            parse_compile_rule_tag("E1: state \"plan\": ..."),
+            Some("E1")
+        );
+        assert_eq!(
+            parse_compile_rule_tag("E10: state \"plan\": x"),
+            Some("E10")
+        );
+        assert_eq!(parse_compile_rule_tag("W4: state \"plan\": x"), Some("W4"));
+        assert_eq!(parse_compile_rule_tag("F5: child 'x': ..."), Some("F5"));
+    }
+
+    #[test]
+    fn parse_compile_rule_tag_rejects_non_rule_prefixes() {
+        assert_eq!(parse_compile_rule_tag("state \"plan\": foo"), None);
+        assert_eq!(parse_compile_rule_tag("warning: something"), None);
+        assert_eq!(parse_compile_rule_tag("E: missing digits"), None);
+        assert_eq!(parse_compile_rule_tag("E1"), None); // no colon at all
+        assert_eq!(parse_compile_rule_tag(""), None);
+        assert_eq!(parse_compile_rule_tag("Ex1: not a digit"), None);
+    }
+
+    #[test]
+    fn compile_error_from_rule_tag_populates_kind() {
+        let err = CompileError::from_rule_tag("E1", "state \"plan\": from_field must not be empty");
+        assert_eq!(err.kind, "E1");
+        assert!(err.message.starts_with("state "));
+        assert!(err.location.is_none());
     }
 
     #[test]
