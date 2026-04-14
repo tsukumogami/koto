@@ -31,32 +31,65 @@ pub struct StateFileHeader {
 /// later ticks can compare a fresh submission against the entry the
 /// child was actually created under (see Decision 10 / R8 spawn-time
 /// immutability). The snapshot captures exactly three fields — the
-/// resolved template path, the variable bindings, and the `waits_on`
+/// source template path, the variable bindings, and the `waits_on`
 /// dependency list — in a deterministic shape:
 ///
-/// * `template` is the canonical path string of the resolved
-///   template. For entries that inherited from the parent's
-///   `default_template`, this is the resolved value AS IT STOOD AT
-///   THE SPAWNING TICK (not a `None` inherited marker).
+/// * `template` is the source template path string as submitted by
+///   the batch scheduler (the path used to compile the template, not
+///   the post-compile cache-dir path). For entries that inherited
+///   from the parent's `default_template`, this is the resolved
+///   source path AS IT STOOD AT THE SPAWNING TICK (not a `None`
+///   inherited marker).
 /// * `vars` uses a [`BTreeMap`] so the serialized key order is
 ///   lexicographic and stable — two snapshots with the same bindings
 ///   serialize byte-identically, which is what R8 needs for
 ///   spawn-time comparison.
-/// * `waits_on` preserves insertion order as it appeared in the
-///   submission.
+/// * `waits_on` is stored sorted ascending; R8 byte-equality
+///   comparison relies on this canonical ordering.
 ///
 /// The struct is only read/written via `WorkflowInitialized` events,
 /// never on its own row, so it does not need its own type_name.
+///
+/// Prefer constructing via [`SpawnEntrySnapshot::new`] to ensure
+/// `waits_on` is stored in canonical (sorted) form. Direct struct
+/// literal construction is permitted but the caller is responsible
+/// for pre-sorting `waits_on`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpawnEntrySnapshot {
-    /// Canonical template path as resolved at spawn time.
+    /// Source template path as submitted by the scheduler (the path
+    /// used to compile the template, not the cache-dir path).
     pub template: String,
     /// Variable bindings in canonical (sorted) form.
     #[serde(default)]
     pub vars: BTreeMap<String, serde_json::Value>,
-    /// `waits_on` dependency list as submitted.
+    /// `waits_on` dependency list, sorted ascending for canonical
+    /// form; R8 byte-equality relies on this.
     #[serde(default)]
     pub waits_on: Vec<String>,
+}
+
+impl SpawnEntrySnapshot {
+    /// Construct a `SpawnEntrySnapshot` with `waits_on` sorted into
+    /// canonical (ascending) order.
+    ///
+    /// This is the preferred construction path: R8 spawn-time
+    /// comparison is a byte-equality check, and two snapshots with
+    /// the same dependency set must produce identical JSON. Sorting
+    /// here makes that invariant hold regardless of the order the
+    /// scheduler submitted dependencies in.
+    pub fn new(
+        template: String,
+        vars: BTreeMap<String, serde_json::Value>,
+        waits_on: Vec<String>,
+    ) -> Self {
+        let mut waits_on = waits_on;
+        waits_on.sort();
+        Self {
+            template,
+            vars,
+            waits_on,
+        }
+    }
 }
 
 /// Type-specific payload for each event variant.
@@ -657,9 +690,9 @@ mod tests {
         // With-snapshot path: a WorkflowInitialized event that carries a
         // canonical-form `spawn_entry`. Must round-trip byte-for-byte and
         // the serialized form must include the snapshot.
-        let snapshot = SpawnEntrySnapshot {
-            template: "impl-issue.md".to_string(),
-            vars: {
+        let snapshot = SpawnEntrySnapshot::new(
+            "impl-issue.md".to_string(),
+            {
                 let mut m = BTreeMap::new();
                 m.insert(
                     "ISSUE_NUMBER".to_string(),
@@ -667,8 +700,8 @@ mod tests {
                 );
                 m
             },
-            waits_on: vec!["B".to_string()],
-        };
+            vec!["B".to_string()],
+        );
         let e = Event {
             seq: 1,
             timestamp: "2026-01-01T00:00:00Z".to_string(),
@@ -709,11 +742,7 @@ mod tests {
         vars.insert("APPLE".to_string(), serde_json::json!("a"));
         vars.insert("MANGO".to_string(), serde_json::json!("m"));
 
-        let snapshot = SpawnEntrySnapshot {
-            template: "t.md".to_string(),
-            vars,
-            waits_on: vec![],
-        };
+        let snapshot = SpawnEntrySnapshot::new("t.md".to_string(), vars, vec![]);
         let json = serde_json::to_string(&snapshot).unwrap();
         let apple_pos = json.find("APPLE").expect("APPLE present");
         let mango_pos = json.find("MANGO").expect("MANGO present");
@@ -722,6 +751,23 @@ mod tests {
             apple_pos < mango_pos && mango_pos < zebra_pos,
             "vars must serialize in sorted key order, got {}",
             json
+        );
+    }
+
+    #[test]
+    fn spawn_entry_snapshot_new_sorts_waits_on() {
+        // The `new` constructor must store `waits_on` in canonical
+        // (sorted) order regardless of the order the scheduler
+        // submitted dependencies in. R8 byte-equality relies on this.
+        let snapshot = SpawnEntrySnapshot::new(
+            "t.md".to_string(),
+            BTreeMap::new(),
+            vec!["b".to_string(), "a".to_string(), "c".to_string()],
+        );
+        assert_eq!(
+            snapshot.waits_on,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "waits_on must be sorted ascending"
         );
     }
 

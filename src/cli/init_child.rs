@@ -710,11 +710,11 @@ Done.
             "TASK_ID".to_string(),
             serde_json::Value::String("42".to_string()),
         );
-        let snapshot = SpawnEntrySnapshot {
-            template: "child.md".to_string(),
-            vars: vars_map,
-            waits_on: vec!["sibling-a".to_string()],
-        };
+        let snapshot = SpawnEntrySnapshot::new(
+            "child.md".to_string(),
+            vars_map,
+            vec!["sibling-a".to_string()],
+        );
 
         let mut cache = TemplateCompileCache::new();
         init_child_from_parent(
