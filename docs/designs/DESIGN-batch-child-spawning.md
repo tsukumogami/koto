@@ -30,6 +30,12 @@ decision: |
   the existing rewind machinery. Observability lands as optional
   `batch` sections on `koto status` and per-row metadata on
   `koto workflows --children`, sharing a `derive_batch_view` helper.
+  Six round-1 follow-up decisions (Decisions 9-14) refine the retry
+  path end-to-end, pin mutation semantics against append-only state,
+  specify the error envelope and pre-append validation timing, harden
+  the concurrency model with kernel-level atomic init and an advisory
+  lock, preserve batch observability past terminal transitions, and
+  close path-resolution ambiguities.
 rationale: |
   The state-level hook is the only shape of four candidates that
   localizes declaration, validation, and execution to a single state
@@ -45,7 +51,18 @@ rationale: |
   use case. Narrow `deny_unknown_fields` gives a better error message
   than a format_version bump with less migration surface. The whole
   feature lands in three sequential PRs (atomic init, schema layer,
-  scheduler + observability) without breaking v0.7.0 behavior.
+  scheduler + observability) without breaking v0.7.0 behavior. The
+  round-1 follow-up decisions settle the corners round-0 left open:
+  retry is routed through a template-declared transition with a
+  discovery surface (Decision 9); spawned-task fields are frozen at
+  spawn time (Decision 10); rejections carry typed discriminators via
+  an extended `NextError` envelope and validation runs pre-append
+  (Decision 11); child init uses `renameat2(RENAME_NOREPLACE)` on
+  Linux with a POSIX fallback and an advisory flock serializes parent
+  ticks (Decision 12); batch views persist past the batched state via
+  a `BatchFinalized` event and terminal responses (Decision 13); and
+  path resolution handles absent headers and splits the resolve-error
+  variant so per-task failures don't abort siblings (Decision 14).
 ---
 
 # DESIGN: batch-child-spawning
@@ -619,8 +636,8 @@ a `children-complete` gate on the same state.
 | `waits_on` | array of string | no | `[]` | Sibling task names that must complete first. |
 | `trigger_rule` | string enum | no | `all_success` | Reserved for v2; only `all_success` accepted in v1. |
 
-**Compiler validation (errors E1–E10, warnings W1–W3, runtime checks
-R1–R7):**
+**Compiler validation (errors E1–E10, warnings W1–W5, runtime checks
+R0–R9):**
 
 | Rule | Level | Check |
 |------|-------|-------|
@@ -634,10 +651,24 @@ R1–R7):**
 | E8 | error | No two states reference the same `from_field` (copy-paste guard) |
 | E9 | error | `default_template` is non-empty and resolves to a compilable template |
 | E10 | error | State with `materialize_children` must also declare a `children-complete` gate (single-state fan-out) |
+| F5 | compile | Child template referenced as `default_template` or per-task override must declare at least one terminal state with `skipped_marker: true` reachable via a scheduler-writable transition (Decision 9). Warning, not error, because batch-eligibility isn't statically knowable at child-compile time. |
 | W1 | warning | A `children-complete` gate is reachable from the declaring state |
 | W2 | warning | If `children-complete.name_filter` is set, it starts with `<parent>.` |
 | W3 | warning | Terminal state whose name contains "block", "fail", or "error" lacks `failure: true` |
-| R1–R7 | runtime | Child template compilable; vars resolve; `waits_on` is a DAG; no dangling refs; task names unique; names pass `validate_workflow_name`; no collisions with existing siblings |
+| W4 | warning | State with `materialize_children` routes only on `all_complete: true` without a second transition handling `any_failed > 0` or `any_skipped > 0`. Failed or skipped children would route to the success branch silently. (Decision 9) |
+| W5 | warning | Terminal state with `failure: true` has no path that writes `failure_reason` to context. The batch view's per-child `reason` field falls back to the state name. (Decision 13) |
+| R0 | runtime | Task list is non-empty (`tasks.len() >= 1`). Decision 11. |
+| R1 | runtime | **Per-task:** child template resolvable and compilable. Failures surface in `SchedulerOutcome.errored` and as `BatchTaskView.outcome: spawn_failed`; siblings continue. (Decision 14) |
+| R2 | runtime | Per-task: `vars` resolve against the child template. Per-task failures in `SchedulerOutcome.errored`. |
+| R3 | runtime | **Whole-submission:** `waits_on` is a DAG (no cycles). Rejects pre-append with `InvalidBatchReason::Cycle`. |
+| R4 | runtime | **Whole-submission:** `waits_on` has no dangling references. |
+| R5 | runtime | **Whole-submission:** task names are unique within the submission. |
+| R6 | runtime | Hard limits: `tasks.len() <= 1000`, `waits_on.len() <= 10` per task, DAG depth `<= 50` where depth is the node count along the longest root-to-leaf path. Per-limit `InvalidBatchReason` variants. (Decision 14) |
+| R7 | runtime | No collisions with existing siblings (enforced at init via `renameat2(RENAME_NOREPLACE)`; see Decision 12). |
+| R8 | runtime | **Spawn-time immutability.** For each task whose child `<parent>.<task.name>` already exists on disk, the submitted entry's `template`, `vars`, and `waits_on` must match the `spawn_entry` snapshot recorded on the child's `WorkflowInitialized` event. Mismatches reject pre-append with `InvalidBatchReason::SpawnedTaskMutated`. (Decision 10) |
+| R9 | runtime | Task name matches `^[A-Za-z0-9_-]+$`, 1-64 chars, not in reserved set `{retry_failed, cancel_tasks}`. (Decision 11) |
+
+All R0-R9 checks are **pre-append** per Decision 11: validation runs as a pure function of the submitted payload before any `EvidenceSubmitted` write. Rejected submissions leave zero state on the parent's event log.
 
 **`failure_policy` placement on the hook, not in the payload.** The
 policy is a parent-template contract — the `await` state's transitions
@@ -645,6 +676,20 @@ and recovery routes are written assuming a specific failure behavior.
 Letting agents override it per-submission would invalidate the parent
 template's promises. One batch per template in v1 makes "per-hook" and
 "per-batch" equivalent.
+
+**Revised in round 1 (see Decisions 9, 10, 11, 14).** Decision 11 adds
+R0 (non-empty task list), R9 (name regex + reserved-name set), and
+commits all runtime rules to pre-append execution. Decision 10 adds R8
+(spawn-time immutability) and defines "union by name" precisely:
+un-spawned entries are last-write-wins, spawned entries are locked
+against the recorded `spawn_entry`. Decision 9 adds W4 (transitions
+that swallow failure) and F5 (batch-eligible child templates must
+declare a scheduler-reachable `skipped_marker` state). Decision 13 adds
+W5 (`failure: true` states that produce no `failure_reason`). Decision
+14 makes R1 per-task so a single bad child template surfaces as
+`BatchTaskView.outcome: spawn_failed` rather than aborting the
+submission, and pins R6's depth definition to node count along the
+longest root-to-leaf path.
 
 #### Alternatives considered
 
@@ -711,6 +756,19 @@ every crash point is enumerated in a table. Every case produces a
 recoverable state with no operator action required. Worst case is a
 leaked `.koto-*.tmp` file, invisible to `exists()` and `list()`,
 cleaned up at next `backend.cleanup`.
+
+**Revised in round 1 (see Decisions 10 and 12).** Decision 10 extends
+the `WorkflowInitialized` event with an optional `spawn_entry`
+snapshot capturing the exact task entry the scheduler used (template,
+vars, waits_on in canonical form). The field is additive and marked
+`#[serde(default, skip_serializing_if = "Option::is_none")]`, so
+pre-Decision-10 children deserialize cleanly. Decision 12 strengthens
+the final-rename step: Linux uses `renameat2(RENAME_NOREPLACE)` for a
+single-syscall fail-if-exists check, and other Unixes use POSIX
+`link()` followed by `unlink()` on the tempfile. The tempfile + rename
+bundle itself is unchanged. The sequence is now "atomic create-only"
+rather than "atomic replace," which closes the `init_state_file`
+TOCTOU window between two concurrent ticks seeing the same ready task.
 
 #### Alternatives considered
 
@@ -873,6 +931,34 @@ helper at `../shared/helper.md`. Users sharing a machine across trust
 boundaries should avoid running koto as a more-privileged account
 against task lists produced by a less-privileged account.
 
+**Revised in round 1 (see Decision 14).** The resolution order above
+covers present-and-valid `template_source_dir` cleanly, but two corners
+needed explicit handling:
+
+- **Absent `template_source_dir`** (pre-Decision-4 state files) skips
+  step (b) entirely. The scheduler falls straight through to step (c)
+  and emits `SchedulerWarning::MissingTemplateSourceDir` once per
+  tick.
+- **Present but stale `template_source_dir`** (the directory doesn't
+  exist on the current machine, e.g., after a cross-home-layout
+  migration) emits `SchedulerWarning::StaleTemplateSourceDir` before
+  falling through to `submitter_cwd`.
+
+Both warnings surface on `SchedulerOutcome.warnings` (see Decision 11
+coordination: the warnings vector is a sibling to `errored`). Agents
+see actionable diagnostics rather than a generic "file not found."
+
+Decision 14 also splits `BatchError::TemplateResolveFailed` into two
+variants so agents can distinguish path failure from compile failure:
+
+- `TemplateNotFound { task, paths_tried }` — every configured base was
+  tried; the file exists at none of them.
+- `TemplateCompileFailed { task, path, compile_error }` — the file was
+  found and read, but template compilation failed.
+
+Both variants surface per-task through `SchedulerOutcome.errored`,
+never as a whole-submission abort (R1 is per-task per Decision 14).
+
 #### Alternatives considered
 
 - **Absolute paths only.** Rejected: non-portable, brittle across
@@ -894,7 +980,7 @@ how a skipped dependent is represented on disk; what the
 `children-complete` gate output schema looks like; and what evidence
 action the parent submits to retry a failed chain.
 
-#### Chosen: first-class failure + synthetic skipped state files + extended gate + `retry_failed` evidence
+#### Chosen: first-class failure + skip-marker state files + extended gate + `retry_failed` evidence
 
 **5.1 Terminal success vs terminal failure.** New optional `failure:
 bool` field on `TemplateState`, meaningful only when `terminal: true`.
@@ -914,13 +1000,13 @@ The scheduler and gate both read `tmpl.states[state].failure`
 directly. Scheduler behavior is no longer coupled to template naming
 conventions.
 
-**5.2 Skipped-child representation: synthetic state file via new
-`skipped_marker: bool` terminal-state field.** When task X is skipped
-because its dependency failed, the scheduler init-spawns the child
-via the same atomic bundle from Decision 2 and the bundle includes a
-`Transitioned → skipped_marker_state` event. The skip reason lives in
-a context key (`skipped_because: <failed_task_name>`), not a new
-event type.
+**5.2 Skipped-child representation: child's real template plus runtime
+reclassification.** When task X is skipped because its dependency
+failed, the scheduler init-spawns the child via the same atomic bundle
+from Decision 2 using the **child's real template** (not a synthetic
+mini-template), and the initial events route the child directly to a
+state where `skipped_marker: true`. The skip reason lives in a context
+key (`skipped_because: <failed_task_name>`), not a new event type.
 
 ```yaml
 states:
@@ -931,17 +1017,46 @@ states:
 ```
 
 Preserves unified discovery via `backend.list()` — all children
-(success, failure, skipped) show up the same way. No new event
-types.
+(success, failure, skipped) show up the same way. No new event types.
+No hidden synthetic-template artifact.
 
-**Skipped-child template identity.** The scheduler does NOT use the
-parent template for skipped children. Instead, it uses a built-in
-synthetic mini-template hardcoded in `src/cli/batch.rs` with exactly
-two states: an initial state and a `skipped_due_to_dep_failure`
-terminal state with `skipped_marker: true`. This avoids requiring
-every child template to declare a skipped-marker state. The synthetic
-template is never compiled from a file; it's constructed in code as a
-`CompiledTemplate` struct.
+**Revised in round 1 (see Decision 9).** The original round-0 design
+used a hardcoded synthetic mini-template for skipped children. That
+mechanism is superseded by runtime reclassification because two
+round-1 blockers were unfixable under it:
+
+1. A real-template running child whose upstream flipped to failure
+   had no legal transition into a *different* template's
+   `skipped_marker` state (cross-template transitions are not an
+   engine feature and adding them is out of scope).
+2. Stale skip markers (a child was skipped because B failed; later B
+   was retried and succeeded) could not be cleared without an
+   explicit "refresh" primitive that costs a new event type.
+
+Runtime reclassification replaces both paths with one sweep. On every
+scheduler tick:
+
+- **Skip markers on the real template are re-evaluated.** If any
+  `waits_on` dependency still reports `failure`, the marker stays. If
+  all dependencies are now `success` or in progress, the marker is
+  stale — the scheduler deletes the child state file and respawns the
+  task with its real template at initial state, per Decision 2's
+  atomic init.
+- **Real-template running children whose upstream flips to failure
+  are delete-and-respawned as skip markers.** The child's in-progress
+  work is invalidated (which is correct: its dependency failed) and
+  the child is respawned directly into its `skipped_marker` terminal.
+
+This is why Decision 1's F5 warning fires: every batch-eligible child
+template must declare a reachable `skipped_marker: true` state so the
+scheduler has somewhere to route.
+
+The delete-and-respawn path is keyed on `skipped_marker: true` on the
+child's current state — never on a hidden marker file or template
+hash. Decision 10's `spawn_entry` snapshot on `WorkflowInitialized` is
+preserved across delete-and-respawn: the scheduler uses the most
+recently accepted task entry, which under Decision 10's rules is
+stable (R8 locks `spawn_entry` against the submitted payload).
 
 **5.3 Extended `children-complete` gate output schema.** Additive
 changes to the existing output:
@@ -989,10 +1104,35 @@ changes to the existing output:
 ```
 
 `outcome` enum values: `success | failure | skipped | pending |
-blocked`. `all_complete` tightens to `pending == 0 AND blocked == 0`.
-`evaluate_children_complete` must also receive `parent_events` so it
-can look up the batch definition when computing `blocked` and
-un-spawned task entries.
+blocked | spawn_failed`. `all_complete` tightens to `pending == 0 AND
+blocked == 0`. `evaluate_children_complete` must also receive
+`parent_events` so it can look up the batch definition when computing
+`blocked` and un-spawned task entries.
+
+**Revised in round 1 (see Decision 9).** `all_complete` alone is not a
+useful route guard for failed batches because it is `true` even when
+every child failed or was skipped — the reference template shipped
+its agent straight to a summary state with no retry window. The gate
+output now exposes four derived booleans alongside `all_complete`:
+
+| Field | Definition |
+|-------|------------|
+| `all_complete` | `pending == 0 AND blocked == 0` (unchanged) |
+| `all_success` | `all_complete AND failed == 0 AND skipped == 0` |
+| `any_failed` | `failed > 0` |
+| `any_skipped` | `skipped > 0` |
+| `needs_attention` | `all_complete AND (failed > 0 OR skipped > 0)` |
+
+Templates route on these booleans via equality-based when-clauses. W4
+(Decision 9) fires at compile time if a `materialize_children` state
+routes only on `all_complete: true` without a second transition
+guarding `any_failed` or `needs_attention`.
+
+Decision 11 adds `spawn_failed` to the per-child `outcome` enum so
+per-task spawn errors (bad child template, per-task R1/R2 failures)
+surface through the gate output the same way real failures do.
+Per-child entries may carry a `spawn_error` object with
+`SpawnErrorKind` and optional `paths_tried` for diagnosis.
 
 **5.4 `retry_failed` evidence action.** `retry_failed` becomes a
 reserved top-level evidence key, treated like `gates` — the
@@ -1008,50 +1148,90 @@ The parent submits:
 {"retry_failed": {"children": ["parent.issue-2"], "include_skipped": true}}
 ```
 
-On submission, a new handler in the scheduler:
+**Revised in round 1 (see Decision 9).** The round-0 draft said
+"handle_retry_failed transitions the parent directly from
+analyze_results back to awaiting_children." That contradicted a
+parallel claim elsewhere in the doc that the advance loop routes the
+transition. One authoritative story now holds: `handle_retry_failed`
+never appends `Transitioned` to the parent. The advance loop fires a
+template-declared transition on `when: evidence.retry_failed: present`.
 
-1. Transitions the parent (no rewind at parent level) from the
-   post-analysis state back to `awaiting_children`.
-2. Computes the transitive closure of retry-set children through
-   the DAG (`include_skipped: true` extends the set to include
-   dependents that were skipped because of a failure in the retry
-   set).
-3. For each child in the closure, calls
-   `internal_rewind_to_initial(name)`. For **failed children**,
-   this appends a `Rewound` event targeting the initial state,
-   starting a fresh epoch (prior evidence invisible). For
-   **skipped children**, the situation is different: a skipped
-   child's event log is only `WorkflowInitialized` plus one
-   `Transitioned → skipped_marker_state`, and
-   `handle_rewind` at `src/cli/mod.rs:1198-1204` errors with
-   "already at initial state, cannot rewind" on single-transition
-   chains. The helper detects this case and, instead of rewinding,
-   atomically deletes the synthetic skipped child state file so
-   the next scheduler tick re-classifies the task as
-   `NotYetSpawned` and re-materializes it from scratch. The
-   delete-and-respawn path is only taken for children whose state
-   files carry `skipped_marker: true` on their current state; real
-   failed children always take the rewind path.
-4. Appends a clearing `{"retry_failed": null}` event to the parent
-   so the next scheduler tick doesn't re-rewind. The null-clearing
-   idiom depends on `merge_epoch_evidence` treating null values
-   as "unset"; this must be documented with a prominent code
-   comment where the handler lives so future maintainers don't
-   accidentally break it.
+The canonical sequence (Decision 9, with Decision 12's cloud-sync
+reordering applied when `CloudBackend` is active):
+
+```
+a. validate R10 (retry set: non-empty; each named child exists and
+   has outcome `failure` or `skipped`; atomicity — all-or-nothing)
+b. append EvidenceSubmitted { retry_failed: <payload> } to parent log
+c. append EvidenceSubmitted { retry_failed: null } clearing event to parent
+   (under CloudBackend, sync_push_state the parent log here; on push
+   failure, return; no child writes have happened yet)
+d. for each child in the downward closure of the retry set:
+   - if outcome is `failure`: append Rewound targeting the initial state
+   - if outcome is `skipped` (current state has `skipped_marker: true`):
+     delete-and-respawn — the scheduler will re-materialize on the
+     next tick based on current dependency outcomes
+e. advance loop runs; it reads the unmerged submission evidence and
+   fires the template transition on evidence.retry_failed: present,
+   routing the parent back to the awaiting state
+```
+
+Step (c) pushes the clearing event before child writes so a
+cloud-sync race that loses the parent log branch cannot leave phantom
+`Rewound` events on children referencing a retry that the resolved
+parent log never records (Decision 12 Q6).
+
+**Why the clearing event lands before child writes under cloud sync.**
+A crash between steps (c) and (d) leaves the parent with
+`retry_failed: null` in merged evidence and the children untouched.
+Re-running `handle_retry_failed` sees `no_retry_in_progress` and
+rejects cleanly. The user resubmits. This converts CD9's "transparent
+re-apply on crash" semantics into "user re-submits on crash," which is
+the trade-off Decision 12 accepts to eliminate phantom child epochs.
+
+**Closure direction is downward.** The retry set extends to
+*dependents* of the named children, not ancestors. `include_skipped:
+true` (the default) propagates the rewind to skipped dependents of
+the retry set. To retry an ancestor, the user names the ancestor
+explicitly. The principle: the user names what they mean.
+
+**Edge cases (Decision 9).** Every retry corner has explicit
+behavior:
+
+| Edge | Behavior |
+|------|----------|
+| Double `retry_failed` without intervening tick | Second submission rejected with `InvalidRetryReason::RetryAlreadyInProgress` |
+| Retry on a running child (outcome `pending`) | Rejected with `ChildNotEligible`; no rewinds written |
+| Retry on a successful child | Rejected with `ChildNotEligible` |
+| Mixed retry set (some retryable, some not) | All-or-nothing: whole submission rejected |
+| Mixed payload (`retry_failed` + other evidence keys) | Rejected with `InvalidRetryReason::MixedWithOtherEvidence`; `extra_fields` names the offending keys |
+| Stale skip markers after partial retry | Decision 9 Part 5: runtime reclassification deletes stale markers on next tick |
+| Concurrent `retry_failed` from two callers | Decision 12's advisory flock serializes parent ticks; loser gets `concurrent_tick` error |
+
+**Discovery: `reserved_actions` response field.** Decision 9 Part 3
+adds a top-level `reserved_actions` array to responses where
+`any_failed` or `any_skipped` is true. Each entry carries the action
+name, a payload schema, an `applies_to` list of currently-retryable
+children, and a ready-to-run `invocation` string. Agents without the
+koto-user skill can construct a correct retry submission by reading
+this field. `reserved_actions` is synthesized by `handle_next` after
+gate evaluation; it does not flow through `expects.fields` because
+reserved actions bypass the advance loop's evidence validator.
 
 **Interception point.** `retry_failed` is intercepted in `handle_next`
-BEFORE `advance_until_stop` runs, not routed through the advance loop.
-When `handle_next` detects `retry_failed` in the submitted evidence,
-it calls `handle_retry_failed` directly, which performs the child
-rewinds and appends the clearing event. Only after retry processing
-completes does `advance_until_stop` run on the (now-modified) parent
-state. This ordering ensures the advance loop sees the post-retry
-state of children, not the pre-retry state.
+BEFORE `advance_until_stop` runs. Only the child side effects and
+parent evidence writes happen in `handle_retry_failed`; the actual
+parent transition fires in the subsequent advance-loop pass, driven
+by the template. Pre-Decision-12, this was "intercept and then let the
+advance loop read merged evidence." Post-Decision-12, step (c)'s
+clearing-event-first ordering means the advance loop reads the
+clearing value; the `evidence.<field>: present` matcher must evaluate
+the un-merged submission payload's presence to fire the transition.
 
 Subsequent `koto next parent` calls tick the scheduler, which sees
-the rewound children as non-terminal and reclassifies them as
-`Running` or `NotYetSpawned` (they exist on disk but at their
-initial state), and the normal flow takes over.
+rewound children as non-terminal and reclassifies them as `Running`
+or `NotYetSpawned` (they exist on disk but at their initial state),
+and the normal flow takes over.
 
 **5.5 Resume walkthrough** (full detail in
 `wip/design_batch-child-spawning_decision_5_report.md`, section
@@ -1062,6 +1242,17 @@ atomic init bundle from Decision 2 plus a
 crashes (recovered by pure re-derivation from disk), mid-retry
 rewind (idempotent via name-based classification), and
 parent-transition crashes (single-event appends are atomic).
+
+**Revised in round 1.** The mid-retry crash scenario changes shape:
+under Decision 12's push-parent-first ordering, a crash after the
+clearing event but before child writes leaves children untouched. On
+resume, `handle_retry_failed` sees `no_retry_in_progress` and rejects;
+the user resubmits the retry. Skip-marker synthesis no longer uses a
+hidden synthetic template (Decision 9); skip markers live on the
+child's real template at a `skipped_marker: true` state, so resume
+classifies them via the same "current state has `skipped_marker:
+true`" predicate observers use. Runtime reclassification sweeps every
+tick, making stale markers a non-issue on resume.
 
 #### Alternatives considered
 
@@ -1154,6 +1345,53 @@ collapses to one `koto status work-on-plan-42` call per poll:
 `batch.summary` drives progress rendering. The consumer never calls
 `backend.list()` equivalents or recomputes the DAG.
 
+**Revised in round 1 (see Decision 13).** Decision 6's output drops
+the `batch` section the moment the parent leaves the batched state,
+but consumers asked to write summary directives or diagnose failures
+need the view to survive that transition. Decision 13 adds four
+additive extensions:
+
+- **`BatchFinalized` event.** When `children-complete` first evaluates
+  `all_complete: true` on a state with `materialize_children`, the
+  advance loop appends a `BatchFinalized` event to the parent log
+  carrying the final `BatchView` snapshot. Subsequent `koto status
+  <parent>` calls replay from this event when the parent's current
+  state has no hook, labeling the section `batch.phase: "final"` (vs
+  `batch.phase: "current"` for live views from Decision 6). Re-
+  entering a batched state (for example after `retry_failed`) appends
+  a new `BatchFinalized` event on the next pass, superseding the
+  prior one.
+
+- **`batch_final_view` on terminal and post-batch `done` responses.**
+  The `done` response gains an optional `batch_final_view` field
+  (suppressed via `skip_serializing_if`) when the parent log contains
+  at least one `BatchFinalized` event. The payload matches the
+  `batch` section shape. This eliminates the two-call pattern
+  (`koto next` + `koto status`) on the terminal tick.
+
+- **`synthetic: true` marker.** `koto status <child>` and the per-row
+  shape in `koto workflows --children <parent>` emit an explicit
+  `synthetic: true` field when the child's current state has
+  `skipped_marker: true`. The predicate is derived from state, not
+  from a template hash or sidecar flag, so it works under Decision
+  9's runtime-reclassification model. `koto next <synthetic-child>`
+  returns an immediate terminal `done` response with a directive
+  explaining the skip rather than an error or silent blank.
+
+- **`skipped_because_chain` array.** Retain the singular
+  `skipped_because` field (direct blocker). Add
+  `skipped_because_chain: [<direct>, ..., <root-failure>]` alongside
+  it, walking upstream through `waits_on` to the first failed (non-
+  skipped) ancestor. Diamond scenarios pick the shortest chain,
+  tie-breaking alphabetically for determinism.
+
+- **`reason_source` projection.** When the batch view's per-child
+  `reason` engages the `failure_reason` context key, emit
+  `reason_source: "failure_reason"`. When it falls back to the state
+  name, emit `reason_source: "state_name"`. Omitted for successful
+  or non-terminal children. Pairs with compile warning W5 so
+  template authors catch the opaque-reason case before ship.
+
 #### Alternatives considered
 
 - **Extend only `koto status`.** Rejected: observers iterating over
@@ -1173,7 +1411,8 @@ collapses to one `koto status work-on-plan-42` call per poll:
 
 When the parent's `children-complete` gate blocks with spawned
 children, the `gate_blocked` response carries machine-readable data
-(`scheduler.spawned`, `blocking_conditions[].output`) but nothing
+(`scheduler.spawned_this_tick`, `scheduler.materialized_children`,
+`blocking_conditions[].output`) but nothing
 tells the agent in plain English what to do — drive children in
 parallel? delegate? wait for CI? poll? The question is whether
 this needs a new engine feature or whether the existing directive
@@ -1192,7 +1431,7 @@ mechanism provides everything needed:
    ## plan_and_await
 
    Children have been spawned from your task list. For each child
-   in the `scheduler.spawned` list below, start a sub-agent that
+   in the `scheduler.spawned_this_tick` list below, start a sub-agent that
    drives it via `koto next <child-name>`. Re-check the parent
    with `koto next parent-42` after each child completes to spawn
    newly-unblocked tasks.
@@ -1205,9 +1444,10 @@ mechanism provides everything needed:
    repeat visits to reduce noise.
 
 3. **Structured data alongside prose.** The `scheduler` field
-   carries `spawned`/`blocked`/`skipped` lists as machine-readable
-   JSON, and `blocking_conditions[].output` carries per-child
-   status with outcome enums. The agent reads the prose to
+   carries `spawned_this_tick`/`materialized_children`/`blocked`/
+   `skipped` lists as machine-readable JSON, and
+   `blocking_conditions[].output` carries per-child status with
+   outcome enums. The agent reads the prose to
    understand the intent; it reads the JSON to know the specifics.
 
 4. **Skill-level documentation.** The koto-user skill's
@@ -1226,7 +1466,7 @@ child completing, `koto next parent-42` returns:
 {
   "action": "gate_blocked",
   "state": "plan_and_await",
-  "directive": "Children have been spawned from your task list. For each child in the scheduler.spawned list below, start a sub-agent that drives it via `koto next <child-name>`. Re-check the parent after each child completes.",
+  "directive": "Children have been spawned from your task list. For each child in the scheduler.spawned_this_tick list below, start a sub-agent that drives it via `koto next <child-name>`. Re-check the parent after each child completes.",
   "details": "The batch scheduler runs on every `koto next parent-42` call. It spawns tasks whose dependencies are all terminal. Drive children in parallel when possible. Each child is an independent workflow with its own state file.",
   "blocking_conditions": [{
     "name": "done",
@@ -1244,7 +1484,7 @@ child completing, `koto next parent-42` returns:
     }
   }],
   "scheduler": {
-    "spawned": ["parent-42.issue-4"],
+    "spawned_this_tick": ["parent-42.issue-4"],
     "already": ["parent-42.issue-1", "parent-42.issue-2", "parent-42.issue-3"],
     "blocked": ["parent-42.issue-5", "parent-42.issue-6", "..."]
   }
@@ -1364,9 +1604,919 @@ accepts; it's purely a response-side artifact.
   decision's chosen approach is the opposite — koto generates the
   schema, not the template author.
 
+### Decision 9: Retry path end-to-end
+
+Round 1 pair simulations exposed four blocker-class gaps in
+Decision 5's retry story: failed batches never reached a state where
+the agent could submit `retry_failed` (the reference template routed
+on `all_complete: true`, which is true for a fully-failed batch);
+Decision 5.4 contradicted itself about whether `handle_retry_failed`
+transitions the parent directly or via the advance loop; agents
+without the koto-user skill had no way to discover `retry_failed`
+(it's reserved, so it never appears in `expects.fields`); and the
+synthetic-template mechanism had two unfixable edges (a real-template
+running child couldn't legally transition into a different template's
+`skipped_marker` state, and stale skip markers after partial retry
+had no cleanup primitive).
+
+The fix is a five-part package; each part is load-bearing for the
+others.
+
+**Key assumptions:**
+
+- Agents will consume a new top-level `reserved_actions` response
+  field on any response where the gate reports `any_failed` or
+  `any_skipped`.
+- Template authors tolerate compile warning W4 against
+  `materialize_children` states that route only on `all_complete`.
+- The when-clause engine supports an `evidence.<field>: present`
+  matcher, or adds it as part of this decision's PR (flagged as a
+  Phase 3 prerequisite).
+- Parent ticks are serialized by Decision 12's advisory flock.
+- Delete-and-respawn of a real-template running child whose upstream
+  flips to failure is the correct outcome; the child's work was
+  already invalidated.
+
+#### Chosen: Template-routed retry, extended gate vocabulary, discovery via `reserved_actions`, runtime reclassification
+
+**Part 1 — Reachability.** Alongside `all_complete`, the gate output
+exposes derived booleans: `all_success`, `any_failed`, `any_skipped`,
+`needs_attention`. Templates route on these using equality-based
+when-clauses. Compile warning W4 fires when a `materialize_children`
+state routes only on `all_complete: true` without a second transition
+guarding `any_failed` or `needs_attention`. The reference `coord.md`
+template adds an `analyze_failures` intermediate state that the agent
+reaches on `needs_attention: true` and from which the agent can
+submit `retry_failed` (reserved) or `acknowledge_failures` (regular
+evidence).
+
+**Part 2 — Mechanism.** `handle_retry_failed` never appends
+`Transitioned` to the parent. The canonical sequence is: validate
+R10; append `EvidenceSubmitted { retry_failed: <payload> }` to the
+parent; append the clearing event; write `Rewound` to closure
+children (delete-and-respawn for skip markers); let the advance loop
+fire a template-declared transition on
+`when: evidence.retry_failed: present`. Decision 12 Q6 reorders this
+for cloud-sync safety: push the parent log (both events) before
+touching children, so a resolved-away parent log branch cannot leave
+phantom child `Rewound` events behind.
+
+**Part 3 — Discovery.** Responses where `any_failed` or `any_skipped`
+is true carry a synthesized `reserved_actions` array:
+
+```json
+{
+  "reserved_actions": [
+    {
+      "name": "retry_failed",
+      "description": "Re-queue failed and skipped children. Dependents are included by default.",
+      "payload_schema": {
+        "children": {"type": "array<string>", "required": true},
+        "include_skipped": {"type": "boolean", "required": false, "default": true}
+      },
+      "applies_to": ["coord.issue-B"],
+      "invocation": "koto next coord --with-data '{\"retry_failed\": {\"children\": [\"coord.issue-B\"]}}'"
+    }
+  ]
+}
+```
+
+`reserved_actions` is a sibling of `expects.fields`, not a member of
+it. Reserved actions bypass the advance loop's evidence validator;
+conflating them with regular evidence fields would confuse agents
+that scan `expects.fields` to decide what to submit. The field is
+also emitted on terminal `done` responses when the final batch view
+still reports failures or skips.
+
+**Part 4 — Edges.** R10 (new validation rule) covers retry payloads:
+non-empty `children` array; each name exists in the declared task
+set; each named child exists on disk with outcome `failure` or
+`skipped`; `include_skipped` optional boolean; no other top-level
+fields. Mixed payloads (`retry_failed` + other evidence) reject with
+`InvalidRetryReason::MixedWithOtherEvidence`. Double retry (second
+submission before the first's tick) rejects with
+`InvalidRetryReason::RetryAlreadyInProgress`. Retries on running or
+successful children reject with
+`InvalidRetryReason::ChildNotEligible` listing each child's current
+outcome. All rejections are atomic: any non-retryable child in the
+set rejects the whole submission.
+
+**Part 5 — Runtime reclassification.** Skip markers use the child's
+real template (F5 compile warning ensures each batch-eligible child
+template declares a reachable `skipped_marker: true` state). Every
+tick, the scheduler re-evaluates every skip marker against current
+dependency outcomes. If no `waits_on` dep is still in `failure`, the
+marker is stale — the scheduler deletes the child state file and
+respawns the task from scratch. Real-template running children whose
+upstream flips to failure are also delete-and-respawned, this time
+as skip markers. The same predicate (`skipped_marker: true` on
+current state) drives both observability (Decision 13's `synthetic:
+true` marker) and scheduler bookkeeping.
+
+#### Alternatives considered
+
+- **Template author adds manual failure branches in every template
+  (status quo).** Rejected: round-1 Cluster A showed authors
+  consistently omit this, producing unreachable retry paths. W4
+  formalizes the check.
+- **Change `all_complete` to mean `pending == 0 AND failed == 0`.**
+  Rejected: breaks backward compatibility for non-batch consumers
+  and conflates "nothing to do" with "everything succeeded," losing
+  a useful discriminator.
+- **Direct parent transition from `handle_retry_failed`.** Rejected:
+  hides the retry in implementation code where template authors
+  can't read the routing. Also conflates CLI-layer evidence handling
+  with engine-layer state advancement. Two layers, one story is
+  cleaner.
+- **Advance-loop-only retry via `accepts`.** Rejected: would flow
+  `retry_failed` through the evidence validator, which would need to
+  special-case the reserved key and re-open the `deny_unknown_fields`
+  decision.
+- **Agents learn retry via koto-user skill only.** Rejected:
+  violates the constraint that retry be discoverable without the
+  skill. The `reserved_actions` block provides a machine-readable
+  signal plus a ready-to-run invocation string.
+- **Embed retry hint in `directive` text.** Rejected: directives are
+  template-author-controlled; koto cannot inject text without
+  surprising the author. Also not machine-readable.
+- **Lenient edge handling (silently ignore non-retryable children
+  in the set).** Rejected: produces partial-success ambiguity and
+  clutter in the audit log (accepted retries that did nothing).
+  Atomicity is clearer.
+- **Auto-extend closure upward to the nearest failed ancestor.**
+  Rejected: changes the semantic of a named retry. The user names
+  what they mean.
+- **Keep synthetic-per-skipped-child template with explicit rules
+  closing the edges.** Rejected: requires cross-template transition
+  support (a new engine feature) to handle a real-template running
+  child whose upstream just failed, plus a dedicated refresh
+  primitive for stale markers. Runtime reclassification covers both
+  with one sweep and no new event types.
+- **Hybrid: synthetic template for initial skip, delete-and-respawn
+  only on retry.** Rejected: two code paths for the same conceptual
+  operation; doubles surface area.
+
+### Decision 10: Mutation semantics and dynamic-addition primitives
+
+The Context section talks about dynamic additions — "a running child
+adds siblings mid-flight" — as a natural extension of the scheduler.
+Round 1 pair 2b probed what happens when a resubmitted task entry
+has different `vars`, `waits_on`, or `template` from the originally
+spawned entry, and surfaced nine concrete mutation-pressure gaps.
+Under the round-0 spec, every variant fails silently or incoherently:
+vars mutations drop at spawn, waits_on mutations corrupt the gate
+output, task removal is impossible (union semantics never
+decrements), renames silently duplicate work, identical resubmissions
+bloat the log with no feedback, and agents have no per-entry signal
+for which resubmitted entries took effect.
+
+This decision specifies what koto accepts at submission-validation
+time, what each accepted entry does, what signal the agent gets back,
+and how the rules compose with Decision 9's retry path and Decision
+11's error envelope. Three constraints anchor the choice: append-only
+state forbids retroactive edits of prior events; disk-derived
+scheduling means a submission that conflicts with disk state has no
+recoverable interpretation; and agents must get explicit signals
+(silent no-ops were the root cause of four round-1 findings).
+
+**Key assumptions:**
+
+- Decision 11's pre-append validation commitment holds; R8 runs
+  before any `EvidenceSubmitted` append.
+- `WorkflowInitialized` carries a `spawn_entry` snapshot (template,
+  vars, waits_on in canonical form) — Decision 2 amendment.
+- Agents accept that `cancel_tasks` is deferred to v1.1, documented
+  as a non-feature in v1.
+- Decision 12 serializes parent ticks via advisory flock; concurrent
+  submissions cannot both R8-reject in a split-brain manner.
+- Canonical-form comparison (sorted `waits_on`, null ≡ omitted for
+  `template`, per-key `vars` diff) is the contract agents design
+  against.
+
+#### Chosen: Strict spawn-time immutability, union by name, per-entry scheduler feedback, `cancel_tasks` deferred
+
+**R8 — Spawn-time immutability.** For each task entry whose computed
+child name `<parent>.<task.name>` already exists on disk as a spawned
+child, the entry's `template`, `vars`, and `waits_on` must match
+field-for-field the entry under which the child was originally
+spawned. The comparison is on the `spawn_entry` snapshot recorded on
+the child's `WorkflowInitialized` event. Mismatch rejects pre-append
+with `InvalidBatchReason::SpawnedTaskMutated { task, changed_fields }`
+where `changed_fields` enumerates each differing field with its
+`spawned_value` and `submitted_value`. One mismatched entry rejects
+the whole submission.
+
+**Union by name.** The effective task set is the union across all
+accepted `EvidenceSubmitted` events. For un-spawned names, the latest
+submission's entry wins (last-write-wins allows pre-spawn
+correction). For spawned names, R8 locks the entry. For new names,
+the entry is included as-is.
+
+**Removal is deferred.** A submission that omits a previously-named
+task does not remove it — omission is a no-op, not a cancellation
+signal. `cancel_tasks` is a reserved evidence action planned for
+v1.1; the design space (closure direction, running-child handling,
+re-add semantics, interaction with retry) is sibling-complexity to
+Decision 9 and out of scope for v1. Operators needing immediate
+removal in v1 can manually delete the child's state file; this
+leaves the parent's view inconsistent and is an unsupported escape
+hatch.
+
+**Renaming surfaces `orphan_candidates`.** When a new task entry has
+a byte-identical `vars` + `waits_on` signature to an already-spawned
+task under a different name, the scheduler emits
+`scheduler.feedback.orphan_candidates` listing the match. This is
+advisory, not blocking — the submission proceeds and the agent sees
+a readable signal to investigate.
+
+**Identical resubmission appends for audit.** A byte-identical
+submission passes validation trivially, appends an
+`EvidenceSubmitted` event, and runs the scheduler. The tick typically
+finds every task `already` spawned (no-op). Suppression would hide
+"the agent kept polling" from forensic investigation; the feedback
+map already tells the agent per-task no-op-ness, so suppression adds
+no value.
+
+**Per-entry feedback.** `SchedulerOutcome::Scheduled` gains a
+`feedback` field:
+
+```rust
+pub struct SchedulerFeedback {
+    pub entries: BTreeMap<String, EntryOutcome>,
+    pub orphan_candidates: Vec<OrphanCandidate>,
+}
+
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum EntryOutcome {
+    Accepted,
+    Already,
+    Blocked { waits_on: Vec<String> },
+    Errored { kind: String },
+}
+```
+
+Keyed by the agent-submitted short name. Every submitted entry gets
+an outcome. No silent cases remain.
+
+**Mixed `retry_failed` + `tasks` payloads reject** with
+`InvalidRetryReason::MixedWithOtherEvidence` (Decision 9 Part 4).
+Agents serialize the two into separate `koto next` calls.
+
+**R8 and runtime reclassification never interfere.** R8 runs at
+submission-validation time (pre-append). Decision 9's runtime
+reclassification operates on committed state using the recorded
+`spawn_entry` snapshot. They are disjoint phases of `handle_next`; the
+scheduler never re-validates.
+
+#### Alternatives considered
+
+- **Silently ignore mutations on spawned children (status quo).**
+  Rejected: root cause of four round-1 findings. Violates the
+  explicit-signal constraint.
+- **Apply mutations retroactively via header edit.** Rejected:
+  requires a mutation primitive (`HeaderMutated` event) on
+  append-only state. Breaks the invariant that makes cloud sync and
+  `expected_seq` work.
+- **Full replace semantics (drop omitted names).** Rejected: removal
+  by omission has no coherent representation under append-only. The
+  cleanest rule is "omission is a no-op; cancellation requires the
+  primitive."
+- **`cancel_tasks` as a v1 reserved action.** Rejected: sibling-
+  complexity to Decision 9's retry story. Deferred to v1.1 with a
+  documented escape hatch.
+- **Reject submissions that omit a previously-named task.**
+  Rejected: makes every resubmission high-friction (the agent must
+  echo every prior name forever).
+- **Implicit rename via a `replaces` field.** Rejected: collapses to
+  `cancel_tasks + submit`, so it's v1.1 work.
+- **First-wins cross-epoch duplicate resolution.** Rejected:
+  prevents pre-spawn correction. R8 already handles the post-spawn
+  case.
+- **Suppress identical-resubmission appends.** Rejected: special-
+  case cost nearly equals R8; obscures the audit trail; redundant
+  with per-task feedback.
+- **Single `ignored` list for feedback.** Rejected: agents need
+  positive signals per entry ("yes, C was accepted"), not just
+  negative drops.
+- **Support mixed `retry_failed + tasks` via two-phase commit.**
+  Rejected: complexity not justified for a use case the agent can
+  serialize naturally.
+
+### Decision 11: Error envelope, validation timing, and batch-edge validation
+
+Round 1 surfaced twelve adjoining gaps around error-response shape,
+validation timing, and rule coverage. The design-as-written says
+`NextError::Batch { kind, message }` (enum-shaped) but the existing
+`NextError` at `src/cli/next_types.rs:283-289` is a struct with
+`code`, `message`, and `details`. Data Flow Step 4 showed
+`EvidenceSubmitted` appended before R1-R7 ran, contradicting Phase
+3's pre-append commitment. The response envelope defined no `error`
+action variant, leaving rejected submissions with nowhere to land
+cleanly. Rule coverage missed empty task lists, name validation, and
+reserved-name collisions; `LimitExceeded.which: &'static str` was
+typed by convention only.
+
+The twelve sub-questions decide together because envelope shape,
+validation phase, and enum discriminators are tightly coupled.
+Treating them as one commitment lets cross-validation check one
+contract instead of twelve.
+
+**Key assumptions:**
+
+- `NextError` is a stable v0.7.0 public contract. Breaking its
+  struct shape requires a major-version bump.
+- Agents pattern-match on snake_case string literals at multiple
+  nesting levels.
+- Decision 9 populates `InvalidRetryReason` variants; Decision 10
+  populates `SpawnedTaskMutated`.
+- Decision 12 renames `scheduler.spawned` → `spawned_this_tick`.
+
+#### Chosen: Unified `action: "error"` envelope, pre-append validation, typed enums throughout
+
+**Envelope shape.** `NextResponse` gains a seventh variant: `action:
+"error"`. `NextError` is extended with an optional `batch` field
+alongside `details`:
+
+```json
+{
+  "action": "error",
+  "state": "plan_and_await",
+  "advanced": false,
+  "error": {
+    "code": "invalid_submission",
+    "message": "Batch definition rejected: cycle in waits_on graph",
+    "details": [{"field": "tasks", "reason": "cycle"}],
+    "batch": {
+      "kind": "invalid_batch_definition",
+      "reason": "cycle",
+      "cycle": ["issue-A", "issue-B", "issue-A"]
+    }
+  },
+  "blocking_conditions": [],
+  "scheduler": null
+}
+```
+
+The existing `code`, `message`, `details` continue to work for every
+current consumer. `error.batch` is new, optional, and populated only
+when the error comes from batch logic. `advanced: false` always on
+error responses — rejection never advances state. `scheduler: null`
+preserves the additive-field invariant.
+
+Mapping from `BatchError` variants to `NextErrorCode`:
+
+- `InvalidBatchDefinition`, `LimitExceeded` → `invalid_submission`
+  (exit 2)
+- `TemplateCompileFailed` at compile time → `template_error` (exit 3)
+- `SpawnFailed` and runtime `TemplateNotFound` /
+  `TemplateCompileFailed` → per-task, surfaced through
+  `scheduler.errored`; top-level `error` is never populated
+- `BackendError` → `integration_unavailable` (exit 1, retryable)
+- `InvalidRetryRequest` → `invalid_submission`
+
+**Pre-append validation.** R0-R9 (and R10 for retry payloads) run as
+pure functions of the submitted payload *before*
+`append_event(EvidenceSubmitted)`. On rejection, no state file writes
+occur; the response carries the error and the parent workflow is
+exactly as it was before the call. Crash-resume is trivially correct:
+re-running the same submission produces the same rejection from the
+same event log. No "poison" `SubmissionRejected` markers, no
+permanent log entries for failed submissions.
+
+Rejected submissions are ephemeral — their existence is observable
+only in the response of the tick that produced them. Accepted-state
+audit lives in the log via `EvidenceSubmitted`, `Transitioned`, and
+the new `SchedulerRan` event (see below).
+
+**Per-task accumulation, never halt.** The scheduler iterates all
+ready tasks. Per-task spawn failures collect in
+`SchedulerOutcome::Scheduled.errored: Vec<TaskSpawnError>`. A single
+bad child template doesn't kneecap a 500-task batch. Tick-wide
+failures (backend list failure during classification) still produce
+`SchedulerOutcome::Error`.
+
+```rust
+pub struct TaskSpawnError {
+    pub task: String,
+    pub kind: SpawnErrorKind,
+    pub paths_tried: Option<Vec<String>>,
+    pub message: String,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum SpawnErrorKind {
+    TemplateNotFound,
+    TemplateCompileFailed,
+    Collision,
+    BackendUnavailable,
+    PermissionDenied,
+    IoError,
+}
+```
+
+`BatchTaskView.outcome` gains `spawn_failed` so per-task spawn errors
+surface through the gate output with `outcome: "spawn_failed"` and an
+optional `spawn_error` object.
+
+**`SchedulerRan` event.** On every non-trivial tick (at least one of
+`spawned`, `skipped`, or `errored` non-empty), the scheduler appends
+a `SchedulerRan` event to the parent log with per-tick outcome
+counts. `koto query --events` shows it alongside `EvidenceSubmitted`
+and `Transitioned`, giving a complete audit trail. No-op ticks
+(everything `already` or `blocked`) skip the append to prevent log
+bloat.
+
+**Empty task list rejects.** R0: `tasks.len() >= 1`. Empty submissions
+reject with `InvalidBatchReason::EmptyTaskList`. This prevents the
+silent-advance footgun when an agent mis-submits.
+
+**`template: null` ≡ omitted.** Both inherit the hook's
+`default_template`. An empty string is a validation error.
+
+**Typed enum discriminators throughout.** `InvalidBatchReason`,
+`InvalidNameDetail`, `LimitKind`, `SpawnErrorKind`, and
+`InvalidRetryReason` replace every free-string or `&'static str`
+field. JSON wire shape uses snake_case serde renaming.
+
+**Name validation (R9).** `task.name` must match `^[A-Za-z0-9_-]+$`,
+be 1-64 characters, and not collide with the reserved set
+`{retry_failed, cancel_tasks}`. Validation applies to the short name
+the agent wrote, not the computed `<parent>.<name>` full name —
+error messages point at what the agent submitted.
+
+**`..` in template paths is silently accepted.** Decision 4 commits
+to the trusted-submitter model; surfacing a warning here would
+half-retract that decision. Security Considerations documents the
+behavior.
+
+#### Alternatives considered
+
+- **Enum-shaped `NextError::Batch { kind, message }`.** Rejected:
+  breaks the existing public struct. Every consumer of `NextError`
+  today unpacks `code` / `message` / `details`; an enum-variant
+  alongside a struct-shape is not a valid Rust type.
+- **Reuse `NextError`; squash batch fields into `details[0].reason`
+  as a JSON string.** Rejected: forces agents to parse strings
+  inside strings.
+- **Post-append validation** (append `EvidenceSubmitted` first, run
+  R0-R9, append `SubmissionRejected` on failure). Rejected: every
+  downstream read path must filter rejected events forever; crash-
+  resume semantics become contorted.
+- **Halt on first per-task spawn error.** Rejected: one typo'd
+  `template:` kills a 500-task batch. Agents forced to bisect.
+- **No `SchedulerRan` event; scheduler decisions ephemeral.**
+  Rejected: partial spawn failures become un-auditable.
+- **Empty task list as immediately-complete batch.** Rejected:
+  collapses "I forgot to add tasks" with "I intentionally want zero
+  tasks." Silent-advance footgun.
+- **`template: null` is an error.** Rejected: pedantic. JSON
+  producers naturally serialize absent Optional fields either way.
+- **Keep `InvalidBatchDefinition.reason: String`.** Rejected: fails
+  the machine-parseable constraint; typos are inevitable over time.
+- **Keep `LimitExceeded.which: &'static str`.** Rejected: typed by
+  coincidence, not by contract. Typed enum gives serde renaming and
+  exhaustive match at zero cost.
+- **Roll premature-retry into `InvalidBatchReason`.** Rejected:
+  retry-request problems are not batch-definition problems. Sibling
+  `InvalidRetryRequest` with its own reason enum keeps the
+  responsibilities clean.
+- **Surface a warning for `..` in template paths.** Rejected:
+  inconsistent with Decision 4's trusted-submitter commitment.
+- **Strict kebab-case-only name regex.** Rejected: excludes
+  legitimate mixed-case and underscore-separated names template
+  authors already use.
+
+### Decision 12: Concurrency model hardening
+
+The round-0 Concurrency Model section correctly identified where
+the races live, then handed responsibility to the caller without
+giving the caller the instruments to satisfy the contract. Round 1
+pair 2c produced ten findings: worker double-dispatch under
+per-tick `spawned` observation, silent overwrite of child state files
+on concurrent `init_state_file` calls, orphan children after cloud-
+sync conflict resolution, split-brain observers with no sync-status
+signal, leaked tempfiles after crashes, and walkthrough language
+("any caller can drive the parent") that actively invited invariant
+violations.
+
+This decision is an eight-part hardening package. Each part
+addresses specific findings, and the parts compose — single-machine
+correctness from parts 1-3 and 7, cross-machine observability from
+parts 4-5, safe retry under cloud sync from part 6, and a mental
+model from part 8.
+
+**Key assumptions:**
+
+- Agents key on `materialized_children` for idempotent dispatch.
+- Linux kernel ≥ 3.15 for `renameat2` (release notes pin this).
+- `flock` is available on all supported Unix targets (already used
+  by `LocalBackend` for `ContextStore` writes).
+- `CloudBackend::check_sync` can compute a three-way `sync_status`
+  cheaply from data it already produces.
+- A 60-second threshold on the tempfile sweep bounds leak duration
+  without disturbing in-flight ticks.
+
+#### Chosen: Eight-part hardening package
+
+**Q1 — `spawned_this_tick` + `materialized_children` ledger.** Rename
+`scheduler.spawned` to `spawned_this_tick` (a per-tick *observation*;
+concurrent ticks can each report the same child). Add
+`materialized_children` as the *ledger* — the complete set of
+children that exist on disk right now, with outcome and state. Agents
+doing idempotent worker dispatch key on `materialized_children`,
+taking the set difference against their last-known-dispatched set.
+Both fields emit on every non-null `scheduler` value.
+
+**Q2 — Kernel-level atomic init.** `LocalBackend::init_state_file`
+uses `renameat2(RENAME_NOREPLACE)` on Linux and `link()` +
+`unlink()` on other Unixes. The tempfile + rename bundle from
+Decision 2 is unchanged; only the final rename step is replaced.
+Collisions surface as `SpawnErrorKind::Collision` through per-task
+`SchedulerOutcome.errored`. The previous "two ticks silently
+overwrite the same child state file" window is closed at the kernel.
+
+**Q3 — Advisory flock per batch parent.** `handle_next` acquires a
+non-blocking `LOCK_EX | LOCK_NB` on
+`<session_dir>/<workflow>.lock` for the duration of the call,
+scoped to batch parents only (detected by current state's
+`materialize_children` hook or a prior `SchedulerRan` /
+`BatchFinalized` event in the log). Contention returns a CD11-shaped
+`concurrent_tick` error (`integration_unavailable`, exit 1,
+retryable). The lock is released on function exit (implicit file-
+handle drop) — no persistent state, no daemon. This is the same
+`flock` primitive `LocalBackend` already uses for `ContextStore`
+writes. Read paths (`koto status`, `koto query`, `koto workflows
+--children`) do not take the lock.
+
+**Q4 — `koto session resolve` reconciles children.** The command
+now iterates children of the resolved parent and reconciles
+divergent child state files via `CloudBackend::check_sync`. Trivial
+divergence (one side is a strict prefix of the other) auto-resolves;
+non-trivial divergence requires per-child `koto session resolve
+<child>`. Flags `--children=auto|skip|accept-remote|accept-local`
+control behavior.
+
+**Q5 — `sync_status` and `machine_id` response fields.** Added
+conditionally: emitted only when `CloudBackend` is configured for
+the workflow. Values for `sync_status`: `fresh`, `stale`,
+`local_only`, `diverged`. Observers see divergence in the response
+before writing, so they can run `koto session resolve` preemptively.
+
+**Q6 — Push-parent-first retry ordering under cloud sync.** Decision
+9's canonical `handle_retry_failed` sequence is reordered under
+`CloudBackend`: push the parent log (both the submit and clearing
+events) before writing `Rewound` to children. A push failure
+returns the error with zero child writes. This eliminates the
+"phantom child epoch" failure mode where a cloud-sync loser branch
+leaves `Rewound` events on children that the resolved parent log
+never references. Local-mode behavior collapses to the same
+ordering; crash recovery becomes "user re-submits" (acceptable at
+submission granularity) instead of "transparent re-apply"
+(unsafe under cloud sync).
+
+**Q7 — Tempfile sweep in `repair_half_initialized_children`.** Each
+scheduler tick on a batch parent runs a pre-pass scoped to the
+current parent, removing `.koto-*.tmp` files older than 60 seconds.
+Q2 eliminates *races* to leaked tempfiles, but crashes (OOM, SIGKILL,
+disk-full) still leave temp files. The sweep is the janitor.
+
+**Q8 — Walkthrough language.** Replace "any caller can drive the
+parent" language with "the coordinator drives the parent; workers
+drive only their own children." The coordinator-owns-parent,
+workers-own-children partition is a caller contract, enforced at
+runtime by Q3's lock. Both the koto-author and koto-user skills
+get matching updates per the `CLAUDE.md` skill-maintenance rule.
+
+#### Alternatives considered
+
+- **Keep `spawned`, document per-tick-ness.** Rejected: the word
+  "spawned" reasonably suggests "new this moment, dispatch now." The
+  cost of renaming is one find-and-replace plus a walkthrough pass;
+  the cost of preserving the misleading name is perpetual
+  documentation warning about a footgun.
+- **Remove `spawned` entirely; require diffing
+  `materialized_children` between ticks.** Rejected: observably-new
+  spawns are information, not noise. Per-tick audit streams and
+  interactive agents benefit from knowing "this tick I spawned D."
+- **Keep the `init_state_file` race and document it.** Rejected on
+  data-preservation grounds: the round-0 argument ("papers over a
+  caller bug") didn't account for silent child-state corruption.
+  `RENAME_NOREPLACE` converts "silently overwrite" into "one process
+  wins, the other reports cleanly."
+- **Lockfile only, no kernel atomicity.** Rejected: `flock` is
+  unreliable over NFS and doesn't cover a second process that
+  bypasses the lock by mistake. Kernel atomicity is cheap insurance.
+- **Caller-serializes with diagnostic-only detection.** Rejected:
+  the diagnostic fires after corruption. Preventative guard (the
+  lock) is strictly better.
+- **Add `--children` flag to `session resolve`, default skip.**
+  Rejected: preserves silent cross-machine divergence. The correct
+  default is "reconcile what you can, flag what you can't."
+- **Add `sync_status` unconditionally on all responses.** Rejected:
+  under local mode the values are constant (`fresh` + hostname) and
+  provide no information. Conditional emission for conditionally-
+  present subsystems is idiomatic.
+- **Defer `sync_status` / `machine_id`.** Rejected: known hazard,
+  low cost, still-`Proposed` design — add it now.
+- **Make the clearing event a pre-condition of child rewinds (via
+  scheduler guard).** Rejected: ad-hoc runtime guard; enforcing
+  ordering at write time is cleaner.
+- **Rely on resume idempotency for retry under cloud sync.**
+  Rejected: collapses to "split-brain-is-fine" when the local log
+  is the losing branch. Finding 8's exact failure mode.
+- **No tempfile sweep.** Rejected: race elimination does not
+  eliminate crash-leak paths (SIGKILL bypasses drop handlers).
+- **Global tempfile sweep across the session directory.** Rejected:
+  overreach. Scoping to the current parent is sufficient.
+- **Hard rule only in Concurrency Model section, preserve casual
+  walkthrough language.** Rejected: mental model is set by earlier
+  prose; a later hard rule doesn't repair it.
+
+### Decision 13: Post-completion observability
+
+Decision 6 extended `koto status <parent>` and `koto workflows
+--children <parent>` with batch metadata, but only while the parent's
+current state declares a `materialize_children` hook. Round 1
+walkthroughs found five gaps that surface the moment the batch
+terminates or the parent advances past the batched state:
+
+1. `koto status` drops the `batch` section the instant the parent
+   leaves the batched state — exactly when consumers need it to
+   write summary directives or diagnose failures.
+2. The minimal `done` response drops `blocking_conditions` and
+   `scheduler`, so batch detail evaporates on the terminal tick.
+3. Synthetic skipped children are shape-indistinguishable in `koto
+   status` and `koto workflows --children` from real terminal work.
+4. Transitive skip attribution is singular (`skipped_because: X`);
+   diamond chains like B-failed → D-skipped → E-skipped lose
+   context about the root cause.
+5. When `failure_reason` is unset, the batch view's `reason` falls
+   back to the opaque terminal state name silently.
+
+All five gaps are observability-only and additive. The fix lands as
+read-only on the query paths; none of the extensions changes
+existing field semantics.
+
+**Key assumptions:**
+
+- Decision 9's on-disk representation of skipped children exposes a
+  single well-known predicate. This decision names it
+  `skipped_marker: true` on the child's current state.
+- Cloud sync tolerates a new `BatchFinalized` event type under
+  existing append-only rules.
+- `batch_final_view` payload stays bounded by Decision 1's R6 caps.
+- W-level warnings (W1-W4) have an existing surfacing / suppression
+  convention that W5 reuses.
+- Adding optional top-level response fields (`batch_final_view`,
+  `synthetic`, `skipped_because_chain`, `reason_source`) is
+  backward-compatible.
+
+#### Chosen: Persist `batch_final_view`, extend terminal responses, mark synthetic children, record transitive skip chain, add W5
+
+**`BatchFinalized` event.** When `children-complete` first evaluates
+`all_complete: true` on a state with `materialize_children`, the
+advance loop appends a `BatchFinalized` event to the parent log
+containing the final `BatchView` snapshot. Subsequent `koto status
+<parent>` calls — regardless of the parent's current state — emit
+the `batch` section by replaying the most recent `BatchFinalized`
+event, labeled `batch.phase: "final"` (versus `batch.phase: "current"`
+for live views). Re-entering a batched state (after `retry_failed`,
+for example) appends a new `BatchFinalized` event on the next pass.
+
+Event-based storage round-trips through cloud sync identically to the
+rest of the append-only log and survives the `retry_failed` evidence-
+clearing write that wipes reserved context keys.
+
+**`batch_final_view` on `done` responses.** The `done` response
+shape gains an optional `batch_final_view` field, present when the
+parent log contains at least one `BatchFinalized` event. The payload
+matches the `batch` section shape. This gives agents on the terminal
+tick — exactly when they're asked to write a summary directive — the
+full batch snapshot without a second command.
+
+**`synthetic: true` marker.** `koto status <child>` and the per-row
+shape in `koto workflows --children <parent>` add an explicit boolean
+`synthetic: true` when the child's current state has `skipped_marker:
+true`. The predicate is computed from state, not from a template
+hash, so it works under Decision 9's runtime-reclassification model.
+`koto next <synthetic-child>` returns an immediate terminal `done`
+response:
+
+```json
+{
+  "action": "done",
+  "state": "skipped_due_to_dep_failure",
+  "directive": "This task was skipped because dependency '<skipped_because>' did not succeed. No action required.",
+  "is_terminal": true,
+  "synthetic": true,
+  "skipped_because": "<name>",
+  "skipped_because_chain": [...]
+}
+```
+
+Error semantics on a legitimate state read would be hostile; a
+silent blank directive is worse. Explicit `synthetic: true` plus an
+interpolated directive gives both machine-readable and human-readable
+answers.
+
+**`skipped_because_chain` array.** Retain the singular
+`skipped_because: <name>` field (the *direct* upstream blocker). Add
+a parallel `skipped_because_chain: [<direct>, ..., <root-failure>]`
+array recording the full attribution path. For B-failed → D-skipped
+→ E-skipped:
+
+- D: `skipped_because: "B"`, `skipped_because_chain: ["B"]`.
+- E: `skipped_because: "D"`, `skipped_because_chain: ["D", "B"]`.
+
+The chain walks upstream through `waits_on` until a failed (non-
+skipped) ancestor. Diamonds pick the shortest chain, alphabetical
+tie-break for determinism. Both fields land in the batch view, in
+`koto status` output, in `--children` rows, and in the synthetic
+child's own responses.
+
+**W5 compile warning.** Terminal state with `failure: true` has no
+path that writes `failure_reason` to context. The batch view's
+`reason` falls back to the state name, which is uninformative. The
+compiler fires W5 when none of the following holds: (a) the state's
+`accepts` block declares a `failure_reason` field; (b) the state's
+`default_action` writes `failure_reason`; (c) an upstream transition
+carries a `context_assignments` entry writing `failure_reason`.
+
+**`reason_source` projection.** When the batch view's per-child
+`reason` engages the `failure_reason` context key, emit
+`reason_source: "failure_reason"`. When it falls back to the state
+name, emit `reason_source: "state_name"`. Omitted for successful or
+not-yet-terminal children.
+
+#### Alternatives considered
+
+- **Carry last-known batch view through subsequent states via an
+  in-memory cache.** Rejected: doesn't survive process restarts;
+  inconsistent with koto's "pure function of disk state" model;
+  breaks on cloud-sync machine handoffs.
+- **Leave batch-view preservation to the consumer via evidence.**
+  Rejected: duplicates work koto already does via
+  `derive_batch_view`. The consumer's snapshot would ride on
+  context keys (polluting template-author namespace) or a sidecar
+  file (violating the append-only-log invariant).
+- **Keep `done` minimal; expect consumers to call `koto status` for
+  batch detail.** Rejected: a known-frequent access pattern (write-
+  summary-on-terminal-tick) shouldn't require two commands when one
+  suffices.
+- **`kind: "skip_marker"` string field instead of `synthetic: bool`.**
+  Rejected: more expressive than the single category observers need.
+  Boolean is simpler; a string enum can be added later without
+  breaking anything.
+- **Error on `koto next <synthetic-child>`.** Rejected: errors
+  imply caller malformation. A synthetic child is a legitimate
+  workflow that happens to have nothing to do.
+- **Switch singular `skipped_because` to name the root cause (B)
+  instead of direct blocker (D).** Rejected: breaking change on an
+  existing field; direct blocker is more locally useful for "which
+  task do I retry to unblock this?"
+- **Replace singular with plural array only.** Rejected: breaking
+  change on existing consumers.
+- **Make missing `failure_reason` writer a hard error (E11).**
+  Rejected: overly strong. A template author may legitimately
+  decide the state name is sufficient (e.g., `done_cancelled_by_user`).
+  Warning respects authorial intent while flagging the common
+  mistake.
+- **Add no warning; rely on skill-level documentation.** Rejected:
+  leaves the silent-fallback gap unflagged at authoring time.
+
+### Decision 14: Path resolution contradictions
+
+Round 1 pair 3c surfaced five gaps against Decision 4's path
+resolution and the `BatchError` enum:
+
+1. R1 and Data Flow step 4 said a single bad child template fails
+   the whole submission, but `BatchError::TemplateResolveFailed
+   { task, ... }` variant shape implied per-task scope.
+2. Decision 4's fallback text said "on ENOENT" — but an absent
+   `template_source_dir` (pre-Decision-4 state files) never reaches
+   the ENOENT check at all.
+3. `TemplateResolveFailed` conflated "file not found" with "file
+   found but failed to compile." `paths_tried` is meaningless for
+   the compile case.
+4. "DAG depth of 50" had three plausible definitions (edges on
+   longest path, nodes on longest path, any-to-any).
+5. Security Considerations noted `template_source_dir` exposure but
+   didn't surface the cross-machine portability limitation.
+
+Decision 4's core mechanism stands: `template_source_dir` on the
+header, `submitter_cwd` on `EvidenceSubmitted` events, resolution
+order absolute → template_source_dir → submitter_cwd → error. This
+decision resolves the five gaps within that mechanism.
+
+**Key assumptions:**
+
+- Decision 11's envelope accommodates per-task scheduler errors and
+  a warnings vector on `SchedulerOutcome`.
+- Agents understand that a per-task failure does not abort siblings.
+- `Path::exists()` per tick is a cheap probe.
+- Same-layout cross-machine is the common case.
+
+#### Chosen: Per-task failures, absent-source-dir skips cleanly, split variant, node-count depth, runtime warning on staleness
+
+**R1 is per-task, not whole-submission.** Child-template compile and
+resolve failures produce per-task errors in `SchedulerOutcome.errored`
+and do not abort sibling spawns. Whole-submission failures restrict
+to graph properties: R3 (cycles), R4 (dangling refs), R5 (duplicate
+names), R6 (limits), R8 (spawn-time mutation), R9 (invalid name).
+These reject pre-append with `InvalidBatchReason` variants. Data
+Flow Step 4 is rewritten to enumerate only R3/R4/R5/R6/R8/R9 as
+whole-submission failures.
+
+**Absent `template_source_dir` skips step (b) and emits a warning.**
+The resolution order grows an explicit absent-case branch:
+
+- (a) Absolute paths pass through.
+- (b) If `template_source_dir` is `Some(dir)`, join the relative path
+  against it. If the file exists, use it. If ENOENT, fall through.
+- **(b') If `template_source_dir` is `None`, skip (b) entirely. Emit
+  `SchedulerWarning::MissingTemplateSourceDir` once per tick. Fall
+  through to (c).**
+- (c) Join against `submitter_cwd`. If the file exists, use it.
+- (d) Return `TemplateNotFound { task, paths_tried }` listing every
+  attempted path.
+
+**Present-but-stale `template_source_dir` emits a warning.** When
+`Path::new(template_source_dir).exists()` is false at scheduler
+start, emit `SchedulerWarning::StaleTemplateSourceDir` and fall
+through to `submitter_cwd`. Deduplicated per `template_source_dir`
+value per tick.
+
+**Split `TemplateResolveFailed` into two variants.**
+
+```rust
+pub enum BatchError {
+    // ... other variants ...
+    TemplateNotFound { task: String, paths_tried: Vec<String> },
+    TemplateCompileFailed { task: String, path: String, compile_error: String },
+}
+```
+
+Agents programmatically distinguish "my path is wrong" from "my
+template file is broken" and can render targeted recovery
+suggestions.
+
+**DAG depth = longest root-to-leaf path, counted in nodes.** A
+**root** is a task with empty `waits_on`; a **leaf** is a task no
+sibling's `waits_on` references. Depth is the node count along the
+longest root-to-leaf path. A linear chain of 51 tasks has depth 51
+and exceeds the limit. `BatchError::LimitExceeded` messages for
+depth now say "Longest dependency chain has N tasks; limit is 50."
+
+Node count matches user intuition ("I wrote 51 tasks") without the
+off-by-one surprise edge-count depth would produce at the 50/51
+boundary.
+
+**Cross-machine portability documented + runtime warning.** Security
+Considerations gains a paragraph describing when
+`template_source_dir` and `submitter_cwd` become stale (cross-home-
+layout migrations, Linux ↔ macOS, different usernames, container
+paths). The paragraph points at the two warnings above and notes
+that a future `koto session retarget` subcommand may land in a
+separate design.
+
+#### Alternatives considered
+
+- **Whole-submission halt on bad child template.** Rejected:
+  inconsistent with the variant's `task: String` field; kills
+  partial-success needed by dynamic additions.
+- **Hybrid per-task for compile, whole for not-found.** Rejected:
+  arbitrary — not-found is no more a graph property than compile-
+  failed.
+- **Error at submission when `template_source_dir` is absent.**
+  Rejected: breaks pre-Decision-4 backward-compatibility. State
+  files predating Decision 4 have no header field and would reject
+  on first batch submission after upgrade.
+- **Silent fallback on absent `template_source_dir`.** Rejected:
+  hides diagnostic signal agents need to understand surprise
+  failures.
+- **Keep one `TemplateResolveFailed` variant with a `kind`
+  discriminator.** Rejected: bloats the variant with fields
+  meaningful to only one kind; still forces agents to pattern-match
+  a nested discriminator.
+- **Edge-count DAG depth.** Rejected: matches CS convention but
+  produces off-by-one surprises at the boundary ("I wrote 51 tasks
+  and koto says depth 50 is the limit — which is it?").
+- **"Any-to-any" longest path.** Rejected: in a DAG, every path
+  extends to a root and leaf, so any-to-any collapses to root-to-
+  leaf. Not a real alternative.
+- **Doc-only portability note, no runtime warning.** Rejected:
+  leaves agents with no runtime signal when cross-machine
+  resolution is about to fail.
+- **`koto session retarget` subcommand to rewrite header fields.**
+  Real fix but out of Decision 14's scope; noted as a future
+  extension.
+- **Repo-relative `template_source_dir` alongside the absolute
+  path.** Real fix but requires git-root detection and a new header
+  field; out of scope for v1.
+
 ## Decision Outcome
 
-The eight decisions interlock into one coherent implementation. The
+The fourteen decisions interlock into one coherent implementation. The
 batch feature lands as a single atomic change set with the following
 architectural thesis:
 
@@ -1390,7 +2540,8 @@ They share three cross-cutting PR landing requirements:
    `init_state_file` refactor extracts the backend-trait method,
    converts `handle_init` to use it, and is independently shippable.
    Three call sites will consume it later (regular init, scheduler
-   spawn, skipped-marker synthesis).
+   spawn, runtime reclassification — delete-and-respawn of skipped
+   children per Decision 9).
 
 3. **One scheduler PR.** Adds `src/cli/batch.rs`, wires
    `run_batch_scheduler` into `handle_next` after `advance_until_stop`,
@@ -1420,7 +2571,8 @@ The new surface divides into three concerns:
 2. **Atomic child-spawn safety** — the `init_state_file` backend method
    that bundles header + initial events into one atomic `rename(2)`.
    Used by three call sites: regular `koto init`, the scheduler's
-   spawn path, and the skipped-marker synthesis path.
+   spawn path, and runtime reclassification (delete-and-respawn of
+   skipped children per Decision 9).
 3. **Failure and retry** — first-class terminal-failure, synthetic
    skipped-marker state files, extended gate output, `retry_failed`
    evidence action, and observability through extended `koto status`
@@ -1492,7 +2644,7 @@ The new surface divides into three concerns:
 │  types.rs: accepts field type gains `tasks` variant         │
 │                                                             │
 │  compile.rs: new validator for materialize_children         │
-│    enforcing E1-E10 errors and W1-W3 warnings               │
+│    enforcing E1-E10 errors and W1-W5 warnings (plus F5)     │
 └─────────────────────────────────────────────────────────────┘
           ▲
           │
@@ -1569,18 +2721,113 @@ pub trait SessionBackend: Send + Sync {
 **New CLI module** (`src/cli/batch.rs`). Placed under `src/cli/`, not
 `src/engine/`, because the scheduler needs `SessionBackend` and
 produces CLI response shapes — putting it in `src/engine/` would
-violate the engine's I/O-free invariant:
+violate the engine's I/O-free invariant.
+
+All new types below carry
+`#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]` unless
+otherwise noted. Enums use `#[serde(rename_all = "snake_case")]`
+and, where tagged, `#[serde(tag = "kind")]` or similar as documented
+per-enum.
 
 ```rust
 pub enum SchedulerOutcome {
     NoBatch,
     Scheduled {
-        spawned: Vec<String>,
-        skipped: Vec<(String, String)>,  // (task, reason)
+        /// Per-tick observation: children whose state file THIS tick created.
+        /// Decision 12 Q1: renamed from `spawned`. Concurrent ticks can each
+        /// return the same child; use `materialized_children` for idempotent
+        /// dispatch.
+        spawned_this_tick: Vec<String>,
+        /// Ledger: every child that exists on disk for this parent right now,
+        /// with outcome and current state. Decision 12 Q1.
+        materialized_children: Vec<MaterializedChild>,
         already: Vec<String>,
         blocked: Vec<String>,
+        skipped: Vec<SkippedEntry>,
+        /// Per-task spawn errors accumulated during the tick. Decision 11 Q4:
+        /// scheduler never halts on one bad task; siblings keep spawning.
+        errored: Vec<TaskSpawnError>,
+        /// Non-fatal warnings the scheduler emitted this tick. Decision 14.
+        warnings: Vec<SchedulerWarning>,
+        /// Per-entry feedback keyed by the agent-submitted short name.
+        /// Decision 10.
+        feedback: SchedulerFeedback,
     },
-    Error { reason: String },
+    /// Reserved for tick-wide failures (backend list failure during
+    /// classification; nothing can be known, so nothing can be reported).
+    Error { reason: BatchError },
+}
+
+pub struct MaterializedChild {
+    pub name: String,
+    pub outcome: TaskOutcome,
+    pub state: Option<String>,
+}
+
+/// Per-task outcome discriminator, shared by MaterializedChild and
+/// BatchTaskView. Decision 11's "typed enum discriminators throughout"
+/// commitment applies here.
+#[serde(rename_all = "snake_case")]
+pub enum TaskOutcome {
+    Success,
+    Failure,
+    Skipped,
+    Pending,
+    Blocked,
+    SpawnFailed,
+}
+
+/// Named entry in `SchedulerOutcome::Scheduled.skipped`. Replaces the
+/// earlier `(String, String)` tuple to keep the JSON shape
+/// agent-readable.
+pub struct SkippedEntry {
+    pub task: String,
+    pub reason: String,
+}
+
+pub struct SchedulerFeedback {
+    /// Keyed by short task name (agent-submitted, not <parent>.<name>).
+    pub entries: BTreeMap<String, EntryOutcome>,
+    /// Signature-match detections (Decision 10: rename detection).
+    pub orphan_candidates: Vec<OrphanCandidate>,
+}
+
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum EntryOutcome {
+    Accepted,
+    Already,
+    Blocked { waits_on: Vec<String> },
+    Errored { kind: String },
+}
+
+pub struct OrphanCandidate {
+    pub new_task: String,
+    pub signature_match: String,
+    pub confidence: String,   // "exact" | "fuzzy"
+    pub message: String,
+}
+
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SchedulerWarning {
+    MissingTemplateSourceDir,
+    StaleTemplateSourceDir { path: String },
+}
+
+pub struct TaskSpawnError {
+    pub task: String,
+    pub kind: SpawnErrorKind,
+    pub paths_tried: Option<Vec<String>>,
+    pub message: String,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum SpawnErrorKind {
+    TemplateNotFound,
+    TemplateCompileFailed,
+    Collision,              // EEXIST on init_state_file
+    BackendUnavailable,
+    PermissionDenied,
+    IoError,
 }
 ```
 
@@ -1593,23 +2840,138 @@ serializes the `NextResponse` variant to JSON, then merges the
 returning. This avoids modifying every `NextResponse` variant to carry
 an optional scheduler field.
 
+**New `action: "error"` response variant** (Decision 11). Rejected
+submissions return a seventh `NextResponse` variant with envelope:
+
+```json
+{
+  "action": "error",
+  "state": "plan_and_await",
+  "advanced": false,
+  "error": {
+    "code": "invalid_submission",
+    "message": "<human-readable>",
+    "details": [{"field": "<path>", "reason": "<snake_case>"}],
+    "batch": {
+      "kind": "invalid_batch_definition",
+      "reason": "<InvalidBatchReason tag>",
+      ... typed fields per variant ...
+    }
+  },
+  "blocking_conditions": [],
+  "scheduler": null
+}
+```
+
+**New `reserved_actions` sibling field** (Decision 9). Emitted on any
+response whose gate output reports `any_failed` or `any_skipped`:
+
+```json
+{
+  "reserved_actions": [{
+    "name": "retry_failed",
+    "description": "...",
+    "payload_schema": { "children": {...}, "include_skipped": {...} },
+    "applies_to": ["<retryable child names>"],
+    "invocation": "koto next <parent> --with-data '{\"retry_failed\": {...}}'"
+  }]
+}
+```
+
+**New `batch_final_view` field on `done` responses** (Decision 13).
+Present when the parent log contains at least one `BatchFinalized`
+event. Payload shape matches the `batch` section of `koto status`.
+
+**New `sync_status` / `machine_id` top-level fields** (Decision 12
+Q5). Emitted only under `CloudBackend`. `sync_status` values:
+`"fresh"`, `"stale"`, `"local_only"`, `"diverged"`.
+
 ```rust
 pub enum BatchError {
-    /// Task list failed validation (size, cycles, unique names, refs).
-    InvalidBatchDefinition { reason: String },
+    /// Task list failed whole-submission validation (graph properties,
+    /// limits, spawn-time immutability, name validity).
+    InvalidBatchDefinition { reason: InvalidBatchReason },
     /// backend.create / init_state_file failed for a specific task.
-    SpawnFailed { task: String, source: anyhow::Error },
-    /// Resolved template path doesn't exist or fails to compile.
-    TemplateResolveFailed { task: String, paths_tried: Vec<String> },
-    /// Backend list/read failed during classification.
-    BackendError { source: anyhow::Error },
-    /// Submission exceeds hard limits (task count, edge count, depth).
-    LimitExceeded { which: &'static str, limit: usize, actual: usize },
+    /// Surfaces per-task via SchedulerOutcome.errored; never a top-level
+    /// NextError.
+    SpawnFailed { task: String, kind: SpawnErrorKind, message: String },
+    /// Template path didn't resolve against any configured base.
+    /// Decision 14: split from the former TemplateResolveFailed.
+    TemplateNotFound { task: String, paths_tried: Vec<String> },
+    /// Template found and read, but compilation failed.
+    /// Decision 14: split from the former TemplateResolveFailed.
+    TemplateCompileFailed { task: String, path: String, compile_error: String },
+    /// Backend list/read failed during classification. Tick-wide.
+    BackendError { message: String, retryable: bool },
+    /// Submission exceeds hard limits. Decision 11 Q10.
+    LimitExceeded { which: LimitKind, limit: usize, actual: usize },
+    /// Retry submission failed validation. Decision 9, Decision 11 Q11.
+    InvalidRetryRequest { reason: InvalidRetryReason },
 }
 
-// BatchError maps to NextError::Batch { kind, message } for CLI
-// response serialization. The NextError variant is added in the
-// same PR that introduces this module.
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum InvalidBatchReason {
+    EmptyTaskList,                                        // R0
+    Cycle { cycle: Vec<String> },                         // R3
+    DanglingRefs { entries: Vec<DanglingRef> },           // R4
+    DuplicateNames { duplicates: Vec<String> },           // R5
+    InvalidName { task: String, detail: InvalidNameDetail }, // R9
+    ReservedNameCollision { task: String, reserved: String }, // R9
+    TriggerRuleUnsupported { task: String, rule: String },
+    /// Decision 10 R8: submission tried to mutate a spawned child's fields.
+    SpawnedTaskMutated { task: String, changed_fields: Vec<MutatedField> },
+    LimitExceededTasks { limit: usize, actual: usize },
+    LimitExceededWaitsOn { task: String, limit: usize, actual: usize },
+    LimitExceededDepth { limit: usize, actual: usize },
+}
+
+#[serde(tag = "detail", rename_all = "snake_case")]
+pub enum InvalidNameDetail {
+    Empty,
+    InvalidChars { pattern: String },
+    TooLong { limit: usize, actual: usize },
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum LimitKind {
+    Tasks,
+    WaitsOn,
+    Depth,
+    PayloadBytes,
+}
+
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum InvalidRetryReason {
+    NoBatchMaterialized,                          // premature retry
+    EmptyChildList,
+    ChildNotEligible { children: Vec<ChildEligibility> },
+    RetryAlreadyInProgress,
+    MixedWithOtherEvidence { extra_fields: Vec<String> },
+}
+
+pub struct MutatedField {
+    pub field: String,   // "template" | "vars" | "waits_on" | "vars.<key>"
+    pub spawned_value: serde_json::Value,
+    pub submitted_value: serde_json::Value,
+}
+
+pub struct ChildEligibility {
+    pub name: String,
+    pub current_outcome: String,
+}
+
+// BatchError maps to the existing NextError struct (Decision 11 Q3).
+// There is NO `NextError::Batch` variant; batch-specific context lives
+// in a sibling `error.batch` object alongside `details`. Mapping:
+//
+//   InvalidBatchDefinition / LimitExceeded / InvalidRetryRequest
+//     → NextError { code: InvalidSubmission, ... }
+//   TemplateCompileFailed at compile time
+//     → NextError { code: TemplateError, ... }
+//   SpawnFailed / TemplateNotFound / TemplateCompileFailed at runtime
+//     → NOT promoted to top-level NextError; surface per-task via
+//       SchedulerOutcome.errored.
+//   BackendError → NextError { code: IntegrationUnavailable, ... }
 
 pub fn run_batch_scheduler(
     backend: &dyn SessionBackend,
@@ -1652,20 +3014,39 @@ pub struct BatchSummary {
     pub skipped: usize,
     pub pending: usize,
     pub blocked: usize,
+    /// Decision 11 Q4: per-task spawn failures that didn't abort siblings.
+    pub spawn_failed: usize,
 }
 
 pub struct BatchTaskView {
     pub name: String,
     pub child: Option<String>,
-    pub outcome: String,
+    /// Decision 11 Q4: per-task outcome, including `spawn_failed`.
+    pub outcome: TaskOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Decision 13: "failure_reason" (context key present) vs
+    /// "state_name" (fallback). Omitted for successful / non-terminal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_source: Option<String>,
+    /// Decision 13: explicit marker for scheduler-authored skip children.
+    /// Computed from `skipped_marker: true` on the child's current state.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub synthetic: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waits_on: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_by: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped_because: Option<String>,
+    /// Decision 13: full attribution path from direct blocker back to the
+    /// first failed (non-skipped) ancestor. Empty when this task is not
+    /// skipped.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_because_chain: Vec<String>,
+    /// Per-task spawn-error detail when outcome == "spawn_failed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawn_error: Option<TaskSpawnError>,
 }
 ```
 
@@ -1737,14 +3118,16 @@ empty `waits_on`, 7 with dependencies forming a DAG).
   "plan_and_await", ...)`
 - scheduler finds `materialize_children` on `plan_and_await`
 - parses the task list from the latest-epoch `EvidenceSubmitted`
-- builds DAG, runs runtime validation (R1–R7)
+- builds DAG, runs whole-submission validation (R3, R4, R5, R6, R8,
+  R9); R0 already ran pre-append; R1/R2 run per-task and accumulate
+  in `SchedulerOutcome.errored`
 - classifies: all 10 tasks `NotYetSpawned`; 3 with empty
   `waits_on` are `Ready`; 7 are `BlockedByDep`
 - for each `Ready` task, calls
   `init_state_file("parent-42.issue-1", header, initial_events)`
   atomically. The initial event list is
   `[WorkflowInitialized, Transitioned → <child initial state>]`.
-- returns `SchedulerOutcome::Scheduled { spawned:
+- returns `SchedulerOutcome::Scheduled { spawned_this_tick:
   ["parent-42.issue-1", "parent-42.issue-3", "parent-42.issue-5"],
   blocked: [...7...] }`
 - response serialized: outer shape is `gate_blocked`, attached
@@ -1764,7 +3147,7 @@ worker runs its own drive loop:
 ```
 loop:
   response = koto next parent-42.issue-1
-  if response is workflow_complete: break
+  if response.action == "done": break
   if response is evidence_required: do the work, collect evidence
   koto next parent-42.issue-1 --with-data @work.json
 ```
@@ -1808,7 +3191,7 @@ ticks parent. Gate re-evaluates: all 10 children terminal,
 all_complete: true }` matches. Advance loop transitions
 `plan_and_await → summarize`. `summarize` is terminal.
 `handle_next` calls `run_batch_scheduler` on `summarize`, which
-finds no hook and returns `NoBatch`. Response: `workflow_complete`.
+finds no hook and returns `NoBatch`. Response carries `action: "done"`.
 
 **Protocol summary.**
 
@@ -1859,9 +3242,11 @@ finds no hook and returns `NoBatch`. Response: `workflow_complete`.
    - Extracts the task list from the latest epoch's
      `EvidenceSubmitted` event via `derive_evidence` +
      `merge_epoch_evidence`.
-   - Builds the DAG and runs runtime validation (R1–R7). Cycles,
-     dangling refs, and duplicate names fail the whole submission
-     with `BatchError::InvalidBatchDefinition`. For dynamic
+   - Builds the DAG and runs whole-submission validation (R3, R4,
+     R5, R6, R8, R9); R0 already ran pre-append; R1/R2 run per-task
+     and accumulate in `SchedulerOutcome.errored`. Cycles, dangling
+     refs, and duplicate names fail the whole submission with
+     `BatchError::InvalidBatchDefinition`. For dynamic
      additions where the cycle emerges only from the merge of
      original + appended tasks, the scheduler rejects the
      resubmission before any new spawn happens; already-spawned
@@ -1878,11 +3263,12 @@ finds no hook and returns `NoBatch`. Response: `workflow_complete`.
      refactored from `handle_init`, passing the parent's
      `template_source_dir` as the resolution base. The child name is
      `<parent>.<task.name>`.
-   - For each `ShouldBeSkipped` task, synthesizes a skipped child:
-     calls `init_state_file` with a header pointing at the parent
-     template and an initial-events list containing
-     `WorkflowInitialized` plus `Transitioned → <skipped_marker_state>`
-     plus a context write (`skipped_because: <failed_task>`).
+   - For each `ShouldBeSkipped` task, calls `init_state_file` with
+     the child's real template and initial events
+     `[WorkflowInitialized, Transitioned → <skipped_marker_state>]`
+     plus a context write `skipped_because: <failed_task>`. F5
+     (Decision 1 compile rule) ensures every batch-eligible child
+     template declares a reachable `skipped_marker: true` state.
    - Returns `SchedulerOutcome::Scheduled` with per-task counts.
 5. `handle_next` maps `SchedulerOutcome` into the response JSON. The
    outer response still reflects the advance loop's decision (gate
@@ -1905,35 +3291,41 @@ every time. Crashes are recoverable because:
 - `EvidenceSubmitted` events are append-only; the task list is
   reconstructed identically on every call.
 
-**Retry:**
+**Retry:** See Decision 5.4 for the canonical sequence. In brief:
 
 1. Parent is at a post-batch analysis state (e.g., `analyze_results`)
    after `children-complete` passed with some failures and skips.
 2. Agent submits
    `koto next parent --with-data '{"retry_failed": {"children": ["parent.issue-2"], "include_skipped": true}}'`.
-3. The advance loop sees the `retry_failed` evidence and transitions
-   the parent back to `awaiting_children` via a template-defined
-   route.
-4. `handle_next` then calls the scheduler. Before the normal tick,
-   the scheduler detects the unconsumed `retry_failed` evidence and
-   runs `handle_retry_failed`:
-   - Computes transitive closure of the retry set through the DAG.
-   - For each child in the closure, appends a `Rewound` event to its
-     state file (reusing `handle_rewind`'s machinery via an
-     `internal_rewind_to_initial` helper). This creates a new epoch;
-     prior evidence is invisible to the current epoch.
-   - Appends a clearing `{"retry_failed": null}` evidence event to
-     the parent to mark the action consumed.
-5. The normal scheduler tick then runs on the now-rewound children,
-   sees them as non-terminal, and the usual flow (wait, gate
-   re-evaluates, terminate, etc.) resumes.
+3. `handle_retry_failed` intercepts in `handle_next` BEFORE
+   `advance_until_stop` runs, following the sequence at Decision 5.4:
+   a. Validate R10 (retry set non-empty; each named child exists and
+      has outcome `failure` or `skipped`; all-or-nothing).
+   b. Append `EvidenceSubmitted { retry_failed: <payload> }` to the
+      parent log.
+   c. Append the clearing `EvidenceSubmitted { retry_failed: null }`
+      event to the parent (under `CloudBackend`, `sync_push_state`
+      the parent log here — push-parent-first per Decision 12 Q6
+      eliminates phantom child epochs on sync failure).
+   d. For each child in the downward closure of the retry set:
+      append `Rewound` targeting the initial state when the child's
+      outcome is `failure`; delete-and-respawn when the child's
+      current state carries `skipped_marker: true` (a `Rewound`
+      event would not reach a non-skipped-marker state).
+   e. Return control to the advance loop, which fires the
+      template-declared transition on
+      `when: evidence.retry_failed: present` on the next tick.
+4. The normal scheduler tick then runs on the rewound or respawned
+   children, sees them as non-terminal, and the usual flow (wait,
+   gate re-evaluates, terminate, etc.) resumes.
 
 ### Concurrency model
 
 A common consumer pattern is for an orchestrator agent (e.g.,
 shirabe's `work-on-plan.md`) to spawn multiple sub-agents, each
 driving one child workflow in parallel. This design supports that
-pattern, with one caller-side invariant.
+pattern with serialization enforced at the koto layer, not at the
+caller.
 
 **Parallelism where it works naturally.** Each child workflow has
 its own state file. Once the scheduler has spawned N ready
@@ -1943,53 +3335,46 @@ all operate on distinct state files with distinct event logs. No
 shared state, no races, no locks needed. This is where the
 parallelism lives.
 
-**Caller invariant: serialize scheduler ticks on the parent.**
-`koto next parent` (the scheduler tick) is not reentrant-safe
-against concurrent invocation. Two concurrent scheduler ticks can
-race on two surfaces:
+**Serialization for batch parents (Decision 12).** Two concurrent
+`koto next parent` calls can race on two surfaces: the parent's
+append-only event log (sequence collision) and the child
+`init_state_file` rename (TOCTOU between `exists` and `rename`).
+Decision 12 closes both at the koto layer:
 
-1. **Parent event log append.** Both ticks read the parent's log
-   at sequence N and both try to append sequence N+1. The existing
-   `expected_seq` integrity check catches this (or worse, silently
-   accepts duplicates and fails the next read). This is a
-   pre-existing v0.7.0 property of koto's append-only event log,
-   not something introduced by batch spawning, but the batch
-   scheduler inherits it.
+1. **Advisory flock on batch parents (Q3).** `handle_next` takes a
+   non-blocking advisory lock on `<session>/<parent>.lock` before
+   reading the parent's log. A concurrent tick hits the lock and
+   returns a typed `concurrent_tick` error immediately; callers
+   can back off and retry. Non-batch workflows are unaffected —
+   the lock is scoped to parents whose current state carries a
+   `materialize_children` hook.
+2. **`renameat2(RENAME_NOREPLACE)` on Linux; `link()` + `unlink()`
+   fallback on other Unixes (Q2).** The `init_state_file` rename
+   step fails loudly on collision instead of silently overwriting,
+   so concurrent spawns can never clobber a child that already
+   exists on disk.
+3. **`materialized_children` ledger (Q1).** Renamed the per-tick
+   `spawned` field to `spawned_this_tick` and added the
+   `materialized_children` ledger — every child on disk for this
+   parent, with outcome and current state. Consumers dispatch off
+   the ledger for idempotency rather than reacting to the per-tick
+   observation.
+4. **Push-parent-first retry ordering (Q6).** `handle_retry_failed`
+   appends the parent's clearing event (and pushes it under cloud
+   sync) before any child `Rewound` or respawn write, so a sync
+   failure can never leave phantom child epochs referencing a
+   retry the resolved parent log does not record.
+5. **Tempfile sweep on resume (Q7).** `repair_half_initialized_children`
+   removes any `.koto-*.tmp` files left behind by a crashed
+   `init_state_file` call before the scheduler classifies children
+   on the next tick.
 
-2. **`init_state_file` TOCTOU.** Both ticks see task-4 as ready,
-   both call `backend.exists("parent.task-4")` (returns false),
-   both call `init_state_file`. Unix `rename(2)` has no
-   "fail if exists" semantics, so the second rename silently
-   overwrites the first. If the child received events between
-   the two ticks, those events are lost.
-
-The invariant consumers must enforce: **only one `koto next parent`
-call may run at a time.** The typical pattern is one coordinator
-task that owns the parent (submits the batch, polls for progress,
-calls `retry_failed` on failures) plus N worker sub-agents that
-each drive one child. The coordinator serializes parent-side
-operations; the workers run in parallel on their own state files.
-
-**When to call `koto next parent` in a parallel batch.** The
-coordinator typically calls `koto next parent` (a) after
-submitting the initial task list, (b) when any child reaches a
-terminal state (to let the scheduler spawn newly-unblocked
-tasks), and (c) periodically as a fallback poll. A simple
-implementation has each worker sub-agent signal the coordinator
-on child-terminal, and the coordinator debounces to one tick per
-signal. A lazier implementation just polls on a timer.
-
-**Why this design doesn't serialize at the koto layer.** Adding
-file locking or `renameat2(RENAME_NOREPLACE)` at the
-`SessionBackend` level is tempting but has two costs: (1) it
-requires Linux-specific syscalls or portable lockfile dancing,
-and (2) it papers over a caller bug rather than surfacing it.
-Koto's stateless-CLI model already assumes "one process writes
-to one workflow at a time" for all non-batch operations; batch
-inherits that assumption unchanged rather than making batch
-special. If the existing v0.7.0 assumption needs to be tightened
-(e.g., for multi-machine cloud sync scenarios), that's a separate
-design concern affecting all of koto, not just batch spawning.
+The invariant is now koto-enforced for batch parents: a second
+concurrent tick sees a typed error, not a silent race. Callers
+running a coordinator + N workers pattern still get the natural
+parallelism on the child side — workers each hold their own child
+state file — and they see a clean error when two ticks race on the
+parent.
 
 **Concrete worked example.** A coordinator agent submits a
 20-task batch. First scheduler tick spawns 5 ready tasks
@@ -2004,10 +3389,11 @@ The scheduler spawns those 3 in the same tick. The coordinator
 starts 3 more workers. And so on.
 
 At peak, up to 20 worker sub-agents could be running in parallel
-(minus however many are already terminal) while the coordinator
-serializes its own `koto next parent` calls. This scales
-linearly with task count on the child side and stays O(1) on
-the parent side.
+(minus however many are already terminal). The coordinator
+naturally serializes its own `koto next parent` calls; if two
+ticks ever overlap, the advisory flock ensures the second returns
+`concurrent_tick` rather than racing. This scales linearly with
+task count on the child side and stays O(1) on the parent side.
 
 ## Implementation Approach
 
@@ -2044,6 +3430,22 @@ implementation.
 - New test: `init_child_from_parent` resolves child-template
   variables correctly when the parent template has different
   variables
+- **Decision 12 Q2:** `renameat2(RENAME_NOREPLACE)` on Linux,
+  `link()` + `unlink()` fallback on other Unixes for the final
+  rename step in `init_state_file`. Release notes pin Linux ≥ 3.15
+  as the minimum supported kernel.
+- **Decision 12 Q3:** advisory non-blocking `flock` on
+  `<session_dir>/<workflow>.lock` acquired in `handle_next` for
+  batch parents (detected by current state's `materialize_children`
+  hook or any `SchedulerRan` / `BatchFinalized` event in the log).
+  Lock released on function exit via file-handle drop; lock file
+  contents are empty — process-lifetime mutex, not persistent
+  state.
+- **Decision 10 / 2 amendment:** `WorkflowInitialized` event gains
+  a `spawn_entry: Option<SpawnEntrySnapshot>` field capturing the
+  canonical-form task entry (template, vars, waits_on). Additive
+  and `#[serde(default, skip_serializing_if = "Option::is_none")]`
+  for round-trip compatibility with pre-Decision-10 children.
 
 **No user-visible change.** Existing `koto init` behavior is
 preserved; only the internal sequence is tightened.
@@ -2073,8 +3475,23 @@ split into two sub-PRs if review velocity stalls (see Mitigations).
 - `derive_expects` updated to auto-generate `item_schema` on
   accepts fields linked to a `materialize_children` hook
   (Decision 8); the schema is koto-generated, not template-authored
-- `CompiledTemplate::validate` extended with E1–E10 errors and W1–W3
-  warnings for `materialize_children`
+- `CompiledTemplate::validate` extended with E1–E10 errors and W1–W5
+  warnings for `materialize_children`. W4 (Decision 9): warn when a
+  batch state routes only on `all_complete: true`. W5 (Decision 13):
+  warn when a `failure: true` state has no path writing
+  `failure_reason`. F5 (Decision 9): warn when a batch-eligible
+  child template lacks a scheduler-reachable `skipped_marker: true`
+  state.
+- **Decision 11:** R0-R9 runtime rules run as pre-append pure
+  functions of the submitted payload. R0 (non-empty tasks), R8
+  (spawn-time immutability against `spawn_entry` snapshot), R9
+  (name regex + reserved names), R6 depth definition (node count
+  along longest root-to-leaf path).
+- Typed enums replace free-string fields in `BatchError`,
+  `InvalidBatchReason`, `LimitKind`, `SpawnErrorKind`,
+  `InvalidRetryReason`. Generated from Decision 11 Q8-Q11.
+- `failure_reason` context-key convention documented in koto-author
+  skill (paired with W5 warning).
 - Tests for each compiler rule and each field default
 
 **No batch scheduler yet.** This PR unlocks the template vocabulary
@@ -2086,12 +3503,20 @@ but runtime is a no-op.
 
 Wire up the actual scheduler and observability.
 
+**Prerequisite:** extend the when-clause engine with an
+`evidence.<field>: present` matcher (Decision 9 Part 2 relies on
+this for the template-declared retry transition). In-scope for this
+phase's first PR; failing this prerequisite blocks retry routing.
+
 **Deliverables:**
 - New module `src/cli/batch.rs` with `run_batch_scheduler`,
   `derive_batch_view`, `handle_retry_failed`, `classify_task`,
   `build_dag`, DAG cycle detector, and `BatchError` enum
-- New `NextError::Batch` variant in `src/cli/next_types.rs` with
-  `From<BatchError>` impl for CLI response serialization
+- **Decision 11:** new `NextResponse::Error` variant in
+  `src/cli/next_types.rs` emitting `action: "error"`. `NextError`
+  gains an optional sibling `batch: Option<BatchErrorContext>`
+  field. No new `NextError::Batch` variant — the existing struct
+  shape is preserved.
 - `handle_next` in `src/cli/mod.rs` calls `run_batch_scheduler`
   after `advance_until_stop`
 - **Update `evaluate_children_complete`'s "no children found"
@@ -2102,15 +3527,60 @@ Wire up the actual scheduler and observability.
   the batch definition.
 - `evaluate_children_complete` extended to emit the Decision 5
   gate output schema (additive fields: `success`, `failed`,
-  `skipped`, `blocked`, per-child `outcome`, `failure_mode`,
-  `skipped_because`, `blocked_by`)
-- `koto status` extended with optional `batch` section
+  `skipped`, `blocked`, `spawn_failed`, per-child `outcome`,
+  `failure_mode`, `skipped_because`, `blocked_by`), plus the
+  Decision 9 derived booleans (`all_success`, `any_failed`,
+  `any_skipped`, `needs_attention`).
+- **Runtime reclassification** in the scheduler tick (Decision 9
+  Part 5). Each tick walks existing children: stale skip markers
+  (dependency outcomes no longer failed) are delete-and-respawned;
+  real-template running children whose upstream just flipped to
+  failure are delete-and-respawned as skip markers. Guard against
+  thrashing by reclassifying only on dep-outcome change.
+- **`BatchFinalized` event** (Decision 13). Appended when the
+  `children-complete` gate first evaluates `all_complete: true` on
+  a state with `materialize_children`. Carries the final
+  `BatchView` snapshot.
+- **`batch_final_view` on `done` responses** (Decision 13),
+  populated from the most recent `BatchFinalized` event.
+- `koto status` extended with optional `batch` section; emits
+  `batch.phase: "current"` when the current state has a hook,
+  `batch.phase: "final"` when replaying from `BatchFinalized`.
+  `synthetic: true` marker on children whose current state has
+  `skipped_marker: true`. `skipped_because_chain` alongside
+  singular `skipped_because`. `reason_source` disambiguation on
+  per-child `reason`.
 - `koto workflows --children` extended with per-row batch metadata
-- `retry_failed` evidence action wired through the advance loop to
-  `handle_retry_failed`. The `null`-clearing-event idiom must be
-  documented with a prominent code comment referencing
-  `merge_epoch_evidence` semantics so future maintainers don't
-  accidentally break it.
+  (same fields).
+- **`retry_failed` advance-loop integration** (Decision 9 Part 2):
+  CLI-layer interception before `advance_until_stop`; template-
+  declared transition fires on `when: evidence.retry_failed:
+  present`; clearing event writes per Decision 12 Q6 ordering.
+- **`reserved_actions` sibling response field** (Decision 9 Part 3):
+  synthesized by `handle_next` after gate evaluation when
+  `any_failed` or `any_skipped` is true. Carries ready-to-run
+  `invocation` strings.
+- **`scheduler.feedback` map** (Decision 10): per-entry outcomes
+  keyed by agent-submitted short name, plus `orphan_candidates`
+  for rename detection.
+- **`materialized_children` ledger on scheduler output** (Decision
+  12 Q1): complete set of on-disk children with outcome and state.
+  Agents key on this for idempotent worker dispatch.
+- **`SchedulerRan` event appended on non-trivial ticks** (Decision
+  11 Q5): per-tick `spawned_this_tick`, `already`, `blocked`, `skipped`,
+  `errored`. Skips append when every task is `already`/`blocked`.
+- **Decision 14:** per-task spawn error accumulation via
+  `SchedulerOutcome.errored` (never halt); split `BatchError` into
+  `TemplateNotFound` and `TemplateCompileFailed`;
+  `SchedulerWarning::MissingTemplateSourceDir` and
+  `StaleTemplateSourceDir` emit via `SchedulerOutcome.warnings`;
+  `Path::exists()` probe once per tick on `template_source_dir`.
+- **Decision 12 Q4-Q7:** `koto session resolve <parent>` reconciles
+  children by default; `sync_status` and `machine_id` response
+  fields emit under `CloudBackend`; push-parent-first ordering in
+  `handle_retry_failed` under `CloudBackend`; per-tick tempfile
+  sweep in `repair_half_initialized_children` scoped to the
+  current parent, threshold 60 seconds.
 - **New `internal_rewind_to_initial(backend, name)` helper.** This
   is new machinery, not an extraction from `handle_rewind` — the
   existing rewind command rewinds one step, not back to initial
@@ -2122,21 +3592,33 @@ Wire up the actual scheduler and observability.
   header but no events (shouldn't happen after Phase 1's atomic
   init bundle, but defense-in-depth for crashes in the older
   code path that ran before Phase 1 shipped). Either deletes or
-  atomically re-initializes them.
+  atomically re-initializes them. Also runs the tempfile sweep
+  above.
 - **Submission-time hard limit enforcement.** At evidence
   submission, reject task lists exceeding hard caps: 1000 tasks,
   10 `waits_on` entries per task, DAG depth of 50. Return
-  `BatchError::LimitExceeded` with actual and limit values.
-  These are hard rejections, not soft recommendations — easier
-  to loosen limits in v2 than to tighten them after users rely
-  on larger batches.
+  per-limit `InvalidBatchReason` variants with actual and limit
+  values. These are hard rejections, not soft recommendations —
+  easier to loosen limits in v2 than to tighten them after users
+  rely on larger batches.
 - Integration tests for: linear batch, diamond DAG, mid-flight
-  append, failure with skip-dependents, `retry_failed` recovery,
-  crash-resume walkthrough from Decision 5's section 5.5,
-  limit-exceeded rejection
+  append, failure with skip-dependents, `retry_failed` recovery
+  (including `reserved_actions` discovery), crash-resume
+  walkthrough from Decision 5's section 5.5, limit-exceeded
+  rejection, concurrent-tick `flock` contention, cloud-sync
+  push-parent-first retry ordering, runtime reclassification
+  sweep, `spawn_failed` per-task accumulation.
 - koto-author and koto-user skill updates covering
-  `materialize_children`, the extended gate output, and the
-  `retry_failed` action
+  `materialize_children`, the extended gate output, the
+  `retry_failed` action, `materialized_children` as the dispatch
+  ledger, the coordinator-owns-parent / workers-own-children
+  partition (Decision 12 Q8), `sync_status` interpretation,
+  `failure_reason` convention, and the `synthetic: true` marker.
+- **Walkthrough rewrite.** Replace "any caller can drive the
+  parent" and "the agent simply calls `koto next` with a different
+  workflow name" language with "the coordinator drives the parent;
+  workers drive only their own children." The partition is a
+  caller contract enforced at runtime by the advisory flock.
 
 **End of Phase 3, the feature is complete.** The shirabe work-on-plan
 design (tsukumogami/shirabe#67) can begin rewriting its spawn loop
@@ -2160,6 +3642,16 @@ These items are explicitly deferred:
   in batch B). Out of scope.
 - A new `koto batch` subcommand namespace. All observability flows
   through existing `koto status` and `koto workflows --children`.
+- **`cancel_tasks` reserved evidence action** (Decision 10). Removal
+  of a spawned task is deferred to v1.1. v1 documents the non-
+  feature: omitting a previously-named task from a later submission
+  is a no-op, not a cancellation signal. Operators needing immediate
+  removal can manually delete the child's state file; this leaves
+  the parent's view inconsistent and is an unsupported escape hatch.
+- **`koto session retarget`** for rewriting `template_source_dir` on
+  state file headers after cross-machine migration (Decision 14).
+  Cross-machine portability is documented with a runtime warning;
+  the mechanism fix is future work.
 
 ## Consequences
 
@@ -2188,11 +3680,32 @@ These items are explicitly deferred:
 - **Shared `derive_batch_view` keeps `status` and `workflows --children`
   in lockstep.** One helper, two read-only call sites, no
   computation drift.
+- **Round-1 findings now closed.** The retry path is reachable out of
+  the box (Decision 9): `analyze_failures` intermediate state, W4
+  compile warning, template-declared transition, `reserved_actions`
+  discovery surface. Mutation semantics are well-defined (Decision
+  10): R8 locks spawned task entries, union-by-name is precise,
+  per-entry feedback removes silent drops. Rejected submissions
+  carry typed discriminators through a unified `action: "error"`
+  envelope and validation runs pre-append (Decision 11). Concurrency
+  TOCTOU is closed at the kernel level via
+  `renameat2(RENAME_NOREPLACE)` / POSIX `link()` fallback plus an
+  advisory flock (Decision 12). Batch views survive terminal
+  transitions via `BatchFinalized` events and `batch_final_view`
+  fields (Decision 13). Path-resolution contradictions are
+  resolved: per-task failures, absent-source-dir fallback, split
+  variant, node-count depth (Decision 14).
+- **Path-resolution diagnostics.** New `SchedulerWarning::
+  MissingTemplateSourceDir` and `SchedulerWarning::
+  StaleTemplateSourceDir` variants surface cross-machine
+  portability issues at run time through `SchedulerOutcome.warnings`,
+  so agents see the root cause instead of a generic
+  `TemplateNotFound` per task.
 
 ### Negative
 
 - **Schema PR is large.** Decision 2's atomicity fix is clean, but
-  Phase 2 bundles eight decisions' worth of schema changes into one
+  Phase 2 bundles six decisions' worth of schema changes into one
   PR: three new `TemplateState` fields, a new accepts field type,
   `deny_unknown_fields`, a new header field, a new event field.
   Reviewers have a lot to track.
@@ -2223,6 +3736,31 @@ These items are explicitly deferred:
   between submission and scheduler tick, relative resolution
   fails. The `submitter_cwd` fallback covers the common case but
   not all cases.
+- **When-clause engine extension is a prerequisite** for retry
+  routing. Decision 9 Part 2 relies on an
+  `evidence.<field>: present` matcher. Phase 3's first PR adds
+  this to the when-clause evaluator; if it slips, retry-routing
+  templates cannot fire their transitions.
+- **F5 puts authoring burden on child templates.** Any template
+  that participates in a batch must declare a reachable
+  `skipped_marker: true` terminal state. The F5 warning is advisory
+  because batch-eligibility isn't statically knowable at child-
+  compile time, but authors who ignore it hit a scheduler error at
+  first skip.
+- **Linux kernel 3.15+ requirement.** `renameat2` (Decision 12 Q2)
+  needs a 2014-era kernel. Non-Linux Unixes (macOS, BSD, illumos)
+  use a POSIX `link()` + `unlink()` fallback. Release notes must
+  pin the minimum.
+- **Response envelope surface grows.** New top-level fields
+  (`reserved_actions`, `batch_final_view`, `sync_status`,
+  `machine_id`) plus new scheduler-object fields
+  (`materialized_children`, `feedback`, `errored`, `warnings`,
+  `spawned_this_tick` rename) expand the envelope. Consumers that
+  pattern-match by field name are unaffected; consumers that
+  compare whole-response shapes would need to tolerate additions.
+- **`cancel_tasks` deferral.** Operators who mis-submit a task name
+  have no v1 recovery path other than manual state-file deletion.
+  v1.1 closes this gap.
 
 ### Mitigations
 
@@ -2251,6 +3789,22 @@ These items are explicitly deferred:
   scheduler's resolution fallback (parent template dir →
   submitter cwd → error) produces an error message listing both
   attempted paths, so users immediately see what was tried.
+- **Surface common authoring mistakes at compile time.** W4
+  (`materialize_children` states that route only on
+  `all_complete`) and W5 (`failure: true` states with no
+  `failure_reason` writer) catch two frequent round-1 mistakes
+  before templates ship. F5 warns on batch-eligible child
+  templates that lack a scheduler-reachable `skipped_marker`
+  state.
+- **Per-task accumulation recovers from spawn failures.** A
+  submission with 10 valid tasks and 1 bad template resolves: the
+  10 spawn; the 1 surfaces as `BatchTaskView.outcome:
+  spawn_failed` with a `spawn_error` payload. The agent fixes the
+  single entry and resubmits.
+- **Reference template demonstrates retry-reachable routing.**
+  The shipped `coord.md` uses `analyze_failures` + `any_failed`
+  guards so authors who copy it get the retry path for free. The
+  walkthrough and both skills carry matching worked examples.
 
 ## Security Considerations
 
@@ -2280,6 +3834,34 @@ spawning within that model.
   the append-only event log (and, if cloud sync is enabled, uploaded
   to the sync bucket). This matches the existing persistence
   behavior of `koto init --var KEY=SECRET`; it is not a regression.
+
+- **Multi-agent shared-parent information flow.** Multiple agents
+  driving the same parent workflow (e.g., a coordinator plus worker
+  sub-agents) all see the parent's response bodies. An R8
+  `SpawnedTaskMutated` error fired by agent B's resubmission reveals
+  the `template` and `vars` fields agent A originally submitted.
+  Inside the trusted-collaborator model, this is not a violation —
+  both agents are already authorized to read the parent's event log.
+  Documented here so observers understand that submission content
+  is visible across agents sharing a parent.
+
+- **Secret-rotation gotcha under R8 rejection.** A `SpawnedTaskMutated`
+  error response (Decision 11) includes the full `changed_fields` array
+  with both the spawned value and the submitted value per field. If an
+  agent attempts to rotate a secret held in `vars` by resubmitting the
+  task list with a new value, both the old and new values appear in the
+  error response body. Response logs, shell histories, and any observer
+  consuming the response will see the old secret. Agents rotating
+  secrets should not do so via resubmission of an already-spawned task.
+  A best-effort mitigation lives in the scheduler: values for `vars`
+  keys matching any of `*_TOKEN`, `*_SECRET`, `*_KEY`, `*_PASSWORD`,
+  `*_COOKIE`, `*_AUTH`, `*_BEARER`, `*_ACCESS_*`, `*_REFRESH_*`, or
+  literal `DATABASE_URL` / `DATABASE_PASSWORD` are redacted in the
+  diff payload before serialization. The redaction is keyed-name
+  based; secrets embedded inside non-matching values (e.g., a token
+  nested in a JSON blob under a `config` key) are NOT redacted.
+  Template authors remain responsible for not submitting secrets
+  they don't want logged.
 
 ### Resource bounds
 
@@ -2334,6 +3916,28 @@ manually `cat`ing the file — no privilege boundary is crossed.
   var values, or secrets into batch status responses that observers
   (other agents, human operators) consume.
 
+- **Error bodies echo agent-submitted content.** Decisions 11 and 14
+  expand the error-response surface: `TemplateNotFound.paths_tried`
+  lists the absolute paths the scheduler attempted, which include the
+  parent's `template_source_dir` and the `submitter_cwd` captured at
+  submission time. `TemplateCompileFailed.compile_error` echoes the
+  compiler's diagnostic text for the failing child template, which may
+  include snippets of that template's body. These are the same classes
+  of data already persisted in state files per the "Persisted path
+  information" subsection above, but the consumer set is broader:
+  response logs, CI output, shared debugging transcripts. Treat the
+  error-response body as equivalently sensitive to the state file.
+
+- **`machine_id` on cloud-mode responses.** Decision 12 adds
+  `machine_id` and `sync_status` as optional top-level fields on
+  responses when `CloudBackend` is active. `machine_id` is a stable
+  per-machine identifier drawn from the cloud-sync configuration (same
+  value cloud sync already uploads with every state-file push), not a
+  new capability or a hostname leak beyond what cloud-sync observers
+  already see. Users sharing response transcripts for debugging should
+  be aware that `machine_id` reveals which of their configured devices
+  produced the response.
+
 ### Cloud sync concurrent submission
 
 If two machines submit different task lists to the same parent
@@ -2356,6 +3960,18 @@ machines in parallel. Consumers running batched workflows on multiple
 machines simultaneously should coordinate submissions externally
 (e.g., by running all submissions on one coordinator machine).
 
+Decision 12's `koto session resolve --children=auto` default extends
+the existing conflict-resolution path to reconcile per-child state
+files alongside the parent log. The `auto` mode trusts the remote
+version for both parent and child reconciliation, matching the
+existing parent-log behavior. Users with partial bucket-integrity
+concerns can run `--children=skip` to leave child state files
+untouched, or `--children=accept-local` / `--children=accept-remote`
+for explicit side selection. The trust model is unchanged from
+round 0 — a compromised cloud-sync bucket can already modify parent
+state files under the existing design. The operational surface
+grows because children are now in scope for `resolve`.
+
 ### Symlink and directory assumptions
 
 - **Session directory is assumed to be user-owned and not world-
@@ -2370,7 +3986,25 @@ machines simultaneously should coordinate submissions externally
 
 ### Supply chain
 
-No new dependencies are introduced. The design uses `tempfile`
+No new direct dependencies are introduced. The design uses `tempfile`
 (pre-existing), `serde` (pre-existing), and the existing koto
 session backend. The `init_state_file` refactor moves existing crate
 usage to new call sites.
+
+Decision 12's `renameat2(RENAME_NOREPLACE)` call on Linux uses `libc`,
+which is already a direct dependency in `Cargo.toml` — not a new
+entry. The macOS and BSD fallback uses `std::fs::hard_link` followed
+by `std::fs::remove_file` from the standard library; no dependency
+expansion. Decision 12's advisory `flock` on the parent's session
+lockfile calls `libc::flock` directly, the same primitive already
+used by `LocalBackend`'s `ContextStore` writes
+(`src/session/local.rs:211-244`), again no new direct dependency.
+
+The `flock` is advisory: POSIX flock only blocks cooperating callers.
+A local process not participating in the locking protocol can still
+open and modify the parent state file. Inside koto's trust model this
+is already equivalent to filesystem-level access to the session
+directory, which grants full control over workflow state regardless
+of any lock. The lock's purpose is to serialize concurrent `koto
+next` invocations by well-behaved callers, not to defend against
+local-root or same-UID attackers.
