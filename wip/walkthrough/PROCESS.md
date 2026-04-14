@@ -13,6 +13,25 @@ replacement for `type: json`, and the single-state fan-out requirement.
 More gaps are expected as we walk through failure paths, retry, and
 dynamic task addition.
 
+## Round 2 update (2026-04-13)
+
+Round 1 ran the validation as **pair simulations** instead of the slow
+interactive walkthrough described below. Nine paired role-plays (three
+shapes × three emphases each) each produced a transcript and a findings
+list, which we synthesized into six combined follow-up decisions
+(CD9-CD14). See `round1_synthesis.md` and the `simulation_round1_*.md`
+files.
+
+The interactive walkthrough protocol described in the rest of this file
+remains valid as a standalone process — we can return to it any time.
+The `walkthrough.md` reference artifact has been rewritten to reflect
+the post-round-1 design and serves as reference material for the
+ongoing pair simulations.
+
+Round 2 is running now with the same pair-simulation structure against
+the revised design. When it finishes, synthesis lives at
+`round2_synthesis.md`.
+
 ## Presentation rules
 
 The user has strong preferences about how information is presented.
