@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::template::types::FieldSchema;
+use crate::template::types::{FieldSchema, FIELD_TYPE_TASKS};
 
 /// Per-field validation error detail.
 #[derive(Debug, Clone, PartialEq)]
@@ -148,6 +148,34 @@ fn validate_field_type(
                 });
             }
         },
+        t if t == FIELD_TYPE_TASKS => {
+            // Structural shape check only: the batch scheduler
+            // (Issue #12) re-parses the array into the canonical
+            // `TaskEntry` form and runs full R0–R9 validation via
+            // `validate_batch_submission`. Here we verify the
+            // payload is an array of objects so the parser has a
+            // well-formed input to chew on; deep schema checks
+            // (unique names, legal regex, DAG rules) live in the
+            // scheduler's validator.
+            match value {
+                serde_json::Value::Array(items) => {
+                    for (i, item) in items.iter().enumerate() {
+                        if !item.is_object() {
+                            errors.push(FieldError {
+                                field: format!("{}[{}]", field_name, i),
+                                reason: format!("expected object, got {}", json_type_name(item)),
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    errors.push(FieldError {
+                        field: field_name.to_string(),
+                        reason: format!("expected array, got {}", json_type_name(value)),
+                    });
+                }
+            }
+        }
         _ => {
             // Unsupported field type -- this should be caught by template validation,
             // but handle it defensively.

@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod batch_error;
 pub mod context;
 pub mod init_child;
@@ -1348,17 +1349,14 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
 /// All parameters are prefixed with `_` today because none of them are
 /// inspected yet; they are threaded through now so the helper's
 /// signature does not change when the real detection logic lands.
-// TODO(#7): inspect template hook metadata once materialize_children
-// hooks parse onto CompiledTemplate::states.
-// TODO(#16, #17): scan `_events` for SchedulerRan / BatchFinalized
-// once those event payloads exist.
+// TODO(#16, #17): scan `events` for SchedulerRan / BatchFinalized once
+// those event payloads exist. Issue #12 wires the first of the two
+// signals — a `materialize_children` hook on the current state — so
+// parents that spawn children serialize ticks under the advisory
+// flock. The event-based check lands with Issues #16/#17.
 #[cfg(unix)]
-fn state_is_batch_scoped(
-    _compiled: &CompiledTemplate,
-    _state_name: &str,
-    _events: &[Event],
-) -> bool {
-    false
+fn state_is_batch_scoped(compiled: &CompiledTemplate, state_name: &str, _events: &[Event]) -> bool {
+    crate::cli::batch::state_has_materialize_children(compiled, state_name)
 }
 
 /// Handle the `koto next` command with full output contract support.
@@ -2205,7 +2203,63 @@ fn handle_next(
                 let d = crate::cli::vars::substitute_vars(d, &runtime_vars);
                 variables.substitute(&d)
             });
-            println!("{}", serde_json::to_string(&resp)?);
+
+            // Run the batch scheduler when the final state carries a
+            // `materialize_children` hook. Fresh events reflect any
+            // transitions appended during the advance loop. The
+            // scheduler is pure disk-state — re-running on a
+            // fully-spawned batch is a no-op.
+            let scheduler_outcome =
+                if crate::cli::batch::state_has_materialize_children(&compiled, final_state) {
+                    let (_, post_events) = backend
+                        .read_events(&name)
+                        .unwrap_or((header.clone(), Vec::new()));
+                    match crate::cli::batch::run_batch_scheduler(
+                        backend,
+                        &compiled,
+                        final_state,
+                        &name,
+                        &post_events,
+                    ) {
+                        Ok(outcome) => Some(outcome),
+                        Err(err) => {
+                            // Issue #12 scope: batch errors here are a
+                            // tick-wide failure (e.g., backend list
+                            // unreachable). Surface via the existing
+                            // BatchError envelope so the scheduler does
+                            // not corrupt the advance response.
+                            let code = err.exit_code();
+                            exit_with_error_code(err.to_envelope(), code);
+                        }
+                    }
+                } else {
+                    None
+                };
+
+            // Emit the response JSON. When the scheduler ran, splice
+            // a `scheduler` sibling key onto the envelope so callers
+            // observe it alongside the advance-loop response. Issue
+            // #12 does this only for `SchedulerOutcome::Scheduled`
+            // and `Error`; `NoBatch` is swallowed as the no-op it
+            // signals.
+            let json_value = serde_json::to_value(&resp)?;
+            let mut envelope = match json_value {
+                serde_json::Value::Object(m) => m,
+                other => {
+                    let mut map = serde_json::Map::new();
+                    map.insert("response".to_string(), other);
+                    map
+                }
+            };
+            if let Some(outcome) = scheduler_outcome {
+                if !matches!(outcome, crate::cli::batch::SchedulerOutcome::NoBatch) {
+                    envelope.insert("scheduler".to_string(), serde_json::to_value(&outcome)?);
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::Value::Object(envelope))?
+            );
             // Auto-cleanup after output when reaching a terminal state.
             if matches!(resp, NextResponse::Terminal { .. }) && !no_cleanup {
                 if let Err(e) = backend.cleanup(&name) {
