@@ -45,7 +45,7 @@ Every response from a batch-scoped parent tick carries a `scheduler.materialized
   "scheduler": {
     "spawned_this_tick": ["coord.task-1"],
     "materialized_children": [
-      {"name": "coord.task-1", "task": "task-1", "outcome": "pending", "state": "working", "waits_on": [], "ready_to_drive": true},
+      {"name": "coord.task-1", "task": "task-1", "outcome": "running", "state": "working", "waits_on": [], "ready_to_drive": true},
       {"name": "coord.task-2", "task": "task-2", "outcome": "blocked", "waits_on": ["task-1"], "ready_to_drive": false},
       {"name": "coord.task-3", "task": "task-3", "outcome": "blocked", "waits_on": ["task-1"], "ready_to_drive": false}
     ]
@@ -59,19 +59,19 @@ The canonical worker-dispatch filter:
 
 > Dispatch a worker for every entry in `materialized_children` where `ready_to_drive == true AND outcome != "spawn_failed"`, excluding any child already dispatched this session.
 
-`ready_to_drive: false` marks children whose `waits_on` dependencies are not yet terminal-success. During retries the scheduler may respawn dependents before their ancestors re-succeed; those land with `ready_to_drive: false` and must NOT be dispatched until the next tick reclassifies them.
+`ready_to_drive: true` requires three conditions together: the child has no spawn error, its `outcome` is `running` (state file exists, non-terminal), and every `waits_on` entry has reached a terminal classification (`success`, `failure`, or `skipped` — any terminal counts). Children with `outcome` of `pending`, `blocked`, or any terminal outcome are never `ready_to_drive`. During retries the scheduler may respawn dependents before their ancestors re-run; those land with `ready_to_drive: false` until the next tick reclassifies them.
 
 `TaskOutcome` values in `materialized_children[*].outcome`:
 
-| Value | Meaning |
-|---|---|
-| `pending` | Task entry exists; no state file yet or spawned-but-not-terminal (unspawned tasks whose deps are ready). |
-| `running` | Child state file exists, not terminal. |
-| `blocked` | Unspawned task with at least one non-terminal `waits_on` dependency. |
-| `success` | Child terminal, template does not flag `failure: true` or `skipped_marker: true`. |
-| `failure` | Child terminal with `failure: true`. |
-| `skipped` | Child terminal with `skipped_marker: true` (dependency failed). |
-| `spawn_failed` | Scheduler couldn't create the state file (compile error, collision, I/O). |
+| Value | Meaning | `ready_to_drive` |
+|---|---|---|
+| `pending` | Task entry exists but no state file has been written yet (deps satisfied, scheduler is about to spawn or just spawned this tick). | always `false` — no child file for a worker to drive |
+| `running` | Child state file exists and is non-terminal. | `true` once every `waits_on` entry is terminal; else `false` |
+| `blocked` | No state file; at least one `waits_on` dependency is non-terminal. | always `false` |
+| `success` | Child terminal; template does not flag `failure: true` or `skipped_marker: true`. | always `false` (terminal) |
+| `failure` | Child terminal with `failure: true`. | always `false` (terminal) |
+| `skipped` | Child terminal with `skipped_marker: true` (dependency failed). | always `false` (terminal) |
+| `spawn_failed` | Scheduler couldn't create the state file (compile error, collision, I/O). | always `false` |
 
 ## `feedback.entries`: what happened to each submitted task
 
@@ -175,13 +175,22 @@ Rejection precedence (R10): `UnknownChildren → ChildIsBatchParent → ChildNot
 
 ## `sync_status` under the cloud backend
 
-When the workflow uses `session.backend = "cloud"`, every response gains two top-level fields:
+`sync_status` and `machine_id` are **not** emitted on regular `koto next` batch responses. They appear only on `koto session resolve` output when the workflow uses the cloud backend:
 
-```json
-{"sync_status": "fresh", "machine_id": "machine-abc123"}
+```bash
+koto session resolve <parent> --children=auto
 ```
 
-`sync_status` values:
+```json
+{
+  "name": "<parent>",
+  "sync_status": "fresh",
+  "machine_id": "machine-abc123",
+  "children": [ ... ]
+}
+```
+
+`sync_status` values (as reported by `koto session resolve`):
 
 | Value | Meaning | Action |
 |---|---|---|
@@ -190,7 +199,7 @@ When the workflow uses `session.backend = "cloud"`, every response gains two top
 | `local_only` | No remote version exists yet. | Proceed; the first write establishes remote. |
 | `diverged` | Local and remote have independent writes since the last common ancestor. | Run `koto session resolve <parent> --children=auto` to reconcile. |
 
-These fields are absent under the local backend. Observers on a second machine see `diverged` when the coordinator has ticked elsewhere. `koto session resolve` reconciles both the parent log and the per-child state files in one call.
+Under the local backend these fields are absent from `koto session resolve` output as well. `koto session resolve` reconciles both the parent log and the per-child state files in one call; run it when a batch is driven across multiple machines and you need to check or reconcile divergence.
 
 ## Skip-marker children: `synthetic: true`
 

@@ -269,7 +269,8 @@ The response shape includes batch-specific fields:
 - `reserved_actions` — ready-to-run retry invocations, synthesized when the gate reports `any_failed`, `any_skipped`, or `any_spawn_failed`.
 - `batch_final_view` — frozen snapshot attached to the terminal `done` response.
 - `synthetic: true` — marker on skip-marker children whose state was materialized directly (no worker ran).
-- `sync_status` — cloud-backend freshness indicator (`fresh`, `stale`, `local_only`, `diverged`).
+
+Cloud-backend freshness indicators (`sync_status`, `machine_id`) are **not** attached to batch `koto next` responses. They surface only on `koto session resolve` output — use that command when you need to check or reconcile cross-machine divergence.
 
 The canonical rule for worker dispatch:
 

@@ -116,7 +116,7 @@ Agents that read the directive for context see a readable explanation. Agents th
 
 ## Routing on aggregate booleans (W4)
 
-The `children-complete` gate surfaces twelve output fields. Five aggregate booleans route the parent:
+The `children-complete` gate surfaces fifteen output fields: eight counts (`total`, `completed`, `pending`, `success`, `failed`, `skipped`, `blocked`, `spawn_failed`), six aggregate booleans, and the per-child `children[]` array. The booleans route the parent:
 
 | Boolean | Derived from | When to route on it |
 |---|---|---|
@@ -125,6 +125,7 @@ The `children-complete` gate surfaces twelve output fields. Five aggregate boole
 | `needs_attention` | `any_failed OR any_skipped OR any_spawn_failed` | Retry / analyze branch. Paired with `all_success` to cover every exit. |
 | `any_failed` | At least one failure | Fine-grained routing when `any_skipped` and `any_failed` need different states. |
 | `any_skipped` | At least one skipped | Same. |
+| `any_spawn_failed` | At least one `spawn_failed` outcome | Fine-grained routing; folded into `needs_attention`. |
 
 The safe default is a two-branch coordinator:
 

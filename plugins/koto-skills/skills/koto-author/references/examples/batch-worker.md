@@ -14,7 +14,7 @@ states:
     accepts:
       status:
         type: enum
-        values: [complete, blocked]
+        values: [complete, blocked, skipped_by_scheduler]
         required: true
     gates:
       tests:
@@ -27,6 +27,12 @@ states:
       - target: done_blocked
         when:
           status: blocked
+      # Synthetic edge to satisfy F5 reachability. The scheduler
+      # materializes skip markers directly — agents never submit
+      # `skipped_by_scheduler`.
+      - target: skipped_due_to_dep_failure
+        when:
+          status: skipped_by_scheduler
   done:
     terminal: true
   done_blocked:
