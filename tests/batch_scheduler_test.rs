@@ -1504,3 +1504,377 @@ fn scheduler_ran_appended_on_reclassification_tick() {
     let ev: serde_json::Value = serde_json::from_str(last_sr).expect("parse event");
     assert_eq!(ev["payload"]["tick_summary"]["reclassified"], true);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #18: koto status + koto workflows --children batch extensions
+// ---------------------------------------------------------------------------
+
+/// scenario-27: `koto status <parent>` returns a `batch` section for a
+/// batch-scoped parent mid-batch, drops it for non-batch parents, and
+/// drops the `ready / blocked / skipped / failed` name vectors once the
+/// parent has transitioned to its terminal state.
+///
+/// Setup: a 3-task batch `A -> B -> C` with A driven to success. At
+/// that moment B is ready (unspawned but no unmet deps), C is blocked
+/// on B, and A is success.
+#[test]
+fn scenario_27_koto_status_batch_section_populated() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_templates(tmp.path());
+
+    // Init parent.
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "parent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "parent init failed: {}", stderr);
+
+    // Submit a 3-task batch: A, B (waits on A), C (waits on B).
+    let payload = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+            {"name": "B", "waits_on": ["A"], "vars": {}},
+            {"name": "C", "waits_on": ["B"], "vars": {}},
+        ]
+    });
+    let (_, _, _) = run_koto(
+        tmp.path(),
+        &["next", "parent", "--with-data", &payload.to_string()],
+    );
+
+    // Drive A to done so B is now ready to spawn. Don't re-tick the
+    // parent yet so the scheduler view shows A=success, B=pending,
+    // C=blocked.
+    drive_child_to_done(tmp.path(), "parent.A");
+
+    // `koto status parent` should emit a `batch` section.
+    let (ok, status, stderr) = run_koto(tmp.path(), &["status", "parent"]);
+    assert!(ok, "status failed: {}", stderr);
+    let batch = status
+        .get("batch")
+        .expect("batch section present for batch-scoped parent");
+    assert_eq!(batch["phase"], "active");
+
+    // Summary.
+    let summary = &batch["summary"];
+    assert_eq!(summary["total"], 3);
+    assert_eq!(summary["success"], 1);
+    assert_eq!(summary["pending"], 1);
+    assert_eq!(summary["blocked"], 1);
+    assert_eq!(summary["failed"], 0);
+    assert_eq!(summary["skipped"], 0);
+
+    // Tasks (may not be in strict submission order when driven through
+    // the gate output; verify by lookup).
+    let tasks = batch["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 3);
+    let task_a = tasks
+        .iter()
+        .find(|t| t["task_name"] == "A")
+        .expect("A present");
+    let task_b = tasks
+        .iter()
+        .find(|t| t["task_name"] == "B")
+        .expect("B present");
+    let task_c = tasks
+        .iter()
+        .find(|t| t["task_name"] == "C")
+        .expect("C present");
+    assert_eq!(task_a["outcome"], "success");
+    assert_eq!(task_a["name"], "parent.A");
+    assert_eq!(task_a["waits_on"].as_array().unwrap().len(), 0);
+    assert_eq!(task_b["outcome"], "pending");
+    assert_eq!(task_b["waits_on"], serde_json::json!(["A"]));
+    assert_eq!(task_c["outcome"], "blocked");
+    assert_eq!(task_c["waits_on"], serde_json::json!(["B"]));
+
+    // Ready / blocked / skipped / failed name vectors present in
+    // active phase.
+    let ready: Vec<String> = batch["ready"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let blocked: Vec<String> = batch["blocked"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let skipped = batch["skipped"].as_array().expect("skipped array");
+    let failed = batch["failed"].as_array().expect("failed array");
+    assert!(
+        ready.contains(&"B".to_string()),
+        "ready missing B: {:?}",
+        ready
+    );
+    assert!(
+        blocked.contains(&"C".to_string()),
+        "blocked missing C: {:?}",
+        blocked
+    );
+    assert!(skipped.is_empty());
+    assert!(failed.is_empty());
+
+    // `koto workflows --children parent` should expose the per-row
+    // batch metadata (task_name, waits_on, reason_code, reason,
+    // skip_reason).
+    let (ok, children_json, stderr) = run_koto(tmp.path(), &["workflows", "--children", "parent"]);
+    assert!(ok, "workflows failed: {}", stderr);
+    let children_rows = children_json.as_array().expect("children array");
+    // A is on disk; verify it carries the per-row batch metadata.
+    let a_row = children_rows
+        .iter()
+        .find(|row| row["name"] == "parent.A")
+        .expect("parent.A row present");
+    assert_eq!(a_row["task_name"], "A");
+    assert_eq!(a_row["outcome"], "success");
+    assert_eq!(a_row["waits_on"], serde_json::json!([] as [&str; 0]));
+
+    // Non-batch parent path: init a separate workflow and verify the
+    // batch section is absent.
+    let non_batch_src = tmp.path().join("plain.md");
+    std::fs::write(
+        &non_batch_src,
+        r#"---
+name: plain
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+Plain start.
+
+## done
+Plain done.
+"#,
+    )
+    .unwrap();
+    let (ok, _, _) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "plain-wf",
+            "--template",
+            non_batch_src.to_str().unwrap(),
+        ],
+    );
+    assert!(ok);
+    let (ok, status, _) = run_koto(tmp.path(), &["status", "plain-wf"]);
+    assert!(ok);
+    assert!(
+        status.get("batch").is_none(),
+        "non-batch parent must omit the batch section; got: {}",
+        serde_json::to_string_pretty(&status).unwrap()
+    );
+
+    // Terminal snapshot: drive the batch to completion, transition
+    // the parent to its terminal state, and check that `koto status`
+    // reports `phase: "final"` AND drops the ready/blocked/skipped/
+    // failed name vectors.
+    // Tick parent so B spawns now that A is done.
+    let (_, _, _) = run_koto(tmp.path(), &["next", "parent"]);
+    drive_child_to_done(tmp.path(), "parent.B");
+    // Tick parent so C spawns.
+    let (_, _, _) = run_koto(tmp.path(), &["next", "parent"]);
+    drive_child_to_done(tmp.path(), "parent.C");
+    // First tick: children-complete passes, BatchFinalized appends,
+    // and the parent stays on `plan` (no `finalize: yes` submitted yet).
+    let (_, _, _) = run_koto(tmp.path(), &["next", "parent"]);
+    // Second tick: submit the full task list plus `finalize: yes` to
+    // route the parent into the terminal `summarize` state.
+    let finalize_payload = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+            {"name": "B", "waits_on": ["A"], "vars": {}},
+            {"name": "C", "waits_on": ["B"], "vars": {}},
+        ],
+        "finalize": "yes"
+    });
+    let (_, _, _) = run_koto(
+        tmp.path(),
+        &[
+            "next",
+            "parent",
+            "--no-cleanup",
+            "--with-data",
+            &finalize_payload.to_string(),
+        ],
+    );
+
+    let (ok, status, stderr) = run_koto(tmp.path(), &["status", "parent"]);
+    assert!(ok, "terminal status failed: {}", stderr);
+    let batch = status
+        .get("batch")
+        .expect("batch section replayed from BatchFinalized event");
+    assert_eq!(batch["phase"], "final");
+    // Post-terminal shape drops the name vectors.
+    assert!(
+        batch.get("ready").is_none(),
+        "ready must be absent in terminal: {}",
+        batch
+    );
+    assert!(batch.get("blocked").is_none());
+    assert!(batch.get("skipped").is_none());
+    assert!(batch.get("failed").is_none());
+    assert_eq!(batch["summary"]["total"], 3);
+    assert_eq!(batch["summary"]["success"], 3);
+}
+
+/// scenario-28: `derive_batch_view` is the single source of truth for
+/// `koto status` and `koto workflows --children`. Both commands surface
+/// fields from the same `BatchView`, so a mutation in one never
+/// disagrees with the other.
+#[test]
+fn scenario_28_derive_batch_view_shared_by_status_and_workflows() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_templates(tmp.path());
+
+    // Init parent with a simple 2-task batch.
+    let (ok, _, _) = run_koto(
+        tmp.path(),
+        &["init", "p28", "--template", parent_path.to_str().unwrap()],
+    );
+    assert!(ok);
+    let payload = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+            {"name": "B", "waits_on": ["A"], "vars": {}},
+        ]
+    });
+    let (_, _, _) = run_koto(
+        tmp.path(),
+        &["next", "p28", "--with-data", &payload.to_string()],
+    );
+    drive_child_to_done(tmp.path(), "p28.A");
+
+    // status → batch.tasks.
+    let (ok, status, _) = run_koto(tmp.path(), &["status", "p28"]);
+    assert!(ok);
+    let batch = status.get("batch").expect("batch section present");
+    let status_tasks = batch["tasks"].as_array().expect("tasks array");
+
+    // workflows --children → row-augmented metadata.
+    let (ok, children_json, _) = run_koto(tmp.path(), &["workflows", "--children", "p28"]);
+    assert!(ok);
+    let children_rows = children_json.as_array().expect("children array");
+
+    // Cross-check: for every on-disk child, the row fields (task_name,
+    // outcome, waits_on) must equal the corresponding batch.tasks entry.
+    for row in children_rows {
+        let name = row["name"].as_str().expect("row name");
+        let batch_task = status_tasks
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("batch.tasks must contain an entry for child row {}", name));
+        assert_eq!(
+            row["task_name"], batch_task["task_name"],
+            "task_name divergence for {}",
+            name
+        );
+        assert_eq!(
+            row["outcome"], batch_task["outcome"],
+            "outcome divergence for {}",
+            name
+        );
+        assert_eq!(
+            row["waits_on"], batch_task["waits_on"],
+            "waits_on divergence for {}",
+            name
+        );
+    }
+}
+
+/// scenario-27 (skip-marker branch): the `synthetic: true` marker and
+/// `skipped_because_chain` surface in both `koto status` and
+/// `koto workflows --children` when a child is backed by a skip marker.
+#[test]
+fn scenario_27_synthetic_marker_and_skipped_chain() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_skip_aware_templates(tmp.path());
+
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "sparent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "parent init failed: {}", stderr);
+
+    // Submit a 2-task batch: A and B (waits on A). Fail A so B lands
+    // as a synthetic skip marker.
+    let payload = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+            {"name": "B", "waits_on": ["A"], "vars": {}},
+        ]
+    });
+    let (_, _, _) = run_koto(
+        tmp.path(),
+        &["next", "sparent", "--with-data", &payload.to_string()],
+    );
+    drive_skip_child_to_fail(tmp.path(), "sparent.A");
+    // Tick so the scheduler reclassifies B from Blocked → Skipped and
+    // spawns a skip marker for it.
+    let (_, _, _) = run_koto(tmp.path(), &["next", "sparent"]);
+
+    // status: batch.tasks[B] has synthetic:true, skipped_because=sparent.A,
+    // and skipped_because_chain=[sparent.A]. reason_code=skipped.
+    let (ok, status, stderr) = run_koto(tmp.path(), &["status", "sparent"]);
+    assert!(ok, "status failed: {}", stderr);
+    let batch = status.get("batch").expect("batch section present");
+    let tasks = batch["tasks"].as_array().expect("tasks array");
+    let task_b = tasks
+        .iter()
+        .find(|t| t["task_name"] == "B")
+        .expect("B present");
+    assert_eq!(task_b["outcome"], "skipped");
+    assert_eq!(
+        task_b["synthetic"], true,
+        "B must carry synthetic:true once spawned as a skip marker: {}",
+        task_b
+    );
+    assert_eq!(task_b["skip_reason"], "sparent.A");
+    assert_eq!(
+        task_b["skipped_because_chain"],
+        serde_json::json!(["sparent.A"])
+    );
+    assert_eq!(task_b["reason_code"], "skipped");
+
+    // workflows --children: B's row carries the same per-task fields.
+    let (ok, children_json, _) = run_koto(tmp.path(), &["workflows", "--children", "sparent"]);
+    assert!(ok);
+    let rows = children_json.as_array().expect("children array");
+    let b_row = rows
+        .iter()
+        .find(|r| r["name"] == "sparent.B")
+        .expect("sparent.B row present");
+    assert_eq!(b_row["task_name"], "B");
+    assert_eq!(b_row["outcome"], "skipped");
+    assert_eq!(b_row["synthetic"], true, "B row must carry synthetic:true");
+    assert_eq!(b_row["skip_reason"], "sparent.A");
+    assert_eq!(b_row["reason_code"], "skipped");
+    assert_eq!(
+        b_row["skipped_because_chain"],
+        serde_json::json!(["sparent.A"])
+    );
+}

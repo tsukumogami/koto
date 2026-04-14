@@ -1501,7 +1501,10 @@ fn extract_tasks(events: &[Event], state: &str, field: &str) -> Option<Vec<TaskE
 /// Read back the terminal / failure / skipped_marker flags for a
 /// child's current state. The child's compiled template lives under
 /// the path recorded on its `WorkflowInitialized` event.
-fn child_state_flags(events: &[Event], current_state: &str) -> Option<(bool, bool, bool)> {
+pub(crate) fn child_state_flags(
+    events: &[Event],
+    current_state: &str,
+) -> Option<(bool, bool, bool)> {
     let template_path = events.iter().find_map(|e| match &e.payload {
         EventPayload::WorkflowInitialized { template_path, .. } => Some(template_path.clone()),
         _ => None,

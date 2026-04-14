@@ -1,5 +1,6 @@
 pub mod batch;
 pub mod batch_error;
+pub mod batch_view;
 pub mod context;
 pub mod init_child;
 pub mod next;
@@ -793,28 +794,40 @@ pub fn run(app: App) -> Result<()> {
                     }));
                 }
             };
-            let filtered: Vec<_> = if roots {
-                metadata
+            if roots {
+                let filtered: Vec<_> = metadata
                     .into_iter()
                     .filter(|wf| wf.parent_workflow.is_none())
-                    .collect()
-            } else if let Some(ref parent_name) = children {
-                metadata
-                    .into_iter()
-                    .filter(|wf| wf.parent_workflow.as_deref() == Some(parent_name.as_str()))
-                    .collect()
-            } else if orphaned {
-                metadata
+                    .collect();
+                println!("{}", serde_json::to_string(&filtered)?);
+                return Ok(());
+            }
+            if orphaned {
+                let filtered: Vec<_> = metadata
                     .into_iter()
                     .filter(|wf| match &wf.parent_workflow {
                         Some(parent) => !backend.exists(parent),
                         None => false,
                     })
-                    .collect()
-            } else {
-                metadata
-            };
-            println!("{}", serde_json::to_string(&filtered)?);
+                    .collect();
+                println!("{}", serde_json::to_string(&filtered)?);
+                return Ok(());
+            }
+            if let Some(ref parent_name) = children {
+                // When the parent is batch-scoped, augment each row
+                // with the per-task metadata derived from the shared
+                // `derive_batch_view` helper — keeping the output in
+                // lock step with `koto status <parent>`'s batch
+                // section.
+                let filtered: Vec<_> = metadata
+                    .into_iter()
+                    .filter(|wf| wf.parent_workflow.as_deref() == Some(parent_name.as_str()))
+                    .collect();
+                let augmented = annotate_children_with_batch_view(&backend, parent_name, filtered);
+                println!("{}", serde_json::to_string(&augmented)?);
+                return Ok(());
+            }
+            println!("{}", serde_json::to_string(&metadata)?);
             Ok(())
         }
         Command::Session { subcommand } => {
@@ -3023,13 +3036,29 @@ fn handle_status(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         .get(&machine_state.current_state)
         .is_some_and(|s| s.terminal);
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "name": name,
         "current_state": machine_state.current_state,
         "template_path": machine_state.template_path,
         "template_hash": machine_state.template_hash,
         "is_terminal": is_terminal,
     });
+
+    // Optional `batch` section — populated when the parent is
+    // batch-scoped (current state has a `materialize_children` hook)
+    // or has previously finalized a batch (a `BatchFinalized` event is
+    // in the log). Shared helper keeps this output byte-identical to
+    // the per-row metadata added to `koto workflows --children`.
+    if let Some(batch_view) = crate::cli::batch_view::derive_batch_view(
+        backend,
+        &events,
+        &compiled,
+        &machine_state.current_state,
+        name,
+    ) {
+        let batch_json = crate::cli::batch_view::batch_view_to_json(&batch_view);
+        response["batch"] = batch_json;
+    }
 
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
@@ -3087,6 +3116,109 @@ fn evaluate_children_complete(
     };
 
     StructuredGateResult { outcome, output }
+}
+
+/// Augment each row of `koto workflows --children <parent>` with
+/// per-task batch metadata when the parent is batch-scoped.
+///
+/// For each child `WorkflowMetadata` entry, look up the corresponding
+/// [`crate::cli::batch_view::TaskView`] by composed name and splice
+/// the following fields onto the output row:
+///
+/// - `task_name`
+/// - `waits_on`
+/// - `reason_code` (sourced from `reason_source`)
+/// - `reason`
+/// - `skip_reason`
+/// - `synthetic` (only when `true`)
+/// - `outcome`
+/// - `skipped_because_chain` (only when non-empty)
+///
+/// Rows that do not correspond to a submitted batch task (e.g., a
+/// non-batch child of the same parent) pass through unchanged. Rows
+/// are returned as raw JSON values so the unknown shape is acceptable
+/// at serialization time.
+fn annotate_children_with_batch_view(
+    backend: &dyn SessionBackend,
+    parent_name: &str,
+    children: Vec<crate::engine::types::WorkflowMetadata>,
+) -> Vec<serde_json::Value> {
+    // Attempt to derive the batch view for the parent. If the parent
+    // doesn't exist or isn't batch-scoped, return the rows unchanged.
+    let view = if backend.exists(parent_name) {
+        match backend.read_events(parent_name) {
+            Ok((header, events)) => match derive_machine_state(&header, &events) {
+                Some(machine_state) => {
+                    let compiled_opt: Option<CompiledTemplate> =
+                        std::fs::read(&machine_state.template_path)
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+                    compiled_opt.and_then(|compiled| {
+                        crate::cli::batch_view::derive_batch_view(
+                            backend,
+                            &events,
+                            &compiled,
+                            &machine_state.current_state,
+                            parent_name,
+                        )
+                    })
+                }
+                None => None,
+            },
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let task_by_name: std::collections::HashMap<String, &crate::cli::batch_view::TaskView> =
+        match &view {
+            Some(v) => v.tasks.iter().map(|t| (t.name.clone(), t)).collect(),
+            None => std::collections::HashMap::new(),
+        };
+
+    children
+        .into_iter()
+        .map(|wf| {
+            let mut row = match serde_json::to_value(&wf) {
+                Ok(serde_json::Value::Object(m)) => m,
+                _ => return serde_json::Value::Null,
+            };
+            if let Some(task) = task_by_name.get(&wf.name) {
+                row.insert(
+                    "task_name".to_string(),
+                    serde_json::json!(task.task_name.clone()),
+                );
+                row.insert(
+                    "waits_on".to_string(),
+                    serde_json::json!(task.waits_on.clone()),
+                );
+                row.insert(
+                    "outcome".to_string(),
+                    serde_json::to_value(task.outcome).unwrap_or(serde_json::Value::Null),
+                );
+                if let Some(rc) = &task.reason_code {
+                    row.insert("reason_code".to_string(), serde_json::json!(rc.clone()));
+                }
+                if let Some(r) = &task.reason {
+                    row.insert("reason".to_string(), serde_json::json!(r.clone()));
+                }
+                if let Some(sr) = &task.skip_reason {
+                    row.insert("skip_reason".to_string(), serde_json::json!(sr.clone()));
+                }
+                if task.synthetic {
+                    row.insert("synthetic".to_string(), serde_json::json!(true));
+                }
+                if !task.skipped_because_chain.is_empty() {
+                    row.insert(
+                        "skipped_because_chain".to_string(),
+                        serde_json::json!(task.skipped_because_chain.clone()),
+                    );
+                }
+            }
+            serde_json::Value::Object(row)
+        })
+        .collect()
 }
 
 fn query_children(backend: &dyn SessionBackend, parent_name: &str) -> Vec<serde_json::Value> {
