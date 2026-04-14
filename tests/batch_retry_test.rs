@@ -538,3 +538,189 @@ fn retry_failed_rejection_writes_no_state() {
         a_log
     );
 }
+
+/// scenario-23 (Issue #17: BatchFinalized appends once, retry appends
+/// fresh event):
+///
+/// 1. Submit a single-task batch {A}. Drive A to FAILED. Tick the
+///    parent: all children are in a terminal state (A failed), so the
+///    children-complete gate reports `all_complete: true` and one
+///    BatchFinalized event appends.
+/// 2. Re-tick the parent with no changes — BatchFinalized must NOT
+///    re-append.
+/// 3. Submit retry_failed for A. The retry evidence invalidates the
+///    prior BatchFinalized (phase stays "final" per design, but the
+///    old event is now stale).
+/// 4. Drive the respawned A to DONE.
+/// 5. Tick the parent again: all_complete becomes true again and a
+///    SECOND BatchFinalized event appends.
+/// 6. Terminate the parent (finalize: yes → summarize) and confirm
+///    the terminal response carries `batch_final_view` from the most
+///    recent BatchFinalized and `batch.phase: "final"`.
+#[test]
+fn scenario_23_batch_finalized_appends_once_retry_appends_fresh() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_templates(tmp.path());
+
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "parent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "parent init failed: {}", stderr);
+
+    // 1a. Submit a single-task batch.
+    let payload = serde_json::json!({
+        "tasks": [{"name": "A", "waits_on": [], "vars": {}}]
+    });
+    let (_, _, _) = run_koto(
+        tmp.path(),
+        &["next", "parent", "--with-data", &payload.to_string()],
+    );
+
+    // 1b. Drive A to failed (still terminal, so all_complete: true).
+    drive_child_to_fail(tmp.path(), "parent.A");
+
+    // 1c. Re-tick the parent: children-complete fires, BatchFinalized appends.
+    let (_, json1, _) = run_koto(tmp.path(), &["next", "parent"]);
+
+    // The response envelope carries batch.phase: "final".
+    assert_eq!(
+        json1["batch"]["phase"].as_str(),
+        Some("final"),
+        "batch.phase must be 'final' after BatchFinalized appends, got: {}",
+        serde_json::to_string(&json1).unwrap_or_default()
+    );
+
+    let parent_log = std::fs::read_to_string(parent_state_path(tmp.path(), "parent")).unwrap();
+    let bf_count = parent_log
+        .lines()
+        .filter(|l| l.contains("\"type\":\"batch_finalized\""))
+        .count();
+    assert_eq!(
+        bf_count, 1,
+        "exactly one BatchFinalized event after first all_complete tick. log:\n{}",
+        parent_log
+    );
+
+    // 2. Re-tick the parent with no changes — BatchFinalized must NOT re-append.
+    let (_, _, _) = run_koto(tmp.path(), &["next", "parent"]);
+    let parent_log = std::fs::read_to_string(parent_state_path(tmp.path(), "parent")).unwrap();
+    let bf_count_noop = parent_log
+        .lines()
+        .filter(|l| l.contains("\"type\":\"batch_finalized\""))
+        .count();
+    assert_eq!(
+        bf_count_noop, 1,
+        "no new BatchFinalized on no-op re-tick. log:\n{}",
+        parent_log
+    );
+
+    // 3. Submit retry_failed for A.
+    let retry_payload = serde_json::json!({
+        "retry_failed": {"children": ["A"]}
+    });
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &["next", "parent", "--with-data", &retry_payload.to_string()],
+    );
+    assert!(
+        ok,
+        "retry_failed submission must succeed. stderr={}",
+        stderr
+    );
+
+    // 4. Drive A to done after the rewind.
+    drive_child_to_done(tmp.path(), "parent.A");
+
+    // 5. Tick the parent: all_complete should flip back to true and a
+    //    fresh BatchFinalized must append.
+    let (_, _json2, _) = run_koto(tmp.path(), &["next", "parent"]);
+
+    let parent_log = std::fs::read_to_string(parent_state_path(tmp.path(), "parent")).unwrap();
+    let bf_lines: Vec<&str> = parent_log
+        .lines()
+        .filter(|l| l.contains("\"type\":\"batch_finalized\""))
+        .collect();
+    assert_eq!(
+        bf_lines.len(),
+        2,
+        "a second BatchFinalized must append after retry re-runs to completion. log:\n{}",
+        parent_log
+    );
+
+    // Sanity: the two BatchFinalized events have monotonically
+    // increasing sequence numbers.
+    let ev1: serde_json::Value = serde_json::from_str(bf_lines[0]).unwrap();
+    let ev2: serde_json::Value = serde_json::from_str(bf_lines[1]).unwrap();
+    assert!(
+        ev2["seq"].as_u64().unwrap() > ev1["seq"].as_u64().unwrap(),
+        "second BatchFinalized must have a higher seq than the first"
+    );
+    // The first BatchFinalized's view reports a failed child
+    // (pre-retry); the second reports an all-success run.
+    assert_eq!(
+        ev1["payload"]["view"]["any_failed"].as_bool(),
+        Some(true),
+        "first BatchFinalized must capture the pre-retry failure. got: {}",
+        ev1
+    );
+    assert_eq!(
+        ev2["payload"]["view"]["all_success"].as_bool(),
+        Some(true),
+        "second BatchFinalized must capture the post-retry success. got: {}",
+        ev2
+    );
+
+    // 6. Drive the parent terminal via finalize: yes. The Terminal
+    //    response carries batch_final_view populated from the most
+    //    recent BatchFinalized (second one, post-retry).
+    let finalize_payload = serde_json::json!({
+        "tasks": [{"name": "A", "waits_on": [], "vars": {}}],
+        "finalize": "yes"
+    });
+    let (ok, json_final, stderr) = run_koto(
+        tmp.path(),
+        &[
+            "next",
+            "parent",
+            "--no-cleanup",
+            "--with-data",
+            &finalize_payload.to_string(),
+        ],
+    );
+    assert!(
+        ok,
+        "finalize tick must succeed. stderr={} json={}",
+        stderr,
+        serde_json::to_string_pretty(&json_final).unwrap_or_default()
+    );
+    assert_eq!(
+        json_final["action"].as_str(),
+        Some("done"),
+        "parent should be terminal after finalize. got: {}",
+        serde_json::to_string_pretty(&json_final).unwrap_or_default()
+    );
+    let bfv = json_final
+        .get("batch_final_view")
+        .expect("batch_final_view present on terminal done response");
+    assert_eq!(
+        bfv["all_complete"].as_bool(),
+        Some(true),
+        "batch_final_view must carry the most recent all_complete state"
+    );
+    assert_eq!(
+        bfv["all_success"].as_bool(),
+        Some(true),
+        "batch_final_view reflects the post-retry (successful) run"
+    );
+    assert_eq!(
+        json_final["batch"]["phase"].as_str(),
+        Some("final"),
+        "batch.phase stays 'final' on terminal response"
+    );
+}

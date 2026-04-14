@@ -214,6 +214,55 @@ pub enum EventPayload {
         /// payload don't need to pair it with the outer envelope.
         timestamp: String,
     },
+    /// Emitted when the `children-complete` gate on a
+    /// `materialize_children` state first reports `all_complete: true`.
+    ///
+    /// The `view` payload freezes the final batch shape at the moment
+    /// the event appends: subsequent `koto status` reads and terminal
+    /// `done` responses replay the most recent `BatchFinalized` to
+    /// populate `batch_final_view` and to label `batch.phase: "final"`.
+    ///
+    /// Retries that re-enter the batched state do NOT mutate the prior
+    /// event; they simply append a fresh `BatchFinalized` on the next
+    /// pass. Consumers always read the MOST RECENT event. See
+    /// DESIGN-batch-child-spawning.md Decision 13.
+    BatchFinalized {
+        /// The `materialize_children` state the batch finalized from.
+        state: String,
+        /// Frozen snapshot of the `children-complete` gate output at
+        /// finalization time.
+        view: serde_json::Value,
+        /// RFC 3339 UTC timestamp mirroring [`Event::timestamp`].
+        timestamp: String,
+        /// Optional marker identifying the event that invalidated this
+        /// finalization. Populated only when the log carries a later
+        /// retry / rewind that re-entered the batched state. Written
+        /// as `None` at append time; higher-level code that replays
+        /// the log may compute and attach this projection when
+        /// rendering stale events. See
+        /// [`crate::cli::batch::annotate_superseded_batch_finalized`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        superseded_by: Option<SupersededByRef>,
+    },
+}
+
+/// Reference to the event that superseded a stale `BatchFinalized`.
+///
+/// Emitted as the `superseded_by` field on prior `BatchFinalized`
+/// events once a retry / rewind / later finalization has invalidated
+/// them. Carries both the `seq` (primary identifier) and the
+/// timestamp so replay tools rendering non-sequential event streams
+/// can correlate without an extra lookup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupersededByRef {
+    /// Monotonic sequence number of the superseding event.
+    pub seq: u64,
+    /// Event type string of the superseding event
+    /// (e.g., `"evidence_submitted"`, `"batch_finalized"`).
+    #[serde(rename = "type")]
+    pub event_type: String,
+    /// RFC 3339 UTC timestamp of the superseding event.
+    pub timestamp: String,
 }
 
 /// Per-tick counts recorded on a [`EventPayload::SchedulerRan`] event.
@@ -253,6 +302,7 @@ impl EventPayload {
             EventPayload::GateEvaluated { .. } => "gate_evaluated",
             EventPayload::GateOverrideRecorded { .. } => "gate_override_recorded",
             EventPayload::SchedulerRan { .. } => "scheduler_ran",
+            EventPayload::BatchFinalized { .. } => "batch_finalized",
         }
     }
 }
@@ -433,6 +483,16 @@ impl<'de> Deserialize<'de> for Event {
                     timestamp: p.timestamp,
                 }
             }
+            "batch_finalized" => {
+                let p: BatchFinalizedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::BatchFinalized {
+                    state: p.state,
+                    view: p.view,
+                    timestamp: p.timestamp,
+                    superseded_by: p.superseded_by,
+                }
+            }
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown event type: {}",
@@ -539,6 +599,15 @@ struct SchedulerRanPayload {
     state: String,
     tick_summary: SchedulerTickSummary,
     timestamp: String,
+}
+
+#[derive(Deserialize)]
+struct BatchFinalizedPayload {
+    state: String,
+    view: serde_json::Value,
+    timestamp: String,
+    #[serde(default)]
+    superseded_by: Option<SupersededByRef>,
 }
 
 /// Metadata about a workflow, derived from the state file header.
@@ -1160,6 +1229,95 @@ mod tests {
         );
         let parsed: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn batch_finalized_event_round_trip() {
+        // Issue #17: BatchFinalized event carries a frozen batch view
+        // and round-trips through serde identically to other events.
+        let view = serde_json::json!({
+            "total": 2,
+            "completed": 2,
+            "pending": 0,
+            "success": 2,
+            "failed": 0,
+            "skipped": 0,
+            "blocked": 0,
+            "spawn_failed": 0,
+            "all_complete": true,
+            "all_success": true,
+            "any_failed": false,
+            "any_skipped": false,
+            "any_spawn_failed": false,
+            "needs_attention": false,
+            "children": [],
+        });
+        let e = Event {
+            seq: 42,
+            timestamp: "2026-04-14T12:00:00Z".to_string(),
+            event_type: "batch_finalized".to_string(),
+            payload: EventPayload::BatchFinalized {
+                state: "plan".to_string(),
+                view: view.clone(),
+                timestamp: "2026-04-14T12:00:00Z".to_string(),
+                superseded_by: None,
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"type\":\"batch_finalized\""));
+        assert!(json.contains("\"state\":\"plan\""));
+        assert!(json.contains("\"all_complete\":true"));
+        // superseded_by is omitted when None.
+        assert!(
+            !json.contains("superseded_by"),
+            "superseded_by must be omitted when None, got {}",
+            json
+        );
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn batch_finalized_event_with_superseded_by_round_trip() {
+        // When a prior BatchFinalized has been invalidated by a later
+        // retry, the `superseded_by` field points at the superseding
+        // event (seq + type + timestamp).
+        let e = Event {
+            seq: 7,
+            timestamp: "2026-04-14T11:00:00Z".to_string(),
+            event_type: "batch_finalized".to_string(),
+            payload: EventPayload::BatchFinalized {
+                state: "plan".to_string(),
+                view: serde_json::json!({"total": 1, "children": []}),
+                timestamp: "2026-04-14T11:00:00Z".to_string(),
+                superseded_by: Some(SupersededByRef {
+                    seq: 12,
+                    event_type: "evidence_submitted".to_string(),
+                    timestamp: "2026-04-14T11:30:00Z".to_string(),
+                }),
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(
+            json.contains("\"superseded_by\""),
+            "superseded_by must serialize when Some, got {}",
+            json
+        );
+        assert!(json.contains("\"seq\":12"));
+        assert!(json.contains("\"type\":\"evidence_submitted\""));
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn batch_finalized_type_name() {
+        let p = EventPayload::BatchFinalized {
+            state: "plan".to_string(),
+            view: serde_json::Value::Null,
+            timestamp: "2026-04-14T11:00:00Z".to_string(),
+            superseded_by: None,
+        };
+        assert_eq!(p.type_name(), "batch_finalized");
     }
 
     #[test]

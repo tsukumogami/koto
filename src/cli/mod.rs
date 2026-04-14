@@ -2477,6 +2477,48 @@ fn handle_next(
                 }
             }
 
+            // Issue #17: append a `BatchFinalized` event when the
+            // `children-complete` gate on the current state first
+            // reports `all_complete: true`. The predicate in
+            // `should_append_batch_finalized` ensures the event
+            // appends at most once per finalization pass; a retry
+            // (retry_failed evidence / Rewound) invalidates the prior
+            // event and the next all-complete tick appends a fresh
+            // BatchFinalized. The view freezes the current gate output
+            // so subsequent `koto status` and terminal `done`
+            // responses can replay the final batch shape.
+            if scheduler_outcome.is_some()
+                && crate::cli::batch::state_has_materialize_children(&compiled, final_state)
+            {
+                let (_, post_events) = backend
+                    .read_events(&name)
+                    .unwrap_or((header.clone(), Vec::new()));
+                let (all_complete, gate_output) = crate::cli::batch::build_children_complete_output(
+                    backend,
+                    &name,
+                    &post_events,
+                    &compiled,
+                    final_state,
+                    None,
+                );
+                if crate::cli::batch::should_append_batch_finalized(&post_events, all_complete) {
+                    if let Some(view) =
+                        crate::cli::batch::BatchFinalView::from_gate_output(&gate_output)
+                    {
+                        let ts = crate::engine::types::now_iso8601();
+                        let payload = crate::engine::types::EventPayload::BatchFinalized {
+                            state: final_state.to_string(),
+                            view: serde_json::to_value(&view).unwrap_or(serde_json::Value::Null),
+                            timestamp: ts.clone(),
+                            superseded_by: None,
+                        };
+                        if let Err(e) = backend.append_event(&name, &payload, &ts) {
+                            eprintln!("warning: failed to append BatchFinalized event: {}", e);
+                        }
+                    }
+                }
+            }
+
             // Emit the response JSON. When the scheduler ran, splice
             // a `scheduler` sibling key onto the envelope so callers
             // observe it alongside the advance-loop response. Issue
@@ -2495,6 +2537,37 @@ fn handle_next(
             if let Some(outcome) = &scheduler_outcome {
                 if !matches!(outcome, crate::cli::batch::SchedulerOutcome::NoBatch) {
                     envelope.insert("scheduler".to_string(), serde_json::to_value(outcome)?);
+                }
+            }
+
+            // Issue #17: attach `batch.phase` and (on terminal
+            // responses) `batch_final_view` from the most recent
+            // `BatchFinalized` event in the log. The phase is sticky
+            // to `"final"` once a `BatchFinalized` has appended —
+            // retries do not revert the phase; the prior view simply
+            // carries a derived `superseded_by` marker for replay
+            // tools. Terminal `done` responses embed the full view so
+            // agents writing a summary directive do not need a second
+            // `koto status` call.
+            let bf_post_events = backend
+                .read_events(&name)
+                .map(|(_, evts)| evts)
+                .unwrap_or_default();
+            let latest_bf =
+                crate::cli::batch::find_most_recent_batch_finalized(&bf_post_events).cloned();
+            if latest_bf.is_some() {
+                let phase = crate::cli::batch::derive_batch_phase(&bf_post_events);
+                let mut batch_obj = serde_json::Map::new();
+                batch_obj.insert("phase".to_string(), serde_json::json!(phase));
+                envelope.insert("batch".to_string(), serde_json::Value::Object(batch_obj));
+            }
+            if matches!(resp, NextResponse::Terminal { .. }) {
+                if let Some(ref ev) = latest_bf {
+                    if let crate::engine::types::EventPayload::BatchFinalized { view, .. } =
+                        &ev.payload
+                    {
+                        envelope.insert("batch_final_view".to_string(), view.clone());
+                    }
                 }
             }
 

@@ -1661,6 +1661,107 @@ pub struct ChildGateEntry {
     pub reason_source: Option<String>,
 }
 
+/// Snapshot of the `children-complete` gate output captured at the
+/// moment a batch finalizes (Issue #17 / DESIGN Decision 13).
+///
+/// Emitted as the `view` payload of a `BatchFinalized` event so that
+/// subsequent `koto status` reads and terminal `done` responses can
+/// replay the final batch shape even after the parent transitions
+/// past its batched state.
+///
+/// The field set mirrors the JSON produced by
+/// [`build_children_complete_output`] — aggregate counts, derived
+/// booleans, and the per-child ledger — so agents reading the stored
+/// view see exactly what the gate reported at finalization time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BatchFinalView {
+    /// Total number of submitted tasks.
+    pub total: usize,
+    /// Number of children in a terminal state (success + failed +
+    /// skipped).
+    pub completed: usize,
+    /// Number of pending children (spawned-but-not-terminal or
+    /// not-yet-spawned).
+    pub pending: usize,
+    /// Number of children in terminal-success state.
+    pub success: usize,
+    /// Number of children in terminal-failure state.
+    pub failed: usize,
+    /// Number of children carrying `skipped_marker` in their terminal
+    /// state.
+    pub skipped: usize,
+    /// Number of children whose dependencies are not yet terminal.
+    pub blocked: usize,
+    /// Number of children whose spawn failed during the scheduler tick.
+    pub spawn_failed: usize,
+    /// `true` when every submitted task reached a terminal outcome.
+    pub all_complete: bool,
+    /// `true` when every submitted task succeeded.
+    pub all_success: bool,
+    /// `true` when at least one child failed.
+    pub any_failed: bool,
+    /// `true` when at least one child was skipped.
+    pub any_skipped: bool,
+    /// `true` when at least one child failed to spawn.
+    pub any_spawn_failed: bool,
+    /// Convenience disjunction of `any_failed | any_skipped |
+    /// any_spawn_failed`.
+    pub needs_attention: bool,
+    /// Per-child ledger frozen at finalization time.
+    pub children: Vec<ChildGateEntry>,
+}
+
+impl BatchFinalView {
+    /// Construct a `BatchFinalView` from the JSON value produced by
+    /// [`build_children_complete_output`]. Returns `None` when the
+    /// shape does not match (e.g., the gate reported an `error`
+    /// outcome). Used at `BatchFinalized` append time to freeze the
+    /// live gate output into a serializable payload.
+    pub fn from_gate_output(value: &serde_json::Value) -> Option<Self> {
+        let obj = value.as_object()?;
+        let children_val = obj.get("children")?;
+        let children: Vec<ChildGateEntry> = serde_json::from_value(children_val.clone()).ok()?;
+        Some(BatchFinalView {
+            total: obj.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            completed: obj.get("completed").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            pending: obj.get("pending").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            success: obj.get("success").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            failed: obj.get("failed").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            skipped: obj.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            blocked: obj.get("blocked").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            spawn_failed: obj
+                .get("spawn_failed")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize,
+            all_complete: obj
+                .get("all_complete")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            all_success: obj
+                .get("all_success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            any_failed: obj
+                .get("any_failed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            any_skipped: obj
+                .get("any_skipped")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            any_spawn_failed: obj
+                .get("any_spawn_failed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            needs_attention: obj
+                .get("needs_attention")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            children,
+        })
+    }
+}
+
 /// Build the extended `children-complete` gate output.
 ///
 /// Classifies every submitted task (via the `materialize_children`
@@ -2158,6 +2259,150 @@ fn build_entries_from_disk(
         entries.push(entry);
     }
     entries
+}
+
+// --------- BatchFinalized helpers (Issue #17) ----------------------
+
+/// Return the most recent `BatchFinalized` event in `events`, if any.
+///
+/// Walks the log in reverse so the first match is the latest
+/// finalization. Consumers that want the frozen `batch_final_view`
+/// always read from this event — prior `BatchFinalized` entries are
+/// stale and will carry a `superseded_by` marker when rendered via
+/// [`annotate_superseded_batch_finalized`].
+pub fn find_most_recent_batch_finalized(events: &[Event]) -> Option<&Event> {
+    events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.payload, EventPayload::BatchFinalized { .. }))
+}
+
+/// Decide whether a fresh `BatchFinalized` event should append for the
+/// current tick (Issue #17 acceptance criterion 2).
+///
+/// Returns `true` only when:
+///   - the `children-complete` gate output reports `all_complete: true`,
+///   - AND either no prior `BatchFinalized` event exists, OR the last
+///     `BatchFinalized` has been invalidated by a later event that
+///     re-entered the batched state (a retry `EvidenceSubmitted` with
+///     `retry_failed`, or a `Rewound` event on the parent).
+///
+/// The append-once-per-finalization guarantee falls out of this
+/// predicate: a no-op re-tick observes the prior `BatchFinalized` with
+/// no intervening retry event, so no new event appends.
+pub fn should_append_batch_finalized(events: &[Event], all_complete: bool) -> bool {
+    if !all_complete {
+        return false;
+    }
+    // Find the seq of the most recent BatchFinalized, if any.
+    let last_bf_seq: Option<u64> = events.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::BatchFinalized { .. } => Some(e.seq),
+        _ => None,
+    });
+    match last_bf_seq {
+        None => true, // no prior finalization — append fresh.
+        Some(seq) => {
+            // Append only if something after the prior BatchFinalized
+            // invalidated it (a retry_failed evidence or a Rewound).
+            events
+                .iter()
+                .filter(|e| e.seq > seq)
+                .any(is_batch_invalidator)
+        }
+    }
+}
+
+/// An event counts as a batch invalidator when it re-enters the
+/// batched state: either a retry_failed evidence submission on the
+/// parent or any `Rewound` event (e.g., retry fast-path).
+fn is_batch_invalidator(e: &Event) -> bool {
+    match &e.payload {
+        EventPayload::EvidenceSubmitted { fields, .. } => fields.contains_key("retry_failed"),
+        EventPayload::Rewound { .. } => true,
+        _ => false,
+    }
+}
+
+/// Return a copy of `events` with every stale `BatchFinalized` payload
+/// annotated with its `superseded_by` marker (Issue #17 Round-3
+/// polish).
+///
+/// A `BatchFinalized` is stale when:
+///   - a later `BatchFinalized` exists in the log (superseded_by →
+///     the later finalization), OR
+///   - a later invalidator (`retry_failed` evidence or a `Rewound`
+///     event) appears after it without an intervening fresh
+///     `BatchFinalized`.
+///
+/// The most recent `BatchFinalized` is only marked superseded when a
+/// later invalidator exists — which is the design's "stale with phase
+/// flipping back to active" case.
+///
+/// Events with other payload types are returned unchanged.
+pub fn annotate_superseded_batch_finalized(events: &[Event]) -> Vec<Event> {
+    // Build a list of (index, seq, type, timestamp) for every event
+    // after which a BatchFinalized would be invalidated. Walking this
+    // list forward lets us assign the FIRST superseding event to the
+    // oldest stale BatchFinalized.
+    let mut out = events.to_vec();
+    let n = events.len();
+    for i in 0..n {
+        let EventPayload::BatchFinalized { .. } = &events[i].payload else {
+            continue;
+        };
+        // Look for the first event after index i that either (a) is a
+        // later BatchFinalized, or (b) is a retry/rewind invalidator.
+        let mut sup: Option<&Event> = None;
+        for later in events.iter().skip(i + 1) {
+            if matches!(later.payload, EventPayload::BatchFinalized { .. })
+                || is_batch_invalidator(later)
+            {
+                sup = Some(later);
+                break;
+            }
+        }
+        if let Some(later) = sup {
+            if let EventPayload::BatchFinalized {
+                state,
+                view,
+                timestamp,
+                ..
+            } = &events[i].payload
+            {
+                out[i].payload = EventPayload::BatchFinalized {
+                    state: state.clone(),
+                    view: view.clone(),
+                    timestamp: timestamp.clone(),
+                    superseded_by: Some(crate::engine::types::SupersededByRef {
+                        seq: later.seq,
+                        event_type: later.payload.type_name().to_string(),
+                        timestamp: later.timestamp.clone(),
+                    }),
+                };
+            }
+        }
+    }
+    out
+}
+
+/// Return the derived `batch.phase` for the current state's event log
+/// (Issue #17 Round-3 polish).
+///
+/// `"final"` once a `BatchFinalized` event has appended and is still
+/// the most recent signal (not yet invalidated by a later retry). The
+/// design treats the stale window where a retry has landed but no new
+/// finalization has appended yet as `"final"` too — the event's
+/// existence is load-bearing, not the parent's current state.
+/// `"active"` otherwise.
+pub fn derive_batch_phase(events: &[Event]) -> &'static str {
+    if events
+        .iter()
+        .any(|e| matches!(e.payload, EventPayload::BatchFinalized { .. }))
+    {
+        "final"
+    } else {
+        "active"
+    }
 }
 
 // --------- Tests ----------------------------------------------------
@@ -3094,5 +3339,177 @@ mod tests {
             Some(EntryOutcome::Errored { kind }) => assert_eq!(kind, "io_error"),
             other => panic!("expected Errored, got {:?}", other),
         }
+    }
+
+    // --------- Issue #17: BatchFinalized helpers ---------------------
+
+    fn bf_event(seq: u64, ts: &str) -> Event {
+        Event {
+            seq,
+            timestamp: ts.to_string(),
+            event_type: "batch_finalized".to_string(),
+            payload: EventPayload::BatchFinalized {
+                state: "plan".to_string(),
+                view: serde_json::json!({}),
+                timestamp: ts.to_string(),
+                superseded_by: None,
+            },
+        }
+    }
+
+    fn retry_evidence_event(seq: u64, ts: &str) -> Event {
+        let mut fields: HashMap<String, serde_json::Value> = HashMap::new();
+        fields.insert(
+            "retry_failed".to_string(),
+            serde_json::json!({"children": ["A"]}),
+        );
+        Event {
+            seq,
+            timestamp: ts.to_string(),
+            event_type: "evidence_submitted".to_string(),
+            payload: EventPayload::EvidenceSubmitted {
+                state: "plan".to_string(),
+                fields,
+                submitter_cwd: None,
+            },
+        }
+    }
+
+    #[test]
+    fn should_append_batch_finalized_when_no_prior_event() {
+        let events: Vec<Event> = vec![];
+        assert!(should_append_batch_finalized(&events, true));
+        // all_complete false short-circuits.
+        assert!(!should_append_batch_finalized(&events, false));
+    }
+
+    #[test]
+    fn should_not_append_batch_finalized_when_prior_not_invalidated() {
+        let events = vec![bf_event(5, "2026-04-14T10:00:00Z")];
+        assert!(!should_append_batch_finalized(&events, true));
+    }
+
+    #[test]
+    fn should_append_batch_finalized_when_retry_intervened() {
+        let events = vec![
+            bf_event(5, "2026-04-14T10:00:00Z"),
+            retry_evidence_event(7, "2026-04-14T10:05:00Z"),
+        ];
+        assert!(should_append_batch_finalized(&events, true));
+    }
+
+    #[test]
+    fn find_most_recent_batch_finalized_returns_latest() {
+        let events = vec![
+            bf_event(5, "2026-04-14T10:00:00Z"),
+            retry_evidence_event(7, "2026-04-14T10:05:00Z"),
+            bf_event(12, "2026-04-14T10:10:00Z"),
+        ];
+        let latest = find_most_recent_batch_finalized(&events).expect("latest exists");
+        assert_eq!(latest.seq, 12);
+    }
+
+    #[test]
+    fn annotate_superseded_by_marks_prior_batch_finalized() {
+        // Scenario: BatchFinalized (seq 5) → retry evidence (seq 7)
+        // → BatchFinalized (seq 12). The first BatchFinalized should
+        // be annotated with superseded_by pointing at seq 7 (the
+        // retry), which is the FIRST invalidator after it. The second
+        // BatchFinalized is still the most recent and no invalidator
+        // follows it, so it stays unmarked.
+        let events = vec![
+            bf_event(5, "2026-04-14T10:00:00Z"),
+            retry_evidence_event(7, "2026-04-14T10:05:00Z"),
+            bf_event(12, "2026-04-14T10:10:00Z"),
+        ];
+        let annotated = annotate_superseded_batch_finalized(&events);
+        match &annotated[0].payload {
+            EventPayload::BatchFinalized { superseded_by, .. } => {
+                let sup = superseded_by.as_ref().expect("prior BF must be marked");
+                assert_eq!(sup.seq, 7);
+                assert_eq!(sup.event_type, "evidence_submitted");
+            }
+            other => panic!("expected BatchFinalized, got {:?}", other),
+        }
+        match &annotated[2].payload {
+            EventPayload::BatchFinalized { superseded_by, .. } => {
+                assert!(
+                    superseded_by.is_none(),
+                    "most recent BatchFinalized must not be superseded"
+                );
+            }
+            other => panic!("expected BatchFinalized, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn annotate_superseded_by_marks_batch_finalized_when_later_invalidator_exists() {
+        // Stale window: BatchFinalized (seq 5) followed by a retry
+        // (seq 7) but no new BatchFinalized yet. The event is still
+        // stale; `superseded_by` points at the retry.
+        let events = vec![
+            bf_event(5, "2026-04-14T10:00:00Z"),
+            retry_evidence_event(7, "2026-04-14T10:05:00Z"),
+        ];
+        let annotated = annotate_superseded_batch_finalized(&events);
+        match &annotated[0].payload {
+            EventPayload::BatchFinalized { superseded_by, .. } => {
+                let sup = superseded_by.as_ref().expect("stale BF must be marked");
+                assert_eq!(sup.seq, 7);
+            }
+            other => panic!("expected BatchFinalized, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn derive_batch_phase_active_when_no_batch_finalized() {
+        let events: Vec<Event> = vec![];
+        assert_eq!(derive_batch_phase(&events), "active");
+    }
+
+    #[test]
+    fn derive_batch_phase_final_once_batch_finalized_appended() {
+        let events = vec![bf_event(5, "2026-04-14T10:00:00Z")];
+        assert_eq!(derive_batch_phase(&events), "final");
+        // Sticky across retries: phase stays final even after a retry
+        // invalidates the prior finalization (design Decision 13).
+        let events_with_retry = vec![
+            bf_event(5, "2026-04-14T10:00:00Z"),
+            retry_evidence_event(7, "2026-04-14T10:05:00Z"),
+        ];
+        assert_eq!(derive_batch_phase(&events_with_retry), "final");
+    }
+
+    #[test]
+    fn batch_final_view_from_gate_output_round_trip() {
+        // Serialized gate output round-trips through BatchFinalView.
+        let gate_output = serde_json::json!({
+            "total": 2,
+            "completed": 2,
+            "pending": 0,
+            "success": 1,
+            "failed": 1,
+            "skipped": 0,
+            "blocked": 0,
+            "spawn_failed": 0,
+            "all_complete": true,
+            "all_success": false,
+            "any_failed": true,
+            "any_skipped": false,
+            "any_spawn_failed": false,
+            "needs_attention": true,
+            "children": [],
+        });
+        let view = BatchFinalView::from_gate_output(&gate_output).expect("parses");
+        assert_eq!(view.total, 2);
+        assert_eq!(view.completed, 2);
+        assert_eq!(view.failed, 1);
+        assert!(view.all_complete);
+        assert!(!view.all_success);
+        assert!(view.any_failed);
+        // Serialize → deserialize round-trip.
+        let json = serde_json::to_string(&view).unwrap();
+        let back: BatchFinalView = serde_json::from_str(&json).unwrap();
+        assert_eq!(view, back);
     }
 }
