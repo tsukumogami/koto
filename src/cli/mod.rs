@@ -1,10 +1,15 @@
 pub mod batch_error;
 pub mod context;
+pub mod init_child;
 pub mod next;
 pub mod next_types;
 pub mod overrides;
 pub mod session;
+pub mod task_spawn_error;
 pub mod vars;
+
+pub use init_child::{init_child_from_parent, TemplateCompileCache};
+pub use task_spawn_error::{SpawnErrorKind, TaskSpawnError};
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
@@ -457,7 +462,7 @@ fn build_local_backend() -> Result<LocalBackend> {
 /// Validate and resolve `--var KEY=VALUE` arguments against the template's
 /// variable declarations. Returns a map of resolved variable bindings ready
 /// for storage in the WorkflowInitialized event.
-fn resolve_variables(
+pub(crate) fn resolve_variables(
     raw_vars: &[String],
     declarations: &BTreeMap<String, VariableDecl>,
 ) -> std::result::Result<HashMap<String, String>, String> {
