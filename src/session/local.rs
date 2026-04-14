@@ -684,6 +684,7 @@ mod tests {
             template_hash: "testhash".to_string(),
             created_at: created_at.to_string(),
             parent_workflow: None,
+            template_source_dir: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
     }
@@ -1139,6 +1140,7 @@ mod tests {
             template_hash: "testhash".to_string(),
             created_at: "2026-04-13T00:00:00Z".to_string(),
             parent_workflow: None,
+            template_source_dir: None,
         };
         let events = vec![
             Event {
@@ -1219,6 +1221,7 @@ mod tests {
                     template_hash: format!("hash-{}", i),
                     created_at: "2026-04-13T00:00:00Z".to_string(),
                     parent_workflow: None,
+                    template_source_dir: None,
                 };
                 let events = vec![Event {
                     seq: 1,

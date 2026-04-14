@@ -337,12 +337,33 @@ pub fn init_child_from_parent(
     let ts = now_iso8601();
     let cache_path_str = cached.cache_path.to_string_lossy().to_string();
 
+    // Capture the source template's parent directory so the batch
+    // scheduler's path resolver (Decision 4 / 14 in
+    // DESIGN-batch-child-spawning.md) can use it as the base for
+    // relative child-template paths. Only meaningful when the source
+    // path is absolute and its parent directory exists; relative
+    // paths or odd shapes (stdin / inline) leave the field `None`,
+    // and the resolver emits `MissingTemplateSourceDir` in that case.
+    let template_source_dir = if template_path.is_absolute() {
+        template_path.parent().map(|p| p.to_path_buf())
+    } else {
+        // Best-effort: resolve relative paths against the current
+        // working directory before snapshotting the parent. The
+        // cache path canonicalization above already proved the file
+        // exists; any failure here is non-fatal — we leave the
+        // header field `None` and let the resolver fall back.
+        std::fs::canonicalize(template_path)
+            .ok()
+            .and_then(|p| p.parent().map(|x| x.to_path_buf()))
+    };
+
     let header = StateFileHeader {
         schema_version: 1,
         workflow: child_name.to_string(),
         template_hash: cached.hash.clone(),
         created_at: ts.clone(),
         parent_workflow: parent_name.map(|s| s.to_string()),
+        template_source_dir,
     };
 
     let init_payload = EventPayload::WorkflowInitialized {
@@ -474,6 +495,7 @@ Done.
             template_hash: "0".repeat(64),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
+            template_source_dir: None,
         };
         let events = vec![Event {
             seq: 1,

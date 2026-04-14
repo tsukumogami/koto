@@ -44,6 +44,7 @@ fn init_backend(dir: &std::path::Path, id: &str) -> LocalBackend {
         template_hash: "0".repeat(64),
         created_at: "2026-01-01T00:00:00Z".to_string(),
         parent_workflow: None,
+        template_source_dir: None,
     };
     let events = vec![Event {
         seq: 1,

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 
 /// Header line written as the first line of a state file.
 ///
@@ -22,6 +23,23 @@ pub struct StateFileHeader {
     /// Name of the parent workflow, if this workflow was created as a child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_workflow: Option<String>,
+
+    /// Directory the source template was loaded from at `koto init`
+    /// time. Used by the batch scheduler's path resolver as the base
+    /// for relative child-template paths (Decision 4 / 14 in
+    /// DESIGN-batch-child-spawning.md).
+    ///
+    /// Captured from the parent directory of the absolute template
+    /// path passed to `handle_init`. `None` for stdin / inline
+    /// templates and for state files written before this field
+    /// existed. The resolver emits
+    /// `SchedulerWarning::MissingTemplateSourceDir` when this is
+    /// `None` and the workflow submits a relative child template.
+    ///
+    /// Additive field: serde-optional, omitted when `None`, so older
+    /// state files round-trip cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_source_dir: Option<PathBuf>,
 }
 
 /// Canonical-form snapshot of the batch task entry that spawned a
@@ -122,6 +140,20 @@ pub enum EventPayload {
     EvidenceSubmitted {
         state: String,
         fields: HashMap<String, serde_json::Value>,
+        /// Working directory of the process that submitted this
+        /// evidence. Used by the batch scheduler's path resolver as
+        /// the final fallback for relative child-template paths
+        /// (Decision 4 / 14 in DESIGN-batch-child-spawning.md).
+        ///
+        /// Captured from `std::env::current_dir()` at submission
+        /// time. `None` for evidence submitted before this field
+        /// existed; the resolver tolerates the absence by leaving
+        /// the relative path unchanged.
+        ///
+        /// Additive field: serde-optional, omitted when `None`, so
+        /// older state files round-trip cleanly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submitter_cwd: Option<PathBuf>,
     },
     IntegrationInvoked {
         state: String,
@@ -276,6 +308,7 @@ impl<'de> Deserialize<'de> for Event {
                 EventPayload::EvidenceSubmitted {
                     state: p.state,
                     fields: p.fields,
+                    submitter_cwd: p.submitter_cwd,
                 }
             }
             "directed_transition" => {
@@ -391,6 +424,8 @@ struct TransitionedPayload {
 struct EvidenceSubmittedPayload {
     state: String,
     fields: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    submitter_cwd: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -559,6 +594,7 @@ mod tests {
             template_hash: "abc123def456".to_string(),
             created_at: "2026-03-15T14:30:00Z".to_string(),
             parent_workflow: None,
+            template_source_dir: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         let parsed: StateFileHeader = serde_json::from_str(&json).unwrap();
@@ -573,6 +609,7 @@ mod tests {
             template_hash: "abc123def456".to_string(),
             created_at: "2026-03-15T14:30:00Z".to_string(),
             parent_workflow: Some("parent-wf".to_string()),
+            template_source_dir: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(json.contains("\"parent_workflow\":\"parent-wf\""));
@@ -588,6 +625,45 @@ mod tests {
         let json = r#"{"schema_version":1,"workflow":"old-wf","template_hash":"abc","created_at":"2026-01-01T00:00:00Z"}"#;
         let parsed: StateFileHeader = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.parent_workflow, None);
+        assert_eq!(parsed.template_source_dir, None);
+    }
+
+    #[test]
+    fn header_round_trip_with_template_source_dir() {
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: "wf".to_string(),
+            template_hash: "hash".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: None,
+            template_source_dir: Some(PathBuf::from("/abs/templates")),
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(
+            json.contains("\"template_source_dir\":\"/abs/templates\""),
+            "got {}",
+            json
+        );
+        let parsed: StateFileHeader = serde_json::from_str(&json).unwrap();
+        assert_eq!(header, parsed);
+    }
+
+    #[test]
+    fn header_none_template_source_dir_not_serialized() {
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: "wf".to_string(),
+            template_hash: "hash".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: None,
+            template_source_dir: None,
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(
+            !json.contains("template_source_dir"),
+            "template_source_dir should be omitted when None, got {}",
+            json
+        );
     }
 
     #[test]
@@ -598,6 +674,7 @@ mod tests {
             template_hash: "hash".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
+            template_source_dir: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -1002,6 +1079,53 @@ mod tests {
             result.is_err(),
             "expected error for missing state field, got: {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn evidence_submitted_round_trip_with_submitter_cwd() {
+        let e = Event {
+            seq: 4,
+            timestamp: "2026-04-13T10:00:00Z".to_string(),
+            event_type: "evidence_submitted".to_string(),
+            payload: EventPayload::EvidenceSubmitted {
+                state: "review".to_string(),
+                fields: {
+                    let mut m = HashMap::new();
+                    m.insert("decision".to_string(), serde_json::json!("approve"));
+                    m
+                },
+                submitter_cwd: Some(PathBuf::from("/work/repo")),
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(
+            json.contains("\"submitter_cwd\":\"/work/repo\""),
+            "got {}",
+            json
+        );
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn evidence_submitted_round_trip_without_submitter_cwd_omits_key() {
+        // Pre-feature evidence event lacking submitter_cwd must
+        // deserialize cleanly and re-serialize without introducing
+        // the new key.
+        let json = r#"{"seq":4,"timestamp":"2026-04-13T10:00:00Z","type":"evidence_submitted","payload":{"state":"review","fields":{"decision":"approve"}}}"#;
+        let parsed: Event = serde_json::from_str(json).expect("parse pre-feature event");
+        match &parsed.payload {
+            EventPayload::EvidenceSubmitted { submitter_cwd, .. } => {
+                assert!(submitter_cwd.is_none());
+            }
+            other => panic!("expected EvidenceSubmitted, got {:?}", other),
+        }
+        let reserialized = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            !reserialized.contains("submitter_cwd"),
+            "round-tripped pre-feature event must not introduce submitter_cwd, got {}",
+            reserialized
         );
     }
 }

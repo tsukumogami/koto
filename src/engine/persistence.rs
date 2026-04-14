@@ -443,6 +443,7 @@ mod tests {
             template_hash: "deadbeef".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
+            template_source_dir: None,
         }
     }
 
@@ -717,6 +718,7 @@ mod tests {
                         m.insert("file".to_string(), serde_json::json!("old.txt"));
                         m
                     },
+                    submitter_cwd: None,
                 },
             ),
             make_event(
@@ -744,6 +746,7 @@ mod tests {
                         m.insert("file".to_string(), serde_json::json!("new.txt"));
                         m
                     },
+                    submitter_cwd: None,
                 },
             ),
         ];
@@ -783,6 +786,7 @@ mod tests {
                         m.insert("data".to_string(), serde_json::json!("stale"));
                         m
                     },
+                    submitter_cwd: None,
                 },
             ),
             make_event(
@@ -1506,6 +1510,7 @@ mod tests {
                 EventPayload::EvidenceSubmitted {
                     state: "gather".to_string(),
                     fields: HashMap::new(),
+                    submitter_cwd: None,
                 },
             ),
             make_event(
@@ -1553,6 +1558,7 @@ mod tests {
                 EventPayload::EvidenceSubmitted {
                     state: "gather".to_string(),
                     fields: HashMap::new(),
+                    submitter_cwd: None,
                 },
             ),
             make_event(

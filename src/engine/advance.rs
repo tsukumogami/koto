@@ -1017,6 +1017,7 @@ mod tests {
                         m.insert("decision".to_string(), serde_json::json!("reject"));
                         m
                     },
+                    submitter_cwd: None,
                 },
             },
             Event {
@@ -1030,6 +1031,7 @@ mod tests {
                         m.insert("decision".to_string(), serde_json::json!("approve"));
                         m
                     },
+                    submitter_cwd: None,
                 },
             },
         ];
@@ -1052,6 +1054,7 @@ mod tests {
                         m.insert("quality".to_string(), serde_json::json!("good"));
                         m
                     },
+                    submitter_cwd: None,
                 },
             },
             Event {
@@ -1065,6 +1068,7 @@ mod tests {
                         m.insert("coverage".to_string(), serde_json::json!(85));
                         m
                     },
+                    submitter_cwd: None,
                 },
             },
         ];

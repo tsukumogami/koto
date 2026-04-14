@@ -1704,9 +1704,17 @@ fn handle_next(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
+        // Capture the submitter's working directory so the batch
+        // scheduler's path resolver (Decision 4 / 14 in
+        // DESIGN-batch-child-spawning.md) can use it as the final
+        // fallback for relative child-template paths. Best-effort:
+        // a failure here (deleted cwd, permission issues) leaves the
+        // field `None` and the resolver tolerates the absence.
+        let submitter_cwd = std::env::current_dir().ok();
         let payload = EventPayload::EvidenceSubmitted {
             state: current_state.clone(),
             fields,
+            submitter_cwd,
         };
         if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
             let ne = NextError {

@@ -117,6 +117,7 @@ mod tests {
             template_hash: template_hash.to_string(),
             created_at: "2026-03-15T10:00:00Z".to_string(),
             parent_workflow: None,
+            template_source_dir: None,
         };
         append_header(&state_path, &header).unwrap();
     }
@@ -292,6 +293,7 @@ mod tests {
             template_hash: template_hash.to_string(),
             created_at: "2026-03-15T10:00:00Z".to_string(),
             parent_workflow: Some(parent.to_string()),
+            template_source_dir: None,
         };
         append_header(&state_path, &header).unwrap();
     }
