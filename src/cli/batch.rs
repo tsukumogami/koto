@@ -877,6 +877,23 @@ pub(crate) fn run_batch_scheduler(
     // Resolve the parent's template source dir + submitter cwd once.
     let (template_source_dir, submitter_cwd) = resolution_context(backend, parent_name, events);
 
+    // Probe `template_source_dir.exists()` once per tick (AC5). The
+    // result is threaded through every per-task resolver call so the
+    // filesystem syscall is amortized across the whole submission.
+    let template_source_dir_exists: Option<bool> =
+        template_source_dir.as_deref().map(|p| p.exists());
+
+    // Emit per-tick warnings (MissingTemplateSourceDir /
+    // StaleTemplateSourceDir) exactly once, here at the top of the
+    // tick, rather than letting the per-task resolver accumulate
+    // duplicates. This is the second half of AC5 + AC3.
+    emit_template_source_dir_warnings(
+        template_source_dir.as_deref(),
+        template_source_dir_exists,
+        submitter_cwd.as_deref(),
+        &mut warnings,
+    );
+
     // Iterate tasks in topological order so a respawn that updates a
     // downstream's upstream outcome propagates within the same tick.
     for name in dag.topological_order.clone() {
@@ -966,6 +983,7 @@ pub(crate) fn run_batch_scheduler(
                     task,
                     hook,
                     template_source_dir.as_deref(),
+                    template_source_dir_exists,
                     submitter_cwd.as_deref(),
                     &mut cache,
                     &mut spawned_this_tick,
@@ -981,6 +999,7 @@ pub(crate) fn run_batch_scheduler(
                     task,
                     hook,
                     template_source_dir.as_deref(),
+                    template_source_dir_exists,
                     submitter_cwd.as_deref(),
                     &mut cache,
                     &mut spawned_this_tick,
@@ -1440,6 +1459,7 @@ fn spawn_ready_task(
     task: &TaskEntry,
     hook: &MaterializeChildrenSpec,
     template_source_dir: Option<&std::path::Path>,
+    template_source_dir_exists: Option<bool>,
     submitter_cwd: Option<&std::path::Path>,
     cache: &mut TemplateCompileCache,
     spawned_this_tick: &mut Vec<String>,
@@ -1451,9 +1471,10 @@ fn spawn_ready_task(
         .template
         .clone()
         .unwrap_or_else(|| hook.default_template.clone());
-    let resolution = crate::engine::path_resolution::resolve_template_path(
+    let resolution = crate::engine::path_resolution::resolve_template_path_with_base_status(
         &raw_template,
         template_source_dir,
+        template_source_dir_exists,
         submitter_cwd,
     );
     accumulate_resolution_warnings(&resolution.warnings, warnings);
@@ -1461,6 +1482,7 @@ fn spawn_ready_task(
     let child_name = format!("{}.{}", parent_name, task.name);
     let vars = vars_to_cli_args(&task.vars);
     let snapshot = build_spawn_entry_snapshot(task, &raw_template);
+    let template_source = template_source_of(task.template.as_ref());
 
     match crate::cli::init_child_from_parent(
         backend,
@@ -1476,7 +1498,13 @@ fn spawn_ready_task(
             classifications.insert(task.name.clone(), TaskClassification::Running);
         }
         Err(err) => {
-            errored.push(err);
+            let paths_tried = canonical_paths_tried(
+                &raw_template,
+                template_source_dir,
+                template_source_dir_exists,
+                submitter_cwd,
+            );
+            errored.push(enrich_spawn_error(err, paths_tried, template_source));
             classifications.insert(task.name.clone(), TaskClassification::Failure);
         }
     }
@@ -1493,6 +1521,7 @@ fn spawn_skip_marker_task(
     task: &TaskEntry,
     hook: &MaterializeChildrenSpec,
     template_source_dir: Option<&std::path::Path>,
+    template_source_dir_exists: Option<bool>,
     submitter_cwd: Option<&std::path::Path>,
     cache: &mut TemplateCompileCache,
     spawned_this_tick: &mut Vec<String>,
@@ -1504,21 +1533,34 @@ fn spawn_skip_marker_task(
         .template
         .clone()
         .unwrap_or_else(|| hook.default_template.clone());
-    let resolution = crate::engine::path_resolution::resolve_template_path(
+    let resolution = crate::engine::path_resolution::resolve_template_path_with_base_status(
         &raw_template,
         template_source_dir,
+        template_source_dir_exists,
         submitter_cwd,
     );
     accumulate_resolution_warnings(&resolution.warnings, warnings);
 
     let child_name = format!("{}.{}", parent_name, task.name);
+    let template_source = template_source_of(task.template.as_ref());
+    let paths_tried = canonical_paths_tried(
+        &raw_template,
+        template_source_dir,
+        template_source_dir_exists,
+        submitter_cwd,
+    );
     let skipped_state = match find_skipped_state_name(&resolution.resolved) {
         Ok(name) => name,
         Err(msg) => {
-            errored.push(TaskSpawnError::new(
+            let base_err = TaskSpawnError::new(
                 &child_name,
                 crate::cli::task_spawn_error::SpawnErrorKind::TemplateCompileFailed,
                 msg,
+            );
+            errored.push(enrich_spawn_error(
+                base_err,
+                paths_tried.clone(),
+                template_source.clone(),
             ));
             classifications.insert(task.name.clone(), TaskClassification::Failure);
             return;
@@ -1543,7 +1585,7 @@ fn spawn_skip_marker_task(
             classifications.insert(task.name.clone(), TaskClassification::Skipped);
         }
         Err(err) => {
-            errored.push(err);
+            errored.push(enrich_spawn_error(err, paths_tried, template_source));
             classifications.insert(task.name.clone(), TaskClassification::Failure);
         }
     }
@@ -1601,8 +1643,15 @@ fn build_spawn_entry_snapshot(task: &TaskEntry, raw_template: &str) -> SpawnEntr
     SpawnEntrySnapshot::new(raw_template.to_string(), vars_map, task.waits_on.clone())
 }
 
-/// Dedup `MissingTemplateSourceDir` (per-tick warning, not per-task)
-/// and append the remaining warnings verbatim.
+/// Dedup `MissingTemplateSourceDir` and `StaleTemplateSourceDir`
+/// (both per-tick warnings, not per-task) and append the remaining
+/// warnings verbatim.
+///
+/// Retained as a narrow safety net in case a per-task resolver call
+/// still produces one of these warnings (e.g., absolute-target
+/// oddities). Under normal operation
+/// [`emit_template_source_dir_warnings`] has already pushed the
+/// single per-tick warning before any per-task call runs.
 fn accumulate_resolution_warnings(
     resolution_warnings: &[SchedulerWarning],
     warnings: &mut Vec<SchedulerWarning>,
@@ -1615,8 +1664,116 @@ fn accumulate_resolution_warnings(
         {
             continue;
         }
+        if let SchedulerWarning::StaleTemplateSourceDir { path, .. } = w {
+            if warnings.iter().any(|existing| {
+                matches!(
+                    existing,
+                    SchedulerWarning::StaleTemplateSourceDir { path: p, .. } if p == path
+                )
+            }) {
+                continue;
+            }
+        }
         warnings.push(w.clone());
     }
+}
+
+/// Emit per-tick path-resolution warnings based on the single
+/// `template_source_dir.exists()` probe performed at the top of the
+/// tick. Issue #21 AC3 + AC5.
+///
+/// - `template_source_dir == None` →
+///   [`SchedulerWarning::MissingTemplateSourceDir`]. Pre-feature
+///   state files carry no base directory; the resolver silently falls
+///   through to `submitter_cwd`, and agents see one warning per tick
+///   telling them why.
+/// - `template_source_dir == Some(p)` but `base_exists == Some(false)`
+///   → [`SchedulerWarning::StaleTemplateSourceDir`]. Cross-machine
+///   migration left the path behind; emit once with the recorded
+///   base, the current machine identifier, and the directory the
+///   scheduler is actually using (typically `submitter_cwd`, or the
+///   recorded base as a best-effort when `submitter_cwd` is absent).
+/// - Otherwise (base is live or was never configured beyond the
+///   `None` case above) no warning is emitted here.
+fn emit_template_source_dir_warnings(
+    template_source_dir: Option<&std::path::Path>,
+    base_exists: Option<bool>,
+    submitter_cwd: Option<&std::path::Path>,
+    warnings: &mut Vec<SchedulerWarning>,
+) {
+    match template_source_dir {
+        None => {
+            warnings.push(SchedulerWarning::MissingTemplateSourceDir);
+        }
+        Some(base) => {
+            if base_exists == Some(false) {
+                let fallback = submitter_cwd
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| base.to_path_buf());
+                warnings.push(SchedulerWarning::StaleTemplateSourceDir {
+                    path: base.to_string_lossy().into_owned(),
+                    machine_id: crate::engine::path_resolution::current_machine_id(),
+                    falling_back_to: fallback,
+                });
+            }
+        }
+    }
+}
+
+/// Classify whether a task's template path came from an agent
+/// override or was inherited from the hook's `default_template`.
+///
+/// Callers pass the task's `template` field directly — `Some` means
+/// the submission carried an explicit path, `None` means the hook
+/// default was used.
+fn template_source_of(
+    task_template: Option<&String>,
+) -> crate::cli::task_spawn_error::TemplateSource {
+    if task_template.is_some() {
+        crate::cli::task_spawn_error::TemplateSource::Override
+    } else {
+        crate::cli::task_spawn_error::TemplateSource::Default
+    }
+}
+
+/// Enrich a per-task spawn error with the path-resolution context
+/// the scheduler knows about (canonicalized `paths_tried` and the
+/// `template_source` discriminator). The caller supplies the context
+/// explicitly so this helper can stay side-effect free.
+fn enrich_spawn_error(
+    mut err: TaskSpawnError,
+    paths_tried: Vec<String>,
+    template_source: crate::cli::task_spawn_error::TemplateSource,
+) -> TaskSpawnError {
+    if !paths_tried.is_empty() && err.paths_tried.is_none() {
+        err.paths_tried = Some(paths_tried);
+    }
+    if err.template_source.is_none() {
+        err.template_source = Some(template_source);
+    }
+    err
+}
+
+/// Compute the canonicalized `paths_tried` list for a task's raw
+/// template string, stringifying via `to_string_lossy` for JSON
+/// emission. Delegates to
+/// [`crate::engine::path_resolution::candidate_paths`] so the
+/// canonicalization rules live alongside the resolver itself.
+fn canonical_paths_tried(
+    raw_template: &str,
+    template_source_dir: Option<&std::path::Path>,
+    template_source_dir_exists: Option<bool>,
+    submitter_cwd: Option<&std::path::Path>,
+) -> Vec<String> {
+    crate::engine::path_resolution::candidate_paths(
+        raw_template,
+        template_source_dir,
+        template_source_dir_exists,
+        submitter_cwd,
+    )
+    .into_iter()
+    .map(|p| p.to_string_lossy().into_owned())
+    .collect()
 }
 
 // --------- Helpers ---------------------------------------------------

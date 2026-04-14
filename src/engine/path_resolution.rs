@@ -107,9 +107,40 @@ pub(crate) fn current_machine_id() -> Option<String> {
 /// `MissingTemplateSourceDir`). Real callers always supply at least
 /// one of the two — the helper tolerates the empty case for ease of
 /// testing.
+///
+/// This wrapper probes `template_source_dir` existence on every call.
+/// Scheduler callers that want to probe once per tick should use
+/// [`resolve_template_path_with_base_status`] and thread the probe
+/// result through every per-task call.
 pub fn resolve_template_path(
     target: &str,
     template_source_dir: Option<&Path>,
+    submitter_cwd: Option<&Path>,
+) -> PathResolution {
+    let base_status = template_source_dir.map(|p| p.exists());
+    resolve_template_path_with_base_status(target, template_source_dir, base_status, submitter_cwd)
+}
+
+/// Like [`resolve_template_path`], but takes a pre-computed
+/// `base_exists` value so the batch scheduler can probe
+/// `template_source_dir` with a single `Path::exists()` syscall per
+/// tick rather than once per task.
+///
+/// `base_exists` must mirror `template_source_dir.is_some()`:
+///
+/// - `template_source_dir == None` → `base_exists` should be `None`.
+/// - `template_source_dir == Some(p)` → `base_exists` should be
+///   `Some(p.exists())`.
+///
+/// Callers that deviate from this contract can still expect a sane
+/// result: the function treats `base_exists == None` as "no base
+/// configured" and `base_exists == Some(false)` as "base configured
+/// but gone". The public [`resolve_template_path`] wrapper fills in
+/// the probe for convenience.
+pub fn resolve_template_path_with_base_status(
+    target: &str,
+    template_source_dir: Option<&Path>,
+    base_exists: Option<bool>,
     submitter_cwd: Option<&Path>,
 ) -> PathResolution {
     let target_path = Path::new(target);
@@ -127,7 +158,8 @@ pub fn resolve_template_path(
     // Step (b): try the template_source_dir base.
     match template_source_dir {
         Some(base) => {
-            if !base.exists() {
+            let exists = base_exists.unwrap_or(false);
+            if !exists {
                 // The recorded base directory is gone (typically a
                 // cross-machine migration). Emit StaleTemplateSourceDir
                 // and fall through to submitter_cwd.
@@ -183,6 +215,94 @@ pub fn resolve_template_path(
         resolved: target_path.to_path_buf(),
         warnings,
     }
+}
+
+/// Return the list of candidate template paths the resolver would
+/// probe for `target`, canonicalized where possible.
+///
+/// The result is the per-task `paths_tried` field surfaced on
+/// [`crate::cli::task_spawn_error::TaskSpawnError`] when resolution
+/// fails. The ordering matches the resolver's fallback order so
+/// agents can reconstruct which step failed:
+///
+/// 1. Absolute `target` → single entry, the absolute path itself.
+/// 2. Relative `target` + live `template_source_dir` → joined
+///    candidate (canonicalized when possible).
+/// 3. Relative `target` + `submitter_cwd` → joined candidate
+///    (canonicalized when possible).
+///
+/// Canonicalization strips `..` segments so agents never see a
+/// path echo a parent-directory traversal. When canonicalization
+/// fails (typically because the candidate does not exist on disk),
+/// the best-effort absolute form is returned: the un-canonicalized
+/// join, made absolute via the base/cwd so no raw `..` segments
+/// leak through from operator-controlled input. When no absolute
+/// base is available, the relative target is returned as-is — no
+/// `..` segments are injected.
+pub fn candidate_paths(
+    target: &str,
+    template_source_dir: Option<&Path>,
+    base_exists: Option<bool>,
+    submitter_cwd: Option<&Path>,
+) -> Vec<PathBuf> {
+    let target_path = Path::new(target);
+    if target_path.is_absolute() {
+        return vec![canonicalize_or_self(target_path)];
+    }
+
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some(base) = template_source_dir {
+        if base_exists.unwrap_or(false) {
+            out.push(canonicalize_or_self(&base.join(target_path)));
+        }
+    }
+    if let Some(cwd) = submitter_cwd {
+        out.push(canonicalize_or_self(&cwd.join(target_path)));
+    }
+    if out.is_empty() {
+        // No base/cwd available: still strip any `..` segments from
+        // the operator-supplied target so the echoed path never
+        // contains parent-traversal segments. AC4 on Issue #21.
+        out.push(lexical_normalize(target_path));
+    }
+    out
+}
+
+/// Canonicalize `p` when possible; otherwise normalize any `..`
+/// segments lexically so callers never see parent-traversal segments
+/// echoed back in error envelopes.
+fn canonicalize_or_self(p: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    lexical_normalize(p)
+}
+
+/// Lexically normalize `p` by collapsing `.` and `..` segments.
+/// Relative `..` segments at the root of a relative path are dropped
+/// rather than preserved — the echoed path must not contain raw
+/// parent-traversal segments even when the target does not exist on
+/// disk (AC4 on Issue #21).
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in p.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                // Strip the last component if it's a normal segment;
+                // otherwise drop the `..` entirely.
+                if !out.pop() {
+                    // Either empty or we only had a RootDir. Leave
+                    // `out` as-is.
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -348,5 +468,90 @@ mod tests {
         if let Some(id) = current_machine_id() {
             assert!(!id.is_empty());
         }
+    }
+
+    #[test]
+    fn resolve_with_base_status_matches_probe_based_behavior_when_base_live() {
+        let base = TempDir::new().unwrap();
+        let file = base.path().join("child.md");
+        std::fs::write(&file, "x").unwrap();
+
+        let via_probe = resolve_template_path("child.md", Some(base.path()), None);
+        let via_status =
+            resolve_template_path_with_base_status("child.md", Some(base.path()), Some(true), None);
+        assert_eq!(via_probe, via_status);
+    }
+
+    #[test]
+    fn resolve_with_base_status_treats_stale_base_consistently() {
+        // Skip the filesystem probe entirely: tell the resolver the
+        // base does not exist, and verify it behaves identically to
+        // the probe-based path.
+        let cwd = TempDir::new().unwrap();
+        let stale = PathBuf::from("/definitely/does/not/exist/anywhere/koto-test-2");
+        let via_probe = resolve_template_path("child.md", Some(&stale), Some(cwd.path()));
+        let via_status = resolve_template_path_with_base_status(
+            "child.md",
+            Some(&stale),
+            Some(false),
+            Some(cwd.path()),
+        );
+        assert_eq!(via_probe, via_status);
+    }
+
+    #[test]
+    fn candidate_paths_absolute_returns_single_entry() {
+        let abs = if cfg!(windows) {
+            r"C:\tmp\template.md"
+        } else {
+            "/tmp/template.md"
+        };
+        let paths = candidate_paths(abs, None, None, None);
+        assert_eq!(paths.len(), 1);
+        // Canonicalization may or may not succeed depending on whether
+        // the file exists; both shapes are acceptable but `..`
+        // segments must never appear.
+        assert!(!paths[0].to_string_lossy().contains(".."));
+    }
+
+    #[test]
+    fn candidate_paths_relative_with_base_and_cwd() {
+        let base = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let file = base.path().join("child.md");
+        std::fs::write(&file, "x").unwrap();
+
+        let paths = candidate_paths("child.md", Some(base.path()), Some(true), Some(cwd.path()));
+        assert_eq!(paths.len(), 2, "should try base then cwd");
+        // The first entry canonicalizes to the existing file.
+        assert_eq!(paths[0], std::fs::canonicalize(&file).unwrap());
+        // The cwd candidate either canonicalizes (if cwd exists, which
+        // it does via TempDir) or normalizes to an absolute form.
+        assert!(paths[1].is_absolute());
+    }
+
+    #[test]
+    fn candidate_paths_never_echoes_parent_segments() {
+        // Nonexistent base + `..`-bearing target: canonicalize will
+        // fail, so lexical normalization applies. The echoed path
+        // must not contain `..` segments.
+        let paths = candidate_paths("../foo/../bar.md", None, None, None);
+        assert_eq!(paths.len(), 1);
+        assert!(
+            !paths[0].to_string_lossy().contains(".."),
+            "expected no .. segments, got {:?}",
+            paths[0]
+        );
+    }
+
+    #[test]
+    fn candidate_paths_skips_stale_base() {
+        // When the base is stale (`base_exists == Some(false)`), we
+        // skip the base candidate and only try submitter_cwd.
+        let cwd = TempDir::new().unwrap();
+        let stale = PathBuf::from("/definitely/does/not/exist/xxx");
+        let paths = candidate_paths("child.md", Some(&stale), Some(false), Some(cwd.path()));
+        assert_eq!(paths.len(), 1, "stale base must be skipped");
+        assert!(paths[0].is_absolute());
     }
 }

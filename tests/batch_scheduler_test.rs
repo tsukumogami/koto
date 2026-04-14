@@ -1878,3 +1878,177 @@ fn scenario_27_synthetic_marker_and_skipped_chain() {
         serde_json::json!(["sparent.A"])
     );
 }
+
+/// scenario-20 (Issue #21): a single task's template-resolution
+/// failure lands in `errored` while its siblings spawn successfully.
+///
+/// Submit three ready tasks. Task "B" carries an explicit `template`
+/// override pointing at a file that doesn't exist. A and C use the
+/// hook's `default_template` ("child.md") which is on disk. The
+/// scheduler must:
+///
+/// 1. Spawn A and C (their template is resolvable).
+/// 2. Push B into `errored` with `kind: template_not_found` — not
+///    halt the tick.
+/// 3. Populate `paths_tried` on B's error, and ensure no `..`
+///    segments leak through the canonicalized paths.
+/// 4. Populate `template_source: override` on B's error, and
+///    `template_source: default` if any task-level failure inherits
+///    from the hook default (the test focuses on B specifically).
+#[test]
+fn scenario_20_partial_failure_accumulates_in_errored() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_templates(tmp.path());
+
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "parent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "parent init failed: {}", stderr);
+
+    // Three independent tasks; B carries a doomed template override.
+    let payload = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+            {
+                "name": "B",
+                "waits_on": [],
+                "vars": {},
+                "template": "does-not-exist.md"
+            },
+            {"name": "C", "waits_on": [], "vars": {}},
+        ]
+    });
+    let (_, json, stderr) = run_koto(
+        tmp.path(),
+        &["next", "parent", "--with-data", &payload.to_string()],
+    );
+    let sched = json
+        .get("scheduler")
+        .unwrap_or_else(|| panic!("scheduler key present; stderr={} json={}", stderr, json));
+
+    // AC1: A and C spawn, even though B failed.
+    let mut spawned: Vec<String> = sched["spawned_this_tick"]
+        .as_array()
+        .expect("spawned_this_tick present")
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    spawned.sort();
+    assert_eq!(
+        spawned,
+        vec!["parent.A".to_string(), "parent.C".to_string()],
+        "A and C must spawn alongside B's failure: {:?}",
+        spawned
+    );
+
+    // AC1/6: B appears in `errored` with a template_not_found kind.
+    let errored = sched["errored"].as_array().expect("errored array present");
+    assert_eq!(
+        errored.len(),
+        1,
+        "exactly one errored entry expected: {:?}",
+        errored
+    );
+    let b_err = &errored[0];
+    assert_eq!(b_err["task"], "parent.B");
+    assert_eq!(b_err["kind"], "template_not_found");
+
+    // AC4: paths_tried present, canonicalized, no `..` segments.
+    let paths_tried = b_err["paths_tried"]
+        .as_array()
+        .expect("paths_tried present on template_not_found error");
+    assert!(
+        !paths_tried.is_empty(),
+        "paths_tried must enumerate at least one candidate"
+    );
+    for p in paths_tried {
+        let s = p.as_str().expect("path entry is a string");
+        assert!(
+            !s.contains(".."),
+            "paths_tried must not echo `..` segments: {}",
+            s
+        );
+    }
+
+    // Round-3 polish: template_source is populated and reflects the
+    // override vs default distinction.
+    assert_eq!(
+        b_err["template_source"], "override",
+        "B supplied its own template; must be recorded as override"
+    );
+
+    // Ledger sanity: B's materialized_children entry carries
+    // outcome=spawn_failed.
+    let ledger = sched["materialized_children"]
+        .as_array()
+        .expect("materialized_children array");
+    let b_row = ledger
+        .iter()
+        .find(|r| r["name"] == "parent.B")
+        .expect("B row present in ledger");
+    assert_eq!(b_row["outcome"], "spawn_failed");
+}
+
+/// Second coverage slice for Issue #21: when a task inherits the
+/// hook's `default_template` and that template is later unavailable,
+/// the per-task error reports `template_source: default`.
+///
+/// E9 requires the parent's `default_template` to resolve at compile
+/// time, so we can't start with a missing default. Instead we init
+/// the parent with the template present (E9 passes), then remove
+/// `child.md` before the scheduler tick runs. The spawn attempt
+/// fails at resolution time with `template_not_found`; the error
+/// surface must report `template_source: default`.
+///
+/// Kept as a small focused test so the override/default split is
+/// asserted independently of the multi-task accumulation guarantee.
+#[test]
+fn scenario_20_template_source_default_inheritance() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_templates(tmp.path());
+
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "parent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "parent init failed: {}", stderr);
+
+    // Remove the default_template so the scheduler's per-task
+    // resolution fails. The child-cache population inside init only
+    // covers templates the parent itself references (E9's positive
+    // probe), not the scheduler's per-task lookup.
+    std::fs::remove_file(tmp.path().join("child.md")).unwrap();
+
+    // Single task with no `template` field — inherits the hook's
+    // `default_template: child.md`, which is now gone.
+    let payload = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+        ]
+    });
+    let (_, json, _) = run_koto(
+        tmp.path(),
+        &["next", "parent", "--with-data", &payload.to_string()],
+    );
+    let sched = json.get("scheduler").expect("scheduler key present");
+    let errored = sched["errored"].as_array().expect("errored array");
+    assert_eq!(errored.len(), 1, "one error expected: {:?}", errored);
+    let a_err = &errored[0];
+    assert_eq!(a_err["task"], "parent.A");
+    assert_eq!(a_err["kind"], "template_not_found");
+    assert_eq!(
+        a_err["template_source"], "default",
+        "A inherits default_template; must be recorded as default"
+    );
+}
