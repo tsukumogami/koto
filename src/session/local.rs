@@ -9,7 +9,7 @@ use crate::engine::persistence;
 use crate::engine::types::{now_iso8601, Event, EventPayload, StateFileHeader};
 use crate::session::context::{ContextStore, KeyMeta, Manifest};
 use crate::session::validate::{validate_context_key, validate_session_id};
-use crate::session::{state_file_name, SessionBackend, SessionInfo};
+use crate::session::{state_file_name, SessionBackend, SessionError, SessionInfo};
 
 /// Filesystem-backed session storage.
 ///
@@ -152,19 +152,26 @@ impl SessionBackend for LocalBackend {
         id: &str,
         header: StateFileHeader,
         initial_events: Vec<Event>,
-    ) -> anyhow::Result<()> {
-        validate_session_id(id)?;
+    ) -> Result<(), SessionError> {
+        // `validate_session_id` returns anyhow::Error today; it's a
+        // caller-input problem, not an I/O failure, so route it through
+        // the Other variant.
+        validate_session_id(id).map_err(SessionError::Other)?;
 
         // Ensure the session directory exists so the tempfile can live on
         // the same filesystem as the final target. Also ensures the .koto
         // root exists with restricted permissions.
-        ensure_koto_root(&self.base_dir)?;
+        ensure_koto_root(&self.base_dir).map_err(SessionError::from)?;
         let session_dir = self.base_dir.join(id);
-        fs::create_dir_all(&session_dir).with_context(|| {
-            format!(
-                "failed to create session directory: {}",
-                session_dir.display()
-            )
+        fs::create_dir_all(&session_dir).map_err(|e| {
+            SessionError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to create session directory {}: {}",
+                    session_dir.display(),
+                    e
+                ),
+            ))
         })?;
 
         let target = session_dir.join(state_file_name(id));
@@ -173,30 +180,29 @@ impl SessionBackend for LocalBackend {
         // into an in-memory buffer. The header itself carries no seq
         // field; events use the caller-supplied seq numbers verbatim.
         let mut buf = String::new();
-        let header_line =
-            serde_json::to_string(&header).context("failed to serialize state file header")?;
+        let header_line = serde_json::to_string(&header)?;
         buf.push_str(&header_line);
         buf.push('\n');
         for event in &initial_events {
-            let line = serde_json::to_string(event).context("failed to serialize initial event")?;
+            let line = serde_json::to_string(event)?;
             buf.push_str(&line);
             buf.push('\n');
         }
 
         // Write the bundle to a tempfile in the session directory so the
-        // final rename/link is same-filesystem. `keep()` defuses the
+        // final rename/link is same-filesystem. The prefix
+        // `.koto-init-` is intentional: sweep tooling for crashed
+        // initialisations relies on this glob. `keep()` defuses the
         // auto-delete so we can drive the final rename ourselves.
         let tmp = tempfile::Builder::new()
             .prefix(".koto-init-")
             .suffix(".tmp")
             .tempfile_in(&session_dir)
-            .with_context(|| format!("failed to create tempfile in: {}", session_dir.display()))?;
+            .map_err(SessionError::Io)?;
         {
             let mut file = tmp.as_file();
-            file.write_all(buf.as_bytes())
-                .context("failed to write state file tempfile")?;
-            file.sync_data()
-                .context("failed to fsync state file tempfile")?;
+            file.write_all(buf.as_bytes()).map_err(SessionError::Io)?;
+            file.sync_data().map_err(SessionError::Io)?;
 
             #[cfg(unix)]
             {
@@ -204,25 +210,14 @@ impl SessionBackend for LocalBackend {
                 // Match append_header/append_event which create state
                 // files with mode 0600.
                 let perms = fs::Permissions::from_mode(0o600);
-                fs::set_permissions(tmp.path(), perms).with_context(|| {
-                    format!(
-                        "failed to set permissions on tempfile: {}",
-                        tmp.path().display()
-                    )
-                })?;
+                fs::set_permissions(tmp.path(), perms).map_err(SessionError::Io)?;
             }
         }
 
         // Detach the tempfile so it is NOT deleted on drop. We will
         // either move it into place (Linux renameat2 or non-Linux link)
         // or explicitly unlink it on failure.
-        let (_file, tmp_path) = tmp.keep().map_err(|e| {
-            anyhow::anyhow!(
-                "failed to persist tempfile for {}: {}",
-                target.display(),
-                e.error
-            )
-        })?;
+        let (_file, tmp_path) = tmp.keep().map_err(|e| SessionError::Io(e.error))?;
 
         match atomic_create_rename(&tmp_path, &target) {
             Ok(()) => Ok(()),
@@ -479,20 +474,26 @@ pub(crate) fn repo_id(working_dir: &Path) -> anyhow::Result<String> {
 /// back to plain `rename()` on `EXDEV`. On non-Unix platforms it falls
 /// back to a best-effort check-then-rename (not strictly atomic).
 ///
-/// When the destination already exists, returns an error whose source
-/// is `io::Error` with `ErrorKind::AlreadyExists`, so callers can
-/// distinguish collisions from other I/O failures via:
-///     err.downcast_ref::<std::io::Error>()
-///        .map(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
+/// When the destination already exists, returns `SessionError::Collision`
+/// so callers can distinguish races from other I/O failures without
+/// inspecting the underlying `io::Error`.
 #[cfg(target_os = "linux")]
-fn atomic_create_rename(src: &Path, dst: &Path) -> anyhow::Result<()> {
+fn atomic_create_rename(src: &Path, dst: &Path) -> Result<(), SessionError> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let src_c = CString::new(src.as_os_str().as_bytes())
-        .map_err(|e| anyhow::anyhow!("src path contains NUL: {}", e))?;
-    let dst_c = CString::new(dst.as_os_str().as_bytes())
-        .map_err(|e| anyhow::anyhow!("dst path contains NUL: {}", e))?;
+    let src_c = CString::new(src.as_os_str().as_bytes()).map_err(|e| {
+        SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("src path contains NUL: {}", e),
+        ))
+    })?;
+    let dst_c = CString::new(dst.as_os_str().as_bytes()).map_err(|e| {
+        SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("dst path contains NUL: {}", e),
+        ))
+    })?;
 
     // SAFETY: We pass valid C strings and AT_FDCWD semantics on both
     // ends. `syscall` returns -1 on error and sets errno.
@@ -510,12 +511,9 @@ fn atomic_create_rename(src: &Path, dst: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let err = std::io::Error::last_os_error();
-    Err(anyhow::Error::new(err).context(format!(
-        "renameat2(RENAME_NOREPLACE) failed: {} -> {}",
-        src.display(),
-        dst.display()
-    )))
+    // `From<io::Error> for SessionError` routes AlreadyExists to the
+    // Collision variant; every other errno becomes SessionError::Io.
+    Err(SessionError::from(std::io::Error::last_os_error()))
 }
 
 /// Non-Linux Unix fallback: POSIX `link()` + `unlink()`.
@@ -526,21 +524,14 @@ fn atomic_create_rename(src: &Path, dst: &Path) -> anyhow::Result<()> {
 /// because the tempfile is created in the session dir) we fall back to
 /// plain `rename()`, accepting a non-atomic window in that extreme case.
 #[cfg(all(unix, not(target_os = "linux")))]
-fn atomic_create_rename(src: &Path, dst: &Path) -> anyhow::Result<()> {
+fn atomic_create_rename(src: &Path, dst: &Path) -> Result<(), SessionError> {
     match fs::hard_link(src, dst) {
         Ok(()) => {
             // Link succeeded; drop the original name.
-            fs::remove_file(src).with_context(|| {
-                format!("failed to remove tempfile after link: {}", src.display())
-            })?;
+            fs::remove_file(src).map_err(SessionError::Io)?;
             Ok(())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow::Error::new(e)
-            .context(format!(
-                "link failed: {} -> {}: destination exists",
-                src.display(),
-                dst.display()
-            ))),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(SessionError::Collision),
         Err(e) => {
             // EXDEV (cross-device) is reported as Other/Uncategorized on
             // most Rust versions. Retry with plain rename, which
@@ -554,29 +545,11 @@ fn atomic_create_rename(src: &Path, dst: &Path) -> anyhow::Result<()> {
                 .unwrap_or(false);
             if is_exdev {
                 if dst.exists() {
-                    return Err(anyhow::Error::new(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        "destination exists",
-                    ))
-                    .context(format!(
-                        "rename fallback: {} -> {}: destination exists",
-                        src.display(),
-                        dst.display()
-                    )));
+                    return Err(SessionError::Collision);
                 }
-                fs::rename(src, dst).with_context(|| {
-                    format!(
-                        "rename (EXDEV fallback) failed: {} -> {}",
-                        src.display(),
-                        dst.display()
-                    )
-                })
+                fs::rename(src, dst).map_err(SessionError::Io)
             } else {
-                Err(anyhow::Error::new(e).context(format!(
-                    "link failed: {} -> {}",
-                    src.display(),
-                    dst.display()
-                )))
+                Err(SessionError::Io(e))
             }
         }
     }
@@ -585,20 +558,11 @@ fn atomic_create_rename(src: &Path, dst: &Path) -> anyhow::Result<()> {
 /// Non-Unix fallback (e.g., Windows test builds). Best-effort
 /// check-then-rename with a non-atomic window.
 #[cfg(not(unix))]
-fn atomic_create_rename(src: &Path, dst: &Path) -> anyhow::Result<()> {
+fn atomic_create_rename(src: &Path, dst: &Path) -> Result<(), SessionError> {
     if dst.exists() {
-        return Err(anyhow::Error::new(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "destination exists",
-        ))
-        .context(format!(
-            "check-then-rename: {} -> {}: destination exists",
-            src.display(),
-            dst.display()
-        )));
+        return Err(SessionError::Collision);
     }
-    fs::rename(src, dst)
-        .with_context(|| format!("rename failed: {} -> {}", src.display(), dst.display()))
+    fs::rename(src, dst).map_err(SessionError::Io)
 }
 
 /// Ensure the `.koto` ancestor directory exists with mode 0700.
@@ -1212,22 +1176,12 @@ mod tests {
         for h in handles {
             match h.join().unwrap() {
                 Ok(()) => wins += 1,
-                Err(e) => {
-                    let is_already_exists = e
-                        .downcast_ref::<std::io::Error>()
-                        .map(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
-                        .unwrap_or(false);
-                    assert!(
-                        is_already_exists,
-                        "unexpected error (want AlreadyExists): {:?}",
-                        e
-                    );
-                    already_exists += 1;
-                }
+                Err(SessionError::Collision) => already_exists += 1,
+                Err(e) => panic!("unexpected error (want Collision): {:?}", e),
             }
         }
         assert_eq!(wins, 1, "exactly one init must commit");
-        assert_eq!(already_exists, 7, "every loser must report AlreadyExists");
+        assert_eq!(already_exists, 7, "every loser must report Collision");
 
         // The committed content must be internally consistent (no torn
         // writes / interleaved payloads): the header's template_hash
@@ -1256,8 +1210,11 @@ mod tests {
         let err = backend
             .init_state_file("wf", h2, e2)
             .expect_err("second init must fail");
-        let io_kind = err.downcast_ref::<std::io::Error>().map(|io| io.kind());
-        assert_eq!(io_kind, Some(std::io::ErrorKind::AlreadyExists));
+        assert!(
+            matches!(err, SessionError::Collision),
+            "want SessionError::Collision, got: {:?}",
+            err
+        );
     }
 
     // -- scenario-2: crash between tempfile write and rename leaves no
@@ -1349,8 +1306,11 @@ mod tests {
         let err = backend
             .init_state_file("wf", h2, e2)
             .expect_err("second init must fail on link() path");
-        let io_kind = err.downcast_ref::<std::io::Error>().map(|io| io.kind());
-        assert_eq!(io_kind, Some(std::io::ErrorKind::AlreadyExists));
+        assert!(
+            matches!(err, SessionError::Collision),
+            "want SessionError::Collision on link() path, got: {:?}",
+            err
+        );
     }
 
     // -- manifest crash recovery: orphaned content without manifest entry --

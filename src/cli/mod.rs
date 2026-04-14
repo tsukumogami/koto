@@ -20,10 +20,10 @@ use crate::cache::{compile_cached, sha256_hex};
 use crate::discover::find_workflows_with_metadata;
 use crate::engine::errors::EngineError;
 use crate::engine::persistence::{derive_decisions, derive_machine_state, derive_state_from_log};
-use crate::engine::types::{now_iso8601, EventPayload, StateFileHeader};
+use crate::engine::types::{now_iso8601, Event, EventPayload, StateFileHeader};
 use crate::session::context::ContextStore;
 use crate::session::local::LocalBackend;
-use crate::session::{state_file_name, Backend, SessionBackend};
+use crate::session::{state_file_name, Backend, SessionBackend, SessionError};
 use crate::template::types::CompiledTemplate;
 
 /// Maximum payload size for --with-data (1 MB).
@@ -1055,18 +1055,13 @@ fn handle_init(
         }
     }
 
-    // Check if session already exists (state file present).
+    // Check if session already exists (state file present). This is a
+    // best-effort pre-check; the atomic `init_state_file` call below is
+    // the authoritative collision detector (it handles concurrent
+    // racers where two callers both see `exists() == false`).
     if backend.exists(name) {
         exit_with_error(serde_json::json!({
             "error": format!("workflow '{}' already exists", name),
-            "command": "init"
-        }));
-    }
-
-    // Create the session directory.
-    if let Err(e) = backend.create(name) {
-        exit_with_error(serde_json::json!({
-            "error": e.to_string(),
             "command": "init"
         }));
     }
@@ -1109,7 +1104,10 @@ fn handle_init(
     let initial_state = compiled.initial_state.clone();
     let ts = now_iso8601();
 
-    // Write header line
+    // Build the atomic bundle: one header + two initial events. The
+    // bundle shape matches what the old three-step sequence produced
+    // (append_header, then append_event for WorkflowInitialized with
+    // seq 1, then append_event for Transitioned with seq 2).
     let header = StateFileHeader {
         schema_version: 1,
         workflow: name.to_string(),
@@ -1117,36 +1115,49 @@ fn handle_init(
         created_at: ts.clone(),
         parent_workflow: parent.map(|s| s.to_string()),
     };
-    if let Err(e) = backend.append_header(name, &header) {
-        exit_with_error(serde_json::json!({
-            "error": e.to_string(),
-            "command": "init"
-        }));
-    }
 
-    // Write workflow_initialized event (seq 1)
     let init_payload = EventPayload::WorkflowInitialized {
         template_path: cache_path_str,
         variables,
     };
-    if let Err(e) = backend.append_event(name, &init_payload, &ts) {
-        exit_with_error(serde_json::json!({
-            "error": e.to_string(),
-            "command": "init"
-        }));
-    }
-
-    // Write initial transitioned event (seq 2, from: null)
     let transition_payload = EventPayload::Transitioned {
         from: None,
         to: initial_state.clone(),
         condition_type: "auto".to_string(),
     };
-    if let Err(e) = backend.append_event(name, &transition_payload, &ts) {
-        exit_with_error(serde_json::json!({
-            "error": e.to_string(),
-            "command": "init"
-        }));
+    let initial_events = vec![
+        Event {
+            seq: 1,
+            timestamp: ts.clone(),
+            event_type: init_payload.type_name().to_string(),
+            payload: init_payload,
+        },
+        Event {
+            seq: 2,
+            timestamp: ts.clone(),
+            event_type: transition_payload.type_name().to_string(),
+            payload: transition_payload,
+        },
+    ];
+
+    // One atomic create-or-fail rename commits the header and both
+    // events together. A collision (another writer won the race)
+    // surfaces the same "already exists" caller-facing error the
+    // pre-check above would have emitted.
+    match backend.init_state_file(name, header, initial_events) {
+        Ok(()) => {}
+        Err(SessionError::Collision) => {
+            exit_with_error(serde_json::json!({
+                "error": format!("workflow '{}' already exists", name),
+                "command": "init"
+            }));
+        }
+        Err(e) => {
+            exit_with_error(serde_json::json!({
+                "error": e.to_string(),
+                "command": "init"
+            }));
+        }
     }
 
     println!(

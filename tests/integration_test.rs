@@ -168,6 +168,49 @@ fn init_creates_state_file() {
 }
 
 #[test]
+fn init_succeeds_with_stale_tempfile_in_session_dir() {
+    // Crash recovery test: if a prior `koto init` crashed between
+    // writing the tempfile and renaming it into place, a stale
+    // `.koto-init-*.tmp` file will still be present in the session
+    // directory. A fresh `koto init` on the same workflow name must
+    // still succeed (proving `handle_init` now goes through the
+    // atomic `init_state_file` path, which tolerates leftover tmp
+    // files — the old three-call sequence had no such recovery
+    // guarantee).
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    // Plant a stale tempfile that mimics the crashed-init shape.
+    let session_dir = sessions_base(dir.path()).join("recover-wf");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join(".koto-init-stale.tmp"),
+        b"partial content from prior crash",
+    )
+    .unwrap();
+
+    // No state file yet, so `exists()` is false and init must run.
+    let state_path = session_state_path(dir.path(), "recover-wf");
+    assert!(
+        !state_path.exists(),
+        "state file must not exist before init"
+    );
+
+    let output = koto_cmd(dir.path())
+        .args(["init", "recover-wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "init must succeed with stale tempfile present: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(state_path.exists(), "state file must be written");
+}
+
+#[test]
 fn init_fails_if_file_exists() {
     let dir = TempDir::new().unwrap();
     let src = write_template_source(dir.path());

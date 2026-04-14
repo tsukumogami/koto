@@ -20,7 +20,7 @@ use crate::config::CloudConfig;
 use crate::session::context::ContextStore;
 use crate::session::local::{repo_id, LocalBackend};
 use crate::session::sync::{self, ManifestCache};
-use crate::session::{state_file_name, SessionBackend, SessionInfo};
+use crate::session::{state_file_name, SessionBackend, SessionError, SessionInfo};
 
 /// S3-backed session storage that delegates to `LocalBackend` for all
 /// filesystem operations and syncs state to an S3-compatible bucket.
@@ -489,10 +489,20 @@ impl SessionBackend for CloudBackend {
         id: &str,
         header: crate::engine::types::StateFileHeader,
         initial_events: Vec<crate::engine::types::Event>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), SessionError> {
         // Delegate the atomic bundle to LocalBackend. On success, do a
         // single S3 PUT that replaces the three pushes the old
         // header+event sequence required.
+        //
+        // NOTE for callers relying on "push parent before child
+        // mutation" ordering: `sync_push_state` runs AFTER the local
+        // atomic rename has committed. A network / S3 failure at that
+        // point leaves the local state file intact (the init has
+        // succeeded from the caller's perspective) but the remote is
+        // stale until the next successful push. Downstream logic that
+        // needs remote-visibility guarantees must reconcile locally-
+        // committed state with a best-effort remote sync; this method
+        // does not block on the upload.
         self.local.init_state_file(id, header, initial_events)?;
         self.sync_push_state(id);
         Ok(())
@@ -801,8 +811,11 @@ mod tests {
         let err = backend
             .init_state_file("wf", header, events)
             .expect_err("second init must fail");
-        let io_kind = err.downcast_ref::<std::io::Error>().map(|io| io.kind());
-        assert_eq!(io_kind, Some(std::io::ErrorKind::AlreadyExists));
+        assert!(
+            matches!(err, SessionError::Collision),
+            "want SessionError::Collision, got: {:?}",
+            err
+        );
     }
 
     // -- SessionBackend: list returns local sessions --

@@ -5,12 +5,98 @@ pub mod sync;
 pub mod validate;
 pub mod version;
 
+use std::fmt;
 use std::path::PathBuf;
 
 use self::context::ContextStore;
 use self::local::LocalBackend;
 
 use crate::engine::types::{Event, EventPayload, StateFileHeader};
+
+/// Typed error for session-scoped operations.
+///
+/// Introduced primarily so callers of `SessionBackend::init_state_file`
+/// can discriminate a collision (state file already present at the
+/// target path) from other I/O failures without relying on downcasting
+/// an `anyhow::Error`. The collision variant lets upstream batch-spawn
+/// logic map "someone else already initialised this workflow" to a
+/// specific outcome (e.g., respawn or skip) while treating other I/O
+/// failures as retryable infrastructure errors.
+#[derive(Debug)]
+pub enum SessionError {
+    /// A state file already exists at the target path. Emitted when the
+    /// atomic create-or-fail rename sees the destination occupied.
+    Collision,
+
+    /// An I/O error from the underlying storage backend that isn't a
+    /// collision. Preserves the original `io::Error` so callers can
+    /// inspect its `kind()` for retry decisions.
+    Io(std::io::Error),
+
+    /// A serialization failure (serde, JSON formatting, etc.). String
+    /// payload because `serde_json::Error` doesn't round-trip cleanly.
+    Serialization(String),
+
+    /// Fallback for failures that don't fit the variants above.
+    Other(anyhow::Error),
+}
+
+impl fmt::Display for SessionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SessionError::Collision => {
+                write!(f, "state file already exists at the target path")
+            }
+            SessionError::Io(e) => write!(f, "session I/O error: {}", e),
+            SessionError::Serialization(s) => write!(f, "session serialization error: {}", s),
+            SessionError::Other(e) => write!(f, "session error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SessionError::Io(e) => Some(e),
+            SessionError::Other(e) => Some(e.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for SessionError {
+    fn from(e: std::io::Error) -> Self {
+        // ErrorKind::AlreadyExists is the canonical signal for "the
+        // create-or-fail rename saw the destination occupied". Map it
+        // to the dedicated Collision variant so callers don't have to
+        // peek at `kind()` themselves.
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            SessionError::Collision
+        } else {
+            SessionError::Io(e)
+        }
+    }
+}
+
+impl From<serde_json::Error> for SessionError {
+    fn from(e: serde_json::Error) -> Self {
+        SessionError::Serialization(e.to_string())
+    }
+}
+
+impl From<anyhow::Error> for SessionError {
+    fn from(e: anyhow::Error) -> Self {
+        // If the underlying cause is an io::Error, preserve the typed
+        // variant so `?` through `anyhow` chains in implementation code
+        // still surfaces Collision correctly.
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            if io.kind() == std::io::ErrorKind::AlreadyExists {
+                return SessionError::Collision;
+            }
+        }
+        SessionError::Other(e)
+    }
+}
 
 /// Information about an existing session.
 #[derive(serde::Serialize)]
@@ -70,12 +156,19 @@ pub trait SessionBackend: Send + Sync {
     /// Bundles the header line and all initial events into a single
     /// tempfile-then-rename operation. The rename is "fail if exists" so
     /// two racing callers on the same path cannot silently overwrite each
-    /// other: exactly one wins and the other receives an error whose
-    /// underlying `io::Error` has `ErrorKind::AlreadyExists`.
+    /// other: exactly one wins and the other receives
+    /// `SessionError::Collision`. Other I/O failures surface as
+    /// `SessionError::Io` so callers can distinguish a racing spawn from
+    /// a disk-full / permission / storage-layer error.
     ///
     /// A crash between the tempfile write and the rename leaves no
     /// partially-written state file at the target path. The tempfile
     /// itself may remain and is garbage-collected by a separate sweep.
+    ///
+    /// Implementations store the tempfile in the same directory as the
+    /// target with the prefix `.koto-init-` and the suffix `.tmp` (for
+    /// example `.koto-init-aBcDeF.tmp`). Sweep tooling that cleans up
+    /// crashed initialisations relies on this convention.
     ///
     /// On Linux this uses `renameat2(RENAME_NOREPLACE)` for a single-
     /// syscall fail-if-exists check. On other Unixes it uses POSIX
@@ -85,7 +178,7 @@ pub trait SessionBackend: Send + Sync {
         id: &str,
         header: StateFileHeader,
         initial_events: Vec<Event>,
-    ) -> anyhow::Result<()>;
+    ) -> Result<(), SessionError>;
 
     /// Read all events from the state file.
     fn read_events(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)>;
@@ -179,7 +272,7 @@ impl SessionBackend for Backend {
         id: &str,
         header: StateFileHeader,
         initial_events: Vec<Event>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), SessionError> {
         match self {
             Backend::Local(b) => b.init_state_file(id, header, initial_events),
             Backend::Cloud(b) => b.init_state_file(id, header, initial_events),
