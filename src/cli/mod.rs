@@ -1,3 +1,4 @@
+pub mod batch_error;
 pub mod context;
 pub mod next;
 pub mod next_types;
@@ -23,7 +24,7 @@ use crate::engine::persistence::{derive_decisions, derive_machine_state, derive_
 use crate::engine::types::{now_iso8601, Event, EventPayload, StateFileHeader};
 use crate::session::context::ContextStore;
 use crate::session::local::LocalBackend;
-use crate::session::{state_file_name, Backend, SessionBackend, SessionError};
+use crate::session::{Backend, SessionBackend, SessionError};
 use crate::template::types::CompiledTemplate;
 
 /// Maximum payload size for --with-data (1 MB).
@@ -1247,6 +1248,59 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Decide whether a workflow state's entry into `handle_next` must be
+/// serialized behind an advisory flock on the parent state file.
+///
+/// The "batch-scoped parent" concept lives in the batch-child-spawning
+/// design (Decision 12): when a parent state materializes children, two
+/// concurrent `koto next` ticks on the same parent can race the
+/// scheduler's read-decide-write cycle and spawn duplicate children or
+/// double-count completions. Such states must serialize ticks; all
+/// other states are free to skip the lock so the happy path is
+/// unchanged.
+///
+/// # Current detection rules
+///
+/// The authoritative signals planned by the design are:
+///
+/// 1. A `materialize_children` hook on the current state's template
+///    (introduced by Issue #7).
+/// 2. A `SchedulerRan` or `BatchFinalized` event in the state log
+///    (introduced by Issues #16 / #17).
+///
+/// Neither signal exists in the codebase yet. This helper therefore
+/// currently returns `false` in every case, which keeps the lock path
+/// cold until the hook machinery lands. Issues #7 / #16 / #17 will
+/// extend this function to inspect the relevant fields; call sites in
+/// `handle_next` do not need to change when that happens.
+///
+/// # Parameters
+///
+/// - `_compiled`: the compiled template for the workflow. When hook
+///   metadata lands, implementations will read
+///   `_compiled.states[state_name]` to check for the hook.
+/// - `_state_name`: the current state name; used as the lookup key in
+///   the compiled template.
+/// - `_events`: the full event log for the workflow. When batch event
+///   types land, implementations will scan this for
+///   `SchedulerRan` / `BatchFinalized` entries.
+///
+/// All parameters are prefixed with `_` today because none of them are
+/// inspected yet; they are threaded through now so the helper's
+/// signature does not change when the real detection logic lands.
+// TODO(#7): inspect template hook metadata once materialize_children
+// hooks parse onto CompiledTemplate::states.
+// TODO(#16, #17): scan `_events` for SchedulerRan / BatchFinalized
+// once those event payloads exist.
+#[cfg(unix)]
+fn state_is_batch_scoped(
+    _compiled: &CompiledTemplate,
+    _state_name: &str,
+    _events: &[Event],
+) -> bool {
+    false
+}
+
 /// Handle the `koto next` command with full output contract support.
 ///
 /// Flow:
@@ -1257,7 +1311,8 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
 ///    state, dispatch on new state (single-shot, no advancement loop)
 /// 5. If --with-data: validate evidence against accepts schema, append
 ///    evidence_submitted event
-/// 6. Acquire advisory flock on state file (non-blocking)
+/// 6. If the current state is a batch-scoped parent, acquire an advisory
+///    flock on the state file (non-blocking). Non-batch states skip this.
 /// 7. Register SIGTERM/SIGINT signal handlers
 /// 8. Merge evidence from current epoch
 /// 9. Run advancement loop (advance_until_stop)
@@ -1266,6 +1321,9 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
 /// NOTE: This handler uses structured `NextError` for domain errors (per the
 /// output contract). Other commands (init, rewind, etc.) use a flat
 /// `{"error": "string", "command": "..."}` format. Do not mix the two styles.
+/// The batch-scoped lock path produces a third envelope shape --
+/// `BatchError::ConcurrentTick` (see `cli::batch_error`) -- which Issue #10
+/// will extend with additional variants.
 #[cfg(unix)]
 fn handle_next(
     backend: &dyn SessionBackend,
@@ -1657,35 +1715,50 @@ fn handle_next(
         }
     }
 
-    // 6. Acquire advisory flock on state file (non-blocking).
-    // Prevents concurrent koto next calls from interleaving writes.
-    let state_path = backend.session_dir(&name).join(state_file_name(&name));
-    let lock_file = match std::fs::File::open(&state_path) {
-        Ok(f) => f,
-        Err(e) => {
-            let ne = NextError {
-                code: NextErrorCode::PersistenceError,
-                message: format!("failed to open state file for locking: {}", e),
-                details: vec![],
-            };
-            let json = serde_json::json!({"error": ne});
-            exit_with_error_code(json, ne.code.exit_code());
-        }
-    };
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = lock_file.as_raw_fd();
-        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if ret != 0 {
-            let err = NextError {
-                code: NextErrorCode::ConcurrentAccess,
-                message: "another koto next is already running for this workflow".to_string(),
-                details: vec![],
-            };
-            let json = serde_json::json!({"error": err});
-            exit_with_error_code(json, err.code.exit_code());
-        }
-    }
+    // 6. For batch-scoped parents only: acquire an advisory flock on
+    // the state file (non-blocking) and hold it for the rest of the
+    // tick. The RAII guard released on drop keeps lock lifetime tied
+    // to this function's scope.
+    //
+    // Non-batch workflows intentionally skip the lock. The parent-
+    // lock requirement comes from the batch-child-spawning design
+    // (Decision 12) where concurrent ticks on a parent state can
+    // race the scheduler's read-decide-write cycle. Ordinary
+    // workflows never run a scheduler, so no ordering is needed and
+    // two concurrent ticks would at worst append-compete at the
+    // state file level -- which the engine's existing single-writer
+    // semantics handle.
+    //
+    // On lock contention we translate `SessionError::Locked` into
+    // `BatchError::ConcurrentTick` rather than reusing
+    // `NextErrorCode::ConcurrentAccess`. The batch envelope lives
+    // alongside the existing `NextError` envelope on purpose: Issue
+    // #10 will extend `BatchError` with additional batch-specific
+    // variants, and agents need to discriminate batch errors from
+    // per-state ones. `_batch_lock` is kept alive across the advance
+    // loop; its field is intentionally unused.
+    let _batch_lock: Option<crate::session::SessionLock> =
+        if state_is_batch_scoped(&compiled, current_state, &events) {
+            match backend.lock_state_file(&name) {
+                Ok(guard) => Some(guard),
+                Err(SessionError::Locked { holder_pid }) => {
+                    let err = crate::cli::batch_error::BatchError::ConcurrentTick { holder_pid };
+                    let code = err.exit_code();
+                    exit_with_error_code(err.to_envelope(), code);
+                }
+                Err(e) => {
+                    let ne = NextError {
+                        code: NextErrorCode::PersistenceError,
+                        message: format!("failed to acquire state file lock: {}", e),
+                        details: vec![],
+                    };
+                    let json = serde_json::json!({"error": ne});
+                    exit_with_error_code(json, ne.code.exit_code());
+                }
+            }
+        } else {
+            None
+        };
 
     // 7. Register signal handlers for clean shutdown.
     let shutdown = Arc::new(AtomicBool::new(false));

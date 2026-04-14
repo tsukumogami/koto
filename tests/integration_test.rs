@@ -1594,54 +1594,61 @@ fn evidence_triggers_auto_advance_chain() {
 }
 
 // ---------------------------------------------------------------------------
-// scenario-37: Concurrent koto next fails with flock contention
+// scenario-37: Non-batch koto next ignores external flocks
 // ---------------------------------------------------------------------------
+//
+// Early revisions of the batch-child-spawning work unconditionally
+// acquired a parent flock inside `handle_next`. That behavior was
+// narrowed (Issue #2) to apply only to batch-scoped parents so the
+// happy path for ordinary workflows stays lock-free.
+//
+// This test pins that narrowed contract: an external flock on a
+// non-batch workflow's state file must not block `koto next`. The
+// batch-scoped lock path is covered by `tests/batch_lock_test.rs`.
 
 #[cfg(unix)]
 #[test]
-fn concurrent_next_fails_with_lock_contention() {
+fn concurrent_next_on_non_batch_workflow_ignores_external_flock() {
     use std::os::unix::io::AsRawFd;
 
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "lock-wf", &template_with_accepts());
 
-    // The state file is named koto-<name>.state.jsonl.
     let state_path = session_state_path(dir.path(), "lock-wf");
     assert!(state_path.exists(), "state file should exist after init");
 
-    // Hold an exclusive flock on the state file, simulating a concurrent koto next.
+    // Hold an exclusive flock on the state file from the test harness.
+    // For a non-batch workflow this must NOT block `koto next`.
     let lock_file = std::fs::File::open(&state_path).unwrap();
     let fd = lock_file.as_raw_fd();
     let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     assert_eq!(ret, 0, "test should acquire flock successfully");
 
-    // Now run koto next -- it should fail because it can't acquire the lock.
     let output = koto_cmd(dir.path())
         .args(["next", "lock-wf"])
         .output()
         .unwrap();
 
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "concurrent next should fail with exit 1, stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
+    // The command should not fail with ConcurrentAccess or BatchError.
+    // Non-batch workflows skip the lock entirely, so the external flock
+    // is irrelevant. The command either succeeds or stops for an
+    // unrelated reason (evidence_required on template_with_accepts),
+    // but never with a concurrent-access envelope.
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
-    assert_eq!(
-        json["error"]["code"].as_str(),
-        Some("concurrent_access"),
-        "error code should be concurrent_access"
-    );
+
+    if let Some(code) = json["error"]["code"].as_str() {
+        assert_ne!(
+            code, "concurrent_access",
+            "non-batch workflow must not surface concurrent_access; stdout={}",
+            stdout
+        );
+    }
     assert!(
-        json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("already running"),
-        "error message should mention already running"
+        json.get("batch").is_none(),
+        "non-batch workflow must not surface a batch envelope; stdout={}",
+        stdout
     );
 
     // Release the lock explicitly.
