@@ -2433,9 +2433,18 @@ fn handle_next(
             // log on every non-trivial tick so `koto query --events`
             // shows per-tick audit alongside `EvidenceSubmitted` /
             // `Transitioned`. No-op ticks (nothing spawned, nothing
-            // errored, nothing newly skipped, classification
-            // unchanged) deliberately skip the append to prevent log
-            // bloat.
+            // errored, classification unchanged) deliberately skip
+            // the append to prevent log bloat.
+            //
+            // The predicate must look ONLY at tick-scoped signals:
+            // `spawned_this_tick` (includes skip-marker spawns — see
+            // `spawn_skip_marker_task`), `errored` (tick-local spawn
+            // errors), and `reclassified_this_tick`. The persistent
+            // "skipped" count in `materialized_children` is NOT a
+            // tick-scoped signal — skip markers persist across ticks,
+            // so using their count would bloat the log with a
+            // `SchedulerRan` event on every subsequent no-op tick
+            // after any skip materialized.
             if let Some(crate::cli::batch::SchedulerOutcome::Scheduled {
                 spawned_this_tick,
                 errored,
@@ -2444,15 +2453,13 @@ fn handle_next(
                 ..
             }) = &scheduler_outcome
             {
-                let skipped_count = materialized_children
-                    .iter()
-                    .filter(|mc| matches!(mc.outcome, crate::cli::batch::TaskOutcome::Skipped))
-                    .count();
-                let is_non_trivial = !spawned_this_tick.is_empty()
-                    || !errored.is_empty()
-                    || *reclassified_this_tick
-                    || skipped_count > 0;
+                let is_non_trivial =
+                    !spawned_this_tick.is_empty() || !errored.is_empty() || *reclassified_this_tick;
                 if is_non_trivial {
+                    let skipped_count = materialized_children
+                        .iter()
+                        .filter(|mc| matches!(mc.outcome, crate::cli::batch::TaskOutcome::Skipped))
+                        .count();
                     let ts = crate::engine::types::now_iso8601();
                     let payload = crate::engine::types::EventPayload::SchedulerRan {
                         state: final_state.to_string(),

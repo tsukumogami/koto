@@ -1214,3 +1214,293 @@ fn scheduler_ran_event_appends_on_non_trivial_tick_and_skips_noop() {
     assert_eq!(ev["payload"]["tick_summary"]["spawned_count"], 1);
     assert_eq!(ev["payload"]["tick_summary"]["errored_count"], 0);
 }
+
+/// Spawning tick — SchedulerOutcome surface must carry a populated
+/// `spawned_this_tick` and a ledger entry for every submitted task.
+/// Guards the baseline "tick 1 response shape" that downstream callers
+/// depend on; a regression here would break the tick_summary shape in
+/// the SchedulerRan event.
+#[test]
+fn scheduler_outcome_populated_on_spawning_tick() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_templates(tmp.path());
+
+    let (ok, _, _) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "parent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok);
+
+    let payload = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+            {"name": "B", "waits_on": ["A"], "vars": {}},
+        ]
+    });
+    let (_, json, _) = run_koto(
+        tmp.path(),
+        &["next", "parent", "--with-data", &payload.to_string()],
+    );
+    let sched = json.get("scheduler").expect("scheduler key present");
+
+    let spawned: Vec<String> = sched["spawned_this_tick"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(spawned, vec!["parent.A".to_string()]);
+
+    let errored = sched["errored"].as_array().expect("errored array present");
+    assert!(errored.is_empty(), "no spawn errors on clean tick");
+    assert_eq!(
+        sched["reclassified_this_tick"].as_bool(),
+        Some(true),
+        "spawning a fresh child flips reclassified_this_tick true"
+    );
+    let ledger = sched
+        .get("materialized_children")
+        .and_then(|v| v.as_array())
+        .expect("materialized_children present");
+    assert_eq!(
+        ledger.len(),
+        2,
+        "ledger covers every submitted task (both A and B)"
+    );
+
+    // The parent log must carry a single SchedulerRan event for this
+    // tick, and its tick_summary fields must reflect the spawn.
+    let state_path = parent_state_path(tmp.path(), "parent");
+    let log = std::fs::read_to_string(&state_path).unwrap();
+    let sr_lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("\"type\":\"scheduler_ran\""))
+        .collect();
+    assert_eq!(sr_lines.len(), 1, "exactly one SchedulerRan after one tick");
+    let ev: serde_json::Value = serde_json::from_str(sr_lines[0]).expect("parse event");
+    assert_eq!(ev["payload"]["tick_summary"]["spawned_count"], 1);
+    assert_eq!(ev["payload"]["tick_summary"]["errored_count"], 0);
+    assert_eq!(ev["payload"]["tick_summary"]["reclassified"], true);
+}
+
+/// Regression test for Issue #16 B1: after a skip marker materializes
+/// (persistent state on disk), a subsequent pure no-op tick MUST NOT
+/// append another SchedulerRan event. The PLAN AC "pure no-op ticks
+/// leave the log unchanged" must hold even when the ledger reports
+/// `skipped_count > 0`, because skip markers are persistent — their
+/// mere presence is not a tick-scoped signal.
+#[test]
+fn scheduler_ran_not_appended_on_noop_after_skip_materialized() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_skip_aware_templates(tmp.path());
+
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "parent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "parent init failed: {}", stderr);
+
+    // Submit {A, D (waits_on A)}. A spawns.
+    let payload = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+            {"name": "D", "waits_on": ["A"], "vars": {}},
+        ]
+    });
+    let (_, _, _) = run_koto(
+        tmp.path(),
+        &["next", "parent", "--with-data", &payload.to_string()],
+    );
+
+    // Drive A to failure. Next parent tick materializes D as a skip
+    // marker (spawn event is non-trivial, so SchedulerRan appends
+    // here — that is expected).
+    drive_skip_child_to_fail(tmp.path(), "parent.A");
+    let (_, _, _) = run_koto(tmp.path(), &["next", "parent"]);
+
+    let state_path = parent_state_path(tmp.path(), "parent");
+    let after_skip = std::fs::read_to_string(&state_path).unwrap();
+    let count_after_skip = after_skip
+        .lines()
+        .filter(|l| l.contains("\"type\":\"scheduler_ran\""))
+        .count();
+    // Sanity: at least one SchedulerRan has been written by now. The
+    // exact count depends on whether tick 1 (spawn A) and tick 2
+    // (spawn skip marker for D) each appended one; both are
+    // non-trivial.
+    assert!(
+        count_after_skip >= 1,
+        "SchedulerRan must have appended for spawn/skip-materialize ticks. log:\n{}",
+        after_skip
+    );
+
+    // Now the batch is fully-materialized: A terminal-failure on
+    // disk, D terminal-skipped on disk. A bare `koto next` must run
+    // the scheduler and produce a Scheduled outcome where the ledger
+    // still reports `skipped_count > 0` (D), but `spawned_this_tick`,
+    // `errored`, and `reclassified_this_tick` are all empty/false.
+    // Under the fixed predicate this is a no-op; SchedulerRan must
+    // NOT be appended.
+    let (_, json, _) = run_koto(tmp.path(), &["next", "parent"]);
+    let sched = json.get("scheduler").expect("scheduler key present");
+    let spawned: Vec<String> = sched["spawned_this_tick"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        spawned.is_empty(),
+        "fully-materialized batch re-tick must not spawn anything. got: {:?}",
+        spawned
+    );
+    assert_eq!(
+        sched["reclassified_this_tick"].as_bool(),
+        Some(false),
+        "no reclassification on a pure no-op tick"
+    );
+    let errored = sched["errored"].as_array().expect("errored array present");
+    assert!(errored.is_empty(), "no spawn errors on pure no-op tick");
+
+    // Ledger should still contain a skip entry for D.
+    let ledger = sched
+        .get("materialized_children")
+        .and_then(|v| v.as_array())
+        .expect("materialized_children present");
+    let skipped_in_ledger = ledger
+        .iter()
+        .filter(|mc| mc["outcome"].as_str() == Some("skipped"))
+        .count();
+    assert!(
+        skipped_in_ledger >= 1,
+        "D's skip marker persists in ledger. ledger: {:?}",
+        ledger
+    );
+
+    // The critical assertion: the predicate must not count the
+    // persistent skip marker as "something the tick did". Log must be
+    // unchanged.
+    let after_noop = std::fs::read_to_string(&state_path).unwrap();
+    let count_after_noop = after_noop
+        .lines()
+        .filter(|l| l.contains("\"type\":\"scheduler_ran\""))
+        .count();
+    assert_eq!(
+        count_after_noop, count_after_skip,
+        "SchedulerRan must NOT append on a no-op tick AFTER skips have been \
+         materialized. Before: {} events; after: {} events. log:\n{}",
+        count_after_skip, count_after_noop, after_noop
+    );
+}
+
+/// A tick that reclassifies (and respawns) a child must append
+/// SchedulerRan. Guards the non-trivial side of the predicate: even
+/// without any brand-new evidence, a reclassification respawn is a
+/// real scheduler-driven change and must be recorded in the audit
+/// log.
+#[test]
+fn scheduler_ran_appended_on_reclassification_tick() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_skip_aware_templates(tmp.path());
+
+    let (ok, _, _) = run_koto(
+        tmp.path(),
+        &[
+            "init",
+            "parent",
+            "--template",
+            parent_path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok);
+
+    // Submit {A, D (waits_on A)}. A spawns.
+    let payload = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+            {"name": "D", "waits_on": ["A"], "vars": {}},
+        ]
+    });
+    let (_, _, _) = run_koto(
+        tmp.path(),
+        &["next", "parent", "--with-data", &payload.to_string()],
+    );
+
+    // Drive A → failed; tick parent so D materializes as a skip
+    // marker.
+    drive_skip_child_to_fail(tmp.path(), "parent.A");
+    let (_, _, _) = run_koto(tmp.path(), &["next", "parent"]);
+
+    let state_path = parent_state_path(tmp.path(), "parent");
+    let before_reclass = std::fs::read_to_string(&state_path).unwrap();
+    let count_before = before_reclass
+        .lines()
+        .filter(|l| l.contains("\"type\":\"scheduler_ran\""))
+        .count();
+
+    // Simulate retry: remove A's directory so the next tick respawns
+    // A and flips `reclassified_this_tick` to true.
+    let a_dir = sessions_base(tmp.path()).join("parent.A");
+    std::fs::remove_dir_all(&a_dir).unwrap();
+
+    let (_, json, _) = run_koto(tmp.path(), &["next", "parent"]);
+    let sched = json.get("scheduler").expect("scheduler key present");
+    assert_eq!(
+        sched["reclassified_this_tick"].as_bool(),
+        Some(true),
+        "A respawn flips reclassified_this_tick=true"
+    );
+    let spawned: Vec<String> = sched["spawned_this_tick"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        spawned.contains(&"parent.A".to_string()),
+        "A must respawn. got: {:?}",
+        spawned
+    );
+
+    // SchedulerRan must have appended for this reclassification tick.
+    let after_reclass = std::fs::read_to_string(&state_path).unwrap();
+    let count_after = after_reclass
+        .lines()
+        .filter(|l| l.contains("\"type\":\"scheduler_ran\""))
+        .count();
+    assert_eq!(
+        count_after,
+        count_before + 1,
+        "SchedulerRan must append on a reclassification tick. \
+         before: {}, after: {}. log:\n{}",
+        count_before,
+        count_after,
+        after_reclass
+    );
+
+    // The tick_summary on the newly appended event must reflect the
+    // reclassification flag.
+    let sr_lines: Vec<&str> = after_reclass
+        .lines()
+        .filter(|l| l.contains("\"type\":\"scheduler_ran\""))
+        .collect();
+    let last_sr = sr_lines.last().expect("at least one SchedulerRan");
+    let ev: serde_json::Value = serde_json::from_str(last_sr).expect("parse event");
+    assert_eq!(ev["payload"]["tick_summary"]["reclassified"], true);
+}
