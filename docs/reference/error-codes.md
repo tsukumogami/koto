@@ -138,3 +138,39 @@ Reinitialize the workflow to pick up the new template.
 ```json
 {"error":"invalid JSON: missing field `format_version`","command":"template validate"}
 ```
+
+---
+
+## Batch errors
+
+Batch-scoped ticks (parents with `materialize_children`, or `retry_failed` submissions) emit a dedicated envelope with `action: "error"` and a typed `error.batch` field carrying a `BatchError` variant. Each variant uses a snake_case `kind` discriminator so agents can dispatch without string-matching on `message`.
+
+| `batch.kind` | Exit | Meaning |
+|---|:---:|---|
+| `concurrent_tick` | 1 | Another `koto next` invocation holds the advisory flock on this batch parent. Retryable after backoff. Carries `holder_pid` (may be `null`). |
+| `invalid_batch_definition` | 2 | A pre-append structural rule rejected the submission. Carries a nested `InvalidBatchReason` (`empty_task_list`, `cycle`, `dangling_refs`, `duplicate_names`, `spawned_task_mutated`, `invalid_name`, `reserved_name_collision`). |
+| `limit_exceeded` | 2 | A pre-append hard limit (R6) was violated. Carries `which` (`tasks`, `waits_on`, `depth`, `payload_bytes`), `limit`, `actual`, and optional `task`. |
+| `template_not_found` | 2 | A task's child template path did not resolve against any configured search base. Carries `task`, `path`, `paths_tried`. |
+| `template_compile_failed` | 2 | A task's child template was found but failed to compile. Carries `task`, `path`, typed `compile_error`. |
+| `backend_error` | 1 or 3 | Backend list/read failed during classification. Exit code 1 when `retryable: true`, else 3. Tick-wide. |
+| `spawn_failed` | 3 | Per-task spawn failure after validation passed (`init_state_file` I/O, collision, compile). Carries `task`, `spawn_kind`, `message`. |
+| `invalid_retry_request` | 2 | A `retry_failed` submission failed validation. Carries a nested `InvalidRetryReason` with pinned precedence: `unknown_children` → `child_is_batch_parent` → `child_not_eligible` → `mixed_with_other_evidence` → `retry_already_in_progress`. |
+
+Example envelope:
+
+```json
+{
+  "action": "error",
+  "error": {
+    "code": "invalid_submission",
+    "batch": {
+      "kind": "limit_exceeded",
+      "which": "tasks",
+      "limit": 1000,
+      "actual": 1500
+    }
+  }
+}
+```
+
+All batch validation runs pre-append — rejected submissions leave no events on the parent's state file.

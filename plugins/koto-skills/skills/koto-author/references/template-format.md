@@ -627,8 +627,51 @@ Koto performs `{{VARIABLE}}` substitution in `command` gate strings before passi
 
 Prefer `context-exists` gates over `command` gates when checking paths or files that come from variable interpolation. The `context-exists` and `context-matches` gate types don't invoke a shell and aren't vulnerable to injection.
 
+## Batch template primitives
+
+The batch child-spawning release added a small set of template primitives. The summary here is deliberately thin — see [batch-authoring.md](batch-authoring.md) for the authoring walkthrough, compile rules, and worked examples.
+
+### New accepts field type and state fields
+
+| Primitive | Where | Purpose |
+|---|---|---|
+| `type: tasks` on an accepts field | state's `accepts` block | Structured task-list field consumed by `materialize_children`. The compiler auto-generates `item_schema` on the response so agents don't hand-write the entry shape. |
+| `materialize_children` | `TemplateState` | Binds a `tasks` accepts field to a child template and declares the batch `failure_policy` (`skip_dependents` default, or `continue`). |
+| `failure: true` | terminal `TemplateState` | Marks a terminal state as a failure outcome. `children-complete` counts these in `failed` and flips `any_failed` / `needs_attention`. |
+| `skipped_marker: true` | terminal `TemplateState` | The target the scheduler writes directly when `failure_policy: skip_dependents` materializes a skip for a dependent. `children-complete` counts these in `skipped`. |
+
+### The `present` matcher in `when` clauses
+
+A `when` clause value of the string `"present"` fires when the named field exists in the evidence map, regardless of value. It's only valid under the `evidence.<field>` namespace:
+
+```yaml
+transitions:
+  - target: handle_retry
+    when:
+      evidence.retry_failed: present
+```
+
+The compiler emits **W6** (non-fatal) when `"present"` appears against any other path (a flat agent-evidence key, a `gates.*` path, `context.*`, etc.) — it almost always means the author meant presence matching but used the wrong prefix.
+
+### `deny_unknown_fields` narrowed to source templates
+
+`#[serde(deny_unknown_fields)]` applies only to `SourceState` (the YAML-frontmatter surface). Compiled template JSON files no longer reject unknown fields, so adding a new compiled-template field in a release doesn't brick state files created by earlier versions. Template authors still get strict rejection at compile time.
+
+### Compile and runtime rule vocabulary
+
+Batch authoring introduces error (E), warning (W), and runtime (R) rule IDs used in compiler and `koto next` error messages.
+
+| Prefix | Range | Scope | Details |
+|---|---|---|---|
+| E | E1-E10 | Compile-time errors on `materialize_children` | See [batch-authoring.md](batch-authoring.md) for the full table |
+| W | W1-W5 | Compile-time warnings on `materialize_children` / `failure` / `skipped_marker` | See [batch-authoring.md](batch-authoring.md) |
+| W | W6 | Compile-time warning on `present` matcher misuse | Fires when `"present"` appears outside `evidence.<field>` paths |
+| F | F5 | Compile-time warning on child template reachability | Child template has no reachable `skipped_marker: true` terminal. See [batch-authoring.md](batch-authoring.md) |
+| R | R0-R9 | Pre-append runtime rules on a submitted task list | Validated in `koto next`. See [batch-workflows.md](../../koto-user/references/batch-workflows.md) |
+
 ## References
 
 - **Evidence routing example**: [evidence-routing-workflow.md](examples/evidence-routing-workflow.md) -- branching with accepts/when
 - **Advanced example**: [complex-workflow.md](examples/complex-workflow.md) -- gates, self-loops, split topology
+- **Batch authoring**: [batch-authoring.md](batch-authoring.md) -- `materialize_children`, E/W/F/R rules, worked examples
 - **SKILL.md conventions**: [Custom skill authoring guide](../../../../../docs/guides/custom-skill-authoring.md)
