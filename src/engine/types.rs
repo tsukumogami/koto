@@ -244,6 +244,57 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         superseded_by: Option<SupersededByRef>,
     },
+    /// Emitted on the PARENT'S log when a child workflow reaches a
+    /// terminal state and is about to be auto-cleaned.
+    ///
+    /// Issue #134: the `children-complete` gate enumerates children
+    /// via `backend.list()`, but auto-cleanup on the child's own
+    /// terminal tick removes the child's session directory before the
+    /// next `koto next <parent>` call can observe it. Without this
+    /// event, the gate evaluator reclassifies a cleaned-up child as
+    /// "pending" (no state file on disk, no classification entry) and
+    /// the batch never satisfies `all_complete`.
+    ///
+    /// The event is appended to the parent's log (NOT the child's)
+    /// just before `backend.cleanup(child)` runs, so the parent can
+    /// synthesize a `ChildSnapshot` for any task whose on-disk state
+    /// file has disappeared. On-disk snapshots always win over event
+    /// replay (they are fresher — e.g., after a retry respawn), so
+    /// the event is purely a fallback for the cleaned-up case.
+    ChildCompleted {
+        /// Full composed session id (e.g. `"parent.task-1"`).
+        child_name: String,
+        /// Short task name — the piece after the `<parent>.` prefix.
+        /// For non-composed children (legacy `koto init --parent`
+        /// without a batch hook) this equals `child_name`.
+        task_name: String,
+        /// Terminal outcome classification as a typed enum —
+        /// serialized as snake_case (`"success"`, `"failure"`,
+        /// `"skipped"`) to keep the wire format stable. Typed at
+        /// the Rust level so the gate evaluator's match is
+        /// exhaustive; silent typo fallbacks were a correctness
+        /// risk with a stringly-typed variant.
+        outcome: TerminalOutcome,
+        /// The child's final state name. Used by the gate's
+        /// `failure_mode` projection when `outcome == Failure`.
+        final_state: String,
+    },
+}
+
+/// Terminal outcome classification for a child workflow session, as
+/// carried on [`EventPayload::ChildCompleted`].
+///
+/// Serialized as snake_case (`"success"`, `"failure"`, `"skipped"`)
+/// to keep the JSONL wire format stable and match the string form
+/// the batch scheduler's classifier emits. Typed (not stringly) so
+/// every match on it is exhaustive — a missing arm is a compile
+/// error, not a silent miscategorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalOutcome {
+    Success,
+    Failure,
+    Skipped,
 }
 
 /// Reference to the event that superseded a stale `BatchFinalized`.
@@ -303,6 +354,7 @@ impl EventPayload {
             EventPayload::GateOverrideRecorded { .. } => "gate_override_recorded",
             EventPayload::SchedulerRan { .. } => "scheduler_ran",
             EventPayload::BatchFinalized { .. } => "batch_finalized",
+            EventPayload::ChildCompleted { .. } => "child_completed",
         }
     }
 }
@@ -493,6 +545,16 @@ impl<'de> Deserialize<'de> for Event {
                     superseded_by: p.superseded_by,
                 }
             }
+            "child_completed" => {
+                let p: ChildCompletedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::ChildCompleted {
+                    child_name: p.child_name,
+                    task_name: p.task_name,
+                    outcome: p.outcome,
+                    final_state: p.final_state,
+                }
+            }
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown event type: {}",
@@ -608,6 +670,14 @@ struct BatchFinalizedPayload {
     timestamp: String,
     #[serde(default)]
     superseded_by: Option<SupersededByRef>,
+}
+
+#[derive(Deserialize)]
+struct ChildCompletedPayload {
+    child_name: String,
+    task_name: String,
+    outcome: TerminalOutcome,
+    final_state: String,
 }
 
 /// Metadata about a workflow, derived from the state file header.

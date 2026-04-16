@@ -49,7 +49,7 @@ use crate::cli::task_spawn_error::TaskSpawnError;
 use crate::engine::batch_validation::TaskEntry;
 use crate::engine::persistence::derive_state_from_log;
 use crate::engine::scheduler_warning::SchedulerWarning;
-use crate::engine::types::{Event, EventPayload, SpawnEntrySnapshot};
+use crate::engine::types::{Event, EventPayload, SpawnEntrySnapshot, TerminalOutcome};
 use crate::session::SessionBackend;
 use crate::template::types::{CompiledTemplate, FailurePolicy, MaterializeChildrenSpec};
 
@@ -846,6 +846,14 @@ pub(crate) fn run_batch_scheduler(
         Err(reason) => return Ok(SchedulerOutcome::Error { reason }),
     };
 
+    // Issue #134: augment on-disk snapshots with synthetic entries for
+    // children that reached terminal and auto-cleaned. The parent's log
+    // carries a `ChildCompleted` event for each such child, and the
+    // scheduler must observe the terminal outcome so it does NOT respawn
+    // the cleaned-up child on the next tick. On-disk snapshots always
+    // win over events (they are fresher — e.g., after a retry respawn).
+    augment_snapshots_with_child_completed(&mut snapshots, events, &name_to_task);
+
     let failure_policy = hook.failure_policy;
 
     // Classify every task in topological order so dependency
@@ -1395,6 +1403,64 @@ enum RespawnTarget {
     /// terminal. Used when a running child's upstream flipped to
     /// failure.
     SkipMarker,
+}
+
+/// On-disk always wins over event — relied on by retry paths that
+/// respawn (or leave Rewound) the child on disk after a prior
+/// terminal+cleanup.
+///
+/// Issue #134: add synthetic [`ChildSnapshot`] entries for tasks whose
+/// children reached terminal and auto-cleaned. The on-disk listing can
+/// no longer see them, but the parent's log carries a `ChildCompleted`
+/// event for each one. Without this augmentation the scheduler would
+/// classify cleaned-up tasks as "not yet spawned" and respawn them
+/// indefinitely.
+///
+/// Precedence: on-disk wins. If a task already has an on-disk snapshot
+/// in `snapshots`, the event is ignored for that task — the on-disk
+/// state is fresher (e.g., a post-retry respawn).
+fn augment_snapshots_with_child_completed(
+    snapshots: &mut HashMap<String, ChildSnapshot>,
+    events: &[Event],
+    name_to_task: &HashMap<&str, &TaskEntry>,
+) {
+    // Latest ChildCompleted per task_name wins. Events are in append
+    // order; a simple overwrite keyed by task_name yields that.
+    let mut latest: HashMap<String, (TerminalOutcome, String)> = HashMap::new();
+    for ev in events {
+        if let EventPayload::ChildCompleted {
+            task_name,
+            outcome,
+            final_state,
+            ..
+        } = &ev.payload
+        {
+            latest.insert(task_name.clone(), (*outcome, final_state.clone()));
+        }
+    }
+    for (task_name, (outcome, final_state)) in latest {
+        if !name_to_task.contains_key(task_name.as_str()) {
+            continue;
+        }
+        if snapshots.contains_key(&task_name) {
+            continue;
+        }
+        let (failure, skipped_marker) = match outcome {
+            TerminalOutcome::Failure => (true, false),
+            TerminalOutcome::Skipped => (false, true),
+            TerminalOutcome::Success => (false, false),
+        };
+        snapshots.insert(
+            task_name,
+            ChildSnapshot {
+                current_state: final_state,
+                terminal: true,
+                failure,
+                skipped_marker,
+                spawn_entry: None,
+            },
+        );
+    }
 }
 
 /// Walk `backend.list()` and return a map from short task name to
@@ -2195,6 +2261,61 @@ pub fn build_children_complete_output(
                 }),
             );
         }
+    }
+
+    // Issue #134: synthesize `ChildSnapshot` entries for children that
+    // have already been cleaned up from disk but left a `ChildCompleted`
+    // event on the parent's log. On-disk snapshots always win (they
+    // are fresher — e.g., after a retry respawn), so entries already
+    // present in `on_disk` are left untouched. The synthesized snapshot
+    // carries the terminal flags the gate needs to project the outcome
+    // back into `success` / `failure` / `skipped`.
+    //
+    // Scan the latest event per task_name so a post-retry
+    // ChildCompleted supersedes any earlier one. Events are iterated in
+    // append order; a simple overwrite yields "latest wins".
+    let mut event_snapshots: HashMap<String, (TerminalOutcome, String)> = HashMap::new();
+    for ev in events {
+        if let EventPayload::ChildCompleted {
+            task_name,
+            outcome,
+            final_state,
+            ..
+        } = &ev.payload
+        {
+            event_snapshots.insert(task_name.clone(), (*outcome, final_state.clone()));
+        }
+    }
+    for (task_name, (outcome, final_state)) in event_snapshots {
+        // Respect the name filter if present. For cleaned-up children
+        // the composed session id is `<parent>.<task_name>`.
+        if let Some(filter) = name_filter {
+            let composed = format!("{}.{}", parent_name, task_name);
+            if !composed.starts_with(filter) {
+                continue;
+            }
+        }
+        if on_disk.contains_key(&task_name) {
+            // On-disk wins (fresher — e.g., a retry respawn after a
+            // prior terminal visit).
+            continue;
+        }
+        let (failure, skipped_marker) = match outcome {
+            TerminalOutcome::Failure => (true, false),
+            TerminalOutcome::Skipped => (false, true),
+            TerminalOutcome::Success => (false, false),
+        };
+        on_disk_order.push(task_name.clone());
+        on_disk.insert(
+            task_name,
+            ChildSnapshot {
+                current_state: final_state,
+                terminal: true,
+                failure,
+                skipped_marker,
+                spawn_entry: None,
+            },
+        );
     }
 
     // If we have a task list, classify each task in topological order
@@ -4043,5 +4164,162 @@ mod tests {
             in_flight.exists(),
             "in-flight tempfile must survive the sweep (< 60s old)"
         );
+    }
+
+    // --------- Issue #134: ChildCompleted snapshot augmentation --------
+
+    /// Helper: build a `ChildCompleted` event for tests. `outcome` is
+    /// the snake_case wire form (`"success"`, `"failure"`, `"skipped"`)
+    /// so each test reads like the JSONL it exercises; the helper
+    /// re-projects it into the typed enum.
+    fn child_completed_event(seq: u64, task_name: &str, outcome: &str, final_state: &str) -> Event {
+        let outcome = match outcome {
+            "success" => TerminalOutcome::Success,
+            "failure" => TerminalOutcome::Failure,
+            "skipped" => TerminalOutcome::Skipped,
+            other => panic!("unknown outcome in test: {}", other),
+        };
+        Event {
+            seq,
+            timestamp: "2026-04-15T00:00:00Z".to_string(),
+            event_type: "child_completed".to_string(),
+            payload: EventPayload::ChildCompleted {
+                child_name: format!("parent.{}", task_name),
+                task_name: task_name.to_string(),
+                outcome,
+                final_state: final_state.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn augment_snapshots_adds_synthetic_entries_for_cleaned_children() {
+        // No on-disk snapshots; one ChildCompleted event. The
+        // augmentation must synthesize a terminal-success snapshot.
+        let tasks = vec![task("a", &[])];
+        let name_to_task: HashMap<&str, &TaskEntry> =
+            tasks.iter().map(|t| (t.name.as_str(), t)).collect();
+        let events = vec![child_completed_event(1, "a", "success", "done")];
+        let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
+        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task);
+        let snap = snapshots.get("a").expect("synthetic snapshot inserted");
+        assert!(snap.terminal);
+        assert!(!snap.failure);
+        assert!(!snap.skipped_marker);
+        assert_eq!(snap.current_state, "done");
+    }
+
+    #[test]
+    fn augment_snapshots_maps_failure_outcome() {
+        let tasks = vec![task("a", &[])];
+        let name_to_task: HashMap<&str, &TaskEntry> =
+            tasks.iter().map(|t| (t.name.as_str(), t)).collect();
+        let events = vec![child_completed_event(1, "a", "failure", "failed")];
+        let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
+        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task);
+        let snap = snapshots.get("a").unwrap();
+        assert!(snap.terminal);
+        assert!(snap.failure);
+        assert!(!snap.skipped_marker);
+    }
+
+    #[test]
+    fn augment_snapshots_maps_skipped_outcome() {
+        let tasks = vec![task("a", &[])];
+        let name_to_task: HashMap<&str, &TaskEntry> =
+            tasks.iter().map(|t| (t.name.as_str(), t)).collect();
+        let events = vec![child_completed_event(1, "a", "skipped", "skipped")];
+        let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
+        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task);
+        let snap = snapshots.get("a").unwrap();
+        assert!(snap.terminal);
+        assert!(!snap.failure);
+        assert!(snap.skipped_marker);
+    }
+
+    #[test]
+    fn augment_snapshots_skips_tasks_not_in_current_submission() {
+        // A ChildCompleted event for a task that is no longer in the
+        // current submission should be ignored so renamed/dropped
+        // tasks don't poison the classification.
+        let tasks = vec![task("b", &[])];
+        let name_to_task: HashMap<&str, &TaskEntry> =
+            tasks.iter().map(|t| (t.name.as_str(), t)).collect();
+        let events = vec![child_completed_event(1, "a", "success", "done")];
+        let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
+        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task);
+        assert!(snapshots.is_empty());
+    }
+
+    #[test]
+    fn augment_snapshots_on_disk_wins_over_event() {
+        // Issue #134 AC4: when a task has BOTH an on-disk snapshot and
+        // a ChildCompleted event (e.g., a prior terminal visit that
+        // was respawned by a retry), the on-disk snapshot is kept
+        // unchanged. Without this precedence, a fresh respawn would
+        // appear as the stale event's outcome and retry semantics
+        // would be invisible to the gate.
+        let tasks = vec![task("a", &[])];
+        let name_to_task: HashMap<&str, &TaskEntry> =
+            tasks.iter().map(|t| (t.name.as_str(), t)).collect();
+        let events = vec![child_completed_event(1, "a", "success", "done")];
+        let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
+        // Fresh on-disk snapshot says the task is Running (not terminal).
+        snapshots.insert("a".to_string(), snap("work", false, false, false));
+        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task);
+        let s = snapshots.get("a").unwrap();
+        assert!(
+            !s.terminal,
+            "fresh on-disk Running snapshot must survive (not be overwritten by stale event)"
+        );
+        assert_eq!(s.current_state, "work");
+    }
+
+    #[test]
+    fn augment_snapshots_latest_event_wins_when_task_cleaned_twice() {
+        // Same task name observed in two ChildCompleted events (e.g.,
+        // the child was retried, completed again, and auto-cleaned
+        // again). With no on-disk snapshot, the later event's outcome
+        // must be what the scheduler sees.
+        let tasks = vec![task("a", &[])];
+        let name_to_task: HashMap<&str, &TaskEntry> =
+            tasks.iter().map(|t| (t.name.as_str(), t)).collect();
+        let events = vec![
+            child_completed_event(1, "a", "failure", "failed"),
+            child_completed_event(2, "a", "success", "done"),
+        ];
+        let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
+        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task);
+        let s = snapshots.get("a").unwrap();
+        assert_eq!(s.current_state, "done");
+        assert!(!s.failure);
+        assert!(s.terminal);
+    }
+
+    #[test]
+    fn child_completed_event_round_trip() {
+        // Sanity: the ChildCompleted event serializes and
+        // deserializes to the same shape, the type discriminator is
+        // the expected string, and the typed outcome enum serializes
+        // as the snake_case wire form.
+        let ev = Event {
+            seq: 7,
+            timestamp: "2026-04-15T00:00:00Z".to_string(),
+            event_type: "child_completed".to_string(),
+            payload: EventPayload::ChildCompleted {
+                child_name: "parent.alpha".to_string(),
+                task_name: "alpha".to_string(),
+                outcome: TerminalOutcome::Success,
+                final_state: "done".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "child_completed");
+        assert_eq!(v["payload"]["task_name"], "alpha");
+        assert_eq!(v["payload"]["outcome"], "success");
+        assert_eq!(v["payload"]["final_state"], "done");
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
     }
 }
