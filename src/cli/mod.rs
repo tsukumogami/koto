@@ -29,7 +29,7 @@ use crate::cache::{compile_cached, sha256_hex};
 use crate::discover::find_workflows_with_metadata;
 use crate::engine::errors::EngineError;
 use crate::engine::persistence::{derive_decisions, derive_machine_state, derive_state_from_log};
-use crate::engine::types::{now_iso8601, Event, EventPayload};
+use crate::engine::types::{now_iso8601, Event, EventPayload, TerminalOutcome};
 use crate::session::context::ContextStore;
 use crate::session::local::LocalBackend;
 use crate::session::{Backend, SessionBackend, SessionError};
@@ -126,6 +126,13 @@ pub enum Command {
     Cancel {
         /// Workflow name
         name: String,
+
+        /// Also remove the session from disk after cancelling. Without
+        /// this flag, cancel leaves the state file in place so the
+        /// history stays auditable; the name cannot be reused for a
+        /// fresh init until `koto session cleanup` runs.
+        #[arg(long)]
+        cleanup: bool,
     },
 
     /// Roll back the workflow to the previous state
@@ -791,9 +798,9 @@ pub fn run(app: App) -> Result<()> {
                 full,
             )
         }
-        Command::Cancel { name } => {
+        Command::Cancel { name, cleanup } => {
             let backend = build_backend()?;
-            handle_cancel(&backend, &name)
+            handle_cancel(&backend, &name, cleanup)
         }
         Command::Rewind { name } => {
             let backend = build_backend()?;
@@ -1197,7 +1204,11 @@ fn handle_init(
     // the session exists.
     if backend.exists(name) {
         exit_with_error(serde_json::json!({
-            "error": format!("workflow '{}' already exists", name),
+            "error": format!(
+                "workflow '{}' already exists; run `koto session cleanup {}` to reuse the name, \
+                 or `koto cancel --cleanup {}` to stop a running workflow first",
+                name, name, name
+            ),
             "command": "init"
         }));
     }
@@ -1409,6 +1420,115 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
 #[cfg(unix)]
 fn state_is_batch_scoped(compiled: &CompiledTemplate, state_name: &str, _events: &[Event]) -> bool {
     crate::cli::batch::state_has_materialize_children(compiled, state_name)
+}
+
+/// Result of the [`append_child_completed_to_parent`] notification
+/// attempt. Drives whether the caller may proceed with
+/// `backend.cleanup(child)` or must defer cleanup so the parent can
+/// still observe the child on disk.
+///
+/// Two "proceed" outcomes collapse to the same caller behavior
+/// (cleanup is safe) but carry different semantic meanings:
+/// * [`ChildCompletedAppend::NoParent`] — the child has no parent
+///   workflow (standalone session) or the parent was already
+///   cleaned up in the same tick. Cleanup must proceed so
+///   non-batch terminal children don't leak.
+/// * [`ChildCompletedAppend::Notified`] — the event was durably
+///   appended; the gate will be able to synthesise a snapshot on
+///   the next parent tick.
+/// * [`ChildCompletedAppend::AppendFailed`] — we found a parent
+///   but the append failed (disk full, permission change, flock
+///   contention bubble-up). The caller MUST skip cleanup so the
+///   next parent tick can classify the child from its on-disk
+///   state. Without this, the gate would lose visibility of the
+///   terminal child entirely.
+#[cfg(unix)]
+enum ChildCompletedAppend {
+    NoParent,
+    Notified,
+    AppendFailed,
+}
+
+/// Issue #134: append a `ChildCompleted` event to the parent's log just
+/// before a child session's auto-cleanup runs.
+///
+/// Called from both terminal cleanup sites in [`handle_next`] (the `--to`
+/// path and the advance-loop path). The return value tells the caller
+/// whether cleanup is safe:
+///
+/// * [`ChildCompletedAppend::NoParent`] — no parent to notify (standalone
+///   child, or the parent was already cleaned up). Cleanup proceeds.
+/// * [`ChildCompletedAppend::Notified`] — event durably appended.
+///   Cleanup proceeds.
+/// * [`ChildCompletedAppend::AppendFailed`] — parent exists but the
+///   append failed. Caller MUST skip cleanup so the next parent tick
+///   can classify the child from its on-disk state. A warning is
+///   logged here; the caller does not re-log.
+///
+/// The event projects the outcome classification (`Success`, `Failure`,
+/// `Skipped`) from the child's compiled template flags on the final
+/// state. The `children-complete` gate evaluator replays these events
+/// to recover per-task outcomes after cleanup has removed the child's
+/// state file from disk.
+#[cfg(unix)]
+fn append_child_completed_to_parent(
+    backend: &dyn SessionBackend,
+    child_name: &str,
+    child_header: &crate::engine::types::StateFileHeader,
+    compiled: &CompiledTemplate,
+    final_state: &str,
+) -> ChildCompletedAppend {
+    let parent_name = match child_header.parent_workflow.as_deref() {
+        Some(p) => p,
+        None => return ChildCompletedAppend::NoParent,
+    };
+    // Parent cleanup may have already removed the parent session (e.g.
+    // if the parent transitioned to terminal in the same tick). A
+    // missing parent is not an error; cleanup of the child proceeds.
+    if !backend.exists(parent_name) {
+        return ChildCompletedAppend::NoParent;
+    }
+
+    // Project the final state's template flags into the outcome enum.
+    let (failure, skipped_marker) = match compiled.states.get(final_state) {
+        Some(s) => (s.failure, s.skipped_marker),
+        None => (false, false),
+    };
+    let outcome = if failure {
+        TerminalOutcome::Failure
+    } else if skipped_marker {
+        TerminalOutcome::Skipped
+    } else {
+        TerminalOutcome::Success
+    };
+
+    // Derive the short task name — the piece after `<parent>.`.
+    let prefix = format!("{}.", parent_name);
+    let task_name = if let Some(rest) = child_name.strip_prefix(&prefix) {
+        rest.to_string()
+    } else {
+        // Non-composed child (e.g., legacy `koto init --parent` without
+        // a batch hook). Fall back to the raw session id.
+        child_name.to_string()
+    };
+
+    let payload = EventPayload::ChildCompleted {
+        child_name: child_name.to_string(),
+        task_name,
+        outcome,
+        final_state: final_state.to_string(),
+    };
+    match backend.append_event(parent_name, &payload, &now_iso8601()) {
+        Ok(_) => ChildCompletedAppend::Notified,
+        Err(e) => {
+            eprintln!(
+                "warning: failed to notify parent of child completion; \
+                 deferring child cleanup so the parent can still observe it: {}",
+                e
+            );
+            ChildCompletedAppend::AppendFailed
+        }
+    }
 }
 
 /// Handle the `koto next` command with full output contract support.
@@ -1724,9 +1844,29 @@ fn handle_next(
                 });
                 println!("{}", serde_json::to_string(&resp)?);
                 // Auto-cleanup after output when reaching a terminal state.
-                if matches!(resp, next_types::NextResponse::Terminal { .. }) && !no_cleanup {
-                    if let Err(e) = backend.cleanup(&name) {
-                        eprintln!("warning: session cleanup failed: {}", e);
+                if let next_types::NextResponse::Terminal {
+                    state: final_state, ..
+                } = &resp
+                {
+                    if !no_cleanup {
+                        // Issue #134: emit ChildCompleted to parent BEFORE
+                        // cleanup so the batch gate can observe outcomes
+                        // for children that auto-clean on terminal. When
+                        // the append fails we must leave the child on
+                        // disk so the parent's next tick can classify
+                        // it from the state file instead of losing it.
+                        let append_result = append_child_completed_to_parent(
+                            backend,
+                            &name,
+                            &header,
+                            &compiled,
+                            final_state,
+                        );
+                        if !matches!(append_result, ChildCompletedAppend::AppendFailed) {
+                            if let Err(e) = backend.cleanup(&name) {
+                                eprintln!("warning: session cleanup failed: {}", e);
+                            }
+                        }
                     }
                 }
                 std::process::exit(0);
@@ -2665,9 +2805,29 @@ fn handle_next(
                 serde_json::to_string(&serde_json::Value::Object(envelope))?
             );
             // Auto-cleanup after output when reaching a terminal state.
-            if matches!(resp, NextResponse::Terminal { .. }) && !no_cleanup {
-                if let Err(e) = backend.cleanup(&name) {
-                    eprintln!("warning: session cleanup failed: {}", e);
+            if let NextResponse::Terminal {
+                state: final_state, ..
+            } = &resp
+            {
+                if !no_cleanup {
+                    // Issue #134: emit ChildCompleted to parent BEFORE
+                    // cleanup so the batch gate can observe outcomes for
+                    // children that auto-clean on terminal. When the
+                    // append fails we must leave the child on disk so
+                    // the parent's next tick can classify it from the
+                    // state file instead of losing it.
+                    let append_result = append_child_completed_to_parent(
+                        backend,
+                        &name,
+                        &header,
+                        &compiled,
+                        final_state,
+                    );
+                    if !matches!(append_result, ChildCompletedAppend::AppendFailed) {
+                        if let Err(e) = backend.cleanup(&name) {
+                            eprintln!("warning: session cleanup failed: {}", e);
+                        }
+                    }
                 }
             }
             std::process::exit(0);
@@ -3288,8 +3448,10 @@ fn query_children(backend: &dyn SessionBackend, parent_name: &str) -> Vec<serde_
 /// Handle the `koto cancel` command.
 ///
 /// Appends a `WorkflowCancelled` event to the event log. Rejects double-cancel
-/// and cancel of already-terminal workflows.
-fn handle_cancel(backend: &dyn SessionBackend, name: &str) -> Result<()> {
+/// and cancel of already-terminal workflows. When `cleanup` is true, also
+/// removes the session directory after the event is written so the name can
+/// be reused without a separate `koto session cleanup` call.
+fn handle_cancel(backend: &dyn SessionBackend, name: &str, cleanup: bool) -> Result<()> {
     if !backend.exists(name) {
         exit_with_error(serde_json::json!({
             "error": format!("workflow '{}' not found", name),
@@ -3389,12 +3551,35 @@ fn handle_cancel(backend: &dyn SessionBackend, name: &str) -> Result<()> {
 
     let children = query_children(backend, name);
 
+    // Capture children before cleanup — once the session is removed the
+    // relationship disappears from the backend listing. We still report
+    // them so the caller has the same visibility regardless of --cleanup.
+    let cleaned = if cleanup {
+        match backend.cleanup(name) {
+            Ok(()) => true,
+            Err(e) => {
+                // The cancel event is already persisted; surface the
+                // cleanup failure without rolling back.
+                exit_with_error_code(
+                    serde_json::json!({
+                        "error": format!("cancelled, but cleanup failed: {}", e),
+                        "command": "cancel"
+                    }),
+                    3,
+                );
+            }
+        }
+    } else {
+        false
+    };
+
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({
             "name": name,
             "state": current_state,
             "cancelled": true,
+            "cleaned_up": cleaned,
             "children": children
         }))?
     );
