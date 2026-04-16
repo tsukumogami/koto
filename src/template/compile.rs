@@ -159,7 +159,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
         anyhow!("invalid YAML: template must begin with YAML front-matter delimited by '---'")
     })?;
 
-    let fm: SourceFrontmatter = serde_yml::from_str(frontmatter_str)
+    let fm: SourceFrontmatter = serde_yaml_ng::from_str(frontmatter_str)
         .with_context(|| "invalid YAML: failed to parse front-matter")?;
 
     // Validate required front-matter fields.
