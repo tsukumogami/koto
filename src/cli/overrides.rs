@@ -16,7 +16,8 @@ use crate::gate::built_in_default;
 use crate::session::SessionBackend;
 
 use super::{
-    exit_code_for_engine_error, exit_with_error_code, EXIT_INFRASTRUCTURE, MAX_WITH_DATA_BYTES,
+    exit_code_for_engine_error, exit_with_error_code, resolve_with_data_source,
+    EXIT_INFRASTRUCTURE, MAX_WITH_DATA_BYTES,
 };
 
 #[derive(Subcommand)]
@@ -88,6 +89,24 @@ pub fn handle_overrides_record(
     rationale: String,
     with_data: Option<String>,
 ) -> Result<()> {
+    // 0. Resolve --with-data source (inline JSON or @file.json). Keeps this
+    //    handler aligned with `koto next`; see `resolve_with_data_source`.
+    let with_data = match with_data {
+        Some(raw) => match resolve_with_data_source(&raw) {
+            Ok(s) => Some(s),
+            Err(err) => {
+                exit_with_error_code(
+                    serde_json::json!({
+                        "error": err.message,
+                        "command": "overrides record"
+                    }),
+                    err.code.exit_code(),
+                );
+            }
+        },
+        None => None,
+    };
+
     // 1. Size-limit checks
     if let Some(ref d) = with_data {
         if d.len() > MAX_WITH_DATA_BYTES {
