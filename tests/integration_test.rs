@@ -246,6 +246,123 @@ fn init_fails_if_file_exists() {
     );
 }
 
+/// Re-initializing the same child name via `koto init --parent` must surface
+/// the same "already exists" error as top-level re-init. Bug #133 tracked
+/// cases where a second init of the same child name could silently create a
+/// duplicate session.
+#[test]
+fn init_child_duplicate_name_rejected() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    let parent = koto_cmd(dir.path())
+        .args(["init", "dup-parent", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        parent.status.success(),
+        "parent init should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&parent.stdout),
+        String::from_utf8_lossy(&parent.stderr)
+    );
+
+    let first_child = koto_cmd(dir.path())
+        .args([
+            "init",
+            "dup-parent.child",
+            "--template",
+            src.to_str().unwrap(),
+            "--parent",
+            "dup-parent",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        first_child.status.success(),
+        "first child init should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&first_child.stdout),
+        String::from_utf8_lossy(&first_child.stderr)
+    );
+
+    let second_child = koto_cmd(dir.path())
+        .args([
+            "init",
+            "dup-parent.child",
+            "--template",
+            src.to_str().unwrap(),
+            "--parent",
+            "dup-parent",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !second_child.status.success(),
+        "second child init on same name must fail"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&second_child.stdout).expect("error output should be valid JSON");
+    let msg = json["error"]
+        .as_str()
+        .expect("error field should be a string");
+    assert!(
+        msg.contains("already exists"),
+        "error should identify duplicate: {}",
+        msg
+    );
+    assert!(
+        msg.contains("dup-parent.child"),
+        "error should name the conflicting session: {}",
+        msg
+    );
+
+    // Only one session must appear under this name.
+    let list = koto_cmd(dir.path()).args(["workflows"]).output().unwrap();
+    let workflows: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let items = workflows.as_array().expect("workflows output is an array");
+    let child_count = items
+        .iter()
+        .filter(|w| w["name"].as_str() == Some("dup-parent.child"))
+        .count();
+    assert_eq!(
+        child_count, 1,
+        "exactly one entry for dup-parent.child; got {}: {}",
+        child_count, workflows
+    );
+}
+
+/// The duplicate-name error message must be identical whether the pre-check
+/// or the atomic `init_state_file` collision detector fires. Pin the exact
+/// error text so orchestrators can rely on a stable string to detect the
+/// "re-spawn attempted on live session" condition without scraping state.
+#[test]
+fn init_duplicate_error_message_is_stable() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    koto_cmd(dir.path())
+        .args(["init", "stable-wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    let dup = koto_cmd(dir.path())
+        .args(["init", "stable-wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&dup.stdout).unwrap();
+    assert_eq!(
+        json["error"].as_str(),
+        Some("workflow 'stable-wf' already exists"),
+        "error text must be the documented stable string: {}",
+        json
+    );
+    assert_eq!(
+        json["command"].as_str(),
+        Some("init"),
+        "envelope must carry the subcommand tag"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // next
 // ---------------------------------------------------------------------------
