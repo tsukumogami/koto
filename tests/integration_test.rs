@@ -7370,3 +7370,214 @@ fn next_with_data_at_file_missing_returns_clear_error() {
         msg
     );
 }
+
+// ---------------------------------------------------------------------------
+// bug #131: --with-data @file support for decisions/overrides record
+// ---------------------------------------------------------------------------
+
+/// `koto decisions record --with-data @<path>` reads JSON from the file and
+/// records the decision, matching the behavior of `koto next --with-data @<path>`.
+#[test]
+fn decisions_record_with_data_at_file_reads_decision_from_file() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "dec-atfile-wf", &template_with_accepts());
+
+    let decision_path = dir.path().join("decision.json");
+    std::fs::write(
+        &decision_path,
+        r#"{"choice":"option-a","rationale":"loaded from file"}"#,
+    )
+    .unwrap();
+
+    let arg = format!("@{}", decision_path.display());
+    let output = koto_cmd(dir.path())
+        .args(["decisions", "record", "dec-atfile-wf", "--with-data", &arg])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "@file decisions record should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["decisions_recorded"].as_u64(),
+        Some(1),
+        "expected decisions_recorded=1, got: {}",
+        json
+    );
+
+    // Confirm the decision body came from the file, not the literal `@path` string.
+    let list = koto_cmd(dir.path())
+        .args(["decisions", "list", "dec-atfile-wf"])
+        .output()
+        .unwrap();
+    let list_json: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let items = list_json["decisions"]["items"]
+        .as_array()
+        .expect("decisions.items should be an array");
+    assert_eq!(items.len(), 1, "expected 1 decision, got: {}", items.len());
+    assert_eq!(
+        items[0]["choice"].as_str(),
+        Some("option-a"),
+        "decision.choice should be loaded from file: {}",
+        items[0]
+    );
+}
+
+/// `koto decisions record --with-data @<path>` surfaces a clear error message
+/// naming the missing path when the file does not exist.
+#[test]
+fn decisions_record_with_data_at_file_missing_returns_clear_error() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "dec-missing-wf", &template_with_accepts());
+
+    let missing = dir.path().join("nope.json");
+    let arg = format!("@{}", missing.display());
+    let output = koto_cmd(dir.path())
+        .args(["decisions", "record", "dec-missing-wf", "--with-data", &arg])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "missing file should fail: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    let msg = json["error"]
+        .as_str()
+        .expect("error field should be a string");
+    assert!(
+        msg.contains(missing.to_str().unwrap()),
+        "error message should name the missing path: {}",
+        msg
+    );
+}
+
+/// `koto overrides record --with-data @<path>` reads the override value from
+/// the file, matching the behavior of `koto next --with-data @<path>`.
+#[test]
+fn overrides_record_with_data_at_file_reads_value_from_file() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(
+        dir.path(),
+        "ovr-atfile-wf",
+        &template_with_failing_command_gate(),
+    );
+
+    // Block on the gate first so overrides record has something to target.
+    let _ = koto_cmd(dir.path())
+        .args(["next", "ovr-atfile-wf"])
+        .output()
+        .unwrap();
+
+    let value_path = dir.path().join("override.json");
+    std::fs::write(&value_path, r#"{"exit_code":0}"#).unwrap();
+
+    let arg = format!("@{}", value_path.display());
+    let output = koto_cmd(dir.path())
+        .args([
+            "overrides",
+            "record",
+            "ovr-atfile-wf",
+            "--gate",
+            "ci_check",
+            "--rationale",
+            "loaded override value from file",
+            "--with-data",
+            &arg,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "@file overrides record should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["status"].as_str(),
+        Some("recorded"),
+        "expected status=recorded, got: {}",
+        json
+    );
+
+    // Confirm the override_applied came from the file contents.
+    let list = koto_cmd(dir.path())
+        .args(["overrides", "list", "ovr-atfile-wf"])
+        .output()
+        .unwrap();
+    let list_json: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let items = list_json["overrides"]["items"]
+        .as_array()
+        .expect("overrides.items should be an array");
+    assert_eq!(items.len(), 1, "expected 1 override, got: {}", items.len());
+    assert_eq!(
+        items[0]["override_applied"]["exit_code"].as_i64(),
+        Some(0),
+        "override_applied.exit_code should be loaded from file: {}",
+        items[0]
+    );
+}
+
+/// `koto overrides record --with-data @<path>` surfaces a clear error message
+/// naming the missing path when the file does not exist.
+#[test]
+fn overrides_record_with_data_at_file_missing_returns_clear_error() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(
+        dir.path(),
+        "ovr-missing-wf",
+        &template_with_failing_command_gate(),
+    );
+
+    let _ = koto_cmd(dir.path())
+        .args(["next", "ovr-missing-wf"])
+        .output()
+        .unwrap();
+
+    let missing = dir.path().join("absent.json");
+    let arg = format!("@{}", missing.display());
+    let output = koto_cmd(dir.path())
+        .args([
+            "overrides",
+            "record",
+            "ovr-missing-wf",
+            "--gate",
+            "ci_check",
+            "--rationale",
+            "missing file",
+            "--with-data",
+            &arg,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "missing file should fail: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    let msg = json["error"]
+        .as_str()
+        .expect("error field should be a string");
+    assert!(
+        msg.contains(missing.to_str().unwrap()),
+        "error message should name the missing path: {}",
+        msg
+    );
+}

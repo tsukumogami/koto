@@ -211,7 +211,7 @@ Records an override for a blocked gate so that the next `koto next` call treats 
 | `<name>` | Yes | Workflow name |
 | `--gate <gate>` | Yes | Name of the gate to override. Must exist in the current template state. |
 | `--rationale <text>` | Yes | Explanation for why the override is appropriate. Max 1 MB. |
-| `--with-data '<json>'` | No | Override value to substitute as gate output. If omitted, falls back to the gate's `override_default` value, then to the built-in default for the gate type. Fails if no default is available. |
+| `--with-data '<json>'` | No | Override value to substitute as gate output. If omitted, falls back to the gate's `override_default` value, then to the built-in default for the gate type. Fails if no default is available. Supports the `@file` prefix to read the value from a file (e.g. `--with-data @override.json`), with the same 1 MB cap as `koto next`. |
 
 **Override value resolution order:**
 1. `--with-data` value
@@ -276,6 +276,8 @@ The `--with-data` JSON must be an object with:
 - `choice` (string, required)
 - `rationale` (string, required)
 - `alternatives_considered` (array of strings, optional)
+
+Supports the `@file` prefix to read the payload from a file (e.g. `--with-data @decision.json`), with the same 1 MB cap as `koto next`.
 
 **Success output:**
 ```json

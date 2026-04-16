@@ -2722,6 +2722,21 @@ fn handle_decisions_record(
     name: String,
     with_data: String,
 ) -> Result<()> {
+    // 0. Resolve --with-data source (inline JSON or @file.json). Keeps this
+    //    handler aligned with `koto next`; see `resolve_with_data_source`.
+    let with_data = match resolve_with_data_source(&with_data) {
+        Ok(s) => s,
+        Err(err) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": err.message,
+                    "command": "decisions record"
+                }),
+                err.code.exit_code(),
+            );
+        }
+    };
+
     // 1. Payload size limit
     if with_data.len() > MAX_WITH_DATA_BYTES {
         exit_with_error_code(

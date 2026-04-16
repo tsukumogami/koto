@@ -2535,21 +2535,21 @@ override_default:
   exit_code: 1
   error: ""
 "#;
-        let gate: Gate = serde_yml::from_str(yaml).unwrap();
+        let gate: Gate = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(gate.override_default.is_some());
         let v = gate.override_default.as_ref().unwrap();
         assert_eq!(v["exit_code"], 1);
         assert_eq!(v["error"], "");
 
         // Serialize back and confirm the value is preserved.
-        let out = serde_yml::to_string(&gate).unwrap();
+        let out = serde_yaml_ng::to_string(&gate).unwrap();
         assert!(
             out.contains("override_default"),
             "override_default should appear in output: {}",
             out
         );
 
-        let gate2: Gate = serde_yml::from_str(&out).unwrap();
+        let gate2: Gate = serde_yaml_ng::from_str(&out).unwrap();
         assert_eq!(gate.override_default, gate2.override_default);
     }
 
@@ -2561,10 +2561,10 @@ override_default:
 type: command
 command: "./check.sh"
 "#;
-        let gate: Gate = serde_yml::from_str(yaml).unwrap();
+        let gate: Gate = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(gate.override_default.is_none());
 
-        let out = serde_yml::to_string(&gate).unwrap();
+        let out = serde_yaml_ng::to_string(&gate).unwrap();
         assert!(
             !out.contains("override_default"),
             "override_default should be absent from output: {}",
