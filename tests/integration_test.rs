@@ -331,10 +331,10 @@ fn init_child_duplicate_name_rejected() {
     );
 }
 
-/// The duplicate-name error message must be identical whether the pre-check
-/// or the atomic `init_state_file` collision detector fires. Pin the exact
-/// error text so orchestrators can rely on a stable string to detect the
-/// "re-spawn attempted on live session" condition without scraping state.
+/// The duplicate-name error must carry the `already exists` signal regardless
+/// of which detector fires (pre-check or atomic rename). Orchestrators
+/// detecting the re-spawn-on-live-session condition match on that prefix;
+/// the surrounding remediation text is advisory and may evolve.
 #[test]
 fn init_duplicate_error_message_is_stable() {
     let dir = TempDir::new().unwrap();
@@ -350,11 +350,13 @@ fn init_duplicate_error_message_is_stable() {
         .output()
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&dup.stdout).unwrap();
-    assert_eq!(
-        json["error"].as_str(),
-        Some("workflow 'stable-wf' already exists"),
-        "error text must be the documented stable string: {}",
-        json
+    let msg = json["error"]
+        .as_str()
+        .expect("error field should be a string");
+    assert!(
+        msg.starts_with("workflow 'stable-wf' already exists"),
+        "error must start with the stable signal: {}",
+        msg
     );
     assert_eq!(
         json["command"].as_str(),
@@ -1895,6 +1897,131 @@ fn cancel_terminal_workflow_returns_error() {
     assert!(
         json["error"].as_str().unwrap().contains("terminal state"),
         "error should mention terminal state"
+    );
+}
+
+/// `koto cancel --cleanup <name>` appends the WorkflowCancelled event AND
+/// removes the session so the name is immediately reusable. Default
+/// `koto cancel` leaves the session on disk for auditability. Bug #132.
+#[test]
+fn cancel_with_cleanup_removes_session() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "cancel-cleanup-wf", minimal_template());
+
+    let cancel = koto_cmd(dir.path())
+        .args(["cancel", "cancel-cleanup-wf", "--cleanup"])
+        .output()
+        .unwrap();
+    assert!(
+        cancel.status.success(),
+        "cancel --cleanup should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&cancel.stdout),
+        String::from_utf8_lossy(&cancel.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&cancel.stdout).unwrap();
+    assert_eq!(
+        json["cleaned_up"].as_bool(),
+        Some(true),
+        "cleaned_up should be true: {}",
+        json
+    );
+
+    // Session must be gone — a second init with the same name must now succeed.
+    let src = write_template_source(dir.path());
+    let reinit = koto_cmd(dir.path())
+        .args([
+            "init",
+            "cancel-cleanup-wf",
+            "--template",
+            src.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        reinit.status.success(),
+        "re-init after cancel --cleanup should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&reinit.stdout),
+        String::from_utf8_lossy(&reinit.stderr)
+    );
+}
+
+/// Default `koto cancel` (no flag) leaves the session on disk. The name
+/// remains reserved until `koto session cleanup` runs. Pins backward
+/// compatibility.
+#[test]
+fn cancel_without_cleanup_preserves_session() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "cancel-keep-wf", minimal_template());
+
+    let cancel = koto_cmd(dir.path())
+        .args(["cancel", "cancel-keep-wf"])
+        .output()
+        .unwrap();
+    assert!(cancel.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&cancel.stdout).unwrap();
+    assert_eq!(
+        json["cleaned_up"].as_bool(),
+        Some(false),
+        "cleaned_up should be false when --cleanup is not passed: {}",
+        json
+    );
+
+    // Re-init must fail because the session is still on disk.
+    let src = write_template_source(dir.path());
+    let reinit = koto_cmd(dir.path())
+        .args([
+            "init",
+            "cancel-keep-wf",
+            "--template",
+            src.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !reinit.status.success(),
+        "re-init after bare cancel must fail"
+    );
+}
+
+/// The `already exists` error on duplicate init points users at the two
+/// remediation paths (`koto session cleanup` for a stopped workflow,
+/// `koto cancel --cleanup` for a running one). Prevents the "confusing
+/// two-step" UX flagged in bug #132.
+#[test]
+fn init_duplicate_error_mentions_remediation() {
+    let dir = TempDir::new().unwrap();
+    let src = write_template_source(dir.path());
+
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "remediation-wf",
+            "--template",
+            src.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    let dup = koto_cmd(dir.path())
+        .args([
+            "init",
+            "remediation-wf",
+            "--template",
+            src.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&dup.stdout).unwrap();
+    let msg = json["error"].as_str().unwrap();
+    assert!(
+        msg.contains("koto session cleanup remediation-wf"),
+        "error should suggest `koto session cleanup`: {}",
+        msg
+    );
+    assert!(
+        msg.contains("koto cancel --cleanup remediation-wf"),
+        "error should suggest `koto cancel --cleanup`: {}",
+        msg
     );
 }
 

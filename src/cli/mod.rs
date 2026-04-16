@@ -126,6 +126,13 @@ pub enum Command {
     Cancel {
         /// Workflow name
         name: String,
+
+        /// Also remove the session from disk after cancelling. Without
+        /// this flag, cancel leaves the state file in place so the
+        /// history stays auditable; the name cannot be reused for a
+        /// fresh init until `koto session cleanup` runs.
+        #[arg(long)]
+        cleanup: bool,
     },
 
     /// Roll back the workflow to the previous state
@@ -791,9 +798,9 @@ pub fn run(app: App) -> Result<()> {
                 full,
             )
         }
-        Command::Cancel { name } => {
+        Command::Cancel { name, cleanup } => {
             let backend = build_backend()?;
-            handle_cancel(&backend, &name)
+            handle_cancel(&backend, &name, cleanup)
         }
         Command::Rewind { name } => {
             let backend = build_backend()?;
@@ -1197,7 +1204,11 @@ fn handle_init(
     // the session exists.
     if backend.exists(name) {
         exit_with_error(serde_json::json!({
-            "error": format!("workflow '{}' already exists", name),
+            "error": format!(
+                "workflow '{}' already exists; run `koto session cleanup {}` to reuse the name, \
+                 or `koto cancel --cleanup {}` to stop a running workflow first",
+                name, name, name
+            ),
             "command": "init"
         }));
     }
@@ -3437,8 +3448,10 @@ fn query_children(backend: &dyn SessionBackend, parent_name: &str) -> Vec<serde_
 /// Handle the `koto cancel` command.
 ///
 /// Appends a `WorkflowCancelled` event to the event log. Rejects double-cancel
-/// and cancel of already-terminal workflows.
-fn handle_cancel(backend: &dyn SessionBackend, name: &str) -> Result<()> {
+/// and cancel of already-terminal workflows. When `cleanup` is true, also
+/// removes the session directory after the event is written so the name can
+/// be reused without a separate `koto session cleanup` call.
+fn handle_cancel(backend: &dyn SessionBackend, name: &str, cleanup: bool) -> Result<()> {
     if !backend.exists(name) {
         exit_with_error(serde_json::json!({
             "error": format!("workflow '{}' not found", name),
@@ -3538,12 +3551,35 @@ fn handle_cancel(backend: &dyn SessionBackend, name: &str) -> Result<()> {
 
     let children = query_children(backend, name);
 
+    // Capture children before cleanup — once the session is removed the
+    // relationship disappears from the backend listing. We still report
+    // them so the caller has the same visibility regardless of --cleanup.
+    let cleaned = if cleanup {
+        match backend.cleanup(name) {
+            Ok(()) => true,
+            Err(e) => {
+                // The cancel event is already persisted; surface the
+                // cleanup failure without rolling back.
+                exit_with_error_code(
+                    serde_json::json!({
+                        "error": format!("cancelled, but cleanup failed: {}", e),
+                        "command": "cancel"
+                    }),
+                    3,
+                );
+            }
+        }
+    } else {
+        false
+    };
+
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({
             "name": name,
             "state": current_state,
             "cancelled": true,
+            "cleaned_up": cleaned,
             "children": children
         }))?
     );

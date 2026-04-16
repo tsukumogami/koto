@@ -100,23 +100,27 @@ Gets the current state directive. Submits evidence when `--with-data` is provide
 ## koto cancel
 
 ```
-koto cancel <name>
+koto cancel <name> [--cleanup]
 ```
 
 Marks a workflow as cancelled, preventing any further advancement.
 
 **Success output:**
 ```json
-{"name": "my-workflow", "state": "current_state", "cancelled": true}
+{"name": "my-workflow", "state": "current_state", "cancelled": true, "cleaned_up": false}
 ```
+
+**Flags:**
+- `--cleanup` — also remove the session directory after writing the cancel event. `cleaned_up: true` in the response. Use this when you want to reuse the workflow name immediately (e.g., restart during development). Without `--cleanup`, the session stays on disk so the history remains auditable.
 
 **After cancellation:**
 - `koto next` returns exit 2 with `error.code = "terminal_state"`.
 - A second `koto cancel` call returns exit 2.
-- Cancellation does **not** auto-clean the session directory. Use `koto session cleanup` to remove it.
+- Without `--cleanup`, the session directory is preserved. Use `koto session cleanup <name>` separately to remove it (or pass `--cleanup` up front).
 
 **Error cases:**
 - Exit 2: already cancelled, workflow already in a terminal state
+- Exit 3: cancel event was written but the subsequent cleanup failed (rare; filesystem error)
 
 ---
 
