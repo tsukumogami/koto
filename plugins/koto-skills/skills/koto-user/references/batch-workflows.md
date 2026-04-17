@@ -14,6 +14,8 @@ One agent (or one thread) holds responsibility for ticking the coordinator via `
 
 The coordinator's job on each tick is: read `scheduler.materialized_children`, figure out which children are new, dispatch workers against those children, and check `blocking_conditions[0].output` for completion.
 
+**Do not manually initialize batch children.** The scheduler owns the child lifecycle: it creates sessions using the composed name `<parent>.<task>`, registers them in the batch tracker, and monitors them for completion. A workflow initialized manually with `koto init <parent>.<task>` is invisible to the batch tracker even if the name matches — the scheduler will spawn a fresh instance on its next tick, discarding the manually-driven work. Always let the coordinator spawn children through the `tasks` submission.
+
 ## Submitting the task list
 
 The coordinator's first real tick lands on a state with `action: "evidence_required"` and `expects.fields.tasks.type: "tasks"`. Build the task list and submit it. The `@file` prefix is standard for batch submissions since the payload tends to be large:
