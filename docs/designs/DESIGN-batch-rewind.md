@@ -1,27 +1,25 @@
 ---
-status: Accepted
+status: Proposed
 problem: |
   koto rewind rolls back the parent's event log but does not touch child sessions
   spawned as a side effect of batch evidence submission. After rewinding past a
   materialize_children state, stale children remain on disk and in cloud sync; the
   next tasks submission appends to the stale batch rather than replacing it, leaving
   the orchestration in an inconsistent state that cannot be recovered without a full
-  cancel+cleanup cycle.
+  cancel+cleanup cycle. The work done by those children is real (commits exist in the
+  repo) and agents need to inspect the koto context to understand it.
 decision: |
-  When handle_rewind detects that the rewound-from state has a materialize_children
-  hook, it cleans up all child sessions via backend.cleanup() (which chains to S3
-  deletion under CloudBackend). A seq-based epoch filter in
-  augment_snapshots_with_child_completed ignores ChildCompleted events written before
-  the rewind boundary, closing the race where a child completes between the Rewound
-  event append and the cleanup loop.
+  Rewind relocates children to a superseded branch rather than deleting them. Each
+  child session is renamed from parent.task to parent~N.task (where N is the epoch
+  counter), and its parent_workflow header is updated to parent~N. The current branch
+  gets clean names for re-submission. Superseded branches remain fully queryable via
+  standard koto commands (status, query, workflows --children parent~N).
 rationale: |
-  Cleanup-on-rewind is the minimal correct fix: it removes stale children from disk
-  and cloud in one operation using existing backend.cleanup() infrastructure, and the
-  epoch filter closes the only remaining race at two call sites with no schema changes.
-  The alternative of making re-submission idempotent (reconciling old children with a
-  new task list) was rejected because the late-arriving ChildCompleted race is a
-  fundamental correctness problem that requires schema changes and epoch tagging
-  throughout the event model — disproportionate complexity for a "start over" operation.
+  Cleanup-on-rewind destroys the only context that explains why commits in the repo
+  exist. The branching model preserves history while giving the current batch a clean
+  namespace. The epoch convention (tilde-N suffix) reuses existing session naming and
+  requires no schema changes to the event model — only a new relocate operation on
+  the session backend and epoch-aware filtering in the scheduler and gate.
 ---
 
 # DESIGN: Batch-Aware Rewind
@@ -40,179 +38,226 @@ After rewinding past a `materialize_children` state:
 - `ChildCompleted` events (from #134) written by children to the parent's log may reference tasks that no longer belong to the current epoch.
 - Under `CloudBackend`, stale child sessions may have been pushed to S3 and would need reconciliation after a local rewind.
 
-The workaround today is `koto cancel --cleanup` followed by `koto init` to start fresh, discarding all orchestration state. This is destructive — it loses any progress made before the bad submission.
+The workaround today is `koto cancel --cleanup` followed by `koto init` to start fresh, discarding all orchestration state. This is destructive — it loses both parent history and child context. The work done by the children (code changes, test runs, decisions recorded) persists in the repo, but the koto state that explains *why* that work was done is gone.
 
 ## Decision Drivers
 
-- **Correctness**: After rewind, the batch state must be consistent. No stale children should appear in the gate, scheduler, or status output.
-- **Cloud parity**: Local state changes from rewind must propagate correctly when consumed through the cloud backend. Stale child sessions on S3 must not leak into the gate's view.
+- **Context preservation**: The work done by children is real — commits exist in the repo. Agents need the koto state to understand what decisions were made, what evidence was submitted, and how the workflow progressed. Rewind must not destroy this context.
+- **Correctness**: After rewind, the current batch must be consistent. Superseded children must not appear in the gate, scheduler, or status output for the current branch.
+- **Queryability**: Superseded branches must remain inspectable through standard koto commands. An agent asking "what happened in the previous attempt?" should be able to find it.
+- **Cloud parity**: Local state changes from rewind must propagate correctly when consumed through the cloud backend.
 - **Minimal blast radius**: Non-batch rewind must remain unchanged — a simple, fast log operation.
-- **Recoverability**: The design should preserve as much prior progress as possible. A rewind past a bad task submission should not force loss of all orchestration history.
-- **Simplicity**: The rewind operation should remain understandable to users. Side-effect cleanup should be predictable and well-documented.
+- **Simplicity**: The branching model must be intuitive. Users already understand rewind as "go back." The branch metaphor adds "and the work you did is over there."
 
 ## Considered Options
 
-### Decision 1: Local Batch Cleanup on Rewind
+### Decision 1: What happens to child sessions on rewind?
 
 What happens to child sessions, stale task-list evidence, and ChildCompleted events when a batch parent rewinds past a `materialize_children` state?
 
 Key assumptions:
 - Children do not write to the parent log except via `ChildCompleted`.
-- `backend.cleanup()` is synchronous and removes the state file before returning, preventing further child events.
-- The rewind target is always one state back (current `handle_rewind` behavior).
 - Reused task names across rewind boundaries are a supported use case.
+- Agents need to inspect superseded children to understand prior work.
+- The session naming convention `parent.task` is the only namespace collision point.
 
-#### Chosen: Clean children on rewind + epoch-filter ChildCompleted
+#### Chosen: Relocate children to a superseded branch (epoch-based renaming)
 
-When `handle_rewind` detects that the rewound-from state has a `materialize_children` hook, it lists all children of the parent and calls `backend.cleanup()` for each. This gives the next submission a clean slate.
+On rewind past a `materialize_children` state:
 
-On top of cleanup, a seq-based epoch filter is added to `augment_snapshots_with_child_completed` (and the parallel batch-view logic). The filter finds the seq of the last `Rewound` event and ignores any `ChildCompleted` event with seq <= that boundary. This closes the narrow race where a child completes between the `Rewound` event append and the cleanup loop, writing a `ChildCompleted` with a post-rewind seq number.
+1. Compute the epoch counter N from the number of `Rewound` events in the parent's log (the rewind being appended is epoch N).
+2. For each child session whose `parent_workflow == parent_name`:
+   - Rename the session directory from `parent.task` to `parent~N.task`.
+   - Update the state file header's `parent_workflow` field from `parent` to `parent~N`.
+3. The current branch now has no children (they've all moved to `parent~N.*`). The scheduler starts fresh.
+4. `ChildCompleted` events from the old epoch are filtered by a seq-based epoch boundary (events with seq <= the `Rewound` event's seq are ignored), closing the race where a child completes between the Rewound event and the relocate loop.
 
-No schema changes to `ChildCompleted`. No changes to `extract_tasks` — after cleanup, stale evidence is harmless because the scheduler finds no on-disk children to match against.
+The `~N` naming convention:
+- Chosen because `~` is not valid in user-provided workflow names (it's a namespace separator for internal use).
+- Visually communicates "branch N of parent" without ambiguity.
+- Sorts naturally in directory listings (`parent~1.task-a` before `parent~2.task-a`).
 
 #### Alternatives Considered
 
-**Option A: Clean children only (no epoch filter).** Nearly correct, but leaves a real race condition: a child completing between the `Rewound` event append and the cleanup loop writes a `ChildCompleted` with a valid post-rewind seq. If the new task list reuses that name, the scheduler incorrectly treats it as terminal. The race window is milliseconds, but the consequence is silent data corruption.
+**Option A: Clean children on rewind (delete).** Removes stale children from disk and cloud. Correct and simple, but destroys the koto context that explains why commits in the repo exist. An agent that needs to understand what happened in the previous batch attempt has no state to inspect. Rejected because context preservation is a primary driver.
 
-**Option B: No cleanup; make re-submission idempotent.** The scheduler reconciles old children with the new task list. Rejected because the late-arriving `ChildCompleted` race is a fundamental correctness problem: a running child from the old batch has no knowledge of the parent's rewind, so when it terminates it poisons the new epoch's event stream. Fixing this requires epoch tagging on every `ChildCompleted` event and filtering in every consumer — disproportionate complexity for what is a "start over" operation.
+**Option B: No cleanup; make re-submission idempotent.** The scheduler reconciles old children with the new task list. The late-arriving `ChildCompleted` race is a fundamental correctness problem that requires schema changes and epoch tagging throughout the event model. Children that were completed in the old batch but need to re-run in the new batch would appear as already-terminal, silently skipping work. Rejected for complexity and correctness risk.
 
-**Option C: Full hybrid (A + B).** Union of all changes from cleanup and reconciliation. Strongest correctness, but the epoch-aware `extract_tasks` and full reconciliation logic are unnecessary when cleanup removes stale children. Implementation risk is high — the filtering touches hot paths in the scheduler and gate evaluator.
+**Option C: Epoch-tag children in place (no rename).** Add an epoch field to each child's header; the scheduler filters by epoch match. Avoids the rename, but causes name collisions: the new batch tries to spawn `parent.task-1` and hits the existing session. The collision guard (from #133) rejects it. To work, this approach requires the scheduler to delete-and-recreate sessions that exist from old epochs — which is cleanup under a different name, and loses the context just the same. Rejected because it doesn't solve the name collision without destroying context.
 
-### Decision 2: Cloud Propagation of Batch Rewind
+### Decision 2: Cloud propagation of batch rewind
 
-How does the cloud backend handle locally-rewound batch state, given that child sessions may have been pushed to S3 before the local rewind?
+How does the cloud backend handle locally-relocated batch children?
 
 Key assumptions:
-- `CloudBackend::cleanup()` chains local deletion with `sync_delete_session()` to remove S3 objects.
-- `sync_delete_session`'s best-effort semantics (warn-and-continue on S3 errors) are acceptable, matching the existing cleanup contract.
-- The v1 limitation where `CloudBackend::list()` produces placeholder entries with empty `parent_workflow` for S3-only sessions provides accidental safety — stale remote-only children are invisible to the gate.
+- `CloudBackend` stores sessions as S3 prefix `<session-name>/`.
+- The existing `sync_push_state` and `sync_delete_session` APIs are available.
+- Network failures during rewind must not corrupt state.
 
-#### Chosen: Immediate S3 cleanup via existing `backend.cleanup()`
+#### Chosen: Relocate on S3 via copy-then-delete, with deferred fallback
 
-Since Decision 1 calls `backend.cleanup()` for each stale child, cloud propagation happens automatically with zero additional code. `CloudBackend::cleanup()` already chains local deletion with `sync_delete_session()`. The parent's `Rewound` event is pushed to S3 via `append_event` → `sync_push_state` before child cleanup begins, preserving the "push parent before child mutation" ordering from the batch child-spawning design.
+During the relocate loop, for each child:
+1. **Local**: `fs::rename(old_dir, new_dir)` — atomic on the same filesystem.
+2. **Cloud**: copy the child's S3 objects from `old-prefix/` to `new-prefix/`, then delete the old prefix. This is a multi-step S3 operation (list + copy + delete) and inherently non-atomic.
+3. **Header update**: rewrite the state file's first line (header) with the updated `parent_workflow` field before the S3 copy, so the remote copy arrives with the correct metadata.
 
-For the network-failure case: if S3 is unreachable during rewind, children are removed locally but persist on S3. The parent's `Rewound` event is committed locally and will be pushed on the next successful sync. Stale children on S3 are filtered from the gate by the v1 `parent_workflow: None` limitation. For explicit recovery, `koto session resolve --children` already handles per-child reconciliation.
+For network failures: if the S3 copy fails, the local rename has already succeeded. The child is locally at `parent~N.task` but remotely still at `parent.task`. This is a transient inconsistency handled by `koto session resolve --children`:
+- Local has `parent~N.task` (with `parent_workflow: parent~N`).
+- Remote has `parent.task` (with `parent_workflow: parent`).
+- The strict-prefix classifier detects the mismatch and flags it for resolution.
+
+The parent's `Rewound` event is pushed to S3 first (via `append_event` → `sync_push_state`), preserving the "push parent before child mutation" ordering.
 
 #### Alternatives Considered
 
-**Option B: Lazy reconciliation via `session resolve --children`.** Don't touch S3 during rewind; rely on explicit resolve. Rejected because it creates a mandatory manual step after every cloud-backend rewind and relies on a known v1 bug for correctness — when `CloudBackend::list()` is fixed to download remote headers, stale children would leak into the gate.
+**Option B: Lazy reconciliation only.** Don't touch S3 during rewind; rely on `session resolve` later. Creates a mandatory manual step and leaves stale children visible on S3 in the interim. Rejected because agents on other machines would see an inconsistent state.
 
-**Option C: Epoch-tagged sessions.** Tag child sessions with the parent's epoch; the gate ignores mismatches. Rejected as over-engineered: introduces epoch counters across the event model, header format, and gate evaluator, and still needs a GC mechanism for S3 storage cleanup. `backend.cleanup()` achieves the same correctness with less code.
-
-**Option D: Push parent rewind + deferred child GC.** Push the parent's `Rewound` event to S3, then filter stale children at gate query time using epoch awareness. Rejected because it adds complexity to `build_children_complete_output` (already ~200 lines) when the storage-layer cleanup from Option A is simpler and already tested.
+**Option C: Delete from S3, re-create under new name.** Equivalent to cleanup-on-S3 + create. Loses the S3 history if the copy fails midway. The copy-then-delete approach is safer because the old data persists until the copy is confirmed. Rejected for lower resilience.
 
 ## Decision Outcome
 
-The two decisions compose cleanly: Decision 1 handles local semantics (cleanup children + epoch-filter ChildCompleted), and Decision 2 confirms that `backend.cleanup()` propagates the local changes to S3 automatically.
+The two decisions compose into a branching model for batch rewind:
 
-After rewind past a `materialize_children` state:
 1. `handle_rewind` appends the `Rewound` event (pushed to S3 under cloud backend).
-2. `handle_rewind` loads the compiled template, checks if the rewound-from state has a `materialize_children` hook.
-3. If yes: lists all children of the parent via `backend.list()`, calls `backend.cleanup()` for each.
-4. The epoch filter in `augment_snapshots_with_child_completed` ignores any `ChildCompleted` event with seq <= the `Rewound` event's seq.
-5. The next `koto next <parent>` call starts with a blank batch — no on-disk children, no stale evidence in scope.
+2. Computes epoch counter N from the parent's rewind history.
+3. Checks if the rewound-from state has a `materialize_children` hook.
+4. If yes: relocates each child from `parent.<task>` to `parent~N.<task>` (local rename + cloud copy-then-delete + header update).
+5. Epoch filter in `augment_snapshots_with_child_completed` ignores `ChildCompleted` events with seq <= the Rewound event's seq.
+6. The next `koto next <parent>` starts with a clean batch. The superseded children remain at `parent~N.*`, fully queryable.
 
-Non-batch rewind is unchanged: step 2 finds no hook, steps 3-4 are skipped.
+Non-batch rewind is unchanged: step 3 finds no hook, steps 4-5 are skipped.
 
 ## Solution Architecture
 
 ### Overview
 
-The fix is localized to two files: `src/cli/mod.rs` (rewind handler) and `src/cli/batch.rs` (epoch filter). No new types, no schema changes, no new CLI flags.
+Three changes: a `relocate` operation on the session backend, batch-aware rewind in `handle_rewind`, and epoch filtering in the ChildCompleted consumer. Plus a query surface so agents can discover and inspect superseded branches.
 
 ### Components
 
-**`handle_rewind` extension** (`src/cli/mod.rs`). After appending the `Rewound` event and before printing the response, the handler:
-1. Reads the compiled template path from `derive_machine_state` (which extracts it from the `WorkflowInitialized` event payload).
-2. Checks if the `from` state (the state being rewound from) has a `materialize_children` hook.
-3. If yes: calls `backend.list()`, filters to children whose `parent_workflow` matches the parent's name, and calls `backend.cleanup(child_id)` for each.
+**`SessionBackend::relocate(from, to)`** (`src/session/mod.rs`, `local.rs`, `cloud.rs`). New trait method that renames a session and updates its state header. Local implementation uses `fs::rename`. Cloud implementation does local rename, then S3 copy-then-delete (best-effort; failure leaves local state correct and remote recoverable via `session resolve`).
 
-The template is already loaded elsewhere in the codebase (`handle_cancel`, `handle_next`); the pattern is established. The `from` state is available in the `Rewound` event payload.
+**`handle_rewind` extension** (`src/cli/mod.rs`). After appending the `Rewound` event:
+1. Loads the compiled template via `derive_machine_state`.
+2. Checks if the `from` state has a `materialize_children` hook.
+3. If yes: computes epoch N, lists children by `parent_workflow`, calls `backend.relocate(child, new_name)` for each, updates each child's `parent_workflow` header to `parent~N`.
+4. Response includes `superseded_branch: "parent~N"` and `children_relocated: count`.
 
-**Epoch-boundary seq helper** (`src/cli/batch.rs`). A small function `last_rewind_seq(events: &[Event]) -> Option<u64>` that scans the event list for the last `Rewound` event and returns its `seq` field. Returns `None` if no rewind has occurred.
+**Epoch filter** (`src/cli/batch.rs`). `last_rewind_seq(events) -> Option<u64>` helper. Both `augment_snapshots_with_child_completed` and `build_children_complete_output` skip `ChildCompleted` events with seq <= the boundary.
 
-**`augment_snapshots_with_child_completed` filter** (`src/cli/batch.rs`). When iterating `ChildCompleted` events, skip any with `event.seq <= boundary_seq` (where `boundary_seq` comes from the helper above). Applied in two locations:
-1. `augment_snapshots_with_child_completed` (used by the scheduler's snapshot path).
-2. The parallel block in `build_children_complete_output` (used by the gate output builder).
+**Query surface for superseded branches**:
+- `koto status parent~N.task-1` — works out of the box (it's a normal session with a funny name).
+- `koto query parent~N.task-1` — works out of the box.
+- `koto workflows --children parent~N` — lists children of the superseded branch (matches `parent_workflow == parent~N`).
+- `koto workflows --children parent` — lists only current-branch children (matches `parent_workflow == parent`). Superseded children are excluded because their `parent_workflow` was updated to `parent~N`.
+- `koto status parent` gains a `superseded_branches` field listing `["parent~1", "parent~2", ...]` derived from the parent's `Rewound` events. This is the discovery surface — an agent sees the branches exist and can drill into any of them.
 
 ### Key Interfaces
 
-No new public interfaces. The changes are internal to existing functions:
-- `handle_rewind(backend, name)` gains batch-awareness via a conditional block.
-- `augment_snapshots_with_child_completed` gains an `epoch_boundary_seq: Option<u64>` parameter.
-- `build_children_complete_output` calls `last_rewind_seq` and passes it through.
+**New trait method:**
+```rust
+fn relocate(&self, from: &str, to: &str) -> anyhow::Result<()>;
+```
+Renames a session directory and updates the state file header's `parent_workflow` (and optionally `name`) field. Returns `Err` if `from` doesn't exist or `to` already exists.
+
+**Response additions:**
+- `koto rewind` response: `superseded_branch: Option<String>`, `children_relocated: usize`.
+- `koto status` response (batch parent only): `superseded_branches: Vec<String>`.
 
 ### Data Flow
 
 ```
 koto rewind <parent>
-  │
-  ├─ append Rewound event to parent log
-  │   └─ (cloud: push parent log to S3)
-  │
-  ├─ load compiled template from state header
-  │
-  ├─ check: does `from` state have materialize_children?
-  │   ├─ NO  → done (non-batch rewind, unchanged)
-  │   └─ YES → list children, cleanup each
-  │            └─ (cloud: delete each child from S3)
-  │
-  └─ print rewind response (with children_cleaned count)
+  |
+  +-- append Rewound event to parent log
+  |     (cloud: push parent log to S3)
+  |
+  +-- load compiled template
+  |
+  +-- check: does `from` state have materialize_children?
+  |     NO  -> done (non-batch rewind, unchanged)
+  |     YES -> compute epoch N
+  |             for each child:
+  |               relocate parent.task -> parent~N.task
+  |               update header: parent_workflow = parent~N
+  |               (cloud: copy to new S3 prefix, delete old)
+  |
+  +-- print rewind response
+        { superseded_branch: "parent~N", children_relocated: 3 }
 
 koto next <parent>  (after rewind)
-  │
-  ├─ extract_tasks: no EvidenceSubmitted in current epoch → empty task list
-  ├─ augment_snapshots: epoch filter skips stale ChildCompleted events
-  ├─ scheduler: no tasks, no children → NoBatch
-  └─ agent submits new tasks → fresh batch starts from zero
+  |
+  +-- extract_tasks: no EvidenceSubmitted in current epoch -> empty
+  +-- augment_snapshots: epoch filter skips stale ChildCompleted
+  +-- scheduler: no tasks, no children -> NoBatch
+  +-- agent submits new tasks -> fresh batch starts from zero
+
+koto status parent
+  { ..., superseded_branches: ["parent~1"] }
+
+koto workflows --children parent~1
+  [ { name: "parent~1.task-a", state: "done", ... } ]
+
+koto status parent~1.task-a
+  { name: "parent~1.task-a", state: "done", ... }
 ```
 
 ## Implementation Approach
 
-### Phase 1: Batch-aware rewind + epoch filter
+### Phase 1: Session relocate primitive
 
-Phases 1 and 2 must ship as a single commit. The design identifies the Phase-1-only race (a child completing between the `Rewound` event and the cleanup loop) as "silent data corruption" — shipping cleanup without the epoch filter creates a correctness gap, even if it's narrow.
-
-Modify `handle_rewind` in `src/cli/mod.rs` to detect `materialize_children` on the rewound-from state and cleanup children. Simultaneously add the `last_rewind_seq` helper and epoch filter to both ChildCompleted consumers.
-
-Note: after batch cleanup, the existing `query_children` call in `handle_rewind` returns an empty array. The `children` field in the rewind response changes from populated to empty after a batch rewind — this is correct behavior (stale children are gone) but agents parsing the response should not be surprised.
+Add `SessionBackend::relocate(from, to)` to the trait with local and cloud implementations. The local side is `fs::rename` + header rewrite. The cloud side is copy-then-delete with best-effort S3 semantics.
 
 Deliverables:
-- `src/cli/mod.rs`: conditional cleanup block in `handle_rewind`
-- `src/cli/batch.rs`: `last_rewind_seq` helper, epoch filter in `augment_snapshots_with_child_completed` and `build_children_complete_output`
-- Integration tests: rewind past batch state, verify children are gone, verify re-init succeeds
-- Unit tests for the epoch filter (events before/after boundary)
+- `src/session/mod.rs`: trait method
+- `src/session/local.rs`: local implementation
+- `src/session/cloud.rs`: cloud implementation
+- Unit tests for relocate (name change, header update, collision rejection)
 
-### Phase 2: Cloud + documentation
+### Phase 2: Batch-aware rewind + epoch filter
 
-Verify cloud propagation works end-to-end (cleanup already chains to S3). Update the rewind response to include `children_cleaned: N` so agents know batch cleanup occurred. Update `koto-user` skill docs.
+This must ship as a single change — the epoch filter closes the ChildCompleted race that exists without it.
+
+Modify `handle_rewind` to detect `materialize_children`, compute epoch, relocate children. Add `last_rewind_seq` helper and epoch filter to both ChildCompleted consumers.
 
 Deliverables:
-- `tests/`: cloud integration test (if cloud test infra supports it) or manual verification
-- `plugins/koto-skills/skills/koto-user/references/command-reference.md`: document rewind behavior for batch parents
-- `plugins/koto-skills/skills/koto-user/references/batch-workflows.md`: document rewind as a recovery path
+- `src/cli/mod.rs`: conditional relocate block in `handle_rewind`
+- `src/cli/batch.rs`: `last_rewind_seq` helper, epoch filter
+- Integration tests: rewind past batch state, verify children relocated, verify re-init succeeds, verify superseded branch queryable
+
+### Phase 3: Query surface + documentation
+
+Add `superseded_branches` to `koto status` for batch parents. Update `koto-user` skill docs with the branching model, the query surface, and rewind-as-recovery for batch workflows.
+
+Deliverables:
+- `src/cli/mod.rs`: `handle_status` gains `superseded_branches` field
+- `plugins/koto-skills/skills/koto-user/references/command-reference.md`: document rewind for batch parents
+- `plugins/koto-skills/skills/koto-user/references/batch-workflows.md`: document branching, query surface
 
 ## Security Considerations
 
 This design modifies file-system and S3 operations during rewind but does not introduce new attack surface:
-- **No external inputs**: Rewind operates on the parent's own event log and enumerates children from `backend.list()`, which reads only from the sessions directory controlled by koto.
-- **No permission escalation**: `backend.cleanup()` removes session directories that koto created; no new filesystem permissions required.
-- **No data exposure**: Child sessions contain workflow state, not credentials. Cleanup deletes them.
-- **S3 deletion**: `sync_delete_session` uses the same authenticated S3 client as existing cleanup paths; no new credentials or scopes.
+- **No external inputs**: Rewind operates on the parent's own event log and enumerates children from `backend.list()`.
+- **No permission escalation**: `relocate` renames directories that koto created; no new permissions.
+- **Session name validation**: The `~N` epoch suffix must be validated by the same `validate_session_id` function used elsewhere, preventing path traversal.
+- **S3 copy-then-delete**: Uses the same authenticated S3 client as existing operations; no new credentials or scopes.
 
-No new attack surface. The S3 data-retention failure mode (stale children persist on S3 after a network failure during rewind) is documented in Consequences; it is a correctness concern, not a security one, and `koto session resolve --children` provides explicit recovery.
+No new attack surface. The S3 data-retention failure mode (old-prefix objects may persist if copy-then-delete fails partway) is a correctness concern, not a security one.
 
 ## Consequences
 
 ### Positive
-- Rewind past a `materialize_children` state produces a clean slate. Agents can fix a bad task submission without `cancel --cleanup` + `koto init`.
-- Cloud state stays consistent: stale children are deleted from S3 in the same operation.
-- Non-batch rewind is unchanged — the conditional block is skipped when no `materialize_children` hook is present.
+- Rewind past `materialize_children` produces a clean namespace without destroying history. Agents can fix a bad task submission and still inspect prior work.
+- Superseded branches are fully queryable with standard koto commands — no new CLI surface needed for basic inspection.
+- Non-batch rewind is unchanged.
+- The branching model is intuitive: "your old work is at `parent~1.*`, carry on."
 
 ### Negative
-- Progress in completed children is lost on rewind. If a batch had 50 tasks and 48 completed, rewinding to fix the task list forces all 50 to re-run.
-- The `sync_delete_session` best-effort semantics mean S3 children may persist after a network failure during rewind.
+- `SessionBackend::relocate` is new API surface on the trait. Both local and cloud backends need implementations.
+- S3 relocate is non-atomic (copy-then-delete). Partial failures leave the old prefix intact, creating temporary duplicates.
+- The `~N` naming convention consumes namespace. Multiple rewinds produce `parent~1`, `parent~2`, etc. These persist until explicitly cleaned up.
 
 ### Mitigations
-- Progress loss is inherent to rewind semantics ("go back and start over"). The workaround (`cancel --cleanup`) already loses all progress. This design loses less (parent history is preserved).
-- For the S3 failure case, `koto session resolve --children` provides explicit recovery. The epoch filter prevents stale ChildCompleted events from affecting correctness regardless of S3 state.
+- The local relocate is a single `fs::rename` — atomic and fast. The cloud side is best-effort with `session resolve` as the recovery path, matching existing patterns.
+- Superseded branches can be cleaned up with `koto session cleanup parent~N` when no longer needed. A future `koto gc` could automate this.
+- The `~` character is reserved in session naming validation, preventing user-created sessions from colliding with epoch branches.
