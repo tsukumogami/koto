@@ -1304,7 +1304,7 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         }));
     }
 
-    let (_header, events) = match backend.read_events(name) {
+    let (header, events) = match backend.read_events(name) {
         Ok(result) => result,
         Err(err) => {
             let code = exit_code_for_engine_error(&err);
@@ -1347,8 +1347,12 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         _ => unreachable!(),
     };
 
+    // The `from` state is the state we're rewinding FROM (current state
+    // before rewind).
+    let from_state = current_state;
+
     let rewind_payload = EventPayload::Rewound {
-        from: current_state,
+        from: from_state.clone(),
         to: prev_state.clone(),
     };
 
@@ -1359,17 +1363,111 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         }));
     }
 
+    // Re-read events to include the Rewound event we just appended.
+    let (_, events_after) = match backend.read_events(name) {
+        Ok(result) => result,
+        Err(_) => {
+            // Fall back to pre-rewind events if re-read fails. The
+            // epoch count will be computed from those, which is one
+            // short, but that's better than failing the entire command.
+            (header.clone(), events.clone())
+        }
+    };
+
+    // Check if the `from` state has a materialize_children hook. If
+    // so, we need to relocate existing children to an epoch branch.
+    let (superseded_branch, children_relocated) =
+        rewind_relocate_children(backend, name, &from_state, &header, &events_after);
+
     let children = query_children(backend, name);
 
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "name": name,
-            "state": prev_state,
-            "children": children
-        }))?
-    );
+    let mut response = serde_json::json!({
+        "name": name,
+        "state": prev_state,
+        "children": children
+    });
+    if let Some(branch) = &superseded_branch {
+        response["superseded_branch"] = serde_json::json!(branch);
+    } else {
+        response["superseded_branch"] = serde_json::Value::Null;
+    }
+    response["children_relocated"] = serde_json::json!(children_relocated);
+
+    println!("{}", serde_json::to_string(&response)?);
     Ok(())
+}
+
+/// If the `from_state` has a `materialize_children` hook, relocate all
+/// children of `parent_name` to an epoch branch (`<parent>~<N>.<task>`).
+///
+/// Returns `(Some(branch_prefix), count)` when children were relocated,
+/// or `(None, 0)` when the state has no hook or there are no children.
+fn rewind_relocate_children(
+    backend: &dyn SessionBackend,
+    parent_name: &str,
+    from_state: &str,
+    header: &crate::engine::types::StateFileHeader,
+    events_after: &[Event],
+) -> (Option<String>, usize) {
+    // Load the compiled template to check for materialize_children.
+    let machine_state = match derive_machine_state(header, events_after) {
+        Some(ms) => ms,
+        None => return (None, 0),
+    };
+    let template_bytes = match std::fs::read(&machine_state.template_path) {
+        Ok(b) => b,
+        Err(_) => return (None, 0),
+    };
+    let compiled: CompiledTemplate = match serde_json::from_slice(&template_bytes) {
+        Ok(t) => t,
+        Err(_) => return (None, 0),
+    };
+
+    // Check if the from_state has a materialize_children hook.
+    let has_hook = compiled
+        .states
+        .get(from_state)
+        .and_then(|s| s.materialize_children.as_ref())
+        .is_some();
+    if !has_hook {
+        return (None, 0);
+    }
+
+    // Compute epoch N: count ALL Rewound events in the full event list
+    // (including the one just appended).
+    let epoch: usize = events_after
+        .iter()
+        .filter(|e| matches!(e.payload, EventPayload::Rewound { .. }))
+        .count();
+
+    let branch_prefix = format!("{}~{}", parent_name, epoch);
+
+    // List children whose parent_workflow == parent_name.
+    let sessions = match backend.list() {
+        Ok(s) => s,
+        Err(_) => return (Some(branch_prefix), 0),
+    };
+
+    let child_prefix = format!("{}.", parent_name);
+    let mut relocated = 0usize;
+    for info in sessions {
+        if info.parent_workflow.as_deref() != Some(parent_name) {
+            continue;
+        }
+        // Only relocate children that match `<parent>.<suffix>`, not
+        // children from previous epochs (which would start with
+        // `<parent>~N.`).
+        if !info.id.starts_with(&child_prefix) {
+            continue;
+        }
+        let suffix = &info.id[child_prefix.len()..];
+        let new_name = format!("{}.{}", branch_prefix, suffix);
+        if backend.relocate(&info.id, &new_name).is_ok() {
+            relocated += 1;
+        }
+    }
+
+    (Some(branch_prefix), relocated)
 }
 
 /// Decide whether a workflow state's entry into `handle_next` must be
@@ -2694,6 +2792,22 @@ fn handle_next(
                         if let Err(e) = backend.append_event(&name, &payload, &ts) {
                             eprintln!("warning: failed to append BatchFinalized event: {}", e);
                         }
+                        // Persist batch_final_view to the context store
+                        // so agents can retrieve it via `koto context get
+                        // <wf> batch_final_view` without parsing the
+                        // event log or terminal response.
+                        let view_json =
+                            serde_json::to_value(&view).unwrap_or(serde_json::Value::Null);
+                        if let Ok(serialized) = serde_json::to_string_pretty(&view_json) {
+                            if let Err(e) =
+                                context_store.add(&name, "batch_final_view", serialized.as_bytes())
+                            {
+                                eprintln!(
+                                    "warning: failed to write batch_final_view to context: {}",
+                                    e
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -3261,8 +3375,36 @@ fn handle_status(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         response["batch"] = batch_json;
     }
 
+    // Superseded branches: list sessions whose name starts with
+    // `<name>~`, extract unique branch prefixes. These are children
+    // relocated by batch-aware rewind.
+    let superseded = derive_superseded_branches(backend, name);
+    if !superseded.is_empty() {
+        response["superseded_branches"] = serde_json::json!(superseded);
+    }
+
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
+}
+
+/// Discover superseded branches by scanning for sessions whose name
+/// starts with `<parent_name>~`. Returns unique branch prefixes
+/// (e.g., `["parent~1", "parent~2"]`), sorted.
+fn derive_superseded_branches(backend: &dyn SessionBackend, parent_name: &str) -> Vec<String> {
+    let prefix = format!("{}~", parent_name);
+    let sessions = match backend.list() {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut branches: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for info in sessions {
+        if let Some(pw) = &info.parent_workflow {
+            if pw.starts_with(&prefix) {
+                branches.insert(pw.clone());
+            }
+        }
+    }
+    branches.into_iter().collect()
 }
 
 /// Query child workflows for a given parent name.

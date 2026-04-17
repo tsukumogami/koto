@@ -38,6 +38,16 @@ pub fn validate_workflow_name(name: &str) -> Result<(), String> {
         return Err("workflow name must not contain null bytes".to_string());
     }
 
+    // Tilde is reserved for epoch-branch naming (e.g., `parent~1.task-a`
+    // after a batch rewind). Reject it with a specific error before the
+    // general character check so the message is clear.
+    if name.contains('~') {
+        return Err(format!(
+            "workflow name '{}' contains '~', which is reserved for internal epoch branching",
+            if name.len() > 50 { &name[..50] } else { name }
+        ));
+    }
+
     // Validate against strict pattern: starts with alphanumeric, then
     // alphanumeric, hyphens, dots, or underscores.
     let valid = name.chars().enumerate().all(|(i, c)| {
@@ -262,6 +272,14 @@ mod tests {
     #[test]
     fn rejects_null_bytes() {
         assert!(validate_workflow_name("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn rejects_tilde_reserved_for_epochs() {
+        let result = validate_workflow_name("my~workflow");
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains('~'), "error should mention tilde: {}", msg);
     }
 
     #[test]

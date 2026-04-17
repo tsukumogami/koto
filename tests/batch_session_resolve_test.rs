@@ -313,6 +313,10 @@ impl SessionBackend for RecorderBackend {
         self.inner.init_state_file(id, header, initial_events)
     }
 
+    fn relocate(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.inner.relocate(from, to)
+    }
+
     fn lock_state_file(&self, id: &str) -> Result<SessionLock, SessionError> {
         self.inner.lock_state_file(id)
     }
