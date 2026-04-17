@@ -1,0 +1,9 @@
+{
+  "topic": "batch-rewind",
+  "decisions": [
+    {"id": 1, "question": "When a batch parent rewinds past a materialize_children state, what happens to the child sessions, the stale task-list evidence, and any ChildCompleted events written by those children?", "status": "complete", "complexity": "standard", "chosen": "Clean children on rewind + epoch-filter ChildCompleted", "report": "wip/design_batch-rewind_decision_1_report.md"},
+    {"id": 2, "question": "How does the cloud backend handle locally-rewound batch state, given that child sessions may have been pushed to S3 before the local rewind?", "status": "complete", "complexity": "standard", "chosen": "Immediate S3 cleanup via existing backend.cleanup()", "report": "wip/design_batch-rewind_decision_2_report.md"}
+  ],
+  "cross_validation": "pending",
+  "round": 0
+}
