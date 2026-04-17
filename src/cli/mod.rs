@@ -3359,8 +3359,36 @@ fn handle_status(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         response["batch"] = batch_json;
     }
 
+    // Superseded branches: list sessions whose name starts with
+    // `<name>~`, extract unique branch prefixes. These are children
+    // relocated by batch-aware rewind.
+    let superseded = derive_superseded_branches(backend, name);
+    if !superseded.is_empty() {
+        response["superseded_branches"] = serde_json::json!(superseded);
+    }
+
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
+}
+
+/// Discover superseded branches by scanning for sessions whose name
+/// starts with `<parent_name>~`. Returns unique branch prefixes
+/// (e.g., `["parent~1", "parent~2"]`), sorted.
+fn derive_superseded_branches(backend: &dyn SessionBackend, parent_name: &str) -> Vec<String> {
+    let prefix = format!("{}~", parent_name);
+    let sessions = match backend.list() {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut branches: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for info in sessions {
+        if let Some(pw) = &info.parent_workflow {
+            if pw.starts_with(&prefix) {
+                branches.insert(pw.clone());
+            }
+        }
+    }
+    branches.into_iter().collect()
 }
 
 /// Query child workflows for a given parent name.

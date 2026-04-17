@@ -488,3 +488,72 @@ fn tilde_in_workflow_name_rejected() {
         error
     );
 }
+
+// -----------------------------------------------------------------------
+// Test 5: koto status shows superseded_branches after batch rewind
+// -----------------------------------------------------------------------
+
+#[test]
+fn status_shows_superseded_branches_after_rewind() {
+    let tmp = TempDir::new().unwrap();
+    let parent_path = write_batch_templates(tmp.path());
+
+    // Init parent, advance to plan, submit tasks.
+    let (ok, _, _) = run_koto(
+        tmp.path(),
+        &["init", "orch", "--template", parent_path.to_str().unwrap()],
+    );
+    assert!(ok);
+    let (ok, _, _) = run_koto(tmp.path(), &["next", "orch"]);
+    assert!(ok);
+    let payload = serde_json::json!({
+        "tasks": [{"name": "t1", "waits_on": [], "vars": {}}]
+    });
+    let (ok, _, _) = run_koto(
+        tmp.path(),
+        &["next", "orch", "--with-data", &payload.to_string()],
+    );
+    assert!(ok);
+
+    // Before rewind: status should NOT have superseded_branches.
+    let (ok, json, _) = run_koto(tmp.path(), &["status", "orch"]);
+    assert!(ok);
+    assert!(
+        json.get("superseded_branches").is_none(),
+        "no superseded_branches before rewind: {}",
+        json
+    );
+
+    // Rewind.
+    let (ok, _, _) = run_koto(tmp.path(), &["rewind", "orch"]);
+    assert!(ok);
+
+    // After rewind: status should show superseded_branches.
+    let (ok, json, _) = run_koto(tmp.path(), &["status", "orch"]);
+    assert!(ok);
+    let branches = json["superseded_branches"]
+        .as_array()
+        .expect("superseded_branches should be an array");
+    assert_eq!(branches.len(), 1, "should have 1 superseded branch");
+    assert_eq!(
+        branches[0].as_str(),
+        Some("orch~1"),
+        "branch name should be orch~1"
+    );
+
+    // koto workflows --children orch~1 should list the relocated child.
+    let (ok, json, _) = run_koto(tmp.path(), &["workflows", "--children", "orch~1"]);
+    assert!(ok);
+    let children = json.as_array().expect("workflows returns array");
+    assert_eq!(
+        children.len(),
+        1,
+        "superseded branch should have 1 child: {}",
+        json
+    );
+    assert_eq!(
+        children[0]["name"].as_str(),
+        Some("orch~1.t1"),
+        "child name should be orch~1.t1"
+    );
+}
