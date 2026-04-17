@@ -1,5 +1,5 @@
 ---
-status: Planned
+status: Current
 problem: |
   koto rewind rolls back the parent's event log but does not touch child sessions
   spawned as a side effect of batch evidence submission. After rewinding past a
