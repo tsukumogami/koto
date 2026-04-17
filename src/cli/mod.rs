@@ -2792,6 +2792,22 @@ fn handle_next(
                         if let Err(e) = backend.append_event(&name, &payload, &ts) {
                             eprintln!("warning: failed to append BatchFinalized event: {}", e);
                         }
+                        // Persist batch_final_view to the context store
+                        // so agents can retrieve it via `koto context get
+                        // <wf> batch_final_view` without parsing the
+                        // event log or terminal response.
+                        let view_json =
+                            serde_json::to_value(&view).unwrap_or(serde_json::Value::Null);
+                        if let Ok(serialized) = serde_json::to_string_pretty(&view_json) {
+                            if let Err(e) =
+                                context_store.add(&name, "batch_final_view", serialized.as_bytes())
+                            {
+                                eprintln!(
+                                    "warning: failed to write batch_final_view to context: {}",
+                                    e
+                                );
+                            }
+                        }
                     }
                 }
             }

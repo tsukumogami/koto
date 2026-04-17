@@ -1877,8 +1877,17 @@ fn canonical_paths_tried(
 /// Parse the task list from the latest `EvidenceSubmitted` event for
 /// `state` whose fields contain `field`. Returns `None` when no such
 /// event is found.
+/// Extract the task list from the latest `EvidenceSubmitted` event for
+/// the given state and field. Epoch-aware: ignores events at or before
+/// the last `Rewound` boundary so that a stale pre-rewind submission
+/// does not leak into the current epoch.
 fn extract_tasks(events: &[Event], state: &str, field: &str) -> Option<Vec<TaskEntry>> {
+    let boundary = last_rewind_seq(events).unwrap_or(0);
     for event in events.iter().rev() {
+        if event.seq <= boundary {
+            // All remaining events are from a prior epoch — stop.
+            break;
+        }
         if let EventPayload::EvidenceSubmitted {
             state: s, fields, ..
         } = &event.payload

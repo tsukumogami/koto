@@ -425,20 +425,40 @@ fn epoch_filter_stale_child_completed_ignored_after_rewind() {
     );
 
     // After rewind the parent is back in `gather`. Advance to `plan`.
-    // The advance loop re-enters `plan`, and the scheduler picks up
-    // the evidence from before the rewind. The key assertion: the
-    // stale ChildCompleted from the previous epoch is ignored, so the
-    // scheduler spawns the child fresh (classified as Running, not
-    // as terminal-success from the stale event).
-    let (ok, json, stderr) = run_koto(tmp.path(), &["next", "epoch-parent"]);
-    assert!(ok, "advance to plan after rewind failed: {}", stderr);
+    // extract_tasks is epoch-aware — it ignores the pre-rewind evidence,
+    // so the scheduler sees NoBatch (no tasks submitted in this epoch).
+    let (ok, json, _) = run_koto(tmp.path(), &["next", "epoch-parent"]);
+    assert!(ok, "advance to plan after rewind failed");
+    assert!(
+        json.get("scheduler").is_none()
+            || json["scheduler"]["materialized_children"]
+                .as_array()
+                .map_or(true, |a| a.is_empty()),
+        "scheduler should see NoBatch (stale evidence filtered): {}",
+        serde_json::to_string_pretty(&json).unwrap_or_default()
+    );
+
+    // Now submit a fresh task list in the current epoch. The stale
+    // ChildCompleted from the prior epoch must be ignored — task-x
+    // should spawn fresh (Running), not be classified as terminal
+    // from the old completion event.
+    let fresh_payload = serde_json::json!({
+        "tasks": [{"name": "task-x", "waits_on": [], "vars": {}}]
+    });
+    let (ok, json, stderr) = run_koto(
+        tmp.path(),
+        &[
+            "next",
+            "epoch-parent",
+            "--with-data",
+            &fresh_payload.to_string(),
+        ],
+    );
+    assert!(ok, "fresh task submission failed: {}", stderr);
 
     let sched = json
         .get("scheduler")
-        .expect("scheduler key present after advance to plan");
-
-    // The child should be freshly spawned this tick (the old
-    // ChildCompleted at a seq before the rewind was filtered out).
+        .expect("scheduler key present after fresh submission");
     let materialized = sched
         .get("materialized_children")
         .and_then(|v| v.as_array())
