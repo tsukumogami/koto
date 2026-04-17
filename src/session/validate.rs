@@ -1,7 +1,13 @@
 /// Validate a session ID against the allowlist pattern.
 ///
 /// Valid IDs must start with a letter and contain only alphanumeric
-/// characters, dots, underscores, and hyphens: `^[a-zA-Z][a-zA-Z0-9._-]*$`.
+/// characters, dots, underscores, hyphens, and tildes:
+/// `^[a-zA-Z][a-zA-Z0-9._~-]*$`.
+///
+/// The tilde (`~`) is reserved for internal epoch-branch naming
+/// (e.g., `parent~1.task-a` after a batch rewind). User-facing
+/// workflow names are validated separately by
+/// [`crate::discover::validate_workflow_name`], which rejects `~`.
 ///
 /// This rejects `.` and `..` (path traversal) without a separate check
 /// since those don't start with a letter.
@@ -18,9 +24,9 @@ pub fn validate_session_id(id: &str) -> anyhow::Result<()> {
     }
 
     for ch in chars {
-        if !ch.is_ascii_alphanumeric() && ch != '.' && ch != '_' && ch != '-' {
+        if !ch.is_ascii_alphanumeric() && ch != '.' && ch != '_' && ch != '-' && ch != '~' {
             anyhow::bail!(
-                "session ID contains invalid character '{}'; allowed: letters, digits, '.', '_', '-'",
+                "session ID contains invalid character '{}'; allowed: letters, digits, '.', '_', '-', '~'",
                 ch
             );
         }
@@ -179,6 +185,11 @@ mod tests {
     #[test]
     fn rejects_null_byte() {
         assert!(validate_session_id("a\0b").is_err());
+    }
+
+    #[test]
+    fn accepts_tilde_for_epoch_branches() {
+        assert!(validate_session_id("parent~1.task-a").is_ok());
     }
 
     // -- context key validation --

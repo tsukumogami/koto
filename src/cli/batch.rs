@@ -852,7 +852,11 @@ pub(crate) fn run_batch_scheduler(
     // scheduler must observe the terminal outcome so it does NOT respawn
     // the cleaned-up child on the next tick. On-disk snapshots always
     // win over events (they are fresher — e.g., after a retry respawn).
-    augment_snapshots_with_child_completed(&mut snapshots, events, &name_to_task);
+    //
+    // Epoch filter: skip ChildCompleted events from before the last
+    // rewind — those belong to relocated children from a prior epoch.
+    let epoch_boundary = last_rewind_seq(events);
+    augment_snapshots_with_child_completed(&mut snapshots, events, &name_to_task, epoch_boundary);
 
     let failure_policy = hook.failure_policy;
 
@@ -1407,6 +1411,21 @@ enum RespawnTarget {
 
 /// On-disk always wins over event — relied on by retry paths that
 /// respawn (or leave Rewound) the child on disk after a prior
+/// Return the `seq` number of the most recent `Rewound` event, or
+/// `None` if no rewind has occurred. `ChildCompleted` events with
+/// `seq <= boundary` belong to a superseded epoch and must be ignored
+/// so the scheduler doesn't see stale completions from relocated
+/// children.
+pub(crate) fn last_rewind_seq(events: &[Event]) -> Option<u64> {
+    events.iter().rev().find_map(|e| {
+        if matches!(e.payload, EventPayload::Rewound { .. }) {
+            Some(e.seq)
+        } else {
+            None
+        }
+    })
+}
+
 /// terminal+cleanup.
 ///
 /// Issue #134: add synthetic [`ChildSnapshot`] entries for tasks whose
@@ -1419,15 +1438,26 @@ enum RespawnTarget {
 /// Precedence: on-disk wins. If a task already has an on-disk snapshot
 /// in `snapshots`, the event is ignored for that task — the on-disk
 /// state is fresher (e.g., a post-retry respawn).
+///
+/// `epoch_boundary_seq`: if `Some(seq)`, any `ChildCompleted` event
+/// with `ev.seq <= seq` is skipped — it belongs to a superseded epoch
+/// and the corresponding children have been relocated.
 fn augment_snapshots_with_child_completed(
     snapshots: &mut HashMap<String, ChildSnapshot>,
     events: &[Event],
     name_to_task: &HashMap<&str, &TaskEntry>,
+    epoch_boundary_seq: Option<u64>,
 ) {
     // Latest ChildCompleted per task_name wins. Events are in append
     // order; a simple overwrite keyed by task_name yields that.
     let mut latest: HashMap<String, (TerminalOutcome, String)> = HashMap::new();
     for ev in events {
+        // Skip events from superseded epochs.
+        if let Some(boundary) = epoch_boundary_seq {
+            if ev.seq <= boundary {
+                continue;
+            }
+        }
         if let EventPayload::ChildCompleted {
             task_name,
             outcome,
@@ -2274,8 +2304,18 @@ pub fn build_children_complete_output(
     // Scan the latest event per task_name so a post-retry
     // ChildCompleted supersedes any earlier one. Events are iterated in
     // append order; a simple overwrite yields "latest wins".
+    //
+    // Epoch filter: skip ChildCompleted events from before the last
+    // rewind — those belong to relocated children from a prior epoch.
+    let epoch_boundary = last_rewind_seq(events);
     let mut event_snapshots: HashMap<String, (TerminalOutcome, String)> = HashMap::new();
     for ev in events {
+        // Skip events from superseded epochs.
+        if let Some(boundary) = epoch_boundary {
+            if ev.seq <= boundary {
+                continue;
+            }
+        }
         if let EventPayload::ChildCompleted {
             task_name,
             outcome,
@@ -4201,7 +4241,7 @@ mod tests {
             tasks.iter().map(|t| (t.name.as_str(), t)).collect();
         let events = vec![child_completed_event(1, "a", "success", "done")];
         let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
-        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task);
+        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task, None);
         let snap = snapshots.get("a").expect("synthetic snapshot inserted");
         assert!(snap.terminal);
         assert!(!snap.failure);
@@ -4216,7 +4256,7 @@ mod tests {
             tasks.iter().map(|t| (t.name.as_str(), t)).collect();
         let events = vec![child_completed_event(1, "a", "failure", "failed")];
         let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
-        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task);
+        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task, None);
         let snap = snapshots.get("a").unwrap();
         assert!(snap.terminal);
         assert!(snap.failure);
@@ -4230,7 +4270,7 @@ mod tests {
             tasks.iter().map(|t| (t.name.as_str(), t)).collect();
         let events = vec![child_completed_event(1, "a", "skipped", "skipped")];
         let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
-        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task);
+        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task, None);
         let snap = snapshots.get("a").unwrap();
         assert!(snap.terminal);
         assert!(!snap.failure);
@@ -4247,7 +4287,7 @@ mod tests {
             tasks.iter().map(|t| (t.name.as_str(), t)).collect();
         let events = vec![child_completed_event(1, "a", "success", "done")];
         let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
-        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task);
+        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task, None);
         assert!(snapshots.is_empty());
     }
 
@@ -4266,7 +4306,7 @@ mod tests {
         let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
         // Fresh on-disk snapshot says the task is Running (not terminal).
         snapshots.insert("a".to_string(), snap("work", false, false, false));
-        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task);
+        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task, None);
         let s = snapshots.get("a").unwrap();
         assert!(
             !s.terminal,
@@ -4289,7 +4329,7 @@ mod tests {
             child_completed_event(2, "a", "success", "done"),
         ];
         let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
-        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task);
+        augment_snapshots_with_child_completed(&mut snapshots, &events, &name_to_task, None);
         let s = snapshots.get("a").unwrap();
         assert_eq!(s.current_state, "done");
         assert!(!s.failure);
@@ -4321,5 +4361,107 @@ mod tests {
         assert_eq!(v["payload"]["final_state"], "done");
         let back: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);
+    }
+
+    // --------- last_rewind_seq tests --------
+
+    #[test]
+    fn last_rewind_seq_returns_none_when_no_rewinds() {
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "transitioned".to_string(),
+            payload: EventPayload::Transitioned {
+                from: Some("a".to_string()),
+                to: "b".to_string(),
+                condition_type: "gate".to_string(),
+            },
+        }];
+        assert_eq!(last_rewind_seq(&events), None);
+    }
+
+    #[test]
+    fn last_rewind_seq_returns_seq_of_last_rewind() {
+        let events = vec![
+            Event {
+                seq: 1,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                event_type: "transitioned".to_string(),
+                payload: EventPayload::Transitioned {
+                    from: Some("a".to_string()),
+                    to: "b".to_string(),
+                    condition_type: "gate".to_string(),
+                },
+            },
+            Event {
+                seq: 2,
+                timestamp: "2026-01-01T00:00:01Z".to_string(),
+                event_type: "rewound".to_string(),
+                payload: EventPayload::Rewound {
+                    from: "b".to_string(),
+                    to: "a".to_string(),
+                },
+            },
+            Event {
+                seq: 3,
+                timestamp: "2026-01-01T00:00:02Z".to_string(),
+                event_type: "transitioned".to_string(),
+                payload: EventPayload::Transitioned {
+                    from: Some("a".to_string()),
+                    to: "b".to_string(),
+                    condition_type: "gate".to_string(),
+                },
+            },
+            Event {
+                seq: 4,
+                timestamp: "2026-01-01T00:00:03Z".to_string(),
+                event_type: "rewound".to_string(),
+                payload: EventPayload::Rewound {
+                    from: "b".to_string(),
+                    to: "a".to_string(),
+                },
+            },
+        ];
+        assert_eq!(last_rewind_seq(&events), Some(4));
+    }
+
+    #[test]
+    fn augment_snapshots_skips_events_before_epoch_boundary() {
+        let tasks = vec![task("a", &[])];
+        let name_to_task: HashMap<&str, &TaskEntry> =
+            tasks.iter().map(|t| (t.name.as_str(), t)).collect();
+        // ChildCompleted at seq=2, epoch boundary at seq=3.
+        let events = vec![child_completed_event(2, "a", "success", "done")];
+        let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
+        augment_snapshots_with_child_completed(
+            &mut snapshots,
+            &events,
+            &name_to_task,
+            Some(3), // boundary > event seq, so event is skipped
+        );
+        assert!(
+            snapshots.is_empty(),
+            "ChildCompleted before boundary should be ignored"
+        );
+    }
+
+    #[test]
+    fn augment_snapshots_keeps_events_after_epoch_boundary() {
+        let tasks = vec![task("a", &[])];
+        let name_to_task: HashMap<&str, &TaskEntry> =
+            tasks.iter().map(|t| (t.name.as_str(), t)).collect();
+        // ChildCompleted at seq=5, epoch boundary at seq=3.
+        let events = vec![child_completed_event(5, "a", "success", "done")];
+        let mut snapshots: HashMap<String, ChildSnapshot> = HashMap::new();
+        augment_snapshots_with_child_completed(
+            &mut snapshots,
+            &events,
+            &name_to_task,
+            Some(3), // boundary < event seq, so event is kept
+        );
+        assert!(
+            snapshots.contains_key("a"),
+            "ChildCompleted after boundary should be kept"
+        );
     }
 }
