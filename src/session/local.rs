@@ -249,6 +249,73 @@ impl SessionBackend for LocalBackend {
         }
     }
 
+    fn relocate(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        validate_session_id(from)?;
+        validate_session_id(to)?;
+
+        let from_dir = self.base_dir.join(from);
+        let from_state = from_dir.join(state_file_name(from));
+
+        // Source must exist (directory + state file).
+        anyhow::ensure!(
+            from_dir.exists() && from_state.exists(),
+            "source session '{}' does not exist",
+            from
+        );
+
+        let to_dir = self.base_dir.join(to);
+
+        // Target must NOT exist (collision guard).
+        anyhow::ensure!(!to_dir.exists(), "target session '{}' already exists", to);
+
+        // Step 1: Rename the session directory.
+        fs::rename(&from_dir, &to_dir).with_context(|| {
+            format!(
+                "failed to rename {} -> {}",
+                from_dir.display(),
+                to_dir.display()
+            )
+        })?;
+
+        // Step 2: Rename the state file inside the (now renamed) directory.
+        let old_state_in_new_dir = to_dir.join(state_file_name(from));
+        let new_state = to_dir.join(state_file_name(to));
+        fs::rename(&old_state_in_new_dir, &new_state).with_context(|| {
+            format!(
+                "failed to rename state file {} -> {}",
+                old_state_in_new_dir.display(),
+                new_state.display()
+            )
+        })?;
+
+        // Step 3: Rewrite the header to update `workflow` and `parent_workflow`.
+        let mut header = persistence::read_header(&new_state)
+            .with_context(|| format!("failed to read header from {}", new_state.display()))?;
+
+        header.workflow = to.to_string();
+        header.parent_workflow = to.rsplit_once('.').map(|(parent, _)| parent.to_string());
+
+        // Read the entire file, replace the first line, write it back.
+        let content = fs::read_to_string(&new_state)
+            .with_context(|| format!("failed to read state file {}", new_state.display()))?;
+        let mut lines: Vec<&str> = content.lines().collect();
+
+        let new_header_line =
+            serde_json::to_string(&header).expect("StateFileHeader serialize is infallible");
+
+        if lines.is_empty() {
+            anyhow::bail!("state file {} is empty", new_state.display());
+        }
+        lines[0] = &new_header_line;
+
+        let new_content = lines.join("\n") + "\n";
+        fs::write(&new_state, new_content.as_bytes()).with_context(|| {
+            format!("failed to write updated state file {}", new_state.display())
+        })?;
+
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn lock_state_file(&self, id: &str) -> Result<SessionLock, SessionError> {
         use std::os::unix::io::AsRawFd;
@@ -1642,5 +1709,128 @@ mod tests {
                 Err(e) => panic!("re-acquire after A drops must succeed: {:?}", e),
             }
         }
+    }
+
+    // ===== relocate tests =====
+
+    /// Helper: write a state file with a parent_workflow.
+    fn write_state_file_with_parent(base_dir: &Path, id: &str, parent: Option<&str>) {
+        let session_dir = base_dir.join(id);
+        fs::create_dir_all(&session_dir).unwrap();
+        let state_path = session_dir.join(state_file_name(id));
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: id.to_string(),
+            template_hash: "testhash".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: parent.map(|s| s.to_string()),
+            template_source_dir: None,
+        };
+        persistence::append_header(&state_path, &header).unwrap();
+    }
+
+    #[test]
+    fn relocate_renames_directory_and_state_file() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        write_state_file_with_parent(tmp.path(), "parent.task-a", Some("parent"));
+
+        backend
+            .relocate("parent.task-a", "parent-v1.task-a")
+            .unwrap();
+
+        // Old session gone.
+        assert!(!backend.exists("parent.task-a"));
+        assert!(!tmp.path().join("parent.task-a").exists());
+
+        // New session present.
+        assert!(backend.exists("parent-v1.task-a"));
+        assert!(tmp.path().join("parent-v1.task-a").exists());
+        assert!(tmp
+            .path()
+            .join("parent-v1.task-a")
+            .join(state_file_name("parent-v1.task-a"))
+            .exists());
+    }
+
+    #[test]
+    fn relocate_updates_header_workflow_and_parent() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        write_state_file_with_parent(tmp.path(), "parent.task-a", Some("parent"));
+
+        backend
+            .relocate("parent.task-a", "parent-v1.task-a")
+            .unwrap();
+
+        let header = backend.read_header("parent-v1.task-a").unwrap();
+        assert_eq!(header.workflow, "parent-v1.task-a");
+        assert_eq!(header.parent_workflow, Some("parent-v1".to_string()));
+        // Other fields preserved.
+        assert_eq!(header.template_hash, "testhash");
+        assert_eq!(header.created_at, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn relocate_sets_parent_none_when_no_dot() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        write_state_file_with_parent(tmp.path(), "old-name", None);
+
+        backend.relocate("old-name", "new-name").unwrap();
+
+        let header = backend.read_header("new-name").unwrap();
+        assert_eq!(header.workflow, "new-name");
+        assert_eq!(header.parent_workflow, None);
+    }
+
+    #[test]
+    fn relocate_collision_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        write_state_file_with_parent(tmp.path(), "source", None);
+        write_state_file_with_parent(tmp.path(), "target", None);
+
+        let result = backend.relocate("source", "target");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+
+        // Both sessions are untouched.
+        assert!(backend.exists("source"));
+        assert!(backend.exists("target"));
+    }
+
+    #[test]
+    fn relocate_missing_source_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+
+        let result = backend.relocate("nonexistent", "target");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn relocate_result_readable_via_read_events() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        write_state_file_with_parent(tmp.path(), "src-wf", None);
+
+        // Append an event so we can verify events survive the rename.
+        let payload = EventPayload::WorkflowInitialized {
+            template_path: "test-tmpl".to_string(),
+            variables: std::collections::HashMap::new(),
+            spawn_entry: None,
+        };
+        backend
+            .append_event("src-wf", &payload, "2026-01-01T00:00:01Z")
+            .unwrap();
+
+        backend.relocate("src-wf", "dst-wf").unwrap();
+
+        let (header, events) = backend.read_events("dst-wf").unwrap();
+        assert_eq!(header.workflow, "dst-wf");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "workflow_initialized");
     }
 }

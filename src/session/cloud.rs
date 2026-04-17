@@ -759,6 +759,69 @@ impl SessionBackend for CloudBackend {
         Ok(())
     }
 
+    fn relocate(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        // Local rename is authoritative; S3 propagation is best-effort.
+        self.local.relocate(from, to)?;
+
+        // Propagate to S3: copy objects from old prefix to new, then
+        // delete the old objects. Mirrors the pattern in
+        // sync_delete_session. Failures are logged but don't fail the
+        // operation since local state is the source of truth.
+        let old_prefix = self.session_prefix(from);
+        match self.bucket.list(old_prefix.clone(), None) {
+            Ok(results) => {
+                for list in &results {
+                    for obj in &list.contents {
+                        // Derive the new key by replacing the old session
+                        // id segment with the new one.
+                        let suffix = match obj.key.strip_prefix(&old_prefix) {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        let new_key = format!("{}{}", self.session_prefix(to), suffix);
+
+                        // Copy old -> new, then delete old.
+                        match self.bucket.get_object(&obj.key) {
+                            Ok(response) if response.status_code() == 200 => {
+                                if let Err(e) = self.put_object(&new_key, response.bytes()) {
+                                    eprintln!(
+                                        "warning: cloud sync: relocate copy failed for {}: {}",
+                                        obj.key, e
+                                    );
+                                    continue;
+                                }
+                                if let Err(e) = self.bucket.delete_object(&obj.key) {
+                                    eprintln!(
+                                        "warning: cloud sync: relocate delete failed for {}: {}",
+                                        obj.key, e
+                                    );
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!(
+                                    "warning: cloud sync: relocate get failed for {}: {}",
+                                    obj.key, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: cloud sync: relocate list failed for prefix {}: {}",
+                    old_prefix, e
+                );
+            }
+        }
+
+        // Push the updated local state file to S3 under the new key.
+        self.sync_push_state(to);
+
+        Ok(())
+    }
+
     fn lock_state_file(&self, id: &str) -> Result<SessionLock, SessionError> {
         // `flock` is strictly a local, per-host primitive. Cloud
         // instances running on different hosts cannot observe each

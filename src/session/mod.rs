@@ -240,6 +240,18 @@ pub trait SessionBackend: Send + Sync {
     /// the narrow retry-failed / batch-resolve paths.
     fn ensure_pushed(&self, id: &str) -> Result<(), SessionError>;
 
+    /// Rename a session from `from` to `to`, updating the state file
+    /// header to reflect the new identity.
+    ///
+    /// Renames the session directory, renames the state file within it,
+    /// and rewrites the header's `workflow` field to `to` and
+    /// `parent_workflow` to the parent derived from `to` (everything
+    /// before the last `.` separator, or `None` if `to` contains no
+    /// `.`).
+    ///
+    /// Returns `Err` if `from` doesn't exist or `to` already exists.
+    fn relocate(&self, from: &str, to: &str) -> anyhow::Result<()>;
+
     /// Acquire a non-blocking advisory `flock(LOCK_EX | LOCK_NB)` on
     /// the session's state file.
     ///
@@ -371,6 +383,13 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.init_state_file(id, header, initial_events),
             Backend::Cloud(b) => b.init_state_file(id, header, initial_events),
+        }
+    }
+
+    fn relocate(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.relocate(from, to),
+            Backend::Cloud(b) => b.relocate(from, to),
         }
     }
 
