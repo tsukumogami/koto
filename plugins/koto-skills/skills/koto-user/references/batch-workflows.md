@@ -262,5 +262,38 @@ Multiple surfaces expose batch state. Use the right one for the question you're 
 | "Is this child itself a sub-batch coordinator?" | `materialized_children[*].role == "coordinator"` with `subbatch_status` for inner-batch counts. |
 
 `spawned_this_tick`, `already`, `blocked`, `skipped`, `errored` under `scheduler` are per-tick observations, useful for logging and diagnostics. Don't key dispatch or completion logic on them.
+
+## Recovering from a bad task submission
+
+If the coordinator submitted an incorrect task list (wrong names, wrong dependencies, wrong template), use `koto rewind <parent>` to go back to the state before the submission.
+
+When the rewind crosses a `materialize_children` state, koto relocates all spawned children to a superseded branch. For example, if `parent` has children `parent.task-a` and `parent.task-b`:
+
+```bash
+koto rewind parent
+# {"state":"gather","superseded_branch":"parent~1","children_relocated":2}
+```
+
+After rewind:
+- The old children are at `parent~1.task-a` and `parent~1.task-b`. They remain fully queryable.
+- The names `parent.task-a` and `parent.task-b` are free for a fresh submission.
+- `koto status parent` shows `superseded_branches: ["parent~1"]` so agents can discover prior attempts.
+
+To inspect what happened in a prior attempt:
+
+```bash
+koto status parent~1.task-a     # state, outcome, evidence
+koto query parent~1.task-a      # full event log
+koto workflows --children parent~1  # all children of that attempt
+```
+
+The work done by those children (commits, test results, decisions) is still in the repo. The koto context at `parent~N.*` explains what decisions were made and why.
+
+To clean up a superseded branch when it's no longer needed:
+
+```bash
+koto session cleanup parent~1.task-a
+koto session cleanup parent~1.task-b
+```
 </content>
 </invoke>

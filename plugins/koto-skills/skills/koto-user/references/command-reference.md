@@ -132,10 +132,16 @@ koto rewind <name>
 
 Rolls back the workflow to the previous state by appending a `Rewound` event. Non-destructive — the event log is preserved.
 
+**Batch parent behavior:** When rewinding past a state with a `materialize_children` hook, the rewind relocates all spawned children to a superseded branch. Children are renamed from `<parent>.<task>` to `<parent>~N.<task>` (where N is the epoch counter), freeing the names for a fresh batch submission. Superseded children remain fully queryable via standard commands (`koto status <parent>~N.<task>`, `koto workflows --children <parent>~N`).
+
 **Success output:**
 ```json
-{"name": "my-workflow", "state": "previous_state_name"}
+{"name": "my-workflow", "state": "previous_state_name", "superseded_branch": "my-workflow~1", "children_relocated": 3}
 ```
+
+The `superseded_branch` and `children_relocated` fields appear only when a batch rewind occurs. For non-batch rewinds they are null/0.
+
+**After batch rewind:** `koto status <parent>` includes a `superseded_branches` array listing all prior branch names. Use `koto workflows --children <parent>~N` to inspect children from any prior attempt.
 
 **Error cases:**
 - Exit 1: already at the initial state (cannot rewind further)
