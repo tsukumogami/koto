@@ -9,8 +9,8 @@ use crate::engine::persistence::derive_overrides;
 use crate::engine::types::{now_iso8601, Event, EventPayload};
 use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::template::types::{
-    is_present_matcher, ActionDecl, CompiledTemplate, TemplateState, EVIDENCE_NAMESPACE,
-    GATES_EVIDENCE_NAMESPACE,
+    is_is_set_matcher, is_present_matcher, ActionDecl, CompiledTemplate, TemplateState,
+    EVIDENCE_NAMESPACE, GATES_EVIDENCE_NAMESPACE, VARS_NAMESPACE,
 };
 
 /// Maximum number of transitions per invocation. Defense-in-depth against
@@ -189,6 +189,16 @@ where
     let mut transition_count: usize = 0;
     // Evidence is only used for the initial state; auto-advanced states start fresh.
     let mut current_evidence = evidence.clone();
+
+    // Extract template variables from the WorkflowInitialized event for vars.*
+    // when-clause evaluation (Issue #141).
+    let workflow_variables: std::collections::HashMap<String, String> = all_events
+        .iter()
+        .find_map(|e| match &e.payload {
+            EventPayload::WorkflowInitialized { variables, .. } => Some(variables.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
 
     // The starting state is NOT added to visited. The visited set tracks states
     // we've auto-advanced THROUGH during this invocation. The starting state was
@@ -451,7 +461,12 @@ where
             );
         }
         let evidence_value = serde_json::Value::Object(merged);
-        match resolve_transition(template_state, &evidence_value, gates_failed) {
+        match resolve_transition(
+            template_state,
+            &evidence_value,
+            gates_failed,
+            &workflow_variables,
+        ) {
             TransitionResolution::Resolved(target) => {
                 // Check for cycle before transitioning
                 if visited.contains(&target) {
@@ -566,6 +581,7 @@ pub fn resolve_transition(
     template_state: &TemplateState,
     evidence: &serde_json::Value,
     gate_failed: bool,
+    variables: &std::collections::HashMap<String, String>,
 ) -> TransitionResolution {
     if template_state.transitions.is_empty() {
         return TransitionResolution::NoTransitions;
@@ -576,6 +592,7 @@ pub fn resolve_transition(
     let mut has_conditional = false;
 
     let evidence_prefix = format!("{}.", EVIDENCE_NAMESPACE);
+    let vars_prefix = format!("{}.", VARS_NAMESPACE);
     for transition in &template_state.transitions {
         match &transition.when {
             Some(conditions) => {
@@ -592,6 +609,19 @@ pub fn resolve_transition(
                             && evidence
                                 .as_object()
                                 .is_some_and(|obj| obj.contains_key(inner));
+                    }
+                    // Issue #141: `vars.<name>: {is_set: bool}` checks whether
+                    // a template variable was provided at init time with a
+                    // non-empty value.
+                    if field.starts_with(&vars_prefix) {
+                        if let Some(expected_set) = is_is_set_matcher(expected) {
+                            let var_name = &field[vars_prefix.len()..];
+                            let is_set = variables
+                                .get(var_name)
+                                .map(|v| !v.is_empty())
+                                .unwrap_or(false);
+                            return is_set == expected_set;
+                        }
                     }
                     resolve_value(evidence, field) == Some(expected)
                 });
@@ -757,7 +787,7 @@ mod tests {
         let state = make_state(vec![unconditional("next")]);
         let evidence = as_evidence(BTreeMap::new());
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::Resolved("next".to_string())
         );
     }
@@ -772,7 +802,7 @@ mod tests {
         m.insert("decision".to_string(), serde_json::json!("approve"));
         let evidence = as_evidence(m);
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::Resolved("approved".to_string())
         );
     }
@@ -787,7 +817,7 @@ mod tests {
         m.insert("decision".to_string(), serde_json::json!("approve"));
         let evidence = as_evidence(m);
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::Resolved("approved".to_string())
         );
     }
@@ -802,7 +832,7 @@ mod tests {
         m.insert("decision".to_string(), serde_json::json!("reject"));
         let evidence = as_evidence(m);
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::Resolved("fallback".to_string())
         );
     }
@@ -817,7 +847,7 @@ mod tests {
         m.insert("x".to_string(), serde_json::json!(1));
         let evidence = as_evidence(m);
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::Ambiguous(vec!["target_a".to_string(), "target_b".to_string()])
         );
     }
@@ -827,7 +857,7 @@ mod tests {
         let state = make_state(vec![]);
         let evidence = as_evidence(BTreeMap::new());
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::NoTransitions
         );
     }
@@ -841,7 +871,7 @@ mod tests {
         // Empty evidence -- no match.
         let evidence = as_evidence(BTreeMap::new());
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::NeedsEvidence
         );
     }
@@ -858,7 +888,7 @@ mod tests {
         m.insert("a".to_string(), serde_json::json!("x"));
         let evidence = as_evidence(m.clone());
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::NeedsEvidence
         );
 
@@ -866,7 +896,7 @@ mod tests {
         m.insert("b".to_string(), serde_json::json!("y"));
         let evidence = as_evidence(m);
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::Resolved("target".to_string())
         );
     }
@@ -888,13 +918,13 @@ mod tests {
 
         // gate_failed=false: unconditional fallback fires
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::Resolved("fallback_state".to_string())
         );
 
         // gate_failed=true: unconditional fallback skipped, needs evidence
         assert_eq!(
-            resolve_transition(&state, &evidence, true),
+            resolve_transition(&state, &evidence, true, &HashMap::new()),
             TransitionResolution::NeedsEvidence
         );
 
@@ -903,7 +933,7 @@ mod tests {
         m.insert("status".to_string(), serde_json::json!("completed"));
         let with_evidence = as_evidence(m);
         assert_eq!(
-            resolve_transition(&state, &with_evidence, true),
+            resolve_transition(&state, &with_evidence, true, &HashMap::new()),
             TransitionResolution::Resolved("next_state".to_string())
         );
     }
@@ -933,7 +963,7 @@ mod tests {
             }
         });
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::Resolved("success".to_string())
         );
 
@@ -947,7 +977,7 @@ mod tests {
             }
         });
         assert_eq!(
-            resolve_transition(&state, &evidence_fail, false),
+            resolve_transition(&state, &evidence_fail, false, &HashMap::new()),
             TransitionResolution::Resolved("failed".to_string())
         );
     }
@@ -963,14 +993,14 @@ mod tests {
         // Evidence without the "gates" key at all
         let evidence = serde_json::json!({ "mode": "issue_backed" });
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::NeedsEvidence
         );
 
         // Evidence with "gates" but missing the "ci" sub-key
         let evidence_partial = serde_json::json!({ "gates": { "lint": { "exit_code": 0 } } });
         assert_eq!(
-            resolve_transition(&state, &evidence_partial, false),
+            resolve_transition(&state, &evidence_partial, false, &HashMap::new()),
             TransitionResolution::NeedsEvidence
         );
     }
@@ -995,7 +1025,7 @@ mod tests {
             "decision": "approve"
         });
         assert_eq!(
-            resolve_transition(&state, &evidence_both, false),
+            resolve_transition(&state, &evidence_both, false, &HashMap::new()),
             TransitionResolution::Resolved("approved".to_string())
         );
 
@@ -1004,14 +1034,14 @@ mod tests {
             "gates": { "ci": { "exit_code": 0, "error": "" } }
         });
         assert_eq!(
-            resolve_transition(&state, &evidence_gate_only, false),
+            resolve_transition(&state, &evidence_gate_only, false, &HashMap::new()),
             TransitionResolution::Resolved("pending".to_string())
         );
 
         // Only decision provided, gate output missing -- falls through to unconditional
         let evidence_decision_only = serde_json::json!({ "decision": "approve" });
         assert_eq!(
-            resolve_transition(&state, &evidence_decision_only, false),
+            resolve_transition(&state, &evidence_decision_only, false, &HashMap::new()),
             TransitionResolution::Resolved("pending".to_string())
         );
     }
@@ -1035,14 +1065,14 @@ mod tests {
         // retry_failed submitted (value irrelevant to the matcher) -> routes to retry.
         let evidence = serde_json::json!({ "retry_failed": ["task-1"] });
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::Resolved("retry".to_string())
         );
 
         // retry_failed with a different payload shape still fires.
         let evidence_bool = serde_json::json!({ "retry_failed": true });
         assert_eq!(
-            resolve_transition(&state, &evidence_bool, false),
+            resolve_transition(&state, &evidence_bool, false, &HashMap::new()),
             TransitionResolution::Resolved("retry".to_string())
         );
     }
@@ -1062,7 +1092,7 @@ mod tests {
 
         let evidence = serde_json::json!({ "status": "pending" });
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::NeedsEvidence
         );
     }
@@ -1077,7 +1107,7 @@ mod tests {
 
         let evidence = serde_json::json!({ "retry_failed": ["task-1"] });
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::NeedsEvidence
         );
     }
@@ -1098,15 +1128,88 @@ mod tests {
         // Only the value-equality branch matches.
         let evidence = serde_json::json!({ "status": "done" });
         assert_eq!(
-            resolve_transition(&state, &evidence, false),
+            resolve_transition(&state, &evidence, false, &HashMap::new()),
             TransitionResolution::Resolved("complete".to_string())
         );
 
         // Value-equality miss still returns NeedsEvidence.
         let evidence_miss = serde_json::json!({ "status": "pending" });
         assert_eq!(
-            resolve_transition(&state, &evidence_miss, false),
+            resolve_transition(&state, &evidence_miss, false, &HashMap::new()),
             TransitionResolution::NeedsEvidence
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #141: vars.<name>: {is_set: bool} matcher
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vars_is_set_true_matches_when_variable_present() {
+        let state = make_state(vec![
+            conditional(
+                "with_branch",
+                vec![("vars.SHARED_BRANCH", serde_json::json!({"is_set": true}))],
+            ),
+            conditional(
+                "without_branch",
+                vec![("vars.SHARED_BRANCH", serde_json::json!({"is_set": false}))],
+            ),
+        ]);
+
+        let evidence = as_evidence(BTreeMap::new());
+        let mut vars = HashMap::new();
+        vars.insert("SHARED_BRANCH".to_string(), "feature/foo".to_string());
+
+        assert_eq!(
+            resolve_transition(&state, &evidence, false, &vars),
+            TransitionResolution::Resolved("with_branch".to_string())
+        );
+    }
+
+    #[test]
+    fn vars_is_set_false_matches_when_variable_absent() {
+        let state = make_state(vec![
+            conditional(
+                "with_branch",
+                vec![("vars.SHARED_BRANCH", serde_json::json!({"is_set": true}))],
+            ),
+            conditional(
+                "without_branch",
+                vec![("vars.SHARED_BRANCH", serde_json::json!({"is_set": false}))],
+            ),
+        ]);
+
+        let evidence = as_evidence(BTreeMap::new());
+        let vars = HashMap::new(); // no variables
+
+        assert_eq!(
+            resolve_transition(&state, &evidence, false, &vars),
+            TransitionResolution::Resolved("without_branch".to_string())
+        );
+    }
+
+    #[test]
+    fn vars_is_set_false_matches_when_variable_empty() {
+        // An empty string counts as "not set" for is_set purposes.
+        let state = make_state(vec![
+            conditional(
+                "with_branch",
+                vec![("vars.SHARED_BRANCH", serde_json::json!({"is_set": true}))],
+            ),
+            conditional(
+                "without_branch",
+                vec![("vars.SHARED_BRANCH", serde_json::json!({"is_set": false}))],
+            ),
+        ]);
+
+        let evidence = as_evidence(BTreeMap::new());
+        let mut vars = HashMap::new();
+        vars.insert("SHARED_BRANCH".to_string(), String::new());
+
+        assert_eq!(
+            resolve_transition(&state, &evidence, false, &vars),
+            TransitionResolution::Resolved("without_branch".to_string())
         );
     }
 

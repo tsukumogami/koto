@@ -6,7 +6,8 @@ use crate::engine::types::{Event, EventPayload};
 use crate::template::types::VAR_REF_PATTERN;
 
 /// Allowlist regex for variable values: alphanumeric, dots, underscores, hyphens, forward slashes.
-const VALUE_PATTERN: &str = r"^[a-zA-Z0-9._/\-]+$";
+/// Empty strings are allowed for optional variables with no default (Issue #141).
+const VALUE_PATTERN: &str = r"^[a-zA-Z0-9._/\-]*$";
 
 /// Holds resolved variable bindings for substitution.
 #[derive(Debug)]
@@ -133,9 +134,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_value_rejects_empty() {
-        let err = validate_value("KEY", "").unwrap_err();
-        assert_eq!(err.key, "KEY");
+    fn validate_value_accepts_empty() {
+        // Empty strings are valid for optional variables with no default (Issue #141).
+        validate_value("KEY", "").unwrap();
     }
 
     #[test]

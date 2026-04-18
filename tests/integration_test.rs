@@ -7825,3 +7825,315 @@ fn overrides_record_with_data_at_file_missing_returns_clear_error() {
         msg
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #141: vars.* is_set when-clause operator
+// ---------------------------------------------------------------------------
+
+fn template_with_vars_is_set() -> String {
+    // with_var and without_var are terminal so the engine stops there,
+    // allowing us to check which branch was taken.
+    r#"---
+name: vars-is-set-workflow
+version: "1.0"
+initial_state: start
+variables:
+  OPT_VAR:
+    description: "Optional variable"
+    required: false
+    default: ""
+states:
+  start:
+    transitions:
+      - target: with_var
+        when:
+          vars.OPT_VAR:
+            is_set: true
+      - target: without_var
+        when:
+          vars.OPT_VAR:
+            is_set: false
+  with_var:
+    terminal: true
+  without_var:
+    terminal: true
+---
+
+## start
+
+Check if OPT_VAR is set.
+
+## with_var
+
+Variable is set. Done.
+
+## without_var
+
+Variable is not set. Done.
+"#
+    .to_string()
+}
+
+fn write_vars_is_set_template(dir: &Path) -> PathBuf {
+    let src = dir.join("vars-is-set.md");
+    std::fs::write(&src, template_with_vars_is_set()).unwrap();
+    src
+}
+
+#[test]
+fn vars_is_set_routes_to_set_branch_when_provided() {
+    let dir = TempDir::new().unwrap();
+    let src = write_vars_is_set_template(dir.path());
+
+    // Init WITH the variable
+    let init_output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "test-set",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OPT_VAR=myvalue",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        init_output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init_output.stdout),
+        String::from_utf8_lossy(&init_output.stderr)
+    );
+
+    // Next should auto-advance to with_var (is_set: true branch) and stop (terminal)
+    let next_output = koto_cmd(dir.path())
+        .args(["next", "test-set"])
+        .output()
+        .unwrap();
+    assert!(
+        next_output.status.success(),
+        "next failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&next_output.stdout),
+        String::from_utf8_lossy(&next_output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&next_output.stdout).unwrap();
+    assert_eq!(
+        json["state"].as_str().unwrap(),
+        "with_var",
+        "should route to with_var when variable is set; got: {}",
+        json
+    );
+}
+
+#[test]
+fn vars_is_set_routes_to_unset_branch_when_not_provided() {
+    let dir = TempDir::new().unwrap();
+    let src = write_vars_is_set_template(dir.path());
+
+    // Init WITHOUT the variable (optional var with empty default)
+    let init_output = koto_cmd(dir.path())
+        .args(["init", "test-unset", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        init_output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init_output.stdout),
+        String::from_utf8_lossy(&init_output.stderr)
+    );
+
+    // Next should auto-advance to without_var (is_set: false branch) and stop (terminal)
+    let next_output = koto_cmd(dir.path())
+        .args(["next", "test-unset"])
+        .output()
+        .unwrap();
+    assert!(
+        next_output.status.success(),
+        "next failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&next_output.stdout),
+        String::from_utf8_lossy(&next_output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&next_output.stdout).unwrap();
+    assert_eq!(
+        json["state"].as_str().unwrap(),
+        "without_var",
+        "should route to without_var when variable is not set; got: {}",
+        json
+    );
+}
+
+#[test]
+fn compile_rejects_equality_matcher_on_vars_key() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("bad-vars.md");
+    std::fs::write(
+        &src,
+        r#"---
+name: bad-vars-workflow
+version: "1.0"
+initial_state: start
+variables:
+  FOO:
+    description: "A variable"
+    required: false
+states:
+  start:
+    transitions:
+      - target: done
+        when:
+          vars.FOO: "bar"
+  done:
+    terminal: true
+---
+
+## start
+
+Check FOO.
+
+## done
+
+Done.
+"#,
+    )
+    .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["template", "compile", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "compile should fail for equality matcher on vars.* key"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("only supports existence matching"),
+        "error should mention existence matching; got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn compile_rejects_undeclared_vars_reference() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("undeclared-var.md");
+    std::fs::write(
+        &src,
+        r#"---
+name: undeclared-vars-workflow
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions:
+      - target: done
+        when:
+          vars.UNKNOWN:
+            is_set: true
+  done:
+    terminal: true
+---
+
+## start
+
+Check UNKNOWN.
+
+## done
+
+Done.
+"#,
+    )
+    .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["template", "compile", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "compile should fail for undeclared vars.* reference"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("undeclared variable") && stdout.contains("UNKNOWN"),
+        "error should mention undeclared variable UNKNOWN; got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn vars_is_set_mutual_exclusivity_allows_true_false_pair() {
+    let dir = TempDir::new().unwrap();
+    let src = write_vars_is_set_template(dir.path());
+
+    let output = koto_cmd(dir.path())
+        .args(["template", "compile", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "compile should accept is_set true/false as disjoint; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn vars_is_set_mutual_exclusivity_rejects_identical_conditions() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("conflicting-is-set.md");
+    std::fs::write(
+        &src,
+        r#"---
+name: conflicting-is-set-workflow
+version: "1.0"
+initial_state: start
+variables:
+  OPT_VAR:
+    description: "Optional variable"
+    required: false
+states:
+  start:
+    transitions:
+      - target: branch_a
+        when:
+          vars.OPT_VAR:
+            is_set: true
+      - target: branch_b
+        when:
+          vars.OPT_VAR:
+            is_set: true
+  branch_a:
+    terminal: true
+  branch_b:
+    terminal: true
+---
+
+## start
+
+Check OPT_VAR.
+
+## branch_a
+
+Branch A.
+
+## branch_b
+
+Branch B.
+"#,
+    )
+    .unwrap();
+
+    let output = koto_cmd(dir.path())
+        .args(["template", "compile", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "compile should fail for identical is_set conditions"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("not mutually exclusive"),
+        "error should mention mutual exclusivity; got: {}",
+        stdout
+    );
+}
