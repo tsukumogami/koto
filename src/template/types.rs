@@ -248,6 +248,22 @@ pub fn is_present_matcher(value: &serde_json::Value) -> bool {
     value.as_str() == Some(PRESENT_MATCHER_VALUE)
 }
 
+/// Namespace prefix for template variable existence checks in `when` clauses.
+/// Keys like `vars.MY_VAR` reference declared template variables.
+pub const VARS_NAMESPACE: &str = "vars";
+
+/// Check if a `when` value is an `{is_set: bool}` matcher.
+///
+/// Returns `Some(true)` for `{"is_set": true}`, `Some(false)` for
+/// `{"is_set": false}`, and `None` for any other shape.
+pub fn is_is_set_matcher(value: &serde_json::Value) -> Option<bool> {
+    let obj = value.as_object()?;
+    if obj.len() != 1 {
+        return None;
+    }
+    obj.get("is_set")?.as_bool()
+}
+
 /// The JSON value type of a gate output field.
 ///
 /// Used by [`gate_type_schema`] to describe the expected type of each field
@@ -1265,14 +1281,15 @@ impl CompiledTemplate {
             }
 
             // Separate gates.* keys (engine-injected gate output), evidence.<field>
-            // presence keys (Issue #11), and flat agent evidence keys. gates.* keys
-            // bypass the accepts block requirement and field-presence checks because
-            // they are populated automatically by the advance loop, not by agents.
+            // presence keys (Issue #11), vars.* keys (Issue #141), and flat agent
+            // evidence keys. gates.* and vars.* keys bypass the accepts block
+            // requirement because they are not agent-submitted evidence.
             // evidence.<field>: present checks only that the field appeared in any
             // submission since the last transition — it does not compare values,
             // so the field is not required to be declared in accepts.
             let gates_prefix = format!("{}.", GATES_EVIDENCE_NAMESPACE);
             let evidence_prefix = format!("{}.", EVIDENCE_NAMESPACE);
+            let vars_prefix = format!("{}.", VARS_NAMESPACE);
             let gate_fields: Vec<(&String, &serde_json::Value)> = when
                 .iter()
                 .filter(|(k, _)| k.starts_with(&gates_prefix))
@@ -1281,14 +1298,22 @@ impl CompiledTemplate {
                 .iter()
                 .filter(|(k, _)| k.starts_with(&evidence_prefix))
                 .collect();
+            let vars_fields: Vec<(&String, &serde_json::Value)> = when
+                .iter()
+                .filter(|(k, _)| k.starts_with(&vars_prefix))
+                .collect();
             let agent_fields: Vec<(&String, &serde_json::Value)> = when
                 .iter()
-                .filter(|(k, _)| !k.starts_with(&gates_prefix) && !k.starts_with(&evidence_prefix))
+                .filter(|(k, _)| {
+                    !k.starts_with(&gates_prefix)
+                        && !k.starts_with(&evidence_prefix)
+                        && !k.starts_with(&vars_prefix)
+                })
                 .collect();
 
             // Rule 5: when conditions that reference agent evidence require an accepts block.
-            // Pure gates.* and evidence.<field>: present conditions are allowed without
-            // an accepts block (presence checks do not reference declared schema).
+            // Pure gates.*, evidence.<field>: present, and vars.* conditions are allowed
+            // without an accepts block.
             if !agent_fields.is_empty() && !has_accepts {
                 return Err(format!(
                     "state {:?} transition to {:?}: when conditions require an accepts block on the state",
@@ -1312,6 +1337,35 @@ impl CompiledTemplate {
                         "state {:?} transition to {:?}: when value for evidence key {:?} must be {:?}; \
                          the evidence.<field> namespace only supports presence matching",
                         state_name, transition.target, field, PRESENT_MATCHER_VALUE
+                    ));
+                }
+            }
+
+            // Issue #141: validate vars.<name> entries use the {is_set: bool} matcher.
+            // The vars.* namespace only supports existence checking, not equality.
+            for (field, value) in &vars_fields {
+                let segments: Vec<&str> = field.splitn(3, '.').collect();
+                if segments.len() != 2 || segments[1].is_empty() {
+                    return Err(format!(
+                        "state {:?}: when clause key {:?} has invalid format; expected \"vars.<VARIABLE_NAME>\"",
+                        state_name, field.as_str()
+                    ));
+                }
+                let var_name = segments[1];
+                // The variable must be declared in the template's variables block.
+                if !self.variables.contains_key(var_name) {
+                    return Err(format!(
+                        "state {:?} transition to {:?}: when clause references undeclared variable {:?}; \
+                         add it to the template's variables block",
+                        state_name, transition.target, var_name
+                    ));
+                }
+                if is_is_set_matcher(value).is_none() {
+                    return Err(format!(
+                        "state {:?} transition to {:?}: when value for vars key {:?} must be \
+                         {{\"is_set\": true}} or {{\"is_set\": false}}; \
+                         the vars.* namespace only supports existence matching",
+                        state_name, transition.target, field
                     ));
                 }
             }
@@ -4339,6 +4393,255 @@ command: "./check.sh"
             warnings.is_empty(),
             "expected no W6 warnings for value-equality matchers; got: {:?}",
             warnings
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #141: is_set matcher and vars.* validation
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn is_is_set_matcher_true() {
+        assert_eq!(
+            is_is_set_matcher(&serde_json::json!({"is_set": true})),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn is_is_set_matcher_false() {
+        assert_eq!(
+            is_is_set_matcher(&serde_json::json!({"is_set": false})),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn is_is_set_matcher_rejects_non_object() {
+        assert_eq!(is_is_set_matcher(&serde_json::json!("is_set")), None);
+        assert_eq!(is_is_set_matcher(&serde_json::json!(true)), None);
+        assert_eq!(is_is_set_matcher(&serde_json::json!(42)), None);
+        assert_eq!(is_is_set_matcher(&serde_json::json!(null)), None);
+    }
+
+    #[test]
+    fn is_is_set_matcher_rejects_extra_keys() {
+        assert_eq!(
+            is_is_set_matcher(&serde_json::json!({"is_set": true, "extra": 1})),
+            None
+        );
+    }
+
+    #[test]
+    fn is_is_set_matcher_rejects_non_bool_value() {
+        assert_eq!(
+            is_is_set_matcher(&serde_json::json!({"is_set": "yes"})),
+            None
+        );
+    }
+
+    /// Helper: build a template with a declared optional variable and transitions
+    /// using vars.* when clauses.
+    fn template_with_var(var_name: &str) -> CompiledTemplate {
+        let mut t = minimal_template();
+        t.variables.insert(
+            var_name.to_string(),
+            VariableDecl {
+                description: String::new(),
+                required: false,
+                default: String::new(),
+            },
+        );
+        t
+    }
+
+    #[test]
+    fn vars_is_set_true_and_false_validate() {
+        let mut t = template_with_var("OPT_VAR");
+        // Add a middle state for the second branch.
+        t.states.insert(
+            "alt".to_string(),
+            TemplateState {
+                directive: "Alt path.".to_string(),
+                transitions: vec![Transition {
+                    target: "done".to_string(),
+                    when: None,
+                }],
+                terminal: false,
+                ..Default::default()
+            },
+        );
+        let state = t.states.get_mut("start").unwrap();
+        let mut when_set = BTreeMap::new();
+        when_set.insert(
+            "vars.OPT_VAR".to_string(),
+            serde_json::json!({"is_set": true}),
+        );
+        let mut when_unset = BTreeMap::new();
+        when_unset.insert(
+            "vars.OPT_VAR".to_string(),
+            serde_json::json!({"is_set": false}),
+        );
+        state.transitions = vec![
+            Transition {
+                target: "done".to_string(),
+                when: Some(when_set),
+            },
+            Transition {
+                target: "alt".to_string(),
+                when: Some(when_unset),
+            },
+        ];
+        assert!(
+            t.validate(true).is_ok(),
+            "vars.* with is_set true/false should validate"
+        );
+    }
+
+    #[test]
+    fn vars_equality_value_is_rejected() {
+        let mut t = template_with_var("FOO");
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert("vars.FOO".to_string(), serde_json::json!("bar"));
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("only supports existence matching"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn vars_undeclared_variable_is_rejected() {
+        let mut t = minimal_template(); // no variables declared
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert(
+            "vars.UNKNOWN".to_string(),
+            serde_json::json!({"is_set": true}),
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("undeclared variable") && err.contains("UNKNOWN"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn vars_is_set_mutual_exclusivity_disjoint() {
+        // {is_set: true} and {is_set: false} on the same field should NOT
+        // trigger a mutual exclusivity error (they are disjoint).
+        let mut t = template_with_var("OPT_VAR");
+        t.states.insert(
+            "alt".to_string(),
+            TemplateState {
+                directive: "Alt path.".to_string(),
+                transitions: vec![Transition {
+                    target: "done".to_string(),
+                    when: None,
+                }],
+                terminal: false,
+                ..Default::default()
+            },
+        );
+        let state = t.states.get_mut("start").unwrap();
+        let mut when_set = BTreeMap::new();
+        when_set.insert(
+            "vars.OPT_VAR".to_string(),
+            serde_json::json!({"is_set": true}),
+        );
+        let mut when_unset = BTreeMap::new();
+        when_unset.insert(
+            "vars.OPT_VAR".to_string(),
+            serde_json::json!({"is_set": false}),
+        );
+        state.transitions = vec![
+            Transition {
+                target: "done".to_string(),
+                when: Some(when_set),
+            },
+            Transition {
+                target: "alt".to_string(),
+                when: Some(when_unset),
+            },
+        ];
+        assert!(
+            t.validate(true).is_ok(),
+            "is_set true/false should be disjoint and not trigger mutual exclusivity error"
+        );
+    }
+
+    #[test]
+    fn vars_is_set_identical_flags_conflict() {
+        // Two transitions with {is_set: true} on the same field should trigger
+        // a mutual exclusivity error.
+        let mut t = template_with_var("OPT_VAR");
+        t.states.insert(
+            "alt".to_string(),
+            TemplateState {
+                directive: "Alt path.".to_string(),
+                transitions: vec![Transition {
+                    target: "done".to_string(),
+                    when: None,
+                }],
+                terminal: false,
+                ..Default::default()
+            },
+        );
+        let state = t.states.get_mut("start").unwrap();
+        let mut when_a = BTreeMap::new();
+        when_a.insert(
+            "vars.OPT_VAR".to_string(),
+            serde_json::json!({"is_set": true}),
+        );
+        let mut when_b = BTreeMap::new();
+        when_b.insert(
+            "vars.OPT_VAR".to_string(),
+            serde_json::json!({"is_set": true}),
+        );
+        state.transitions = vec![
+            Transition {
+                target: "done".to_string(),
+                when: Some(when_a),
+            },
+            Transition {
+                target: "alt".to_string(),
+                when: Some(when_b),
+            },
+        ];
+        let err = t.validate(true).unwrap_err();
+        assert!(err.contains("not mutually exclusive"), "got: {}", err);
+    }
+
+    #[test]
+    fn vars_does_not_require_accepts_block() {
+        // vars.* conditions should not require an accepts block (they are not
+        // agent-submitted evidence).
+        let mut t = template_with_var("OPT_VAR");
+        let state = t.states.get_mut("start").unwrap();
+        assert!(state.accepts.is_none(), "precondition: no accepts block");
+        let mut when = BTreeMap::new();
+        when.insert(
+            "vars.OPT_VAR".to_string(),
+            serde_json::json!({"is_set": true}),
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+        }];
+        assert!(
+            t.validate(true).is_ok(),
+            "vars.* should not require an accepts block"
         );
     }
 }

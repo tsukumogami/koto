@@ -653,6 +653,37 @@ transitions:
 
 The compiler emits **W6** (non-fatal) when `"present"` appears against any other path (a flat agent-evidence key, a `gates.*` path, `context.*`, etc.) — it almost always means the author meant presence matching but used the wrong prefix.
 
+### The `is_set` matcher for template variables in `when` clauses
+
+A `when` clause can check whether a template variable was provided at init time using the `vars.<VARIABLE_NAME>: {is_set: true/false}` syntax. This lets templates branch based on whether an optional variable was set:
+
+```yaml
+variables:
+  SHARED_BRANCH:
+    description: "Shared branch name"
+    required: false
+    default: ""
+
+states:
+  start:
+    transitions:
+      - target: use_shared_branch
+        when:
+          vars.SHARED_BRANCH:
+            is_set: true
+      - target: create_branch
+        when:
+          vars.SHARED_BRANCH:
+            is_set: false
+```
+
+A variable counts as "set" when its value is a non-empty string. Variables that are absent or have an empty string default are "not set".
+
+The compiler enforces:
+- `vars.*` keys must use `{is_set: true}` or `{is_set: false}` as the value. Equality matchers (e.g., `vars.FOO: "bar"`) are rejected.
+- The variable name after `vars.` must be declared in the template's `variables` block.
+- `{is_set: true}` and `{is_set: false}` on the same field are disjoint (no mutual exclusivity conflict). Two identical `{is_set: true}` conditions on different transitions are flagged as conflicting.
+
 ### `deny_unknown_fields` narrowed to source templates
 
 `#[serde(deny_unknown_fields)]` applies only to `SourceState` (the YAML-frontmatter surface). Compiled template JSON files no longer reject unknown fields, so adding a new compiled-template field in a release doesn't brick state files created by earlier versions. Template authors still get strict rejection at compile time.
