@@ -83,6 +83,12 @@ pub struct TemplateState {
     /// only when `terminal` is true.
     #[serde(default, skip_serializing_if = "is_false")]
     pub skipped_marker: bool,
+    /// Optional auto-advance predicate. When all key-value pairs in this map
+    /// match the available evidence (gate output + template variables), the
+    /// engine auto-transitions from this state without waiting for agent
+    /// evidence. Uses the same dot-path syntax as `when` clauses on transitions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_if: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 /// Template-level declaration that a state fans out child workflows from an
@@ -628,6 +634,114 @@ impl CompiledTemplate {
                     }
                 }
             }
+            // Validate skip_if field rules (before evidence-routing validation so that
+            // E-SKIP-AMBIGUOUS is evaluated independently of the mutual-exclusivity check).
+            if let Some(skip_conditions) = &state.skip_if {
+                // E-SKIP-TERMINAL: skip_if on a terminal state is unreachable.
+                if state.terminal {
+                    return Err(format!(
+                        "E-SKIP-TERMINAL: state {:?}: skip_if cannot be declared on a terminal state; \
+                         the terminal check fires before skip_if, making it unreachable\n  \
+                         remedy: remove skip_if or make the state non-terminal",
+                        state_name
+                    ));
+                }
+
+                // E-SKIP-NO-TRANSITIONS: skip_if with no transitions has no target to advance to.
+                if state.transitions.is_empty() {
+                    return Err(format!(
+                        "E-SKIP-NO-TRANSITIONS: state {:?}: skip_if requires at least one declared transition\n  \
+                         remedy: add a transition target, or remove skip_if",
+                        state_name
+                    ));
+                }
+
+                // E-SKIP-AMBIGUOUS: when all transitions are conditional, simulate skip_if values
+                // as synthetic evidence against each conditional transition's when clause.
+                // Zero matches or more than one match is an error.
+                // NOTE: this reuses the same condition evaluator as the runtime advance loop.
+                // Keep in sync with resolve_transition() in src/engine/advance.rs.
+                let all_conditional = state.transitions.iter().all(|t| t.when.is_some());
+                if all_conditional {
+                    let vars_prefix = format!("{}.", VARS_NAMESPACE);
+                    let matches: Vec<&str> = state
+                        .transitions
+                        .iter()
+                        .filter(|t| {
+                            if let Some(when) = &t.when {
+                                when.iter().all(|(field, expected)| {
+                                    // vars.NAME: {is_set: bool} check: match against skip_if conditions.
+                                    if field.starts_with(&vars_prefix) {
+                                        if let Some(expected_set) = is_is_set_matcher(expected) {
+                                            let var_name = &field[vars_prefix.len()..];
+                                            let is_set = skip_conditions
+                                                .get(field)
+                                                .or_else(|| skip_conditions.get(var_name))
+                                                .map(|v| {
+                                                    if let Some(b) = is_is_set_matcher(v) {
+                                                        b
+                                                    } else {
+                                                        !v.is_null()
+                                                    }
+                                                })
+                                                .unwrap_or(false);
+                                            return is_set == expected_set;
+                                        }
+                                    }
+                                    // Direct key match: skip_if provides synthetic evidence.
+                                    skip_conditions.get(field) == Some(expected)
+                                })
+                            } else {
+                                false
+                            }
+                        })
+                        .map(|t| t.target.as_str())
+                        .collect();
+
+                    match matches.len() {
+                        0 => {
+                            return Err(format!(
+                                "E-SKIP-AMBIGUOUS: state {:?}: skip_if values match zero conditional transitions; \
+                                 exactly one must match\n  \
+                                 remedy: ensure skip_if values match the when clause of exactly one transition",
+                                state_name
+                            ));
+                        }
+                        1 => {} // exactly one match — valid
+                        _ => {
+                            return Err(format!(
+                                "E-SKIP-AMBIGUOUS: state {:?}: skip_if values match more than one conditional transition {:?}; \
+                                 exactly one must match\n  \
+                                 remedy: refine skip_if values or when clauses so exactly one transition matches",
+                                state_name,
+                                matches
+                            ));
+                        }
+                    }
+                }
+
+                // W-SKIP-GATE-ABSENT: warn when a skip_if key of the form gates.NAME.*
+                // references a gate name not declared on this state.
+                let gates_prefix = format!("{}.", GATES_EVIDENCE_NAMESPACE);
+                for key in skip_conditions.keys() {
+                    if key.starts_with(&gates_prefix) {
+                        let segments: Vec<&str> = key.splitn(3, '.').collect();
+                        if segments.len() >= 2 {
+                            let gate_name_ref = segments[1];
+                            if !state.gates.contains_key(gate_name_ref) {
+                                eprintln!(
+                                    "warning: W-SKIP-GATE-ABSENT: state {:?}: skip_if key {:?} references \
+                                     gate {:?} which is not declared on this state; \
+                                     the condition will be silently unmatchable at runtime\n  \
+                                     remedy: declare a gate named {:?} on this state, or correct the key",
+                                    state_name, key, gate_name_ref, gate_name_ref
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             // Validate evidence routing rules on transitions (D3 included).
             self.validate_evidence_routing(state_name, state)?;
 
@@ -1526,6 +1640,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         states.insert(
@@ -1542,6 +1657,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         CompiledTemplate {
@@ -1764,6 +1880,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         assert!(
@@ -1919,6 +2036,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -1980,6 +2098,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -2032,6 +2151,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -2082,6 +2202,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -3181,6 +3302,7 @@ command: "./check.sh"
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         t
@@ -3296,6 +3418,7 @@ command: "./check.sh"
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3409,6 +3532,7 @@ command: "./check.sh"
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3693,6 +3817,7 @@ command: "./check.sh"
             terminal: true,
             failure: true,
             skipped_marker: true,
+            skip_if: None,
             ..TemplateState::default()
         };
         let json = serde_json::to_value(&state).unwrap();
@@ -3779,6 +3904,7 @@ command: "./check.sh"
             }),
             failure: false,
             skipped_marker: false,
+            skip_if: None,
         };
         let done = TemplateState {
             directive: "Done.".to_string(),
@@ -3792,6 +3918,7 @@ command: "./check.sh"
             materialize_children: None,
             failure: false,
             skipped_marker: false,
+            skip_if: None,
         };
         let mut states = BTreeMap::new();
         states.insert("plan".to_string(), plan);
@@ -3956,6 +4083,7 @@ command: "./check.sh"
             }),
             failure: false,
             skipped_marker: false,
+            skip_if: None,
         };
         t.states.insert("plan2".to_string(), plan2);
         let err = t.validate(true).unwrap_err();
@@ -4079,6 +4207,7 @@ command: "./check.sh"
             materialize_children: None,
             failure: false,
             skipped_marker: false,
+            skip_if: None,
         };
         t.states.insert("blocked".to_string(), blocked);
         let warnings = t.collect_materialize_children_warnings();
@@ -4106,6 +4235,7 @@ command: "./check.sh"
             materialize_children: None,
             failure: true,
             skipped_marker: false,
+            skip_if: None,
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();
@@ -4176,6 +4306,7 @@ command: "./check.sh"
             materialize_children: None,
             failure: true,
             skipped_marker: false,
+            skip_if: None,
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();
@@ -4211,6 +4342,7 @@ command: "./check.sh"
             materialize_children: None,
             failure: true,
             skipped_marker: false,
+            skip_if: None,
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();

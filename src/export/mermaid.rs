@@ -109,6 +109,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         states.insert(
@@ -125,6 +126,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         CompiledTemplate {
@@ -181,6 +183,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         let t = CompiledTemplate {
@@ -238,6 +241,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         states.insert(
@@ -254,6 +258,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         states.insert(
@@ -270,6 +275,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
 
@@ -357,6 +363,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
 
@@ -388,6 +395,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         states.insert(
@@ -407,6 +415,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         states.insert(
@@ -426,6 +435,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
         states.insert(
@@ -442,6 +452,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         );
 

@@ -3082,6 +3082,7 @@ mod tests {
             materialize_children: None,
             failure: false,
             skipped_marker: false,
+            skip_if: None,
         };
         compiled.states.insert("s".to_string(), state.clone());
         assert!(!state_has_materialize_children(&compiled, "s"));

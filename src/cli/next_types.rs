@@ -1171,6 +1171,7 @@ mod tests {
             materialize_children: None,
             failure: false,
             skipped_marker: false,
+            skip_if: None,
         }
     }
 
