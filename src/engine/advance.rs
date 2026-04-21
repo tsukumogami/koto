@@ -434,7 +434,7 @@ where
             }
         }
 
-        // 8. Resolve transition
+        // Evidence assembly (shared by steps 7 and 8)
         // Build a merged evidence Value: start with agent evidence (flat keys),
         // then layer gate output under "gates" (engine data takes precedence).
         // This allows when clauses to reference both agent-submitted fields and
@@ -515,6 +515,7 @@ where
             }
         }
 
+        // 8. Resolve transition
         match resolve_transition(
             template_state,
             &evidence_value,
