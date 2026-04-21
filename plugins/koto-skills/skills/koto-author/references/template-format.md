@@ -500,6 +500,105 @@ The compiler validates `children-complete` gate fields at compile time:
 - `name_filter` is optional and not validated beyond being a string (the prefix match happens at runtime).
 - Like all gate types, `children-complete` gates must have corresponding `gates.*` when-clause routing or the D5 check will fail.
 
+### skip_if — automatic transitions
+
+`skip_if` lets a state advance automatically when certain conditions hold, without waiting for evidence from the agent. The engine evaluates `skip_if` before asking for evidence. If the conditions match, the engine fires the matching transition and loops — consecutive `skip_if` states chain within a single `koto next` call.
+
+#### Field syntax
+
+`skip_if` is a flat dict of dot-path keys and expected values. The key format is the same as `when` clauses:
+
+```yaml
+states:
+  check_context:
+    skip_if:
+      gates.context_check.exists: true
+    transitions:
+      - target: already_done
+        when:
+          gates.context_check.exists: true
+      - target: do_work
+```
+
+The engine evaluates all `skip_if` keys against a merged map of gate outputs and workflow variables. If all keys match, the engine resolves the matching transition (the one whose `when` clause the `skip_if` values satisfy) and advances.
+
+#### Motivating condition types
+
+**Gate output** — skip if a gate already produced a particular result:
+
+```yaml
+states:
+  await_file:
+    gates:
+      file_check:
+        type: context-exists
+        key: output.md
+    skip_if:
+      gates.file_check.exists: true
+    transitions:
+      - target: process
+        when:
+          gates.file_check.exists: true
+      - target: await_file
+        when:
+          gates.file_check.exists: false
+```
+
+This is the idiomatic workaround when a `context-exists` gate would otherwise block indefinitely: the self-loop keeps the agent polling, and `skip_if` fires as soon as the key appears.
+
+**Template variable existence** — skip based on whether an optional variable was provided at init time:
+
+```yaml
+variables:
+  SHARED_BRANCH:
+    description: Shared branch to use if pre-created
+    required: false
+    default: ""
+
+states:
+  branch_setup:
+    skip_if:
+      vars.SHARED_BRANCH:
+        is_set: true
+    transitions:
+      - target: use_shared_branch
+        when:
+          vars.SHARED_BRANCH:
+            is_set: true
+      - target: create_branch
+```
+
+**Direct evidence value** — skip when a specific piece of evidence is already present in the workflow's merged state:
+
+```yaml
+states:
+  check_result:
+    skip_if:
+      result: pass
+    transitions:
+      - target: done
+        when:
+          result: pass
+      - target: retry
+```
+
+#### Compile-time rules
+
+| Rule | Type | Condition |
+|------|------|-----------|
+| `E-SKIP-TERMINAL` | Error | `skip_if` declared on a terminal state |
+| `E-SKIP-NO-TRANSITIONS` | Error | State has `skip_if` but no transitions declared |
+| `E-SKIP-AMBIGUOUS` | Error | `skip_if` values match zero or more than one conditional transition |
+| `W-SKIP-GATE-ABSENT` | Warning | A `gates.NAME.*` key in `skip_if` references a gate not declared on the same state |
+
+`E-SKIP-AMBIGUOUS` identifies which transitions matched and which values caused the conflict. Fix it by ensuring the `skip_if` values uniquely satisfy exactly one `when` clause.
+
+`W-SKIP-GATE-ABSENT` is a warning — compilation succeeds but the gate output will be absent at runtime, so the condition will never match. Add the missing gate or correct the key.
+
+#### Chaining behavior
+
+When the engine fires a `skip_if` transition, it immediately re-evaluates the new state. If that state also has a matching `skip_if`, the engine advances again — all within the same `koto next` call. The response always reflects the final landing state. `advanced: true` appears in the response whenever at least one `skip_if` fired during the call.
+
 ### Self-loops
 
 A transition whose target is its own state creates a retry loop. The agent (or the engine via gate routing) stays in the state until conditions change:
@@ -695,8 +794,12 @@ Batch authoring introduces error (E), warning (W), and runtime (R) rule IDs used
 | Prefix | Range | Scope | Details |
 |---|---|---|---|
 | E | E1-E10 | Compile-time errors on `materialize_children` | See [batch-authoring.md](batch-authoring.md) for the full table |
+| E | E-SKIP-TERMINAL | Compile-time error on `skip_if` | `skip_if` declared on a terminal state — remove it or remove `terminal: true` |
+| E | E-SKIP-NO-TRANSITIONS | Compile-time error on `skip_if` | State has `skip_if` but no transitions — add at least one transition |
+| E | E-SKIP-AMBIGUOUS | Compile-time error on `skip_if` | `skip_if` values match zero or more than one conditional transition — ensure values satisfy exactly one `when` clause |
 | W | W1-W5 | Compile-time warnings on `materialize_children` / `failure` / `skipped_marker` | See [batch-authoring.md](batch-authoring.md) |
 | W | W6 | Compile-time warning on `present` matcher misuse | Fires when `"present"` appears outside `evidence.<field>` paths |
+| W | W-SKIP-GATE-ABSENT | Compile-time warning on `skip_if` | A `gates.NAME.*` key references a gate not declared on the state — add the gate or fix the key |
 | F | F5 | Compile-time warning on child template reachability | Child template has no reachable `skipped_marker: true` terminal. See [batch-authoring.md](batch-authoring.md) |
 | R | R0-R9 | Pre-append runtime rules on a submitted task list | Validated in `koto next`. See [batch-workflows.md](../../koto-user/references/batch-workflows.md) |
 
