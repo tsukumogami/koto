@@ -1234,6 +1234,7 @@ mod tests {
                     from: None,
                     to: "start".to_string(),
                     condition_type: "initial".to_string(),
+                    skip_if_matched: None,
                 },
             },
         ];

@@ -65,6 +65,8 @@ struct SourceState {
     failure: bool,
     #[serde(default)]
     skipped_marker: bool,
+    #[serde(default)]
+    skip_if: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// YAML front-matter view of a `materialize_children` hook.
@@ -255,6 +257,13 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
                     failure_policy: sm.failure_policy,
                 });
 
+        // Transform source skip_if to compiled skip_if (HashMap -> BTreeMap for determinism).
+        let compiled_skip_if: Option<std::collections::BTreeMap<String, serde_json::Value>> =
+            source_state
+                .skip_if
+                .as_ref()
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+
         compiled_states.insert(
             state_name.clone(),
             TemplateState {
@@ -269,6 +278,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
                 materialize_children: compiled_materialize_children,
                 failure: source_state.failure,
                 skipped_marker: source_state.skipped_marker,
+                skip_if: compiled_skip_if,
             },
         );
     }
@@ -1892,5 +1902,279 @@ Skipped (but unreachable).
         // If deny_unknown_fields were on CompiledTemplate/TemplateState this
         // would error; the test is that it does not.
         let _: CompiledTemplate = serde_json::from_value(json).unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Issue 1: skip_if field validation rules (E-SKIP-TERMINAL,
+    // E-SKIP-NO-TRANSITIONS, E-SKIP-AMBIGUOUS, W-SKIP-GATE-ABSENT).
+    // -------------------------------------------------------------------
+
+    /// scenario-1: skip_if field accepted in a valid template without error.
+    #[test]
+    fn skip_if_valid_field_compiles() {
+        let src = r#"---
+name: skip-if-test
+version: "1.0"
+initial_state: decide
+states:
+  decide:
+    accepts:
+      verdict:
+        type: enum
+        values: [proceed, skip]
+        required: true
+    skip_if:
+      verdict: proceed
+    transitions:
+      - target: done
+        when:
+          verdict: proceed
+      - target: bypassed
+        when:
+          verdict: skip
+  done:
+    terminal: true
+  bypassed:
+    terminal: true
+---
+
+## decide
+
+Make a decision.
+
+## done
+
+Done.
+
+## bypassed
+
+Bypassed.
+"#;
+        let f = write_temp(src);
+        let result = compile(f.path(), true).unwrap();
+        let decide = &result.states["decide"];
+        assert!(decide.skip_if.is_some(), "skip_if should be Some");
+        let skip_map = decide.skip_if.as_ref().unwrap();
+        assert_eq!(skip_map.get("verdict"), Some(&serde_json::json!("proceed")));
+    }
+
+    /// scenario-2: E-SKIP-TERMINAL — skip_if on terminal state is rejected.
+    #[test]
+    fn skip_if_on_terminal_state_is_error() {
+        let src = r#"---
+name: skip-terminal
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+    skip_if:
+      verdict: proceed
+---
+
+## start
+
+Start.
+
+## done
+
+Done.
+"#;
+        let f = write_temp(src);
+        let err = compile(f.path(), true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("E-SKIP-TERMINAL"),
+            "expected E-SKIP-TERMINAL error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("done"),
+            "error should name the offending state, got: {}",
+            msg
+        );
+    }
+
+    /// scenario-3: E-SKIP-NO-TRANSITIONS — skip_if with no transitions is rejected.
+    #[test]
+    fn skip_if_with_no_transitions_is_error() {
+        let src = r#"---
+name: skip-no-transitions
+version: "1.0"
+initial_state: orphan
+states:
+  orphan:
+    skip_if:
+      verdict: proceed
+    transitions: []
+---
+
+## orphan
+
+No outgoing transitions.
+"#;
+        let f = write_temp(src);
+        let err = compile(f.path(), true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("E-SKIP-NO-TRANSITIONS"),
+            "expected E-SKIP-NO-TRANSITIONS error, got: {}",
+            msg
+        );
+    }
+
+    /// scenario-4: E-SKIP-AMBIGUOUS — skip_if values matching zero conditional transitions.
+    #[test]
+    fn skip_if_ambiguous_routing_is_error_zero_matches() {
+        // All transitions are conditional and skip_if values match none of them.
+        let src = r#"---
+name: skip-ambiguous-zero
+version: "1.0"
+initial_state: decide
+states:
+  decide:
+    accepts:
+      verdict:
+        type: enum
+        values: [proceed, skip]
+        required: true
+    skip_if:
+      verdict: unknown
+    transitions:
+      - target: done
+        when:
+          verdict: proceed
+      - target: bypassed
+        when:
+          verdict: skip
+  done:
+    terminal: true
+  bypassed:
+    terminal: true
+---
+
+## decide
+
+Make a decision.
+
+## done
+
+Done.
+
+## bypassed
+
+Bypassed.
+"#;
+        let f = write_temp(src);
+        let err = compile(f.path(), true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("E-SKIP-AMBIGUOUS"),
+            "expected E-SKIP-AMBIGUOUS error (zero matches), got: {}",
+            msg
+        );
+    }
+
+    /// scenario-5: E-SKIP-AMBIGUOUS — skip_if values matching more than one conditional transition.
+    ///
+    /// E-SKIP-AMBIGUOUS is validated before the mutual exclusivity check (Rule 4), so the
+    /// compile() path can be used directly. We construct a template where both conditional
+    /// transitions match the skip_if evidence — each transition's when clause is a subset
+    /// of the skip_if map. The mutual exclusivity check would later reject transitions that
+    /// share no fields, but E-SKIP-AMBIGUOUS fires first.
+    #[test]
+    fn skip_if_ambiguous_routing_is_error() {
+        // Two conditional transitions with disjoint field keys; both match skip_if evidence.
+        // Transition A: when: {verdict: proceed} — matches skip_if.verdict = proceed
+        // Transition B: when: {mode: fast}       — matches skip_if.mode = fast
+        // skip_if has both verdict and mode, so BOTH transitions match.
+        // E-SKIP-AMBIGUOUS fires before the mutual exclusivity check.
+        let src = r#"---
+name: skip-ambiguous-multi
+version: "1.0"
+initial_state: decide
+states:
+  decide:
+    accepts:
+      verdict:
+        type: enum
+        values: [proceed, skip]
+        required: true
+      mode:
+        type: enum
+        values: [fast, slow]
+        required: true
+    skip_if:
+      verdict: proceed
+      mode: fast
+    transitions:
+      - target: fast_path
+        when:
+          verdict: proceed
+      - target: slow_path
+        when:
+          mode: fast
+  fast_path:
+    terminal: true
+  slow_path:
+    terminal: true
+---
+
+## decide
+
+Make a decision.
+
+## fast_path
+
+Fast.
+
+## slow_path
+
+Slow.
+"#;
+        let f = write_temp(src);
+        let err = compile(f.path(), true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("E-SKIP-AMBIGUOUS"),
+            "expected E-SKIP-AMBIGUOUS error (multiple matches), got: {}",
+            msg
+        );
+    }
+
+    /// scenario-6: W-SKIP-GATE-ABSENT — skip_if key referencing undeclared gate name produces a warning (not an error).
+    #[test]
+    fn skip_if_gate_absent_produces_warning_not_error() {
+        // skip_if references gates.missing_gate.exists but no gate named
+        // missing_gate is declared on the state. This should compile
+        // successfully (warning only, not error).
+        let src = r#"---
+name: skip-gate-absent
+version: "1.0"
+initial_state: check
+states:
+  check:
+    skip_if:
+      gates.missing_gate.exists: true
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## check
+
+Check the context.
+
+## done
+
+Done.
+"#;
+        let f = write_temp(src);
+        // W-SKIP-GATE-ABSENT is a warning, not an error — compile succeeds.
+        compile(f.path(), true).expect("W-SKIP-GATE-ABSENT should warn but not fail compilation");
     }
 }

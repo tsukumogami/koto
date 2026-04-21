@@ -174,6 +174,52 @@ such states before returning. If you do see it, call `koto next` again without a
 
 ---
 
+## Scenario (c2): skip_if fired — engine advanced one or more states automatically
+
+One or more states in the chain had a `skip_if` block whose conditions matched. The
+engine fired the matching transition and continued advancing without waiting for agent
+input. The response reflects the final landing state after all chained `skip_if`
+transitions completed.
+
+```json
+{
+  "action": "evidence_required",
+  "state": "do_work",
+  "directive": "The preparatory state was skipped automatically. Proceed with the main task.",
+  "advanced": true,
+  "expects": {
+    "event_type": "evidence_submitted",
+    "fields": {
+      "result": {
+        "type": "enum",
+        "required": true,
+        "values": ["pass", "fail"]
+      }
+    }
+  },
+  "blocking_conditions": [],
+  "error": null
+}
+```
+
+**Decision points:**
+- `advanced: true` signals that the engine made at least one `skip_if` transition during
+  this call. The agent may have landed several states ahead of where it started.
+- The response reflects the final state only — intermediate states that were skipped are
+  not listed. To see the full transition history, inspect the JSONL event log for the
+  session.
+- In the event log, each `skip_if` transition appears as a `Transitioned` event with
+  `"condition_type": "skip_if"` and a non-null `skip_if_matched` map showing the
+  conditions that fired. Events for states advanced via evidence or gates use a different
+  `condition_type` value and have `skip_if_matched` absent.
+- Consecutive `skip_if` states chain within a single call. If the landing state also has
+  a `skip_if` whose conditions match, the engine advances again before returning.
+- The shape of the landing state determines the action: `evidence_required`,
+  `gate_blocked`, `done`, etc. `advanced: true` is the only `skip_if`-specific signal in
+  the response itself.
+
+---
+
 ## Scenario (d): gate_blocked — agent can resolve
 
 The state has one or more failed gates, no `accepts` block, and at least one gate is
@@ -459,6 +505,9 @@ Several fields are conditionally absent rather than `null`. When writing code to
 - `expects` is always written but may be `null` — this is not the same as absent.
 - `options` inside an `expects` object is omitted (not written) when empty, not written
   as `[]`.
+- In the JSONL event log, `skip_if_matched` is absent on `Transitioned` events whose
+  `condition_type` is not `"skip_if"`. Don't assume this field is present — check
+  `condition_type` first.
 
 ---
 

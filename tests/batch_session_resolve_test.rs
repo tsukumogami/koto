@@ -421,6 +421,7 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
             from: Some("work".to_string()),
             to: "failed".to_string(),
             condition_type: "direct".to_string(),
+            skip_if_matched: None,
         },
     };
     seed_backend

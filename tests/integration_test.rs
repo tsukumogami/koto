@@ -8137,3 +8137,383 @@ Branch B.
         stdout
     );
 }
+
+// ---------------------------------------------------------------------------
+// skip_if
+// ---------------------------------------------------------------------------
+
+#[test]
+fn skip_if_log_records_condition_type_and_matched_values() {
+    let dir = TempDir::new().unwrap();
+
+    let template = r#"---
+name: skip-if-log-test
+version: "1.0"
+initial_state: start
+variables:
+  MY_VAR:
+    description: "test var"
+    required: false
+    default: ""
+states:
+  start:
+    skip_if:
+      vars.MY_VAR:
+        is_set: false
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Do the first task.
+
+## done
+
+All done.
+"#;
+
+    let src = dir.path().join("skip-if-log-test.md");
+    std::fs::write(&src, template).unwrap();
+
+    let init_output = koto_cmd(dir.path())
+        .args(["init", "my-wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        init_output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init_output.stdout),
+        String::from_utf8_lossy(&init_output.stderr)
+    );
+
+    // koto next: skip_if fires because MY_VAR is unset — the condition {is_set: false}
+    // is satisfied when the variable is empty (the default).
+    // --no-cleanup keeps the session directory so we can inspect the state file.
+    let next_output = koto_cmd(dir.path())
+        .args(["next", "my-wf", "--no-cleanup"])
+        .output()
+        .unwrap();
+    assert!(
+        next_output.status.success(),
+        "next failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&next_output.stdout),
+        String::from_utf8_lossy(&next_output.stderr)
+    );
+
+    // Read and parse each line of the JSONL state file.
+    let state_path = session_state_path(dir.path(), "my-wf");
+    let state_content = std::fs::read_to_string(&state_path).unwrap();
+    let skip_if_events: Vec<serde_json::Value> = state_content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            event["type"].as_str() == Some("transitioned")
+                && event["payload"]["condition_type"].as_str() == Some("skip_if")
+        })
+        .collect();
+
+    assert_eq!(
+        skip_if_events.len(),
+        1,
+        "expected exactly one transitioned event with condition_type=skip_if, got {}: {:?}",
+        skip_if_events.len(),
+        skip_if_events
+    );
+
+    let matched = &skip_if_events[0]["payload"]["skip_if_matched"];
+    assert!(
+        matched.is_object(),
+        "skip_if_matched should be an object, got: {}",
+        matched
+    );
+    assert_eq!(
+        matched["vars.MY_VAR"],
+        serde_json::json!({"is_set": false}),
+        "skip_if_matched should record the matched condition; got: {}",
+        matched
+    );
+}
+
+#[test]
+fn skip_if_consecutive_chain_emits_correct_events() {
+    let dir = TempDir::new().unwrap();
+
+    let template = r#"---
+name: skip-if-chain-test
+version: "1.0"
+initial_state: a
+variables:
+  CHAIN_DISABLED:
+    description: "Disables chaining when set"
+    required: false
+    default: ""
+states:
+  a:
+    skip_if:
+      vars.CHAIN_DISABLED:
+        is_set: false
+    transitions:
+      - target: b
+  b:
+    skip_if:
+      vars.CHAIN_DISABLED:
+        is_set: false
+    transitions:
+      - target: c
+  c:
+    terminal: true
+---
+
+## a
+
+State a.
+
+## b
+
+State b.
+
+## c
+
+State c.
+"#;
+
+    let src = dir.path().join("skip-if-chain-test.md");
+    std::fs::write(&src, template).unwrap();
+
+    let init_output = koto_cmd(dir.path())
+        .args(["init", "chain-test-wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        init_output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init_output.stdout),
+        String::from_utf8_lossy(&init_output.stderr)
+    );
+
+    // koto next: skip_if fires on both a and b, advancing to c (terminal).
+    // --no-cleanup keeps the session directory so we can inspect the state file.
+    let next_output = koto_cmd(dir.path())
+        .args(["next", "chain-test-wf", "--no-cleanup"])
+        .output()
+        .unwrap();
+    assert!(
+        next_output.status.success(),
+        "next failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&next_output.stdout),
+        String::from_utf8_lossy(&next_output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&next_output.stdout).unwrap();
+    assert_eq!(
+        json["state"].as_str(),
+        Some("c"),
+        "should reach terminal state c; got: {}",
+        json
+    );
+    assert_eq!(
+        json["advanced"], true,
+        "advanced should be true after skip_if chain"
+    );
+
+    // Count Transitioned events with condition_type == "skip_if" in the state file.
+    let state_path = session_state_path(dir.path(), "chain-test-wf");
+    let state_content = std::fs::read_to_string(&state_path).unwrap();
+    let skip_if_count = state_content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            event["type"].as_str() == Some("transitioned")
+                && event["payload"]["condition_type"].as_str() == Some("skip_if")
+        })
+        .count();
+
+    assert_eq!(
+        skip_if_count, 2,
+        "expected exactly 2 skip_if transitioned events (a->b and b->c), got {}",
+        skip_if_count
+    );
+}
+
+#[test]
+fn skip_if_cycle_detection() {
+    let dir = TempDir::new().unwrap();
+
+    let template = r#"---
+name: skip-if-cycle-test
+version: "1.0"
+initial_state: a
+variables:
+  NO_CYCLE:
+    description: "When set, prevents skip_if from firing"
+    required: false
+    default: ""
+states:
+  a:
+    skip_if:
+      vars.NO_CYCLE:
+        is_set: false
+    transitions:
+      - target: b
+  b:
+    skip_if:
+      vars.NO_CYCLE:
+        is_set: false
+    transitions:
+      - target: a
+---
+
+## a
+
+State a.
+
+## b
+
+State b.
+"#;
+
+    let src = dir.path().join("skip-if-cycle-test.md");
+    std::fs::write(&src, template).unwrap();
+
+    let init_output = koto_cmd(dir.path())
+        .args(["init", "cycle-wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        init_output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init_output.stdout),
+        String::from_utf8_lossy(&init_output.stderr)
+    );
+
+    // First koto next: cycle a->b->a->... should be detected and reported as error
+    let next_output = koto_cmd(dir.path())
+        .args(["next", "cycle-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        !next_output.status.success(),
+        "next should fail with cycle detection; stdout={}",
+        String::from_utf8_lossy(&next_output.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&next_output.stdout);
+    assert!(
+        stdout.contains("cycle detected"),
+        "error should mention 'cycle detected'; got: {}",
+        stdout
+    );
+
+    // Second koto next: state file should still be intact; cycle repeats
+    let next_output2 = koto_cmd(dir.path())
+        .args(["next", "cycle-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        !next_output2.status.success(),
+        "second next should also fail with cycle detection; stdout={}",
+        String::from_utf8_lossy(&next_output2.stdout)
+    );
+}
+
+fn skip_if_chain_template(num_states: usize) -> String {
+    // Build a template with num_states states: s0..s(num_states-1), where s(num_states-1) is terminal.
+    // States s0 through s(num_states-2) each have skip_if and transition to the next state.
+    let last = num_states - 1;
+
+    let mut yaml = format!(
+        "---\nname: skip-if-limit-test\nversion: \"1.0\"\ninitial_state: s0\nvariables:\n  CHAIN_STOP:\n    description: \"When set, stops chaining\"\n    required: false\n    default: \"\"\nstates:\n"
+    );
+
+    for i in 0..num_states {
+        if i == last {
+            yaml.push_str(&format!("  s{}:\n    terminal: true\n", i));
+        } else {
+            yaml.push_str(&format!(
+                "  s{}:\n    skip_if:\n      vars.CHAIN_STOP:\n        is_set: false\n    transitions:\n      - target: s{}\n",
+                i,
+                i + 1
+            ));
+        }
+    }
+
+    yaml.push_str("---\n");
+
+    // Add markdown sections for each state.
+    for i in 0..num_states {
+        yaml.push_str(&format!("\n## s{}\n\nState s{}.\n", i, i));
+    }
+
+    yaml
+}
+
+#[test]
+fn skip_if_chain_triggers_limit() {
+    let dir = TempDir::new().unwrap();
+
+    // 101 states: s0..s100, where s100 is terminal.
+    // s0..s99 each have skip_if and unconditional transition to next.
+    // The engine chain limit is 100. With 101 states, the first koto next chains
+    // s0->s1->...->s100 (100 transitions, all persisted), then hits the limit at
+    // the top of the 101st loop iteration — after the transition to s100 is written
+    // but before the terminal check for s100 runs. Exit code is non-zero.
+    // The second koto next starts at s100, sees it's terminal, and returns action=done.
+    let template = skip_if_chain_template(101);
+    let src = dir.path().join("skip-if-limit-test.md");
+    std::fs::write(&src, &template).unwrap();
+
+    let init_output = koto_cmd(dir.path())
+        .args(["init", "chain-wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        init_output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init_output.stdout),
+        String::from_utf8_lossy(&init_output.stderr)
+    );
+
+    // First koto next: should hit the chain limit (100 transitions)
+    let next_output = koto_cmd(dir.path())
+        .args(["next", "chain-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        !next_output.status.success(),
+        "next should fail with chain limit; stdout={}",
+        String::from_utf8_lossy(&next_output.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&next_output.stdout);
+    assert!(
+        stdout.contains("chain limit reached"),
+        "error should mention 'chain limit reached'; got: {}",
+        stdout
+    );
+
+    // Second koto next: state file is intact; should advance to s100 (terminal)
+    let next_output2 = koto_cmd(dir.path())
+        .args(["next", "chain-wf"])
+        .output()
+        .unwrap();
+    assert!(
+        next_output2.status.success(),
+        "second next should succeed from where chain stopped; stdout={} stderr={}",
+        String::from_utf8_lossy(&next_output2.stdout),
+        String::from_utf8_lossy(&next_output2.stderr)
+    );
+    let json2: serde_json::Value = serde_json::from_slice(&next_output2.stdout).unwrap();
+    assert_eq!(
+        json2["action"].as_str(),
+        Some("done"),
+        "second next should reach terminal state with action=done; got: {}",
+        json2
+    );
+    assert_eq!(
+        json2["state"].as_str(),
+        Some("s100"),
+        "second next should reach s100; got: {}",
+        json2
+    );
+}

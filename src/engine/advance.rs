@@ -156,7 +156,8 @@ pub enum IntegrationError {
 /// 4. Integration declared (invoke runner)
 /// 5. Action execution (if state has default_action)
 /// 6. Gates (evaluate all, stop if any fail)
-/// 7. Transition resolution (match evidence against conditions)
+/// 7. skip_if evaluation (if conditions met, auto-transition and continue loop)
+/// 8. Transition resolution (match evidence against conditions)
 ///
 /// I/O operations are injected as closures for testability:
 /// - `append_event`: persist a state transition event
@@ -407,6 +408,9 @@ where
                             .any(|k| k.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)))
                     })
                     .unwrap_or(false)
+            }) || template_state.skip_if.as_ref().is_some_and(|s| {
+                s.keys()
+                    .any(|k| k.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)))
             });
 
             if any_failed {
@@ -430,7 +434,7 @@ where
             }
         }
 
-        // 7. Resolve transition
+        // Evidence assembly (shared by steps 7 and 8)
         // Build a merged evidence Value: start with agent evidence (flat keys),
         // then layer gate output under "gates" (engine data takes precedence).
         // This allows when clauses to reference both agent-submitted fields and
@@ -461,6 +465,57 @@ where
             );
         }
         let evidence_value = serde_json::Value::Object(merged);
+
+        // 7. skip_if evaluation
+        // Evaluate skip_if conditions before falling through to transition resolution.
+        // If all conditions are met, auto-transition without waiting for agent evidence.
+        if let Some(skip_conditions) = &template_state.skip_if {
+            if conditions_satisfied(skip_conditions, &evidence_value, &workflow_variables) {
+                // Resolve which transition the skip_if fires using the assembled
+                // evidence_value (which contains nested gate output under "gates").
+                // Using evidence_value rather than a flat skip_conditions map ensures
+                // that gates.* when-clauses resolve correctly via dot-path traversal.
+                // conditions_satisfied() already verified the runtime state matches,
+                // so evidence_value contains the right values for routing.
+                match resolve_transition(
+                    template_state,
+                    &evidence_value,
+                    false,
+                    &workflow_variables,
+                ) {
+                    TransitionResolution::Resolved(target) => {
+                        // Cycle detection BEFORE writing the event.
+                        if visited.contains(&target) {
+                            return Ok(AdvanceResult {
+                                final_state: state,
+                                advanced,
+                                stop_reason: StopReason::CycleDetected { state: target },
+                            });
+                        }
+                        // Append transitioned event.
+                        let payload = EventPayload::Transitioned {
+                            from: Some(state.clone()),
+                            to: target.clone(),
+                            condition_type: "skip_if".to_string(),
+                            skip_if_matched: Some(skip_conditions.clone()),
+                        };
+                        append_event(&payload).map_err(AdvanceError::PersistenceError)?;
+                        visited.insert(target.clone());
+                        state = target;
+                        advanced = true;
+                        transition_count += 1;
+                        current_evidence = BTreeMap::new();
+                        continue; // Chain: re-enter loop at next state
+                    }
+                    _ => {
+                        // skip_if couldn't resolve a unique transition — fall through to
+                        // normal resolution (this should not happen if compile validation passed)
+                    }
+                }
+            }
+        }
+
+        // 8. Resolve transition
         match resolve_transition(
             template_state,
             &evidence_value,
@@ -482,6 +537,7 @@ where
                     from: Some(state.clone()),
                     to: target.clone(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 };
                 append_event(&payload).map_err(AdvanceError::PersistenceError)?;
 
@@ -557,6 +613,46 @@ fn resolve_value<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serd
         current = current.get(segment)?;
     }
     Some(current)
+}
+
+/// Evaluate whether all skip_if conditions are satisfied.
+///
+/// Returns `true` only when every key-value pair in `conditions` is matched
+/// against the current engine state (merged evidence + variables).
+///
+/// Matching rules:
+/// - **`vars.NAME: {is_set: bool}`** — resolves the named template variable at
+///   runtime against the `variables` map. Returns `true` when
+///   `variables.get(name).map(|v| !v.is_empty()).unwrap_or(false)` equals the
+///   expected bool.
+/// - **all other keys** — dot-path lookup in `merged_evidence` using
+///   `resolve_value`, compared with JSON equality. Gate keys like
+///   `gates.ci.exit_code` require the nested gate structure in `merged_evidence`
+///   (built from `gate_evidence_map` before this function is called).
+///
+/// Note: the compile-time analogue `skip_if_matches_when` in `src/template/types.rs`
+/// uses a flat `BTreeMap::get()` lookup rather than dot-path traversal because
+/// compile time has no nested gate output — both maps are flat. At runtime,
+/// gate output arrives as nested JSON, so dot-path traversal is needed here.
+fn conditions_satisfied(
+    conditions: &std::collections::BTreeMap<String, serde_json::Value>,
+    merged_evidence: &serde_json::Value,
+    variables: &std::collections::HashMap<String, String>,
+) -> bool {
+    let vars_prefix = format!("{}.", VARS_NAMESPACE);
+    conditions.iter().all(|(key, expected)| {
+        if key.starts_with(&vars_prefix) {
+            if let Some(expected_set) = is_is_set_matcher(expected) {
+                let var_name = &key[vars_prefix.len()..];
+                let is_set = variables
+                    .get(var_name)
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false);
+                return is_set == expected_set;
+            }
+        }
+        resolve_value(merged_evidence, key) == Some(expected)
+    })
 }
 
 /// Resolve which transition to take from a state given current evidence.
@@ -696,6 +792,7 @@ mod tests {
             materialize_children: None,
             failure: false,
             skipped_marker: false,
+            skip_if: None,
         }
     }
 
@@ -1303,6 +1400,7 @@ mod tests {
                 from: Some("a".to_string()),
                 to: "b".to_string(),
                 condition_type: "auto".to_string(),
+                skip_if_matched: None,
             },
         }];
 
@@ -1332,6 +1430,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -1348,6 +1447,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -1367,6 +1467,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -1383,6 +1484,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -1449,6 +1551,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         )]);
 
@@ -1506,6 +1609,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         )]);
 
@@ -1553,6 +1657,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         )]);
 
@@ -1621,6 +1726,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         )]);
 
@@ -1720,6 +1826,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -1736,6 +1843,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -1752,6 +1860,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -1839,6 +1948,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -1855,6 +1965,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -1871,6 +1982,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -1957,6 +2069,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -1973,6 +2086,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -2057,6 +2171,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -2073,6 +2188,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -2236,6 +2352,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -2252,6 +2369,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -2300,6 +2418,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         )]);
 
@@ -2355,6 +2474,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ));
         }
@@ -2373,6 +2493,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         ));
 
@@ -2413,6 +2534,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         )]);
 
@@ -2454,6 +2576,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -2470,6 +2593,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -2486,6 +2610,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -2531,6 +2656,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -2547,6 +2673,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -2563,6 +2690,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -2630,6 +2758,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         )]);
 
@@ -2684,6 +2813,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         )]);
 
@@ -2727,6 +2857,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         )]);
 
@@ -2804,6 +2935,7 @@ mod tests {
                 materialize_children: None,
                 failure: false,
                 skipped_marker: false,
+                skip_if: None,
             },
         )]);
 
@@ -2865,6 +2997,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -2881,6 +3014,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -2939,6 +3073,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -2955,6 +3090,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -3022,6 +3158,7 @@ mod tests {
                     from: None,
                     to: state.to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -3066,6 +3203,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -3082,6 +3220,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -3156,6 +3295,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -3172,6 +3312,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -3289,6 +3430,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -3305,6 +3447,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -3316,6 +3459,7 @@ mod tests {
                 from: None,
                 to: "build-state".to_string(),
                 condition_type: "auto".to_string(),
+                skip_if_matched: None,
             },
         )];
 
@@ -3407,6 +3551,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -3423,6 +3568,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -3503,6 +3649,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             (
@@ -3519,6 +3666,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
         ]);
@@ -3529,6 +3677,7 @@ mod tests {
                 from: None,
                 to: "check-state".to_string(),
                 condition_type: "auto".to_string(),
+                skip_if_matched: None,
             },
         )];
 
@@ -3624,6 +3773,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             ("complete", {
@@ -3711,6 +3861,7 @@ mod tests {
                     materialize_children: None,
                     failure: false,
                     skipped_marker: false,
+                    skip_if: None,
                 },
             ),
             ("complete", {
@@ -3755,5 +3906,201 @@ mod tests {
         assert_eq!(result.final_state, "complete");
         assert!(result.advanced);
         assert!(matches!(result.stop_reason, StopReason::Terminal));
+    }
+
+    // -----------------------------------------------------------------------
+    // conditions_satisfied tests (skip_if runtime evaluator)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn skip_if_conditions_satisfied_vars_set() {
+        // vars.NAME: {is_set: true} must return true when the variable is present
+        // and non-empty.
+        let mut conditions = BTreeMap::new();
+        conditions.insert(
+            "vars.MY_VAR".to_string(),
+            serde_json::json!({"is_set": true}),
+        );
+
+        let evidence = serde_json::json!({});
+        let mut vars = HashMap::new();
+        vars.insert("MY_VAR".to_string(), "some-value".to_string());
+
+        assert!(
+            conditions_satisfied(&conditions, &evidence, &vars),
+            "conditions_satisfied should return true when variable is set"
+        );
+    }
+
+    #[test]
+    fn skip_if_conditions_satisfied_vars_unset() {
+        // vars.NAME: {is_set: true} must return false when the variable is absent.
+        let mut conditions = BTreeMap::new();
+        conditions.insert(
+            "vars.MY_VAR".to_string(),
+            serde_json::json!({"is_set": true}),
+        );
+
+        let evidence = serde_json::json!({});
+        let vars = HashMap::new(); // variable not present
+
+        assert!(
+            !conditions_satisfied(&conditions, &evidence, &vars),
+            "conditions_satisfied should return false when variable is absent"
+        );
+    }
+
+    #[test]
+    fn skip_if_conditions_satisfied_vars_is_set_false_matches_absent() {
+        // vars.NAME: {is_set: false} must return true when the variable is absent.
+        let mut conditions = BTreeMap::new();
+        conditions.insert(
+            "vars.MY_VAR".to_string(),
+            serde_json::json!({"is_set": false}),
+        );
+
+        let evidence = serde_json::json!({});
+        let vars = HashMap::new(); // variable not present
+
+        assert!(
+            conditions_satisfied(&conditions, &evidence, &vars),
+            "conditions_satisfied should return true when is_set: false and variable is absent"
+        );
+    }
+
+    #[test]
+    fn skip_if_conditions_satisfied_scalar_equality() {
+        // Non-vars keys use dot-path equality against the merged evidence.
+        let mut conditions = BTreeMap::new();
+        conditions.insert("status".to_string(), serde_json::json!("ready"));
+
+        let evidence = serde_json::json!({"status": "ready"});
+
+        assert!(
+            conditions_satisfied(&conditions, &evidence, &HashMap::new()),
+            "conditions_satisfied should return true when scalar evidence matches"
+        );
+    }
+
+    #[test]
+    fn skip_if_conditions_satisfied_scalar_mismatch_returns_false() {
+        let mut conditions = BTreeMap::new();
+        conditions.insert("status".to_string(), serde_json::json!("ready"));
+
+        let evidence = serde_json::json!({"status": "pending"});
+
+        assert!(
+            !conditions_satisfied(&conditions, &evidence, &HashMap::new()),
+            "conditions_satisfied should return false when scalar evidence does not match"
+        );
+    }
+
+    #[test]
+    fn skip_if_fires_on_advance() {
+        // A state with skip_if: {vars.SKIP: {is_set: true}} and a single unconditional
+        // transition should auto-advance via skip_if when the variable is set.
+        // The WorkflowInitialized event supplies the variable.
+        let template = make_template(vec![
+            (
+                "skippable",
+                TemplateState {
+                    directive: "Skippable.".to_string(),
+                    details: String::new(),
+                    transitions: vec![unconditional("done")],
+                    terminal: false,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: {
+                        let mut m = BTreeMap::new();
+                        m.insert("vars.SKIP".to_string(), serde_json::json!({"is_set": true}));
+                        Some(m)
+                    },
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: None,
+                },
+            ),
+        ]);
+
+        // Provide a WorkflowInitialized event that sets SKIP.
+        let all_events = vec![Event {
+            seq: 1,
+            timestamp: "2026-04-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "test.md".to_string(),
+                variables: {
+                    let mut m = HashMap::new();
+                    m.insert("SKIP".to_string(), "true".to_string());
+                    m
+                },
+                spawn_entry: None,
+            },
+        }];
+
+        let mut appended: Vec<EventPayload> = Vec::new();
+        let mut append = |payload: &EventPayload| -> Result<(), String> {
+            appended.push(payload.clone());
+            Ok(())
+        };
+        let shutdown = AtomicBool::new(false);
+
+        let result = advance_until_stop(
+            "skippable",
+            &template,
+            &BTreeMap::new(),
+            &all_events,
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &noop_action,
+            &shutdown,
+        )
+        .unwrap();
+
+        // skip_if fired: auto-advanced to terminal "done".
+        assert_eq!(result.final_state, "done");
+        assert!(result.advanced);
+        assert_eq!(result.stop_reason, StopReason::Terminal);
+
+        // The Transitioned event must have condition_type = "skip_if".
+        let skip_event = appended.iter().find(|p| {
+            matches!(p, EventPayload::Transitioned { condition_type, .. }
+                if condition_type == "skip_if")
+        });
+        assert!(
+            skip_event.is_some(),
+            "expected a Transitioned event with condition_type 'skip_if'"
+        );
+
+        // The Transitioned event must carry skip_if_matched.
+        if let Some(EventPayload::Transitioned {
+            skip_if_matched, ..
+        }) = skip_event
+        {
+            assert!(
+                skip_if_matched.is_some(),
+                "skip_if_matched should be Some in the Transitioned event"
+            );
+        }
     }
 }
