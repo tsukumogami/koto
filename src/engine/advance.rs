@@ -156,7 +156,8 @@ pub enum IntegrationError {
 /// 4. Integration declared (invoke runner)
 /// 5. Action execution (if state has default_action)
 /// 6. Gates (evaluate all, stop if any fail)
-/// 7. Transition resolution (match evidence against conditions)
+/// 7. skip_if evaluation (if conditions met, auto-transition and continue loop)
+/// 8. Transition resolution (match evidence against conditions)
 ///
 /// I/O operations are injected as closures for testability:
 /// - `append_event`: persist a state transition event
@@ -469,18 +470,15 @@ where
         // If all conditions are met, auto-transition without waiting for agent evidence.
         if let Some(skip_conditions) = &template_state.skip_if {
             if conditions_satisfied(skip_conditions, &evidence_value, &workflow_variables) {
-                // Resolve which transition the skip_if fires.
-                // Reuse resolve_transition with the skip_if map as synthetic evidence,
-                // same as the compile-time E-SKIP-AMBIGUOUS check does.
-                let skip_evidence = serde_json::Value::Object(
-                    skip_conditions
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                );
+                // Resolve which transition the skip_if fires using the assembled
+                // evidence_value (which contains nested gate output under "gates").
+                // Using evidence_value rather than a flat skip_conditions map ensures
+                // that gates.* when-clauses resolve correctly via dot-path traversal.
+                // conditions_satisfied() already verified the runtime state matches,
+                // so evidence_value contains the right values for routing.
                 match resolve_transition(
                     template_state,
-                    &skip_evidence,
+                    &evidence_value,
                     false,
                     &workflow_variables,
                 ) {
@@ -626,7 +624,14 @@ fn resolve_value<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serd
 ///   `variables.get(name).map(|v| !v.is_empty()).unwrap_or(false)` equals the
 ///   expected bool.
 /// - **all other keys** — dot-path lookup in `merged_evidence` using
-///   `resolve_value`, compared with JSON equality.
+///   `resolve_value`, compared with JSON equality. Gate keys like
+///   `gates.ci.exit_code` require the nested gate structure in `merged_evidence`
+///   (built from `gate_evidence_map` before this function is called).
+///
+/// Note: the compile-time analogue `skip_if_matches_when` in `src/template/types.rs`
+/// uses a flat `BTreeMap::get()` lookup rather than dot-path traversal because
+/// compile time has no nested gate output — both maps are flat. At runtime,
+/// gate output arrives as nested JSON, so dot-path traversal is needed here.
 fn conditions_satisfied(
     conditions: &std::collections::BTreeMap<String, serde_json::Value>,
     merged_evidence: &serde_json::Value,
