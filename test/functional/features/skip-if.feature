@@ -8,7 +8,7 @@ Feature: skip_if auto-advance conditions
     When I run "koto next test-wf"
     Then the exit code is 0
     And the JSON output field "state" equals "c"
-    And the JSON output field "advanced" equals "true"
+    And the JSON output field "advanced" is true
 
   # Scenario 2: unmet condition blocks — no --var means skip_if doesn't fire
   Scenario: unmet vars condition blocks at evidence_required
@@ -29,7 +29,7 @@ Feature: skip_if auto-advance conditions
     And I run "koto context add test-wf ctx_flag --from-file ctx_data.txt"
     When I run "koto next test-wf"
     Then the exit code is 0
-    And the JSON output field "advanced" equals "true"
+    And the JSON output field "advanced" is true
     And the JSON output field "state" equals "done"
 
   # Scenario 4: gate-backed skip_if does not fire when context key is absent
@@ -49,7 +49,7 @@ Feature: skip_if auto-advance conditions
     And I run "koto init test-wf --template .koto/templates/skip-if-vars.md --var SHARED_BRANCH=main"
     When I run "koto next test-wf"
     Then the exit code is 0
-    And the JSON output field "advanced" equals "true"
+    And the JSON output field "advanced" is true
     And the JSON output field "state" equals "done"
 
   # Scenario 6: correct conditional branch selected when skip_if fires with multi-branch transitions
@@ -60,4 +60,4 @@ Feature: skip_if auto-advance conditions
     When I run "koto next branch-wf"
     Then the exit code is 0
     And the JSON output field "state" equals "main_track"
-    And the JSON output field "advanced" equals "true"
+    And the JSON output field "advanced" is true
