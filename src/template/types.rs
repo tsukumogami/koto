@@ -270,6 +270,55 @@ pub fn is_is_set_matcher(value: &serde_json::Value) -> Option<bool> {
     obj.get("is_set")?.as_bool()
 }
 
+/// Return `true` when every key-value pair in `when` is satisfied by
+/// `skip_conditions` acting as synthetic evidence.
+///
+/// This function is the shared evaluator for the compile-time E-SKIP-AMBIGUOUS
+/// check (called from `validate()` in this file) and the runtime
+/// `conditions_satisfied()` helper in `src/engine/advance.rs`. Both callers
+/// must use this function so the invariant "compile-time routing uses the same
+/// logic as runtime routing" is enforced structurally.
+///
+/// # Matching rules (mirrored from `resolve_transition()` in advance.rs)
+///
+/// - **`vars.NAME: {is_set: bool}`** — compile-time approximation: the
+///   condition is satisfied when `skip_conditions` provides a set/unset signal
+///   for the same variable key.  No variable store is available at compile
+///   time; we look at whether `skip_conditions` contains an `is_set`-shaped
+///   value (or any non-null value) for the key.
+/// - **direct value equality** — the `skip_conditions` map must contain the
+///   key with an equal JSON value.
+pub(crate) fn skip_if_matches_when(
+    skip_conditions: &BTreeMap<String, serde_json::Value>,
+    when: &BTreeMap<String, serde_json::Value>,
+) -> bool {
+    let vars_prefix = format!("{}.", VARS_NAMESPACE);
+    when.iter().all(|(field, expected)| {
+        // vars.NAME: {is_set: bool} path.
+        if field.starts_with(&vars_prefix) {
+            if let Some(expected_set) = is_is_set_matcher(expected) {
+                let is_set = skip_conditions
+                    .get(field.as_str())
+                    .or_else(|| {
+                        let var_name = &field[vars_prefix.len()..];
+                        skip_conditions.get(var_name)
+                    })
+                    .map(|v| {
+                        if let Some(b) = is_is_set_matcher(v) {
+                            b
+                        } else {
+                            !v.is_null()
+                        }
+                    })
+                    .unwrap_or(false);
+                return is_set == expected_set;
+            }
+        }
+        // Direct value equality path.
+        skip_conditions.get(field.as_str()) == Some(expected)
+    })
+}
+
 /// The JSON value type of a gate output field.
 ///
 /// Used by [`gate_type_schema`] to describe the expected type of each field
@@ -659,38 +708,20 @@ impl CompiledTemplate {
                 // E-SKIP-AMBIGUOUS: when all transitions are conditional, simulate skip_if values
                 // as synthetic evidence against each conditional transition's when clause.
                 // Zero matches or more than one match is an error.
-                // NOTE: this reuses the same condition evaluator as the runtime advance loop.
-                // Keep in sync with resolve_transition() in src/engine/advance.rs.
+                //
+                // When the state has a mix of conditional and unconditional transitions
+                // (i.e. `all_conditional` is false), E-SKIP-AMBIGUOUS does not apply:
+                // the unconditional transition acts as the fallback route and guarantees
+                // that skip_if always has somewhere to advance. The ambiguity check is
+                // only meaningful when every branch requires a specific condition to fire.
                 let all_conditional = state.transitions.iter().all(|t| t.when.is_some());
                 if all_conditional {
-                    let vars_prefix = format!("{}.", VARS_NAMESPACE);
                     let matches: Vec<&str> = state
                         .transitions
                         .iter()
                         .filter(|t| {
                             if let Some(when) = &t.when {
-                                when.iter().all(|(field, expected)| {
-                                    // vars.NAME: {is_set: bool} check: match against skip_if conditions.
-                                    if field.starts_with(&vars_prefix) {
-                                        if let Some(expected_set) = is_is_set_matcher(expected) {
-                                            let var_name = &field[vars_prefix.len()..];
-                                            let is_set = skip_conditions
-                                                .get(field)
-                                                .or_else(|| skip_conditions.get(var_name))
-                                                .map(|v| {
-                                                    if let Some(b) = is_is_set_matcher(v) {
-                                                        b
-                                                    } else {
-                                                        !v.is_null()
-                                                    }
-                                                })
-                                                .unwrap_or(false);
-                                            return is_set == expected_set;
-                                        }
-                                    }
-                                    // Direct key match: skip_if provides synthetic evidence.
-                                    skip_conditions.get(field) == Some(expected)
-                                })
+                                skip_if_matches_when(skip_conditions, when)
                             } else {
                                 false
                             }
