@@ -68,3 +68,13 @@ Feature: skip_if auto-advance conditions
     When I run "koto next test-wf"
     Then the exit code is 0
     And the JSON output field "action" equals "evidence_required"
+
+  # Scenario 8: correct conditional branch selected when skip_if fires with multi-branch transitions
+  Scenario: skip_if selects correct conditional branch when multiple transitions exist
+    Given a clean koto environment
+    And the template "skip-if-branch" exists
+    And I run "koto init branch-wf --template .koto/templates/skip-if-branch.md --var ROUTE=main"
+    When I run "koto next branch-wf"
+    Then the exit code is 0
+    And the JSON output field "state" equals "main_track"
+    And the JSON output field "advanced" equals "true"
