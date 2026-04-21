@@ -129,6 +129,57 @@ Reinitialize the workflow to pick up the new template.
 {"error":"missing required field 'initial_state'","command":"template compile"}
 ```
 
+#### skip_if diagnostic codes
+
+The `skip_if` field has four compile-time diagnostics. Two are errors (compilation fails) and one is a warning (compilation succeeds with output to stderr).
+
+**E-SKIP-TERMINAL (error)** — `skip_if` is declared on a terminal state. The terminal check fires before `skip_if`, so the auto-advance condition can never match.
+
+```
+E-SKIP-TERMINAL: state "done": skip_if cannot be declared on a terminal state; the terminal check fires before skip_if, making it unreachable
+  remedy: remove skip_if or make the state non-terminal
+```
+
+Fix: remove the `skip_if` field, or remove `terminal: true` from the state.
+
+**E-SKIP-NO-TRANSITIONS (error)** — `skip_if` is declared but the state has no transitions. There's nowhere for the auto-advance to go.
+
+```
+E-SKIP-NO-TRANSITIONS: state "check": skip_if requires at least one declared transition
+  remedy: add a transition target, or remove skip_if
+```
+
+Fix: add at least one transition, or remove `skip_if`.
+
+**E-SKIP-AMBIGUOUS (error)** — When all of a state's transitions are conditional (`when` clauses present on every transition), the `skip_if` values must match exactly one of them. Zero matches or more than one match is an error.
+
+Zero matches:
+
+```
+E-SKIP-AMBIGUOUS: state "decide": skip_if values match zero conditional transitions; exactly one must match
+  remedy: ensure skip_if values match the when clause of exactly one transition
+```
+
+More than one match:
+
+```
+E-SKIP-AMBIGUOUS: state "decide": skip_if values match more than one conditional transition ["fast_path", "slow_path"]; exactly one must match
+  remedy: refine skip_if values or when clauses so exactly one transition matches
+```
+
+Fix: adjust `skip_if` values or the `when` clauses on transitions so exactly one conditional transition matches.
+
+E-SKIP-AMBIGUOUS doesn't apply when the state has a mix of conditional and unconditional transitions. An unconditional transition acts as the fallback, so there's always a valid route.
+
+**W-SKIP-GATE-ABSENT (warning)** — A `skip_if` key of the form `gates.NAME.*` references a gate name that isn't declared on the state. The condition will never match at runtime. Compilation succeeds, but a diagnostic goes to stderr.
+
+```
+warning: W-SKIP-GATE-ABSENT: state "check": skip_if key "gates.ci.exit_code" references gate "ci" which is not declared on this state; the condition will be silently unmatchable at runtime
+  remedy: declare a gate named "ci" on this state, or correct the key
+```
+
+Fix: add the referenced gate name to the state's `gates` block, or correct the `skip_if` key.
+
 ---
 
 ### template validate
