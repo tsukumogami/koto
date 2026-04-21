@@ -273,13 +273,15 @@ pub fn is_is_set_matcher(value: &serde_json::Value) -> Option<bool> {
 /// Return `true` when every key-value pair in `when` is satisfied by
 /// `skip_conditions` acting as synthetic evidence.
 ///
-/// This function is the shared evaluator for the compile-time E-SKIP-AMBIGUOUS
-/// check (called from `validate()` in this file) and the runtime
-/// `conditions_satisfied()` helper in `src/engine/advance.rs`. Both callers
-/// must use this function so the invariant "compile-time routing uses the same
-/// logic as runtime routing" is enforced structurally.
+/// Used by the compile-time E-SKIP-AMBIGUOUS check in `validate()` to determine
+/// which conditional transitions the skip_if values would activate. The runtime
+/// evaluator (`conditions_satisfied()` in `src/engine/advance.rs`) answers a
+/// different question — whether actual runtime evidence satisfies the skip_if
+/// predicate — so it does not call this function. What the two share is
+/// `is_is_set_matcher`: both use it to interpret `{is_set: bool}` values for
+/// the `vars.NAME` case, keeping the matching semantics aligned.
 ///
-/// # Matching rules (mirrored from `resolve_transition()` in advance.rs)
+/// # Matching rules
 ///
 /// - **`vars.NAME: {is_set: bool}`** — compile-time approximation: the
 ///   condition is satisfied when `skip_conditions` provides a set/unset signal
