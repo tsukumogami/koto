@@ -8139,6 +8139,229 @@ Branch B.
 }
 
 // ---------------------------------------------------------------------------
+// unconditional fallback guard (#146)
+// ---------------------------------------------------------------------------
+
+// Regression test for issue #146: when a state is entered via auto-advance
+// (skip_if chain or unconditional transition), an unconditional fallback on
+// the newly-entered state must NOT fire if that state also has conditional
+// transitions. The state must wait for fresh agent evidence.
+#[test]
+fn unconditional_fallback_blocked_when_entered_via_skip_if() {
+    let dir = TempDir::new().unwrap();
+
+    // Template: A --skip_if--> B --conditional/unconditional--> C/D
+    // A has a skip_if that fires when status=done.
+    // B has a conditional (result: ok -> C) and an unconditional fallback (-> D).
+    // The bug: after skip_if fires from A to B, B's unconditional fallback also
+    // fires in the same koto next call, silently bypassing B's directive.
+    let template = r#"---
+name: fallback-guard-test
+version: "1.0"
+initial_state: a
+states:
+  a:
+    accepts:
+      status:
+        type: enum
+        values: [done]
+        required: true
+    skip_if:
+      status: done
+    transitions:
+      - target: b
+  b:
+    accepts:
+      result:
+        type: enum
+        values: [ok, fail]
+        required: true
+    transitions:
+      - target: c
+        when:
+          result: ok
+      - target: d
+  c:
+    terminal: true
+  d:
+    terminal: true
+---
+
+## a
+
+Submit status=done to advance.
+
+## b
+
+Submit result to continue.
+
+## c
+
+Reached C.
+
+## d
+
+Reached D (unconditional fallback).
+"#;
+
+    let src = dir.path().join("fallback-guard.md");
+    std::fs::write(&src, template).unwrap();
+
+    let init_output = koto_cmd(dir.path())
+        .args(["init", "wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        init_output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init_output.stdout),
+        String::from_utf8_lossy(&init_output.stderr)
+    );
+
+    // koto next with {status: done}: skip_if fires on A, advancing to B.
+    // B has conditional + unconditional, and was entered via auto-advance —
+    // the unconditional fallback must NOT fire. Expect evidence_required at B.
+    let next_output = koto_cmd(dir.path())
+        .args(["next", "wf", "--with-data", r#"{"status": "done"}"#])
+        .output()
+        .unwrap();
+    assert!(
+        next_output.status.success(),
+        "next failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&next_output.stdout),
+        String::from_utf8_lossy(&next_output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&next_output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("invalid JSON: {}", stdout));
+
+    assert_eq!(
+        json["action"].as_str(),
+        Some("evidence_required"),
+        "expected evidence_required at B after skip_if from A; got: {}",
+        json
+    );
+    assert_eq!(
+        json["state"].as_str(),
+        Some("b"),
+        "expected current state to be B; got: {}",
+        json
+    );
+    assert_eq!(
+        json["advanced"].as_bool(),
+        Some(true),
+        "expected advanced=true (A was skipped); got: {}",
+        json
+    );
+
+    // Now submit result=ok: should advance to C.
+    let next_output2 = koto_cmd(dir.path())
+        .args(["next", "wf", "--with-data", r#"{"result": "ok"}"#])
+        .output()
+        .unwrap();
+    assert!(
+        next_output2.status.success(),
+        "second next failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&next_output2.stdout),
+        String::from_utf8_lossy(&next_output2.stderr)
+    );
+    let stdout2 = String::from_utf8_lossy(&next_output2.stdout);
+    let json2: serde_json::Value =
+        serde_json::from_str(&stdout2).unwrap_or_else(|_| panic!("invalid JSON: {}", stdout2));
+
+    assert_eq!(
+        json2["state"].as_str(),
+        Some("c"),
+        "expected to reach C after result=ok; got: {}",
+        json2
+    );
+}
+
+// Pure-routing states (only unconditional transition, no conditional) must
+// still auto-fire when entered via auto-advance.
+#[test]
+fn unconditional_fallback_fires_for_pure_routing_state() {
+    let dir = TempDir::new().unwrap();
+
+    // Template: A --skip_if--> B (pure routing, unconditional only) --> C
+    let template = r#"---
+name: pure-routing-test
+version: "1.0"
+initial_state: a
+states:
+  a:
+    accepts:
+      status:
+        type: enum
+        values: [done]
+        required: true
+    skip_if:
+      status: done
+    transitions:
+      - target: b
+  b:
+    transitions:
+      - target: c
+  c:
+    terminal: true
+---
+
+## a
+
+Submit status=done to advance.
+
+## b
+
+Router — always advance to C.
+
+## c
+
+Final state.
+"#;
+
+    let src = dir.path().join("pure-routing.md");
+    std::fs::write(&src, template).unwrap();
+
+    let init_output = koto_cmd(dir.path())
+        .args(["init", "wf", "--template", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        init_output.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init_output.stderr)
+    );
+
+    // koto next with {status: done}: skip_if fires A->B, then B (pure routing)
+    // must also fire unconditionally -> C. Both transitions happen in one call.
+    let next_output = koto_cmd(dir.path())
+        .args(["next", "wf", "--with-data", r#"{"status": "done"}"#])
+        .output()
+        .unwrap();
+    assert!(
+        next_output.status.success(),
+        "next failed: {}",
+        String::from_utf8_lossy(&next_output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&next_output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("invalid JSON: {}", stdout));
+
+    assert_eq!(
+        json["state"].as_str(),
+        Some("c"),
+        "expected to reach C (pure-routing B auto-fires); got: {}",
+        json
+    );
+    assert_eq!(
+        json["advanced"].as_bool(),
+        Some(true),
+        "expected advanced=true; got: {}",
+        json
+    );
+}
+
+// ---------------------------------------------------------------------------
 // skip_if
 // ---------------------------------------------------------------------------
 
