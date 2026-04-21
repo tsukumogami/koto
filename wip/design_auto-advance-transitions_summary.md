@@ -17,7 +17,12 @@ resume-awareness, with consecutive auto-advancing states chaining naturally.
 - Compile-time validation: exactly one transition must match when skip_if fires (decided)
 - has_gates_routing detection must include skip_if gate references (discovered gap)
 
+## Security Review (Phase 5)
+
+**Outcome:** Option 2 — Document considerations
+**Summary:** No new attack surface, permission escalation, or external input sources. Two documentation notes: skip_if_matched records condition values verbatim in the event log; compile-time and runtime evaluators must stay aligned.
+
 ## Current Status
 
-**Phase:** 0 - Setup (Explore Handoff)
+**Phase:** 6 - Final Review
 **Last Updated:** 2026-04-20
