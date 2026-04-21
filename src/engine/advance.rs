@@ -434,7 +434,7 @@ where
             }
         }
 
-        // 7. Resolve transition
+        // 8. Resolve transition
         // Build a merged evidence Value: start with agent evidence (flat keys),
         // then layer gate output under "gates" (engine data takes precedence).
         // This allows when clauses to reference both agent-submitted fields and
@@ -466,6 +466,7 @@ where
         }
         let evidence_value = serde_json::Value::Object(merged);
 
+        // 7. skip_if evaluation
         // Evaluate skip_if conditions before falling through to transition resolution.
         // If all conditions are met, auto-transition without waiting for agent evidence.
         if let Some(skip_conditions) = &template_state.skip_if {
