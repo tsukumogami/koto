@@ -482,6 +482,7 @@ where
                     from: Some(state.clone()),
                     to: target.clone(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 };
                 append_event(&payload).map_err(AdvanceError::PersistenceError)?;
 
@@ -1304,6 +1305,7 @@ mod tests {
                 from: Some("a".to_string()),
                 to: "b".to_string(),
                 condition_type: "auto".to_string(),
+                skip_if_matched: None,
             },
         }];
 
@@ -3061,6 +3063,7 @@ mod tests {
                     from: None,
                     to: state.to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -3361,6 +3364,7 @@ mod tests {
                 from: None,
                 to: "build-state".to_string(),
                 condition_type: "auto".to_string(),
+                skip_if_matched: None,
             },
         )];
 
@@ -3578,6 +3582,7 @@ mod tests {
                 from: None,
                 to: "check-state".to_string(),
                 condition_type: "auto".to_string(),
+                skip_if_matched: None,
             },
         )];
 

@@ -4385,6 +4385,7 @@ mod tests {
                 from: Some("a".to_string()),
                 to: "b".to_string(),
                 condition_type: "gate".to_string(),
+                skip_if_matched: None,
             },
         }];
         assert_eq!(last_rewind_seq(&events), None);
@@ -4401,6 +4402,7 @@ mod tests {
                     from: Some("a".to_string()),
                     to: "b".to_string(),
                     condition_type: "gate".to_string(),
+                    skip_if_matched: None,
                 },
             },
             Event {
@@ -4420,6 +4422,7 @@ mod tests {
                     from: Some("a".to_string()),
                     to: "b".to_string(),
                     condition_type: "gate".to_string(),
+                    skip_if_matched: None,
                 },
             },
             Event {

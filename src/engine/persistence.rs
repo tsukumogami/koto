@@ -496,6 +496,7 @@ mod tests {
                     from: None,
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
         ];
@@ -533,6 +534,7 @@ mod tests {
                 from: None,
                 to: "gather".to_string(),
                 condition_type: "auto".to_string(),
+                skip_if_matched: None,
             },
         );
         let e4 = make_event(
@@ -541,6 +543,7 @@ mod tests {
                 from: Some("gather".to_string()),
                 to: "plan".to_string(),
                 condition_type: "gate".to_string(),
+                skip_if_matched: None,
             },
         );
 
@@ -616,6 +619,7 @@ mod tests {
                     from: None,
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -624,6 +628,7 @@ mod tests {
                     from: Some("gather".to_string()),
                     to: "analyze".to_string(),
                     condition_type: "gate".to_string(),
+                    skip_if_matched: None,
                 },
             ),
         ];
@@ -647,6 +652,7 @@ mod tests {
                     from: None,
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -655,6 +661,7 @@ mod tests {
                     from: Some("gather".to_string()),
                     to: "analyze".to_string(),
                     condition_type: "gate".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -707,6 +714,7 @@ mod tests {
                     from: None,
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -727,6 +735,7 @@ mod tests {
                     from: Some("gather".to_string()),
                     to: "analyze".to_string(),
                     condition_type: "gate".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -775,6 +784,7 @@ mod tests {
                     from: None,
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -795,6 +805,7 @@ mod tests {
                     from: Some("gather".to_string()),
                     to: "analyze".to_string(),
                     condition_type: "gate".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -844,6 +855,7 @@ mod tests {
                 from: None,
                 to: "gather".to_string(),
                 condition_type: "auto".to_string(),
+                skip_if_matched: None,
             },
             "2026-01-01T00:00:01Z",
         )
@@ -915,6 +927,7 @@ mod tests {
                     from: None,
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
         ];
@@ -967,6 +980,7 @@ mod tests {
                     from: None,
                     to: "implementation".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -1014,6 +1028,7 @@ mod tests {
                     from: None,
                     to: "implementation".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -1032,6 +1047,7 @@ mod tests {
                     from: Some("implementation".to_string()),
                     to: "review".to_string(),
                     condition_type: "gate".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -1067,6 +1083,7 @@ mod tests {
                     from: None,
                     to: "implementation".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             // A decision tagged with a different state name should be ignored.
@@ -1158,6 +1175,7 @@ mod tests {
                     from: None,
                     to: "review".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_override_event(2, "review", "ci-passes"),
@@ -1180,6 +1198,7 @@ mod tests {
                     from: None,
                     to: "review".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_override_event(2, "review", "ci-passes"),
@@ -1189,6 +1208,7 @@ mod tests {
                     from: Some("review".to_string()),
                     to: "deploy".to_string(),
                     condition_type: "gate".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -1218,6 +1238,7 @@ mod tests {
                     from: None,
                     to: "other_state".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_override_event(2, "other_state", "some-gate"),
@@ -1227,6 +1248,7 @@ mod tests {
                     from: Some("other_state".to_string()),
                     to: "review".to_string(),
                     condition_type: "gate".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_override_event(4, "review", "ci-passes"),
@@ -1253,6 +1275,7 @@ mod tests {
                     from: None,
                     to: "review".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             // Mismatched state field: should be excluded.
@@ -1279,6 +1302,7 @@ mod tests {
                     from: None,
                     to: "review".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_override_event(2, "review", "ci-passes"),
@@ -1288,6 +1312,7 @@ mod tests {
                     from: Some("review".to_string()),
                     to: "deploy".to_string(),
                     condition_type: "gate".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_override_event(4, "deploy", "smoke-test"),
@@ -1321,6 +1346,7 @@ mod tests {
                     from: None,
                     to: "review".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_gate_evaluated_event(
@@ -1351,6 +1377,7 @@ mod tests {
                 from: None,
                 to: "review".to_string(),
                 condition_type: "auto".to_string(),
+                skip_if_matched: None,
             },
         )];
 
@@ -1368,6 +1395,7 @@ mod tests {
                     from: None,
                     to: "review".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_gate_evaluated_event(
@@ -1382,6 +1410,7 @@ mod tests {
                     from: Some("review".to_string()),
                     to: "deploy".to_string(),
                     condition_type: "gate".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -1419,6 +1448,7 @@ mod tests {
                 from: None,
                 to: "gather".to_string(),
                 condition_type: "auto".to_string(),
+                skip_if_matched: None,
             },
         )];
         let counts = derive_visit_counts(&events);
@@ -1435,6 +1465,7 @@ mod tests {
                     from: None,
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -1443,6 +1474,7 @@ mod tests {
                     from: Some("gather".to_string()),
                     to: "analyze".to_string(),
                     condition_type: "gate".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(
@@ -1503,6 +1535,7 @@ mod tests {
                     from: None,
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             ),
             make_event(

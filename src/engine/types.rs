@@ -136,6 +136,15 @@ pub enum EventPayload {
         from: Option<String>,
         to: String,
         condition_type: String,
+        /// When the transition was triggered by a `skip_if` condition,
+        /// this field records the matched key-value pairs from the
+        /// state's `skip_if` map. `None` for ordinary evidence-driven
+        /// or gate-driven transitions.
+        ///
+        /// Additive field: omitted from serialization when `None` so
+        /// pre-feature JSONL files round-trip without modification.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skip_if_matched: Option<BTreeMap<String, serde_json::Value>>,
     },
     EvidenceSubmitted {
         state: String,
@@ -440,6 +449,7 @@ impl<'de> Deserialize<'de> for Event {
                     from: p.from,
                     to: p.to,
                     condition_type: p.condition_type,
+                    skip_if_matched: p.skip_if_matched,
                 }
             }
             "evidence_submitted" => {
@@ -587,6 +597,8 @@ struct TransitionedPayload {
     from: Option<String>,
     to: String,
     condition_type: String,
+    #[serde(default)]
+    skip_if_matched: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -1067,6 +1079,7 @@ mod tests {
                 from: None,
                 to: "gather".to_string(),
                 condition_type: "auto".to_string(),
+                skip_if_matched: None,
             },
         };
         let json = serde_json::to_string(&e).unwrap();
@@ -1080,6 +1093,7 @@ mod tests {
             from: Some("a".to_string()),
             to: "b".to_string(),
             condition_type: "auto".to_string(),
+            skip_if_matched: None,
         };
         assert_eq!(p.type_name(), "transitioned");
 

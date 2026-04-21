@@ -489,6 +489,7 @@ mod tests {
                     from: None,
                     to: "start".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             },
         ];
@@ -522,6 +523,7 @@ mod tests {
                     from: None,
                     to: "start".to_string(),
                     condition_type: "auto".to_string(),
+                    skip_if_matched: None,
                 },
             },
             Event {

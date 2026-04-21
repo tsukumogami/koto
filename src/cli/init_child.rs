@@ -480,6 +480,7 @@ fn init_child_core(
         from: None,
         to: initial_state.clone(),
         condition_type: "auto".to_string(),
+        skip_if_matched: None,
     };
     let initial_events = vec![
         Event {
