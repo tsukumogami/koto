@@ -8189,7 +8189,8 @@ All done.
         String::from_utf8_lossy(&init_output.stderr)
     );
 
-    // koto next: skip_if fires because MY_VAR is not set (is_set: false == true).
+    // koto next: skip_if fires because MY_VAR is unset — the condition {is_set: false}
+    // is satisfied when the variable is empty (the default).
     // --no-cleanup keeps the session directory so we can inspect the state file.
     let next_output = koto_cmd(dir.path())
         .args(["next", "my-wf", "--no-cleanup"])
@@ -8282,10 +8283,16 @@ State c.
     let src = dir.path().join("skip-if-chain-test.md");
     std::fs::write(&src, template).unwrap();
 
-    koto_cmd(dir.path())
+    let init_output = koto_cmd(dir.path())
         .args(["init", "chain-test-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
+    assert!(
+        init_output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init_output.stdout),
+        String::from_utf8_lossy(&init_output.stderr)
+    );
 
     // koto next: skip_if fires on both a and b, advancing to c (terminal).
     // --no-cleanup keeps the session directory so we can inspect the state file.
@@ -8371,10 +8378,16 @@ State b.
     let src = dir.path().join("skip-if-cycle-test.md");
     std::fs::write(&src, template).unwrap();
 
-    koto_cmd(dir.path())
+    let init_output = koto_cmd(dir.path())
         .args(["init", "cycle-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
+    assert!(
+        init_output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init_output.stdout),
+        String::from_utf8_lossy(&init_output.stderr)
+    );
 
     // First koto next: cycle a->b->a->... should be detected and reported as error
     let next_output = koto_cmd(dir.path())
@@ -8442,15 +8455,25 @@ fn skip_if_chain_triggers_limit() {
 
     // 101 states: s0..s100, where s100 is terminal.
     // s0..s99 each have skip_if and unconditional transition to next.
-    // The engine chain limit is 100, so the first koto next will stop before reaching s100.
+    // The engine chain limit is 100. With 101 states, the first koto next chains
+    // s0->s1->...->s100 (100 transitions, all persisted), then hits the limit at
+    // the top of the 101st loop iteration — after the transition to s100 is written
+    // but before the terminal check for s100 runs. Exit code is non-zero.
+    // The second koto next starts at s100, sees it's terminal, and returns action=done.
     let template = skip_if_chain_template(101);
     let src = dir.path().join("skip-if-limit-test.md");
     std::fs::write(&src, &template).unwrap();
 
-    koto_cmd(dir.path())
+    let init_output = koto_cmd(dir.path())
         .args(["init", "chain-wf", "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
+    assert!(
+        init_output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init_output.stdout),
+        String::from_utf8_lossy(&init_output.stderr)
+    );
 
     // First koto next: should hit the chain limit (100 transitions)
     let next_output = koto_cmd(dir.path())
