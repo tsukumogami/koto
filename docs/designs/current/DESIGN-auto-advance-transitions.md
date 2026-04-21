@@ -1,5 +1,5 @@
 ---
-status: Planned
+status: Implemented
 problem: |
   Plan-backed orchestrator workflows contain states whose evidence submissions are
   fully deterministic given the current context -- yet agents must drive each state
@@ -31,7 +31,7 @@ rationale: |
 
 ## Status
 
-Planned
+Implemented
 
 ## Context and Problem Statement
 
