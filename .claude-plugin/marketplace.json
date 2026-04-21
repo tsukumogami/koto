@@ -9,7 +9,7 @@
     {
       "name": "koto-skills",
       "description": "Workflow skills for koto",
-      "version": "0.8.4-dev",
+      "version": "0.8.4",
       "author": {
         "name": "tsukumogami"
       },
