@@ -12,3 +12,21 @@ Feature: Template compilation
     When I run "koto template compile .koto/templates/bad.md"
     Then the exit code is not 0
     And the output contains "error"
+
+  Scenario: template export routes W3 warning to stderr not stdout
+    Given a clean koto environment
+    And the template "warn-triggers" exists
+    When I run "koto template export .koto/templates/warn-triggers.md"
+    Then the exit code is 0
+    And the output does not contain "warning:"
+    And the error output contains "warning:"
+    And the error output contains "W3:"
+
+  Scenario: template compile routes W3 warning to stderr not stdout
+    Given a clean koto environment
+    And the template "warn-triggers" exists
+    When I run "koto template compile .koto/templates/warn-triggers.md"
+    Then the exit code is 0
+    And the output does not contain "warning:"
+    And the error output contains "warning:"
+    And the error output contains "W3:"
