@@ -4151,10 +4151,15 @@ fn export_cli_outputs_mermaid_to_stdout() {
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        stdout.starts_with("stateDiagram-v2\n"),
-        "CLI stdout should contain mermaid diagram, got:\n{}",
+        stdout.starts_with("```mermaid\n"),
+        "CLI stdout should be wrapped in mermaid fence, got:\n{}",
         stdout
     );
+    assert!(
+        stdout.ends_with("```\n"),
+        "CLI stdout should end with closing fence"
+    );
+    assert!(stdout.contains("stateDiagram-v2"));
     assert!(stdout.contains("[*] --> entry"));
     assert!(stdout.contains("done --> [*]"));
 }
@@ -5075,8 +5080,12 @@ fn export_30_state_template_latency_under_500ms() {
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        stdout.starts_with("stateDiagram-v2\n"),
-        "output should be valid mermaid"
+        stdout.starts_with("```mermaid\n"),
+        "output should be wrapped in mermaid fence"
+    );
+    assert!(
+        stdout.ends_with("```\n"),
+        "output should end with closing fence"
     );
     assert!(
         stdout.contains("[*] --> s0"),
