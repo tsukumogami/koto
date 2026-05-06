@@ -1,5 +1,5 @@
 ---
-status: Draft
+status: Accepted
 problem: |
   koto's JSONL session event log is missing four fields that cannot be added once
   external consumers adopt the schema. The event log is append-only: past events
@@ -17,7 +17,7 @@ goals: |
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem statement
 
