@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Planned
 upstream: docs/prds/PRD-session-schema-hygiene.md
 problem: |
   koto's JSONL session event log is missing four fields — session UUID, sub-second
@@ -30,7 +30,7 @@ rationale: |
 
 ## Status
 
-Proposed
+Planned
 
 ## Context and Problem Statement
 
