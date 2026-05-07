@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Planned
 problem: |
   koto sessions produce JSONL event logs read by multiple planned consumers — a local
   dashboard, an S3-backed dashboard, and a hosted relay. Without an explicit data
@@ -35,7 +35,7 @@ rationale: |
 
 ## Status
 
-Proposed
+Planned
 
 ## Context and Problem Statement
 
