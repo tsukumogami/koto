@@ -4,7 +4,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
 use crate::engine::errors::EngineError;
-use crate::engine::types::{Event, EventPayload, MachineState, StateFileHeader};
+use crate::engine::types::{
+    Event, EventPayload, MachineState, StateFileHeader, CURRENT_SCHEMA_VERSION,
+};
 
 /// Write the header line to a new state file.
 ///
@@ -134,9 +136,16 @@ pub fn read_header(path: &Path) -> anyhow::Result<StateFileHeader> {
 
 /// Parse a header line as a `StateFileHeader`.
 fn parse_header(first_line: &str) -> anyhow::Result<StateFileHeader> {
-    serde_json::from_str::<StateFileHeader>(first_line).map_err(|e| {
-        EngineError::StateFileCorrupted(format!("failed to parse header: {}", e)).into()
-    })
+    let header = serde_json::from_str::<StateFileHeader>(first_line)
+        .map_err(|e| EngineError::StateFileCorrupted(format!("failed to parse header: {}", e)))?;
+    if header.schema_version > CURRENT_SCHEMA_VERSION {
+        return Err(EngineError::IncompatibleSchemaVersion {
+            found: header.schema_version,
+            max_supported: CURRENT_SCHEMA_VERSION,
+        }
+        .into());
+    }
+    Ok(header)
 }
 
 /// Read all events from the JSONL state file at `path`.
@@ -476,6 +485,55 @@ mod tests {
         }
         std::fs::write(&path, &content).unwrap();
         path
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema version guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn schema_version_1_is_accepted() {
+        let dir = TempDir::new().unwrap();
+        let header = make_header(); // schema_version: 1
+        let events = vec![make_event(
+            1,
+            EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: HashMap::new(),
+                spawn_entry: None,
+            },
+        )];
+        let path = write_state_file(dir.path(), "sv1", &header, &events);
+        assert!(read_events(&path).is_ok());
+    }
+
+    #[test]
+    fn schema_version_2_returns_incompatible_error() {
+        let dir = TempDir::new().unwrap();
+        let mut header = make_header();
+        header.schema_version = 2;
+        let events = vec![make_event(
+            1,
+            EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: HashMap::new(),
+                spawn_entry: None,
+            },
+        )];
+        let path = write_state_file(dir.path(), "sv2", &header, &events);
+        let err = read_events(&path).unwrap_err();
+        let engine_err = err.downcast::<EngineError>().expect("must be EngineError");
+        assert!(
+            matches!(
+                engine_err,
+                EngineError::IncompatibleSchemaVersion {
+                    found: 2,
+                    max_supported: 1
+                }
+            ),
+            "unexpected error: {:?}",
+            engine_err
+        );
     }
 
     // -----------------------------------------------------------------------

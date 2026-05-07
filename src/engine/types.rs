@@ -2,6 +2,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
+/// Current schema version written in every `StateFileHeader`.
+///
+/// Readers reject log files where `schema_version > CURRENT_SCHEMA_VERSION`
+/// with `EngineError::IncompatibleSchemaVersion`. Bump this constant when:
+/// - a new required event type is added,
+/// - a required field is removed from an existing event type, or
+/// - the event envelope keys (seq, timestamp, type, payload) change.
+///
+/// Additive optional fields do NOT require a bump.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
 /// Header line written as the first line of a state file.
 ///
 /// Contains metadata about the workflow log. Has no `seq` field -- it is
