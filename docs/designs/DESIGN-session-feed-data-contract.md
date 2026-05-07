@@ -328,6 +328,21 @@ cover rendered or projected views. Specifically:
   rendering code, not by the writer). Consumers reading raw files will never see it.
   Rendering layer specifications may extend the contract for their own views.
 
+### Lifecycle metadata surface
+
+Session-level metadata — ownership, summary description, project tag, computed current
+state — is not part of this contract's current scope. This contract covers only the
+fields koto writes to the raw JSONL today.
+
+When lifecycle metadata is introduced, the `StateFileHeader` at line 1 is the natural
+surface: it is written once at session init, visible before any events are parsed, and
+rewritten in place during workflow rename operations. Additive optional header fields
+follow the same non-breaking rules as additive event fields: readers that do not
+recognize a new header field MUST ignore it rather than rejecting the file.
+
+Consumers should not expect lifecycle metadata in the event stream itself. It belongs
+in the header or in a sidecar file alongside the log, not interleaved with events.
+
 ### File structure
 
 A session log file is a sequence of UTF-8 encoded JSONL lines. Two record types appear:
@@ -859,9 +874,9 @@ session progress.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `state` | String | Yes | State the scheduler ran against. |
-| `tick_summary.spawned_count` | u32 | Yes | Children spawned this tick. |
-| `tick_summary.errored_count` | u32 | Yes | Children that errored this tick. |
-| `tick_summary.skipped_count` | u32 | Yes | Children skipped this tick. |
+| `tick_summary.spawned_count` | usize | Yes | Children spawned this tick. |
+| `tick_summary.errored_count` | usize | Yes | Children that errored this tick. |
+| `tick_summary.skipped_count` | usize | Yes | Children skipped this tick. |
 | `tick_summary.reclassified` | bool | Yes | Whether any child's classification changed during this tick. |
 | `timestamp` | String | Yes | RFC 3339 UTC timestamp. Matches the outer `Event.timestamp`. |
 
@@ -890,11 +905,11 @@ file. The frontmatter encodes the machine-readable schema:
 schema_version: 1
 header:
   fields:
-    session_id: {type: string, format: uuid, required: true}
     schema_version: {type: integer, required: true}
     workflow: {type: string, required: true}
     template_hash: {type: string, required: true}
     created_at: {type: string, format: rfc3339, required: true}
+    session_id: {type: string, format: uuid, required: false}
     parent_workflow: {type: string, required: false}
     template_source_dir: {type: string, required: false}
 events:
@@ -908,16 +923,47 @@ events:
 ---
 ```
 
+**Frontmatter schema vocabulary.** The following keys are valid under each field entry.
+The validator must implement exactly this semantics — two implementers must produce the
+same validation result for the same log file:
+
+| Key | Values | Validator behaviour |
+|-----|--------|---------------------|
+| `type` | `string`, `integer`, `boolean`, `object`, `array`, `any` | Check JSON value kind. `any` skips type checking. |
+| `required` | `true` / `false` | `true`: field must be present and non-null (unless `nullable: true`). `false`: field may be absent; absent fields are valid and deserialize to their default. |
+| `nullable` | `true` / `false` (default `false`) | When `true`, the field may be present with a JSON `null` value even if `required: true`. |
+| `format` | `uuid`, `rfc3339` | Advisory hint for human readers; the validator MAY check format but is not required to. |
+| `enum` | list of string values | Field value MUST be one of the listed strings. |
+| `tier` | `1`, `2`, `3` | Advisory classification; the validator does not enforce tier coverage. |
+
+The `tier` key appears at the event level, not the field level. The validator does not
+check or report on tier coverage — tier is documentation for consumer implementers.
+
 The markdown body covers the header spec, event envelope, reader guarantees,
 forward-compatibility rules, JSON examples for every event type, and tier classification.
 Explicitly call out the known gaps: no `workflow_completed` event, gate output schema is
 gate-type-specific, `batch_finalized.superseded_by` is never present in raw JSONL.
 
-Also write a validator CLI (`src/bin/validate-session-feed.rs` or a standalone tool)
-that reads `docs/reference/session-feed.md`, extracts the frontmatter schema via
-`split_frontmatter()`, and validates a given JSONL log file: for each event line, look
-up `events.<type>.fields` by the `type` string and report field-level validation errors.
-Reuses `serde_yaml_ng` (already a production dependency). Estimated effort: 4–8 hours.
+**Validator delivery.** Implement the validator as a `koto template validate-feed`
+subcommand rather than a standalone binary. This avoids needing a new `[[bin]]` entry
+in `Cargo.toml` and keeps the feature accessible without a separate install step.
+`split_frontmatter` in `src/template/compile.rs` must be made `pub(crate)` (currently
+private) and re-exported from `src/template/mod.rs` so the CLI subcommand can reach it.
+The subcommand reads `docs/reference/session-feed.md`, extracts the frontmatter via
+`split_frontmatter()`, and validates a given JSONL log file path passed as an argument:
+for each event line, look up `events.<type>.fields` by the `type` string and report
+field-level validation errors. Reuses `serde_yaml_ng` (already a production dependency).
+Estimated effort: 4–8 hours.
+
+**PR template.** Add the following item to `.github/pull_request_template.md` (create
+the file if it does not exist) under a `## Checklist` section:
+
+```
+- [ ] If `EventPayload` variants or `StateFileHeader` fields were added, removed, or
+      renamed: `docs/reference/session-feed.md` frontmatter and body updated to match.
+```
+
+Adding this checklist item is a deliverable of Track 1, not a future task.
 
 ### Track 2: Implementation changes
 
@@ -945,12 +991,21 @@ other => EventPayload::Unknown {
 },
 ```
 
-Update `type_name()` to return `"unknown"` for this variant (used in log output, not in
-any write path). No `Serialize` arm needed — `Unknown` events are never written.
+Update `type_name()` to return `"unknown"` for this variant. `type_name()` is used in
+`append_event` to set the `event_type` field on a written `Event`. Because `Unknown`
+events are never written, this return value is never used by any write path — but add a
+`debug_assert!(false, "Unknown events must not be passed to append_event")` in
+`append_event` to make the invariant explicit and catch misuse during development.
 
-The advance loop, `read_events`, `koto status`, and `koto query` must handle `Unknown`
-gracefully: skip it in any match that drives state machine logic; include it in raw event
-dumps (`koto query --events`) for diagnostic purposes.
+`No Serialize` arm is needed — `Unknown` events are never written to disk.
+
+The advance loop and `koto status` must skip `Unknown` in any match that drives state
+machine logic (add a `_ | EventPayload::Unknown { .. }` arm or equivalent). `koto query
+--events` must include `Unknown` events in raw event dumps for diagnostic purposes,
+serializing them with the original `type_name` string from the variant — not the static
+`"unknown"` string from `type_name()` — so the actual unrecognized type name is visible
+to the operator. The persistence derive functions (`derive_state_from_log`,
+`derive_evidence`, etc.) already have wildcard arms and require no changes.
 
 **2. Activate schema_version**
 
@@ -964,16 +1019,22 @@ Add to `src/engine/types.rs`:
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 ```
 
-Add a validation check in `persistence::read_header` (or `local::read_header`):
+Add a validation check in `parse_header` in `src/engine/persistence.rs` — the single
+parse site called by both `read_header` and `read_events`, ensuring the guard covers
+every call path including the `CloudBackend` and direct `read_events` callers:
 
 ```rust
 if header.schema_version > CURRENT_SCHEMA_VERSION {
-    return Err(SessionError::IncompatibleSchemaVersion {
+    return Err(EngineError::IncompatibleSchemaVersion {
         found: header.schema_version,
         max_supported: CURRENT_SCHEMA_VERSION,
     });
 }
 ```
+
+Add `IncompatibleSchemaVersion { found: u32, max_supported: u32 }` to `EngineError` in
+`src/engine/errors.rs`. Do not add it to `SessionError` — the guard lives in the
+persistence layer, which returns `EngineError`.
 
 Existing `StateFileHeader` construction sites already write `schema_version: 1` — no
 change needed there. The constant formalizes the value and provides a single update
@@ -992,7 +1053,7 @@ stays at 1.
 - Unit test: reading a log with an unknown event type in a non-final position does not
   return `StateFileCorrupted`.
 - Unit test: `schema_version` validation guard: log with `schema_version > 1` returns
-  `IncompatibleSchemaVersion` error.
+  `EngineError::IncompatibleSchemaVersion`.
 - Existing integration tests: verify no regression in the advance loop when unknown
   events appear in the event stream.
 
@@ -1050,8 +1111,13 @@ a relay injecting events) must acquire it.
 
 - The `Unknown` catch-all silently swallows events that, under the old behavior, would
   have surfaced as errors. A consumer that reads a log from a version with a critical
-  new event type (e.g., a future `PauseRequested` event) will silently skip those events
-  rather than alerting.
+  new event type will silently skip those events rather than alerting. The schema_version
+  guard is the mitigation: when a new event type is added, schema_version is bumped so
+  that older readers can detect incompatibility at line 1 rather than silently ignoring
+  semantically significant events. Note: any future `EventPayload` variant added for
+  remote session management (e.g., a pause or interrupt event) requires both a new enum
+  variant in `types.rs` and a schema_version bump, so old readers reject the log rather
+  than silently misrepresenting session state.
 - Adding a schema_version validation guard creates a new failure mode: koto binaries
   older than the guard version will reject newer-format log files if they implement the
   check. This is the correct behavior but must be communicated to users who mix koto
