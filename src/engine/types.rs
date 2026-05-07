@@ -311,6 +311,21 @@ pub enum EventPayload {
         /// `failure_mode` projection when `outcome == Failure`.
         final_state: String,
     },
+    /// Catch-all for event type strings not recognized by this koto version.
+    ///
+    /// Enables graceful degradation when reading logs produced by a newer
+    /// koto version that introduced a new event type. The original type
+    /// string and raw payload are preserved so operators can inspect them
+    /// via `koto query --events`.
+    ///
+    /// This variant is deserialization-only. It is never written to disk —
+    /// `append_event` guards the write path with a `debug_assert`.
+    Unknown {
+        /// The unrecognized `type` string from the original event.
+        type_name: String,
+        /// The original `payload` object, preserved verbatim.
+        raw_payload: serde_json::Value,
+    },
 }
 
 /// Terminal outcome classification for a child workflow session, as
@@ -388,6 +403,7 @@ impl EventPayload {
             EventPayload::SchedulerRan { .. } => "scheduler_ran",
             EventPayload::BatchFinalized { .. } => "batch_finalized",
             EventPayload::ChildCompleted { .. } => "child_completed",
+            EventPayload::Unknown { .. } => "unknown",
         }
     }
 }
@@ -422,7 +438,7 @@ impl Serialize for Event {
         let mut map = serializer.serialize_map(Some(4))?;
         map.serialize_entry("seq", &self.seq)?;
         map.serialize_entry("timestamp", &self.timestamp)?;
-        map.serialize_entry("type", &self.payload.type_name())?;
+        map.serialize_entry("type", &self.event_type)?;
         map.serialize_entry("payload", &self.payload)?;
         map.end()
     }
@@ -600,12 +616,10 @@ impl<'de> Deserialize<'de> for Event {
                     final_state: p.final_state,
                 }
             }
-            other => {
-                return Err(serde::de::Error::custom(format!(
-                    "unknown event type: {}",
-                    other
-                )));
-            }
+            other => EventPayload::Unknown {
+                type_name: other.to_string(),
+                raw_payload: payload_val.clone(),
+            },
         };
 
         Ok(Event {
@@ -1737,5 +1751,52 @@ mod tests {
             }
             other => panic!("expected Rewound, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn unknown_event_type_deserializes_to_unknown_variant() {
+        let json = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"pause_requested","payload":{"reason":"user request"}}"#;
+        let parsed: Event =
+            serde_json::from_str(json).expect("unknown event type must parse without error");
+        match parsed.payload {
+            EventPayload::Unknown {
+                type_name,
+                raw_payload,
+            } => {
+                assert_eq!(type_name, "pause_requested");
+                assert_eq!(raw_payload["reason"], "user request");
+            }
+            other => panic!("expected Unknown, got {:?}", other),
+        }
+        assert_eq!(parsed.event_type, "pause_requested");
+    }
+
+    #[test]
+    fn unknown_event_type_name_returns_unknown() {
+        let p = EventPayload::Unknown {
+            type_name: "future_event".to_string(),
+            raw_payload: serde_json::json!({}),
+        };
+        assert_eq!(p.type_name(), "unknown");
+    }
+
+    #[test]
+    fn unknown_event_serializes_with_original_type_string() {
+        // koto query --events output must show the original type string, not "unknown".
+        let e = Event {
+            seq: 5,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "future_event".to_string(),
+            payload: EventPayload::Unknown {
+                type_name: "future_event".to_string(),
+                raw_payload: serde_json::json!({"field": "value"}),
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            val["type"], "future_event",
+            "type field must be original type string, not 'unknown'"
+        );
     }
 }

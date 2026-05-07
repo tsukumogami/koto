@@ -41,6 +41,10 @@ pub fn append_header(path: &Path, header: &StateFileHeader) -> anyhow::Result<()
 /// then appends with `max_seq + 1`. Creates the file with mode 0600 on
 /// unix if it doesn't exist. Calls `sync_data()` after every write.
 pub fn append_event(path: &Path, payload: &EventPayload, timestamp: &str) -> anyhow::Result<u64> {
+    debug_assert!(
+        !matches!(payload, EventPayload::Unknown { .. }),
+        "Unknown events must not be passed to append_event"
+    );
     // Determine the next seq by reading the current last seq.
     let next_seq = if path.exists() {
         read_last_seq(path)? + 1
