@@ -2826,26 +2826,99 @@ fn context_list_with_prefix_filter() {
 }
 
 #[test]
-fn context_add_does_not_advance_workflow_state() {
+fn context_add_appends_context_added_event_without_state_transition() {
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "state-wf", minimal_template());
 
-    // Read state file content before context add
+    // Note the current state before context add.
     let state_path = session_state_path(dir.path(), "state-wf");
     let before = std::fs::read_to_string(&state_path).unwrap();
+    let before_lines: Vec<&str> = before.lines().collect();
+    let before_seq_count = before_lines.len();
 
-    // Add context
+    // Add context.
     koto_cmd(dir.path())
         .args(["context", "add", "state-wf", "scope.md"])
         .write_stdin("context data")
         .assert()
         .success();
 
-    // State file should be unchanged (no new events appended)
+    // State file should have exactly one new line: the context_added event.
     let after = std::fs::read_to_string(&state_path).unwrap();
+    let after_lines: Vec<&str> = after.lines().collect();
     assert_eq!(
-        before, after,
-        "context add should not modify the state file"
+        after_lines.len(),
+        before_seq_count + 1,
+        "context add should append exactly one event"
+    );
+
+    // The new event must be a context_added with the correct fields.
+    let new_line = after_lines.last().unwrap();
+    let event: serde_json::Value =
+        serde_json::from_str(new_line).expect("last line must be valid JSON");
+    assert_eq!(event["type"], "context_added");
+    assert_eq!(event["payload"]["key"], "scope.md");
+    assert_eq!(
+        event["payload"]["size"], 12,
+        "size must match 'context data' byte length"
+    );
+    assert!(
+        !event["payload"]["hash"].as_str().unwrap_or("").is_empty(),
+        "hash must be non-empty"
+    );
+
+    // The workflow state (from transitions) must be unchanged: no transitioned event added.
+    let added_event: serde_json::Value = serde_json::from_str(new_line).unwrap();
+    assert_eq!(
+        added_event["type"], "context_added",
+        "only a context_added event must have been appended, not a state transition"
+    );
+}
+
+#[test]
+fn context_add_event_seq_less_than_following_next_event() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "state-wf", minimal_template());
+
+    // Add context.
+    koto_cmd(dir.path())
+        .args(["context", "add", "state-wf", "scope.md"])
+        .write_stdin("ordering check")
+        .assert()
+        .success();
+
+    // Run koto next (--no-cleanup so the state file survives terminal-state cleanup).
+    koto_cmd(dir.path())
+        .args(["next", "state-wf", "--no-cleanup"])
+        .assert()
+        .success();
+
+    // Read events and verify ordering guarantee: context_added.seq < koto next event seqs.
+    let state_path = session_state_path(dir.path(), "state-wf");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    let events: Vec<serde_json::Value> = content
+        .lines()
+        .skip(1) // skip header
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    let context_added_seq = events
+        .iter()
+        .find(|e| e["type"] == "context_added")
+        .and_then(|e| e["seq"].as_u64())
+        .expect("context_added event must exist");
+
+    // All events after the context_added event must have a higher seq.
+    let later_seqs: Vec<u64> = events
+        .iter()
+        .filter_map(|e| e["seq"].as_u64())
+        .filter(|&seq| seq > context_added_seq)
+        .collect();
+
+    assert!(
+        !later_seqs.is_empty(),
+        "koto next must have appended at least one event with seq > {} (context_added seq)",
+        context_added_seq
     );
 }
 

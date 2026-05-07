@@ -444,6 +444,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            session_id: String::new(),
         }
     }
 
@@ -669,6 +670,7 @@ mod tests {
                 EventPayload::Rewound {
                     from: "analyze".to_string(),
                     to: "gather".to_string(),
+                    rationale: None,
                 },
             ),
         ];
@@ -743,6 +745,7 @@ mod tests {
                 EventPayload::Rewound {
                     from: "analyze".to_string(),
                     to: "gather".to_string(),
+                    rationale: None,
                 },
             ),
             // New evidence after rewind
@@ -813,6 +816,7 @@ mod tests {
                 EventPayload::Rewound {
                     from: "analyze".to_string(),
                     to: "gather".to_string(),
+                    rationale: None,
                 },
             ),
         ];
@@ -867,6 +871,7 @@ mod tests {
             &EventPayload::Rewound {
                 from: "gather".to_string(),
                 to: "start".to_string(),
+                rationale: None,
             },
             "2026-01-01T00:00:02Z",
         )
@@ -1055,6 +1060,7 @@ mod tests {
                 EventPayload::Rewound {
                     from: "review".to_string(),
                     to: "implementation".to_string(),
+                    rationale: None,
                 },
             ),
         ];
@@ -1216,6 +1222,7 @@ mod tests {
                 EventPayload::Rewound {
                     from: "deploy".to_string(),
                     to: "review".to_string(),
+                    rationale: None,
                 },
             ),
             make_override_event(5, "review", "ci-passes"),
@@ -1321,6 +1328,7 @@ mod tests {
                 EventPayload::Rewound {
                     from: "deploy".to_string(),
                     to: "review".to_string(),
+                    rationale: None,
                 },
             ),
             make_override_event(6, "review", "lint-passes"),
@@ -1418,6 +1426,7 @@ mod tests {
                 EventPayload::Rewound {
                     from: "deploy".to_string(),
                     to: "review".to_string(),
+                    rationale: None,
                 },
             ),
         ];
@@ -1482,6 +1491,7 @@ mod tests {
                 EventPayload::Rewound {
                     from: "analyze".to_string(),
                     to: "gather".to_string(),
+                    rationale: None,
                 },
             ),
         ];
@@ -1497,6 +1507,7 @@ mod tests {
             EventPayload::DirectedTransition {
                 from: "plan".to_string(),
                 to: "implement".to_string(),
+                rationale: None,
             },
         )];
         let counts = derive_visit_counts(&events);
@@ -1511,6 +1522,7 @@ mod tests {
             EventPayload::Rewound {
                 from: "analyze".to_string(),
                 to: "gather".to_string(),
+                rationale: None,
             },
         )];
         let counts = derive_visit_counts(&events);
@@ -1551,6 +1563,7 @@ mod tests {
                 EventPayload::DirectedTransition {
                     from: "gather".to_string(),
                     to: "analyze".to_string(),
+                    rationale: None,
                 },
             ),
             make_event(
@@ -1565,6 +1578,7 @@ mod tests {
                 EventPayload::Rewound {
                     from: "analyze".to_string(),
                     to: "gather".to_string(),
+                    rationale: None,
                 },
             ),
         ];

@@ -758,6 +758,7 @@ mod tests {
             created_at: created_at.to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            session_id: String::new(),
         };
         persistence::append_header(&state_path, &header).unwrap();
     }
@@ -1214,6 +1215,7 @@ mod tests {
             created_at: "2026-04-13T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            session_id: String::new(),
         };
         let events = vec![
             Event {
@@ -1296,6 +1298,7 @@ mod tests {
                     created_at: "2026-04-13T00:00:00Z".to_string(),
                     parent_workflow: None,
                     template_source_dir: None,
+                    session_id: String::new(),
                 };
                 let events = vec![Event {
                     seq: 1,
@@ -1726,6 +1729,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: parent.map(|s| s.to_string()),
             template_source_dir: None,
+            session_id: String::new(),
         };
         persistence::append_header(&state_path, &header).unwrap();
     }
@@ -1833,5 +1837,34 @@ mod tests {
         assert_eq!(header.workflow, "dst-wf");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "workflow_initialized");
+    }
+
+    #[test]
+    fn relocate_preserves_session_id() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+
+        let original_session_id = "550e8400-e29b-41d4-a716-446655440000";
+        let session_dir = tmp.path().join("old-wf");
+        fs::create_dir_all(&session_dir).unwrap();
+        let state_path = session_dir.join(state_file_name("old-wf"));
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: "old-wf".to_string(),
+            template_hash: "testhash".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: None,
+            template_source_dir: None,
+            session_id: original_session_id.to_string(),
+        };
+        persistence::append_header(&state_path, &header).unwrap();
+
+        backend.relocate("old-wf", "new-wf").unwrap();
+
+        let relocated_header = backend.read_header("new-wf").unwrap();
+        assert_eq!(
+            relocated_header.session_id, original_session_id,
+            "session_id must survive relocate unchanged"
+        );
     }
 }

@@ -386,6 +386,7 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
         created_at: now_iso8601(),
         parent_workflow: None,
         template_source_dir: None,
+        session_id: String::new(),
     };
     seed_backend
         .init_state_file(parent, parent_header, Vec::new())
@@ -402,6 +403,7 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
         created_at: ts.clone(),
         parent_workflow: Some(parent.to_string()),
         template_source_dir: None,
+        session_id: String::new(),
     };
     let init_event = Event {
         seq: 1,

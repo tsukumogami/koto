@@ -1014,6 +1014,7 @@ mod tests {
             created_at: created_at.to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            session_id: String::new(),
         };
         append_header(&state_path, &header).unwrap();
     }
@@ -1101,6 +1102,7 @@ mod tests {
             created_at: "2026-04-13T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            session_id: String::new(),
         };
         let events = vec![Event {
             seq: 1,
@@ -1137,6 +1139,7 @@ mod tests {
             created_at: "2026-04-13T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            session_id: String::new(),
         };
         let events = vec![Event {
             seq: 1,
@@ -1176,6 +1179,7 @@ mod tests {
             created_at: "2026-04-13T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            session_id: String::new(),
         };
         let events = vec![Event {
             seq: 1,
