@@ -1,6 +1,6 @@
 ---
 schema: plan/v1
-status: Draft
+status: Done
 execution_mode: single-pr
 upstream: docs/designs/DESIGN-session-schema-hygiene.md
 milestone: "Session Schema Hygiene"
@@ -11,7 +11,7 @@ issue_count: 4
 
 ## Status
 
-Draft
+Done
 
 ## Scope Summary
 
