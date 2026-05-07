@@ -11,23 +11,24 @@ problem: |
   old reader loading a log where a newer koto appended a new event type fails with a
   corruption error rather than graceful degradation.
 decision: |
-  Publish a markdown reference spec at docs/reference/session-feed.md that defines the
-  event envelope, all current event types with canonical field names, a three-tier
-  audience classification, reader guarantees, and forward-compatibility rules. Activate
-  schema_version as the in-band contract version signal (bumped only for structural
-  breaks; additive fields never require a bump). Add an Unknown catch-all variant to the
-  EventPayload deserializer so koto's own tools degrade gracefully when reading logs from
-  newer koto versions. Breaking changes within an event type use a new type name
-  (e.g., transitioned_v2) rather than modifying the existing type.
+  Publish docs/reference/session-feed.md as a combined YAML-frontmatter + markdown-body
+  file: the frontmatter encodes the machine-readable event schema (all 15 event types,
+  field names, types, required/optional, tier assignment); the markdown body covers
+  behavioral guarantees, reader requirements, JSON examples, and forward-compatibility
+  rules. A companion validator CLI reads the frontmatter and validates actual JSONL log
+  files against it. Activate schema_version as the in-band contract version signal.
+  Add an Unknown catch-all variant to the EventPayload deserializer. Breaking changes
+  within an event type use a new type name (e.g., transitioned_v2).
 rationale: |
-  A markdown spec fits koto's existing documentation convention and can encode behavioral
-  guarantees (ordering, atomicity, seq gaps, single-writer) that JSON Schema cannot.
-  schema_version is already in every log at line 1 — activation is one constant and one
-  validation guard, costing nothing in new wire format. The Unknown catch-all directly
-  fixes the sharpest forward-compat gap identified in the codebase (hard-fail on unknown
-  type strings) while preserving typed dispatch for all known variants. A tiered event
-  classification prevents three independent consumers from independently re-deriving
-  audience intent with no shared guidance.
+  The combined format is single-file (no sync surface between a schema file and a prose
+  file), fits koto's established YAML-frontmatter + markdown-body idiom used by every
+  template file and design doc, and represents the untagged EventPayload enum more simply
+  than JSON Schema oneOf chains. koto already ships split_frontmatter() and serde_yaml_ng
+  as production dependencies, making a validator CLI a 4-8 hour addition. Prose is
+  mandatory regardless of form because ~70% of the contract content is behavioral
+  (ordering, atomicity, partial-write recovery, terminal state gap) — the frontmatter
+  covers the structural 30% without requiring a second file. A tiered event classification
+  prevents three independent consumers from independently re-deriving audience intent.
 ---
 
 # DESIGN: Session-Feed Data Contract
@@ -220,30 +221,48 @@ end-user views.
 
 ### Decision 4: Artifact form
 
-The contract needs a document form that serves the intended audience and can encode the
-full range of required content.
+The contract needs a document form that serves the intended audience, encodes the full
+range of required content, and enables structured validation of actual JSONL log files.
 
-**Option A: Markdown reference document (chosen)**
+**Option A: Combined YAML frontmatter + markdown body (chosen)**
 
-A markdown file at `docs/reference/session-feed.md` defines the header, event envelope,
-all current event type payloads with field-level documentation, versioning semantics,
-reader guarantees, and forward-compatibility rules. This fits koto's existing
-documentation convention (all other contracts are specified in markdown: CLI output
-contract, error codes, template format). Behavioral guarantees — ordering, atomicity,
-single-writer requirement, partial-write recovery — cannot be expressed in JSON Schema
-and require prose regardless.
+`docs/reference/session-feed.md` uses a YAML frontmatter block as the machine-readable
+event schema and a markdown body for behavioral guarantees, reader requirements, JSON
+examples, and tier classification. The frontmatter defines the header and all 15 event
+types with field names, types, required/optional status, and tier assignment (~120–180
+lines). The markdown body covers everything that JSON Schema cannot express. One file;
+no sync surface.
 
-**Option B: JSON Schema at a stable URL**
+A companion validator CLI extracts the frontmatter and validates JSONL log files against
+it: for each event line, look up `events.<type>.fields` by the `type` string and validate.
+koto already ships `split_frontmatter()` and `serde_yaml_ng` as production dependencies;
+the validator reuses both. Estimated build time: 4–8 hours.
 
-A formal JSON Schema document at `docs/schema/session-feed-v1.json`. Enables off-the-shelf
-validation tooling. Ruled out: JSON Schema cannot encode behavioral guarantees (ordering,
-atomicity, epoch boundaries, seq gap semantics). A prose supplement is required regardless,
-making JSON Schema a second artifact to maintain. The `#[serde(untagged)]` enum pattern
-koto uses requires complex `oneOf`/`if-then-else` chains in JSON Schema. No JSON Schema
-tooling exists in koto's CI today. A JSON Schema can be added as a supplement once the
-markdown spec is stable; the markdown spec is the right primary artifact.
+This is koto's established idiom: every template file and design doc uses YAML frontmatter
++ markdown body. The session-feed spec extends this pattern to field-level schema rather
+than introducing a new artifact type. The untagged `EventPayload` enum maps directly to
+a YAML map keyed by type string — approximately 2–3x more concise than the equivalent
+JSON Schema `oneOf`/`if`/`then` chains.
 
-**Option C: AsyncAPI document**
+**Option B: Markdown only**
+
+A markdown file with field tables and JSON examples in prose; no machine-readable schema
+block. Ruled out: provides no path to structured validation of log files. Behavioral
+content and human readability are identical to Option A's markdown body; the only loss
+is the structured frontmatter and the validator it enables.
+
+**Option C: JSON Schema at a stable URL**
+
+A formal JSON Schema document at `docs/schema/session-feed-v1.json` plus a separate
+markdown prose supplement. Enables off-the-shelf validation tooling (ajv, jsonschema).
+Ruled out: two files create a sync surface that requires CI enforcement to manage; the
+`#[serde(untagged)]` pattern requires complex `oneOf`/`if`/`then`/`else` chains for 15
+variants; no JSON Schema tooling exists in koto's CI today. The main advantage — off-the-
+shelf validator support — applies only to consumers who already have JSON Schema CI
+infrastructure; the three planned consumers do not. If a future consumer needs ajv
+integration specifically, the YAML frontmatter can be compiled to JSON Schema at that point.
+
+**Option D: AsyncAPI document**
 
 AsyncAPI is designed for networked async APIs with explicit channels and protocol bindings.
 Ruled out: the session feed is a local filesystem artifact, not a networked channel.
@@ -291,8 +310,9 @@ Five decisions, all high-confidence:
    (internal). Classification is in the spec; each consumer decides its own rendering
    priority within tiers but must not omit Tier 1 events from user-visible views.
 
-4. **Markdown reference document as primary artifact.** `docs/reference/session-feed.md`.
-   No JSON Schema in this iteration; may be added as a supplement later.
+4. **Combined YAML frontmatter + markdown body as the contract artifact.**
+   `docs/reference/session-feed.md` with machine-readable event schema in frontmatter
+   and behavioral prose in the body. A companion validator CLI ships alongside the spec.
 
 5. **New type name for breaking payload changes.** Additive optional fields are always
    non-breaking. Removing required fields, changing field types, or renaming fields
@@ -860,15 +880,44 @@ Two parallel tracks: the spec document (documentation), and the koto implementat
 changes (code). Neither blocks the other, but both must ship in the same PR to keep
 the contract and the implementation consistent.
 
-### Track 1: Spec document
+### Track 1: Spec document and validator
 
-Write `docs/reference/session-feed.md` containing the header spec, event envelope,
-reader guarantees, forward-compatibility rules, and all event type definitions with
-their tier classification. This is the primary contract artifact.
+Write `docs/reference/session-feed.md` as a combined YAML-frontmatter + markdown-body
+file. The frontmatter encodes the machine-readable schema:
 
-The doc draws from this design doc's Solution Architecture section. Include concrete
-JSON examples for every event type. Explicitly call out the known gaps: no
-`workflow_completed` event, gate output schema is gate-type-specific.
+```yaml
+---
+schema_version: 1
+header:
+  fields:
+    session_id: {type: string, format: uuid, required: true}
+    schema_version: {type: integer, required: true}
+    workflow: {type: string, required: true}
+    template_hash: {type: string, required: true}
+    created_at: {type: string, format: rfc3339, required: true}
+    parent_workflow: {type: string, required: false}
+    template_source_dir: {type: string, required: false}
+events:
+  workflow_initialized:
+    tier: 1
+    fields:
+      template_path: {type: string, required: true}
+      variables: {type: object, required: false}
+      spawn_entry: {type: object, nullable: true, required: false}
+  # ... all 15 event types
+---
+```
+
+The markdown body covers the header spec, event envelope, reader guarantees,
+forward-compatibility rules, JSON examples for every event type, and tier classification.
+Explicitly call out the known gaps: no `workflow_completed` event, gate output schema is
+gate-type-specific, `batch_finalized.superseded_by` is never present in raw JSONL.
+
+Also write a validator CLI (`src/bin/validate-session-feed.rs` or a standalone tool)
+that reads `docs/reference/session-feed.md`, extracts the frontmatter schema via
+`split_frontmatter()`, and validates a given JSONL log file: for each event line, look
+up `events.<type>.fields` by the `type` string and report field-level validation errors.
+Reuses `serde_yaml_ng` (already a production dependency). Estimated effort: 4–8 hours.
 
 ### Track 2: Implementation changes
 
@@ -1007,9 +1056,13 @@ a relay injecting events) must acquire it.
   older than the guard version will reject newer-format log files if they implement the
   check. This is the correct behavior but must be communicated to users who mix koto
   versions.
-- The markdown spec introduces a second artifact to keep in sync with `src/engine/types.rs`.
-  A field rename in Rust without updating the spec silently diverges. No CI check enforces
-  this alignment (a JSON Schema companion would enable one, but is deferred).
+- The combined spec file (`docs/reference/session-feed.md`) must be kept in sync with
+  `src/engine/types.rs`. A field rename in Rust without updating the spec silently diverges.
+  No CI check enforces this alignment today; the PR template checklist is the mitigation.
+- The validator CLI uses a custom YAML schema format, not JSON Schema. Consumers whose CI
+  already has JSON Schema tooling (ajv) cannot validate directly against the spec without
+  a conversion step. The YAML frontmatter can be compiled to JSON Schema if a consumer
+  needs it; that tooling is not in scope for this iteration.
 - The `template_path` semantic confusion (cache path, not source path) is documented
   but not fixed. Adding a `source_template_path` field to `workflow_initialized` would
   require a new event type or an additive field addition; this is deferred to a follow-on
