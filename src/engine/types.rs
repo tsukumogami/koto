@@ -329,8 +329,13 @@ pub enum EventPayload {
     /// string and raw payload are preserved so operators can inspect them
     /// via `koto query --events`.
     ///
-    /// This variant is deserialization-only. It is never written to disk —
-    /// `append_event` guards the write path with a `debug_assert`.
+    /// This variant is deserialization-only. Callers must not pass it to
+    /// `append_event` — doing so would write a corrupted event to disk.
+    /// The guard in `append_event` is a `debug_assert` rather than a hard
+    /// panic because this is an internal invariant: `Unknown` is only ever
+    /// constructed inside the `Event::deserialize` impl, so production builds
+    /// can rely on the type system to uphold the constraint without the runtime
+    /// check.
     Unknown {
         /// The unrecognized `type` string from the original event.
         type_name: String,
@@ -449,6 +454,9 @@ impl Serialize for Event {
         let mut map = serializer.serialize_map(Some(4))?;
         map.serialize_entry("seq", &self.seq)?;
         map.serialize_entry("timestamp", &self.timestamp)?;
+        // Use the stored event_type string rather than payload.type_name() so that
+        // Unknown events round-trip their original type string (e.g. "pause_requested")
+        // instead of the static "unknown" label when serialized by koto query --events.
         map.serialize_entry("type", &self.event_type)?;
         map.serialize_entry("payload", &self.payload)?;
         map.end()

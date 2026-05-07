@@ -55,8 +55,12 @@ pub(crate) fn validate_feed(log_file: &str) -> anyhow::Result<()> {
 
 /// Core validation logic; accepts an explicit spec path for testability.
 pub(crate) fn validate_feed_with_spec(log_file: &str, spec_path: &Path) -> anyhow::Result<()> {
-    let spec_content = std::fs::read_to_string(spec_path)
-        .with_context(|| format!("failed to read feed spec from {}", spec_path.display()))?;
+    let spec_content = std::fs::read_to_string(spec_path).with_context(|| {
+        format!(
+            "failed to read feed spec from {}; set KOTO_FEED_SPEC to override the path",
+            spec_path.display()
+        )
+    })?;
 
     let (frontmatter_str, _body) = split_frontmatter(&spec_content)
         .ok_or_else(|| anyhow!("feed spec has no YAML frontmatter"))?;
