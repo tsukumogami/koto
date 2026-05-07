@@ -548,7 +548,11 @@ fn write_rewound_event(
         .current_state
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    let payload = EventPayload::Rewound { from, to: target };
+    let payload = EventPayload::Rewound {
+        from,
+        to: target,
+        rationale: None,
+    };
     backend.append_event(&snapshot.composed, &payload, &now_iso8601())?;
     Ok(())
 }

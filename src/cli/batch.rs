@@ -4017,6 +4017,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: Some("p".to_string()),
             template_source_dir: None,
+            session_id: String::new(),
         };
         persistence::append_header(&state_path, &header).unwrap();
     }
@@ -4126,6 +4127,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: Some("p".to_string()),
             template_source_dir: None,
+            session_id: String::new(),
         };
         persistence::append_header(&state_path, &header).unwrap();
         // Append a WorkflowInitialized event so the file is
@@ -4412,6 +4414,7 @@ mod tests {
                 payload: EventPayload::Rewound {
                     from: "b".to_string(),
                     to: "a".to_string(),
+                    rationale: None,
                 },
             },
             Event {
@@ -4432,6 +4435,7 @@ mod tests {
                 payload: EventPayload::Rewound {
                     from: "b".to_string(),
                     to: "a".to_string(),
+                    rationale: None,
                 },
             },
         ];

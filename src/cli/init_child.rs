@@ -43,7 +43,9 @@ use std::path::{Path, PathBuf};
 
 use crate::cache::compile_cached;
 use crate::cli::task_spawn_error::{SpawnErrorKind, TaskSpawnError};
-use crate::engine::types::{now_iso8601, Event, EventPayload, SpawnEntrySnapshot, StateFileHeader};
+use crate::engine::types::{
+    generate_session_id, now_iso8601, Event, EventPayload, SpawnEntrySnapshot, StateFileHeader,
+};
 use crate::session::{SessionBackend, SessionError};
 use crate::template::types::CompiledTemplate;
 
@@ -469,6 +471,7 @@ fn init_child_core(
         created_at: ts.clone(),
         parent_workflow: parent_name.map(|s| s.to_string()),
         template_source_dir,
+        session_id: generate_session_id(),
     };
 
     let init_payload = EventPayload::WorkflowInitialized {
@@ -603,6 +606,7 @@ Done.
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            session_id: String::new(),
         };
         let events = vec![Event {
             seq: 1,

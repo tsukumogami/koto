@@ -40,6 +40,14 @@ pub struct StateFileHeader {
     /// state files round-trip cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_source_dir: Option<PathBuf>,
+
+    /// UUID v4 identifier generated at `koto init` time and preserved
+    /// unchanged through rename operations.
+    ///
+    /// Additive field: deserializes to an empty string when absent so
+    /// older state files continue to load without error.
+    #[serde(default)]
+    pub session_id: String,
 }
 
 /// Canonical-form snapshot of the batch task entry that spawned a
@@ -172,10 +180,25 @@ pub enum EventPayload {
     DirectedTransition {
         from: String,
         to: String,
+        /// Optional human-readable reason for this directed transition.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rationale: Option<String>,
     },
     Rewound {
         from: String,
         to: String,
+        /// Optional human-readable reason for this rewind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rationale: Option<String>,
+    },
+    /// Emitted when a context artifact is successfully stored via `koto context add`.
+    ContextAdded {
+        /// The context key under which the artifact was stored.
+        key: String,
+        /// SHA-256 hex digest of the artifact content.
+        hash: String,
+        /// Size of the artifact content in bytes.
+        size: u64,
     },
     WorkflowCancelled {
         state: String,
@@ -356,6 +379,7 @@ impl EventPayload {
             EventPayload::DirectedTransition { .. } => "directed_transition",
             EventPayload::IntegrationInvoked { .. } => "integration_invoked",
             EventPayload::Rewound { .. } => "rewound",
+            EventPayload::ContextAdded { .. } => "context_added",
             EventPayload::WorkflowCancelled { .. } => "workflow_cancelled",
             EventPayload::DefaultActionExecuted { .. } => "default_action_executed",
             EventPayload::DecisionRecorded { .. } => "decision_recorded",
@@ -467,6 +491,7 @@ impl<'de> Deserialize<'de> for Event {
                 EventPayload::DirectedTransition {
                     from: p.from,
                     to: p.to,
+                    rationale: p.rationale,
                 }
             }
             "integration_invoked" => {
@@ -484,6 +509,16 @@ impl<'de> Deserialize<'de> for Event {
                 EventPayload::Rewound {
                     from: p.from,
                     to: p.to,
+                    rationale: p.rationale,
+                }
+            }
+            "context_added" => {
+                let p: ContextAddedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::ContextAdded {
+                    key: p.key,
+                    hash: p.hash,
+                    size: p.size,
                 }
             }
             "workflow_cancelled" => {
@@ -613,6 +648,8 @@ struct EvidenceSubmittedPayload {
 struct DirectedTransitionPayload {
     from: String,
     to: String,
+    #[serde(default)]
+    rationale: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -626,6 +663,15 @@ struct IntegrationInvokedPayload {
 struct RewoundPayload {
     from: String,
     to: String,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ContextAddedPayload {
+    key: String,
+    hash: String,
+    size: u64,
 }
 
 #[derive(Deserialize)]
@@ -734,24 +780,49 @@ pub struct MachineState {
 pub fn now_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let secs = SystemTime::now()
+    let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+        .unwrap_or_default();
 
-    // Format as YYYY-MM-DDTHH:MM:SSZ using integer arithmetic.
-    let s = secs;
-    let sec = s % 60;
-    let min = (s / 60) % 60;
-    let hour = (s / 3600) % 24;
-    let days = s / 86400; // days since 1970-01-01
+    let secs = duration.as_secs();
+    let millis = duration.subsec_millis();
+
+    // Format as YYYY-MM-DDTHH:MM:SS.mmmZ using integer arithmetic.
+    let sec = secs % 60;
+    let min = (secs / 60) % 60;
+    let hour = (secs / 3600) % 24;
+    let days = secs / 86400; // days since 1970-01-01
 
     // Compute year/month/day from days-since-epoch.
     let (year, month, day) = days_to_ymd(days);
 
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, month, day, hour, min, sec
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        year, month, day, hour, min, sec, millis
+    )
+}
+
+/// Generate a UUID v4 using `/dev/urandom` with no external crate dependencies.
+pub fn generate_session_id() -> String {
+    use std::io::Read;
+
+    let mut buf = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .unwrap_or_default();
+
+    // Set version 4 bits.
+    buf[6] = (buf[6] & 0x0F) | 0x40;
+    // Set variant bits (RFC 4122).
+    buf[8] = (buf[8] & 0x3F) | 0x80;
+
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        buf[0], buf[1], buf[2], buf[3],
+        buf[4], buf[5],
+        buf[6], buf[7],
+        buf[8], buf[9],
+        buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]
     )
 }
 
@@ -800,6 +871,7 @@ mod tests {
             created_at: "2026-03-15T14:30:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            session_id: String::new(),
         };
         let json = serde_json::to_string(&header).unwrap();
         let parsed: StateFileHeader = serde_json::from_str(&json).unwrap();
@@ -815,6 +887,7 @@ mod tests {
             created_at: "2026-03-15T14:30:00Z".to_string(),
             parent_workflow: Some("parent-wf".to_string()),
             template_source_dir: None,
+            session_id: String::new(),
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(json.contains("\"parent_workflow\":\"parent-wf\""));
@@ -842,6 +915,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: Some(PathBuf::from("/abs/templates")),
+            session_id: String::new(),
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -862,6 +936,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            session_id: String::new(),
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -880,6 +955,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            session_id: String::new(),
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -1062,6 +1138,7 @@ mod tests {
             payload: EventPayload::Rewound {
                 from: "analyze".to_string(),
                 to: "gather".to_string(),
+                rationale: None,
             },
         };
         let json = serde_json::to_string(&e).unwrap();
@@ -1100,6 +1177,7 @@ mod tests {
         let p2 = EventPayload::Rewound {
             from: "b".to_string(),
             to: "a".to_string(),
+            rationale: None,
         };
         assert_eq!(p2.type_name(), "rewound");
     }
@@ -1155,9 +1233,20 @@ mod tests {
     #[test]
     fn now_iso8601_format() {
         let ts = now_iso8601();
-        assert_eq!(ts.len(), 20);
+        assert_eq!(
+            ts.len(),
+            24,
+            "expected 24-char millisecond-precision timestamp, got '{}'",
+            ts
+        );
         assert!(ts.ends_with('Z'));
         assert!(ts.contains('T'));
+        assert_eq!(
+            ts.chars().nth(19),
+            Some('.'),
+            "expected '.' at position 19, got '{}'",
+            ts
+        );
     }
 
     #[test]
@@ -1423,5 +1512,230 @@ mod tests {
             "round-tripped pre-feature event must not introduce submitter_cwd, got {}",
             reserialized
         );
+    }
+
+    // ===== Issue 1: millisecond timestamps =====
+
+    #[test]
+    fn now_iso8601_millisecond_precision() {
+        let ts = now_iso8601();
+        // Format: YYYY-MM-DDTHH:MM:SS.mmmZ (24 chars)
+        assert_eq!(ts.len(), 24);
+        // Position 19 must be the decimal point.
+        let bytes = ts.as_bytes();
+        assert_eq!(bytes[19], b'.');
+        // Remaining three chars before Z must be digits.
+        assert!(bytes[20].is_ascii_digit());
+        assert!(bytes[21].is_ascii_digit());
+        assert!(bytes[22].is_ascii_digit());
+        assert_eq!(bytes[23], b'Z');
+    }
+
+    // ===== Issue 2: session_id on StateFileHeader =====
+
+    #[test]
+    fn header_session_id_round_trip() {
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: "wf".to_string(),
+            template_hash: "hash".to_string(),
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+            parent_workflow: None,
+            template_source_dir: None,
+            session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(json.contains("\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\""));
+        let parsed: StateFileHeader = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.session_id, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn header_session_id_defaults_to_empty_for_old_state_files() {
+        // Old state files without session_id field should parse cleanly.
+        let json = r#"{"schema_version":1,"workflow":"old-wf","template_hash":"abc","created_at":"2026-01-01T00:00:00Z"}"#;
+        let parsed: StateFileHeader = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.session_id, "");
+    }
+
+    #[test]
+    fn generate_session_id_format() {
+        let id = generate_session_id();
+        // UUID v4: 8-4-4-4-12 hex groups separated by hyphens, all lowercase.
+        assert_eq!(id.len(), 36, "UUID must be 36 chars, got '{}'", id);
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.len(), 5, "UUID must have 5 hyphen-delimited parts");
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[1].len(), 4);
+        assert_eq!(parts[2].len(), 4);
+        assert_eq!(parts[3].len(), 4);
+        assert_eq!(parts[4].len(), 12);
+        // Version nibble: must be '4'.
+        assert_eq!(&parts[2][0..1], "4", "version nibble must be 4");
+        // Variant bits: first char of group 4 must be 8, 9, a, or b.
+        let variant_char = parts[3].chars().next().unwrap();
+        assert!(
+            matches!(variant_char, '8' | '9' | 'a' | 'b'),
+            "variant char must be 8/9/a/b, got '{}'",
+            variant_char
+        );
+        // All chars must be lowercase hex or hyphens.
+        for c in id.chars() {
+            assert!(
+                c.is_ascii_hexdigit() && !c.is_ascii_uppercase() || c == '-',
+                "UUID must be lowercase hex, got char '{}'",
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn generate_session_id_unique() {
+        let a = generate_session_id();
+        let b = generate_session_id();
+        assert_ne!(a, b, "two generated UUIDs must differ");
+    }
+
+    // ===== Issue 3: context_added event =====
+
+    #[test]
+    fn context_added_round_trip() {
+        let e = Event {
+            seq: 7,
+            timestamp: "2026-05-01T12:00:00.000Z".to_string(),
+            event_type: "context_added".to_string(),
+            payload: EventPayload::ContextAdded {
+                key: "plan.md".to_string(),
+                hash: "abc123def456abc123def456abc123def456abc123def456abc123def456abc12345"
+                    .to_string(),
+                size: 1024,
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"type\":\"context_added\""));
+        assert!(json.contains("\"key\":\"plan.md\""));
+        assert!(json.contains("\"size\":1024"));
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn context_added_type_name() {
+        let p = EventPayload::ContextAdded {
+            key: "scope.md".to_string(),
+            hash: "abc".to_string(),
+            size: 42,
+        };
+        assert_eq!(p.type_name(), "context_added");
+    }
+
+    // ===== Issue 4: --rationale on directed_transition and rewound =====
+
+    #[test]
+    fn directed_transition_with_rationale_round_trip() {
+        let e = Event {
+            seq: 8,
+            timestamp: "2026-05-01T12:00:00.000Z".to_string(),
+            event_type: "directed_transition".to_string(),
+            payload: EventPayload::DirectedTransition {
+                from: "analysis".to_string(),
+                to: "implementation".to_string(),
+                rationale: Some("Design approved by stakeholders".to_string()),
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"rationale\":\"Design approved by stakeholders\""));
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn directed_transition_without_rationale_omits_field() {
+        let e = Event {
+            seq: 9,
+            timestamp: "2026-05-01T12:00:00.000Z".to_string(),
+            event_type: "directed_transition".to_string(),
+            payload: EventPayload::DirectedTransition {
+                from: "analysis".to_string(),
+                to: "implementation".to_string(),
+                rationale: None,
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(
+            !json.contains("rationale"),
+            "rationale must be absent when None, got {}",
+            json
+        );
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn old_directed_transition_event_without_rationale_deserializes() {
+        // Pre-feature directed_transition events that have no rationale field
+        // must continue to parse correctly.
+        let json = r#"{"seq":1,"timestamp":"2026-01-01T00:00:00Z","type":"directed_transition","payload":{"from":"a","to":"b"}}"#;
+        let parsed: Event = serde_json::from_str(json).expect("pre-feature event must parse");
+        match parsed.payload {
+            EventPayload::DirectedTransition { rationale, .. } => {
+                assert!(rationale.is_none());
+            }
+            other => panic!("expected DirectedTransition, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rewound_with_rationale_round_trip() {
+        let e = Event {
+            seq: 10,
+            timestamp: "2026-05-01T12:00:00.000Z".to_string(),
+            event_type: "rewound".to_string(),
+            payload: EventPayload::Rewound {
+                from: "implementation".to_string(),
+                to: "analysis".to_string(),
+                rationale: Some("Scope changed after review".to_string()),
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"rationale\":\"Scope changed after review\""));
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn rewound_without_rationale_omits_field() {
+        let e = Event {
+            seq: 11,
+            timestamp: "2026-05-01T12:00:00.000Z".to_string(),
+            event_type: "rewound".to_string(),
+            payload: EventPayload::Rewound {
+                from: "implementation".to_string(),
+                to: "analysis".to_string(),
+                rationale: None,
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(
+            !json.contains("rationale"),
+            "rationale must be absent when None, got {}",
+            json
+        );
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn old_rewound_event_without_rationale_deserializes() {
+        // Pre-feature rewound events that have no rationale field must
+        // continue to parse correctly.
+        let json = r#"{"seq":1,"timestamp":"2026-01-01T00:00:00Z","type":"rewound","payload":{"from":"b","to":"a"}}"#;
+        let parsed: Event = serde_json::from_str(json).expect("pre-feature event must parse");
+        match parsed.payload {
+            EventPayload::Rewound { rationale, .. } => {
+                assert!(rationale.is_none());
+            }
+            other => panic!("expected Rewound, got {:?}", other),
+        }
     }
 }

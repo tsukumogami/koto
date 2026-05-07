@@ -4,13 +4,18 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::cache::sha256_hex;
+use crate::engine::types::{now_iso8601, EventPayload};
 use crate::session::context::ContextStore;
+use crate::session::SessionBackend;
 
-/// Read content from stdin and store it under the given key.
+/// Read content from stdin and store it under the given key, then emit a
+/// `context_added` event to the session log.
 ///
 /// When `from_file` is provided, reads from that path instead of stdin.
 pub fn handle_add(
     store: &dyn ContextStore,
+    backend: &dyn SessionBackend,
     session: &str,
     key: &str,
     from_file: Option<&str>,
@@ -28,7 +33,18 @@ pub fn handle_add(
         }
     };
 
-    store.add(session, key, &content)
+    store.add(session, key, &content)?;
+
+    let hash = sha256_hex(&content);
+    let size = content.len() as u64;
+    let event = EventPayload::ContextAdded {
+        key: key.to_string(),
+        hash,
+        size,
+    };
+    backend.append_event(session, &event, &now_iso8601())?;
+
+    Ok(())
 }
 
 /// Retrieve stored content and write it to stdout.

@@ -120,6 +120,10 @@ pub enum Command {
         /// Always include the details field in the response, regardless of visit count
         #[arg(long)]
         full: bool,
+
+        /// Optional explanation for why this directed transition was made (only used with --to)
+        #[arg(long)]
+        rationale: Option<String>,
     },
 
     /// Cancel a workflow, preventing further advancement
@@ -139,6 +143,10 @@ pub enum Command {
     Rewind {
         /// Workflow name
         name: String,
+
+        /// Optional explanation for why this rewind was made
+        #[arg(long)]
+        rationale: Option<String>,
     },
 
     /// List all active workflows in the current directory
@@ -785,6 +793,7 @@ pub fn run(app: App) -> Result<()> {
             to,
             no_cleanup,
             full,
+            rationale,
         } => {
             let backend = build_backend()?;
             let context_store: &dyn ContextStore = &backend;
@@ -796,15 +805,16 @@ pub fn run(app: App) -> Result<()> {
                 to,
                 no_cleanup,
                 full,
+                rationale,
             )
         }
         Command::Cancel { name, cleanup } => {
             let backend = build_backend()?;
             handle_cancel(&backend, &name, cleanup)
         }
-        Command::Rewind { name } => {
+        Command::Rewind { name, rationale } => {
             let backend = build_backend()?;
-            handle_rewind(&backend, &name)
+            handle_rewind(&backend, &name, rationale)
         }
         Command::Status { name } => {
             let backend = build_backend()?;
@@ -896,7 +906,8 @@ pub fn run(app: App) -> Result<()> {
                     key,
                     from_file,
                 } => {
-                    if let Err(e) = context::handle_add(store, &session, &key, from_file.as_deref())
+                    if let Err(e) =
+                        context::handle_add(store, &backend, &session, &key, from_file.as_deref())
                     {
                         exit_with_error_code(
                             serde_json::json!({
@@ -1296,7 +1307,11 @@ fn handle_init(
 }
 
 /// Handle the `koto rewind` command.
-fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
+fn handle_rewind(
+    backend: &dyn SessionBackend,
+    name: &str,
+    rationale: Option<String>,
+) -> Result<()> {
     if !backend.exists(name) {
         exit_with_error(serde_json::json!({
             "error": format!("workflow '{}' not found", name),
@@ -1354,6 +1369,7 @@ fn handle_rewind(backend: &dyn SessionBackend, name: &str) -> Result<()> {
     let rewind_payload = EventPayload::Rewound {
         from: from_state.clone(),
         to: prev_state.clone(),
+        rationale,
     };
 
     if let Err(e) = backend.append_event(name, &rewind_payload, &now_iso8601()) {
@@ -1653,6 +1669,7 @@ fn append_child_completed_to_parent(
 /// `BatchError::ConcurrentTick` (see `cli::batch_error`) -- which Issue #10
 /// will extend with additional variants.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn handle_next(
     backend: &dyn SessionBackend,
     context_store: &dyn ContextStore,
@@ -1661,6 +1678,7 @@ fn handle_next(
     to: Option<String>,
     no_cleanup: bool,
     full: bool,
+    rationale: Option<String>,
 ) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
@@ -1919,6 +1937,7 @@ fn handle_next(
         let payload = EventPayload::DirectedTransition {
             from: current_state.clone(),
             to: target.clone(),
+            rationale: rationale.clone(),
         };
         if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
             let ne = NextError {
@@ -2974,6 +2993,7 @@ fn handle_next(
     _to: Option<String>,
     _no_cleanup: bool,
     _full: bool,
+    _rationale: Option<String>,
 ) -> Result<()> {
     exit_with_error_code(
         serde_json::json!({
