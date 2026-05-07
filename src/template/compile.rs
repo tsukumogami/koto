@@ -590,7 +590,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
 
 /// Split a markdown file into front-matter and body.
 /// Returns (frontmatter_str, body_str) if the file starts with `---`.
-fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     let content = content.trim_start_matches('\n');
     if !content.starts_with("---") {
         return None;

@@ -9,6 +9,7 @@ pub mod overrides;
 pub mod retry;
 pub mod session;
 pub mod task_spawn_error;
+pub mod validate_feed;
 pub mod vars;
 
 pub use init_child::{init_child_from_parent, TemplateCompileCache};
@@ -411,6 +412,12 @@ pub enum TemplateSubcommand {
     Validate {
         /// Path to the compiled template JSON
         path: String,
+    },
+
+    /// Validate a JSONL session log against the session-feed spec
+    ValidateFeed {
+        /// Path to the JSONL session log file
+        log_file: String,
     },
 
     /// Export a template as a visual diagram
@@ -982,6 +989,13 @@ pub fn run(app: App) -> Result<()> {
                         "error": e.to_string(),
                         "command": "template validate"
                     }));
+                }
+                Ok(())
+            }
+            TemplateSubcommand::ValidateFeed { log_file } => {
+                if let Err(e) = validate_feed::validate_feed(&log_file) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
                 }
                 Ok(())
             }
