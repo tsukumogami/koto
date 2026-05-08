@@ -12,6 +12,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::cli::dashboard_data::{compute_elapsed_since, DetailData, SessionTree};
 
+/// Which tab is active in the detail pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DashboardTab {
+    Summary,
+    History,
+    Remaining,
+}
+
 /// Which pane the user is currently viewing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ViewMode {
@@ -96,6 +104,9 @@ pub struct DashboardAppState {
 
     /// The session ID that was focused when `detail_cache` was last populated.
     pub detail_cache_session: Option<String>,
+
+    /// Which tab is currently selected in the detail pane.
+    pub active_tab: DashboardTab,
 }
 
 impl DashboardAppState {
@@ -117,6 +128,7 @@ impl DashboardAppState {
             detail_cache: None,
             detail_cache_mtime: None,
             detail_cache_session: None,
+            active_tab: DashboardTab::Summary,
         }
     }
 
@@ -234,6 +246,14 @@ impl DashboardAppState {
                     self.focused_id = Some(row.session_id.clone());
                     self.detail_cache = None;
                 }
+            }
+
+            (_, KeyCode::Tab, _) => {
+                self.active_tab = match self.active_tab {
+                    DashboardTab::Summary => DashboardTab::History,
+                    DashboardTab::History => DashboardTab::Remaining,
+                    DashboardTab::Remaining => DashboardTab::Summary,
+                };
             }
 
             _ => {}
@@ -839,6 +859,28 @@ mod tests {
                 leaf.session_id
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tab cycling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tab_key_cycles_through_tabs() {
+        let mut state = DashboardAppState::new(500);
+        assert_eq!(state.active_tab, DashboardTab::Summary);
+
+        // Press Tab once: Summary -> History
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.active_tab, DashboardTab::History);
+
+        // Press Tab again: History -> Remaining
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.active_tab, DashboardTab::Remaining);
+
+        // Press Tab again: Remaining -> Summary (wrap)
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.active_tab, DashboardTab::Summary);
     }
 
     // -----------------------------------------------------------------------

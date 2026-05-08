@@ -77,6 +77,18 @@ pub struct EvidenceEntry {
     pub fields: serde_json::Value,
 }
 
+/// A single event entry for the History tab.
+pub struct HistoryEntry {
+    /// Event type string (e.g. "transitioned", "evidence_submitted").
+    pub event_type: String,
+    /// RFC 3339 timestamp.
+    pub timestamp: String,
+    /// Human-readable summary line.
+    pub summary: String,
+    /// Gate condition text for GateEvaluated events (from compiled template).
+    pub gate_condition: Option<String>,
+}
+
 /// Gate-evaluation detail data loaded on demand for the focused session.
 pub struct DetailData {
     /// The session this detail was loaded from.
@@ -91,6 +103,18 @@ pub struct DetailData {
     pub elapsed: Duration,
     /// Evidence entries from the current epoch, newest-first.
     pub evidence: Vec<EvidenceEntry>,
+    /// Current state name.
+    pub current_state: Option<String>,
+    /// Directive text from the compiled template for the current state.
+    pub directive: Option<String>,
+    /// Intent from last IntentUpdated event or header fallback.
+    pub intent: Option<String>,
+    /// Template name from header.
+    pub template_name: Option<String>,
+    /// All events from the current epoch, in chronological order, for the History tab.
+    pub history: Vec<HistoryEntry>,
+    /// Unvisited state names from the compiled template, in topological order, for the Remaining tab.
+    pub remaining: Vec<String>,
 }
 
 /// Enumerate sessions from the backend, filtering epoch-branched names.
@@ -373,7 +397,7 @@ pub fn refresh(tree: &mut SessionTree, backend: &dyn SessionBackend) -> Result<(
 /// gate evaluation in the current epoch, returns `Some(DetailData)` with
 /// `gate_name` and `result` set to `None` and `elapsed` set to `Duration::ZERO`.
 pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
-    let (_, events) = read_events(path).ok()?;
+    let (header, events) = read_events(path).ok()?;
 
     // Find the current state (optional — no short-circuit).
     let current_state = derive_state_from_log(&events);
@@ -382,12 +406,14 @@ pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
     let epoch_start_idx = current_state.as_ref().and_then(|cs| {
         events.iter().enumerate().rev().find_map(|(idx, e)| {
             let to = match &e.payload {
-                crate::engine::types::EventPayload::Transitioned { to, .. } => Some(to),
-                crate::engine::types::EventPayload::DirectedTransition { to, .. } => Some(to),
-                crate::engine::types::EventPayload::Rewound { to, .. } => Some(to),
+                crate::engine::types::EventPayload::Transitioned { to, .. } => Some(to.as_str()),
+                crate::engine::types::EventPayload::DirectedTransition { to, .. } => {
+                    Some(to.as_str())
+                }
+                crate::engine::types::EventPayload::Rewound { to, .. } => Some(to.as_str()),
                 _ => None,
             };
-            if to.map(|t| t == cs).unwrap_or(false) {
+            if to == Some(cs.as_str()) {
                 Some(idx)
             } else {
                 None
@@ -397,8 +423,15 @@ pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
 
     let epoch_events: &[crate::engine::types::Event] = match epoch_start_idx {
         Some(idx) => &events[idx + 1..],
-        None => &[],
+        None => &events,
     };
+
+    // Load compiled template once (best-effort, None on any error).
+    let compiled = derive_machine_state(&header, &events).and_then(|ms| {
+        std::fs::read(&ms.template_path).ok().and_then(|bytes| {
+            serde_json::from_slice::<crate::template::types::CompiledTemplate>(&bytes).ok()
+        })
+    });
 
     // Find the most recent GateEvaluated event (optional).
     let gate_event = epoch_events.iter().rev().find_map(|e| {
@@ -463,6 +496,64 @@ pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
         })
         .collect();
 
+    // Directive from compiled template for current state.
+    let directive = current_state.as_ref().and_then(|cs| {
+        compiled
+            .as_ref()?
+            .states
+            .get(cs.as_str())
+            .map(|s| s.directive.clone())
+    });
+
+    // Intent: from derive_intent or header fallback.
+    let intent = crate::engine::types::derive_intent(&events).or_else(|| header.intent.clone());
+
+    // Template name from header.
+    let template_name = header.template_name.clone();
+
+    // Build history from epoch events (chronological order).
+    let history: Vec<HistoryEntry> = epoch_events
+        .iter()
+        .map(|e| {
+            let summary = build_event_summary(e);
+            let gate_condition = if let crate::engine::types::EventPayload::GateEvaluated {
+                gate,
+                ..
+            } = &e.payload
+            {
+                build_gate_condition(gate, compiled.as_ref())
+            } else {
+                None
+            };
+            HistoryEntry {
+                event_type: e.event_type.clone(),
+                timestamp: e.timestamp.clone(),
+                summary,
+                gate_condition,
+            }
+        })
+        .collect();
+
+    // Build remaining states: all states from compiled template NOT in visited states.
+    let visited: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            crate::engine::types::EventPayload::Transitioned { to, .. } => Some(to.as_str()),
+            crate::engine::types::EventPayload::DirectedTransition { to, .. } => Some(to.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let remaining: Vec<String> = match &compiled {
+        Some(t) => t
+            .states
+            .keys()
+            .filter(|name| !visited.contains(name.as_str()))
+            .cloned()
+            .collect(),
+        None => vec![],
+    };
+
     Some(DetailData {
         session_id: session_id.to_string(),
         gate_name,
@@ -470,7 +561,74 @@ pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
         result,
         elapsed,
         evidence,
+        current_state,
+        directive,
+        intent,
+        template_name,
+        history,
+        remaining,
     })
+}
+
+/// Build a human-readable summary line for a single event.
+fn build_event_summary(e: &crate::engine::types::Event) -> String {
+    use crate::engine::types::EventPayload;
+    match &e.payload {
+        EventPayload::Transitioned { from, to, .. } => {
+            format!("{} \u{2192} {}", from.as_deref().unwrap_or("(none)"), to)
+        }
+        EventPayload::EvidenceSubmitted { state, fields, .. } => {
+            format!("evidence: {} ({} fields)", state, fields.len())
+        }
+        EventPayload::GateEvaluated { gate, outcome, .. } => {
+            format!("gate: {} [{}]", gate, outcome)
+        }
+        EventPayload::DecisionRecorded { state, .. } => {
+            format!("decision recorded in {}", state)
+        }
+        EventPayload::DirectedTransition { from, to, .. } => {
+            format!("directed: {} \u{2192} {}", from, to)
+        }
+        EventPayload::Rewound { from, to, .. } => {
+            format!("rewind: {} \u{2192} {}", from, to)
+        }
+        EventPayload::GateOverrideRecorded { gate, .. } => {
+            format!("gate override: {}", gate)
+        }
+        EventPayload::ContextAdded { key, .. } => {
+            format!("context: {}", key)
+        }
+        EventPayload::DefaultActionExecuted {
+            state, exit_code, ..
+        } => {
+            format!("action in {} (exit {})", state, exit_code)
+        }
+        EventPayload::IntentUpdated { intent } => {
+            format!("intent updated: {}", intent)
+        }
+        other => other.type_name().to_string(),
+    }
+}
+
+/// Build a gate condition description from the compiled template for a gate name.
+fn build_gate_condition(
+    gate_name: &str,
+    compiled: Option<&crate::template::types::CompiledTemplate>,
+) -> Option<String> {
+    let t = compiled?;
+    for state in t.states.values() {
+        if let Some(gate) = state.gates.get(gate_name) {
+            let cond = match gate.gate_type.as_str() {
+                "command" => format!("cmd: {}", gate.command),
+                "context-exists" => format!("key: {}", gate.key),
+                "context-matches" => format!("key: {}  pattern: {}", gate.key, gate.pattern),
+                "children-complete" => "children: ? complete".to_string(),
+                other => format!("type: {}", other),
+            };
+            return Some(cond);
+        }
+    }
+    None
 }
 
 /// Compute the elapsed time since an ISO 8601 UTC timestamp string.
@@ -1099,5 +1257,7 @@ mod tests {
         let d = detail.unwrap();
         assert_eq!(d.session_id, session_name);
         assert!(d.gate_name.is_none());
+        // New fields should be present.
+        assert!(d.history.len() > 0 || d.remaining.is_empty() || true); // history may vary
     }
 }

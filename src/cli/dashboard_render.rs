@@ -14,12 +14,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
-    TableState,
+    TableState, Tabs,
 };
 use ratatui::Frame;
 
 use crate::cli::dashboard_data::{DetailData, SessionTree};
-use crate::cli::dashboard_state::{DashboardAppState, TaskCounts};
+use crate::cli::dashboard_state::{DashboardAppState, DashboardTab, TaskCounts};
 
 /// Maximum number of evidence entries rendered in the detail pane.
 const EVIDENCE_DISPLAY_CAP: usize = 3;
@@ -56,6 +56,7 @@ pub fn render_frame(f: &mut Frame<'_>, state: &DashboardAppState) {
         state.detail_cache.as_ref(),
         state.focused_id.as_deref(),
         &state.tree,
+        &state.active_tab,
         chunks[1],
     );
 }
@@ -128,86 +129,164 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
     }
 }
 
-/// Render the detail pane for the focused session.
-///
-/// Shows a contextual message when `detail` is `None`:
-/// - "No state history" when the session has never transitioned (unknown status)
-/// - "No gate evaluations recorded" when the session has a current state but no gates
-///
-/// When detail data is present, displays gate name, command, result, elapsed,
-/// and evidence entries (newest-first, capped at 3).
+/// Render the detail pane for the focused session with tabbed navigation.
 fn render_detail(
+    f: &mut Frame<'_>,
+    detail: Option<&DetailData>,
+    session_name: Option<&str>,
+    tree: &SessionTree,
+    active_tab: &DashboardTab,
+    area: ratatui::layout::Rect,
+) {
+    let title = match session_name {
+        Some(name) => format!(" {} ", name),
+        None => " session ".to_string(),
+    };
+
+    let outer_block = Block::default().borders(Borders::ALL).title(title);
+    let inner_area = outer_block.inner(area);
+    f.render_widget(outer_block, area);
+
+    // Split inner_area: tabs row at top (height 1), content below.
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner_area);
+
+    // Tabs widget.
+    let tab_titles = vec!["Summary", "History", "Remaining"];
+    let selected = match active_tab {
+        DashboardTab::Summary => 0,
+        DashboardTab::History => 1,
+        DashboardTab::Remaining => 2,
+    };
+    let tabs = Tabs::new(tab_titles)
+        .select(selected)
+        .style(Style::default())
+        .highlight_style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Yellow),
+        );
+    f.render_widget(tabs, chunks[0]);
+
+    // Tab content.
+    match active_tab {
+        DashboardTab::Summary => render_summary_tab(f, detail, session_name, tree, chunks[1]),
+        DashboardTab::History => render_history_tab(f, detail, chunks[1]),
+        DashboardTab::Remaining => render_remaining_tab(f, detail, chunks[1]),
+    }
+}
+
+/// Render the Summary tab content.
+fn render_summary_tab(
     f: &mut Frame<'_>,
     detail: Option<&DetailData>,
     session_name: Option<&str>,
     tree: &SessionTree,
     area: ratatui::layout::Rect,
 ) {
-    let title = match session_name {
-        Some(name) => format!(" {}: detail ", name),
-        None => " detail ".to_string(),
-    };
-    let block = Block::default().borders(Borders::ALL).title(title);
-
     match detail {
         None => {
             let msg = session_name
                 .and_then(|name| tree.sessions.get(name))
                 .map(|s| {
                     if s.current_state.is_some() {
-                        "No gate evaluations recorded"
+                        "No data"
                     } else {
                         "No state history"
                     }
                 })
                 .unwrap_or("No data");
-            let paragraph = Paragraph::new(msg).block(block);
-            f.render_widget(paragraph, area);
+            f.render_widget(Paragraph::new(msg), area);
         }
         Some(data) => {
             let mut lines: Vec<Line> = Vec::new();
 
-            // Gate name and result on the first line.
-            let gate_name_str = data.gate_name.as_deref().unwrap_or("-");
-            let result_str = data.result.as_deref().unwrap_or("-");
-            lines.push(Line::from(vec![
-                Span::raw(format!("Gate: {} | ", gate_name_str)),
-                Span::styled(
-                    result_str.to_string(),
-                    if result_str == "PASS" {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::Red)
-                    },
-                ),
-                Span::raw(format!(" | elapsed: {}", format_duration(data.elapsed))),
-            ]));
-
-            // Command line (if present).
-            if let Some(cmd) = &data.command {
-                lines.push(Line::from(format!("Command: {}", cmd)));
+            if let Some(ref cs) = data.current_state {
+                lines.push(Line::from(format!("State: {}", cs)));
+            }
+            if let Some(ref d) = data.directive {
+                lines.push(Line::from(format!("Directive: {}", d)));
+            }
+            if let (Some(ref gn), Some(ref result)) = (&data.gate_name, &data.result) {
+                lines.push(Line::from(vec![
+                    Span::raw(format!("Gate: {} | ", gn)),
+                    Span::styled(
+                        result.clone(),
+                        if result == "PASS" {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default().fg(Color::Red)
+                        },
+                    ),
+                ]));
+            }
+            if let Some(ref intent) = data.intent {
+                lines.push(Line::from(format!("Intent: {}", intent)));
+            }
+            if let Some(ref tn) = data.template_name {
+                lines.push(Line::from(format!("Template: {}", tn)));
             }
 
-            // Evidence entries: newest-first (already ordered), cap at EVIDENCE_DISPLAY_CAP.
+            // Evidence (newest-first, capped at EVIDENCE_DISPLAY_CAP).
             let total_evidence = data.evidence.len();
             if total_evidence > 0 {
                 lines.push(Line::from("Evidence:"));
                 for entry in data.evidence.iter().take(EVIDENCE_DISPLAY_CAP) {
-                    let fields_str = serde_json::to_string(&entry.fields)
-                        .expect("serde_json::Value serialization is infallible");
+                    let fields_str = serde_json::to_string(&entry.fields).unwrap_or_default();
                     lines.push(Line::from(format!("  [{}] {}", entry.state, fields_str)));
                 }
                 if total_evidence > EVIDENCE_DISPLAY_CAP {
-                    let more = total_evidence - EVIDENCE_DISPLAY_CAP;
-                    lines.push(Line::from(format!("  \u{2193} {} more", more)));
+                    lines.push(Line::from(format!(
+                        "  \u{2193} {} more",
+                        total_evidence - EVIDENCE_DISPLAY_CAP
+                    )));
                 }
             }
 
-            let text = Text::from(lines);
-            let paragraph = Paragraph::new(text).block(block);
-            f.render_widget(paragraph, area);
+            f.render_widget(Paragraph::new(Text::from(lines)), area);
         }
     }
+}
+
+/// Render the History tab content.
+fn render_history_tab(f: &mut Frame<'_>, detail: Option<&DetailData>, area: ratatui::layout::Rect) {
+    let lines: Vec<Line> = match detail {
+        None => vec![Line::from("No data")],
+        Some(data) if data.history.is_empty() => vec![Line::from("No events in current epoch")],
+        Some(data) => {
+            let mut lines = Vec::new();
+            for entry in &data.history {
+                let ts_end = entry.timestamp.len().min(19);
+                lines.push(Line::from(format!(
+                    "[{}] {}",
+                    &entry.timestamp[..ts_end],
+                    entry.summary
+                )));
+                if let Some(ref cond) = entry.gate_condition {
+                    lines.push(Line::from(format!("  {}", cond)));
+                }
+            }
+            lines
+        }
+    };
+    f.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// Render the Remaining tab content.
+fn render_remaining_tab(
+    f: &mut Frame<'_>,
+    detail: Option<&DetailData>,
+    area: ratatui::layout::Rect,
+) {
+    let lines: Vec<Line> = match detail {
+        None => vec![Line::from("No data")],
+        Some(data) if data.remaining.is_empty() => vec![Line::from("No remaining states")],
+        Some(data) => data
+            .remaining
+            .iter()
+            .map(|s| Line::from(s.clone()))
+            .collect(),
+    };
+    f.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 /// Format a `Duration` as a compact human-readable string.
@@ -399,6 +478,12 @@ mod tests {
             result: Some("PASS".to_string()),
             elapsed: Duration::from_secs(0),
             evidence: vec![],
+            current_state: None,
+            directive: None,
+            intent: None,
+            template_name: None,
+            history: vec![],
+            remaining: vec![],
         });
 
         let backend = TestBackend::new(80, 24);
@@ -421,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn render_detail_shows_command_when_present() {
+    fn render_detail_shows_gate_and_fail_result_in_summary_tab() {
         let mut state = empty_state();
         state.detail_cache = Some(DetailData {
             session_id: "test-session".to_string(),
@@ -430,6 +515,12 @@ mod tests {
             result: Some("FAIL".to_string()),
             elapsed: Duration::from_secs(30),
             evidence: vec![],
+            current_state: None,
+            directive: None,
+            intent: None,
+            template_name: None,
+            history: vec![],
+            remaining: vec![],
         });
 
         let backend = TestBackend::new(80, 24);
@@ -440,8 +531,13 @@ mod tests {
         // At width=80 with 40/60 split, the detail pane occupies columns 32-79.
         let detail_cols = region_to_string(&buffer, 0..24, 32..80);
         assert!(
-            detail_cols.contains("cargo build"),
-            "detail pane should contain command; got: {:?}",
+            detail_cols.contains("build-gate"),
+            "detail pane should contain gate name; got: {:?}",
+            detail_cols
+        );
+        assert!(
+            detail_cols.contains("FAIL"),
+            "detail pane should contain FAIL result; got: {:?}",
             detail_cols
         );
     }
@@ -473,6 +569,12 @@ mod tests {
                     fields: serde_json::json!({"k": "v4"}),
                 },
             ],
+            current_state: None,
+            directive: None,
+            intent: None,
+            template_name: None,
+            history: vec![],
+            remaining: vec![],
         });
 
         let backend = TestBackend::new(80, 24);
@@ -707,6 +809,135 @@ mod tests {
             !all.contains("koto dashboard"),
             "width=30 should not render list; got: {:?}",
             &all[..all.len().min(200)]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tabbed detail pane tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_detail_summary_tab_shows_intent() {
+        use crate::cli::dashboard_state::DashboardTab;
+
+        let mut state = empty_state();
+        state.active_tab = DashboardTab::Summary;
+        state.detail_cache = Some(DetailData {
+            session_id: "sess".to_string(),
+            gate_name: None,
+            command: None,
+            result: None,
+            elapsed: Duration::ZERO,
+            evidence: vec![],
+            current_state: Some("gather".to_string()),
+            directive: Some("Do work.".to_string()),
+            intent: Some("test intent value".to_string()),
+            template_name: Some("my-template".to_string()),
+            history: vec![],
+            remaining: vec![],
+        });
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let right = region_to_string(&buffer, 0..24, 40..100);
+        assert!(
+            right.contains("test intent value"),
+            "Summary tab should show intent; got: {:?}",
+            &right[..right.len().min(300)]
+        );
+    }
+
+    #[test]
+    fn tab_cycles_three_times_returns_to_summary() {
+        use crate::cli::dashboard_state::DashboardTab;
+        use crossterm::event::KeyModifiers;
+
+        let mut state = empty_state();
+        assert_eq!(state.active_tab, DashboardTab::Summary);
+        for _ in 0..3 {
+            state.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Tab,
+                KeyModifiers::NONE,
+            ));
+        }
+        assert_eq!(state.active_tab, DashboardTab::Summary);
+    }
+
+    #[test]
+    fn render_history_tab_shows_evidence_only_session() {
+        use crate::cli::dashboard_data::HistoryEntry;
+        use crate::cli::dashboard_state::DashboardTab;
+
+        let mut state = empty_state();
+        state.active_tab = DashboardTab::History;
+        state.detail_cache = Some(DetailData {
+            session_id: "sess".to_string(),
+            gate_name: None,
+            command: None,
+            result: None,
+            elapsed: Duration::ZERO,
+            evidence: vec![EvidenceEntry {
+                state: "gather".to_string(),
+                fields: serde_json::json!({"k": "v"}),
+            }],
+            current_state: Some("gather".to_string()),
+            directive: None,
+            intent: None,
+            template_name: None,
+            history: vec![HistoryEntry {
+                event_type: "evidence_submitted".to_string(),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                summary: "evidence: gather (1 fields)".to_string(),
+                gate_condition: None,
+            }],
+            remaining: vec![],
+        });
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let right = region_to_string(&buffer, 0..24, 40..100);
+        assert!(
+            right.contains("evidence") || right.contains("gather"),
+            "History tab should show evidence event; got: {:?}",
+            &right[..right.len().min(300)]
+        );
+    }
+
+    #[test]
+    fn render_remaining_tab_empty_when_all_states_visited() {
+        use crate::cli::dashboard_state::DashboardTab;
+
+        let mut state = empty_state();
+        state.active_tab = DashboardTab::Remaining;
+        state.detail_cache = Some(DetailData {
+            session_id: "sess".to_string(),
+            gate_name: None,
+            command: None,
+            result: None,
+            elapsed: Duration::ZERO,
+            evidence: vec![],
+            current_state: Some("done".to_string()),
+            directive: None,
+            intent: None,
+            template_name: None,
+            history: vec![],
+            remaining: vec![],
+        });
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let right = region_to_string(&buffer, 0..24, 40..100);
+        assert!(
+            right.contains("No remaining") || right.contains("remaining"),
+            "Remaining tab should show empty message; got: {:?}",
+            &right[..right.len().min(300)]
         );
     }
 }

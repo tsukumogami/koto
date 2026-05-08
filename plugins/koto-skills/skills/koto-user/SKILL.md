@@ -288,6 +288,16 @@ koto decisions record <name> --with-data '{"choice": "option-a", "rationale": "b
 
 `choice` and `rationale` are required. `alternatives_considered` is optional.
 
+## Updating session intent
+
+Use `koto session update --intent` to record a human-readable description of what the workflow is trying to accomplish. This doesn't advance the state — it appends an `intent_updated` event to the log, visible in the dashboard's Summary tab.
+
+```bash
+koto session update <name> --intent "investigate the flaky CI failure in the auth module"
+```
+
+Intent strings over 1024 characters are rejected. The command exits non-zero if the session doesn't exist.
+
 ## Reference material
 
 Read these on demand, not upfront. The sections above cover the common path. Consult a reference file only when you hit the specific situation it describes.
