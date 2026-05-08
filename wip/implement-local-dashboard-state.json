@@ -581,14 +581,15 @@
     {
       "number": 5,
       "title": "feat(cli): implement dashboard entry point and --once mode",
-      "status": "scrutinized",
+      "status": "pushed",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
       "issue_type": "code",
       "dependencies": [],
       "commits": [
         "673e5c562f56b0ceb59f592923b94152f0ef4e9e",
-        "ba063dd"
+        "ba063dd",
+        "0619406"
       ],
       "agent_type": "coder",
       "summary": {
