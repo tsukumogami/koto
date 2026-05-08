@@ -3,6 +3,11 @@
 //! Converts `DashboardAppState` into ratatui widget trees and draws them
 //! to a `Frame`. Implements list view, detail pane, scrollbar, and cursor
 //! highlighting.
+//!
+//! Layout is driven by terminal width:
+//! - width < 40: "terminal too narrow" message
+//! - width < 80: list-only (full width)
+//! - width >= 80: horizontal split — 40% list / 60% detail
 
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -14,34 +19,45 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::cli::dashboard_data::{DetailData, SessionTree};
-use crate::cli::dashboard_state::{DashboardAppState, TaskCounts, ViewMode};
+use crate::cli::dashboard_state::{DashboardAppState, TaskCounts};
 
 /// Maximum number of evidence entries rendered in the detail pane.
 const EVIDENCE_DISPLAY_CAP: usize = 3;
 
 /// Draw the full dashboard to `f`.
 ///
-/// Switches between a full-height list (`ViewMode::List`) and a vertically-split
-/// layout with a detail pane at the bottom (`ViewMode::Detail`).
+/// Layout is width-driven:
+/// - width < 40: shows a "terminal too narrow" message
+/// - width < 80: list-only, using the full area
+/// - width >= 80: horizontal 40%/60% split — list on the left, detail on the right
 pub fn render_frame(f: &mut Frame<'_>, state: &DashboardAppState) {
-    match state.view_mode {
-        ViewMode::List => {
-            let area = f.area();
-            render_list(f, state, area);
-        }
-        ViewMode::Detail => {
-            let chunks =
-                Layout::vertical([Constraint::Min(0), Constraint::Length(8)]).split(f.area());
-            render_list(f, state, chunks[0]);
-            render_detail(
-                f,
-                state.detail_cache.as_ref(),
-                state.focused_id.as_deref(),
-                &state.tree,
-                chunks[1],
-            );
-        }
+    let area = f.area();
+    let width = area.width;
+
+    if width < 40 {
+        let msg =
+            Paragraph::new("terminal too narrow").block(Block::default().borders(Borders::ALL));
+        f.render_widget(msg, area);
+        return;
     }
+
+    if width < 80 {
+        render_list(f, state, area);
+        return;
+    }
+
+    // Width >= 80: horizontal 40% list / 60% detail.
+    let chunks =
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(area);
+
+    render_list(f, state, chunks[0]);
+    render_detail(
+        f,
+        state.detail_cache.as_ref(),
+        state.focused_id.as_deref(),
+        &state.tree,
+        chunks[1],
+    );
 }
 
 /// Render the session list as a 4-column table with cursor highlighting and scrollbar.
@@ -280,15 +296,16 @@ mod tests {
     #[test]
     fn render_frame_list_mode_header_row_present() {
         let state = empty_state();
-        let backend = TestBackend::new(80, 24);
+        // Use width=100 so the horizontal split gives the list pane ~40 columns,
+        // enough to show all four header columns (Name, State, Elapsed, Tasks).
+        let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render_frame(f, &state)).unwrap();
 
         let buffer = terminal.backend().buffer().clone();
         // Row 1 (0-indexed) is the table header inside the border.
-        let row1: String = (0..80)
-            .map(|x| buffer.cell((x, 1)).unwrap().symbol().to_string())
-            .collect();
+        // At width=100 the left pane is columns 0-39.
+        let row1 = region_to_string(&buffer, 1..2, 0..40);
         assert!(
             row1.contains("Name"),
             "header row should contain 'Name'; got: {:?}",
@@ -307,9 +324,7 @@ mod tests {
 
     #[test]
     fn render_detail_shows_no_data_when_cache_is_none_and_no_focused_session() {
-        let state = empty_state();
-        let mut state = state;
-        state.view_mode = ViewMode::Detail;
+        let mut state = empty_state();
         state.detail_cache = None;
 
         let backend = TestBackend::new(80, 24);
@@ -317,11 +332,13 @@ mod tests {
         terminal.draw(|f| render_frame(f, &state)).unwrap();
 
         let buffer = terminal.backend().buffer().clone();
-        let detail_rows = region_to_string(&buffer, 16..24, 0..80);
+        // At width=80 with 40/60 split, the detail pane occupies the right 60%
+        // (columns 32-79, all rows).
+        let detail_cols = region_to_string(&buffer, 0..24, 32..80);
         assert!(
-            detail_rows.contains("No data"),
-            "detail pane should contain 'No data'; got rows 16-23: {:?}",
-            detail_rows
+            detail_cols.contains("No data"),
+            "detail pane should contain 'No data'; got right pane: {:?}",
+            detail_cols
         );
     }
 
@@ -333,7 +350,6 @@ mod tests {
         use std::time::SystemTime;
 
         let mut state = empty_state();
-        state.view_mode = ViewMode::Detail;
         state.focused_id = Some("my-wf".to_string());
         state.detail_cache = None;
         state.tree.sessions.insert(
@@ -364,18 +380,18 @@ mod tests {
         terminal.draw(|f| render_frame(f, &state)).unwrap();
 
         let buffer = terminal.backend().buffer().clone();
-        let detail_rows = region_to_string(&buffer, 16..24, 0..80);
+        // At width=80 with 40/60 split, the detail pane occupies columns 32-79.
+        let detail_cols = region_to_string(&buffer, 0..24, 32..80);
         assert!(
-            detail_rows.contains("No state history"),
+            detail_cols.contains("No state history"),
             "unknown session should show 'No state history'; got: {:?}",
-            detail_rows
+            detail_cols
         );
     }
 
     #[test]
     fn render_detail_shows_gate_and_result_when_cache_is_present() {
         let mut state = empty_state();
-        state.view_mode = ViewMode::Detail;
         state.detail_cache = Some(DetailData {
             session_id: "test-session".to_string(),
             gate_name: Some("my-gate".to_string()),
@@ -390,24 +406,23 @@ mod tests {
         terminal.draw(|f| render_frame(f, &state)).unwrap();
 
         let buffer = terminal.backend().buffer().clone();
-        // Detail pane is the bottom 8 rows.
-        let detail_rows = region_to_string(&buffer, 16..24, 0..80);
+        // At width=80 with 40/60 split, the detail pane occupies columns 32-79.
+        let detail_cols = region_to_string(&buffer, 0..24, 32..80);
         assert!(
-            detail_rows.contains("my-gate"),
+            detail_cols.contains("my-gate"),
             "detail pane should contain gate name; got: {:?}",
-            detail_rows
+            detail_cols
         );
         assert!(
-            detail_rows.contains("PASS"),
+            detail_cols.contains("PASS"),
             "detail pane should contain result; got: {:?}",
-            detail_rows
+            detail_cols
         );
     }
 
     #[test]
     fn render_detail_shows_command_when_present() {
         let mut state = empty_state();
-        state.view_mode = ViewMode::Detail;
         state.detail_cache = Some(DetailData {
             session_id: "test-session".to_string(),
             gate_name: Some("build-gate".to_string()),
@@ -422,18 +437,18 @@ mod tests {
         terminal.draw(|f| render_frame(f, &state)).unwrap();
 
         let buffer = terminal.backend().buffer().clone();
-        let detail_rows = region_to_string(&buffer, 16..24, 0..80);
+        // At width=80 with 40/60 split, the detail pane occupies columns 32-79.
+        let detail_cols = region_to_string(&buffer, 0..24, 32..80);
         assert!(
-            detail_rows.contains("cargo build"),
+            detail_cols.contains("cargo build"),
             "detail pane should contain command; got: {:?}",
-            detail_rows
+            detail_cols
         );
     }
 
     #[test]
     fn render_detail_shows_evidence_entries_capped_at_3() {
         let mut state = empty_state();
-        state.view_mode = ViewMode::Detail;
         state.detail_cache = Some(DetailData {
             session_id: "test-session".to_string(),
             gate_name: Some("evidence-gate".to_string()),
@@ -465,11 +480,12 @@ mod tests {
         terminal.draw(|f| render_frame(f, &state)).unwrap();
 
         let buffer = terminal.backend().buffer().clone();
-        let detail_rows = region_to_string(&buffer, 16..24, 0..80);
+        // At width=80 with 40/60 split, the detail pane occupies columns 32-79.
+        let detail_cols = region_to_string(&buffer, 0..24, 32..80);
         assert!(
-            detail_rows.contains("1 more"),
+            detail_cols.contains("1 more"),
             "detail pane should show '1 more' indicator for 4 entries; got: {:?}",
-            detail_rows
+            detail_cols
         );
     }
 
@@ -599,16 +615,98 @@ mod tests {
         );
         state.tree.roots = vec!["my-workflow".to_string()];
 
-        let backend = TestBackend::new(80, 24);
+        // Use width=100 so the list pane (left 40% = 40 cols) has enough room
+        // for the Name column to render the session name.
+        let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render_frame(f, &state)).unwrap();
 
         let buffer = terminal.backend().buffer().clone();
-        let all_content = region_to_string(&buffer, 0..24, 0..80);
+        // Check the left pane (columns 0-39) for the session name.
+        // The table may truncate the name to fit — check for a known prefix.
+        let list_pane = region_to_string(&buffer, 0..24, 0..40);
         assert!(
-            all_content.contains("my-workflow"),
-            "rendered output should contain session name; got content (truncated): {}",
-            &all_content[..all_content.len().min(200)]
+            list_pane.contains("my-workflow") || list_pane.contains("my-w"),
+            "rendered output should contain session name (or prefix); got content (truncated): {}",
+            &list_pane[..list_pane.len().min(200)]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Responsive layout tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_frame_width_100_shows_horizontal_split() {
+        let state = empty_state();
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        // Left side (list pane) — columns 0-39, all rows.
+        let left_side = region_to_string(&buffer, 0..24, 0..40);
+        assert!(
+            left_side.contains("koto dashboard") || left_side.contains("Name"),
+            "left side should contain list content; got: {:?}",
+            &left_side[..left_side.len().min(200)]
+        );
+        // Right side (detail pane) — columns 40-99, all rows.
+        let right_side = region_to_string(&buffer, 0..24, 40..100);
+        assert!(
+            right_side.contains('\u{2500}')
+                || right_side.contains('─')
+                || right_side.contains('|')
+                || right_side.contains('│')
+                || right_side.contains("detail"),
+            "right side should contain detail pane border; got: {:?}",
+            &right_side[..right_side.len().min(200)]
+        );
+    }
+
+    #[test]
+    fn render_frame_width_60_shows_list_only() {
+        let state = empty_state();
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        // The list should span the full width — check the top row for the block title.
+        let top_row = region_to_string(&buffer, 0..1, 0..60);
+        assert!(
+            top_row.contains("koto dashboard"),
+            "width=60 should show list-only with dashboard title; got: {:?}",
+            top_row
+        );
+        // Should NOT have a "detail" pane title anywhere.
+        let all = region_to_string(&buffer, 0..24, 0..60);
+        assert!(
+            !all.contains("detail"),
+            "width=60 should not show detail pane; got: {:?}",
+            &all[..all.len().min(200)]
+        );
+    }
+
+    #[test]
+    fn render_frame_width_30_shows_too_narrow_message() {
+        let state = empty_state();
+        let backend = TestBackend::new(30, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let all = region_to_string(&buffer, 0..24, 0..30);
+        assert!(
+            all.contains("terminal too narrow") || all.contains("too narrow"),
+            "width=30 should show too-narrow message; got: {:?}",
+            &all[..all.len().min(200)]
+        );
+        // Should NOT contain "koto dashboard" (list not rendered).
+        assert!(
+            !all.contains("koto dashboard"),
+            "width=30 should not render list; got: {:?}",
+            &all[..all.len().min(200)]
         );
     }
 }
