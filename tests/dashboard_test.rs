@@ -1,5 +1,7 @@
 use assert_cmd::Command;
 use assert_fs::TempDir;
+use koto::engine::persistence::append_event;
+use koto::engine::types::EventPayload;
 use std::path::Path;
 
 fn koto_cmd(dir: &Path) -> Command {
@@ -13,13 +15,13 @@ fn koto_cmd(dir: &Path) -> Command {
     cmd
 }
 
-fn write_template(dir: &Path, name: &str, content: &str) -> std::path::PathBuf {
+fn write_template(dir: &Path, name: &str, content: &str) -> String {
     let path = dir.join(format!("{}.md", name));
     std::fs::write(&path, content).unwrap();
-    path
+    path.to_str().unwrap().to_string()
 }
 
-/// Template that auto-advances to terminal "done" state in one koto next call.
+/// Template that auto-advances to terminal "done" state.
 fn terminal_template() -> &'static str {
     r#"---
 name: terminal-workflow
@@ -43,8 +45,10 @@ Finished.
 "#
 }
 
-/// Template that requires evidence to transition, keeping the session in
-/// "gather" state after koto init + koto next.
+/// Template that keeps the session in "gather" after koto init + one koto next.
+///
+/// No auto-transition fires without evidence (`result: ok`), so the session
+/// stays in "gather" with status_bucket "running". Tests depend on this invariant.
 fn running_template() -> &'static str {
     r#"---
 name: running-workflow
@@ -99,36 +103,36 @@ fn dashboard_once_produces_tab_separated_output_with_running_and_terminal() {
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
 
-    // Create terminal session: init only, then manually append the final transition.
-    // koto next deletes the session directory when reaching terminal state, so we
-    // instead append the transitioned event directly to keep the session on disk.
+    // Create terminal session: init only, then append the final transition via
+    // the typed API. koto next deletes the session directory when it becomes
+    // terminal, so we cannot use it to drive the session to "done".
     let term_src = write_template(dir.path(), "term-tmpl", terminal_template());
     koto_cmd(dir.path())
-        .args(["init", "term-wf", "--template", term_src.to_str().unwrap()])
+        .args(["init", "term-wf", "--template", &term_src])
         .assert()
         .success();
 
-    // Append a transitioned event to advance term-wf to "done" (terminal).
-    // Derive the next seq from the file to avoid brittleness if koto init
-    // ever gains additional bootstrap events.
     let state_path = dir
         .path()
         .join("sessions")
         .join("term-wf")
         .join("koto-term-wf.state.jsonl");
-    let mut content = std::fs::read_to_string(&state_path).unwrap();
-    let next_seq = content.lines().filter(|l| l.contains(r#""seq""#)).count() + 1;
-    content.push_str(&format!(
-        r#"{{"seq":{},"timestamp":"2026-01-01T00:00:02Z","type":"transitioned","payload":{{"from":"start","to":"done","condition_type":"auto"}}}}"#,
-        next_seq
-    ));
-    content.push('\n');
-    std::fs::write(&state_path, &content).unwrap();
+    append_event(
+        &state_path,
+        &EventPayload::Transitioned {
+            from: Some("start".to_string()),
+            to: "done".to_string(),
+            condition_type: "auto".to_string(),
+            skip_if_matched: None,
+        },
+        "2026-01-01T00:00:02Z",
+    )
+    .unwrap();
 
-    // Create running session: stays in "gather" state (conditional transition, no auto-advance).
+    // Create running session: stays in "gather" (conditional transition requires evidence).
     let run_src = write_template(dir.path(), "run-tmpl", running_template());
     koto_cmd(dir.path())
-        .args(["init", "run-wf", "--template", run_src.to_str().unwrap()])
+        .args(["init", "run-wf", "--template", &run_src])
         .assert()
         .success();
     koto_cmd(dir.path())
@@ -154,7 +158,6 @@ fn dashboard_once_produces_tab_separated_output_with_running_and_terminal() {
     assert_eq!(lines.len(), 2, "expected 2 session lines, got: {:?}", lines);
 
     // Every line must have exactly 4 tab-separated fields.
-    let valid_buckets = ["running", "done", "failed", "blocked", "unknown"];
     for line in &lines {
         let fields: Vec<&str> = line.split('\t').collect();
         assert_eq!(
@@ -163,6 +166,7 @@ fn dashboard_once_produces_tab_separated_output_with_running_and_terminal() {
             "line '{}' should have 4 tab-separated fields",
             line
         );
+        let valid_buckets = ["running", "done", "failed", "blocked", "unknown"];
         assert!(
             valid_buckets.contains(&fields[3]),
             "status_bucket '{}' is not a valid value",
@@ -170,7 +174,7 @@ fn dashboard_once_produces_tab_separated_output_with_running_and_terminal() {
         );
     }
 
-    // Verify running session (alphabetically first "run-wf").
+    // Verify running session.
     let run_line = lines
         .iter()
         .find(|l| l.starts_with("run-wf\t"))
@@ -185,7 +189,7 @@ fn dashboard_once_produces_tab_separated_output_with_running_and_terminal() {
         "running session should have bucket 'running'"
     );
 
-    // Verify terminal session ("term-wf").
+    // Verify terminal session.
     let term_line = lines
         .iter()
         .find(|l| l.starts_with("term-wf\t"))
