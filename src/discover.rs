@@ -129,6 +129,8 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         append_header(&state_path, &header).unwrap();
     }
@@ -314,6 +316,8 @@ mod tests {
             parent_workflow: Some(parent.to_string()),
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         append_header(&state_path, &header).unwrap();
     }

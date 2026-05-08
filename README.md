@@ -109,6 +109,8 @@ The `action` field is `"execute"` while work remains and `"done"` at the termina
 
 **Batch child spawning**: A coordinator template can fan out a dynamic task list to child workflows with declared dependencies (`waits_on`), wait for them via a `children-complete` gate, and route on aggregate outcomes. Submit the task list with `koto next <coord> --with-data @tasks.json`; the scheduler spawns one child per task, honors DAG ordering, and surfaces per-child progress under `scheduler.materialized_children`. The `koto-author` and `koto-user` skills each ship a batch-specific reference.
 
+**Live dashboard**: `koto dashboard` opens a live TUI showing all sessions for the current repo as a tree with state, elapsed time, and task counts. Navigate with j/k, press Enter to open a detail panel, and q to quit. Pass `--once` to print a tab-separated snapshot and exit — useful for scripting or CI status checks.
+
 **Configuration**: koto merges config from two layers: project config (`.koto/config.toml`, shared via version control) and user config (`~/.koto/config.toml`, machine-specific). `koto config set` writes to project config by default (like `git config`); use `--user` for machine-specific settings. Credentials are restricted to user config and environment variables -- they can't be set in project config. Use `koto config list` to see the resolved values.
 
 ## Agent integration

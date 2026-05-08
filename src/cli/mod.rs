@@ -2,6 +2,10 @@ pub mod batch;
 pub mod batch_error;
 pub mod batch_view;
 pub mod context;
+pub mod dashboard;
+pub mod dashboard_data;
+pub mod dashboard_render;
+pub mod dashboard_state;
 pub mod init_child;
 pub mod next;
 pub mod next_types;
@@ -99,6 +103,10 @@ pub enum Command {
         /// Name of an existing parent workflow (creates a child workflow)
         #[arg(long)]
         parent: Option<String>,
+
+        /// Human-readable description of the workflow's goal
+        #[arg(long)]
+        intent: Option<String>,
     },
 
     /// Get the current state directive for a workflow
@@ -206,6 +214,24 @@ pub enum Command {
         #[command(subcommand)]
         subcommand: ConfigCommand,
     },
+
+    /// Live terminal dashboard showing session hierarchy and state
+    Dashboard(DashboardArgs),
+}
+
+/// Arguments for the `koto dashboard` command.
+#[derive(clap::Args)]
+pub struct DashboardArgs {
+    /// Show only sessions under this named workflow
+    pub name: Option<String>,
+
+    /// Print one tab-separated line per session and exit (no TUI)
+    #[arg(long)]
+    pub once: bool,
+
+    /// Poll interval in milliseconds (default: 500)
+    #[arg(long)]
+    pub interval: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -269,6 +295,14 @@ pub enum SessionCommand {
         /// per-child `koto session resolve`.
         #[arg(long, value_enum, default_value_t = ChildrenPolicy::Auto)]
         children: ChildrenPolicy,
+    },
+    /// Update session metadata fields
+    Update {
+        /// Session name
+        name: String,
+        /// Set the workflow's intent description
+        #[arg(long)]
+        intent: String,
     },
 }
 
@@ -515,8 +549,7 @@ fn build_local_backend() -> Result<LocalBackend> {
     if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
         Ok(LocalBackend::with_base_dir(PathBuf::from(base)))
     } else {
-        let working_dir = std::env::current_dir()?;
-        LocalBackend::new(&working_dir)
+        LocalBackend::new()
     }
 }
 
@@ -790,9 +823,17 @@ pub fn run(app: App) -> Result<()> {
             template,
             vars,
             parent,
+            intent,
         } => {
             let backend = build_backend()?;
-            handle_init(&backend, &name, &template, &vars, parent.as_deref())
+            handle_init(
+                &backend,
+                &name,
+                &template,
+                &vars,
+                parent.as_deref(),
+                intent.as_deref(),
+            )
         }
         Command::Next {
             name,
@@ -902,6 +943,17 @@ pub fn run(app: App) -> Result<()> {
                     keep,
                     children,
                 } => session::handle_resolve(&backend, &name, &keep, children),
+                SessionCommand::Update { name, intent } => {
+                    session::handle_update(&backend, &name, &intent)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "name": name,
+                            "updated": true
+                        }))?
+                    );
+                    Ok(())
+                }
             }
         }
         Command::Context { subcommand } => {
@@ -1102,6 +1154,10 @@ pub fn run(app: App) -> Result<()> {
             }
         }
         Command::Config { subcommand } => handle_config(subcommand),
+        Command::Dashboard(args) => {
+            let backend = build_backend()?;
+            dashboard::run(args, &backend)
+        }
     }
 }
 
@@ -1198,6 +1254,7 @@ fn handle_init(
     template: &str,
     vars: &[String],
     parent: Option<&str>,
+    intent: Option<&str>,
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation.
     if let Err(msg) = crate::discover::validate_workflow_name(name) {
@@ -1287,6 +1344,14 @@ fn handle_init(
                     exit_with_error(body);
                 }
             }
+        }
+    }
+
+    // If --intent was provided, append an IntentUpdated event.
+    if let Some(intent_str) = intent {
+        if let Err(e) = session::handle_update(backend, name, intent_str) {
+            // Non-fatal: log a warning but do not abort the init.
+            eprintln!("warning: failed to record intent: {}", e);
         }
     }
 

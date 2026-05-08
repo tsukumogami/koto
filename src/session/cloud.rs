@@ -72,7 +72,7 @@ impl CloudBackend {
     /// `LocalBackend`). The cloud config provides S3 endpoint, bucket
     /// name, region, and credentials.
     pub fn new(working_dir: &Path, cloud_config: &CloudConfig) -> anyhow::Result<Self> {
-        let local = LocalBackend::new(working_dir)?;
+        let local = LocalBackend::new()?;
         let prefix = repo_id(working_dir)?;
         let bucket = create_bucket(cloud_config)?;
         Ok(Self {
@@ -1015,6 +1015,8 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         append_header(&state_path, &header).unwrap();
     }
@@ -1103,6 +1105,8 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         let events = vec![Event {
             seq: 1,
@@ -1140,6 +1144,8 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         let events = vec![Event {
             seq: 1,
@@ -1180,6 +1186,8 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         let events = vec![Event {
             seq: 1,

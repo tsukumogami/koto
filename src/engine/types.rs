@@ -59,6 +59,19 @@ pub struct StateFileHeader {
     /// older state files continue to load without error.
     #[serde(default)]
     pub session_id: String,
+
+    /// Human-readable description of the workflow's goal, set at init time.
+    ///
+    /// Additive field: omitted when None, defaults to None on old state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+
+    /// Name of the template used to initialize this workflow.
+    ///
+    /// Populated from the template's `name` frontmatter field at init time.
+    /// Additive field: omitted when None, defaults to None on old state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_name: Option<String>,
 }
 
 /// Canonical-form snapshot of the batch task entry that spawned a
@@ -322,6 +335,12 @@ pub enum EventPayload {
         /// `failure_mode` projection when `outcome == Failure`.
         final_state: String,
     },
+    /// Emitted by `koto session update --intent` to update the workflow's
+    /// stated goal concurrently with execution. Multiple events may appear;
+    /// the last one wins (see `derive_intent`).
+    IntentUpdated {
+        intent: String,
+    },
     /// Catch-all for event type strings not recognized by this koto version.
     ///
     /// Enables graceful degradation when reading logs produced by a newer
@@ -419,9 +438,22 @@ impl EventPayload {
             EventPayload::SchedulerRan { .. } => "scheduler_ran",
             EventPayload::BatchFinalized { .. } => "batch_finalized",
             EventPayload::ChildCompleted { .. } => "child_completed",
+            EventPayload::IntentUpdated { .. } => "intent_updated",
             EventPayload::Unknown { .. } => "unknown",
         }
     }
+}
+
+/// Return the intent string from the last `IntentUpdated` event in `events`,
+/// or `None` if no such event exists.
+pub fn derive_intent(events: &[Event]) -> Option<String> {
+    events.iter().rev().find_map(|e| {
+        if let EventPayload::IntentUpdated { intent } = &e.payload {
+            Some(intent.clone())
+        } else {
+            None
+        }
+    })
 }
 
 /// A single event appended to the JSONL state log.
@@ -635,6 +667,11 @@ impl<'de> Deserialize<'de> for Event {
                     final_state: p.final_state,
                 }
             }
+            "intent_updated" => {
+                let p: IntentUpdatedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::IntentUpdated { intent: p.intent }
+            }
             other => EventPayload::Unknown {
                 type_name: other.to_string(),
                 raw_payload: payload_val.clone(),
@@ -771,6 +808,11 @@ struct ChildCompletedPayload {
     final_state: String,
 }
 
+#[derive(Deserialize)]
+struct IntentUpdatedPayload {
+    intent: String,
+}
+
 /// Metadata about a workflow, derived from the state file header.
 ///
 /// Used by `koto workflows` to return structured information about
@@ -887,7 +929,7 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     (year, month, days + 1)
 }
 
-fn is_leap(y: u64) -> bool {
+pub(crate) fn is_leap(y: u64) -> bool {
     (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
@@ -905,6 +947,8 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         let parsed: StateFileHeader = serde_json::from_str(&json).unwrap();
@@ -921,6 +965,8 @@ mod tests {
             parent_workflow: Some("parent-wf".to_string()),
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(json.contains("\"parent_workflow\":\"parent-wf\""));
@@ -949,6 +995,8 @@ mod tests {
             parent_workflow: None,
             template_source_dir: Some(PathBuf::from("/abs/templates")),
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -970,6 +1018,8 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -989,6 +1039,8 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -1576,6 +1628,8 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            intent: None,
+            template_name: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(json.contains("\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\""));
@@ -1817,5 +1871,47 @@ mod tests {
             val["type"], "future_event",
             "type field must be original type string, not 'unknown'"
         );
+    }
+
+    // ===== Issue 2 (new): intent_updated event and derive_intent =====
+
+    #[test]
+    fn derive_intent_returns_none_when_no_intent_events() {
+        use super::{derive_intent, Event};
+        let events: Vec<Event> = vec![];
+        assert_eq!(derive_intent(&events), None);
+    }
+
+    #[test]
+    fn derive_intent_returns_last_intent() {
+        use super::{derive_intent, Event, EventPayload};
+        fn make_intent_event(seq: u64, intent: &str) -> Event {
+            Event {
+                seq,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                event_type: "intent_updated".to_string(),
+                payload: EventPayload::IntentUpdated {
+                    intent: intent.to_string(),
+                },
+            }
+        }
+        let events = vec![
+            make_intent_event(1, "first intent"),
+            make_intent_event(2, "second intent"),
+        ];
+        assert_eq!(derive_intent(&events), Some("second intent".to_string()));
+    }
+
+    #[test]
+    fn intent_updated_roundtrips() {
+        use super::{Event, EventPayload};
+        let json = r#"{"seq":1,"timestamp":"2026-01-01T00:00:00Z","type":"intent_updated","payload":{"intent":"test goal"}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(event.payload, EventPayload::IntentUpdated { ref intent } if intent == "test goal")
+        );
+        let serialized = serde_json::to_string(&event).unwrap();
+        assert!(serialized.contains("intent_updated"));
+        assert!(serialized.contains("test goal"));
     }
 }

@@ -46,6 +46,8 @@ fn init_backend(dir: &std::path::Path, id: &str) -> LocalBackend {
         parent_workflow: None,
         template_source_dir: None,
         session_id: String::new(),
+        intent: None,
+        template_name: None,
     };
     let events = vec![Event {
         seq: 1,

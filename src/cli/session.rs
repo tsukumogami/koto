@@ -5,6 +5,34 @@ use crate::session::cloud::{ChildResolution, CloudBackend};
 use crate::session::Backend;
 use crate::session::SessionBackend;
 
+/// Append an `IntentUpdated` event to the named session's log.
+pub fn handle_update(backend: &dyn SessionBackend, name: &str, intent: &str) -> anyhow::Result<()> {
+    use crate::engine::{
+        persistence,
+        types::{now_iso8601, EventPayload},
+    };
+    use crate::session::state_file_name;
+
+    if intent.len() > 1024 {
+        anyhow::bail!(
+            "intent string too long: {} characters (max 1024)",
+            intent.len()
+        );
+    }
+
+    let dir = backend.session_dir(name);
+    if !backend.exists(name) {
+        anyhow::bail!("session '{}' does not exist", name);
+    }
+
+    let state_path = dir.join(state_file_name(name));
+    let payload = EventPayload::IntentUpdated {
+        intent: intent.to_string(),
+    };
+    persistence::append_event(&state_path, &payload, &now_iso8601())?;
+    Ok(())
+}
+
 /// Print the absolute session directory path.
 pub fn handle_dir(backend: &dyn SessionBackend, name: &str) -> Result<()> {
     let dir = backend.session_dir(name);

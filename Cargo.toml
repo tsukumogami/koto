@@ -26,6 +26,8 @@ toml = "0.8"
 anyhow = "1"
 tempfile = "3"
 rust-s3 = { version = "0.37", default-features = false, features = ["sync-rustls-tls", "fail-on-err"] }
+ratatui = "0.29"
+crossterm = "0.28"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -138,22 +138,10 @@ for page in paginator.paginate(Bucket='{bucket}', Prefix='{prefix}'):
 /// Compute the repo-id prefix for a temp directory.
 /// Matches koto's repo_id() function: first 16 hex chars of SHA-256 of canonical path.
 fn repo_id_prefix(dir: &Path) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    // koto uses sha256 of the canonical path, but we can just read it from
-    // the session dir that koto creates after init.
-    let sessions_dir = dir.join(".koto").join("sessions");
-    if sessions_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    return entry.file_name().to_string_lossy().to_string();
-                }
-            }
-        }
-    }
-    // Fallback: empty prefix (lists everything)
-    String::new()
+    use sha2::{Digest, Sha256};
+    let canonical = std::fs::canonicalize(dir).expect("canonicalize temp dir");
+    let hash = hex::encode(Sha256::digest(canonical.to_string_lossy().as_bytes()));
+    hash[..16].to_string()
 }
 
 #[test]
