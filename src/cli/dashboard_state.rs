@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::cli::dashboard_data::{DetailData, SessionTree};
+use crate::cli::dashboard_data::{compute_elapsed_since, DetailData, SessionTree};
 
 /// Which pane the user is currently viewing.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +31,10 @@ pub struct TaskCounts {
     pub done: usize,
     /// Number of children in a failed/error terminal state.
     pub failed: usize,
+    /// Number of children in a blocked state (non-terminal, gate failed).
+    pub blocked: usize,
+    /// Number of done children that had blocking issues before finishing.
+    pub done_blocked: usize,
 }
 
 /// A flattened row produced by `visible_rows()`.
@@ -262,6 +266,7 @@ impl DashboardAppState {
         let mut running = 0;
         let mut done = 0;
         let mut failed = 0;
+        let mut blocked = 0;
 
         for s in self.tree.sessions.values() {
             if s.header
@@ -277,10 +282,12 @@ impl DashboardAppState {
                     } else {
                         done += 1;
                     }
+                } else if s.is_blocked {
+                    blocked += 1;
                 } else if s.current_state.is_some() {
                     running += 1;
                 }
-                // else: pending/blocked — counted in total but not in running/done/failed
+                // else: pending — counted in total but not in running/done/failed/blocked
             }
         }
 
@@ -289,6 +296,8 @@ impl DashboardAppState {
             running,
             done,
             failed,
+            blocked,
+            done_blocked: 0,
         }
     }
 
@@ -313,12 +322,19 @@ impl DashboardAppState {
                 None
             };
 
+            let root_elapsed = self
+                .tree
+                .sessions
+                .get(root_id)
+                .map(|s| compute_elapsed_since(&s.header.created_at))
+                .unwrap_or(Duration::ZERO);
+
             rows.push(RowDescriptor {
                 indent_depth: 0,
                 session_id: root_id.clone(),
                 display_name: root_id.clone(),
                 state: root_state,
-                elapsed: Duration::from_secs(0),
+                elapsed: root_elapsed,
                 task_counts,
             });
 
@@ -331,12 +347,19 @@ impl DashboardAppState {
                         .get(&child_id)
                         .and_then(|s| s.current_state.clone());
 
+                    let child_elapsed = self
+                        .tree
+                        .sessions
+                        .get(&child_id)
+                        .map(|s| compute_elapsed_since(&s.header.created_at))
+                        .unwrap_or(Duration::ZERO);
+
                     rows.push(RowDescriptor {
                         indent_depth: 1,
                         session_id: child_id.clone(),
                         display_name: child_id.clone(),
                         state: child_state,
-                        elapsed: Duration::from_secs(0),
+                        elapsed: child_elapsed,
                         task_counts: None,
                     });
                 }
@@ -407,6 +430,7 @@ mod tests {
             current_state: current_state.map(|s| s.to_string()),
             is_terminal,
             is_blocked: false,
+            intent: None,
             mtime: SystemTime::UNIX_EPOCH,
             state_path: PathBuf::new(),
         }
@@ -724,7 +748,7 @@ mod tests {
 
     #[test]
     fn task_counts_aggregated_for_coordinator() {
-        let mut state = coordinator_with_children_state();
+        let state = coordinator_with_children_state();
         // Don't need to expand to get root row's task_counts.
         let rows = state.visible_rows();
         let root_row = &rows[0];

@@ -13,6 +13,7 @@ use crate::engine::persistence::{
     derive_last_gate_evaluated, derive_machine_state, derive_state_from_log, read_events,
     read_header,
 };
+use crate::engine::types::derive_intent;
 use crate::engine::types::is_leap;
 use crate::engine::types::StateFileHeader;
 use crate::session::{state_file_name, SessionBackend};
@@ -36,6 +37,8 @@ pub struct CachedSession {
     /// epoch has an outcome other than `"passed"`. Always `false` for terminal
     /// sessions and sessions with no recorded state.
     pub is_blocked: bool,
+    /// Intent derived from IntentUpdated events, or from header fallback.
+    pub intent: Option<String>,
     /// Last-modified time of the state file; used for cache invalidation.
     pub mtime: SystemTime,
     /// Path to the state file; used for re-reads on mtime change.
@@ -79,11 +82,11 @@ pub struct DetailData {
     /// The session this detail was loaded from.
     pub session_id: String,
     /// The identifier (name) of the most recently evaluated gate (e.g., "my-build-gate").
-    pub gate_name: String,
+    pub gate_name: Option<String>,
     /// The command, if the gate was a command gate.
     pub command: Option<String>,
     /// The result of the gate evaluation ("PASS" or "FAIL").
-    pub result: String,
+    pub result: Option<String>,
     /// Time elapsed since the gate evaluation timestamp.
     pub elapsed: Duration,
     /// Evidence entries from the current epoch, newest-first.
@@ -183,6 +186,7 @@ pub fn read_session(path: &Path) -> CachedSession {
                 current_state: None,
                 is_terminal: false,
                 is_blocked: false,
+                intent: None,
                 mtime,
                 state_path: path.to_path_buf(),
             };
@@ -193,11 +197,13 @@ pub fn read_session(path: &Path) -> CachedSession {
     let (header, events) = match read_events(path) {
         Ok(pair) => pair,
         Err(_) => {
+            let intent = fallback_header.intent.clone();
             return CachedSession {
                 header: fallback_header,
                 current_state: None,
                 is_terminal: false,
                 is_blocked: false,
+                intent,
                 mtime,
                 state_path: path.to_path_buf(),
             };
@@ -261,11 +267,14 @@ pub fn read_session(path: &Path) -> CachedSession {
         false
     };
 
+    let intent = derive_intent(&events).or_else(|| header.intent.clone());
+
     CachedSession {
         header,
         current_state,
         is_terminal,
         is_blocked,
+        intent,
         mtime,
         state_path: path.to_path_buf(),
     }
@@ -360,31 +369,38 @@ pub fn refresh(tree: &mut SessionTree, backend: &dyn SessionBackend) -> Result<(
 
 /// Load detailed gate-evaluation data for a session on demand.
 ///
-/// Returns `None` if the session has no gate evaluation in the current epoch.
+/// Returns `None` only on I/O errors reading the event log. When there is no
+/// gate evaluation in the current epoch, returns `Some(DetailData)` with
+/// `gate_name` and `result` set to `None` and `elapsed` set to `Duration::ZERO`.
 pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
     let (_, events) = read_events(path).ok()?;
 
-    // Find the most recent GateEvaluated event for any gate.
-    let current_state = derive_state_from_log(&events)?;
+    // Find the current state (optional — no short-circuit).
+    let current_state = derive_state_from_log(&events);
 
-    // Find the epoch boundary for the current state.
-    let epoch_start_idx = events.iter().enumerate().rev().find_map(|(idx, e)| {
-        let to = match &e.payload {
-            crate::engine::types::EventPayload::Transitioned { to, .. } => Some(to),
-            crate::engine::types::EventPayload::DirectedTransition { to, .. } => Some(to),
-            crate::engine::types::EventPayload::Rewound { to, .. } => Some(to),
-            _ => None,
-        };
-        if to.map(|t| t == &current_state).unwrap_or(false) {
-            Some(idx)
-        } else {
-            None
-        }
-    })?;
+    // Find the epoch boundary for the current state (optional).
+    let epoch_start_idx = current_state.as_ref().and_then(|cs| {
+        events.iter().enumerate().rev().find_map(|(idx, e)| {
+            let to = match &e.payload {
+                crate::engine::types::EventPayload::Transitioned { to, .. } => Some(to),
+                crate::engine::types::EventPayload::DirectedTransition { to, .. } => Some(to),
+                crate::engine::types::EventPayload::Rewound { to, .. } => Some(to),
+                _ => None,
+            };
+            if to.map(|t| t == cs).unwrap_or(false) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+    });
 
-    let epoch_events = &events[epoch_start_idx + 1..];
+    let epoch_events: &[crate::engine::types::Event] = match epoch_start_idx {
+        Some(idx) => &events[idx + 1..],
+        None => &[],
+    };
 
-    // Find the most recent GateEvaluated event.
+    // Find the most recent GateEvaluated event (optional).
     let gate_event = epoch_events.iter().rev().find_map(|e| {
         if let crate::engine::types::EventPayload::GateEvaluated {
             gate,
@@ -397,12 +413,28 @@ pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
         } else {
             None
         }
-    })?;
+    });
 
-    let (gate_name, outcome, gate_timestamp) = gate_event;
+    // Extract gate_name, result, elapsed from gate_event (all optional).
+    let gate_name = gate_event.as_ref().map(|(g, _, _)| g.clone());
 
-    // Get the last evaluated output for this gate.
-    let gate_output = derive_last_gate_evaluated(&events, &gate_name);
+    let result = gate_event.as_ref().map(|(_, outcome, _)| {
+        if outcome == "passed" {
+            "PASS".to_string()
+        } else {
+            "FAIL".to_string()
+        }
+    });
+
+    let elapsed = gate_event
+        .as_ref()
+        .map(|(_, _, ts)| compute_elapsed_since(ts))
+        .unwrap_or(Duration::ZERO);
+
+    // Get the last evaluated output for this gate (if any).
+    let gate_output = gate_name
+        .as_ref()
+        .and_then(|gn| derive_last_gate_evaluated(&events, gn));
 
     // Extract the command from the gate output if present.
     let command = gate_output
@@ -410,18 +442,6 @@ pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
         .and_then(|v| v.get("command").or_else(|| v.get("cmd")))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-
-    // Determine the result label.
-    // The engine writes "passed" (see advance.rs GateOutcome::Passed). There is no "pass" alias
-    // in the engine; the check has been removed to avoid confusion.
-    let result = if outcome == "passed" {
-        "PASS".to_string()
-    } else {
-        "FAIL".to_string()
-    };
-
-    // Compute elapsed since gate evaluation.
-    let elapsed = compute_elapsed_since(&gate_timestamp);
 
     // Gather evidence entries from the current epoch.
     let evidence: Vec<EvidenceEntry> = epoch_events
@@ -456,7 +476,7 @@ pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
 /// Compute the elapsed time since an ISO 8601 UTC timestamp string.
 ///
 /// Falls back to `Duration::ZERO` on any parse error.
-fn compute_elapsed_since(timestamp: &str) -> Duration {
+pub(crate) fn compute_elapsed_since(timestamp: &str) -> Duration {
     // Parse RFC 3339 / ISO 8601 timestamp manually.
     // Format: YYYY-MM-DDTHH:MM:SS[.mmm]Z
     let parse = || -> Option<Duration> {
@@ -662,6 +682,7 @@ mod tests {
                 current_state: None,
                 is_terminal: false,
                 is_blocked: false,
+                intent: None,
                 mtime,
                 state_path: path,
             },
@@ -692,6 +713,7 @@ mod tests {
                 current_state: None,
                 is_terminal: false,
                 is_blocked: false,
+                intent: None,
                 mtime: old_mtime,
                 state_path: path.clone(),
             },
@@ -722,6 +744,7 @@ mod tests {
                 current_state: None,
                 is_terminal: false,
                 is_blocked: false,
+                intent: None,
                 mtime: current_mtime,
                 state_path: path.clone(),
             },
@@ -899,6 +922,7 @@ mod tests {
                 current_state: None,
                 is_terminal: false,
                 is_blocked: false,
+                intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::from("/nonexistent"),
             },
@@ -948,6 +972,7 @@ mod tests {
                 current_state: None,
                 is_terminal: false,
                 is_blocked: false,
+                intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
             },
@@ -959,6 +984,7 @@ mod tests {
                 current_state: None,
                 is_terminal: false,
                 is_blocked: false,
+                intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
             },
@@ -980,6 +1006,7 @@ mod tests {
                 current_state: None,
                 is_terminal: false,
                 is_blocked: false,
+                intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
             },
@@ -991,6 +1018,7 @@ mod tests {
                 current_state: None,
                 is_terminal: false,
                 is_blocked: false,
+                intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
             },
@@ -1013,6 +1041,7 @@ mod tests {
                 current_state: None,
                 is_terminal: false,
                 is_blocked: false,
+                intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
             },
@@ -1021,5 +1050,54 @@ mod tests {
         let roots = rebuild_roots(&sessions);
         assert_eq!(roots.len(), 1);
         assert!(roots.contains(&"orphan".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // read_detail: returns Some for sessions without gate evaluations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_detail_returns_data_for_evidence_only_session() {
+        use crate::session::state_file_name;
+
+        let tmp = TempDir::new().unwrap();
+        let session_name = "test_sess";
+        let state_path = tmp.path().join(state_file_name(session_name));
+
+        // Write a minimal header.
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: session_name.to_string(),
+            template_hash: "hash".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: None,
+            template_source_dir: None,
+            session_id: String::new(),
+            intent: None,
+            template_name: None,
+        };
+        append_header(&state_path, &header).unwrap();
+
+        // Append only an EvidenceSubmitted event (no GateEvaluated).
+        append_event(
+            &state_path,
+            &EventPayload::EvidenceSubmitted {
+                state: "gather".to_string(),
+                fields: HashMap::new(),
+                submitter_cwd: None,
+            },
+            "2026-01-01T00:01:00Z",
+        )
+        .unwrap();
+
+        // read_detail should return Some even with no GateEvaluated event.
+        let detail = read_detail(&state_path, session_name);
+        assert!(
+            detail.is_some(),
+            "read_detail must return Some for evidence-only session"
+        );
+        let d = detail.unwrap();
+        assert_eq!(d.session_id, session_name);
+        assert!(d.gate_name.is_none());
     }
 }

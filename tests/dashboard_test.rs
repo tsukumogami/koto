@@ -157,13 +157,13 @@ fn dashboard_once_produces_tab_separated_output_with_running_and_terminal() {
 
     assert_eq!(lines.len(), 2, "expected 2 session lines, got: {:?}", lines);
 
-    // Every line must have exactly 4 tab-separated fields.
+    // Every line must have exactly 6 tab-separated fields.
     for line in &lines {
         let fields: Vec<&str> = line.split('\t').collect();
         assert_eq!(
             fields.len(),
-            4,
-            "line '{}' should have 4 tab-separated fields",
+            6,
+            "line '{}' should have 6 tab-separated fields",
             line
         );
         let valid_buckets = ["running", "done", "failed", "blocked", "unknown"];

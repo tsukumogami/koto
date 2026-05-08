@@ -152,11 +152,13 @@ fn render_detail(
             let mut lines: Vec<Line> = Vec::new();
 
             // Gate name and result on the first line.
+            let gate_name_str = data.gate_name.as_deref().unwrap_or("-");
+            let result_str = data.result.as_deref().unwrap_or("-");
             lines.push(Line::from(vec![
-                Span::raw(format!("Gate: {} | ", data.gate_name)),
+                Span::raw(format!("Gate: {} | ", gate_name_str)),
                 Span::styled(
-                    data.result.clone(),
-                    if data.result == "PASS" {
+                    result_str.to_string(),
+                    if result_str == "PASS" {
                         Style::default().fg(Color::Green)
                     } else {
                         Style::default().fg(Color::Red)
@@ -351,6 +353,7 @@ mod tests {
                 current_state: None,
                 is_terminal: false,
                 is_blocked: false,
+                intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
             },
@@ -375,9 +378,9 @@ mod tests {
         state.view_mode = ViewMode::Detail;
         state.detail_cache = Some(DetailData {
             session_id: "test-session".to_string(),
-            gate_name: "my-gate".to_string(),
+            gate_name: Some("my-gate".to_string()),
             command: None,
-            result: "PASS".to_string(),
+            result: Some("PASS".to_string()),
             elapsed: Duration::from_secs(0),
             evidence: vec![],
         });
@@ -407,9 +410,9 @@ mod tests {
         state.view_mode = ViewMode::Detail;
         state.detail_cache = Some(DetailData {
             session_id: "test-session".to_string(),
-            gate_name: "build-gate".to_string(),
+            gate_name: Some("build-gate".to_string()),
             command: Some("cargo build".to_string()),
-            result: "FAIL".to_string(),
+            result: Some("FAIL".to_string()),
             elapsed: Duration::from_secs(30),
             evidence: vec![],
         });
@@ -433,9 +436,9 @@ mod tests {
         state.view_mode = ViewMode::Detail;
         state.detail_cache = Some(DetailData {
             session_id: "test-session".to_string(),
-            gate_name: "evidence-gate".to_string(),
+            gate_name: Some("evidence-gate".to_string()),
             command: None,
-            result: "PASS".to_string(),
+            result: Some("PASS".to_string()),
             elapsed: Duration::from_secs(0),
             evidence: vec![
                 EvidenceEntry {
@@ -510,6 +513,8 @@ mod tests {
             running: 1,
             done: 3,
             failed: 1,
+            blocked: 0,
+            done_blocked: 0,
         };
         let result = format_task_counts(Some(&counts));
         assert!(
@@ -587,6 +592,7 @@ mod tests {
                 current_state: Some("running".to_string()),
                 is_terminal: false,
                 is_blocked: false,
+                intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
             },

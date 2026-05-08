@@ -15,7 +15,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use crate::cli::dashboard_data::{self, CachedSession, SessionTree};
+use crate::cli::dashboard_data::{self, compute_elapsed_since, CachedSession, SessionTree};
 use crate::cli::dashboard_render::render_frame;
 use crate::cli::dashboard_state::{DashboardAppState, ViewMode};
 use crate::cli::DashboardArgs;
@@ -90,12 +90,17 @@ pub fn run(args: DashboardArgs, backend: &dyn SessionBackend) -> Result<()> {
             }
             if let Some(session) = tree.sessions.get(session_id) {
                 let current_state = session.current_state.as_deref().unwrap_or("").to_string();
-                let elapsed_secs = session.mtime.elapsed().unwrap_or(Duration::ZERO).as_secs();
+                let elapsed_secs = compute_elapsed_since(&session.header.created_at).as_secs();
                 let elapsed = format_elapsed(elapsed_secs);
                 let status_bucket = classify_status(session);
                 println!(
-                    "{}\t{}\t{}\t{}",
-                    session_id, current_state, elapsed, status_bucket
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    session_id,
+                    current_state,
+                    elapsed,
+                    status_bucket,
+                    session.intent.as_deref().unwrap_or(""),
+                    session.header.template_name.as_deref().unwrap_or(""),
                 );
             }
         }
@@ -200,6 +205,7 @@ mod tests {
             current_state: current_state.map(|s| s.to_string()),
             is_terminal,
             is_blocked,
+            intent: None,
             mtime: SystemTime::UNIX_EPOCH,
             state_path: PathBuf::new(),
         }
