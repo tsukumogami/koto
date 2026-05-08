@@ -2,6 +2,7 @@ pub mod batch;
 pub mod batch_error;
 pub mod batch_view;
 pub mod context;
+pub mod dashboard;
 pub mod dashboard_data;
 pub mod dashboard_render;
 pub mod dashboard_state;
@@ -1125,7 +1126,7 @@ pub fn run(app: App) -> Result<()> {
         Command::Config { subcommand } => handle_config(subcommand),
         Command::Dashboard(args) => {
             let backend = build_backend()?;
-            dashboard_data::run(args, &backend)
+            dashboard::run(args, &backend)
         }
     }
 }
