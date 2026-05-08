@@ -20,6 +20,11 @@ use crate::session::{state_file_name, SessionBackend};
 /// Lightweight snapshot of one session's derived state, held in the tree.
 pub struct CachedSession {
     /// Full header from the first line of the state file.
+    ///
+    /// When `current_state` is `None` (parse failed), this may be a zero-value
+    /// placeholder produced by `make_empty_header()`, in which case `header.workflow`
+    /// is an empty string. Callers should use the tree key (session name) for display
+    /// purposes rather than `header.workflow` when `current_state` is `None`.
     pub header: StateFileHeader,
     /// Current state derived from the event log, or `None` on parse error.
     pub current_state: Option<String>,
@@ -71,7 +76,7 @@ pub struct DetailData {
     pub gate_name: String,
     /// The command, if the gate was a command gate.
     pub command: Option<String>,
-    /// The result of the gate evaluation ("pass" or "fail").
+    /// The result of the gate evaluation ("PASS" or "FAIL").
     pub result: String,
     /// Time elapsed since the gate evaluation timestamp.
     pub elapsed: Duration,
