@@ -12,8 +12,11 @@ problem: |
   override rationale — is stored in the event log but rendered nowhere. Session identifiers
   are opaque machine-generated slugs. Parent-child tree rendering is incomplete: connectors
   are missing, expand/collapse is bound to the wrong mode, and depth is capped at one level.
-  The net result is a dashboard that operators open, find uninformative, and abandon in
-  favor of running manual CLI queries.
+  Session discovery is scoped to the current working directory, so a developer monitoring
+  a dozen parallel agentic workflows across multiple niwa workspaces sees only the sessions
+  from whichever repo they happened to launch the dashboard from. The net result is a
+  dashboard that operators open, find incomplete and uninformative, and abandon in favor
+  of running manual CLI queries.
 goals: |
   The enhanced dashboard gives operators a complete picture of any workflow session without
   leaving the TUI or running auxiliary commands. A three-tier information hierarchy (list
@@ -22,8 +25,11 @@ goals: |
   detail pane works for every session type — gate-based, evidence-based, and hybrid. The
   full event narrative is browsable in a scrollable History tab. Parent-child session trees
   use proper connectors, correct key bindings, and propagate worst-case child status to
-  collapsed parent rows. The `--once` scripting mode includes all new fields for automation
-  use without breaking existing scripts that read the current four-column output.
+  collapsed parent rows. Session discovery spans the full local machine rather than the
+  current working directory, so developers monitoring parallel agentic workflows across
+  multiple niwa workspaces see everything in one view. The `--once` mode includes all new
+  fields for integration tests without breaking existing scripts that read the current
+  four-column output.
 ---
 
 # PRD: koto dashboard — full observability surface
@@ -69,6 +75,28 @@ at the bottom. The stated design intent — horizontal split with list at ~40% a
 ~60% — was never built. The 8-row strip cannot accommodate meaningful content for any of the
 three tiers (quick-check, status review, deep history).
 
+**No cross-workspace visibility.** Session discovery is scoped to the repository containing
+the current working directory. A developer running koto workflows across a dozen niwa
+workspaces — the primary use case for the dashboard — sees only the sessions in whichever
+repo they invoked `koto dashboard` from. This makes the dashboard useless as a real-time
+monitoring tool for parallel agentic work and undermines the path to F5 (S3-backed
+dashboard): a scope model tied to the current directory cannot extend naturally to cloud
+storage.
+
+## Personas
+
+**Operator** — a developer running long-form agentic workflows and monitoring their
+progress from a single terminal. The primary scenario: a developer has a dozen niwa
+workspaces open on their local machine, each running an independent shirabe workflow
+(explore → prd → design → plan → work-on). From a single `koto dashboard` session they
+watch all workflows advance in real time, deep-dive into the decisions and assumptions any
+AI agent has made, and navigate to a specific Claude Code session when they need to nudge
+it in a new direction.
+
+This persona is the same audience targeted by the koto observability VISION: a developer
+who needs to watch parallel agents from one screen without switching between terminal
+sessions. The dashboard is their control surface.
+
 ## Goals
 
 1. **Fix the broken basics.** Elapsed time shows the real duration since the last state
@@ -97,12 +125,20 @@ three tiers (quick-check, status review, deep history).
    without running the interactive TUI. Extending its columns to include `intent` and
    `template_name` makes the new fields verifiable in automated tests.
 
+7. **Global session scope.** The dashboard discovers all koto sessions on the local
+   machine regardless of the directory from which it is invoked. A developer running a
+   dozen niwa workspaces sees all workflow sessions in a single view. This scope model
+   is the foundation for F5 (S3-backed dashboard) from the koto observability roadmap:
+   once scope is global and directory-independent, extending it to cloud storage is a
+   matter of swapping the storage backend, not redesigning the scope model.
+
 ## User Stories
 
-**US-1: Status check without auxiliary commands**
-As an operator running multiple concurrent workflow sessions, I want to open the dashboard
-and immediately identify which sessions are running, blocked, failed, or done — without
-running `koto query` or `koto status`.
+**US-1: Status check across all workspaces**
+As an operator with multiple niwa workspaces running independent shirabe workflows, I want
+to open the dashboard from any directory and immediately see the status of all sessions on
+my local machine — running, blocked, failed, or done — without running `koto query` or
+switching between workspace directories.
 
 **US-2: Understanding a session's current directive**
 As an operator who sees a session in an unexpected state, I want to select that session and
@@ -135,6 +171,13 @@ As a contributor writing integration tests for the dashboard, I want to run
 `koto dashboard --once` and assert on the tab-separated output to verify that `intent`,
 `template_name`, and `status_bucket` are correctly extracted and displayed — without
 driving the interactive TUI.
+
+**US-8: Cross-workspace monitoring from a fixed location**
+As an operator who keeps a dedicated terminal with `koto dashboard` running, I want that
+terminal to show sessions from all my niwa workspaces without having to restart the
+dashboard from each workspace directory. When I start a new workflow in workspace B while
+the dashboard is running from workspace A, the new session appears automatically on the
+next polling cycle.
 
 ## Requirements
 
@@ -343,6 +386,20 @@ Each full refresh cycle — reading all session state files and rendering all vi
 must complete in under 200 ms for a session set with up to 500 events per JSONL log. This
 ensures one complete render per polling cycle without skipped frames.
 
+**R18: Global session discovery**
+`koto dashboard` must discover and display all koto sessions on the local machine regardless
+of the working directory from which the command is invoked. Session discovery uses the
+global koto sessions directory (as defined by the F2 data contract) rather than a
+per-repository or per-directory subset. Sessions from different workspaces appear in the
+same flat list, ordered by their most recent activity (most recently active first).
+
+This scope is the prerequisite for F5 (S3-backed dashboard) in the koto observability
+roadmap. Once session scope is global and directory-independent at the local level, the
+storage backend can be swapped for S3 without redesigning the scope model.
+
+`koto dashboard --once` launched from a directory with no local koto sessions must still
+output rows for sessions discovered in other workspaces on the machine.
+
 ## Acceptance Criteria
 
 ### Elapsed column
@@ -448,7 +505,7 @@ ensures one complete render per polling cycle without skipped frames.
 - [ ] Column 6 (template_name) is empty string for sessions without template_name
 - [ ] A script that reads columns 1–4 only continues to produce correct output after this
   change (new columns are additive)
-- [ ] `koto dashboard --once` with no sessions in the current repository exits with code 0
+- [ ] `koto dashboard --once` with no koto sessions on the local machine exits with code 0
   and produces no output lines (empty stdout)
 
 ### Keyboard reference
@@ -466,6 +523,17 @@ ensures one complete render per polling cycle without skipped frames.
 - [ ] `k`/`↑` in Detail view moves to the previous session without leaving Detail view
 - [ ] `r` in any view triggers an immediate refresh without waiting for the polling interval
 - [ ] `h`/`←` and `l`/`→` in Detail view are no-ops (no crash, no mode change)
+
+### Global session scope
+
+- [ ] `koto dashboard` launched from `/workspace-a` displays sessions originating in
+  `/workspace-b` when both have active koto sessions on the same machine
+- [ ] `koto dashboard --once` launched from a directory with no koto sessions outputs
+  rows for sessions discovered in other workspaces on the local machine
+- [ ] A session started in a new workspace after the dashboard is already running appears
+  on the next polling cycle without restarting the dashboard
+- [ ] The session list orders sessions by most recent activity (the session that transitioned
+  most recently appears first in the list)
 
 ### Backwards compatibility
 
@@ -561,6 +629,18 @@ fewer than 20 characters for the intent after a typical 30-character session ID 
 columns, only the session ID is shown. This is an extension of the R16 list-only mode
 (below 80 columns) and resolves the narrow-terminal intent display question without a
 separate config option.
+
+**Decision: Global session scope by default — no per-repo filtering**
+The dashboard discovers all sessions on the local machine from the outset rather than
+scoping to the current working directory. Alternatives considered: (1) repo-scoped by
+default, global via `--global` flag; (2) configurable scope with a default setting.
+Both alternatives were rejected because the primary use case — a developer monitoring
+a dozen parallel niwa workflows from a fixed terminal — only works with global scope.
+A `--scope` filter can be added later as a follow-on if users need to narrow the view.
+The deeper reason for global-by-default is architectural: the koto observability roadmap's
+F5 (S3-backed dashboard) extends F3's local scope to cloud storage. If F3 were
+repo-scoped, F5 would need to redesign the scope model rather than just swapping the
+storage backend.
 
 **Decision: Schema additive — no version bump**
 The codebase already uses `#[serde(default, skip_serializing_if = "Option::is_none")]` on
