@@ -690,14 +690,63 @@
     {
       "number": 6,
       "title": "test(cli): add dashboard integration tests",
-      "status": "pending",
+      "status": "implemented",
       "ci_status": "pending",
       "ci_fix_attempts": 0,
-      "issue_type": "",
+      "issue_type": "code",
       "dependencies": [],
       "commits": [],
-      "agent_type": "",
-      "summary": null,
+      "agent_type": "coder",
+      "summary": {
+        "narrative": "",
+        "files_changed": [
+          "tests/dashboard_test.rs"
+        ],
+        "tests_added": 3,
+        "key_decisions": "Used assert_cmd + assert_fs crates. Terminal session created via koto init + manual JSONL append (koto next deletes session dir on terminal). Running session stays in gather via conditional transition requiring evidence. State file path is sessions/<name>/koto-<name>.state.jsonl.",
+        "requirements_map": [
+          {
+            "ac": "tests/dashboard_test.rs exists with at least one integration test",
+            "status": "implemented",
+            "evidence": "tests/dashboard_test.rs: 3 tests"
+          },
+          {
+            "ac": "--once with empty session dir exits 0 with no output",
+            "status": "implemented",
+            "evidence": "dashboard_once_empty_dir_exits_zero_with_no_output test passes"
+          },
+          {
+            "ac": "--once with running and terminal sessions produces 4-field tab-separated output",
+            "status": "implemented",
+            "evidence": "dashboard_once_produces_tab_separated_output_with_running_and_terminal test passes"
+          },
+          {
+            "ac": "output lines have exactly 4 tab-separated fields",
+            "status": "implemented",
+            "evidence": "test asserts fields.len() == 4 for each line"
+          },
+          {
+            "ac": "status_bucket is one of {running, done, failed, blocked, unknown}",
+            "status": "implemented",
+            "evidence": "test asserts valid_buckets.contains(&fields[3])"
+          },
+          {
+            "ac": "running session shows status_bucket = running",
+            "status": "implemented",
+            "evidence": "test asserts run_fields[3] == 'running'"
+          },
+          {
+            "ac": "terminal session shows status_bucket = done",
+            "status": "implemented",
+            "evidence": "test asserts term_fields[3] == 'done'"
+          },
+          {
+            "ac": "cargo test passes with no regressions",
+            "status": "implemented",
+            "evidence": "954 unit tests + 3 integration tests pass"
+          }
+        ]
+      },
       "testable_scenarios": [
         "scenario-13",
         "scenario-14",

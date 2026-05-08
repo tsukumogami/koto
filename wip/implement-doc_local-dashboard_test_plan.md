@@ -144,7 +144,7 @@ Issues covered: 6
 **Commands**:
 - Run `cargo test` in the `tests/` directory; the integration test for `--once` creates fixture sessions and asserts tab-separated output
 **Expected**: exit code 0; each output line matches the pattern `<name>\t<current_state>\t<elapsed>\t<status_bucket>` where `status_bucket` is one of `running`, `done`, `failed`, `blocked`, `unknown`
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -155,7 +155,7 @@ Issues covered: 6
 **Commands**:
 - `cargo test dashboard --test` (the integration test in `tests/` that sets up one running and one terminal session)
 **Expected**: exit code 0; at least one line has `status_bucket = running`, at least one line has `status_bucket = done` or `failed`; columns are tab-separated with exactly 4 fields per line
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -168,7 +168,7 @@ Issues covered: 6
 - In a real terminal: `koto dashboard`; wait for TUI to appear; press Ctrl+C
 - After exit, verify: type `stty -a` and check that `echo` is on and `icanon` is on
 **Expected**: terminal is restored to normal mode; shell prompt appears; subsequent commands behave normally; `stty -a` shows `echo` and `icanon` enabled
-**Status**: pending
+**Status**: deferred — requires PTY
 
 ---
 
@@ -201,7 +201,7 @@ Issues covered: 6
 - Wait up to 1 second (one poll cycle at default 500ms interval)
 - Observe the dashboard display
 **Expected**: after the next poll tick, the row for the advanced session updates to show the new state without requiring a manual `r` refresh; the state column reflects the updated state name
-**Status**: pending
+**Status**: deferred — requires PTY and concurrent writes
 
 ---
 
@@ -214,7 +214,7 @@ Issues covered: 6
 - Set up a directory with two sessions (one running, one terminal) using fixture JSONL files
 - Run: `koto dashboard --once | awk -F'\t' '{print NF}'`
 **Expected**: every output line prints `4` (exactly 4 tab-separated fields); no lines with fewer or more fields; exit code 0
-**Status**: pending
+**Status**: passed
 
 ---
 
@@ -236,4 +236,4 @@ Issues covered: 6
 **Commands**:
 - `cargo test`
 **Expected**: exit code 0; no pre-existing tests regress; dashboard-specific integration tests in `tests/` pass; `wip/` directory is clean (no leftover files)
-**Status**: pending
+**Status**: passed
