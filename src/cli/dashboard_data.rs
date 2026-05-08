@@ -13,6 +13,7 @@ use crate::engine::persistence::{
     derive_last_gate_evaluated, derive_machine_state, derive_state_from_log, read_events,
     read_header,
 };
+use crate::engine::types::is_leap;
 use crate::engine::types::StateFileHeader;
 use crate::session::{state_file_name, SessionBackend};
 
@@ -66,8 +67,8 @@ pub struct EvidenceEntry {
 pub struct DetailData {
     /// The session this detail was loaded from.
     pub session_id: String,
-    /// The type of the most recently evaluated gate (e.g., "command").
-    pub gate_type: String,
+    /// The identifier (name) of the most recently evaluated gate (e.g., "my-build-gate").
+    pub gate_name: String,
     /// The command, if the gate was a command gate.
     pub command: Option<String>,
     /// The result of the gate evaluation ("pass" or "fail").
@@ -349,7 +350,9 @@ pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
         .map(|s| s.to_string());
 
     // Determine the result label.
-    let result = if outcome == "passed" || outcome == "pass" {
+    // The engine writes "passed" (see advance.rs GateOutcome::Passed). There is no "pass" alias
+    // in the engine; the check has been removed to avoid confusion.
+    let result = if outcome == "passed" {
         "PASS".to_string()
     } else {
         "FAIL".to_string()
@@ -380,7 +383,7 @@ pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
 
     Some(DetailData {
         session_id: session_id.to_string(),
-        gate_type: gate_name,
+        gate_name,
         command,
         result,
         elapsed,
@@ -447,10 +450,6 @@ fn days_since_epoch(year: u64, month: u64, day: u64) -> Option<u64> {
     }
     days += day - 1;
     Some(days)
-}
-
-fn is_leap(y: u64) -> bool {
-    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 #[cfg(test)]
