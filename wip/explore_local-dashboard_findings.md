@@ -32,6 +32,8 @@ What are the requirements for a locally-running dashboard that gives koto users 
 
 User selected "Explore invocation model and scope" and raised daemon mode (`systemd start/stop`) as an architectural question. This is the key open question for Round 2.
 
+## Decision: Crystallize
+
 ## Round 2
 
 ### Key Insights
