@@ -2,6 +2,9 @@ pub mod batch;
 pub mod batch_error;
 pub mod batch_view;
 pub mod context;
+pub mod dashboard_data;
+pub mod dashboard_render;
+pub mod dashboard_state;
 pub mod init_child;
 pub mod next;
 pub mod next_types;
@@ -206,6 +209,24 @@ pub enum Command {
         #[command(subcommand)]
         subcommand: ConfigCommand,
     },
+
+    /// Live terminal dashboard showing session hierarchy and state
+    Dashboard(DashboardArgs),
+}
+
+/// Arguments for the `koto dashboard` command.
+#[derive(clap::Args)]
+pub struct DashboardArgs {
+    /// Show only sessions under this named workflow
+    pub name: Option<String>,
+
+    /// Print one tab-separated line per session and exit (no TUI)
+    #[arg(long)]
+    pub once: bool,
+
+    /// Poll interval in milliseconds (default: 500)
+    #[arg(long)]
+    pub interval: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -1102,6 +1123,10 @@ pub fn run(app: App) -> Result<()> {
             }
         }
         Command::Config { subcommand } => handle_config(subcommand),
+        Command::Dashboard(args) => {
+            let backend = build_backend()?;
+            dashboard_data::run(args, &backend)
+        }
     }
 }
 
