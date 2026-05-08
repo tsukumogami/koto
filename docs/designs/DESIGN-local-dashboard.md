@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Planned
 upstream: docs/prds/PRD-local-dashboard.md
 problem: |
   koto has no live visibility surface. The engine writes session state to JSONL files
@@ -32,7 +32,7 @@ rationale: |
 
 ## Status
 
-Proposed
+Planned
 
 ## Context and Problem Statement
 
