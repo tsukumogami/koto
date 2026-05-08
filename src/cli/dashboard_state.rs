@@ -116,8 +116,10 @@ impl DashboardAppState {
             }
 
             // Force refresh: set tick_count so next tick fires a poll.
+            // Must be saturating_sub(1) so the event loop's pre-increment
+            // lands exactly on poll_every_n_ticks (the check boundary).
             (_, KeyCode::Char('r'), _) => {
-                self.tick_count = self.poll_every_n_ticks;
+                self.tick_count = self.poll_every_n_ticks.saturating_sub(1);
             }
 
             // List-view navigation.
@@ -592,7 +594,7 @@ mod tests {
         let mut state = DashboardAppState::new(500);
         state.tick_count = 0;
         state.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        assert_eq!(state.tick_count, state.poll_every_n_ticks);
+        assert_eq!(state.tick_count, state.poll_every_n_ticks.saturating_sub(1));
     }
 
     // -----------------------------------------------------------------------
