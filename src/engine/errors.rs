@@ -18,4 +18,7 @@ pub enum EngineError {
 
     #[error("state file corrupted: {0}")]
     StateFileCorrupted(String),
+
+    #[error("incompatible schema version: found {found}, max supported {max_supported}")]
+    IncompatibleSchemaVersion { found: u32, max_supported: u32 },
 }

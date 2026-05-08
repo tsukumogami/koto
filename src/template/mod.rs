@@ -2,3 +2,5 @@
 // Implemented in Issue 2.
 pub mod compile;
 pub mod types;
+
+pub(crate) use compile::split_frontmatter;
