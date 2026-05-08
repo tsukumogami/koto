@@ -49,6 +49,21 @@ Issue: tsukumogami/vision#366. Blocked by #365 (now unblocked). Downstream: #368
 5. **What complexity exists in real nested orchestrator hierarchies?**
    How deep do hierarchies go in practice (2 levels? 4?)? Do sibling sessions exist at the same level? Understanding the real shape of orchestrator output determines whether a tree view, flat list with grouping, or a DAG view is appropriate.
 
+## Round 2 Research Leads
+
+1. **Should the dashboard run as an always-on daemon (systemd/launchd service), or as an ad-hoc command invoked per-session?**
+   The user raised daemon mode explicitly. This is a fork that determines whether the PRD specs a persistent background service (always watching sessions, serving a local web UI) vs. an ad-hoc TUI command. The rendering choice (TUI vs. web) is downstream of this decision.
+
+2. **What does comparable tooling do: ad-hoc vs. daemon invocation patterns for session observability?**
+   How do tools like k9s, Grafana Agent, or other local observability tools handle "always-on vs. start-when-you-need-it"? Are there patterns from the Rust ecosystem for lightweight background daemons?
+
+3. **What does the koto session lifecycle look like in practice — how long do sessions run, and does "always-on" matter?**
+   If sessions complete in seconds, ad-hoc launch is fine. If sessions run for hours (long AI coding workflows), a daemon lets you check the dashboard without having started it at the right time. The lifecycle length shapes which model makes sense.
+
+---
+
+## Original Round 1 Leads (for reference)
+
 6. **Is there evidence of real demand for this, and what do users do today instead?** (lead-adversarial-demand)
    You are a demand-validation researcher. Investigate whether evidence supports pursuing this topic. Report what you found. Cite only what you found in durable artifacts. The verdict belongs to convergence and the user.
 
