@@ -30,6 +30,12 @@ pub struct CachedSession {
     pub current_state: Option<String>,
     /// Whether the current state is a terminal state in the template.
     pub is_terminal: bool,
+    /// Whether the session is waiting on a gate that has not yet passed.
+    ///
+    /// True when the most recent `GateEvaluated` event in the current state's
+    /// epoch has an outcome other than `"passed"`. Always `false` for terminal
+    /// sessions and sessions with no recorded state.
+    pub is_blocked: bool,
     /// Last-modified time of the state file; used for cache invalidation.
     pub mtime: SystemTime,
     /// Path to the state file; used for re-reads on mtime change.
@@ -176,6 +182,7 @@ pub fn read_session(path: &Path) -> CachedSession {
                 header: make_empty_header(),
                 current_state: None,
                 is_terminal: false,
+                is_blocked: false,
                 mtime,
                 state_path: path.to_path_buf(),
             };
@@ -190,6 +197,7 @@ pub fn read_session(path: &Path) -> CachedSession {
                 header: fallback_header,
                 current_state: None,
                 is_terminal: false,
+                is_blocked: false,
                 mtime,
                 state_path: path.to_path_buf(),
             };
@@ -207,10 +215,57 @@ pub fn read_session(path: &Path) -> CachedSession {
         None => false,
     };
 
+    // Detect blocked: non-terminal session whose most recent gate evaluation in
+    // the current epoch did not pass.
+    let is_blocked = if !is_terminal {
+        if let Some(ref cs) = current_state {
+            let epoch_start = events.iter().enumerate().rev().find_map(|(idx, e)| {
+                let to = match &e.payload {
+                    crate::engine::types::EventPayload::Transitioned { to, .. } => {
+                        Some(to.as_str())
+                    }
+                    crate::engine::types::EventPayload::DirectedTransition { to, .. } => {
+                        Some(to.as_str())
+                    }
+                    crate::engine::types::EventPayload::Rewound { to, .. } => Some(to.as_str()),
+                    _ => None,
+                };
+                if to == Some(cs.as_str()) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            });
+            if let Some(start) = epoch_start {
+                events[start + 1..]
+                    .iter()
+                    .rev()
+                    .find_map(|e| {
+                        if let crate::engine::types::EventPayload::GateEvaluated {
+                            outcome, ..
+                        } = &e.payload
+                        {
+                            Some(outcome != "passed")
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     CachedSession {
         header,
         current_state,
         is_terminal,
+        is_blocked,
         mtime,
         state_path: path.to_path_buf(),
     }
@@ -602,6 +657,7 @@ mod tests {
                 header: make_header("old-session", None),
                 current_state: None,
                 is_terminal: false,
+                is_blocked: false,
                 mtime,
                 state_path: path,
             },
@@ -631,6 +687,7 @@ mod tests {
                 header: make_header("changing-session", None),
                 current_state: None,
                 is_terminal: false,
+                is_blocked: false,
                 mtime: old_mtime,
                 state_path: path.clone(),
             },
@@ -660,6 +717,7 @@ mod tests {
                 header: make_header("stable-session", None),
                 current_state: None,
                 is_terminal: false,
+                is_blocked: false,
                 mtime: current_mtime,
                 state_path: path.clone(),
             },
@@ -782,6 +840,7 @@ mod tests {
                 header: make_header("gone-session", None),
                 current_state: None,
                 is_terminal: false,
+                is_blocked: false,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::from("/nonexistent"),
             },
@@ -830,6 +889,7 @@ mod tests {
                 header: make_header("root-a", None),
                 current_state: None,
                 is_terminal: false,
+                is_blocked: false,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
             },
@@ -840,6 +900,7 @@ mod tests {
                 header: make_header("root-b", None),
                 current_state: None,
                 is_terminal: false,
+                is_blocked: false,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
             },
@@ -860,6 +921,7 @@ mod tests {
                 header: make_header("parent", None),
                 current_state: None,
                 is_terminal: false,
+                is_blocked: false,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
             },
@@ -870,6 +932,7 @@ mod tests {
                 header: make_header("child", Some("parent")),
                 current_state: None,
                 is_terminal: false,
+                is_blocked: false,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
             },
@@ -891,6 +954,7 @@ mod tests {
                 header: make_header("orphan", Some("missing-parent")),
                 current_state: None,
                 is_terminal: false,
+                is_blocked: false,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
             },

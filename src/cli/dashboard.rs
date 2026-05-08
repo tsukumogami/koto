@@ -44,6 +44,8 @@ fn classify_status(session: &CachedSession) -> &'static str {
         } else {
             "done"
         }
+    } else if session.is_blocked {
+        "blocked"
     } else if session.current_state.is_some() {
         "running"
     } else {
@@ -76,14 +78,17 @@ pub fn run(args: DashboardArgs, backend: &dyn SessionBackend) -> Result<()> {
     if args.once {
         let mut tree = SessionTree::new();
         dashboard_data::refresh(&mut tree, backend)?;
-        for session_id in &tree.roots {
-            if let Some(session) = tree.sessions.get(session_id) {
-                // Apply optional name filter.
-                if let Some(ref filter) = args.name {
-                    if session_id != filter {
-                        continue;
-                    }
+        // Collect and sort all session IDs for deterministic output.
+        let mut all_ids: Vec<&str> = tree.sessions.keys().map(|s| s.as_str()).collect();
+        all_ids.sort();
+        for session_id in all_ids {
+            // Apply optional name filter.
+            if let Some(ref filter) = args.name {
+                if session_id != filter {
+                    continue;
                 }
+            }
+            if let Some(session) = tree.sessions.get(session_id) {
                 let current_state = session.current_state.as_deref().unwrap_or("").to_string();
                 let elapsed_secs = session.mtime.elapsed().unwrap_or(Duration::ZERO).as_secs();
                 let elapsed = format_elapsed(elapsed_secs);
@@ -169,6 +174,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_session(current_state: Option<&str>, is_terminal: bool) -> CachedSession {
+        make_session_with_blocked(current_state, is_terminal, false)
+    }
+
+    fn make_session_with_blocked(
+        current_state: Option<&str>,
+        is_terminal: bool,
+        is_blocked: bool,
+    ) -> CachedSession {
         use crate::engine::types::StateFileHeader;
         use std::path::PathBuf;
         use std::time::SystemTime;
@@ -184,6 +197,7 @@ mod tests {
             },
             current_state: current_state.map(|s| s.to_string()),
             is_terminal,
+            is_blocked,
             mtime: SystemTime::UNIX_EPOCH,
             state_path: PathBuf::new(),
         }
@@ -211,6 +225,12 @@ mod tests {
     fn classify_status_terminal_error() {
         let s = make_session(Some("parse_error"), true);
         assert_eq!(classify_status(&s), "failed");
+    }
+
+    #[test]
+    fn classify_status_blocked_gate_failed() {
+        let s = make_session_with_blocked(Some("build"), false, true);
+        assert_eq!(classify_status(&s), "blocked");
     }
 
     #[test]

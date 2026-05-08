@@ -404,6 +404,7 @@ mod tests {
             header: make_header(name, parent),
             current_state: current_state.map(|s| s.to_string()),
             is_terminal,
+            is_blocked: false,
             mtime: SystemTime::UNIX_EPOCH,
             state_path: PathBuf::new(),
         }

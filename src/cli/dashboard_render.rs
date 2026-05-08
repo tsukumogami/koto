@@ -525,6 +525,7 @@ mod tests {
                 },
                 current_state: Some("running".to_string()),
                 is_terminal: false,
+                is_blocked: false,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
             },
