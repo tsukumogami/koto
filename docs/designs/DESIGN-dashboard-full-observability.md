@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Planned
 upstream: docs/prds/PRD-dashboard-full-observability.md
 problem: |
   The koto dashboard has a working scaffold — event loop, session tree, polling,
@@ -37,7 +37,7 @@ rationale: |
 
 ## Status
 
-Proposed
+Planned
 
 ## Context and Problem Statement
 
