@@ -1,24 +1,38 @@
 ---
-status: In Progress
+status: Done
 problem: |
-  koto users running hours-long orchestration workflows — AI coding pipelines spanning
-  multiple phases, batch jobs with hundreds of parallel tasks, and eventually full
-  multi-skill sequences (explore → prd → design → plan → work-on) — have no live
-  visibility into what's happening. The only tools available are `koto status <name>`
-  and `koto workflows`, which produce static JSON snapshots and require manual
-  re-invocation. When a batch job has 200 child sessions running in parallel, users
-  are effectively blind: they can't see which children are running, which are blocked,
-  which have failed, or what the current gate state is — without scripting their own
-  polling loop.
+  koto users running hours-long orchestration workflows have no live visibility into what's
+  happening. The available commands — `koto status <name>` and `koto workflows` — produce
+  static JSON snapshots and require manual re-invocation. When a batch coordinator spawns
+  hundreds of parallel child sessions, users must script their own polling loop or invoke
+  `koto status` across every child manually.
+
+  Beyond the basic visibility gap, the initial dashboard implementation had several broken
+  behaviors: the elapsed column was hardcoded to "0s" regardless of actual runtime; the
+  detail pane was gated on gate evaluations and returned empty for evidence-only sessions,
+  which are the dominant workflow pattern; tree connectors were missing; expand/collapse was
+  bound to the wrong mode; and depth was capped at one level. Rich narrative data —
+  transition rationale, decision rationale, rewind rationale, gate override rationale — was
+  stored in the event log but rendered nowhere. Session identifiers were opaque
+  machine-generated slugs with no mechanism to associate a session with its human intent.
+  Session discovery was scoped to the current working directory, so a developer monitoring
+  parallel agentic workflows across multiple niwa workspaces saw only sessions from
+  whichever repo they happened to launch the dashboard from.
 goals: |
-  A terminal UI dashboard (`koto dashboard`) that gives koto users live visibility into
-  their workflow sessions: which sessions are running, which have failed, what each
-  gate's current evaluation result is, and how a batch coordinator's children are
-  progressing. The dashboard stays current while workflows run and requires no setup
-  beyond running the command. Success means a user monitoring a 1000-task batch can
-  immediately see how many tasks are succeeding and failing, identify which specific
-  tasks need attention, and understand the gate state blocking completion — all without
-  leaving the terminal or writing any polling scripts.
+  A terminal UI dashboard (`koto dashboard`) that gives koto users live, complete visibility
+  into all workflow sessions on their local machine: which sessions are running, which have
+  failed, what each gate's current evaluation result is, and how a batch coordinator's
+  children are progressing. The dashboard stays current while workflows run and requires no
+  setup beyond running the command.
+
+  The full implementation delivers: correct elapsed time; a detail pane that works for every
+  session type (gate-based, evidence-based, hybrid); a three-tier information hierarchy (list
+  view, tabbed detail pane with Summary / History / Remaining tabs, scrollable event
+  timeline); human-readable intent labels and template names surfaced in the list;
+  proper tree connectors with unlimited depth; worst-case child status rollup on collapsed
+  parents; health-severity sort so blocked and failed sessions surface immediately; global
+  session discovery across all niwa workspaces on the local machine; and a `--once` mode
+  with six-column tab-separated output for integration tests and scripting.
 source_issue: 366
 ---
 
@@ -26,121 +40,115 @@ source_issue: 366
 
 ## Status
 
-In Progress
+Done
 
 ## Problem Statement
 
 koto users running hours-long orchestration workflows have no live visibility into what's
 happening. The available commands — `koto status <name>` and `koto workflows` — produce
 static JSON snapshots and require manual re-invocation to observe changes. When a batch
-coordinator spawns 200 parallel child sessions, a user wanting to track progress must
-either script their own polling loop or repeatedly invoke `koto status` across every child
-session manually.
+coordinator spawns hundreds of parallel child sessions, tracking progress requires scripting
+a polling loop or repeatedly invoking `koto status` across every child manually.
 
-This gap becomes acute as koto workflows grow in scope. Today the `/work-on` skill runs a
-single session per issue. In the future, the full multi-phase pipeline
-(explore → prd → design → plan → work-on) will be koto-managed, spanning multiple nested
-sessions across phases that each last minutes to hours. A user watching this pipeline run
-has no way to see which phase is active, which child work-on sessions are progressing
-versus blocked, or which gates are failing — without disruptive polling.
+This gap is acute as koto workflows grow in scope. A full multi-phase pipeline
+(explore → prd → design → plan → work-on) spans multiple nested sessions across phases
+that each last minutes to hours. A user watching this pipeline run has no way to see which
+phase is active, which child sessions are progressing versus blocked, or which gates are
+failing.
 
-F3: Local Dashboard is the first tangible observability experience that addresses this gap.
-It is also the foundation that makes F5 (S3-backed dashboard) and F6 (hosted relay)
-legible: a user who has watched a batch pipeline in a local TUI understands exactly why
-remote dashboard access is valuable.
+The initial dashboard implementation addressed the basic scaffolding but left several things
+broken or missing. The elapsed column was hardcoded to `Duration::from_secs(0)` — every
+session showed "0s" regardless of actual runtime. The detail pane was gated on the presence
+of a `GateEvaluated` event: evidence-only sessions, the dominant pattern in shirabe-style
+workflows, permanently showed "No gate evaluations recorded." Tree rendering used space
+indentation only, with no `├─`/`└─` connectors, expand/collapse bound to the wrong mode, and
+depth capped at one level. The layout used a fixed 8-row vertical strip instead of a
+horizontal split. Session discovery was scoped to the current working directory, making the
+dashboard useless for a developer monitoring parallel agentic workflows across multiple niwa
+workspaces.
+
+Beyond the missing basics, rich narrative data already recorded by the koto engine was never
+surfaced: `DecisionRecorded.rationale`, `DirectedTransition.rationale`, `Rewound.rationale`,
+`GateOverrideRecorded.rationale`, `ContextAdded` artifacts, and `DefaultActionExecuted`
+output. Session identifiers were opaque machine-generated slugs with no mechanism to
+associate a session with its human intent without running `koto query`.
+
+F3: Local Dashboard is the first tangible observability experience in koto. It is also the
+foundation that makes F5 (S3-backed dashboard) and F6 (hosted relay) legible: a global,
+directory-independent local scope means extending to cloud storage is a matter of swapping
+the storage backend, not redesigning the scope model.
 
 ## Goals
 
-- Give users a live view of workflow sessions for their current repository without any
-  setup beyond running `koto dashboard`.
-- Surface hierarchy (root → batch coordinator → child tasks) in a single readable view, so
-  users understand the relationship between sessions at a glance.
-- Make failures immediately visible: failed task count in the aggregate row, failed children
-  sorted to the top on expansion, gate failure details in the focused view.
-- Support the target use case: monitoring a multi-hour pipeline (the full
-  explore → prd → design → plan → work-on sequence) where sessions may number in the tens
-  to hundreds.
+- Give users a live view of all workflow sessions on their local machine without any setup
+  beyond running `koto dashboard`, from any directory.
+- Surface hierarchy (root → batch coordinator → child tasks) with proper tree connectors,
+  unlimited depth, and worst-case status rollup on collapsed parents.
+- Make failures immediately visible: health-severity sort (blocked first, then running, then
+  done), failed count in aggregate rows, failed children sorted to the top on expansion.
+- Surface all event data the koto engine already records: decision rationale, transition
+  rationale, rewind rationale, gate override rationale, context artifacts, evidence
+  summaries — visible in a tabbed detail pane.
+- Identify sessions with human-readable intent labels and template names, set at init time
+  or updated mid-workflow via `koto session update`.
+- Support the target use case: monitoring a multi-hour pipeline
+  (explore → prd → design → plan → work-on) where sessions may number in the tens to
+  hundreds across multiple niwa workspaces.
+- Provide a `--once` mode with six-column tab-separated output for scripting and integration
+  tests without breaking existing scripts that read the first four columns.
 - Establish a command interface that does not preclude a future daemon mode (`koto daemon
   start/stop`) without breaking changes.
 
-## User Stories
+## Non-Goals
 
-**UC-1: Monitoring a batch workflow**
-A user submits 1000 tasks to a batch coordinator at 9am and returns at 11am. They run
-`koto dashboard` and immediately see the coordinator's aggregate row: `1000 tasks · 847
-done · 12 failed · 141 pending`. The failed count is red. They press Enter to expand the
-coordinator and see the 12 failed tasks sorted to the top of the child list. They navigate
-to a failing task and see which gate is blocking it.
-
-**UC-2: Watching a multi-phase pipeline**
-A user kicks off a full orchestration run (`koto init orchestrator ...`) that will run for
-4+ hours through explore → prd → design → plan → work-on phases. They run `koto dashboard`
-and see the root orchestrator session plus the currently active phase session. As the
-pipeline progresses, the dashboard updates automatically; the user doesn't need to do
-anything.
-
-**UC-3: Investigating a stalled session**
-A user notices a session hasn't advanced in 30 minutes. They run `koto dashboard <name>` to
-open the focused view. They see the current state name, the gates blocking it, and the last
-gate evaluation result. They can tell immediately whether the gate failed (command gate
-returned exit code 1) or is waiting on children (children-complete gate not yet satisfied).
-
-**UC-4: Mid-session launch**
-A workflow has been running for 2 hours before the user thinks to check on it. They run
-`koto dashboard`. The dashboard shows the full session history — all elapsed time, all
-transitions — because koto has been writing the JSONL log since `koto init`. The user gets
-complete context with no data loss.
-
-**UC-5: Scripting and automation**
-A CI harness or agent monitor wants to poll dashboard state without a TUI. The user runs
-`koto dashboard --once` and gets a one-shot snapshot of current session state that can be
-piped to downstream tooling.
+- **Daemon / always-on mode**: No background process, no `koto daemon start/stop`. The
+  command interface must not preclude this in V2 (top-level `koto dashboard` leaves room
+  for `koto daemon` as a parallel top-level command).
+- **Web-based dashboard**: Would require introducing tokio as a first async runtime
+  dependency. Deferred to V2.
+- **Remote access**: F5 (S3-backed) and F6 (hosted relay) scope.
+- **Authentication or multi-user scenarios**: Sessions are scoped to the current user's
+  `~/.koto/` directory.
+- **Session management actions from dashboard**: No cancel, rewind, or override. Read-only
+  view only.
+- **inotify/kqueue file watching**: Polling is sufficient. File-system event subscriptions
+  deferred to V2 optimization.
+- **Session filtering / search**: The `/` filter pattern is deferred to a follow-on issue.
+- **Rewind epoch navigation**: Browsing archived `~`-named epoch sessions is deferred.
+- **Help overlay**: A `?` key overlay is out of scope; the keyboard reference is in the
+  documentation.
+- **Mouse support**: Keyboard only.
+- **Export or logging of dashboard output**: Except for `--once` mode, no persistent output.
+- **Full raw event log viewer**: Deep event inspection remains the domain of `koto query`.
+  The History tab is a browsable summary, not a replacement.
 
 ## Requirements
 
 ### Functional Requirements
 
-**R1 — Repo-wide session list (`koto dashboard`)**
-Running `koto dashboard` without arguments opens a terminal UI showing all sessions for the
-current repository. Sessions are discovered by scanning `~/.koto/sessions/<repo-id>/` where
-`repo-id` is derived from the current working directory (same derivation as `koto init`).
+**R1 — Global session discovery**
+`koto dashboard` discovers all koto sessions on the local machine regardless of the working
+directory from which the command is invoked. Session discovery uses the global koto sessions
+directory at `~/.koto/sessions/<name>/` (flat storage; migration helper runs on first use
+to move any per-repo-scoped sessions into the flat layout). Sessions from different
+workspaces appear in the same list.
 
-**R2 — Focused single-session view (`koto dashboard <name>`)**
-Running `koto dashboard <name>` opens a focused view for that specific session, showing its
-current state, elapsed time, gate panel, evidence timeline, and (if applicable) child task
-list.
+**R2 — Session list with health-severity sort**
+Sessions are ordered by health severity: failed (0) → blocked (1) → running (2) →
+unknown (3) → done (4), with most recently active descending as a tiebreaker within each
+bucket. This ordering applies to both the interactive TUI and `--once` output.
 
-**R3 — Session hierarchy display**
-The repo-wide view renders sessions in a tree derived from the `parent_workflow` header
-field in each session's state file:
-- A session with no `parent_workflow` is a root session (indented at level 0)
-- A session that other sessions name as their `parent_workflow` is a coordinator (displayed
-  with an aggregate row, described in R5)
-- A session with a `parent_workflow` and no children of its own is a leaf task
-
-Sessions are connected with ASCII tree connectors (`├──`, `╰──`). A session can be both a
-child (has `parent_workflow`) and a coordinator (has children) — for example, a phase
-session spawned by a root orchestrator that itself spawns work-on sessions. Tree rendering
-is limited to 3 visible indentation levels; sessions deeper than level 3 are rendered at
-level 3 indent without further nesting. Session names longer than 40 characters are
-truncated with `…` in the repo-wide list.
-
-Example structure:
-```
-orchestrator                (root, level 0)
-├── design                  (coordinator, level 1 — has children)
-│   ├── design.issue-1      (leaf, level 2)
-│   └── design.issue-2      (leaf, level 2)
-└── plan                    (leaf, level 1 — no children yet)
-```
-
-**R4 — Per-session row display**
+**R3 — Per-session row display**
 Each session row displays:
-- Session name (with tree prefix for children)
-- Current state name (from the most recent `transitioned`, `directed_transition`, or
-  `rewound` event)
-- Elapsed time since session creation (human-readable: `4h 12m`, `45m`, `2s`)
-- Status indicator (one of: `done`, `failed`, `blocked`, `running`, `unknown`)
+- Session name (with tree prefix for children), truncated to 60 characters including any
+  ` · <intent>` suffix
+- Intent label (` · <intent>`) when set; only session ID shown when absent. Below 60
+  terminal columns, only the session ID is shown.
+- Template name as a distinct column; `"-"` when absent
+- Current state name
+- Elapsed time since last state transition (human-readable: `4h 12m`, `45m`, `2s`);
+  calculated from `WorkflowInitialized` timestamp for sessions that have not yet transitioned
+- Status indicator: `done`, `failed`, `blocked`, `running`, or `unknown`
 
 **Status derivation rules** (evaluated in priority order):
 1. `done` — current state has `terminal: true` in the compiled template
@@ -151,15 +159,18 @@ Each session row displays:
 4. `running` — session is active (not terminal) and has no failing or blocking gates
 5. `unknown` — compiled template cannot be loaded
 
-If the compiled template is unavailable, the status is `unknown` (no crash).
+**R4 — Session hierarchy display**
+Sessions are rendered in a tree derived from the `parent_workflow` header field. Tree
+connectors use `├─ ` for non-final siblings and `└─ ` for the final sibling in a group.
+Root-level sessions have no connector prefix. The tree renders to at least 5 levels of
+nesting; depth is determined by session data, not a compile-time cap. Collapsed parent rows
+show a child-count badge `[N]` after the session name (direct children only, not all
+descendants).
 
 **R5 — Batch coordinator aggregate row**
-When a session has child sessions, its display includes an inline aggregate row showing:
+When a session has child sessions, its display includes an inline aggregate row:
 `N tasks · X done · Y failed · Z pending`
 where failed count is rendered in red when Y > 0.
-
-The dashboard derives child status by applying R4's status rules to each child session.
-The aggregate buckets map as follows:
 
 | Child session status | Aggregate bucket |
 |---------------------|-----------------|
@@ -167,328 +178,443 @@ The aggregate buckets map as follows:
 | `failed` (gate evaluation failed) | failed |
 | `unknown` (template unavailable) | failed |
 | `blocked` (children-complete gate unsatisfied) | pending |
+| `done_blocked` (terminal blocked state) | pending |
 | `running` | pending |
 
-Total N = done + failed + pending. Skipped (terminal via a "skip" state) and
-spawn_failed children are included via their derived status: skipped sessions are
-terminal → done; spawn_failed sessions typically have a failed gate → failed.
-
 **R6 — Default collapse for large batches**
-When a session has more than 5 children, the children are collapsed behind the aggregate
-row by default. The user presses Enter to expand. When a session has 5 or fewer children,
-they are expanded by default.
-
-The collapse threshold is evaluated once at initial render based on the child count at
-that moment. Subsequent child additions during polling do not trigger auto-collapse of an
-already-expanded batch. If a user manually expands a batch and the count grows to 1000
-during a long run, the batch remains expanded until the user collapses it.
+Sessions with more than 5 children are collapsed by default; ≤5 children are expanded by
+default. Auto-collapse is evaluated once at initial render. A user who manually expands a
+batch that then grows to 1000 children during a long run remains expanded until they
+collapse it.
 
 **R7 — Failure-first child sorting**
-When a batch coordinator's children are expanded, they are sorted by status priority:
-1. Failed (red)
-2. Blocked (yellow)
-3. Running (actively executing gates or actions)
-4. Pending (waiting to begin)
-5. Done / skipped (dim)
+Expanded batch children are sorted: failed first, then blocked, then running, then pending,
+then done/skipped. Within each group, sorted by name.
 
-Within each status group, children are sorted by name.
+**R8 — Parent status rollup**
+When a parent is collapsed, its displayed status reflects the worst-case status across all
+descendants:
+1. Any descendant is `failed` → parent shows `failed`
+2. Any descendant is `blocked` or `done_blocked` and no `failed` descendants → parent
+   shows `blocked`
+3. All descendants are `done` and parent is itself terminal → parent shows `done`
+4. All descendants are terminal but set includes both `done` and `done_blocked` → parent
+   shows `blocked`
+5. Otherwise → parent shows `running`; if parent itself has `unknown` status and no
+   descendants have `failed` or `blocked`, parent shows `unknown`
 
-**R8 — Gate evaluation panel**
-In the focused single-session view, a gate panel shows the most recent evaluation result
-for each gate in the current state. Gate data is sourced from Tier 2 `gate_evaluated`
-events via the epoch-scoped `derive_last_gate_evaluated()` function.
+When expanded, each row shows its own independent status.
 
-Each gate row displays:
-- Gate name (from the template's state definition)
-- Gate type: `command`, `context-exists`, `context-matches`, or `children-complete`
-- Last outcome: `passed` (green) or `failed` (red), or `—` if never evaluated in the
-  current epoch
-- Key output field(s):
-  - Command gate: exit code and error message (if any)
-  - Context gates: the `exists` or `matches` boolean
-  - Children-complete gate: `all_complete`, `any_failed`, and child counts
+**R9 — Width-driven layout**
+- ≥80 columns: horizontal split, list at 40%, detail pane at 60%
+- <80 columns: list-only view (detail pane hidden)
+- <40 columns: "terminal too narrow" message
 
-Gates that have never been evaluated in the current epoch are shown with outcome `—`.
+**R10 — Tabbed detail pane — Summary tab**
+Default tab when entering Detail view. Displays:
+- Current state name
+- The `directive` field from the current state's compiled template entry
+- Most recent evidence submission: evidence fields as `key: value` pairs; optional
+  `summary` string (from R16) rendered in bold above raw fields when present
+- Gate result if evaluated in current epoch: gate name, result (PASS/FAIL), command
+- Session `intent` (from R15) and `template_name` (from R16) when present
 
-**R9 — Evidence submission timeline**
-The focused view includes an evidence timeline listing the most recent `evidence_submitted`
-events for that session (up to 10 entries). Each entry shows: submission timestamp, state
-at submission, and a truncated preview of the evidence content (first 80 Unicode codepoints,
-with embedded newlines replaced by spaces, and `…` appended when truncated).
+Sessions with no data beyond `WorkflowInitialized` show "No data yet" — not an error or
+blank space. "No gate evaluations recorded" must not appear for any session that has
+submitted evidence.
 
-**R10 — Terminal state detection**
-A session is marked as `done` when its current state (derived from the most recent
-transition event) corresponds to a state with `terminal: true` in the compiled template.
-The dashboard must load the compiled template to make this determination; no
-`workflow_completed` event exists in the session feed.
+**R11 — Tabbed detail pane — History tab**
+Scrollable tab showing all events for the selected session in chronological order, each
+prefixed with `[YYYY-MM-DD HH:MM:SS]`. Minimum event types rendered:
 
-If the compiled template cannot be found at the path recorded in the session's machine
-state, the session status is shown as `unknown` rather than crashing.
+| Event type | Fields to render |
+|---|---|
+| `WorkflowInitialized` | template name, initial variables |
+| `StateTransitioned` | from-state, to-state, trigger |
+| `EvidenceSubmitted` | state, fields (key: value), `summary` if present |
+| `GateEvaluated` | gate name, result (PASS/FAIL); second line with gate type and condition summary from compiled template: `command` gates show `cmd: <command>`; `context-exists` shows `key: <key>`; `context-matches` shows `key: <key>  pattern: <pattern>`; `children-complete` shows `children: <completed>/<total> complete`. Condition line silently omitted when compiled template is unavailable. |
+| `DecisionRecorded` | decision text, rationale |
+| `DirectedTransition` | target state, rationale |
+| `Rewound` | from-state, to-state, rationale |
+| `GateOverrideRecorded` | gate name, override result, rationale |
+| `ContextAdded` | key, artifact reference |
+| `DefaultActionExecuted` | action type, first 3 newline-delimited lines of output |
 
-**R11 — Epoch-branched session filtering**
-Sessions whose name contains `~` (epoch-branched sessions created by `koto rewind`) are
-hidden from the repo-wide session list. In the focused parent session view, a collapsed
-"Archived epochs" row shows the count of archived epoch branches; it does not expand in
-the MVP.
+Unknown event types render as `[Unknown event: <type>]` rather than crashing or being
+silently omitted. Switching to a different session resets History tab scroll to the top.
 
-**R12 — Live polling**
-The dashboard polls for session updates at a default interval of 500ms. The poll interval
-is configurable via `--interval <ms>`. A header row shows the time since the last
-successful poll refresh.
+**R12 — Tabbed detail pane — Remaining tab**
+Lists states in the session's compiled template not yet visited (no `StateTransitioned`
+event with that destination in the current epoch). States listed in topological order for
+DAG templates; definition order otherwise. When the compiled template is unavailable:
+> Template unavailable — run `koto template compile <path>` to restore the remaining-states view.
 
-**R13 — One-shot mode**
-Running `koto dashboard --once` (with or without a session name) outputs the current
-dashboard state to stdout as plain text and exits with code 0. This mode is intended for
-scripting and non-interactive contexts.
+A terminal session shows an empty list or "All states visited."
 
-Output format: one session per line. Fields are tab-separated in order: NAME, STATE,
-ELAPSED, STATUS. Children are output after their parent, sorted by R7's priority order.
-No ANSI color codes. No tree connector characters.
+**R13 — Gate evaluation panel**
+The Summary tab shows the most recent evaluation result per gate in the current state. Each
+gate row displays: gate name, gate type (`command`, `context-exists`, `context-matches`, or
+`children-complete`), last outcome (`passed` / `failed` / `—` if never evaluated in current
+epoch), and key output field(s):
+- Command gate: exit code and error message if any
+- Context gates: the `exists` or `matches` boolean
+- Children-complete gate: `all_complete`, `any_failed`, and child counts
 
-Example output:
+**R14 — Epoch-branched session filtering**
+Sessions whose name contains `~` are hidden from the session list. In the focused parent
+session view, a collapsed "Archived epochs" row shows the count of archived epoch branches.
+
+**R15 — `intent` on session state**
+`StateFileHeader` carries `intent: Option<String>`. Set at initialization via
+`koto init --intent "<text>"` or updated on an existing session via
+`koto session update <name> --intent "<text>"`. Both write atomically. Older state files
+without this field deserialize without error; field defaults to `None`.
+
+**R16 — `template_name` and `EvidenceSubmitted.summary`**
+`StateFileHeader` carries `template_name: Option<String>`, written from the compiled
+template's `name` field at `koto init` time. Read from the state file header on each
+refresh without loading the compiled template from disk. `EvidenceSubmitted` carries
+`summary: Option<String>`. Agents submit it via `--with-data '{"summary": "...", ...}'`.
+Pre-feature payloads without either field deserialize without error.
+
+**R17 — Live polling**
+The dashboard polls at 1 second by default. Poll interval is configurable via
+`--interval <ms>`. A header row shows time since last successful poll refresh.
+
+**R18 — One-shot mode**
+`koto dashboard --once` outputs current dashboard state to stdout as plain text and exits
+with code 0. Output format: one session per line, 6 tab-separated columns:
+
 ```
-orchestrator	exploring	4h 12m	running
-design	in-progress	45m	running
-design.issue-1	implementing	12m	running
-design.issue-2	waiting	8m	pending
-plan	pending	--	pending
+session_id\tcurrent_state\telapsed\tstatus_bucket\tintent\ttemplate_name
 ```
 
-`koto dashboard <name> --once` outputs only the named session and its children (same
-format). If the named session does not exist, exits with code 1 and a message on stderr.
+Columns 1–4 are the original columns and remain unchanged. `intent` (column 5) is empty
+string when not set. `template_name` (column 6) is empty string when not set. No ANSI color
+codes. Health-severity sort applies. `koto dashboard --once` with no sessions exits with
+code 0 and produces no output lines.
 
-**R14 — Navigation and exit**
-The dashboard supports the following key bindings:
+`koto dashboard <name> --once` outputs only that session and its children. If the named
+session does not exist, exits with code 1 and a message on stderr.
 
+**R19 — Navigation and key bindings**
+
+*Global (any view):*
 | Key | Action |
 |-----|--------|
-| `j` / `↓` | Move cursor down |
-| `k` / `↑` | Move cursor up |
-| `g` / `Home` | Jump to first entry |
-| `G` / `End` | Jump to last entry |
-| `Enter` | Expand/collapse children |
-| `r` | Force immediate refresh |
-| `q` | Quit |
-| `?` | Show key bindings help |
-| `Ctrl+C` | Quit (always works) |
+| `q` or `Ctrl+C` | Quit |
+| `r` | Force refresh |
 
-**R15 — Error handling for incomplete data**
-The dashboard handles the following edge cases without crashing:
-- Truncated final JSONL line (file written mid-event): treated as if the line doesn't
-  exist; uses the previous complete event
-- Unknown event type in the JSONL log: skipped with no error
-- Session in progress with no `workflow_completed` event: treated as running
+*List view:*
+| Key | Action |
+|-----|--------|
+| `j` or `↓` | Cursor down |
+| `k` or `↑` | Cursor up |
+| `Enter` | Enter Detail view for focused session |
+| `l` or `→` | Expand focused session's children (no-op if none or already expanded) |
+| `h` or `←` | Collapse focused session's children (no-op if none or already collapsed) |
+
+*Detail view:*
+| Key | Action |
+|-----|--------|
+| `j` or `↓` | Select next session (stays in Detail view) |
+| `k` or `↑` | Select previous session (stays in Detail view) |
+| `Esc` | Return to List view |
+| `Tab` | Cycle to next tab (Summary → History → Remaining → Summary) |
+| `Shift+Tab` | Cycle to previous tab |
+| `1` | Jump to Summary tab |
+| `2` | Jump to History tab |
+| `3` | Jump to Remaining tab |
+| `PageDown` or `Ctrl+D` | Scroll down in current tab |
+| `PageUp` or `Ctrl+U` | Scroll up in current tab |
+| `h` or `←` | No-op |
+| `l` or `→` | No-op |
+
+**R20 — Error handling**
+- Truncated final JSONL line: treat as if the line doesn't exist; use the previous complete event
+- Unknown event type in JSONL log: skip without error
+- Session with no `workflow_completed` event: treat as running
+- Compiled template unavailable: session shows `unknown` status; no crash
+
+**R21 — Outside-repository behavior**
+`koto dashboard` with no sessions on the local machine shows an empty list with
+"No sessions found" rather than an error. If a repo-id cannot be derived, exits with code 1
+and a message on stderr.
 
 ### Non-Functional Requirements
 
-**R16 — Startup time (repo-wide)**
-`koto dashboard` (no arguments) must display the initial session list within 1 second when
-the repository has ≤100 sessions.
+**R22 — Startup time**
+`koto dashboard` (no arguments) must display the initial session list within 1 second for
+≤100 sessions. `koto dashboard <name>` must display the initial session view within 100ms
+for a session with ≤1000 events.
 
-**R17 — Startup time (focused)**
-`koto dashboard <name>` must display the initial session view within 100ms for a session
-with ≤1000 events.
+**R23 — Refresh performance**
+Each full refresh cycle — reading all session state files and rendering all visible rows —
+must complete in under 200ms for a session set with up to 500 events per JSONL log.
 
-**R18 — Update latency**
-New events written to a session's JSONL log must be visible in the dashboard within 2×
-the poll interval (≤1 second at the default 500ms setting).
-
-**R19 — No async runtime**
+**R24 — No async runtime**
 The implementation must not introduce an async runtime (tokio, async-std, etc.). koto is
-synchronous by design; this constraint must be maintained.
+synchronous by design.
 
-**R20 — Single binary**
-The dashboard must be part of the existing `koto` binary. No additional binaries or daemon
-processes are required.
+**R25 — Single binary**
+The dashboard is part of the existing `koto` binary. No additional binaries or daemon
+processes required.
 
-**R21 — Minimum terminal dimensions**
-The dashboard renders correctly on terminals ≥80 columns × 24 rows. On terminals below this
-size, the dashboard displays a "terminal too small (min 80×24)" message and waits for
-the terminal to be resized; it does not crash. `koto dashboard --once` is not subject to
-this constraint (it outputs plain text regardless of terminal size).
-
-**R22 — Outside-repository behavior**
-If `koto dashboard` is run from a directory with no `~/.koto/sessions/<repo-id>/` directory
-(no sessions exist for the current repository), the dashboard displays an empty session list
-with a "No sessions for this repository" message rather than an error. If the repo-id cannot
-be derived (e.g., not a valid directory), it exits with code 1 and a message on stderr.
+**R26 — Backwards compatibility**
+State files predating this feature (without `intent`, `template_name`, or
+`EvidenceSubmitted.summary`) must deserialize without errors. These fields default to `None`.
+The schema version remains 1; no migration is required. Each new optional field has a
+round-trip test confirming old files parse cleanly and re-serializing omits absent fields.
 
 ## Acceptance Criteria
 
-**Session display**
-- [ ] `koto dashboard` opens a TUI showing all sessions for the current repository
-- [ ] Sessions are displayed in a tree with ASCII connectors; sessions with `parent_workflow`
-      are indented under their parent
-- [ ] A session with children shows an aggregate row `N tasks · X done · Y failed · Z
+### Session display
+
+- [x] `koto dashboard` opens a TUI showing all sessions on the local machine regardless of
+      the working directory
+- [x] Sessions are ordered by health severity (failed → blocked → running → unknown → done),
+      with most recently active as tiebreaker within each bucket
+- [x] Sessions are displayed in a tree with `├─`/`└─` connectors; sessions with
+      `parent_workflow` are indented under their parent
+- [x] A session with children shows an aggregate row `N tasks · X done · Y failed · Z
       pending`; failed count is red when non-zero
-- [ ] A coordinator with >5 children shows only the aggregate row by default (children
-      collapsed)
-- [ ] A coordinator with ≤5 children shows its children expanded by default
-- [ ] Pressing Enter on a collapsed coordinator expands it; pressing Enter again collapses it
-- [ ] Expanded children are sorted: failed first, then blocked, then running, then pending,
+- [x] A coordinator with >5 children shows only the aggregate row by default (children
+      collapsed); a collapsed parent shows `[N]` badge for direct child count
+- [x] A coordinator with ≤5 children shows its children expanded by default
+- [x] Expanded children are sorted: failed first, then blocked, then running, then pending,
       then done/skipped
-- [ ] A session in a terminal state shows status `done`; the status matches `koto status
-      <name>` terminal detection
-
-**Focused view**
-- [ ] `koto dashboard <name>` opens a focused view for that specific session
-- [ ] The focused view shows the current state name matching what `koto status <name>`
-      reports
-- [ ] The focused view shows a gate panel with last evaluation result per gate in the current
-      state (gate name, type, outcome, and key output field)
-- [ ] The focused view shows an evidence timeline with the last ≤10 `evidence_submitted`
-      events; each entry shows timestamp, state, and a truncated preview
-
-**Filtering and edge cases**
-- [ ] Sessions with `~` in their name do not appear in the repo-wide list
-- [ ] The focused parent view shows a collapsed "Archived epochs" row when epoch-branched
+- [x] A session in a terminal state shows status `done`
+- [x] A parent with a `failed` descendant shows `failed` status when collapsed
+- [x] A parent with a `done_blocked` terminal descendant (and no `failed` descendants) shows
+      `blocked` status when collapsed
+- [x] A parent whose all descendants are `done` and is itself terminal shows `done` when
+      collapsed
+- [x] `intent` appears alongside the session ID in the list when set; no separator shown
+      when absent
+- [x] `template_name` appears as a distinct column; `"-"` when absent
+- [x] Sessions with `~` in their name do not appear in the list
+- [x] The focused parent view shows a collapsed "Archived epochs" row when epoch-branched
       children exist
-- [ ] A JSONL file with a truncated final line is read without crashing; the truncated line
+
+### Layout
+
+- [x] On a terminal ≥80 columns, the session list and detail pane are side-by-side (40/60
+      split)
+- [x] On a terminal <80 columns, dashboard shows list-only view (detail pane hidden)
+- [x] On a terminal <40 columns, dashboard shows "terminal too narrow"
+
+### Detail pane — Summary tab
+
+- [x] A session with only evidence submissions shows a non-empty Summary tab with evidence
+      fields rendered as `key: value` pairs
+- [x] A session with only gate evaluations shows gate name, result, and command in the
+      Summary tab
+- [x] A session with both evidence and gate evaluations shows both sections
+- [x] A newly initialized session (no events beyond `WorkflowInitialized`) shows "No data
+      yet" in the Summary tab
+- [x] No session shows "No gate evaluations recorded" in place of actual evidence data
+- [x] The directive text for the current state is visible
+- [x] When `EvidenceSubmitted` has a `summary` field, it appears above the raw `key: value`
+      pairs
+- [x] `intent` and `template_name` appear in the Summary tab when set
+
+### Detail pane — History tab
+
+- [x] All 10 event types from R11 are rendered with their relevant fields
+- [x] Each event row includes a `[YYYY-MM-DD HH:MM:SS]` timestamp prefix
+- [x] A `GateEvaluated` event for a `command` gate renders a second line showing
+      `cmd: <command>` from the compiled template
+- [x] A `GateEvaluated` event for a `context-exists` gate renders `key: <key>`
+- [x] A `GateEvaluated` event for a `children-complete` gate renders
+      `children: <completed>/<total> complete`
+- [x] When the compiled template is unavailable, `GateEvaluated` renders only the name and
+      result line — no crash, no error, no blank line
+- [x] An unknown event type renders as `[Unknown event: <type>]` and does not crash
+- [x] Events appear in chronological order (oldest first)
+- [x] The History tab is scrollable; `PageDown`/`Ctrl+D` reaches content below visible area
+- [x] After scrolling past the last event, the scroll offset does not increase further
+- [x] Switching focus to a different session resets History tab scroll to the top
+
+### Detail pane — Remaining tab
+
+- [x] An active session lists at least one unvisited state
+- [x] A terminal session shows an empty Remaining tab or "All states visited"
+- [x] For a DAG template with states at equal topological depth, states are listed in
+      definition order
+- [x] When the compiled template is unavailable, the exact fallback message from R12 is shown
+
+### `intent` and `template_name`
+
+- [x] `koto init --intent "investigating issue #42"` persists `intent` in the state file
+      header
+- [x] `koto session update <name> --intent "new text"` overwrites `intent` without modifying
+      other fields
+- [x] Running `koto session update` on a session without `intent` adds the field; running it
+      with `intent` already set replaces the value
+- [x] A session without intent shows only the session ID (no `·` separator)
+- [x] `template_name` appears for sessions whose template has a `name:` field in frontmatter
+- [x] State files created before this feature (missing `intent`, `template_name`) load
+      without errors
+
+### Navigation and keyboard bindings
+
+- [x] `l`/`→` expands a collapsed parent in List view; no-op on a leaf session
+- [x] `h`/`←` collapses an expanded parent in List view; no-op on a leaf session
+- [x] `Enter` in List view enters Detail view for the focused session
+- [x] `Esc` returns to List view from Detail view
+- [x] `Tab` cycles through the three tabs in Detail view (Summary → History → Remaining →
+      Summary)
+- [x] `Shift+Tab` cycles in reverse
+- [x] `1`, `2`, `3` jump directly to Summary, History, and Remaining tabs
+- [x] `PageDown`/`Ctrl+D` scrolls down in the History tab
+- [x] `j`/`↓` in Detail view moves to the next session without leaving Detail view
+- [x] `k`/`↑` in Detail view moves to the previous session without leaving Detail view
+- [x] `r` triggers an immediate refresh in any view
+- [x] `h`/`←` and `l`/`→` in Detail view are no-ops (no crash, no mode change)
+- [x] `q` or `Ctrl+C` exits with code 0
+
+### Edge cases
+
+- [x] A JSONL file with a truncated final line is read without crashing; the truncated line
       is ignored
-- [ ] An unknown event type in the JSONL log is skipped; the dashboard does not crash
-- [ ] `koto dashboard` with no sessions for the current repo shows an empty list with an
-      explanatory message (no error)
+- [x] An unknown event type in the JSONL log is skipped; the dashboard does not crash
+- [x] `koto dashboard` with no sessions shows an empty list with an explanatory message
+- [x] A session started before `koto dashboard` was launched shows complete history (elapsed
+      from session creation, not dashboard launch)
+- [x] The elapsed column never shows "0s" for a session that transitioned more than 10
+      seconds ago
 
-**Navigation and exit**
-- [ ] Pressing `q` or `Ctrl+C` exits with code 0 and no error output
-- [ ] A session started before `koto dashboard` was launched shows complete history (elapsed
-      time from session creation, not from dashboard launch)
-- [ ] The header row shows the time since the last successful poll refresh
+### One-shot mode
 
-**One-shot mode**
-- [ ] `koto dashboard --once` outputs one session per line (tab-separated: NAME, STATE,
-      ELAPSED, STATUS) and exits with code 0
-- [ ] `koto dashboard <name> --once` outputs only that session and its children
-- [ ] `koto dashboard nonexistent-name --once` exits with code 1 and an error on stderr
-- [ ] `koto dashboard nonexistent-name` (TUI mode) exits with code 1 and an error message
+- [x] `koto dashboard --once` outputs exactly 6 tab-separated columns per line
+- [x] Column 4 (`status_bucket`) is one of: `running`, `blocked`, `done`, `failed`,
+      `unknown`
+- [x] Column 5 (intent) is empty string for sessions without intent
+- [x] Column 6 (template_name) is empty string for sessions without template_name
+- [x] A script reading only columns 1–4 continues to produce correct output
+- [x] `koto dashboard <name> --once` outputs only that session and its children
+- [x] `koto dashboard nonexistent --once` exits with code 1 and an error on stderr
+- [x] `koto dashboard --once` with no sessions exits with code 0 and produces no output lines
 
-**Configuration**
-- [ ] `koto dashboard --interval 1000` sets the poll interval to 1000ms
-- [ ] `koto dashboard --interval 100` polls every 100ms without error
+### Global session scope
 
-**Performance**
-- [ ] Startup for `koto dashboard` with 100 sessions completes within 1 second (first frame
-      painted)
-- [ ] Startup for `koto dashboard <name>` with ≤1000 events completes within 100ms
+- [x] `koto dashboard` launched from `/workspace-a` displays sessions from `/workspace-b`
+- [x] `koto dashboard --once` launched from a directory with no local sessions outputs rows
+      for sessions from other workspaces on the machine
+- [x] A session started in a new workspace after the dashboard is running appears on the
+      next polling cycle
+- [x] Health-severity sort applies consistently to TUI and `--once` output
 
-**Terminal constraints**
-- [ ] On a terminal <80 columns or <24 rows, the dashboard shows a "terminal too small"
-      message and does not crash
+### Backwards compatibility
 
-## Out of Scope
+- [x] State files created by older koto versions (missing `intent`, `template_name`,
+      `EvidenceSubmitted.summary`) load without a parse error
+- [x] Round-trip serialization of a `StateFileHeader` without `intent` or `template_name`
+      omits those fields (no null values written to disk)
 
-- **Daemon / always-on mode**: No background process, no `koto daemon start/stop`. The
-  command interface must not preclude this in V2 (top-level `koto dashboard` leaves room
-  for `koto daemon` as a parallel top-level command).
-- **Web-based dashboard**: Requires introducing an async runtime (tokio) as a first
-  dependency. Deferred to V2 if demand emerges for remote access preview.
-- **Remote access**: F5 (S3-backed) and F6 (hosted relay) scope.
-- **Authentication or multi-user scenarios**: Sessions are scoped to the current user's
-  `~/.koto/` directory.
-- **Cross-repository session aggregation**: Dashboard scope is the current working
-  directory's repository only.
-- **Session management actions from dashboard**: No cancel, rewind, or override. Read-only
-  view only.
-- **inotify/kqueue file watching**: Polling at 500ms is sufficient for MVP. File-system
-  event subscriptions deferred to V2 optimization.
-- **Mermaid/graphical dependency graphs**: Text-based tree only. Graph rendering deferred.
-- **Export or logging of dashboard output**: Except for `--once` mode, no persistent output.
+### Performance
+
+- [x] Startup for `koto dashboard` with 100 sessions completes within 1 second
+- [x] Startup for `koto dashboard <name>` with ≤1000 events completes within 100ms
+- [x] Full refresh for a session with 500 events completes within 200ms
 
 ## Known Limitations
 
-- **Terminal state requires template coupling**: The absence of a `workflow_completed`
-  event means the dashboard must load the compiled template for each session to determine
-  terminal status. If the compiled template is deleted or moved after session creation, the
-  session shows `unknown` status. This is the same limitation `koto status` has; it's not
-  unique to the dashboard.
-- **Gate panel requires Tier 2 event scanning**: Displaying the last gate result per state
-  requires scanning `gate_evaluated` events (Tier 2) and applying epoch-boundary logic.
-  This adds client-side computation that grows with log length. For very long sessions
-  (1000+ events), gate display may be slightly slower than basic session metadata.
-- **1000-sibling performance at polling rate**: Discovering 1000 child sessions each poll
-  cycle requires ~2 seconds of I/O at sequential read speeds. The implementation should
-  limit the child discovery scan to ≤500ms; if it exceeds this, it may skip the current
-  poll cycle rather than block the UI.
+- **Terminal state requires template coupling**: The absence of a `workflow_completed` event
+  means the dashboard must load the compiled template for each session to determine terminal
+  status. If the compiled template is deleted or moved after session creation, the session
+  shows `unknown` status. This matches the same limitation in `koto status`.
+- **Remaining tab requires local template cache**: Sessions imported from another machine or
+  whose cache was cleared show the "Template unavailable" fallback.
+- **`intent` is human-editable but not auto-generated**: The dashboard renders intent when
+  present but cannot require agents to provide it. Sessions without intent fall back to the
+  session ID.
+- **`EvidenceSubmitted.summary` is agent-optional**: The dashboard renders it when present
+  but cannot require agents to provide it. Evidence without a summary falls back to raw
+  field display.
 - **Epoch-branched session drill-down deferred**: The focused parent view shows an
-  "Archived epochs" summary row but does not expand it in the MVP. Users who need to
-  inspect archived epoch children must use `koto status` or `koto workflows` directly.
+  "Archived epochs" summary row but does not expand it. Users who need to inspect archived
+  epoch children must use `koto status` or `koto workflows` directly.
 
 ## Decisions and Trade-offs
 
-**D1 — Rendering technology: ratatui (TUI) over embedded web server**
-
-Chosen: ratatui (pure-Rust TUI, no async runtime).
-
-An embedded web server (axum, actix) would require introducing tokio — the first async
-runtime dependency in koto, which is intentionally synchronous. ratatui is a single
-pure-Rust dependency with no external system dependencies, integrates naturally with the
-synchronous codebase, and matches the distribution model (single binary, no browser
-required). A web-based dashboard is deferred to V2 if there is demand for a preview of
-F5/F6-style remote access.
+**D1 — Rendering technology: ratatui over embedded web server**
+ratatui is a pure-Rust TUI with no external system dependencies and no async runtime
+requirement. An embedded web server (axum, actix) would introduce tokio — the first async
+runtime dependency in koto, which is intentionally synchronous. A web-based dashboard is
+deferred to V2 if there is demand for a preview of F5/F6-style remote access.
 
 **D2 — Invocation model: ad-hoc command over daemon**
-
-Chosen: ad-hoc `koto dashboard [<name>]` that users run when they want to observe.
-
 Sessions accumulate JSONL log data from `koto init` regardless of whether a dashboard is
 running, so launching mid-session gives complete history. This "data always accumulates"
-property (similar to git instaweb) means an always-on daemon is a convenience rather than
-a data-completeness requirement. The ad-hoc model avoids daemon lifecycle management and
-stays compatible with V2 daemon integration: `koto daemon start/stop` can be added as
-separate top-level commands without any conflict with `koto dashboard`.
+property means an always-on daemon is a convenience rather than a data-completeness
+requirement. The ad-hoc model avoids daemon lifecycle management and stays compatible with
+V2 daemon integration: `koto daemon start/stop` can be added as separate top-level commands
+without conflict.
 
 **D3 — Terminal state detection: template-loading over heuristics**
+Loading the compiled template at `MachineState.template_path` and checking `terminal: true`
+is how `koto status` determines terminal status. The dashboard uses the same mechanism for
+consistency. Timeout or last-transition heuristics produce false positives and false
+negatives; template-loading does not.
 
-Chosen: load compiled template at `MachineState.template_path` and check `terminal: true`.
+**D4 — Universal detail pane — no session-type discrimination**
+The Summary tab renders all available data regardless of session type, with absent sections
+silently omitted. Alternatives — separate gate-only and evidence-only tabs, or conditional
+UI — require operators to understand which session type they're looking at. The goal is
+monitoring, not diagnostics.
 
-Two alternatives were considered: (A) timeout heuristic ("session is done if no events in
-N hours") and (B) last-transition inference ("if the last transition has no pending gates,
-call it terminal"). Both alternatives produce false positives (a paused running session
-would appear done) or false negatives (a terminal session with unusual timing would stay
-marked running). Template-loading is how `koto status` determines terminal status today;
-the dashboard uses the same mechanism for consistency. The compiled template is always
-present when the session is active (it's created by `koto init` before any events are
-written).
+**D5 — `intent` supplements the session ID rather than replacing it**
+The session ID is the key used in all `koto next <name>` / `koto rewind <name>` commands.
+Format `<session-id> · <intent>` with 60-character truncation on the intent portion
+preserves the ID while adding context.
 
-**D4 — Gate display scope: Tier 2 events in MVP**
+**D6 — `--once` columns appended, not interleaved**
+New columns are at positions 5 and 6. Interleaving before `status_bucket` would break
+existing parsers reading column 4. Empty string (not null or placeholder) is used for absent
+values so `awk '{ print $5 }'` parsing works consistently.
 
-Chosen: include gate display using Tier 2 `gate_evaluated` events.
+**D7 — Status rollup uses worst-case child status**
+`failed > blocked > running > done` matches the convention used by monitoring tools and
+surfaces the most actionable condition first. The rollup applies only when the parent is
+collapsed.
 
-Gate evaluations are explicitly listed as a display target in the observability roadmap for
-F3. Deferring would narrow the MVP significantly and reduce its utility for the primary use
-case (investigating stalled sessions). The F2 data contract provides all necessary event
-fields; the dashboard computes "last gate result per gate per epoch" using the existing
-`derive_last_gate_evaluated()` function from `src/engine/persistence.rs`. This is
-achievable within the MVP scope without introducing significant complexity.
+**D8 — `l`/`h` for tree expand/collapse in List view; no-op in Detail view**
+These bindings follow the vim hjkl convention where `h`/`l` mean directional navigation
+(shallower/deeper in the tree). In Detail view, `h`/`←` and `l`/`→` are no-ops rather than
+being rebound to tab navigation, which would create two different actions for the same key
+in adjacent modes.
 
-**D5 — Epoch-branched session handling: filter from main list, summarize in focused view**
+**D9 — Global session scope by default**
+The dashboard discovers all sessions on the local machine from the outset. The primary use
+case — a developer monitoring a dozen parallel niwa workflows from a fixed terminal — only
+works with global scope. Repo-scoped default would need a `--global` flag, adding friction
+for the primary use case. Architecturally, global-by-default at the local level makes F5
+(S3-backed dashboard) a storage-backend swap rather than a scope-model redesign.
 
-Chosen: sessions with `~` in their name are hidden from the repo-wide list. The focused
-parent view shows an "Archived epochs" summary row.
+**D10 — Health-severity sort over recency sort**
+Severity-first ordering (failed → blocked → running → unknown → done, recency as tiebreaker)
+directly answers the operator's opening question ("which session needs attention?") without
+requiring a mental re-sort. Alternatives considered: most recently active first (conflates
+recency with urgency), alphabetical (no relationship to urgency), hybrid (arbitrary boundary
+that complicates both implementation and mental model). `--once` consumers needing a
+different order can sort the output themselves.
 
-Without filtering, rewinding a batch parent multiple times produces accumulated epoch
-branches (e.g., `research~1.task-a`, `research~3.task-a`) that make the session list
-unreadable. Filtering by `~` name pattern is the simplest reliable approach: the `~`
-character is reserved for epoch branching and cannot appear in user-specified workflow
-names. The focused parent view shows a summary (not an expansion) of archived epochs so
-users can see the breadth of historical rewinding without cluttering the active view.
+**D11 — Schema additive, no version bump**
+`intent`, `template_name`, and `EvidenceSubmitted.summary` are added as optional fields
+using `#[serde(default, skip_serializing_if = "Option::is_none")]`, following the established
+pattern in the codebase. No schema version bump required. The schema version comment at
+`types.rs:13` explicitly documents that additive optional fields do not require a bump.
 
-**D6 — Command name: `koto dashboard` over `koto observe` or nesting under `koto session`**
+**D12 — Epoch-branched session handling**
+Sessions with `~` in their name are hidden from the session list. The focused parent view
+shows an "Archived epochs" summary row (not expandable in this release). Without filtering,
+rewinding a batch parent multiple times produces accumulated epoch branches that make the
+list unreadable. The `~` character is reserved for epoch branching and cannot appear in
+user-specified workflow names.
 
-Chosen: top-level `koto dashboard [<name>]`.
-
-Three namespaces were considered: (A) `koto dashboard` (top-level), (B) `koto session
-dashboard` (nested), (C) `koto observe` / `koto watch` (top-level, more generic). Option A
-is the clearest: it mirrors the mental model ("I want to see the dashboard"), parallels
-existing top-level commands (`koto status`, `koto workflows`), and leaves room for `koto
-daemon` as a parallel top-level command when V2 arrives. Nesting under `session` produces
-an awkward invocation (`koto session dashboard`) and doesn't fit V2 daemon patterns.
-Alternative names like `observe` are more generic than needed and less discoverable.
-
-## Open Questions
-
-None. All questions from Phase 2 research were resolved during drafting. The exploration
-and research phases addressed: terminal state detection strategy (template-loading),
-invocation model (ad-hoc TUI), epoch-branched sessions (filter from main list), performance
-envelope (≤1s startup for 100 sessions, 500ms poll interval as hard default), and command
-interface V2 compatibility (top-level `koto dashboard`).
+**D13 — Command name: `koto dashboard`**
+Top-level `koto dashboard [<name>]` parallels existing top-level commands (`koto status`,
+`koto workflows`) and leaves room for `koto daemon` as a parallel top-level command. Nesting
+under `session` produces an awkward invocation and doesn't fit V2 daemon patterns.
+Alternative names like `observe` or `watch` are more generic and less discoverable.
