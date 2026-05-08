@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: In Progress
 problem: |
   The koto dashboard introduced in PRD-local-dashboard.md gives users a live list of
   sessions with basic status and elapsed time. While the infrastructure is in place, the
@@ -36,7 +36,7 @@ goals: |
 
 ## Status
 
-Accepted
+In Progress
 
 ## Problem Statement
 
