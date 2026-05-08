@@ -13,7 +13,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::cli::dashboard_data::DetailData;
+use crate::cli::dashboard_data::{DetailData, SessionTree};
 use crate::cli::dashboard_state::{DashboardAppState, TaskCounts, ViewMode};
 
 /// Maximum number of evidence entries rendered in the detail pane.
@@ -37,6 +37,7 @@ pub fn render_frame(f: &mut Frame<'_>, state: &DashboardAppState) {
                 f,
                 state.detail_cache.as_ref(),
                 state.focused_id.as_deref(),
+                &state.tree,
                 chunks[1],
             );
         }
@@ -113,12 +114,17 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
 
 /// Render the detail pane for the focused session.
 ///
-/// Shows `"Loading…"` when `detail` is `None`. When present, displays gate
-/// name, command, result, elapsed, and evidence entries (newest-first, capped at 3).
+/// Shows a contextual message when `detail` is `None`:
+/// - "No state history" when the session has never transitioned (unknown status)
+/// - "No gate evaluations recorded" when the session has a current state but no gates
+///
+/// When detail data is present, displays gate name, command, result, elapsed,
+/// and evidence entries (newest-first, capped at 3).
 fn render_detail(
     f: &mut Frame<'_>,
     detail: Option<&DetailData>,
     session_name: Option<&str>,
+    tree: &SessionTree,
     area: ratatui::layout::Rect,
 ) {
     let title = match session_name {
@@ -129,7 +135,17 @@ fn render_detail(
 
     match detail {
         None => {
-            let paragraph = Paragraph::new("Loading\u{2026}").block(block);
+            let msg = session_name
+                .and_then(|name| tree.sessions.get(name))
+                .map(|s| {
+                    if s.current_state.is_some() {
+                        "No gate evaluations recorded"
+                    } else {
+                        "No state history"
+                    }
+                })
+                .unwrap_or("No data");
+            let paragraph = Paragraph::new(msg).block(block);
             f.render_widget(paragraph, area);
         }
         Some(data) => {
@@ -284,13 +300,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // render_detail: Loading text (scenario-11)
+    // render_detail: no-data messages (scenario-11)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn render_detail_shows_loading_when_cache_is_none() {
+    fn render_detail_shows_no_data_when_cache_is_none_and_no_focused_session() {
         let state = empty_state();
-        // Force detail mode so render_detail is called.
         let mut state = state;
         state.view_mode = ViewMode::Detail;
         state.detail_cache = None;
@@ -300,12 +315,54 @@ mod tests {
         terminal.draw(|f| render_frame(f, &state)).unwrap();
 
         let buffer = terminal.backend().buffer().clone();
-        // The detail pane occupies the bottom 8 rows (rows 16..24 for a 24-row terminal).
-        // Check that "Loading..." appears somewhere in those rows.
         let detail_rows = region_to_string(&buffer, 16..24, 0..80);
         assert!(
-            detail_rows.contains("Loading"),
-            "detail pane should contain 'Loading'; got rows 16-23: {:?}",
+            detail_rows.contains("No data"),
+            "detail pane should contain 'No data'; got rows 16-23: {:?}",
+            detail_rows
+        );
+    }
+
+    #[test]
+    fn render_detail_shows_no_state_history_for_unknown_session() {
+        use crate::cli::dashboard_data::CachedSession;
+        use crate::engine::types::StateFileHeader;
+        use std::path::PathBuf;
+        use std::time::SystemTime;
+
+        let mut state = empty_state();
+        state.view_mode = ViewMode::Detail;
+        state.focused_id = Some("my-wf".to_string());
+        state.detail_cache = None;
+        state.tree.sessions.insert(
+            "my-wf".to_string(),
+            CachedSession {
+                header: StateFileHeader {
+                    schema_version: 1,
+                    workflow: "my-wf".to_string(),
+                    template_hash: "abc".to_string(),
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    parent_workflow: None,
+                    template_source_dir: None,
+                    session_id: String::new(),
+                },
+                current_state: None,
+                is_terminal: false,
+                is_blocked: false,
+                mtime: SystemTime::UNIX_EPOCH,
+                state_path: PathBuf::new(),
+            },
+        );
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let detail_rows = region_to_string(&buffer, 16..24, 0..80);
+        assert!(
+            detail_rows.contains("No state history"),
+            "unknown session should show 'No state history'; got: {:?}",
             detail_rows
         );
     }
