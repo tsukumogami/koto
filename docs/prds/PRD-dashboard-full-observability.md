@@ -1,5 +1,5 @@
 ---
-status: Draft
+status: Accepted
 problem: |
   The koto dashboard introduced in PRD-local-dashboard.md gives users a live list of
   sessions with basic status and elapsed time. While the infrastructure is in place, the
@@ -36,7 +36,7 @@ goals: |
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
@@ -55,8 +55,9 @@ shirabe-style workflows — permanently show this message.
 **Invisible event data.** The koto event log records rich narrative data that the dashboard
 never renders: `DecisionRecorded.decision.rationale`, `DirectedTransition.rationale`,
 `Rewound.rationale`, `GateOverrideRecorded.rationale`, `ContextAdded` artifacts, and
-`DefaultActionExecuted` output. Three derivation functions that compute decisions, overrides,
-and visit counts exist in the data layer but are never called from the dashboard path.
+`DefaultActionExecuted` output. The data layer has no functions for deriving decisions,
+overrides, or visit counts from the event log — this capability needs to be built, not
+merely wired up.
 
 **No context at the list level.** Session identifiers like `task_session-feed-issue-1` are
 machine-generated slugs that tell an operator nothing about what the session is trying to
@@ -234,7 +235,7 @@ following event types must be rendered with meaningful labels and their relevant
 | `WorkflowInitialized` | template name, initial variables |
 | `StateTransitioned` | from-state, to-state, trigger |
 | `EvidenceSubmitted` | state, fields (key: value), `summary` if present |
-| `GateEvaluated` | gate name, result, command |
+| `GateEvaluated` | gate name, result (PASS/FAIL), and a second line with gate type and condition summary derived from the compiled template: `command` gates show `cmd: <command>`; `context-exists` gates show `key: <key>`; `context-matches` gates show `key: <key>  pattern: <pattern>`; `children-complete` gates show `children: <completed>/<total> complete`. When the compiled template is unavailable, the condition line is silently omitted. |
 | `DecisionRecorded` | decision text, rationale |
 | `DirectedTransition` | target state, rationale |
 | `Rewound` | from-state, to-state, rationale |
@@ -263,9 +264,11 @@ A terminal session (all states visited) must show an empty list or "All states v
 
 **R7: `intent` on StateFileHeader**
 `StateFileHeader` must gain `intent: Option<String>` following the established pattern:
-`#[serde(default, skip_serializing_if = "Option::is_none")]`. The field is set via
-`koto init --intent "<text>"` and persisted in the state file at initialization. Older state
-files that predate this field must deserialize without error; the field defaults to `None`.
+`#[serde(default, skip_serializing_if = "Option::is_none")]`. The field is set at
+initialization via `koto init --intent "<text>"` and can be updated on an existing session
+via `koto session update <name> --intent "<text>"`. Both commands write the value to the
+state file header atomically. Older state files that predate this field must deserialize
+without error; the field defaults to `None`.
 
 **R8: `template_name` on StateFileHeader**
 `StateFileHeader` must gain `template_name: Option<String>` using the same serde pattern as
@@ -391,7 +394,10 @@ ensures one complete render per polling cycle without skipped frames.
 of the working directory from which the command is invoked. Session discovery uses the
 global koto sessions directory (as defined by the F2 data contract) rather than a
 per-repository or per-directory subset. Sessions from different workspaces appear in the
-same flat list, ordered by their most recent activity (most recently active first).
+same flat list ordered by health severity, with recency as a tiebreaker within each
+severity bucket. Sort key: failed (0) → blocked (1) → running (2) → unknown (3) → done (4),
+then most recently active descending within each bucket. This ordering applies to both the
+interactive TUI and `--once` output.
 
 This scope is the prerequisite for F5 (S3-backed dashboard) in the koto observability
 roadmap. Once session scope is global and directory-independent at the local level, the
@@ -444,6 +450,14 @@ output rows for sessions discovered in other workspaces on the machine.
 
 - [ ] All 10 event types from R5 are rendered with their relevant fields in the History tab
 - [ ] Each event row includes a `[YYYY-MM-DD HH:MM:SS]` timestamp prefix
+- [ ] A `GateEvaluated` event for a `command` gate renders two lines: the name/result line
+  and a second line showing `cmd: <command>` from the compiled template
+- [ ] A `GateEvaluated` event for a `context-exists` gate renders a second line showing
+  `key: <key>`
+- [ ] A `GateEvaluated` event for a `children-complete` gate renders a second line showing
+  `children: <completed>/<total> complete`
+- [ ] When the compiled template is unavailable, `GateEvaluated` renders only the name and
+  result line — no crash, no error message, no blank line
 - [ ] An event type not in the known list is rendered as `[Unknown event: <type>]` and does
   not crash the dashboard
 - [ ] Events appear in chronological order (oldest first)
@@ -468,6 +482,10 @@ output rows for sessions discovered in other workspaces on the machine.
 
 - [ ] `koto init --intent "investigating issue #42"` persists `intent: investigating issue
   #42` in the state file header
+- [ ] `koto session update <name> --intent "new text"` overwrites the `intent` field in the
+  state file header of an existing session without modifying any other field
+- [ ] Running `koto session update` on a session that has no `intent` set adds the field;
+  running it on a session that already has `intent` replaces the value
 - [ ] A session initialized without `--intent` shows only the session ID in the list
   (no `·` separator)
 - [ ] A session where `<session-id> · <intent>` is exactly 60 characters shows the full
@@ -532,8 +550,13 @@ output rows for sessions discovered in other workspaces on the machine.
   rows for sessions discovered in other workspaces on the local machine
 - [ ] A session started in a new workspace after the dashboard is already running appears
   on the next polling cycle without restarting the dashboard
-- [ ] The session list orders sessions by most recent activity (the session that transitioned
-  most recently appears first in the list)
+- [ ] A `failed` session appears above a `running` session in the list regardless of which
+  transitioned more recently
+- [ ] A `blocked` session appears above a `running` session and below a `failed` session
+- [ ] Two `running` sessions are ordered by most recent transition (more recently active first)
+- [ ] `done` sessions appear below all active sessions (`failed`, `blocked`, `running`,
+  `unknown`)
+- [ ] `--once` output reflects the same severity-first ordering as the TUI
 
 ### Backwards compatibility
 
@@ -573,8 +596,9 @@ output rows for sessions discovered in other workspaces on the machine.
   template in `~/.cache/koto/<hash>.json`. Sessions imported from another machine or whose
   cache was cleared show the "Template unavailable" fallback. This matches the existing
   behavior of `koto status` for terminal detection.
-- **`intent` is set at init time only**: There is no command to update intent on an existing
-  session. Intent must be provided when running `koto init`.
+- **`intent` is human-editable but not auto-generated**: The dashboard renders intent when
+  present but cannot require agents to provide it. Sessions without intent fall back to
+  displaying the session ID only.
 - **`EvidenceSubmitted.summary` is agent-optional**: The dashboard renders it when present
   but cannot require agents to provide it. Evidence without a summary falls back to raw
   field display.
@@ -629,6 +653,32 @@ fewer than 20 characters for the intent after a typical 30-character session ID 
 columns, only the session ID is shown. This is an extension of the R16 list-only mode
 (below 80 columns) and resolves the narrow-terminal intent display question without a
 separate config option.
+
+**Decision: Gate condition shown inline in History tab — static definition, not runtime re-evaluation**
+`GateEvaluated` events render a second line with the gate type and condition summary derived
+from the compiled template. Alternatives considered: (1) no additional context — leaves
+`context-exists` and `context-matches` gates with zero explanation on failure; (2) re-evaluate
+the gate condition at render time to show "why it failed given current state" — rejected
+because this renders current truth not historical truth, misleading operators investigating
+past failures, and requires shell execution at render time; (3) collapsible section — adds
+a second navigation model inside an already-scrolling tab for marginal space savings; (4)
+show condition only on failure — pass context is equally useful when tracing progression
+and selective rendering forces non-uniform scrolling. The static two-line format is
+sufficient because the operator's question is always "what did this gate check?" — which
+the definition answers without runtime evaluation. The compiled template is already loaded
+for R6, so no new I/O is required.
+
+**Decision: Session list ordered by health severity, recency as tiebreaker**
+Sort key: failed (0) → blocked (1) → running (2) → unknown (3) → done (4), then most
+recently active descending within each bucket. Alternatives considered: (1) most recently
+active first (PRD draft) — conflates recency with urgency, forces the operator to mentally
+re-sort by status; (2) alphabetical (current `--once` implementation) — no relationship to
+urgency; (3) hybrid active-by-severity/done-by-recency — introduces an arbitrary boundary
+that complicates both the implementation and the mental model; (4) configurable ordering —
+premature for one well-defined primary use case, and `--once` consumers needing a different
+order can sort the output themselves. The severity-first ordering directly answers the
+operator's opening question ("which session needs attention?") without requiring a mental
+re-sort across the list.
 
 **Decision: Global session scope by default — no per-repo filtering**
 The dashboard discovers all sessions on the local machine from the outset rather than
