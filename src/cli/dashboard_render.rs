@@ -16,6 +16,9 @@ use ratatui::Frame;
 use crate::cli::dashboard_data::DetailData;
 use crate::cli::dashboard_state::{DashboardAppState, TaskCounts, ViewMode};
 
+/// Maximum number of evidence entries rendered in the detail pane.
+const EVIDENCE_DISPLAY_CAP: usize = 3;
+
 /// Draw the full dashboard to `f`.
 ///
 /// Switches between a full-height list (`ViewMode::List`) and a vertically-split
@@ -151,19 +154,19 @@ fn render_detail(
                 lines.push(Line::from(format!("Command: {}", cmd)));
             }
 
-            // Evidence entries: newest-first (already ordered), cap at 3.
+            // Evidence entries: newest-first (already ordered), cap at EVIDENCE_DISPLAY_CAP.
             let total_evidence = data.evidence.len();
-            let shown = data.evidence.iter().take(3);
-
-            lines.push(Line::from("Evidence:"));
-            for entry in shown {
-                let fields_str = serde_json::to_string(&entry.fields).unwrap_or_default();
-                lines.push(Line::from(format!("  [{}] {}", entry.state, fields_str)));
-            }
-
-            if total_evidence > 3 {
-                let more = total_evidence - 3;
-                lines.push(Line::from(format!("  \u{2193} {} more", more)));
+            if total_evidence > 0 {
+                lines.push(Line::from("Evidence:"));
+                for entry in data.evidence.iter().take(EVIDENCE_DISPLAY_CAP) {
+                    let fields_str = serde_json::to_string(&entry.fields)
+                        .expect("serde_json::Value serialization is infallible");
+                    lines.push(Line::from(format!("  [{}] {}", entry.state, fields_str)));
+                }
+                if total_evidence > EVIDENCE_DISPLAY_CAP {
+                    let more = total_evidence - EVIDENCE_DISPLAY_CAP;
+                    lines.push(Line::from(format!("  \u{2193} {} more", more)));
+                }
             }
 
             let text = Text::from(lines);
