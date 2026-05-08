@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: In Progress
 problem: |
   koto users running hours-long orchestration workflows — AI coding pipelines spanning
   multiple phases, batch jobs with hundreds of parallel tasks, and eventually full
@@ -26,7 +26,7 @@ source_issue: 366
 
 ## Status
 
-Accepted
+In Progress
 
 ## Problem Statement
 
