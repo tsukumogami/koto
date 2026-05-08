@@ -30,7 +30,12 @@ pub fn render_frame(f: &mut Frame<'_>, state: &DashboardAppState) {
             let chunks =
                 Layout::vertical([Constraint::Min(0), Constraint::Length(8)]).split(f.area());
             render_list(f, state, chunks[0]);
-            render_detail(f, state.detail_cache.as_ref(), chunks[1]);
+            render_detail(
+                f,
+                state.detail_cache.as_ref(),
+                state.focused_id.as_deref(),
+                chunks[1],
+            );
         }
     }
 }
@@ -105,14 +110,23 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
 
 /// Render the detail pane for the focused session.
 ///
-/// Shows `"Loading..."` when `detail` is `None`. When present, displays gate
+/// Shows `"Loading…"` when `detail` is `None`. When present, displays gate
 /// name, command, result, elapsed, and evidence entries (newest-first, capped at 3).
-fn render_detail(f: &mut Frame<'_>, detail: Option<&DetailData>, area: ratatui::layout::Rect) {
-    let block = Block::default().borders(Borders::ALL).title("Detail");
+fn render_detail(
+    f: &mut Frame<'_>,
+    detail: Option<&DetailData>,
+    session_name: Option<&str>,
+    area: ratatui::layout::Rect,
+) {
+    let title = match session_name {
+        Some(name) => format!(" {}: detail ", name),
+        None => " detail ".to_string(),
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
 
     match detail {
         None => {
-            let paragraph = Paragraph::new("Loading...").block(block);
+            let paragraph = Paragraph::new("Loading\u{2026}").block(block);
             f.render_widget(paragraph, area);
         }
         Some(data) => {
