@@ -92,8 +92,10 @@ three tiers (quick-check, status review, deep history).
    Unlimited depth. Status rollup covers `done_blocked` children. Parent shows worst-case
    descendant status when collapsed.
 
-6. **Scripting support.** `--once` mode includes intent and template name as additional
-   columns, appended after the existing four columns so current scripts continue to work.
+6. **Testability via `--once`.** The `--once` mode provides a non-interactive snapshot of
+   dashboard state, primarily useful for integration tests that assert on session data
+   without running the interactive TUI. Extending its columns to include `intent` and
+   `template_name` makes the new fields verifiable in automated tests.
 
 ## User Stories
 
@@ -128,10 +130,11 @@ As an operator who initializes many sessions from the same template for differen
 want each session to display a human-readable label alongside its slug identifier so I can
 tell them apart without memorizing session names.
 
-**US-7: Scripted status polling**
-As an automation author who parses `koto dashboard --once`, I want my current script (which
-reads four tab-separated columns) to continue working unchanged after this enhancement, while
-new scripts can also read the added `intent` and `template_name` columns.
+**US-7: Integration test verification**
+As a contributor writing integration tests for the dashboard, I want to run
+`koto dashboard --once` and assert on the tab-separated output to verify that `intent`,
+`template_name`, and `status_bucket` are correctly extracted and displayed — without
+driving the interactive TUI.
 
 ## Requirements
 
@@ -272,8 +275,10 @@ When expanded, each row shows its own independent status.
 The existing `TaskCounts` struct must be extended to track `blocked` and `done_blocked` as
 distinct buckets so that `done_blocked` terminal children are not conflated with `done`.
 
-**R13: `--once` scripting mode — extended columns**
-`koto dashboard --once` output must be extended from 4 to 6 tab-separated columns per line:
+**R13: `--once` mode — extended columns for testability**
+`koto dashboard --once` is a non-interactive snapshot mode primarily used in integration
+tests to assert on dashboard state without driving the TUI. Its output must be extended from
+4 to 6 tab-separated columns per line:
 ```
 session_id\tcurrent_state\telapsed\tstatus_bucket\tintent\ttemplate_name
 ```
