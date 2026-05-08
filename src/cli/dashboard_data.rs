@@ -56,4 +56,3 @@ pub struct DetailData {
 pub fn refresh(_tree: &mut SessionTree, _backend: &dyn SessionBackend) -> Result<()> {
     Ok(())
 }
-
