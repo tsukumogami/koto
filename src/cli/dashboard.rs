@@ -17,7 +17,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use crate::cli::dashboard_data::{self, compute_elapsed_since, CachedSession, SessionTree};
 use crate::cli::dashboard_render::render_frame;
-use crate::cli::dashboard_state::{DashboardAppState, ViewMode};
+use crate::cli::dashboard_state::DashboardAppState;
 use crate::cli::DashboardArgs;
 use crate::session::SessionBackend;
 
@@ -151,11 +151,20 @@ pub fn run(args: DashboardArgs, backend: &dyn SessionBackend) -> Result<()> {
             state.clamp_cursor();
             state.tick_count = 0;
 
-            // If in Detail mode, refresh the detail cache for the focused session.
-            if let (ViewMode::Detail, Some(ref id)) = (&state.view_mode, &state.focused_id) {
+            // Refresh detail cache for the focused session using mtime guard.
+            if let Some(ref id) = state.focused_id.clone() {
+                let current_mtime = state.tree.sessions.get(id).map(|s| s.mtime);
                 let path = state.tree.sessions.get(id).map(|s| s.state_path.clone());
-                if let Some(path) = path {
-                    state.detail_cache = dashboard_data::read_detail(&path, id);
+
+                let session_changed = state.detail_cache_session.as_deref() != Some(id.as_str());
+                let mtime_changed = current_mtime != state.detail_cache_mtime;
+
+                if session_changed || mtime_changed {
+                    if let Some(path) = path {
+                        state.detail_cache = dashboard_data::read_detail(&path, id);
+                        state.detail_cache_mtime = current_mtime;
+                        state.detail_cache_session = Some(id.clone());
+                    }
                 }
             }
         }

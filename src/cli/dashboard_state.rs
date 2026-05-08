@@ -4,8 +4,9 @@
 //! Provides cursor movement, keyboard dispatch, and depth-first tree
 //! flattening via `visible_rows()`.
 
+use std::cmp::Reverse;
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -42,6 +43,9 @@ pub struct TaskCounts {
 pub struct RowDescriptor {
     /// Depth in the session hierarchy (0 = root / coordinator, 1 = child).
     pub indent_depth: usize,
+    /// Tree connector string for display (e.g. "├─ ", "└─ ").
+    /// Empty for root/depth-0 rows.
+    pub connector: String,
     /// Session identifier (key in `SessionTree::sessions`).
     pub session_id: String,
     /// Human-readable display name derived from the session ID.
@@ -86,6 +90,12 @@ pub struct DashboardAppState {
     /// Cached gate detail for the currently focused session, or `None` when
     /// no session is focused or the detail has not been loaded yet.
     pub detail_cache: Option<DetailData>,
+
+    /// The last mtime seen when `detail_cache` was populated, for invalidation.
+    pub detail_cache_mtime: Option<SystemTime>,
+
+    /// The session ID that was focused when `detail_cache` was last populated.
+    pub detail_cache_session: Option<String>,
 }
 
 impl DashboardAppState {
@@ -105,6 +115,8 @@ impl DashboardAppState {
             tick_count: 0,
             poll_every_n_ticks,
             detail_cache: None,
+            detail_cache_mtime: None,
+            detail_cache_session: None,
         }
     }
 
@@ -126,12 +138,34 @@ impl DashboardAppState {
                 self.tick_count = self.poll_every_n_ticks.saturating_sub(1);
             }
 
-            // List-view navigation.
+            // List-view navigation updates focused_id.
             (ViewMode::List, KeyCode::Char('j') | KeyCode::Down, _) => {
                 self.move_cursor_down();
+                let rows = self.visible_rows();
+                if let Some(row) = rows.get(self.cursor_idx) {
+                    self.focused_id = Some(row.session_id.clone());
+                }
             }
             (ViewMode::List, KeyCode::Char('k') | KeyCode::Up, _) => {
                 self.move_cursor_up();
+                let rows = self.visible_rows();
+                if let Some(row) = rows.get(self.cursor_idx) {
+                    self.focused_id = Some(row.session_id.clone());
+                }
+            }
+
+            // List-view expand/collapse via arrow keys or vim keys.
+            (ViewMode::List, KeyCode::Right | KeyCode::Char('l'), _) => {
+                if let Some(ref id) = self.focused_id.clone() {
+                    if self.session_has_children(id) {
+                        self.expanded.insert(id.clone());
+                    }
+                }
+            }
+            (ViewMode::List, KeyCode::Left | KeyCode::Char('h'), _) => {
+                if let Some(ref id) = self.focused_id.clone() {
+                    self.expanded.remove(id);
+                }
             }
 
             // Enter in List view: transition to Detail for the focused session.
@@ -158,6 +192,20 @@ impl DashboardAppState {
                             }
                         }
                     }
+                }
+            }
+
+            // Detail-view expand/collapse via arrow keys or vim keys.
+            (ViewMode::Detail, KeyCode::Right | KeyCode::Char('l'), _) => {
+                if let Some(ref id) = self.focused_id.clone() {
+                    if self.session_has_children(id) {
+                        self.expanded.insert(id.clone());
+                    }
+                }
+            }
+            (ViewMode::Detail, KeyCode::Left | KeyCode::Char('h'), _) => {
+                if let Some(ref id) = self.focused_id.clone() {
+                    self.expanded.remove(id);
                 }
             }
 
@@ -235,31 +283,6 @@ impl DashboardAppState {
         })
     }
 
-    /// Collect children of a root session, sorted by priority:
-    /// failed → running → pending/blocked → terminal-but-not-failed.
-    fn sorted_children(&self, root_id: &str) -> Vec<String> {
-        let mut children: Vec<&str> = self
-            .tree
-            .sessions
-            .iter()
-            .filter(|(_, s)| {
-                s.header
-                    .parent_workflow
-                    .as_deref()
-                    .map(|p| p == root_id)
-                    .unwrap_or(false)
-            })
-            .map(|(name, _)| name.as_str())
-            .collect();
-
-        children.sort_by_key(|name| {
-            let s = &self.tree.sessions[*name];
-            sort_priority(s.is_terminal, s.current_state.as_deref())
-        });
-
-        children.iter().map(|s| s.to_string()).collect()
-    }
-
     /// Compute aggregate `TaskCounts` for a root session based on its children.
     fn task_counts_for_root(&self, root_id: &str) -> TaskCounts {
         let mut total = 0;
@@ -303,88 +326,130 @@ impl DashboardAppState {
 
     /// Build a depth-first ordered list of visible rows.
     ///
-    /// Roots appear at depth 0. When a root is in `expanded`, its children
-    /// follow immediately at depth 1, sorted by failure priority.
+    /// Roots appear at depth 0, sorted by health severity. When a session is
+    /// in `expanded`, its children follow immediately at depth+1 with tree
+    /// connectors (`├─ `/`└─ `), also sorted by health severity.
     pub fn visible_rows(&self) -> Vec<RowDescriptor> {
         let mut rows = Vec::new();
 
-        for root_id in &self.tree.roots {
-            // Root row.
-            let root_state = self
-                .tree
+        // Sort roots by health severity.
+        let mut sorted_roots: Vec<&String> = self.tree.roots.iter().collect();
+        sorted_roots.sort_by_key(|id| {
+            self.tree
                 .sessions
-                .get(root_id)
-                .and_then(|s| s.current_state.clone());
+                .get(*id)
+                .map(session_sort_key)
+                .unwrap_or((3, Reverse(SystemTime::UNIX_EPOCH)))
+        });
 
-            let task_counts = if self.session_has_children(root_id) {
-                Some(self.task_counts_for_root(root_id))
-            } else {
-                None
-            };
-
-            let root_elapsed = self
-                .tree
-                .sessions
-                .get(root_id)
-                .map(|s| compute_elapsed_since(&s.header.created_at))
-                .unwrap_or(Duration::ZERO);
-
-            rows.push(RowDescriptor {
-                indent_depth: 0,
-                session_id: root_id.clone(),
-                display_name: root_id.clone(),
-                state: root_state,
-                elapsed: root_elapsed,
-                task_counts,
-            });
-
-            // Children, only when expanded.
-            if self.expanded.contains(root_id) {
-                for child_id in self.sorted_children(root_id) {
-                    let child_state = self
-                        .tree
-                        .sessions
-                        .get(&child_id)
-                        .and_then(|s| s.current_state.clone());
-
-                    let child_elapsed = self
-                        .tree
-                        .sessions
-                        .get(&child_id)
-                        .map(|s| compute_elapsed_since(&s.header.created_at))
-                        .unwrap_or(Duration::ZERO);
-
-                    rows.push(RowDescriptor {
-                        indent_depth: 1,
-                        session_id: child_id.clone(),
-                        display_name: child_id.clone(),
-                        state: child_state,
-                        elapsed: child_elapsed,
-                        task_counts: None,
-                    });
-                }
-            }
+        for root_id in sorted_roots {
+            self.append_rows_for_session(root_id, &[], &mut rows);
         }
 
         rows
     }
+
+    /// Recursively append rows for a session and, if expanded, its children.
+    ///
+    /// `ancestor_is_last[i]` is `true` when the ancestor at depth `i` was the
+    /// last child of its own parent. This drives the `│ `/`  ` prefix and
+    /// `├─ `/`└─ ` connector at the current level.
+    fn append_rows_for_session(
+        &self,
+        session_id: &str,
+        ancestor_is_last: &[bool],
+        rows: &mut Vec<RowDescriptor>,
+    ) {
+        let depth = ancestor_is_last.len();
+
+        // Build the connector string (empty for root rows).
+        let connector = if depth == 0 {
+            String::new()
+        } else {
+            let mut s = String::new();
+            // For each ancestor above the current level, emit a continuation
+            // prefix: "│ " when that ancestor was not the last child, "  " when
+            // it was (no more siblings to connect).
+            for &is_last in &ancestor_is_last[..depth - 1] {
+                s.push_str(if is_last { "  " } else { "│ " });
+            }
+            // Current-level connector.
+            let is_last = *ancestor_is_last.last().unwrap_or(&false);
+            s.push_str(if is_last { "└─ " } else { "├─ " });
+            s
+        };
+
+        let session = self.tree.sessions.get(session_id);
+        let state = session.and_then(|s| s.current_state.clone());
+        let elapsed = session
+            .map(|s| compute_elapsed_since(&s.header.created_at))
+            .unwrap_or(Duration::ZERO);
+
+        let task_counts = if self.session_has_children(session_id) {
+            Some(self.task_counts_for_root(session_id))
+        } else {
+            None
+        };
+
+        rows.push(RowDescriptor {
+            indent_depth: depth,
+            connector,
+            session_id: session_id.to_string(),
+            display_name: session_id.to_string(),
+            state,
+            elapsed,
+            task_counts,
+        });
+
+        // Recurse into children if this session is expanded.
+        if self.expanded.contains(session_id) {
+            let mut children: Vec<&String> = self
+                .tree
+                .sessions
+                .iter()
+                .filter(|(_, s)| s.header.parent_workflow.as_deref() == Some(session_id))
+                .map(|(name, _)| name)
+                .collect();
+            children.sort_by_key(|id| {
+                self.tree
+                    .sessions
+                    .get(*id)
+                    .map(session_sort_key)
+                    .unwrap_or((3, Reverse(SystemTime::UNIX_EPOCH)))
+            });
+
+            let child_count = children.len();
+            for (i, child_id) in children.iter().enumerate() {
+                let is_last = i == child_count - 1;
+                let mut new_ancestors = ancestor_is_last.to_vec();
+                new_ancestors.push(is_last);
+                self.append_rows_for_session(child_id, &new_ancestors, rows);
+            }
+        }
+    }
 }
 
-/// Classify a session's state into a sort priority bucket (lower = shown first).
+/// Sort key for health-severity ordering.
 ///
-/// 0 = failed, 1 = running, 2 = pending/blocked, 3 = terminal-not-failed
-fn sort_priority(is_terminal: bool, state: Option<&str>) -> u8 {
-    if is_terminal {
-        if is_failed_state(state) {
+/// Priority buckets: failed=0, blocked=1, running=2, unknown=3, done=4.
+/// Within each bucket, sessions are ordered by most-recent mtime descending.
+pub(crate) fn session_sort_key(
+    session: &crate::cli::dashboard_data::CachedSession,
+) -> (u8, Reverse<SystemTime>) {
+    let bucket = if session.is_terminal {
+        if is_failed_state(session.current_state.as_deref()) {
             0 // failed
         } else {
-            3 // terminal but not failed
+            4 // done
         }
-    } else if state.is_some() {
-        1 // running
+    } else if session.is_blocked {
+        1 // blocked
+    } else if session.current_state.is_some() {
+        2 // running
     } else {
-        2 // pending/blocked
-    }
+        3 // unknown/pending
+    };
+    (bucket, Reverse(session.mtime))
 }
 
 /// Return true if `state` contains "failed" or "error" (case-insensitive).
@@ -813,5 +878,118 @@ mod tests {
         state.cursor_idx = 5;
         state.clamp_cursor();
         assert_eq!(state.cursor_idx, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // three-level tree connectors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn visible_rows_three_level_tree_connectors() {
+        // Tree: root -> [child-a (non-last), child-b (last)]
+        //       child-a -> [gc-1 (last)]
+        let mut state = DashboardAppState::new(500);
+        state.tree.sessions.insert(
+            "root".to_string(),
+            make_session("root", None, Some("running"), false),
+        );
+        state.tree.sessions.insert(
+            "child-a".to_string(),
+            make_session("child-a", Some("root"), Some("running"), false),
+        );
+        state.tree.sessions.insert(
+            "child-b".to_string(),
+            make_session("child-b", Some("root"), Some("done"), true),
+        );
+        state.tree.sessions.insert(
+            "gc-1".to_string(),
+            make_session("gc-1", Some("child-a"), Some("running"), false),
+        );
+        state.tree.roots = vec!["root".to_string()];
+        state.expanded.insert("root".to_string());
+        state.expanded.insert("child-a".to_string());
+
+        let rows = state.visible_rows();
+        // Expect root, child-a, gc-1, child-b (health-severity order: running before done)
+        assert_eq!(rows.len(), 4);
+
+        let root_row = rows.iter().find(|r| r.session_id == "root").unwrap();
+        assert_eq!(root_row.indent_depth, 0);
+        assert_eq!(root_row.connector, "");
+
+        let gc_row = rows.iter().find(|r| r.session_id == "gc-1").unwrap();
+        assert_eq!(gc_row.indent_depth, 2);
+        assert!(
+            !gc_row.connector.is_empty(),
+            "grandchild must have a non-empty connector"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // health-severity ordering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn visible_rows_health_severity_ordering() {
+        let mut state = DashboardAppState::new(500);
+
+        let mut make_session_blocked = |name: &str,
+                                        parent: Option<&str>,
+                                        state_str: Option<&str>,
+                                        is_terminal: bool,
+                                        is_blocked: bool| {
+            let mut s = make_session(name, parent, state_str, is_terminal);
+            s.is_blocked = is_blocked;
+            s
+        };
+
+        state.tree.sessions.insert(
+            "s-done".to_string(),
+            make_session_blocked("s-done", None, Some("done"), true, false),
+        );
+        state.tree.sessions.insert(
+            "s-failed".to_string(),
+            make_session_blocked("s-failed", None, Some("failed"), true, false),
+        );
+        state.tree.sessions.insert(
+            "s-running".to_string(),
+            make_session_blocked("s-running", None, Some("gather"), false, false),
+        );
+        state.tree.sessions.insert(
+            "s-blocked".to_string(),
+            make_session_blocked("s-blocked", None, Some("waiting"), false, true),
+        );
+        state.tree.sessions.insert(
+            "s-unknown".to_string(),
+            make_session_blocked("s-unknown", None, None, false, false),
+        );
+
+        // Let visible_rows sort — do not pre-sort roots.
+        state.tree.roots = state.tree.sessions.keys().cloned().collect();
+
+        let rows = state.visible_rows();
+        assert_eq!(rows.len(), 5);
+
+        let positions: std::collections::HashMap<&str, usize> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.session_id.as_str(), i))
+            .collect();
+        assert!(
+            positions["s-failed"] < positions["s-blocked"],
+            "failed must come before blocked"
+        );
+        assert!(
+            positions["s-blocked"] < positions["s-running"],
+            "blocked must come before running"
+        );
+        assert!(
+            positions["s-running"] < positions["s-unknown"],
+            "running must come before unknown"
+        );
+        assert!(
+            positions["s-unknown"] < positions["s-done"],
+            "unknown must come before done"
+        );
     }
 }

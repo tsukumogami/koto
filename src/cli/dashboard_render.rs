@@ -62,7 +62,7 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
     let rows: Vec<Row> = rows_data
         .iter()
         .map(|row| {
-            let name_cell = format!("{}{}", " ".repeat(row.indent_depth * 2), row.display_name);
+            let name_cell = format!("{}{}", row.connector, row.display_name);
 
             let state_cell = row.state.as_deref().unwrap_or("-").to_string();
             let elapsed_cell = format_duration(row.elapsed);
