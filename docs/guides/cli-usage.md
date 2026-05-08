@@ -671,6 +671,60 @@ koto session resolve <name> --keep remote
 
 After resolving, normal operations resume.
 
+### dashboard
+
+Opens a live TUI showing all sessions for the current repository. Unlike other koto commands, `dashboard` outputs to the terminal rather than JSON, so it's not suitable for agent use.
+
+```bash
+koto dashboard [<name>] [--once] [--interval <ms>]
+```
+
+**Positional argument:**
+- `<name>` -- Optional. When provided, filters the display to the named session only.
+
+**Optional flags:**
+- `--once` -- Print a snapshot and exit. Outputs tab-separated lines, one per session, then exits 0. Exits 0 even when the session directory is empty.
+- `--interval <ms>` -- Override the default 500ms poll interval. Only affects the live TUI mode.
+
+**TUI navigation:**
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Move cursor down / up |
+| `Enter` | Open detail panel for selected session |
+| `Escape` | Close detail panel |
+| `r` | Force refresh |
+| `q` | Quit |
+
+The TUI shows all sessions as a tree with each session's current state, elapsed time, and task counts. It polls for changes at 500ms by default.
+
+**`--once` output format:**
+
+Each line is tab-separated with four fields:
+
+```
+<name>\t<current_state>\t<elapsed>\t<status_bucket>
+```
+
+The `status_bucket` column uses one of five values: `running`, `done`, `failed`, `blocked`, or `unknown`.
+
+**Examples:**
+
+```bash
+# Open the live TUI for all sessions
+koto dashboard
+
+# Watch a single session
+koto dashboard my-workflow
+
+# Snapshot for scripting
+koto dashboard --once
+
+# Snapshot for a specific session, faster poll in live mode
+koto dashboard --once my-workflow
+koto dashboard --interval 200
+```
+
 ### version
 
 Prints version information as JSON.

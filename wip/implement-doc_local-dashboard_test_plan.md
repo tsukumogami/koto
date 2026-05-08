@@ -186,7 +186,7 @@ Issues covered: 6
 - Press Escape; verify detail panel disappears
 - Press `q`; verify TUI exits cleanly
 **Expected**: session tree renders correctly with hierarchical indentation; cursor navigation works; detail panel slides up on Enter and closes on Escape; `q` exits with terminal restored
-**Status**: pending
+**Status**: deferred — requires PTY for TUI rendering
 
 ---
 

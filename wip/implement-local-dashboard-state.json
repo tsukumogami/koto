@@ -1,5 +1,5 @@
 {
-  "pr_status": "implementing",
+  "pr_status": "finalizing",
   "design_doc": "docs/plans/PLAN-local-dashboard.md",
   "branch": "docs/local-dashboard",
   "pr_number": 154,
@@ -581,8 +581,8 @@
     {
       "number": 5,
       "title": "feat(cli): implement dashboard entry point and --once mode",
-      "status": "pushed",
-      "ci_status": "pending",
+      "status": "completed",
+      "ci_status": "passed",
       "ci_fix_attempts": 0,
       "issue_type": "code",
       "dependencies": [],
@@ -690,12 +690,15 @@
     {
       "number": 6,
       "title": "test(cli): add dashboard integration tests",
-      "status": "implemented",
-      "ci_status": "pending",
+      "status": "completed",
+      "ci_status": "passed",
       "ci_fix_attempts": 0,
       "issue_type": "code",
       "dependencies": [],
-      "commits": [],
+      "commits": [
+        "fd471cb",
+        "31a9f91"
+      ],
       "agent_type": "coder",
       "summary": {
         "narrative": "",
@@ -703,7 +706,7 @@
           "tests/dashboard_test.rs"
         ],
         "tests_added": 3,
-        "key_decisions": "Used assert_cmd + assert_fs crates. Terminal session created via koto init + manual JSONL append (koto next deletes session dir on terminal). Running session stays in gather via conditional transition requiring evidence. State file path is sessions/<name>/koto-<name>.state.jsonl.",
+        "key_decisions": "Used assert_cmd + assert_fs crates. Terminal session created via koto init + persistence::append_event (koto next deletes session dir on terminal). Running session stays in gather via conditional transition requiring evidence. XDG_CACHE_HOME redirected to temp dir for test isolation.",
         "requirements_map": [
           {
             "ac": "tests/dashboard_test.rs exists with at least one integration test",
