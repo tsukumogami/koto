@@ -472,6 +472,12 @@ fn init_child_core(
         parent_workflow: parent_name.map(|s| s.to_string()),
         template_source_dir,
         session_id: generate_session_id(),
+        intent: None,
+        template_name: if cached.compiled.name.is_empty() {
+            None
+        } else {
+            Some(cached.compiled.name.clone())
+        },
     };
 
     let init_payload = EventPayload::WorkflowInitialized {
@@ -607,6 +613,8 @@ Done.
             parent_workflow: None,
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         let events = vec![Event {
             seq: 1,

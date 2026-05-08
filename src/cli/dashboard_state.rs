@@ -391,6 +391,8 @@ mod tests {
             parent_workflow: parent.map(|s| s.to_string()),
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         }
     }
 

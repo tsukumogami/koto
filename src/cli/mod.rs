@@ -103,6 +103,10 @@ pub enum Command {
         /// Name of an existing parent workflow (creates a child workflow)
         #[arg(long)]
         parent: Option<String>,
+
+        /// Human-readable description of the workflow's goal
+        #[arg(long)]
+        intent: Option<String>,
     },
 
     /// Get the current state directive for a workflow
@@ -291,6 +295,14 @@ pub enum SessionCommand {
         /// per-child `koto session resolve`.
         #[arg(long, value_enum, default_value_t = ChildrenPolicy::Auto)]
         children: ChildrenPolicy,
+    },
+    /// Update session metadata fields
+    Update {
+        /// Session name
+        name: String,
+        /// Set the workflow's intent description
+        #[arg(long)]
+        intent: String,
     },
 }
 
@@ -811,9 +823,17 @@ pub fn run(app: App) -> Result<()> {
             template,
             vars,
             parent,
+            intent,
         } => {
             let backend = build_backend()?;
-            handle_init(&backend, &name, &template, &vars, parent.as_deref())
+            handle_init(
+                &backend,
+                &name,
+                &template,
+                &vars,
+                parent.as_deref(),
+                intent.as_deref(),
+            )
         }
         Command::Next {
             name,
@@ -923,6 +943,17 @@ pub fn run(app: App) -> Result<()> {
                     keep,
                     children,
                 } => session::handle_resolve(&backend, &name, &keep, children),
+                SessionCommand::Update { name, intent } => {
+                    session::handle_update(&backend, &name, &intent)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "name": name,
+                            "updated": true
+                        }))?
+                    );
+                    Ok(())
+                }
             }
         }
         Command::Context { subcommand } => {
@@ -1223,6 +1254,7 @@ fn handle_init(
     template: &str,
     vars: &[String],
     parent: Option<&str>,
+    intent: Option<&str>,
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation.
     if let Err(msg) = crate::discover::validate_workflow_name(name) {
@@ -1312,6 +1344,14 @@ fn handle_init(
                     exit_with_error(body);
                 }
             }
+        }
+    }
+
+    // If --intent was provided, append an IntentUpdated event.
+    if let Some(intent_str) = intent {
+        if let Err(e) = session::handle_update(backend, name, intent_str) {
+            // Non-fatal: log a warning but do not abort the init.
+            eprintln!("warning: failed to record intent: {}", e);
         }
     }
 

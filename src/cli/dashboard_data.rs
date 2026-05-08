@@ -300,6 +300,8 @@ fn make_empty_header() -> StateFileHeader {
         parent_workflow: None,
         template_source_dir: None,
         session_id: String::new(),
+        intent: None,
+        template_name: None,
     }
 }
 
@@ -530,6 +532,8 @@ mod tests {
             parent_workflow: parent.map(|s| s.to_string()),
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         }
     }
 

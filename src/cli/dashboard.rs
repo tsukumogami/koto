@@ -194,6 +194,8 @@ mod tests {
                 parent_workflow: None,
                 template_source_dir: None,
                 session_id: String::new(),
+                intent: None,
+                template_name: None,
             },
             current_state: current_state.map(|s| s.to_string()),
             is_terminal,

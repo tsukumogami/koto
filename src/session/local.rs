@@ -828,6 +828,8 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
     }
@@ -1285,6 +1287,8 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         let events = vec![
             Event {
@@ -1368,6 +1372,8 @@ mod tests {
                     parent_workflow: None,
                     template_source_dir: None,
                     session_id: String::new(),
+                    intent: None,
+                    template_name: None,
                 };
                 let events = vec![Event {
                     seq: 1,
@@ -1799,6 +1805,8 @@ mod tests {
             parent_workflow: parent.map(|s| s.to_string()),
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
     }
@@ -1925,6 +1933,8 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             session_id: original_session_id.to_string(),
+            intent: None,
+            template_name: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
 

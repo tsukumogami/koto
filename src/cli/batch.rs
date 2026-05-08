@@ -4018,6 +4018,8 @@ mod tests {
             parent_workflow: Some("p".to_string()),
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
     }
@@ -4128,6 +4130,8 @@ mod tests {
             parent_workflow: Some("p".to_string()),
             template_source_dir: None,
             session_id: String::new(),
+            intent: None,
+            template_name: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
         // Append a WorkflowInitialized event so the file is
