@@ -72,7 +72,7 @@ impl CloudBackend {
     /// `LocalBackend`). The cloud config provides S3 endpoint, bucket
     /// name, region, and credentials.
     pub fn new(working_dir: &Path, cloud_config: &CloudConfig) -> anyhow::Result<Self> {
-        let local = LocalBackend::new(working_dir)?;
+        let local = LocalBackend::new()?;
         let prefix = repo_id(working_dir)?;
         let bucket = create_bucket(cloud_config)?;
         Ok(Self {

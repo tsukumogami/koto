@@ -25,23 +25,22 @@ pub(crate) const INIT_TMP_SUFFIX: &str = ".tmp";
 /// Filesystem-backed session storage.
 ///
 /// Stores sessions at `<base_dir>/<id>/` where `base_dir` is typically
-/// `~/.koto/sessions/<repo-id>/`.
+/// `~/.koto/sessions/`.
 pub struct LocalBackend {
     base_dir: PathBuf,
 }
 
 impl LocalBackend {
-    /// Create a backend rooted at `~/.koto/sessions/<repo-id>/`.
+    /// Create a backend rooted at `~/.koto/sessions/`.
     ///
-    /// The `working_dir` is canonicalized and hashed to produce a stable
-    /// repo-id that scopes sessions per project.
-    pub fn new(working_dir: &Path) -> anyhow::Result<Self> {
+    /// Sessions from the old per-repo layout (`~/.koto/sessions/<repo-id>/`)
+    /// are migrated to the flat layout on first use.
+    pub fn new() -> anyhow::Result<Self> {
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
-        let id = repo_id(working_dir)?;
-        Ok(Self {
-            base_dir: home.join(".koto").join("sessions").join(id),
-        })
+        let base_dir = home.join(".koto").join("sessions");
+        migrate_if_needed(&base_dir);
+        Ok(Self { base_dir })
     }
 
     /// Create a backend with an explicit base directory.
@@ -602,6 +601,76 @@ pub(crate) fn repo_id(working_dir: &Path) -> anyhow::Result<String> {
         .map_err(|e| anyhow::anyhow!("failed to canonicalize {}: {}", working_dir.display(), e))?;
     let hash = sha256_hex(canonical.to_string_lossy().as_bytes());
     Ok(hash[..16].to_string())
+}
+
+/// Migrate sessions from the old per-repo layout to the flat layout.
+///
+/// The old layout placed sessions under `base/<repo-id>/` where `<repo-id>`
+/// was exactly 16 lowercase hexadecimal characters. This function detects
+/// such subdirectories and moves their contents up one level to `base/`.
+fn migrate_if_needed(base: &Path) {
+    let entries = match fs::read_dir(base) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        // Detect old-layout dirs: exactly 16 lowercase hex characters.
+        if name.len() != 16
+            || !name
+                .chars()
+                .all(|c: char| c.is_ascii_digit() || matches!(c, 'a'..='f'))
+        {
+            continue;
+        }
+
+        let old_dir = path;
+        let sessions = match fs::read_dir(&old_dir) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let mut migrated_count = 0usize;
+        for session_entry in sessions.flatten() {
+            let session_name = session_entry.file_name();
+            let dest = base.join(&session_name);
+            if dest.exists() {
+                eprintln!(
+                    "koto: migration skipped {}: session already exists at {}",
+                    session_name.to_string_lossy(),
+                    dest.display()
+                );
+            } else {
+                match fs::rename(session_entry.path(), &dest) {
+                    Ok(()) => migrated_count += 1,
+                    Err(e) => {
+                        eprintln!(
+                            "koto: migration error moving {}: {}",
+                            session_name.to_string_lossy(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        if migrated_count > 0 {
+            eprintln!(
+                "koto: migrated sessions from {} to {}",
+                old_dir.display(),
+                base.display()
+            );
+        }
+        let _ = fs::remove_dir(&old_dir);
+    }
 }
 
 /// Atomically move `src` to `dst` with "fail if destination exists"
@@ -1866,5 +1935,61 @@ mod tests {
             relocated_header.session_id, original_session_id,
             "session_id must survive relocate unchanged"
         );
+    }
+
+    // -- scenario N: migrate_if_needed --
+
+    #[test]
+    fn migrate_noop_when_no_old_layout_dirs() {
+        let tmp = TempDir::new().unwrap();
+        // No old-layout subdirs exist — function should be a no-op
+        migrate_if_needed(tmp.path());
+        // No sessions created
+        let entries: Vec<_> = fs::read_dir(tmp.path()).unwrap().collect();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn migrate_moves_sessions_up_one_level() {
+        let tmp = TempDir::new().unwrap();
+        // Create old-layout structure: base/abcdef1234567890/mysession/
+        let old_dir = tmp.path().join("abcdef1234567890");
+        let session_dir = old_dir.join("mysession");
+        fs::create_dir_all(&session_dir).unwrap();
+        // Write a dummy file so the session dir isn't empty
+        fs::write(session_dir.join("state.jsonl"), b"test").unwrap();
+
+        migrate_if_needed(tmp.path());
+
+        // Session should be at base/mysession
+        assert!(tmp.path().join("mysession").exists());
+        // Old-layout dir should be gone (or empty)
+        assert!(!tmp
+            .path()
+            .join("abcdef1234567890")
+            .join("mysession")
+            .exists());
+    }
+
+    #[test]
+    fn migrate_leaves_collision_in_place() {
+        let tmp = TempDir::new().unwrap();
+        // Create old-layout session
+        let old_dir = tmp.path().join("abcdef1234567890");
+        let old_session = old_dir.join("conflict");
+        fs::create_dir_all(&old_session).unwrap();
+        fs::write(old_session.join("old.jsonl"), b"old").unwrap();
+
+        // Create conflicting session at base level
+        let existing_session = tmp.path().join("conflict");
+        fs::create_dir_all(&existing_session).unwrap();
+        fs::write(existing_session.join("new.jsonl"), b"new").unwrap();
+
+        migrate_if_needed(tmp.path());
+
+        // Conflicting session at base level is untouched
+        assert!(tmp.path().join("conflict").join("new.jsonl").exists());
+        // Old session remains (not moved)
+        assert!(old_session.join("old.jsonl").exists());
     }
 }

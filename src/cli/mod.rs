@@ -537,8 +537,7 @@ fn build_local_backend() -> Result<LocalBackend> {
     if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
         Ok(LocalBackend::with_base_dir(PathBuf::from(base)))
     } else {
-        let working_dir = std::env::current_dir()?;
-        LocalBackend::new(&working_dir)
+        LocalBackend::new()
     }
 }
 
