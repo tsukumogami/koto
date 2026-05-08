@@ -12,6 +12,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::cli::dashboard_data::{DetailData, SessionTree};
 
 /// Which pane the user is currently viewing.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ViewMode {
     /// The session list (default view).
     List,
