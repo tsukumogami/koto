@@ -1,0 +1,39 @@
+{
+  "topic": "local-dashboard",
+  "decisions": [
+    {
+      "id": 1,
+      "question": "Event loop architecture: how should the dashboard interleave keyboard event handling and periodic session-file polling in a synchronous (no async runtime) Rust binary? Options include: (A) single-threaded tick loop using crossterm::event::poll() with a short timeout, (B) two threads — one for keyboard events, one for file polling — communicating via a channel, (C) non-blocking crossterm::event::try_read() with an explicit sleep between ticks.",
+      "status": "complete",
+      "chosen": "A",
+      "complexity": "standard",
+      "report_file": "wip/design_local-dashboard_decision_1_report.md"
+    },
+    {
+      "id": 2,
+      "question": "Session state model: how should the dashboard represent the session hierarchy in memory, derive aggregate counts, and refresh state on each poll cycle? Options include: (A) read all session headers on each tick and rebuild the tree from scratch, (B) cache session metadata by last-modified time and re-read only changed files, (C) maintain a mutable tree ADT with incremental diffs applied on each poll cycle.",
+      "status": "complete",
+      "chosen": "C",
+      "complexity": "standard",
+      "report_file": "wip/design_local-dashboard_decision_2_report.md"
+    },
+    {
+      "id": 3,
+      "question": "ratatui widget layout: how should the TUI panels be organized? Options include: (A) single scrollable session list occupying the full window with a contextual detail footer (gate + evidence) for the selected row, (B) vertical split with session tree on the left (~60%) and detail panel on the right (~40%), (C) tabbed layout with a 'Sessions' tab and a 'Detail' tab that the user switches between.",
+      "status": "complete",
+      "chosen": "A",
+      "complexity": "standard",
+      "report_file": "wip/design_local-dashboard_decision_3_report.md"
+    },
+    {
+      "id": 4,
+      "question": "Module organization: where should dashboard code live in the existing koto codebase? Options include: (A) new file src/cli/dashboard.rs (alongside other CLI modules like next.rs, session.rs), (B) new top-level module src/dashboard/ with its own mod.rs, data layer, and rendering submodules, (C) inline in src/cli/mod.rs alongside the Dashboard command handler.",
+      "status": "complete",
+      "chosen": "A (with sub-files)",
+      "complexity": "standard",
+      "report_file": "wip/design_local-dashboard_decision_4_report.md"
+    }
+  ],
+  "cross_validation": "passed",
+  "round": 1
+}
