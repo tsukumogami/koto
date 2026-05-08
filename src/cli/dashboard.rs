@@ -124,10 +124,10 @@ pub fn run(args: DashboardArgs, backend: &dyn SessionBackend) -> Result<()> {
     }
 
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
-    // The guard restores the terminal on any exit path from this point forward,
-    // including returns via `?` and panics.
+    // Bind the guard immediately after enable_raw_mode so that if
+    // EnterAlternateScreen fails, disable_raw_mode still runs on drop.
     let _guard = TerminalGuard;
+    execute!(io::stdout(), EnterAlternateScreen)?;
 
     let crossterm_backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(crossterm_backend)?;

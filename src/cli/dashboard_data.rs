@@ -808,6 +808,60 @@ mod tests {
         assert!(!cached.is_terminal);
     }
 
+    #[test]
+    fn read_session_with_failed_gate_sets_is_blocked() {
+        let dir = TempDir::new().unwrap();
+        // Write a session with a transition to "build" followed by a failed gate.
+        let path = write_state_file_with_transition(dir.path(), "blocked-session", "build");
+        append_event(
+            &path,
+            &EventPayload::GateEvaluated {
+                state: "build".to_string(),
+                gate: "lint-gate".to_string(),
+                output: serde_json::Value::Null,
+                outcome: "failed".to_string(),
+                timestamp: "2026-01-01T00:00:02Z".to_string(),
+            },
+            "2026-01-01T00:00:02Z",
+        )
+        .unwrap();
+
+        let cached = read_session(&path);
+
+        assert_eq!(cached.current_state, Some("build".to_string()));
+        assert!(
+            cached.is_blocked,
+            "failed gate should set is_blocked = true"
+        );
+        assert!(!cached.is_terminal);
+    }
+
+    #[test]
+    fn read_session_with_passed_gate_is_not_blocked() {
+        let dir = TempDir::new().unwrap();
+        let path = write_state_file_with_transition(dir.path(), "passing-session", "build");
+        append_event(
+            &path,
+            &EventPayload::GateEvaluated {
+                state: "build".to_string(),
+                gate: "lint-gate".to_string(),
+                output: serde_json::Value::Null,
+                outcome: "passed".to_string(),
+                timestamp: "2026-01-01T00:00:02Z".to_string(),
+            },
+            "2026-01-01T00:00:02Z",
+        )
+        .unwrap();
+
+        let cached = read_session(&path);
+
+        assert_eq!(cached.current_state, Some("build".to_string()));
+        assert!(
+            !cached.is_blocked,
+            "passed gate should leave is_blocked = false"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // refresh: orchestration
     // -----------------------------------------------------------------------
