@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::{Kt1Config, KotoConfig};
+use super::{KotoConfig, Kt1Config};
 
 /// Override values for the `kt1` config block that come from outside
 /// the layered config files. Each `None` means "no override at this
