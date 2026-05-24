@@ -10,4 +10,5 @@ pub mod path_resolution;
 pub mod persistence;
 pub mod scheduler_warning;
 pub mod substitute;
+pub mod terminal_index;
 pub mod types;
