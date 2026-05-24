@@ -141,6 +141,15 @@ pub enum Command {
         /// project > user > built-in default).
         #[arg(long = "redelegation-cap")]
         redelegation_cap: Option<u32>,
+
+        /// Dispatch epoch the writer is presenting (Issue 13 / PRD R43).
+        /// Required for `--with-data` writes against a CHILD workflow's
+        /// log: the koto CLI validates `presented == header.dispatch_epoch`
+        /// before any persistence call and rejects mismatches with
+        /// `EpochFenceViolation` (exit 65). Parent-workflow ticks
+        /// (`koto next <coord_workflow>`) do NOT require the flag.
+        #[arg(long = "dispatch-epoch")]
+        dispatch_epoch: Option<u32>,
     },
 
     /// Cancel a workflow, preventing further advancement
@@ -988,6 +997,7 @@ pub fn run(app: App) -> Result<()> {
             full,
             rationale,
             redelegation_cap,
+            dispatch_epoch,
         } => {
             let backend = build_backend()?;
             let context_store: &dyn ContextStore = &backend;
@@ -1001,6 +1011,7 @@ pub fn run(app: App) -> Result<()> {
                 full,
                 rationale,
                 redelegation_cap,
+                dispatch_epoch,
             )
         }
         Command::Cancel { name, cleanup } => {
@@ -1980,6 +1991,7 @@ fn handle_next(
     full: bool,
     rationale: Option<String>,
     redelegation_cap: Option<u32>,
+    dispatch_epoch: Option<u32>,
 ) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
@@ -2385,6 +2397,66 @@ fn handle_next(
             exit_with_error_code(json, ne.code.exit_code());
         }
     };
+
+    // Issue 13: epoch fence on CHILD-log writes. The fence applies
+    // ONLY to `--with-data` writes against a child workflow's log
+    // (header.parent_workflow.is_some()). Coordinator-side ticks
+    // against the parent workflow's own log are NOT under the fence
+    // per R43's wording ("every writer to a CHILD'S log"). The check
+    // fires BEFORE any persistence write so an on-mismatch rejection
+    // never leaves partial state on disk.
+    //
+    // A missing `--dispatch-epoch` flag on a child-log write is an
+    // implicit mismatch: a writer that does not present an epoch is
+    // rejected as if it had presented the wrong epoch. The
+    // SubagentStop hook (Issue 16's spawn helper) bakes the epoch at
+    // spawn time and threads it through; a hook that omits the flag
+    // is a bug, and the fence surfaces it.
+    if with_data.is_some() && crate::engine::epoch::fence_applies_to(&header) {
+        let child_sid = match crate::engine::types::ValidatedSessionId::new(&name) {
+            Ok(v) => v,
+            Err(e) => {
+                // ValidatedSessionId::new returns EngineError::InvalidSessionId,
+                // which has its own exit code (1). Defer to it.
+                let code = e.exit_code();
+                exit_with_error_code(
+                    serde_json::json!({
+                        "error": format!("{}", e),
+                        "command": "next"
+                    }),
+                    code,
+                );
+            }
+        };
+        if let Err(e) = crate::engine::epoch::validate_epoch(&child_sid, &header, dispatch_epoch) {
+            // EpochFenceViolation maps to exit 65 (EX_DATAERR) via
+            // EngineError::exit_code. Use the typed envelope so
+            // operators reading the error see the fence-mismatch
+            // shape and can program against it.
+            let code = e.exit_code();
+            let (expected, presented) = match &e {
+                EngineError::EpochFenceViolation {
+                    expected,
+                    presented,
+                    ..
+                } => (*expected, *presented),
+                _ => unreachable!("validate_epoch returns EpochFenceViolation only"),
+            };
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": {
+                        "code": "epoch_fence_violation",
+                        "message": format!("{}", e),
+                        "child_session_id": name,
+                        "expected_dispatch_epoch": expected,
+                        "presented_dispatch_epoch": presented,
+                    },
+                    "command": "next"
+                }),
+                code,
+            );
+        }
+    }
 
     // 5. Handle --with-data (evidence submission)
     if let Some(ref data_str) = with_data {
@@ -3411,6 +3483,7 @@ fn handle_next(
     _full: bool,
     _rationale: Option<String>,
     _redelegation_cap: Option<u32>,
+    _dispatch_epoch: Option<u32>,
 ) -> Result<()> {
     exit_with_error_code(
         serde_json::json!({

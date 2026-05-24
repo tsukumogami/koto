@@ -104,6 +104,8 @@ koto next <name> --with-data @evidence.json
 
 The file must contain the JSON payload directly (no shell quoting needed) and must be at most 1 MB.
 
+**Dispatched-agent writes (`SubagentStop` hooks):** if you are a dispatched subagent writing back to a request-store child workflow, you MUST pass `--dispatch-epoch <n>` with the epoch baked into your spawn. Example: `koto next <child> --dispatch-epoch 0 --with-data '{"status":"completed"}'`. The koto CLI validates `presented == header.dispatch_epoch` before any persistence call and rejects mismatches with `EpochFenceViolation` (exit code 65). Operator-driven `koto next <coord_workflow>` calls on the parent workflow do NOT require the flag.
+
 ### Sub-case B: Gates failed, evidence fallback available
 
 **Signals:** `blocking_conditions` is non-empty, `expects.fields` is non-empty
