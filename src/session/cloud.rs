@@ -1139,6 +1139,7 @@ mod tests {
                 variables: Default::default(),
                 spawn_entry: None,
             },
+            idempotency_hash: None,
         }];
 
         // S3 push will fail (unreachable endpoint) but the call should
@@ -1189,6 +1190,7 @@ mod tests {
                 variables: Default::default(),
                 spawn_entry: None,
             },
+            idempotency_hash: None,
         }];
         backend
             .init_state_file("wf", header.clone(), events.clone())
@@ -1242,6 +1244,7 @@ mod tests {
                 variables: Default::default(),
                 spawn_entry: None,
             },
+            idempotency_hash: None,
         }];
         backend.init_state_file("wf", header, events).unwrap();
 

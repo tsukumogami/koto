@@ -1322,6 +1322,7 @@ mod tests {
                     variables: std::collections::HashMap::new(),
                     spawn_entry: None,
                 },
+                idempotency_hash: None,
             },
             Event {
                 seq: 2,
@@ -1333,6 +1334,7 @@ mod tests {
                     condition_type: "initial".to_string(),
                     skip_if_matched: None,
                 },
+                idempotency_hash: None,
             },
         ];
         (header, events)
@@ -1417,6 +1419,7 @@ mod tests {
                         variables: std::collections::HashMap::new(),
                         spawn_entry: None,
                     },
+                    idempotency_hash: None,
                 }];
                 bar.wait();
                 b.init_state_file("race", header, events)

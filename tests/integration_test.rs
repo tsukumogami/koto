@@ -414,16 +414,16 @@ fn next_returns_state_directive_transitions() {
         "error field should be null on success"
     );
 
-    // KT1 Issue 5: `unassigned_children` is carried on every
-    // directive-bearing `NextResponse` variant. The Terminal
-    // (`action: "done"`) and Error variants do not carry the field —
-    // a coordinator on a terminal workflow has nothing to dispatch.
-    // This test reaches Terminal via auto-advancement, so assert the
-    // field is ABSENT (matching the Terminal-variant Serialize
-    // contract) rather than `[]`.
-    assert!(
-        json.get("unassigned_children").is_none(),
-        "Terminal responses must not carry unassigned_children, got: {}",
+    // Task #18: `unassigned_children` is carried on every
+    // `NextResponse` variant including Terminal so coordinator-side
+    // consumers branch uniformly on the field's presence rather than
+    // on the action label. The test reaches Terminal via
+    // auto-advancement; assert the field is present and `[]` (no
+    // unassigned children exist in this fresh workflow's workspace).
+    assert_eq!(
+        json["unassigned_children"],
+        serde_json::json!([]),
+        "Terminal responses must carry an empty unassigned_children, got: {}",
         json
     );
 }

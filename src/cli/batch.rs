@@ -3736,6 +3736,7 @@ mod tests {
                 },
                 timestamp: "2026-04-14T00:00:00Z".to_string(),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(
@@ -3811,6 +3812,7 @@ mod tests {
                 timestamp: ts.to_string(),
                 superseded_by: None,
             },
+            idempotency_hash: None,
         }
     }
 
@@ -3829,6 +3831,7 @@ mod tests {
                 fields,
                 submitter_cwd: None,
             },
+            idempotency_hash: None,
         }
     }
 
@@ -4247,6 +4250,7 @@ mod tests {
                 outcome,
                 final_state: final_state.to_string(),
             },
+            idempotency_hash: None,
         }
     }
 
@@ -4370,6 +4374,7 @@ mod tests {
                 outcome: TerminalOutcome::Success,
                 final_state: "done".to_string(),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&ev).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4395,6 +4400,7 @@ mod tests {
                 condition_type: "gate".to_string(),
                 skip_if_matched: None,
             },
+            idempotency_hash: None,
         }];
         assert_eq!(last_rewind_seq(&events), None);
     }
@@ -4412,6 +4418,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                 },
+                idempotency_hash: None,
             },
             Event {
                 seq: 2,
@@ -4422,6 +4429,7 @@ mod tests {
                     to: "a".to_string(),
                     rationale: None,
                 },
+                idempotency_hash: None,
             },
             Event {
                 seq: 3,
@@ -4433,6 +4441,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                 },
+                idempotency_hash: None,
             },
             Event {
                 seq: 4,
@@ -4443,6 +4452,7 @@ mod tests {
                     to: "a".to_string(),
                     rationale: None,
                 },
+                idempotency_hash: None,
             },
         ];
         assert_eq!(last_rewind_seq(&events), Some(4));

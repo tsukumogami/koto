@@ -56,6 +56,7 @@ fn init_parent_backend(dir: &std::path::Path, parent: &str) -> LocalBackend {
         timestamp: header.created_at.clone(),
         event_type: init_payload.type_name().to_string(),
         payload: init_payload,
+        idempotency_hash: None,
     };
     backend
         .init_state_file(parent, header, vec![event])

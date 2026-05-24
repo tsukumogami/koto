@@ -440,6 +440,7 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
             variables: Default::default(),
             spawn_entry: None,
         },
+        idempotency_hash: None,
     };
     let transition_event = Event {
         seq: 2,
@@ -451,6 +452,7 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
             condition_type: "direct".to_string(),
             skip_if_matched: None,
         },
+        idempotency_hash: None,
     };
     seed_backend
         .init_state_file(&child, child_header, vec![init_event, transition_event])

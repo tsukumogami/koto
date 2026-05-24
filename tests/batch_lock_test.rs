@@ -69,6 +69,7 @@ fn init_backend(dir: &std::path::Path, id: &str) -> LocalBackend {
             variables: std::collections::HashMap::new(),
             spawn_entry: None,
         },
+        idempotency_hash: None,
     }];
     backend
         .init_state_file(id, header, events)

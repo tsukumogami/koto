@@ -38,6 +38,7 @@ fn evidence_event(seq: u64, fields: HashMap<String, serde_json::Value>) -> Event
         timestamp: "2026-05-24T00:00:00Z".to_string(),
         event_type: payload.type_name().to_string(),
         payload,
+        idempotency_hash: None,
     }
 }
 

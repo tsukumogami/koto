@@ -480,6 +480,7 @@ mod tests {
                     variables: HashMap::new(),
                     spawn_entry: None,
                 },
+                idempotency_hash: None,
             },
             Event {
                 seq: 2,
@@ -491,6 +492,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                 },
+                idempotency_hash: None,
             },
         ];
 
@@ -514,6 +516,7 @@ mod tests {
                     variables: HashMap::new(),
                     spawn_entry: None,
                 },
+                idempotency_hash: None,
             },
             Event {
                 seq: 2,
@@ -525,6 +528,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                 },
+                idempotency_hash: None,
             },
             Event {
                 seq: 3,
@@ -537,6 +541,7 @@ mod tests {
                     outcome: "failed".to_string(),
                     timestamp: ts.clone(),
                 },
+                idempotency_hash: None,
             },
         ];
 
