@@ -413,6 +413,19 @@ fn next_returns_state_directive_transitions() {
         json["error"].is_null(),
         "error field should be null on success"
     );
+
+    // KT1 Issue 5: `unassigned_children` is carried on every
+    // directive-bearing `NextResponse` variant. The Terminal
+    // (`action: "done"`) and Error variants do not carry the field —
+    // a coordinator on a terminal workflow has nothing to dispatch.
+    // This test reaches Terminal via auto-advancement, so assert the
+    // field is ABSENT (matching the Terminal-variant Serialize
+    // contract) rather than `[]`.
+    assert!(
+        json.get("unassigned_children").is_none(),
+        "Terminal responses must not carry unassigned_children, got: {}",
+        json
+    );
 }
 
 #[test]
@@ -1482,6 +1495,15 @@ fn next_with_to_performs_directed_transition() {
         "advanced should be true after directed transition"
     );
     assert!(json["error"].is_null(), "error should be null");
+
+    // KT1 Issue 5: the `--to` envelope must also carry the empty
+    // `unassigned_children` sibling so directive consumers see a
+    // uniform shape regardless of which `koto next` path produced it.
+    assert_eq!(
+        json["unassigned_children"],
+        serde_json::json!([]),
+        "unassigned_children should be present and empty on the --to path"
+    );
 
     // Verify the state file has a directed_transition event.
     let state_path = session_state_path(dir.path(), "directed-wf");

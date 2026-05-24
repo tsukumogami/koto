@@ -72,6 +72,8 @@ Every `koto next` response includes an `action` field. Dispatch on this field on
 
 Note: `directive` is absent on `done` responses. Don't expect it.
 
+Directive-bearing responses also include a top-level `unassigned_children: []` field. It lists child workflows that need agent dispatch and stays empty unless a workflow uses the request-store machinery. Treat the field as informational — it has no effect on the action you take on the current response.
+
 ## Handling `evidence_required`
 
 This action covers three distinct situations. Distinguish them by examining `blocking_conditions` and `expects.fields` together.
