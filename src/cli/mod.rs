@@ -1839,7 +1839,7 @@ fn handle_next(
     // applying the per-tick `--redelegation-cap` CLI flag (if any) on
     // top of the file+env layers already merged by load_config().
     // Emit the `[kt1.recursion]` reserved-namespace warning at startup.
-    let _kt1 = {
+    let kt1 = {
         let base = crate::config::resolve::load_config().unwrap_or_default();
         crate::config::warn_if_kt1_recursion_reserved(&base);
         let cli_overrides = crate::config::resolve::Kt1Overrides {
@@ -1848,6 +1848,17 @@ fn handle_next(
         };
         crate::config::resolve::kt1_config(&base.kt1, &cli_overrides)
     };
+
+    // Issue 7: cursor GC fires on every coordinator tick boot so
+    // abandoned coordinators' cursor state is reclaimed eventually.
+    // The walk is bounded by coordinator count (not session count) and
+    // tolerates a missing coordinators/ directory.
+    if let Some(home) = dirs::home_dir() {
+        let koto_root = home.join(".koto");
+        if let Err(e) = crate::engine::discovery::gc_stale_cursors(&koto_root, &kt1) {
+            eprintln!("warning: cursor GC failed at koto next startup: {}", e);
+        }
+    }
 
     // 1. Mutual exclusivity check
     if with_data.is_some() && to.is_some() {
@@ -2692,6 +2703,29 @@ fn handle_next(
                 }
             };
 
+            // Issue 7: run the discovery scan once per tick. The
+            // workflow being ticked IS the coordinator's own workflow,
+            // so its session id doubles as the coord_id for the cursor
+            // file and the candidate filter. A scan error is non-fatal
+            // — the directive still ships, just without populated
+            // `unassigned_children`. An invalid coord_id (workspace id
+            // that doesn't pass ValidatedCoordId's regex) is also
+            // non-fatal: scan returns empty.
+            let unassigned_children: Vec<crate::cli::next_types::UnassignedChild> = (|| {
+                let home = dirs::home_dir()?;
+                let koto_root = home.join(".koto");
+                let coord_id = crate::engine::types::ValidatedCoordId::new(&name).ok()?;
+                match crate::engine::discovery::scan(&koto_root, &coord_id, &kt1) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        eprintln!("warning: discovery scan failed: {}", e);
+                        None
+                    }
+                }
+            })(
+            )
+            .unwrap_or_default();
+
             let resp = match advance_result.stop_reason {
                 StopReason::Terminal => NextResponse::Terminal {
                     state: final_state.clone(),
@@ -2706,7 +2740,7 @@ fn handle_next(
                         details: details.clone(),
                         advanced,
                         blocking_conditions: blocking,
-                        unassigned_children: vec![],
+                        unassigned_children: unassigned_children.clone(),
                     }
                 }
                 StopReason::EvidenceRequired { failed_gates } => {
@@ -2728,7 +2762,7 @@ fn handle_next(
                         advanced,
                         expects: es,
                         blocking_conditions: blocking,
-                        unassigned_children: vec![],
+                        unassigned_children: unassigned_children.clone(),
                     }
                 }
                 StopReason::UnresolvableTransition => {
@@ -2751,7 +2785,7 @@ fn handle_next(
                     advanced,
                     expects,
                     integration: IntegrationOutput { name, output },
-                    unassigned_children: vec![],
+                    unassigned_children: unassigned_children.clone(),
                 },
                 StopReason::IntegrationUnavailable { name } => {
                     NextResponse::IntegrationUnavailable {
@@ -2764,7 +2798,7 @@ fn handle_next(
                             name,
                             available: false,
                         },
-                        unassigned_children: vec![],
+                        unassigned_children: unassigned_children.clone(),
                     }
                 }
                 StopReason::ActionRequiresConfirmation {
@@ -2788,7 +2822,7 @@ fn handle_next(
                         stderr,
                     },
                     expects,
-                    unassigned_children: vec![],
+                    unassigned_children: unassigned_children.clone(),
                 },
                 StopReason::CycleDetected { state: cycle_state } => {
                     // Cycle is a template bug; report as an error.
@@ -2828,7 +2862,7 @@ fn handle_next(
                             advanced,
                             expects: es.clone(),
                             blocking_conditions: vec![],
-                            unassigned_children: vec![],
+                            unassigned_children: unassigned_children.clone(),
                         }
                     } else {
                         NextResponse::EvidenceRequired {
@@ -2842,7 +2876,7 @@ fn handle_next(
                                 options: vec![],
                             },
                             blocking_conditions: vec![],
-                            unassigned_children: vec![],
+                            unassigned_children: unassigned_children.clone(),
                         }
                     }
                 }

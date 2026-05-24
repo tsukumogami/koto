@@ -116,7 +116,7 @@ Every successful response is a JSON object with an `action` field and an `error`
 
 "yes" = always present. "--" = absent from the JSON (not `null`, just missing). "object or `null`" = present as an object when the state has an `accepts` block, `null` otherwise. "optional" = present on first visit to the state (or when `--full` is passed), absent on subsequent visits and when the state has no details content.
 
-The `unassigned_children` array is present on every directive-bearing response (everything except Terminal `done`). Each element describes a child workflow waiting on agent dispatch with fields `child_session_id`, `role`, `template`, `inputs` (optional), `requested_by`, `created_at`, and `dispatch_epoch`. The list is populated by the discovery scan in a later phase; today it is always `[]`.
+The `unassigned_children` array is present on every directive-bearing response (everything except Terminal `done`). Each element describes a child workflow waiting on agent dispatch with fields `child_session_id`, `role`, `template`, `inputs` (optional), `requested_by`, `created_at`, and `dispatch_epoch`. The discovery scan populates the list from headers under `~/.koto/sessions/*` whose KT1 fields name the workflow being ticked as their `coordinator_of_record` and that have not yet been claimed; the list caps at `kt1.directive_batch_size` (default 50) per tick, with overflow surfaced on subsequent ticks.
 
 The `advanced` field is a boolean indicating that at least one state transition occurred during this invocation. It's informational only -- dispatch on `action`, not on `advanced`.
 

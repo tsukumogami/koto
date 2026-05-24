@@ -72,7 +72,7 @@ Every `koto next` response includes an `action` field. Dispatch on this field on
 
 Note: `directive` is absent on `done` responses. Don't expect it.
 
-Directive-bearing responses also include a top-level `unassigned_children: []` field. It lists child workflows that need agent dispatch and stays empty unless a workflow uses the request-store machinery. Treat the field as informational — it has no effect on the action you take on the current response.
+Directive-bearing responses also include a top-level `unassigned_children` array. It lists child workflows that name this coordinator as their `coordinator_of_record` and need agent dispatch; each element carries `child_session_id`, `role`, `template`, optional `inputs`, `requested_by`, `created_at`, and `dispatch_epoch`. The array stays empty unless the workspace contains unassigned children for this coordinator. Treat the field as informational alongside the directive — the current state's directive is still authoritative for what to do next.
 
 ## Handling `evidence_required`
 
