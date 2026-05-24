@@ -339,4 +339,6 @@ Read these on demand, not upfront. The sections above cover the common path. Con
 
 **Evidence rejected (`invalid_submission`)** — one or more fields didn't pass validation. The error includes a `details` array with per-field reasons. Fix the field values and resubmit. Call `koto next <name>` without `--with-data` to re-read the `expects` schema if needed.
 
+**"reserved audit-event kind"** — your `--with-data` payload included a `fields.kind` value that collides with the KT1 audit family. Four literal kinds (`ChildDispatched`, `ChildRedelegated`, `RequesterWoken`, `RequesterRespawn`) and anything starting with the `kt1.` prefix are reserved for the engine — template authors can't use them. Rename the field value to something workflow-specific (e.g., `"verdict"`, `"scrutineer"`) and resubmit.
+
 **`koto next` returns the same state repeatedly** — check `advanced` in the response. If it's `false`, the engine stopped where it already was (gates still blocking, or evidence still missing). Re-read `blocking_conditions` and `directive`.

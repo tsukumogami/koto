@@ -765,16 +765,24 @@ pub(super) fn resolve_with_data_source(
     })
 }
 
-/// Parse a `--with-data` JSON string and check for the reserved `"gates"` key.
+/// Parse a `--with-data` JSON string and check for reserved keys and
+/// reserved KT1 audit-event kinds.
 ///
 /// Returns the parsed `Value` on success, or a `NextError` with code
-/// `InvalidSubmission` when the JSON is malformed or contains the reserved key.
-/// This function contains only pure logic; callers are responsible for exiting.
+/// `InvalidSubmission` when the JSON is malformed, contains the
+/// reserved `"gates"` key, or carries a `fields.kind` value that
+/// collides with the KT1 audit family (Decision 6 in
+/// DESIGN-koto-request-store): the four reserved literal names or
+/// anything starting with the `kt1.` prefix.
+///
+/// This function contains only pure logic; callers are responsible
+/// for exiting.
 #[cfg(unix)]
 fn validate_with_data_payload(
     data_str: &str,
 ) -> Result<serde_json::Value, crate::cli::next_types::NextError> {
     use crate::cli::next_types::{NextError, NextErrorCode};
+    use crate::engine::audit;
 
     let data: serde_json::Value = serde_json::from_str(data_str).map_err(|e| NextError {
         code: NextErrorCode::InvalidSubmission,
@@ -791,7 +799,43 @@ fn validate_with_data_payload(
         });
     }
 
+    // Reserved-kind gate (Issue 14 / Decision 6). The kind is carried
+    // either at the top level (`{"kind":"..."}`) or nested under
+    // `fields` (`{"fields":{"kind":"..."}}`); both shapes are
+    // valid submission entry points that ultimately land in
+    // EventPayload::EvidenceSubmitted's `fields` map, so both have
+    // to pass the same reservation rule.
+    if let Some(kind) = extract_kind_from_submission(&data) {
+        if audit::is_reserved_kind(kind) {
+            return Err(NextError {
+                code: NextErrorCode::InvalidSubmission,
+                message: format!("reserved audit-event kind: {}", kind),
+                details: vec![],
+            });
+        }
+    }
+
     Ok(data)
+}
+
+/// Inspect a `--with-data` JSON value and pull out the `kind`
+/// discriminator if one is present.
+///
+/// Accepts two payload shapes:
+///   `{"kind": "X", ...}`          — top-level discriminator
+///   `{"fields": {"kind": "X"}, ...}` — nested under `fields`, the
+///                                     shape used internally on
+///                                     `EvidenceSubmitted` events
+///
+/// Returns `None` if neither carries a string `kind`.
+#[cfg(unix)]
+fn extract_kind_from_submission(data: &serde_json::Value) -> Option<&str> {
+    if let Some(s) = data.get("kind").and_then(|v| v.as_str()) {
+        return Some(s);
+    }
+    data.get("fields")
+        .and_then(|v| v.get("kind"))
+        .and_then(|v| v.as_str())
 }
 
 /// Execute a command with polling: run repeatedly, evaluate gates after each
@@ -4161,5 +4205,79 @@ mod tests {
             "error message should mention 'reserved': {}",
             err.message
         );
+    }
+
+    // ----- Issue 14: reserved audit-event kind rejection (Decision 6) -----
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_rejects_all_four_reserved_literal_kinds() {
+        use crate::cli::next_types::NextErrorCode;
+        use crate::engine::audit::RESERVED_KINDS;
+
+        for kind in RESERVED_KINDS {
+            // Top-level discriminator shape.
+            let payload = format!(r#"{{"kind":"{}"}}"#, kind);
+            let err = validate_with_data_payload(&payload)
+                .expect_err("must reject reserved kind at parse time");
+            assert_eq!(err.code, NextErrorCode::InvalidSubmission);
+            assert!(
+                err.message.contains("reserved audit-event kind"),
+                "expected reserved-kind error, got: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(kind),
+                "error must name the offending kind {}, got: {}",
+                kind,
+                err.message
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_rejects_nested_reserved_kinds() {
+        use crate::engine::audit::CHILD_DISPATCHED;
+        // EvidenceSubmitted-shaped payload with `kind` inside `fields`.
+        let payload = format!(r#"{{"fields":{{"kind":"{}"}}}}"#, CHILD_DISPATCHED);
+        let err = validate_with_data_payload(&payload).expect_err("must reject nested kind");
+        assert!(err.message.contains("reserved audit-event kind"));
+        assert!(err.message.contains(CHILD_DISPATCHED));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_rejects_kt1_prefix() {
+        for kind in ["kt1.foo", "kt1.", "kt1.deep.kind"] {
+            let payload = format!(r#"{{"kind":"{}"}}"#, kind);
+            let err = validate_with_data_payload(&payload).expect_err("must reject kt1.* prefix");
+            assert!(err.message.contains("reserved audit-event kind"));
+            assert!(err.message.contains(kind));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_accepts_template_author_kinds() {
+        // Any kind that is neither a reserved literal nor kt1.-prefixed
+        // must land on disk untouched. Verifying via the parser is
+        // enough — `handle_next`'s downstream persistence test
+        // coverage is provided elsewhere.
+        for ok in ["verdict", "review", "scrutineer", "kt", "kt1foo"] {
+            let payload = format!(r#"{{"kind":"{}","note":"x"}}"#, ok);
+            let v = validate_with_data_payload(&payload).expect("must accept");
+            assert_eq!(v["kind"], serde_json::json!(ok));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_accepts_payload_without_kind() {
+        // Payloads that don't carry a `kind` at all are unaffected by
+        // the reserved-kind gate (they hit the existing schema-side
+        // validation downstream).
+        let v = validate_with_data_payload(r#"{"note":"hello"}"#).expect("must accept");
+        assert_eq!(v["note"], serde_json::json!("hello"));
     }
 }
