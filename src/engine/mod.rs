@@ -6,6 +6,7 @@ pub mod batch_validation;
 #[cfg(unix)]
 pub mod claim;
 pub mod discovery;
+pub mod epoch;
 pub mod errors;
 pub mod evidence;
 pub mod path_resolution;
