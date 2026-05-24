@@ -105,6 +105,34 @@ pub enum EngineError {
         offending_kind: String,
     },
 
+    /// Recursion cap exceeded on a `koto session start --needs-agent`
+    /// invocation. The caller's spawn request would push one of the
+    /// three dimensions (depth, fanout, total-unassigned) past its
+    /// hard-reject threshold. The caps are hard-coded constants at V1
+    /// (Decision 4) so this rejection is structural — the operator
+    /// has no override surface; the calling agent must restructure
+    /// its dispatch fanout.
+    ///
+    /// Maps to BSD sysexit code `EX_USAGE` (64) at the CLI boundary —
+    /// the caller's request is invalid; no retry will help until the
+    /// dispatch shape changes. Drives PRD R29.
+    #[error(
+        "recursion cap exceeded ({dimension}): observed {observed}, hard reject at {threshold}"
+    )]
+    RecursionCapExceeded {
+        /// Which dimension fired: `"depth"`, `"fanout"`, or
+        /// `"total_unassigned"`. The string is part of the typed
+        /// error so operators reading logs can attribute the
+        /// rejection without parsing the message body.
+        dimension: String,
+        /// The hard-reject threshold for this dimension.
+        threshold: u32,
+        /// The observed count that triggered the rejection. Strictly
+        /// greater than or equal to `threshold` for the variant to
+        /// be valid.
+        observed: u32,
+    },
+
     /// A retry presented the same `idempotency_hash` as a prior event
     /// AND a divergent payload at the same `state_name`. The
     /// short-circuit cannot apply (the payloads differ) and the
@@ -138,6 +166,7 @@ impl EngineError {
     /// Mapping:
     /// - `EpochFenceViolation` → 65 (`EX_DATAERR`)
     /// - `RedelegationCapExceeded` → 75 (`EX_TEMPFAIL`)
+    /// - `RecursionCapExceeded` → 64 (`EX_USAGE`)
     /// - `ConcurrentSubmissionConflict` → 75 (`EX_TEMPFAIL`)
     /// - `StateFileCorrupted` → 3 (legacy `EXIT_INFRASTRUCTURE`)
     /// - other variants → 1 (generic error)
@@ -149,6 +178,7 @@ impl EngineError {
         match self {
             EngineError::EpochFenceViolation { .. } => 65,
             EngineError::RedelegationCapExceeded { .. } => 75,
+            EngineError::RecursionCapExceeded { .. } => 64,
             EngineError::ConcurrentSubmissionConflict { .. } => 75,
             EngineError::StateFileCorrupted(_) => 3,
             _ => 1,

@@ -51,6 +51,16 @@ tempfile = "3"
 name = "discovery_scan"
 harness = false
 
+# Issue 17: criterion bench harness for the recursion-cap validator.
+# Hard-gates the 26k workspace / 100 open sessions case at 30 ms p95
+# (AD3.3 perf-cliff avoidance). Unlike Issue 10's bench (soft-by-
+# default), this one fails CI on a breach because the
+# terminal-index filter is supposed to make it fast — a slow result
+# means the filter is misimplemented.
+[[bench]]
+name = "recursion_caps"
+harness = false
+
 [features]
 cloud-integration-tests = []
 
