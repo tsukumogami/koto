@@ -303,6 +303,7 @@ pub fn handle_start(
         timestamp: ts.clone(),
         event_type: init_payload.type_name().to_string(),
         payload: init_payload,
+        idempotency_hash: None,
     }];
 
     backend

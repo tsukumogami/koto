@@ -269,6 +269,7 @@ mod tests {
                 ]),
                 spawn_entry: None,
             },
+            idempotency_hash: None,
         }];
 
         let vars = Variables::from_events(&events).unwrap();
@@ -293,6 +294,7 @@ mod tests {
                 variables: HashMap::from([("BAD".to_string(), "has spaces".to_string())]),
                 spawn_entry: None,
             },
+            idempotency_hash: None,
         }];
 
         let err = Variables::from_events(&events).unwrap_err();
@@ -310,6 +312,7 @@ mod tests {
                 variables: HashMap::from([("PATH".to_string(), "org/repo-name_v1.2".to_string())]),
                 spawn_entry: None,
             },
+            idempotency_hash: None,
         }];
 
         let vars = Variables::from_events(&events).unwrap();

@@ -104,6 +104,29 @@ pub enum EngineError {
         /// in the Display message for diagnostics.
         offending_kind: String,
     },
+
+    /// A retry presented the same `idempotency_hash` as a prior event
+    /// AND a divergent payload at the same `state_name`. The
+    /// short-circuit cannot apply (the payloads differ) and the
+    /// rewrite cannot apply (the hash already exists), so the writer
+    /// must back off and re-read the event log before deciding what
+    /// to do.
+    ///
+    /// Maps to BSD sysexit code `EX_TEMPFAIL` (75) at the CLI
+    /// boundary — the conflict is transient under the caller's
+    /// control. Drives PRD R17 (idempotent retries) and OQ8
+    /// (idempotency-hash domain). See Issue 12 of
+    /// PLAN-koto-request-store.
+    #[error("concurrent submission conflict for session '{session_id}' at state '{state_name}'")]
+    ConcurrentSubmissionConflict {
+        /// Session id (workflow name) whose log carries the
+        /// conflicting prior event.
+        session_id: String,
+        /// Template state name where the conflict surfaced. The hash
+        /// domain is `(state_name, payload)`; conflicts can only fire
+        /// when both inputs and a prior hash match.
+        state_name: String,
+    },
 }
 
 impl EngineError {
@@ -115,6 +138,7 @@ impl EngineError {
     /// Mapping:
     /// - `EpochFenceViolation` → 65 (`EX_DATAERR`)
     /// - `RedelegationCapExceeded` → 75 (`EX_TEMPFAIL`)
+    /// - `ConcurrentSubmissionConflict` → 75 (`EX_TEMPFAIL`)
     /// - `StateFileCorrupted` → 3 (legacy `EXIT_INFRASTRUCTURE`)
     /// - other variants → 1 (generic error)
     ///
@@ -125,6 +149,7 @@ impl EngineError {
         match self {
             EngineError::EpochFenceViolation { .. } => 65,
             EngineError::RedelegationCapExceeded { .. } => 75,
+            EngineError::ConcurrentSubmissionConflict { .. } => 75,
             EngineError::StateFileCorrupted(_) => 3,
             _ => 1,
         }

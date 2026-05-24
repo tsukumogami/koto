@@ -508,12 +508,14 @@ fn init_child_core(
             timestamp: ts.clone(),
             event_type: init_payload.type_name().to_string(),
             payload: init_payload,
+            idempotency_hash: None,
         },
         Event {
             seq: 2,
             timestamp: ts.clone(),
             event_type: transition_payload.type_name().to_string(),
             payload: transition_payload,
+            idempotency_hash: None,
         },
     ];
 
@@ -647,6 +649,7 @@ Done.
                 variables: HashMap::new(),
                 spawn_entry: None,
             },
+            idempotency_hash: None,
         }];
         backend
             .init_state_file(parent, header, events)

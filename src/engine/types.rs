@@ -754,12 +754,26 @@ pub struct Event {
 
     /// Type-specific payload.
     pub payload: EventPayload,
+
+    /// Optional SHA-256 hex digest of canonical-JSON-serialized
+    /// `(state_name, payload)`, set when the event was written via
+    /// [`crate::engine::persistence::append_event_idempotent`]. Lets
+    /// retry-prone callers (wake-delivery, evidence submission)
+    /// short-circuit identical retries by comparing against this hash
+    /// on subsequent calls. Absent on events written via the legacy
+    /// [`crate::engine::persistence::append_event`] path or before
+    /// KT1 Issue 12 landed.
+    ///
+    /// Additive serde-optional field: omitted from serialization when
+    /// `None` so pre-Issue-12 state files round-trip unchanged.
+    pub idempotency_hash: Option<String>,
 }
 
 impl Serialize for Event {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(4))?;
+        let extra = self.idempotency_hash.as_ref().map_or(0, |_| 1);
+        let mut map = serializer.serialize_map(Some(4 + extra))?;
         map.serialize_entry("seq", &self.seq)?;
         map.serialize_entry("timestamp", &self.timestamp)?;
         // Use the stored event_type string rather than payload.type_name() so that
@@ -767,6 +781,9 @@ impl Serialize for Event {
         // instead of the static "unknown" label when serialized by koto query --events.
         map.serialize_entry("type", &self.event_type)?;
         map.serialize_entry("payload", &self.payload)?;
+        if let Some(h) = &self.idempotency_hash {
+            map.serialize_entry("idempotency_hash", h)?;
+        }
         map.end()
     }
 }
@@ -954,11 +971,20 @@ impl<'de> Deserialize<'de> for Event {
             },
         };
 
+        // Optional KT1 Issue 12 idempotency-hash field. Absent on
+        // pre-Issue-12 events; present when written via
+        // `append_event_idempotent`.
+        let idempotency_hash = obj
+            .get("idempotency_hash")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         Ok(Event {
             seq,
             timestamp,
             event_type,
             payload,
+            idempotency_hash,
         })
     }
 }
@@ -1419,6 +1445,7 @@ mod tests {
                 variables: HashMap::new(),
                 spawn_entry: None,
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"workflow_initialized\""));
@@ -1485,6 +1512,7 @@ mod tests {
                 variables: HashMap::new(),
                 spawn_entry: Some(snapshot.clone()),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(
@@ -1556,6 +1584,7 @@ mod tests {
                 to: "gather".to_string(),
                 rationale: None,
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         let parsed: Event = serde_json::from_str(&json).unwrap();
@@ -1574,6 +1603,7 @@ mod tests {
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         let parsed: Event = serde_json::from_str(&json).unwrap();
@@ -1638,6 +1668,7 @@ mod tests {
                     "alternatives_considered": ["Parallel requests", "Queue-based processing"]
                 }),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"decision_recorded\""));
@@ -1678,6 +1709,7 @@ mod tests {
                 stdout: "Switched to a new branch 'feature'\n".to_string(),
                 stderr: String::new(),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"default_action_executed\""));
@@ -1711,6 +1743,7 @@ mod tests {
                 outcome: "passed".to_string(),
                 timestamp: "2026-04-01T00:00:00Z".to_string(),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"gate_evaluated\""));
@@ -1746,6 +1779,7 @@ mod tests {
                 actual_output: serde_json::json!({"exit_code": 1, "error": "timeout"}),
                 timestamp: "2026-04-01T00:01:00Z".to_string(),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"gate_override_recorded\""));
@@ -1809,6 +1843,7 @@ mod tests {
                 },
                 submitter_cwd: Some(PathBuf::from("/work/repo")),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(
@@ -1851,6 +1886,7 @@ mod tests {
                 timestamp: "2026-04-14T12:00:00Z".to_string(),
                 superseded_by: None,
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"batch_finalized\""));
@@ -1885,6 +1921,7 @@ mod tests {
                     timestamp: "2026-04-14T11:30:00Z".to_string(),
                 }),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(
@@ -2039,6 +2076,7 @@ mod tests {
                     .to_string(),
                 size: 1024,
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"context_added\""));
@@ -2071,6 +2109,7 @@ mod tests {
                 to: "implementation".to_string(),
                 rationale: Some("Design approved by stakeholders".to_string()),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"rationale\":\"Design approved by stakeholders\""));
@@ -2089,6 +2128,7 @@ mod tests {
                 to: "implementation".to_string(),
                 rationale: None,
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(
@@ -2125,6 +2165,7 @@ mod tests {
                 to: "analysis".to_string(),
                 rationale: Some("Scope changed after review".to_string()),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"rationale\":\"Scope changed after review\""));
@@ -2143,6 +2184,7 @@ mod tests {
                 to: "analysis".to_string(),
                 rationale: None,
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(
@@ -2206,6 +2248,7 @@ mod tests {
                 type_name: "future_event".to_string(),
                 raw_payload: serde_json::json!({"field": "value"}),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2235,6 +2278,7 @@ mod tests {
                 payload: EventPayload::IntentUpdated {
                     intent: intent.to_string(),
                 },
+                idempotency_hash: None,
             }
         }
         let events = vec![
