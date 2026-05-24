@@ -133,6 +133,13 @@ pub enum Command {
         /// Optional explanation for why this directed transition was made (only used with --to)
         #[arg(long)]
         rationale: Option<String>,
+
+        /// Per-tick override for kt1.redelegation_cap. Applies only to
+        /// this `koto next` invocation; subsequent ticks resolve the
+        /// cap through the full 5-level cascade (CLI flag > env-var >
+        /// project > user > built-in default).
+        #[arg(long = "redelegation-cap")]
+        redelegation_cap: Option<u32>,
     },
 
     /// Cancel a workflow, preventing further advancement
@@ -842,6 +849,7 @@ pub fn run(app: App) -> Result<()> {
             no_cleanup,
             full,
             rationale,
+            redelegation_cap,
         } => {
             let backend = build_backend()?;
             let context_store: &dyn ContextStore = &backend;
@@ -854,6 +862,7 @@ pub fn run(app: App) -> Result<()> {
                 no_cleanup,
                 full,
                 rationale,
+                redelegation_cap,
             )
         }
         Command::Cancel { name, cleanup } => {
@@ -1168,6 +1177,7 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
     match subcommand {
         ConfigCommand::Get { key } => {
             let resolved = config::resolve::load_config()?;
+            config::warn_if_kt1_recursion_reserved(&resolved);
             match config::get_value(&resolved, &key) {
                 Some(value) => {
                     println!("{}", value);
@@ -1758,6 +1768,7 @@ fn handle_next(
     no_cleanup: bool,
     full: bool,
     rationale: Option<String>,
+    redelegation_cap: Option<u32>,
 ) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
@@ -1774,6 +1785,20 @@ fn handle_next(
     use crate::gate::evaluate_gates;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+
+    // Resolve KT1 operator config through the full 5-level cascade,
+    // applying the per-tick `--redelegation-cap` CLI flag (if any) on
+    // top of the file+env layers already merged by load_config().
+    // Emit the `[kt1.recursion]` reserved-namespace warning at startup.
+    let _kt1 = {
+        let base = crate::config::resolve::load_config().unwrap_or_default();
+        crate::config::warn_if_kt1_recursion_reserved(&base);
+        let cli_overrides = crate::config::resolve::Kt1Overrides {
+            redelegation_cap,
+            ..Default::default()
+        };
+        crate::config::resolve::kt1_config(&base.kt1, &cli_overrides)
+    };
 
     // 1. Mutual exclusivity check
     if with_data.is_some() && to.is_some() {
@@ -3073,6 +3098,7 @@ fn handle_next(
     _no_cleanup: bool,
     _full: bool,
     _rationale: Option<String>,
+    _redelegation_cap: Option<u32>,
 ) -> Result<()> {
     exit_with_error_code(
         serde_json::json!({
