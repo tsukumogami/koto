@@ -82,7 +82,6 @@ pub struct StateFileHeader {
     // components read from the on-disk header. All are
     // `#[serde(default, skip_serializing_if = "Option::is_none")]` so
     // pre-KT1 state files round-trip unchanged.
-
     /// Whether this workflow is requesting agent assignment.
     ///
     /// Drives the KT1 request-store: when `Some(true)` the workflow is

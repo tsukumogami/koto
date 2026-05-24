@@ -478,6 +478,17 @@ fn init_child_core(
         } else {
             Some(cached.compiled.name.clone())
         },
+        needs_agent: None,
+        role: None,
+        inputs: None,
+        coordinator_of_record: None,
+        requested_by: None,
+        assignment_claim: None,
+        dispatch_epoch: 0,
+        priority: None,
+        deadline: None,
+        retry_count: None,
+        agent_config: None,
     };
 
     let init_payload = EventPayload::WorkflowInitialized {
@@ -615,6 +626,17 @@ Done.
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
         };
         let events = vec![Event {
             seq: 1,

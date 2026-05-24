@@ -389,6 +389,17 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
         session_id: String::new(),
         intent: None,
         template_name: None,
+        needs_agent: None,
+        role: None,
+        inputs: None,
+        coordinator_of_record: None,
+        requested_by: None,
+        assignment_claim: None,
+        dispatch_epoch: 0,
+        priority: None,
+        deadline: None,
+        retry_count: None,
+        agent_config: None,
     };
     seed_backend
         .init_state_file(parent, parent_header, Vec::new())
@@ -408,6 +419,17 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
         session_id: String::new(),
         intent: None,
         template_name: None,
+        needs_agent: None,
+        role: None,
+        inputs: None,
+        coordinator_of_record: None,
+        requested_by: None,
+        assignment_claim: None,
+        dispatch_epoch: 0,
+        priority: None,
+        deadline: None,
+        retry_count: None,
+        agent_config: None,
     };
     let init_event = Event {
         seq: 1,

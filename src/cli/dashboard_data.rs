@@ -335,6 +335,17 @@ fn make_empty_header() -> StateFileHeader {
         session_id: String::new(),
         intent: None,
         template_name: None,
+        needs_agent: None,
+        role: None,
+        inputs: None,
+        coordinator_of_record: None,
+        requested_by: None,
+        assignment_claim: None,
+        dispatch_epoch: 0,
+        priority: None,
+        deadline: None,
+        retry_count: None,
+        agent_config: None,
     }
 }
 
@@ -712,6 +723,17 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
         }
     }
 
@@ -1233,6 +1255,17 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
         };
         append_header(&state_path, &header).unwrap();
 
