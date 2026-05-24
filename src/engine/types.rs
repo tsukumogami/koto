@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
+pub use crate::engine::persistence::derive_state_from_log;
+
 /// Current schema version written in every `StateFileHeader`.
 ///
 /// Readers reject log files where `schema_version > CURRENT_SCHEMA_VERSION`
@@ -72,6 +74,88 @@ pub struct StateFileHeader {
     /// Additive field: omitted when None, defaults to None on old state files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_name: Option<String>,
+
+    // ===== KT1 request-store fields (Decision 1) =====
+    //
+    // The seven additive + four reserved fields below land the
+    // dispatch-request marker that bunki BK2 and downstream KT1
+    // components read from the on-disk header. All are
+    // `#[serde(default, skip_serializing_if = "Option::is_none")]` so
+    // pre-KT1 state files round-trip unchanged.
+
+    /// Whether this workflow is requesting agent assignment.
+    ///
+    /// Drives the KT1 request-store: when `Some(true)` the workflow is
+    /// awaiting (or has been claimed for) an agent dispatch. `None` on
+    /// pre-KT1 headers and on workflows that don't need agent
+    /// orchestration. Companion-field validation (role / inputs) is
+    /// owned by the CLI layer (Issue 4), not the type layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_agent: Option<bool>,
+
+    /// Role identifier the assigning coordinator should match against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+
+    /// Arbitrary JSON payload passed to the agent at dispatch time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<serde_json::Value>,
+
+    /// Identifier of the coordinator that owns this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_of_record: Option<String>,
+
+    /// Identifier of the principal that submitted this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+
+    /// Claim record written by the coordinator that picked up this
+    /// request. Populated as a single atomic write through the
+    /// claim sidecar (Issue 11); absent until claim time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_claim: Option<AssignmentClaim>,
+
+    /// Generation counter incremented every time the request is
+    /// re-dispatched after a previous claim was revoked. Defaults to
+    /// `0` on pre-KT1 headers and on never-claimed requests.
+    #[serde(default)]
+    pub dispatch_epoch: u32,
+
+    // ===== Reserved KT1 fields (forward-compatibility) =====
+    //
+    // Wire-format placeholders for follow-up features. Always
+    // serialize as absent keys when `None`; reading code may parse
+    // them but should not act on them yet.
+    /// Reserved: dispatch priority (forward-compat placeholder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+
+    /// Reserved: optional deadline (RFC 3339 string, forward-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<String>,
+
+    /// Reserved: retry counter (forward-compat placeholder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<u32>,
+
+    /// Reserved: opaque agent configuration blob (forward-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_config: Option<serde_json::Value>,
+}
+
+/// Claim record written by the coordinator that picks up an agent
+/// dispatch request.
+///
+/// Carries the coordinator id and the RFC 3339 claim timestamp. The
+/// struct is treated as opaque by the type layer; ordering and
+/// fencing semantics live in the claim sidecar and dispatch-epoch
+/// fence (Issues 11 and 13).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssignmentClaim {
+    /// Identifier of the claiming coordinator.
+    pub coord_id: String,
+    /// RFC 3339 UTC timestamp at which the claim was recorded.
+    pub claimed_at: String,
 }
 
 /// Canonical-form snapshot of the batch task entry that spawned a
@@ -417,6 +501,28 @@ pub struct SchedulerTickSummary {
     /// True when at least one child's classification changed during
     /// this tick.
     pub reclassified: bool,
+}
+
+/// Snapshot of a child state file that `classify_task` needs to
+/// determine the child's `TaskOutcome`. Built once per tick by the
+/// scheduler and looked up by short task name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildSnapshot {
+    /// Current state name as derived from the event log.
+    pub current_state: String,
+    /// Whether the current state is terminal, per the child's own
+    /// compiled template.
+    pub terminal: bool,
+    /// Whether the current state has `failure: true`.
+    pub failure: bool,
+    /// Whether the current state has `skipped_marker: true`.
+    pub skipped_marker: bool,
+    /// `spawn_entry` recorded on the child's `WorkflowInitialized`
+    /// event, when present. Issue #12 does not yet consume this
+    /// (no R8 runtime check); later issues use it for rename
+    /// detection and respawn-entry comparison.
+    #[allow(dead_code)]
+    pub spawn_entry: Option<SpawnEntrySnapshot>,
 }
 
 impl EventPayload {
@@ -949,6 +1055,17 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         let parsed: StateFileHeader = serde_json::from_str(&json).unwrap();
@@ -967,6 +1084,17 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(json.contains("\"parent_workflow\":\"parent-wf\""));
@@ -997,6 +1125,17 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -1020,6 +1159,17 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -1041,6 +1191,17 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -1630,6 +1791,17 @@ mod tests {
             session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(json.contains("\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\""));
