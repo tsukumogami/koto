@@ -183,6 +183,26 @@ koto init <child-name> --parent <parent-name> --template <path>
 
 The `--parent` flag validates that the parent workflow exists and records the link in the child's state file. The naming convention `parent.child` is recommended but not enforced — the metadata link is what matters.
 
+### Requesting agent dispatch on a new child
+
+When the child you're spawning needs a separate agent to pick it up later (the "request store" pattern), use `koto session start` instead of `koto init`. It writes a request-store header on the child so a coordinator can later dispatch the right agent:
+
+```bash
+koto session start <child-name> \
+  --parent <parent-name> \
+  --needs-agent \
+  --role <role-name> \
+  --template <template-name> \
+  --inputs '<json>'
+```
+
+- `--needs-agent` marks the child as awaiting dispatch and **requires** the `--role`, `--template`, and `--inputs` companions. Any of those without `--needs-agent`, or `--needs-agent` without the full set, rejects at parse time.
+- `--inputs` is a JSON blob (max 1 MiB, max 128 nesting levels).
+- `--coordinator-of-record <c>` is optional; it defaults to the parent's effective coordinator.
+- Omit all four to start a plain child session without a dispatch marker — useful when the child is launched in-process by the same agent.
+
+The session id (`--parent`) and coordinator id (`--coordinator-of-record`) are validated against `^[a-zA-Z0-9][a-zA-Z0-9._-]*$` (max 255 chars) before any path operation, so paths like `../etc/passwd` or shell-metacharacter ids are rejected up front.
+
 ### Checking children
 
 List a parent's children:

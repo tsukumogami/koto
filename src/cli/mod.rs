@@ -276,6 +276,62 @@ pub enum ConfigCommand {
 
 #[derive(Subcommand)]
 pub enum SessionCommand {
+    /// Start a child session under `--parent`.
+    ///
+    /// Decision 1's request-store authoring surface: the spawning
+    /// subagent calls `koto session start --parent <p>` and either
+    /// (a) provides `--needs-agent` plus the full
+    /// `--role` / `--template` / `--inputs` companion set to enqueue
+    /// a dispatch request on the new child, or (b) leaves all four
+    /// off to start a plain child session whose header carries no
+    /// dispatch-request marker.
+    ///
+    /// Companion-flag contract (enforced at parse time):
+    ///   --needs-agent set → --role + --template + --inputs ALL required.
+    ///   Any of --role/--template/--inputs/--coordinator-of-record
+    ///     present without --needs-agent → reject naming --needs-agent.
+    Start {
+        /// Name of the new child session.
+        name: String,
+
+        /// Name of the parent workflow this session is a child of.
+        /// Validated via [`ValidatedSessionId`] before any path op.
+        #[arg(long)]
+        parent: String,
+
+        /// Mark this session as awaiting agent dispatch
+        /// (writes `needs_agent = true` to the header).
+        #[arg(long = "needs-agent")]
+        needs_agent: bool,
+
+        /// Role identifier the assigning coordinator should match
+        /// against. Required when `--needs-agent` is set.
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Template name to record in the header. Reuses the existing
+        /// `template_name` field per Decision 1 line 222 (NOT a new
+        /// field). Required when `--needs-agent` is set.
+        #[arg(long)]
+        template: Option<String>,
+
+        /// JSON inputs blob passed to the agent at dispatch time.
+        /// Required when `--needs-agent` is set.
+        ///
+        /// Rejects payloads larger than 1 MiB or with JSON nesting
+        /// deeper than 128 levels (Security Considerations
+        /// defense-in-depth #1).
+        #[arg(long)]
+        inputs: Option<String>,
+
+        /// Coordinator id that owns this request. Defaults to the
+        /// parent's recorded `coordinator_of_record`, falling back to
+        /// the parent's session id when the parent is itself
+        /// pre-KT1. Validated via [`ValidatedCoordId`] before write.
+        #[arg(long = "coordinator-of-record")]
+        coordinator_of_record: Option<String>,
+    },
+
     /// Print the absolute session directory path
     Dir {
         /// Session name
@@ -932,6 +988,24 @@ pub fn run(app: App) -> Result<()> {
         Command::Session { subcommand } => {
             let backend = build_backend()?;
             match subcommand {
+                SessionCommand::Start {
+                    name,
+                    parent,
+                    needs_agent,
+                    role,
+                    template,
+                    inputs,
+                    coordinator_of_record,
+                } => session::handle_start(
+                    &backend,
+                    &name,
+                    &parent,
+                    needs_agent,
+                    role.as_deref(),
+                    template.as_deref(),
+                    inputs.as_deref(),
+                    coordinator_of_record.as_deref(),
+                ),
                 SessionCommand::Dir { name } => session::handle_dir(&backend, &name),
                 SessionCommand::List => session::handle_list(&backend),
                 SessionCommand::Cleanup { name } => {
