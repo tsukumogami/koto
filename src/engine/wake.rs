@@ -249,7 +249,7 @@ pub fn find_wake_candidates(
         if requested_by.is_empty() {
             // Without a requested_by we can't address the wake
             // primitive. Skip; Issue 4 guarantees the field is
-            // populated on KT1 requests but pre-Issue-4 headers may
+            // populated on request-store requests but pre-Issue-4 headers may
             // lack it.
             continue;
         }
@@ -284,7 +284,7 @@ fn emit_one_wake_batch(
     }
     let fields = requester_woken_fields(children, requested_by);
     let payload = EventPayload::EvidenceSubmitted {
-        state: "kt1.wake".to_string(),
+        state: "request_store.wake".to_string(),
         fields,
         submitter_cwd: None,
     };
@@ -633,7 +633,7 @@ mod tests {
             timestamp: timestamp.into(),
             event_type: "evidence_submitted".into(),
             payload: EventPayload::EvidenceSubmitted {
-                state: "kt1.dispatch".into(),
+                state: "request_store.dispatch".into(),
                 fields,
                 submitter_cwd: None,
             },
@@ -661,7 +661,7 @@ mod tests {
             timestamp: timestamp.into(),
             event_type: "evidence_submitted".into(),
             payload: EventPayload::EvidenceSubmitted {
-                state: "kt1.wake".into(),
+                state: "request_store.wake".into(),
                 fields,
                 submitter_cwd: None,
             },

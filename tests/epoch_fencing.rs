@@ -1,4 +1,4 @@
-//! Integration tests for KT1 Issue 13's epoch fence on child-log writes.
+//! Integration tests for Issue 13's epoch fence on child-log writes.
 //!
 //! Inline unit tests in `src/engine/epoch.rs` cover the pure validator's
 //! happy path, stale-epoch, future-epoch, missing-flag, exit-code

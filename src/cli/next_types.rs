@@ -1916,7 +1916,7 @@ mod tests {
         assert_eq!(ctx.payload, expected_batch);
     }
 
-    // -- UnassignedChild serde tests (KT1 Issue 5) ----------------------
+    // -- UnassignedChild serde tests (Issue 5) ----------------------
 
     #[test]
     fn unassigned_child_round_trip_all_fields() {
@@ -1972,7 +1972,7 @@ mod tests {
     fn unassigned_child_inputs_default_to_none_when_key_absent() {
         // Additive-evolution discipline: a payload that omits `inputs`
         // must deserialize cleanly with `inputs = None`. Mirrors how
-        // pre-KT1 producers (none today, but future external writers)
+        // pre-request-store producers (none today, but future external writers)
         // can emit the minimal shape.
         let raw = r#"{
             "child_session_id": "a.b",
@@ -1990,7 +1990,7 @@ mod tests {
     #[test]
     fn directive_envelope_partial_consumer_ignores_unassigned_children() {
         // Additive-evolution discipline (Decision 5): consumers that
-        // parse only the pre-KT1 directive fields continue to function
+        // parse only the pre-request-store directive fields continue to function
         // when `unassigned_children` is present at the top level.
         //
         // Simulate the new envelope shape: an existing `koto next`
@@ -2124,16 +2124,16 @@ mod tests {
         assert_eq!(v["unassigned_children"], serde_json::json!([]));
     }
 
-    /// Pre-KT1 directive content is unchanged: the serialized JSON for an
-    /// `EvidenceRequired` variant matches the pre-KT1 fixture exactly
+    /// Pre-request-store directive content is unchanged: the serialized JSON for an
+    /// `EvidenceRequired` variant matches the pre-request-store fixture exactly
     /// once the new `unassigned_children` field is stripped. This is the
     /// "byte-identical workflow_directive content" check from PLAN
     /// Issue 5's acceptance criteria.
     #[test]
-    fn pre_kt1_directive_content_unchanged_after_stripping_new_field() {
-        // Pre-KT1 expected fixture: the entire `koto next` JSON shape
+    fn pre_request_store_directive_content_unchanged_after_stripping_new_field() {
+        // Pre-request-store expected fixture: the entire `koto next` JSON shape
         // for an `EvidenceRequired` directive return prior to Issue 5.
-        let pre_kt1_fixture = serde_json::json!({
+        let pre_request_store_fixture = serde_json::json!({
             "action": "evidence_required",
             "state": "review",
             "directive": "Review the changes.",
@@ -2161,13 +2161,13 @@ mod tests {
         };
 
         let mut emitted: serde_json::Value = serde_json::to_value(&resp).unwrap();
-        // Strip the additive field; the remainder must equal the pre-KT1 fixture.
+        // Strip the additive field; the remainder must equal the pre-request-store fixture.
         let stripped = emitted
             .as_object_mut()
             .unwrap()
             .remove("unassigned_children");
         assert_eq!(stripped, Some(serde_json::json!([])));
-        assert_eq!(emitted, pre_kt1_fixture);
+        assert_eq!(emitted, pre_request_store_fixture);
     }
 
     /// A populated `unassigned_children` list (the shape Issue 7 will

@@ -171,7 +171,7 @@ states:
 A few `--with-data` field values are reserved by koto and rejected at parse time:
 
 - The top-level `"gates"` key is reserved — agents can't submit it; koto fills it in from gate evaluation.
-- The `fields.kind` discriminator collides with the KT1 audit-event family if its value is one of `ChildDispatched`, `ChildRedelegated`, `RequesterWoken`, `RequesterRespawn`, or anything starting with `kt1.`. Template authors authoring `accepts` blocks must pick a different value for any `kind`-shaped enum (`"verdict"`, `"scrutineer"`, `"decision"`, etc.).
+- The `fields.kind` discriminator collides with the request-store audit-event family if its value is one of `ChildDispatched`, `ChildRedelegated`, `RequesterWoken`, `RequesterRespawn`, or anything starting with `request_store.`. Template authors authoring `accepts` blocks must pick a different value for any `kind`-shaped enum (`"verdict"`, `"scrutineer"`, `"decision"`, etc.).
 
 Both rejections surface as `invalid_submission` with a `reserved`-flavored message before any disk write.
 

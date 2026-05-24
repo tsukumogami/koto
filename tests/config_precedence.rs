@@ -1,8 +1,8 @@
-//! Integration tests for the `kt1` config precedence cascade.
+//! Integration tests for the `request_store` config precedence cascade.
 //!
 //! Validates the five-level resolution order from DESIGN-koto-request-store
 //! Decision 4: CLI flag > env-var > project config > user config > built-in
-//! default. Also covers the `[kt1.recursion]` reserved-but-ignored namespace
+//! default. Also covers the `[request_store.recursion]` reserved-but-ignored namespace
 //! warn behavior on `koto config get` and `koto next` startup.
 
 use assert_cmd::Command;
@@ -17,9 +17,9 @@ fn koto_cmd(home_dir: &Path, cwd_dir: &Path) -> Command {
     cmd.current_dir(cwd_dir);
     cmd.env("HOME", home_dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(cwd_dir));
-    // Clear all KT1 env-vars by default so the test author opts in
+    // Clear all request-store env-vars by default so the test author opts in
     // explicitly when exercising the env-var layer.
-    for k in KT1_ENV_KEYS {
+    for k in REQUEST_STORE_ENV_KEYS {
         cmd.env_remove(k);
     }
     cmd
@@ -31,15 +31,15 @@ fn sessions_base(dir: &Path) -> PathBuf {
     base
 }
 
-const KT1_ENV_KEYS: &[&str] = &[
-    "KOTO_KT1_STALE_CLAIM_TIMEOUT_S",
-    "KOTO_KT1_STALE_DISPATCH_TIMEOUT_S",
-    "KOTO_KT1_REDELEGATION_CAP",
-    "KOTO_KT1_COORD_CURSOR_TTL_DAYS",
-    "KOTO_KT1_TERMINAL_INDEX_COMPACT_LINES",
-    "KOTO_KT1_COMPACT_LOCK_TIMEOUT_S",
-    "KOTO_KT1_DIRECTIVE_BATCH_SIZE",
-    "KOTO_KT1_RESPAWN_GENERATION_CAP",
+const REQUEST_STORE_ENV_KEYS: &[&str] = &[
+    "KOTO_REQUEST_STORE_STALE_CLAIM_TIMEOUT_S",
+    "KOTO_REQUEST_STORE_STALE_DISPATCH_TIMEOUT_S",
+    "KOTO_REQUEST_STORE_REDELEGATION_CAP",
+    "KOTO_REQUEST_STORE_COORD_CURSOR_TTL_DAYS",
+    "KOTO_REQUEST_STORE_TERMINAL_INDEX_COMPACT_LINES",
+    "KOTO_REQUEST_STORE_COMPACT_LOCK_TIMEOUT_S",
+    "KOTO_REQUEST_STORE_DIRECTIVE_BATCH_SIZE",
+    "KOTO_REQUEST_STORE_RESPAWN_GENERATION_CAP",
 ];
 
 fn write_user_config(home_dir: &Path, body: &str) {
@@ -80,14 +80,14 @@ fn defaults_apply_when_no_overrides_set() {
 
     // Spot-check each of the eight dimensions against Decision 4's defaults.
     let cases = [
-        ("kt1.stale_claim_timeout_seconds", "600"),
-        ("kt1.stale_dispatch_timeout_seconds", "600"),
-        ("kt1.redelegation_cap", "3"),
-        ("kt1.coord_cursor_ttl_days", "7"),
-        ("kt1.terminal_index_compact_lines", "100000"),
-        ("kt1.compact_lock_timeout_seconds", "3600"),
-        ("kt1.directive_batch_size", "50"),
-        ("kt1.respawn_generation_cap", "2"),
+        ("request_store.stale_claim_timeout_seconds", "600"),
+        ("request_store.stale_dispatch_timeout_seconds", "600"),
+        ("request_store.redelegation_cap", "3"),
+        ("request_store.coord_cursor_ttl_days", "7"),
+        ("request_store.terminal_index_compact_lines", "100000"),
+        ("request_store.compact_lock_timeout_seconds", "3600"),
+        ("request_store.directive_batch_size", "50"),
+        ("request_store.respawn_generation_cap", "2"),
     ];
     for (key, expected) in cases {
         let (code, stdout, stderr) = config_get(&home_dir, &cwd_dir, key);
@@ -108,14 +108,21 @@ fn user_config_overrides_default() {
     std::fs::create_dir_all(&home_dir).unwrap();
     std::fs::create_dir_all(&cwd_dir).unwrap();
 
-    write_user_config(&home_dir, "[kt1]\nstale_claim_timeout_seconds = 1200\n");
+    write_user_config(
+        &home_dir,
+        "[request_store]\nstale_claim_timeout_seconds = 1200\n",
+    );
 
-    let (code, stdout, _) = config_get(&home_dir, &cwd_dir, "kt1.stale_claim_timeout_seconds");
+    let (code, stdout, _) = config_get(
+        &home_dir,
+        &cwd_dir,
+        "request_store.stale_claim_timeout_seconds",
+    );
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "1200");
 
     // Untouched dimensions still resolve to defaults.
-    let (_, stdout, _) = config_get(&home_dir, &cwd_dir, "kt1.redelegation_cap");
+    let (_, stdout, _) = config_get(&home_dir, &cwd_dir, "request_store.redelegation_cap");
     assert_eq!(stdout.trim(), "3");
 }
 
@@ -131,10 +138,20 @@ fn project_config_overrides_user() {
     std::fs::create_dir_all(&home_dir).unwrap();
     std::fs::create_dir_all(&cwd_dir).unwrap();
 
-    write_user_config(&home_dir, "[kt1]\nstale_claim_timeout_seconds = 1200\n");
-    write_project_config(&cwd_dir, "[kt1]\nstale_claim_timeout_seconds = 1800\n");
+    write_user_config(
+        &home_dir,
+        "[request_store]\nstale_claim_timeout_seconds = 1200\n",
+    );
+    write_project_config(
+        &cwd_dir,
+        "[request_store]\nstale_claim_timeout_seconds = 1800\n",
+    );
 
-    let (_, stdout, _) = config_get(&home_dir, &cwd_dir, "kt1.stale_claim_timeout_seconds");
+    let (_, stdout, _) = config_get(
+        &home_dir,
+        &cwd_dir,
+        "request_store.stale_claim_timeout_seconds",
+    );
     assert_eq!(stdout.trim(), "1800");
 }
 
@@ -150,12 +167,12 @@ fn env_var_overrides_project_config() {
     std::fs::create_dir_all(&home_dir).unwrap();
     std::fs::create_dir_all(&cwd_dir).unwrap();
 
-    write_user_config(&home_dir, "[kt1]\nredelegation_cap = 2\n");
-    write_project_config(&cwd_dir, "[kt1]\nredelegation_cap = 4\n");
+    write_user_config(&home_dir, "[request_store]\nredelegation_cap = 2\n");
+    write_project_config(&cwd_dir, "[request_store]\nredelegation_cap = 4\n");
 
     let output = koto_cmd(&home_dir, &cwd_dir)
-        .env("KOTO_KT1_REDELEGATION_CAP", "5")
-        .args(["config", "get", "kt1.redelegation_cap"])
+        .env("KOTO_REQUEST_STORE_REDELEGATION_CAP", "5")
+        .args(["config", "get", "request_store.redelegation_cap"])
         .output()
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -191,7 +208,7 @@ fn cli_flag_overrides_env_var_in_koto_next() {
 
 #[test]
 fn only_redelegation_cap_is_cli_overridable() {
-    // The six other tunable KT1 dimensions must NOT be exposed as CLI
+    // The six other tunable request-store dimensions must NOT be exposed as CLI
     // flags at V1 (Decision 4: --redelegation-cap is the only one).
     let output = Command::cargo_bin("koto")
         .unwrap()
@@ -218,11 +235,11 @@ fn only_redelegation_cap_is_cli_overridable() {
 }
 
 // ---------------------------------------------------------------------------
-// Reserved [kt1.recursion] namespace warn behavior
+// Reserved [request_store.recursion] namespace warn behavior
 // ---------------------------------------------------------------------------
 
 #[test]
-fn kt1_recursion_table_emits_warn_on_config_get() {
+fn request_store_recursion_table_emits_warn_on_config_get() {
     let tmp = TempDir::new().unwrap();
     let home_dir = tmp.path().join("home");
     let cwd_dir = tmp.path().join("proj");
@@ -231,51 +248,51 @@ fn kt1_recursion_table_emits_warn_on_config_get() {
 
     write_user_config(
         &home_dir,
-        "[kt1.recursion]\nmax_depth_soft = 7\nmax_depth_hard = 20\n",
+        "[request_store.recursion]\nmax_depth_soft = 7\nmax_depth_hard = 20\n",
     );
 
-    let (code, _stdout, stderr) = config_get(&home_dir, &cwd_dir, "kt1.redelegation_cap");
+    let (code, _stdout, stderr) = config_get(&home_dir, &cwd_dir, "request_store.redelegation_cap");
     assert_eq!(
         code, 0,
-        "[kt1.recursion] presence must NOT cause failure; stderr={}",
+        "[request_store.recursion] presence must NOT cause failure; stderr={}",
         stderr
     );
     assert!(
-        stderr.contains("[kt1.recursion]"),
+        stderr.contains("[request_store.recursion]"),
         "warn message should mention the reserved table; stderr was:\n{}",
         stderr
     );
 }
 
 #[test]
-fn kt1_recursion_absent_is_silent_on_config_get() {
+fn request_store_recursion_absent_is_silent_on_config_get() {
     let tmp = TempDir::new().unwrap();
     let home_dir = tmp.path().join("home");
     let cwd_dir = tmp.path().join("proj");
     std::fs::create_dir_all(&home_dir).unwrap();
     std::fs::create_dir_all(&cwd_dir).unwrap();
 
-    let (code, _stdout, stderr) = config_get(&home_dir, &cwd_dir, "kt1.redelegation_cap");
+    let (code, _stdout, stderr) = config_get(&home_dir, &cwd_dir, "request_store.redelegation_cap");
     assert_eq!(code, 0);
     assert!(
-        !stderr.contains("[kt1.recursion]"),
+        !stderr.contains("[request_store.recursion]"),
         "stderr should be silent when the reserved table is absent; got:\n{}",
         stderr
     );
 }
 
 #[test]
-fn kt1_recursion_table_emits_warn_on_koto_next_startup() {
+fn request_store_recursion_table_emits_warn_on_koto_next_startup() {
     let tmp = TempDir::new().unwrap();
     let home_dir = tmp.path().join("home");
     let cwd_dir = tmp.path().join("proj");
     std::fs::create_dir_all(&home_dir).unwrap();
     std::fs::create_dir_all(&cwd_dir).unwrap();
 
-    write_user_config(&home_dir, "[kt1.recursion]\nmax_depth_soft = 7\n");
+    write_user_config(&home_dir, "[request_store.recursion]\nmax_depth_soft = 7\n");
 
     // Invoke `koto next` on a non-existent workflow -- the call fails
-    // (no such workflow) but the [kt1.recursion] warn fires at startup
+    // (no such workflow) but the [request_store.recursion] warn fires at startup
     // before the workflow-not-found check, so it must appear on stderr
     // regardless of exit code.
     let output = koto_cmd(&home_dir, &cwd_dir)
@@ -284,14 +301,14 @@ fn kt1_recursion_table_emits_warn_on_koto_next_startup() {
         .unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("[kt1.recursion]"),
+        stderr.contains("[request_store.recursion]"),
         "koto next startup must emit the reserved-namespace warn; stderr was:\n{}",
         stderr
     );
 }
 
 #[test]
-fn kt1_recursion_project_table_also_warns() {
+fn request_store_recursion_project_table_also_warns() {
     let tmp = TempDir::new().unwrap();
     let home_dir = tmp.path().join("home");
     let cwd_dir = tmp.path().join("proj");
@@ -300,12 +317,12 @@ fn kt1_recursion_project_table_also_warns() {
 
     // Reserved-namespace warn must fire when the table is in project
     // config too (not only user config).
-    write_project_config(&cwd_dir, "[kt1.recursion]\nmax_depth_soft = 7\n");
+    write_project_config(&cwd_dir, "[request_store.recursion]\nmax_depth_soft = 7\n");
 
-    let (_, _, stderr) = config_get(&home_dir, &cwd_dir, "kt1.redelegation_cap");
+    let (_, _, stderr) = config_get(&home_dir, &cwd_dir, "request_store.redelegation_cap");
     assert!(
-        stderr.contains("[kt1.recursion]"),
-        "project config [kt1.recursion] should also trigger the warn; stderr was:\n{}",
+        stderr.contains("[request_store.recursion]"),
+        "project config [request_store.recursion] should also trigger the warn; stderr was:\n{}",
         stderr
     );
 }
@@ -315,7 +332,7 @@ fn kt1_recursion_project_table_also_warns() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn all_kt1_env_var_keys_parse() {
+fn all_request_store_env_var_keys_parse() {
     let tmp = TempDir::new().unwrap();
     let home_dir = tmp.path().join("home");
     let cwd_dir = tmp.path().join("proj");
@@ -324,39 +341,43 @@ fn all_kt1_env_var_keys_parse() {
 
     let cases: &[(&str, &str, &str)] = &[
         (
-            "KOTO_KT1_STALE_CLAIM_TIMEOUT_S",
-            "kt1.stale_claim_timeout_seconds",
+            "KOTO_REQUEST_STORE_STALE_CLAIM_TIMEOUT_S",
+            "request_store.stale_claim_timeout_seconds",
             "11",
         ),
         (
-            "KOTO_KT1_STALE_DISPATCH_TIMEOUT_S",
-            "kt1.stale_dispatch_timeout_seconds",
+            "KOTO_REQUEST_STORE_STALE_DISPATCH_TIMEOUT_S",
+            "request_store.stale_dispatch_timeout_seconds",
             "12",
         ),
-        ("KOTO_KT1_REDELEGATION_CAP", "kt1.redelegation_cap", "13"),
         (
-            "KOTO_KT1_COORD_CURSOR_TTL_DAYS",
-            "kt1.coord_cursor_ttl_days",
+            "KOTO_REQUEST_STORE_REDELEGATION_CAP",
+            "request_store.redelegation_cap",
+            "13",
+        ),
+        (
+            "KOTO_REQUEST_STORE_COORD_CURSOR_TTL_DAYS",
+            "request_store.coord_cursor_ttl_days",
             "14",
         ),
         (
-            "KOTO_KT1_TERMINAL_INDEX_COMPACT_LINES",
-            "kt1.terminal_index_compact_lines",
+            "KOTO_REQUEST_STORE_TERMINAL_INDEX_COMPACT_LINES",
+            "request_store.terminal_index_compact_lines",
             "15",
         ),
         (
-            "KOTO_KT1_COMPACT_LOCK_TIMEOUT_S",
-            "kt1.compact_lock_timeout_seconds",
+            "KOTO_REQUEST_STORE_COMPACT_LOCK_TIMEOUT_S",
+            "request_store.compact_lock_timeout_seconds",
             "16",
         ),
         (
-            "KOTO_KT1_DIRECTIVE_BATCH_SIZE",
-            "kt1.directive_batch_size",
+            "KOTO_REQUEST_STORE_DIRECTIVE_BATCH_SIZE",
+            "request_store.directive_batch_size",
             "17",
         ),
         (
-            "KOTO_KT1_RESPAWN_GENERATION_CAP",
-            "kt1.respawn_generation_cap",
+            "KOTO_REQUEST_STORE_RESPAWN_GENERATION_CAP",
+            "request_store.respawn_generation_cap",
             "18",
         ),
     ];

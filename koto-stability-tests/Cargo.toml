@@ -5,11 +5,11 @@ name = "koto-stability-tests"
 # release artifact. Bumping it has no effect on koto's semver.
 version = "0.0.0"
 edition = "2021"
-description = "External-consumer compile-check fixture for koto's Stage 1 frozen public surface (KT1 Issue 20)"
+description = "External-consumer compile-check fixture for koto's Stage 1 frozen public surface (Issue 20)"
 publish = false
 
 [dependencies]
-# KT1 Issue 20: depend on koto via `path = ".."` so workspace-internal
+# Issue 20: depend on koto via `path = ".."` so workspace-internal
 # `cargo test -p koto-stability-tests` resolves against the
 # in-source koto build. The alternative (`version = "0.10.0"`,
 # registry-pin) breaks workspace-internal verification until the

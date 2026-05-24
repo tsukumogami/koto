@@ -1496,7 +1496,7 @@ fn next_with_to_performs_directed_transition() {
     );
     assert!(json["error"].is_null(), "error should be null");
 
-    // KT1 Issue 5: the `--to` envelope must also carry the empty
+    // Issue 5: the `--to` envelope must also carry the empty
     // `unassigned_children` sibling so directive consumers see a
     // uniform shape regardless of which `koto next` path produced it.
     assert_eq!(

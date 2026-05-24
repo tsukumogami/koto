@@ -1,6 +1,6 @@
 # Workspace Layout
 
-This document catalogs the files KT1 introduces under `~/.koto/` and
+This document catalogs the files the request-store introduces under `~/.koto/` and
 their derivability / safe-deletion semantics. Operators reading this
 can confidently prune any of the listed files when troubleshooting
 without risk of data loss — every entry is rebuildable from the
@@ -8,7 +8,7 @@ authoritative session state (headers + event logs).
 
 Cross-references: `docs/STABILITY.md` for the public crate stability
 contract; `docs/designs/DESIGN-koto-request-store.md` for the full
-KT1 design (Consequences > Mitigations, line 2223, is the source
+request-store design (Consequences > Mitigations, line 2223, is the source
 of authority for this document).
 
 ## Directory tree
@@ -18,19 +18,19 @@ of authority for this document).
 ├── sessions/                                  # AUTHORITATIVE state
 │   └── <session-id>/
 │       ├── koto-<session-id>.state.jsonl      # header + event log
-│       └── claim.lock                         # derived (KT1 sidecar)
-├── coordinators/                              # derived (KT1 cursor state)
+│       └── claim.lock                         # derived (request-store sidecar)
+├── coordinators/                              # derived (request-store cursor state)
 │   └── <coord_id>/
 │       └── scan_cursor.toml
-├── _terminal_index.jsonl                      # derived (KT1 skip-list)
-└── _terminal_index.compact.lock               # derived (KT1 compaction lease)
+├── _terminal_index.jsonl                      # derived (request-store skip-list)
+└── _terminal_index.compact.lock               # derived (request-store compaction lease)
 ```
 
 Sessions under `~/.koto/sessions/` ARE the authoritative state and
 must not be deleted manually except via `koto session cleanup`. The
 four derived files below are safe to delete.
 
-## Derived files introduced by KT1
+## Derived files introduced by the request-store
 
 ### 1. `~/.koto/_terminal_index.jsonl`
 
@@ -90,7 +90,7 @@ TOML: `{coord_id, started_at, started_at_unix_seconds}`.
 - **Recovery cost:** the stale-lock recovery walk inside
   `recover_stale_compact_lock` cleans up automatically on the next
   compaction tick when the lock's `started_at` exceeds
-  `kt1.compact_lock_timeout_seconds` (default 3600 s) AND the
+  `request_store.compact_lock_timeout_seconds` (default 3600 s) AND the
   recorded `coord_id` is foreign. No operator action required for
   typical crashed-coordinator cases.
 
@@ -109,7 +109,7 @@ dispatched agent completes the child's terminal write.
   reached terminal. Deleting a sidecar while a dispatch is in flight
   allows a second coordinator to re-claim the same child. Use
   `koto workspace prune` to remove sidecars whose owning coordinator
-  is older than the configured `kt1.stale_claim_timeout_seconds`
+  is older than the configured `request_store.stale_claim_timeout_seconds`
   (default 600 s).
 - **Recovery cost:** the stale-claim recovery walk inside Issue 11's
   `recover_orphaned_sidecar` cleans up dead-coord sidecars on the
@@ -135,9 +135,9 @@ koto workspace prune
 
 - Stale scan cursors whose `last_scan_at` exceeds the 7-day TTL.
 - Stale compaction locks whose `started_at` exceeds
-  `kt1.compact_lock_timeout_seconds`.
+  `request_store.compact_lock_timeout_seconds`.
 - Stale claim sidecars whose `claimed_at` exceeds
-  `kt1.stale_claim_timeout_seconds`.
+  `request_store.stale_claim_timeout_seconds`.
 
 The verb does NOT delete session directories under
 `~/.koto/sessions/`. Session cleanup is the
@@ -159,7 +159,7 @@ session directory permanently destroys the session's history.
 
 - `docs/STABILITY.md` — public crate surface lockdown (Issue 19,
   Decision 5).
-- `docs/designs/DESIGN-koto-request-store.md` — full KT1 design.
+- `docs/designs/DESIGN-koto-request-store.md` — full request-store design.
   Consequences > Mitigations (line 2223) is the source of
   authority for this document.
 - `koto workspace prune --help` — the operator-driven cleanup verb.

@@ -1,5 +1,5 @@
 [workspace]
-# KT1 Issue 20: register the external-consumer fixture crate as a
+# Issue 20: register the external-consumer fixture crate as a
 # workspace member so `cargo test -p koto-stability-tests` resolves
 # the koto dependency via `path = ".."`. The koto crate itself
 # remains the workspace root package (this is a hybrid layout —
@@ -8,7 +8,7 @@ members = ["koto-stability-tests"]
 
 [package]
 name = "koto"
-# KT1 Issue 20: MAJOR bump from 0.9.1-dev → 0.10.0 marks the
+# Issue 20: MAJOR bump from 0.9.1-dev → 0.10.0 marks the
 # Stage 1 stability lockdown release. Per koto's 0.x semver
 # discipline, MINOR is treated as MAJOR (Cargo convention for
 # pre-1.0 crates). See CHANGELOG.md for the release notes and

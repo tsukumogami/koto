@@ -1,4 +1,4 @@
-//! Integration tests for KT1 Issue 12:
+//! Integration tests for Issue 12:
 //! `feat(persistence): idempotency hash + 3-point fsync discipline`.
 //!
 //! Covers the 11 acceptance criteria from the issue body:

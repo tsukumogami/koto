@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use filetime::{set_file_mtime, FileTime};
 
-use koto::config::Kt1Config;
+use koto::config::RequestStoreConfig;
 use koto::engine::discovery::scan;
 use koto::engine::persistence::append_header;
 use koto::engine::terminal_index::{
@@ -157,7 +157,7 @@ fn discovery_skips_session_listed_in_terminal_index() {
     )
     .unwrap();
 
-    let candidates = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let candidates = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     let ids: Vec<&str> = candidates
         .iter()
         .map(|c| c.child_session_id.as_str())
@@ -204,7 +204,7 @@ fn discovery_resurfaces_session_when_disk_header_mtime_exceeds_index() {
     )
     .unwrap();
 
-    let candidates = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let candidates = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     let ids: Vec<&str> = candidates
         .iter()
         .map(|c| c.child_session_id.as_str())
@@ -263,7 +263,7 @@ fn multi_writer_same_session_dedups_to_higher_mtime() {
     assert_eq!(winner.header_mtime_ns, disk_ns);
     assert_eq!(winner.terminal_state, "completed");
 
-    let candidates = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let candidates = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     let ids: Vec<&str> = candidates
         .iter()
         .map(|c| c.child_session_id.as_str())
@@ -288,7 +288,7 @@ fn discovery_unaffected_when_index_file_absent() {
     );
     // No terminal index file written.
     assert!(!terminal_index_path(root).exists());
-    let candidates = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let candidates = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     let ids: Vec<&str> = candidates
         .iter()
         .map(|c| c.child_session_id.as_str())

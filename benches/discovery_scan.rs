@@ -1,6 +1,6 @@
-//! Criterion benchmark harness for the KT1 discovery scan.
+//! Criterion benchmark harness for the request-store discovery scan.
 //!
-//! Implements KT1 Issue 10. Measures the discovery scan
+//! Implements Issue 10. Measures the discovery scan
 //! ([`koto::engine::discovery::scan`]) plus terminal-index filter
 //! ([`koto::engine::terminal_index::read_terminal_index`]) at workspace
 //! sizes of 100, 1k, 10k, and 26k sessions, asserting the year-2 R20
@@ -107,7 +107,7 @@ use std::time::Duration;
 use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion};
 use filetime::{set_file_mtime, FileTime};
 
-use koto::config::Kt1Config;
+use koto::config::RequestStoreConfig;
 use koto::engine::discovery::{scan, write_cursor_atomic, ScanCursor};
 use koto::engine::persistence::append_header;
 use koto::engine::terminal_index::{append_terminal_index_entry, TerminalIndexEntry};
@@ -366,7 +366,7 @@ fn bench_warm_cursor(c: &mut Criterion) {
                     tmp
                 },
                 |tmp| {
-                    let out = scan(tmp.path(), &coord(), &Kt1Config::default()).unwrap();
+                    let out = scan(tmp.path(), &coord(), &RequestStoreConfig::default()).unwrap();
                     black_box(out);
                 },
                 BatchSize::SmallInput,
@@ -404,7 +404,7 @@ fn bench_cold_cursor(c: &mut Criterion) {
                     tmp
                 },
                 |tmp| {
-                    let out = scan(tmp.path(), &coord(), &Kt1Config::default()).unwrap();
+                    let out = scan(tmp.path(), &coord(), &RequestStoreConfig::default()).unwrap();
                     black_box(out);
                 },
                 BatchSize::SmallInput,

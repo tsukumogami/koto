@@ -10,7 +10,7 @@
 //! through this verb.
 //!
 //! The verb intentionally does NOT consult `coordinator_of_record`:
-//! KT1 workspaces can be pruned by any operator regardless of which
+//! Request-store workspaces can be pruned by any operator regardless of which
 //! coordinator (if any) is currently dispatching to the tree (Decision
 //! 4 line 578). It also does NOT mutate
 //! `~/.koto/_terminal_index.jsonl` -- Issue 9 owns terminal-index
@@ -147,7 +147,7 @@ pub fn handle_prune(
     }
 
     // 10. Confirmation prompt. `--yes` skips. Issue 18 will plumb
-    //     `KOTO_KT1_PRUNE_CONFIRM=1` as another bypass through this
+    //     `KOTO_REQUEST_STORE_PRUNE_CONFIRM=1` as another bypass through this
     //     same `prompt_required` parameter.
     let prompt_required = !yes;
     if !confirm_prune(prompt_required)? {
@@ -178,10 +178,10 @@ pub fn handle_prune(
     let cursors_gc = match (|| -> anyhow::Result<usize> {
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
-        let kt1 = crate::config::resolve::load_config()
+        let rs = crate::config::resolve::load_config()
             .unwrap_or_default()
-            .kt1;
-        crate::engine::discovery::gc_stale_cursors(&home.join(".koto"), &kt1)
+            .request_store;
+        crate::engine::discovery::gc_stale_cursors(&home.join(".koto"), &rs)
     })() {
         Ok(n) => n,
         Err(e) => {
@@ -352,7 +352,7 @@ fn print_preview(
 ///
 /// `prompt_required = false` means the caller has already gathered
 /// consent (e.g. `--yes` on the CLI, or Issue 18's
-/// `KOTO_KT1_PRUNE_CONFIRM=1` env-var bypass) and the prompt is
+/// `KOTO_REQUEST_STORE_PRUNE_CONFIRM=1` env-var bypass) and the prompt is
 /// skipped. With `prompt_required = true`, the function writes the
 /// prompt to stdout, reads one line from stdin, and returns true on
 /// `y`/`yes` (case-insensitive, trimmed). EOF on stdin counts as

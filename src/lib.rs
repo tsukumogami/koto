@@ -12,7 +12,7 @@ pub mod gate;
 pub mod session;
 pub mod template;
 
-// ===== KT1 Stage 1 frozen public surface (Issue 19 / Decision 5) =====
+// ===== Stage 1 frozen public surface (Issue 19 / Decision 5) =====
 //
 // The re-exports below pin the canonical paths bunki BK2 imports
 // against. Breaking changes to these names — renames, removals, or

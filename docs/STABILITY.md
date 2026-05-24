@@ -197,7 +197,7 @@ in the `Unknown` form and a future upgrade re-decodes them losslessly.
 
 ## Future Stage 2 surface (informational)
 
-The KT1 substrate-orchestration traits (`SubstrateSpawner`,
+The request-store substrate-orchestration traits (`SubstrateSpawner`,
 `SubstrateWaker`, `SubstrateRespawner`) are bunki BK2's swap-in
 surface for dispatching agents, delivering wakes, and respawning
 crashed coordinators. Their APIs are still in flux as Issues 15 and
@@ -210,8 +210,8 @@ ships.
 
 ## Operator-facing references
 
-- `docs/workspace-layout.md` — operator catalog of KT1 derived files
+- `docs/workspace-layout.md` — operator catalog of request-store derived files
   (`_terminal_index.jsonl`, scan cursors, compaction lock, claim
   sidecars) and their safe-deletion semantics.
-- `docs/designs/DESIGN-koto-request-store.md` — full KT1 design,
+- `docs/designs/DESIGN-koto-request-store.md` — full request-store design,
   Decision 5 (this contract's source of authority).

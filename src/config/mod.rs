@@ -9,17 +9,17 @@ pub struct KotoConfig {
     #[serde(default)]
     pub session: SessionConfig,
     #[serde(default)]
-    pub kt1: Kt1Config,
+    pub request_store: RequestStoreConfig,
 }
 
-/// KT1 (coordinator/operator) configuration.
+/// Request-store (coordinator/operator) configuration.
 ///
 /// Carries the eight operator-tunable dimensions from Decision 4 of
 /// DESIGN-koto-request-store. Each field has a built-in default and
 /// is independently overridable via TOML, env-var, or (for
 /// `redelegation_cap`) a per-tick CLI flag on `koto next`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct Kt1Config {
+pub struct RequestStoreConfig {
     #[serde(default = "default_stale_claim_timeout_seconds")]
     pub stale_claim_timeout_seconds: u64,
     #[serde(default = "default_stale_dispatch_timeout_seconds")]
@@ -38,15 +38,15 @@ pub struct Kt1Config {
     pub respawn_generation_cap: u32,
     /// Reserved-but-ignored namespace for V1.1 recursion-cap promotion.
     /// V1 runtime caps are hard-coded in `src/engine/caps.rs`; values
-    /// supplied under `[kt1.recursion]` are accepted by the parser but
-    /// emit a warn-level log on `koto config get` and `koto next`
-    /// startup so operators get a clear signal that the namespace is
-    /// reserved.
+    /// supplied under `[request_store.recursion]` are accepted by the
+    /// parser but emit a warn-level log on `koto config get` and `koto
+    /// next` startup so operators get a clear signal that the namespace
+    /// is reserved.
     #[serde(default)]
     pub recursion: Option<toml::Value>,
 }
 
-impl Default for Kt1Config {
+impl Default for RequestStoreConfig {
     fn default() -> Self {
         Self {
             stale_claim_timeout_seconds: default_stale_claim_timeout_seconds(),
@@ -120,22 +120,37 @@ pub fn get_value(config: &KotoConfig, key: &str) -> Option<String> {
         "session.cloud.region" => config.session.cloud.region.clone(),
         "session.cloud.access_key" => config.session.cloud.access_key.clone(),
         "session.cloud.secret_key" => config.session.cloud.secret_key.clone(),
-        "kt1.stale_claim_timeout_seconds" => {
-            Some(config.kt1.stale_claim_timeout_seconds.to_string())
+        "request_store.stale_claim_timeout_seconds" => {
+            Some(config.request_store.stale_claim_timeout_seconds.to_string())
         }
-        "kt1.stale_dispatch_timeout_seconds" => {
-            Some(config.kt1.stale_dispatch_timeout_seconds.to_string())
+        "request_store.stale_dispatch_timeout_seconds" => Some(
+            config
+                .request_store
+                .stale_dispatch_timeout_seconds
+                .to_string(),
+        ),
+        "request_store.redelegation_cap" => Some(config.request_store.redelegation_cap.to_string()),
+        "request_store.coord_cursor_ttl_days" => {
+            Some(config.request_store.coord_cursor_ttl_days.to_string())
         }
-        "kt1.redelegation_cap" => Some(config.kt1.redelegation_cap.to_string()),
-        "kt1.coord_cursor_ttl_days" => Some(config.kt1.coord_cursor_ttl_days.to_string()),
-        "kt1.terminal_index_compact_lines" => {
-            Some(config.kt1.terminal_index_compact_lines.to_string())
+        "request_store.terminal_index_compact_lines" => Some(
+            config
+                .request_store
+                .terminal_index_compact_lines
+                .to_string(),
+        ),
+        "request_store.compact_lock_timeout_seconds" => Some(
+            config
+                .request_store
+                .compact_lock_timeout_seconds
+                .to_string(),
+        ),
+        "request_store.directive_batch_size" => {
+            Some(config.request_store.directive_batch_size.to_string())
         }
-        "kt1.compact_lock_timeout_seconds" => {
-            Some(config.kt1.compact_lock_timeout_seconds.to_string())
+        "request_store.respawn_generation_cap" => {
+            Some(config.request_store.respawn_generation_cap.to_string())
         }
-        "kt1.directive_batch_size" => Some(config.kt1.directive_batch_size.to_string()),
-        "kt1.respawn_generation_cap" => Some(config.kt1.respawn_generation_cap.to_string()),
         _ => None,
     }
 }
@@ -220,14 +235,14 @@ pub const ALL_KEYS: &[&str] = &[
     "session.cloud.region",
     "session.cloud.access_key",
     "session.cloud.secret_key",
-    "kt1.stale_claim_timeout_seconds",
-    "kt1.stale_dispatch_timeout_seconds",
-    "kt1.redelegation_cap",
-    "kt1.coord_cursor_ttl_days",
-    "kt1.terminal_index_compact_lines",
-    "kt1.compact_lock_timeout_seconds",
-    "kt1.directive_batch_size",
-    "kt1.respawn_generation_cap",
+    "request_store.stale_claim_timeout_seconds",
+    "request_store.stale_dispatch_timeout_seconds",
+    "request_store.redelegation_cap",
+    "request_store.coord_cursor_ttl_days",
+    "request_store.terminal_index_compact_lines",
+    "request_store.compact_lock_timeout_seconds",
+    "request_store.directive_batch_size",
+    "request_store.respawn_generation_cap",
 ];
 
 /// Produce a redacted copy of the config for display.
@@ -243,13 +258,13 @@ pub fn redact(config: &KotoConfig) -> KotoConfig {
     redacted
 }
 
-/// Emit a warn-level log to stderr if the `[kt1.recursion]` table is
-/// populated in the resolved config. Called from `koto config get` and
-/// `koto next` startup. Silent when the namespace is absent.
-pub fn warn_if_kt1_recursion_reserved(config: &KotoConfig) {
-    if config.kt1.recursion.is_some() {
+/// Emit a warn-level log to stderr if the `[request_store.recursion]`
+/// table is populated in the resolved config. Called from `koto config
+/// get` and `koto next` startup. Silent when the namespace is absent.
+pub fn warn_if_request_store_recursion_reserved(config: &KotoConfig) {
+    if config.request_store.recursion.is_some() {
         eprintln!(
-            "warning: [kt1.recursion] is a reserved-but-ignored namespace at V1; \
+            "warning: [request_store.recursion] is a reserved-but-ignored namespace at V1; \
              values supplied here have no effect (runtime recursion caps are hard-coded). \
              The table is pre-staked for future operator-tunable promotion."
         );
@@ -270,34 +285,34 @@ mod tests {
     }
 
     #[test]
-    fn test_kt1_config_defaults() {
-        let kt1 = Kt1Config::default();
-        assert_eq!(kt1.stale_claim_timeout_seconds, 600);
-        assert_eq!(kt1.stale_dispatch_timeout_seconds, 600);
-        assert_eq!(kt1.redelegation_cap, 3);
-        assert_eq!(kt1.coord_cursor_ttl_days, 7);
-        assert_eq!(kt1.terminal_index_compact_lines, 100_000);
-        assert_eq!(kt1.compact_lock_timeout_seconds, 3600);
-        assert_eq!(kt1.directive_batch_size, 50);
-        assert_eq!(kt1.respawn_generation_cap, 2);
-        assert!(kt1.recursion.is_none());
+    fn test_request_store_config_defaults() {
+        let rs = RequestStoreConfig::default();
+        assert_eq!(rs.stale_claim_timeout_seconds, 600);
+        assert_eq!(rs.stale_dispatch_timeout_seconds, 600);
+        assert_eq!(rs.redelegation_cap, 3);
+        assert_eq!(rs.coord_cursor_ttl_days, 7);
+        assert_eq!(rs.terminal_index_compact_lines, 100_000);
+        assert_eq!(rs.compact_lock_timeout_seconds, 3600);
+        assert_eq!(rs.directive_batch_size, 50);
+        assert_eq!(rs.respawn_generation_cap, 2);
+        assert!(rs.recursion.is_none());
     }
 
     #[test]
-    fn test_kt1_config_partial_toml_uses_defaults() {
-        let toml_str = "[kt1]\nredelegation_cap = 5\n";
+    fn test_request_store_config_partial_toml_uses_defaults() {
+        let toml_str = "[request_store]\nredelegation_cap = 5\n";
         let cfg: KotoConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.kt1.redelegation_cap, 5);
+        assert_eq!(cfg.request_store.redelegation_cap, 5);
         // Other dimensions stay at their built-in defaults.
-        assert_eq!(cfg.kt1.stale_claim_timeout_seconds, 600);
-        assert_eq!(cfg.kt1.directive_batch_size, 50);
+        assert_eq!(cfg.request_store.stale_claim_timeout_seconds, 600);
+        assert_eq!(cfg.request_store.directive_batch_size, 50);
     }
 
     #[test]
-    fn test_kt1_recursion_table_parses_without_error() {
-        let toml_str = "[kt1.recursion]\nmax_depth_soft = 7\nmax_depth_hard = 20\n";
+    fn test_request_store_recursion_table_parses_without_error() {
+        let toml_str = "[request_store.recursion]\nmax_depth_soft = 7\nmax_depth_hard = 20\n";
         let cfg: KotoConfig = toml::from_str(toml_str).unwrap();
-        assert!(cfg.kt1.recursion.is_some());
+        assert!(cfg.request_store.recursion.is_some());
     }
 
     #[test]

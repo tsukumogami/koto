@@ -42,7 +42,7 @@
 //!
 //! ## Hard-coded at V1 (Decision 4)
 //!
-//! The reserved `[kt1.recursion]` namespace (Issue 18) pre-stakes the
+//! The reserved `[request_store.recursion]` namespace (Issue 18) pre-stakes the
 //! TOML location for a V1.1 promotion to operator-configurable caps,
 //! but at V1 the thresholds are hard-coded constants. An operator
 //! override surface would silently break substrate-agnostic operation

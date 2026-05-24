@@ -1,4 +1,4 @@
-//! Coverage for KT1 Issue 11 — O_EXCL sidecar atomicity, happy-path
+//! Coverage for Issue 11 — O_EXCL sidecar atomicity, happy-path
 //! dispatch orchestration, and drift recovery (cases 3a/3b/3c +
 //! malformed fallthrough).
 //!

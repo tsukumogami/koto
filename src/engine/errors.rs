@@ -91,10 +91,11 @@ pub enum EngineError {
     },
 
     /// `koto next --with-data` carried a `fields.kind` value that
-    /// collides with the KT1 audit family — either one of the four
-    /// reserved literal names ([`crate::engine::audit::RESERVED_KINDS`])
-    /// or anything starting with the [`crate::engine::audit::KT1_PREFIX`]
-    /// prefix. Rejected at parse time before any disk write so
+    /// collides with the request-store audit family — either one of
+    /// the four reserved literal names
+    /// ([`crate::engine::audit::RESERVED_KINDS`]) or anything starting
+    /// with the [`crate::engine::audit::REQUEST_STORE_PREFIX`] prefix.
+    /// Rejected at parse time before any disk write so
     /// template authors cannot shadow a reserved kind and corrupt
     /// bunki BK2's dispatch_invalidation read path. See Decision 6
     /// in DESIGN-koto-request-store.

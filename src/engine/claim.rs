@@ -615,7 +615,7 @@ fn append_redelegated_audit(
     now: &SystemTime,
 ) -> Result<()> {
     let payload = EventPayload::EvidenceSubmitted {
-        state: "kt1.redelegation".to_string(),
+        state: "request_store.redelegation".to_string(),
         fields,
         submitter_cwd: None,
     };
@@ -666,7 +666,7 @@ pub fn claim_and_dispatch(
     let fields =
         audit::child_dispatched_fields(child_session_id, coord_id.as_str(), header.dispatch_epoch);
     let payload = EventPayload::EvidenceSubmitted {
-        state: "kt1.dispatch".to_string(),
+        state: "request_store.dispatch".to_string(),
         fields,
         submitter_cwd: None,
     };

@@ -1,4 +1,4 @@
-//! Criterion benchmark harness for KT1 Issue 17 recursion-cap
+//! Criterion benchmark harness for Issue 17 recursion-cap
 //! enforcement.
 //!
 //! Measures [`koto::engine::caps::validate_recursion_caps`] at

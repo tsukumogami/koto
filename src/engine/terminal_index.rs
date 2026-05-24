@@ -528,7 +528,7 @@ pub struct CompactLock {
 pub fn maybe_compact_terminal_index(
     koto_root: &Path,
     coord_id: &str,
-    cfg: &crate::config::Kt1Config,
+    cfg: &crate::config::RequestStoreConfig,
 ) -> Result<CompactionOutcome> {
     let index_path = terminal_index_path(koto_root);
     if !index_path.exists() {
@@ -767,7 +767,7 @@ fn set_mode_0600(_path: &Path) -> Result<()> {
 pub fn recover_stale_compact_lock(
     koto_root: &Path,
     coord_id: &str,
-    cfg: &crate::config::Kt1Config,
+    cfg: &crate::config::RequestStoreConfig,
 ) -> Result<bool> {
     let lock_path = compact_lock_path(koto_root);
     let contents = match std::fs::read_to_string(&lock_path) {
@@ -1082,11 +1082,11 @@ mod tests {
     fn cfg_with_threshold_and_timeout(
         threshold: u64,
         timeout_seconds: u64,
-    ) -> crate::config::Kt1Config {
-        crate::config::Kt1Config {
+    ) -> crate::config::RequestStoreConfig {
+        crate::config::RequestStoreConfig {
             terminal_index_compact_lines: threshold,
             compact_lock_timeout_seconds: timeout_seconds,
-            ..crate::config::Kt1Config::default()
+            ..crate::config::RequestStoreConfig::default()
         }
     }
 

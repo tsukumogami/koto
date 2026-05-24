@@ -1,4 +1,4 @@
-//! Integration tests for KT1 Issue 17 recursion-cap enforcement.
+//! Integration tests for Issue 17 recursion-cap enforcement.
 //!
 //! Covers the 10 acceptance criteria for `src/engine/caps.rs`:
 //! - Six numeric-boundary tests (3 dimensions × warn/reject) — depth

@@ -122,7 +122,7 @@ pub fn validate_epoch(
 ///
 /// R43's wording is "every writer to a CHILD'S log" but the design's
 /// scope is the request-store dispatched-agent protocol. Batch
-/// children predate KT1 and have their own single-writer discipline
+/// children predate the request-store and have their own single-writer discipline
 /// (the dispatched agent is the same process as the spawning batch
 /// scheduler).
 pub fn fence_applies_to(header: &StateFileHeader) -> bool {

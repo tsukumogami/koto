@@ -1,9 +1,9 @@
-//! Integration coverage for the KT1 reserved-kind audit family
-//! (Decision 6 in DESIGN-koto-request-store).
+//! Integration coverage for the request-store reserved-kind audit
+//! family (Decision 6 in DESIGN-koto-request-store).
 //!
 //! Exercises the four reserved-kind constants, the parser-rejection
 //! contract (template authors cannot submit a reserved `fields.kind`
-//! via `koto next --with-data`), the `kt1.` prefix gate, the
+//! via `koto next --with-data`), the `request_store.` prefix gate, the
 //! `wake_payload_summary` count-only narrative, and a bunki-shaped
 //! consumer that omits `EvidenceSubmitted` and falls through to an
 //! `Unknown` catch-all on the wire payload.
@@ -15,8 +15,8 @@ use serde_json::json;
 
 use koto::engine::audit::{
     child_dispatched_fields, child_redelegated_fields, is_reserved_kind, requester_respawn_fields,
-    requester_woken_fields, wake_payload_summary, CHILD_DISPATCHED, CHILD_REDELEGATED, KT1_PREFIX,
-    REQUESTER_RESPAWN, REQUESTER_WOKEN, RESERVED_KINDS,
+    requester_woken_fields, wake_payload_summary, CHILD_DISPATCHED, CHILD_REDELEGATED,
+    REQUESTER_RESPAWN, REQUESTER_WOKEN, REQUEST_STORE_PREFIX, RESERVED_KINDS,
 };
 use koto::engine::errors::EngineError;
 use koto::engine::types::{Event, EventPayload, ValidatedSessionId};
@@ -50,7 +50,7 @@ fn reserved_constants_match_design_table() {
     assert_eq!(CHILD_REDELEGATED, "ChildRedelegated");
     assert_eq!(REQUESTER_WOKEN, "RequesterWoken");
     assert_eq!(REQUESTER_RESPAWN, "RequesterRespawn");
-    assert_eq!(KT1_PREFIX, "kt1.");
+    assert_eq!(REQUEST_STORE_PREFIX, "request_store.");
     assert_eq!(RESERVED_KINDS.len(), 4);
 }
 
@@ -66,15 +66,27 @@ fn reserved_kinds_table_test_all_four() {
 }
 
 #[test]
-fn kt1_prefix_table_test() {
-    for kind in ["kt1.", "kt1.foo", "kt1.respawn", "kt1.deeply.nested.kind"] {
+fn request_store_prefix_table_test() {
+    for kind in [
+        "request_store.",
+        "request_store.foo",
+        "request_store.respawn",
+        "request_store.deeply.nested.kind",
+    ] {
         assert!(is_reserved_kind(kind));
     }
 }
 
 #[test]
 fn template_author_kinds_are_accepted() {
-    for ok in ["verdict", "review", "scrutineer", "kt", "kt1", "kt1foo"] {
+    for ok in [
+        "verdict",
+        "review",
+        "scrutineer",
+        "request",
+        "request_stor",
+        "request_storefoo",
+    ] {
         assert!(
             !is_reserved_kind(ok),
             "{:?} must not be treated as reserved",
@@ -169,7 +181,7 @@ fn reserved_kind_collision_exit_code_defaults_to_one() {
     // the design doesn't pin a sysexit value, so it falls through
     // to the generic-error default.
     let err = EngineError::ReservedKindCollision {
-        offending_kind: "kt1.foo".to_string(),
+        offending_kind: "request_store.foo".to_string(),
     };
     assert_eq!(err.exit_code(), 1);
 }
@@ -248,8 +260,12 @@ fn reserved_literal_kinds_fail_audit_predicate() {
 }
 
 #[test]
-fn kt1_prefix_kinds_fail_audit_predicate() {
-    for kind in ["kt1.foo", "kt1.respawn", "kt1.x.y.z"] {
+fn request_store_prefix_kinds_fail_audit_predicate() {
+    for kind in [
+        "request_store.foo",
+        "request_store.respawn",
+        "request_store.x.y.z",
+    ] {
         assert!(is_reserved_kind(kind));
     }
 }

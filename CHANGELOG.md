@@ -41,7 +41,7 @@ The intentional behavior change is required by the dispatch
 protocol itself: the discovery scan and the terminal-index reader
 both depend on terminal sessions remaining on disk long enough for
 the per-coordinator cursor to advance correctly. The 7-day TTL on
-coordinator cursors (`kt1.coord_cursor_ttl_days`) bounds the
+coordinator cursors (`request_store.coord_cursor_ttl_days`) bounds the
 horizon during which a terminal session needs to remain visible.
 
 koto's dashboard surfaces stale-tree indicators so operators see at
@@ -100,7 +100,7 @@ accidental breaking changes before release.
   four-case drift recovery.
 - Audit-event family with reserved `kind` discriminator on
   `EvidenceSubmitted`: `ChildDispatched`, `ChildRedelegated`,
-  `RequesterWoken`, `RequesterRespawn`. The `kt1.` prefix is
+  `RequesterWoken`, `RequesterRespawn`. The `request_store.` prefix is
   reserved for future audit kinds.
 - Idempotency-hash short-circuit + 3-point fsync discipline before
   substrate wake-delivery.
@@ -112,8 +112,8 @@ accidental breaking changes before release.
 - Recursion-cap enforcement + recursion_caps bench harness.
 - Discovery scan bench harness with soft-by-default reporting at
   100/1k/10k/26k workspace sizes.
-- `Kt1Config` 5-level precedence cascade + reserved
-  `[kt1.recursion]` warn. Eight operator-tunable dimensions:
+- `RequestStoreConfig` 5-level precedence cascade + reserved
+  `[request_store.recursion]` warn. Eight operator-tunable dimensions:
   `stale_claim_timeout_seconds`,
   `stale_dispatch_timeout_seconds`, `redelegation_cap`,
   `coord_cursor_ttl_days`, `terminal_index_compact_lines`,

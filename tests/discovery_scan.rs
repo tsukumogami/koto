@@ -1,6 +1,6 @@
 //! Integration tests for `koto::engine::discovery`.
 //!
-//! Covers the 12 acceptance criteria from KT1 Issue 7:
+//! Covers the 12 acceptance criteria from Issue 7:
 //! ordered candidate set, default-50 batch cap, candidate filter
 //! (coord_of_record + assignment_claim exclusions); tied-boundary
 //! correctness (the 32-headers / 24-surfaced race AC); quiet second
@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use filetime::{set_file_mtime, FileTime};
 
 use koto::cli::next_types::UnassignedChild;
-use koto::config::Kt1Config;
+use koto::config::RequestStoreConfig;
 use koto::engine::discovery::{
     cursor_path, gc_stale_cursors, read_cursor, scan, write_cursor_atomic, ScanCursor,
 };
@@ -103,10 +103,10 @@ fn now_micros() -> u64 {
         .as_micros() as u64
 }
 
-fn cfg_with_batch_size(batch: u32) -> Kt1Config {
-    Kt1Config {
+fn cfg_with_batch_size(batch: u32) -> RequestStoreConfig {
+    RequestStoreConfig {
         directive_batch_size: batch,
-        ..Kt1Config::default()
+        ..RequestStoreConfig::default()
     }
 }
 
@@ -138,7 +138,7 @@ fn scan_returns_candidates_ordered_by_mtime_ascending() {
         base + 2_000_000,
     );
 
-    let out = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let out = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     assert_eq!(out.len(), 3);
     let order: Vec<&str> = out.iter().map(|c| c.child_session_id.as_str()).collect();
     assert_eq!(order, vec!["child-a", "child-b", "child-c"]);
@@ -158,7 +158,7 @@ fn scan_caps_at_default_directive_batch_size() {
             mtime,
         );
     }
-    let out = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let out = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     assert_eq!(out.len(), 50);
     // The 50 surfaced should be the 50 OLDEST (mtime ascending).
     assert_eq!(out[0].child_session_id, "child-000");
@@ -180,7 +180,7 @@ fn scan_excludes_children_for_other_coordinator() {
     other.coordinator_of_record = Some("other-coord".into());
     write_session(root, &other, base + 200);
 
-    let out = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let out = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].child_session_id, "ours");
 }
@@ -201,7 +201,7 @@ fn scan_excludes_already_claimed_children() {
     write_session(root, &claimed, base + 100);
     write_session(root, &make_unassigned_child_header("free"), base + 200);
 
-    let out = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let out = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].child_session_id, "free");
 }
@@ -244,7 +244,7 @@ fn tied_boundary_surfaces_strictly_newer_plus_unseen_tied() {
     };
     write_cursor_atomic(root, COORD, &prior).unwrap();
 
-    let out = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let out = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     let surfaced: BTreeSet<String> = out.into_iter().map(|c| c.child_session_id).collect();
     assert_eq!(
         surfaced.len(),
@@ -277,10 +277,10 @@ fn second_tick_with_no_new_writes_returns_empty() {
     write_session(root, &make_unassigned_child_header("c1"), base + 1);
     write_session(root, &make_unassigned_child_header("c2"), base + 2);
 
-    let first = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let first = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     assert_eq!(first.len(), 2);
 
-    let second = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let second = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     assert!(
         second.is_empty(),
         "no new writes should produce empty second tick, got {:?}",
@@ -304,7 +304,7 @@ fn cursor_recovery_absent_full_rescans() {
 
     write_session(root, &make_unassigned_child_header("c1"), base + 100);
     // Do NOT prime any cursor. First scan should see everything (full rescan).
-    let out = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let out = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     assert_eq!(out.len(), 1);
     // And a fresh cursor was written.
     assert!(cursor_path(root, COORD).exists());
@@ -324,7 +324,7 @@ fn cursor_recovery_malformed_full_rescans_and_rewrites() {
     fs::write(&path, b"garbage = [[[ not toml").unwrap();
 
     write_session(root, &make_unassigned_child_header("c1"), base + 100);
-    let out = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let out = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     assert_eq!(out.len(), 1);
     // Cursor was rewritten cleanly.
     let recovered = read_cursor(root, COORD, 7);
@@ -353,7 +353,7 @@ fn cursor_recovery_ttl_exceeded_full_rescans() {
 
     // TTL = 7 (default). The 100-day-old cursor triggers full rescan
     // → c1 surfaces despite being "older than" the high last_max.
-    let out = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let out = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     assert_eq!(out.len(), 1);
 }
 
@@ -369,7 +369,7 @@ fn cursor_write_leaves_no_orphan_tmp_file() {
         &make_unassigned_child_header("c1"),
         now_micros() - 100,
     );
-    let _ = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let _ = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
 
     let path = cursor_path(root, COORD);
     assert!(path.exists());
@@ -414,7 +414,7 @@ fn cursor_write_overwrites_previous_atomically() {
 fn gc_stale_cursors_deletes_only_stale_foreign_cursors() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let cfg = Kt1Config::default();
+    let cfg = RequestStoreConfig::default();
     let stale = ScanCursor {
         last_scan_at_unix_micros: now_micros().saturating_sub(100 * 24 * 60 * 60 * 1_000_000),
         ..Default::default()
@@ -447,7 +447,7 @@ fn gc_stale_cursors_deletes_only_stale_foreign_cursors() {
 fn scan_does_not_resurrect_a_deleted_stale_cursor() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let cfg = Kt1Config::default();
+    let cfg = RequestStoreConfig::default();
 
     // Prime a stale cursor that GC will sweep.
     let stale = ScanCursor {
@@ -575,7 +575,7 @@ fn handoff_new_coord_builds_cursor_from_scratch() {
     write_session(root, &h2, base + 2);
 
     // Old coord ticks and advances its cursor.
-    let old_out = scan(root, &old_coord_id, &Kt1Config::default()).unwrap();
+    let old_out = scan(root, &old_coord_id, &RequestStoreConfig::default()).unwrap();
     assert_eq!(old_out.len(), 2);
     let old_cursor = read_cursor(root, "old-coord", 7);
     assert!(old_cursor.last_max_header_mtime_unix_micros >= base + 2);
@@ -592,7 +592,7 @@ fn handoff_new_coord_builds_cursor_from_scratch() {
 
     // New coord's first tick: no cursor present for new-coord-id → full
     // rescan. Surfaces both children.
-    let new_out = scan(root, &new_coord_id, &Kt1Config::default()).unwrap();
+    let new_out = scan(root, &new_coord_id, &RequestStoreConfig::default()).unwrap();
     assert_eq!(new_out.len(), 2);
 
     // And new-coord's cursor was written from scratch (no inheritance
@@ -618,13 +618,13 @@ fn surfaced_candidate_does_not_re_surface_on_next_tick() {
         base + 500,
     );
 
-    let first = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let first = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].child_session_id, "only-child");
 
     // Subsequent ticks must return empty until a new header write.
     for _ in 0..3 {
-        let out = scan(root, &coord(), &Kt1Config::default()).unwrap();
+        let out = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
         assert!(out.is_empty(), "re-surfaced candidate: {:?}", out);
     }
 }
@@ -653,7 +653,7 @@ fn scan_skips_headers_with_missing_companion_fields() {
     valid.coordinator_of_record = Some(COORD.into());
     write_session(root, &valid, base + 200);
 
-    let out = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let out = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].child_session_id, "valid");
 }
@@ -671,7 +671,7 @@ fn scan_skips_non_directory_entries_in_sessions() {
         &make_unassigned_child_header("real"),
         now_micros() - 100,
     );
-    let out = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let out = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].child_session_id, "real");
 }
@@ -681,7 +681,7 @@ fn scan_returns_empty_when_sessions_dir_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     // No sessions/ directory at all.
-    let out = scan(root, &coord(), &Kt1Config::default()).unwrap();
+    let out = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
     assert!(out.is_empty());
 }
 

@@ -1,5 +1,5 @@
 //! Integration tests for `koto::engine::terminal_index` compaction
-//! lease (KT1 Issue 9).
+//! lease (Issue 9).
 //!
 //! Inline unit tests in `src/engine/terminal_index.rs` cover threshold
 //! gating, lease EEXIST handling, dedup-with-first-appearance-order,
@@ -20,7 +20,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use koto::config::Kt1Config;
+use koto::config::RequestStoreConfig;
 use koto::engine::terminal_index::{
     append_terminal_index_entry, compact_lock_path, drain_terminal_index_ordered,
     maybe_compact_terminal_index, read_terminal_index, recover_stale_compact_lock, temp_index_path,
@@ -36,11 +36,11 @@ fn fixture_entry(sid: &str, mtime_ns: u64, state: &str) -> TerminalIndexEntry {
     }
 }
 
-fn cfg(threshold: u64, timeout_seconds: u64) -> Kt1Config {
-    Kt1Config {
+fn cfg(threshold: u64, timeout_seconds: u64) -> RequestStoreConfig {
+    RequestStoreConfig {
         terminal_index_compact_lines: threshold,
         compact_lock_timeout_seconds: timeout_seconds,
-        ..Kt1Config::default()
+        ..RequestStoreConfig::default()
     }
 }
 

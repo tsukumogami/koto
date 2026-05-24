@@ -1,17 +1,19 @@
-//! KT1 reserved audit-event kinds and typed payload-shape helpers.
+//! Request-store reserved audit-event kinds and typed payload-shape
+//! helpers.
 //!
 //! Decision 6 (DESIGN-koto-request-store) commits to **reusing**
 //! [`EventPayload::EvidenceSubmitted`] rather than adding new
-//! `EventPayload` variants for the KT1 audit family — PRD D10
-//! requires zero new variants. The audit family is therefore keyed
+//! `EventPayload` variants for the request-store audit family — PRD
+//! D10 requires zero new variants. The audit family is therefore keyed
 //! off a reserved `fields.kind` discriminator on every
 //! `EvidenceSubmitted` event.
 //!
-//! Four canonical reserved kinds are exposed here, plus the `kt1.`
-//! prefix reservation. Template authors cannot use any of these as a
-//! `fields.kind` value on `koto next --with-data` submissions —
-//! [`is_reserved_kind`] is consumed by the CLI parser to reject
-//! collisions at write time with [`crate::engine::errors::EngineError::ReservedKindCollision`].
+//! Four canonical reserved kinds are exposed here, plus the
+//! `request_store.` prefix reservation. Template authors cannot use
+//! any of these as a `fields.kind` value on `koto next --with-data`
+//! submissions — [`is_reserved_kind`] is consumed by the CLI parser
+//! to reject collisions at write time with
+//! [`crate::engine::errors::EngineError::ReservedKindCollision`].
 //!
 //! [`wake_payload_summary`] takes
 //! `&[crate::engine::types::ValidatedSessionId]` rather than
@@ -50,12 +52,12 @@ pub const REQUESTER_WOKEN: &str = "RequesterWoken";
 /// terminal child failure (PRD R31 respawn).
 pub const REQUESTER_RESPAWN: &str = "RequesterRespawn";
 
-/// Prefix reserved for KT1 audit-event kinds.
+/// Prefix reserved for request-store audit-event kinds.
 ///
 /// Template authors cannot submit a `fields.kind` whose value starts
 /// with this prefix; the reservation gives koto headroom to add
 /// future audit kinds without shadowing template-author code.
-pub const KT1_PREFIX: &str = "kt1.";
+pub const REQUEST_STORE_PREFIX: &str = "request_store.";
 
 /// Canonical list of reserved literal kinds.
 ///
@@ -69,17 +71,18 @@ pub const RESERVED_KINDS: &[&str] = &[
     REQUESTER_RESPAWN,
 ];
 
-/// Return `true` when `kind` collides with the KT1 audit family.
+/// Return `true` when `kind` collides with the request-store audit
+/// family.
 ///
 /// A collision means any of:
 /// 1. exact match against one of the four reserved literal names; OR
-/// 2. starts with the `kt1.` prefix.
+/// 2. starts with the `request_store.` prefix.
 ///
 /// The CLI parser-rejection hook (`validate_with_data_payload` in
 /// `src/cli/mod.rs`) consumes this predicate to reject offending
 /// `koto next --with-data` payloads before any disk write.
 pub fn is_reserved_kind(kind: &str) -> bool {
-    if kind.starts_with(KT1_PREFIX) {
+    if kind.starts_with(REQUEST_STORE_PREFIX) {
         return true;
     }
     RESERVED_KINDS.contains(&kind)
@@ -285,10 +288,10 @@ mod tests {
     }
 
     #[test]
-    fn kt1_prefix_collides() {
-        assert!(is_reserved_kind("kt1.foo"));
-        assert!(is_reserved_kind("kt1."));
-        assert!(is_reserved_kind("kt1.anything.with.dots"));
+    fn request_store_prefix_collides() {
+        assert!(is_reserved_kind("request_store.foo"));
+        assert!(is_reserved_kind("request_store."));
+        assert!(is_reserved_kind("request_store.anything.with.dots"));
     }
 
     #[test]
@@ -298,8 +301,8 @@ mod tests {
             "review",
             "scrutineer",
             "child-completed",
-            "kt",
-            "kt1",
+            "request",
+            "request_stor",
         ] {
             assert!(
                 !is_reserved_kind(ok),

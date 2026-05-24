@@ -27,7 +27,7 @@
 //! - Cursor file is absent (never written, or deleted by GC / operator)
 //! - Cursor file fails to parse (malformed TOML)
 //! - Cursor `last_scan_at_unix_micros` is older than the configured TTL
-//!   (`kt1.coord_cursor_ttl_days`, default 7 days)
+//!   (`request_store.coord_cursor_ttl_days`, default 7 days)
 //!
 //! After a fresh-rescan the next cursor write captures the current scan
 //! state and the next tick resumes incremental behavior.
@@ -48,7 +48,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::next_types::UnassignedChild;
-use crate::config::Kt1Config;
+use crate::config::RequestStoreConfig;
 use crate::engine::persistence::read_header;
 use crate::engine::terminal_index::{header_mtime_unix_nanos, read_terminal_index};
 use crate::engine::types::{StateFileHeader, ValidatedCoordId};
@@ -63,7 +63,7 @@ use crate::session::{state_file_name, validate::validate_session_id};
 pub struct ScanCursor {
     /// Wall-clock micros when this cursor was last written. Drives
     /// the TTL recovery path: a cursor older than
-    /// `kt1.coord_cursor_ttl_days` is treated as absent.
+    /// `request_store.coord_cursor_ttl_days` is treated as absent.
     #[serde(default)]
     pub last_scan_at_unix_micros: u64,
 
@@ -191,7 +191,7 @@ pub fn write_cursor_atomic(koto_root: &Path, coord_id: &str, cursor: &ScanCursor
 /// Called from `koto workspace prune` and from `koto next` startup so
 /// stale coordinator state is reclaimed on both code paths. Missing
 /// coordinators directory returns 0 without error.
-pub fn gc_stale_cursors(koto_root: &Path, cfg: &Kt1Config) -> Result<usize> {
+pub fn gc_stale_cursors(koto_root: &Path, cfg: &RequestStoreConfig) -> Result<usize> {
     let dir = koto_root.join("coordinators");
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
@@ -273,7 +273,7 @@ pub fn walk_admits(
     false
 }
 
-/// True when the header's KT1 request-store fields name `coord_id` as
+/// True when the header's request-store fields name `coord_id` as
 /// the coordinator-of-record AND mark the request as unassigned
 /// (`needs_agent == Some(true)` AND `assignment_claim.is_none()`).
 fn header_is_candidate(header: &StateFileHeader, coord_id: &str) -> bool {
@@ -333,7 +333,7 @@ fn header_mtime_unix_micros(path: &Path) -> Result<u64> {
 pub fn scan(
     koto_root: &Path,
     coord_id: &ValidatedCoordId,
-    cfg: &Kt1Config,
+    cfg: &RequestStoreConfig,
 ) -> Result<Vec<UnassignedChild>> {
     let sessions_dir = koto_root.join("sessions");
     let cursor = read_cursor(koto_root, coord_id.as_str(), cfg.coord_cursor_ttl_days);
@@ -680,7 +680,7 @@ mod tests {
     #[test]
     fn gc_stale_cursors_deletes_stale_preserves_fresh() {
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = Kt1Config::default(); // 7-day TTL
+        let cfg = RequestStoreConfig::default(); // 7-day TTL
         let hundred_days_micros: u64 = 100 * 24 * 60 * 60 * 1_000_000;
         let stale = ScanCursor {
             last_scan_at_unix_micros: now_unix_micros().saturating_sub(hundred_days_micros),
@@ -702,7 +702,7 @@ mod tests {
     #[test]
     fn gc_stale_cursors_handles_missing_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = Kt1Config::default();
+        let cfg = RequestStoreConfig::default();
         let deleted = gc_stale_cursors(tmp.path(), &cfg).unwrap();
         assert_eq!(deleted, 0);
     }
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn gc_stale_cursors_deletes_malformed() {
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = Kt1Config::default();
+        let cfg = RequestStoreConfig::default();
         let path = cursor_path(tmp.path(), "garbage-coord");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"not toml :::").unwrap();

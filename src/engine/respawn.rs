@@ -53,7 +53,7 @@
 //!
 //! 1. `respawn_generation_cap_exceeded`: the requester's header
 //!    already records `respawn_generation == cap` (default 2 per
-//!    `kt1.respawn_generation_cap`).
+//!    `request_store.respawn_generation_cap`).
 //! 2. `missing_role`: the requester's header has `role: None`
 //!    (legacy session predating Issue 4). F1 cannot dispatch a
 //!    fresh subagent without a role.
@@ -100,7 +100,7 @@ pub const RESUME_CONTEXT_PROMPT: &str = "You are resuming session <id>. Read you
 /// Default substrate transcript-retention floor. Claude Code Agent
 /// Teams documents 30 days; bunki BK2's hosted substrate may differ.
 /// Currently hard-coded; a future Issue 18 extension may expose this
-/// as `kt1.transcript_retention_days`.
+/// as `request_store.transcript_retention_days`.
 pub const DEFAULT_TRANSCRIPT_RETENTION_DAYS: u32 = 30;
 
 /// Render the [`RESUME_CONTEXT_PROMPT`] with `<id>` substituted by
@@ -227,7 +227,7 @@ pub enum NoOpReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum F3Cause {
     /// `respawn_generation == cap`. Default cap is 2 per
-    /// `kt1.respawn_generation_cap`.
+    /// `request_store.respawn_generation_cap`.
     RespawnGenerationCapExceeded,
     /// Requester's header has `role: None` (legacy session
     /// predating Issue 4). F1 cannot dispatch without a role.
@@ -272,7 +272,7 @@ pub struct F1Inputs<'a> {
     pub now: SystemTime,
     /// Substrate transcript-retention window.
     pub retention_floor: Duration,
-    /// Respawn-generation cap (`kt1.respawn_generation_cap`).
+    /// Respawn-generation cap (`request_store.respawn_generation_cap`).
     pub cap: u32,
     /// Template-existence check. Returns `false` when the
     /// template referenced in `header.template_name` is no
@@ -411,7 +411,7 @@ pub struct RespawnExecution<'a> {
     pub now: SystemTime,
     /// Substrate transcript-retention window.
     pub retention_floor: Duration,
-    /// Respawn-generation cap (`kt1.respawn_generation_cap`).
+    /// Respawn-generation cap (`request_store.respawn_generation_cap`).
     pub cap: u32,
     /// Whether the requester's `template_name` is currently
     /// compilable / present in the registry. Caller-determined.
@@ -541,7 +541,7 @@ fn emit_respawn_event(
         &respawned_at,
     );
     let payload = EventPayload::EvidenceSubmitted {
-        state: "kt1.respawn".to_string(),
+        state: "request_store.respawn".to_string(),
         fields,
         submitter_cwd: None,
     };
@@ -562,7 +562,7 @@ fn emit_workflow_cancelled(
     now: SystemTime,
 ) -> Result<()> {
     let payload = EventPayload::WorkflowCancelled {
-        state: "kt1.respawn".to_string(),
+        state: "request_store.respawn".to_string(),
         reason: reason.to_string(),
     };
     let timestamp = format_rfc3339_millis(now);

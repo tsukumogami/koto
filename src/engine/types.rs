@@ -258,18 +258,18 @@ pub struct StateFileHeader {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_name: Option<String>,
 
-    // ===== KT1 request-store fields (Decision 1) =====
+    // ===== Request-store fields (Decision 1) =====
     //
     // The seven additive + four reserved fields below land the
-    // dispatch-request marker that bunki BK2 and downstream KT1
-    // components read from the on-disk header. All are
+    // dispatch-request marker that bunki BK2 and downstream
+    // request-store components read from the on-disk header. All are
     // `#[serde(default, skip_serializing_if = "Option::is_none")]` so
-    // pre-KT1 state files round-trip unchanged.
+    // pre-request-store state files round-trip unchanged.
     /// Whether this workflow is requesting agent assignment.
     ///
-    /// Drives the KT1 request-store: when `Some(true)` the workflow is
+    /// Drives the request-store: when `Some(true)` the workflow is
     /// awaiting (or has been claimed for) an agent dispatch. `None` on
-    /// pre-KT1 headers and on workflows that don't need agent
+    /// pre-request-store headers and on workflows that don't need agent
     /// orchestration. Companion-field validation (role / inputs) is
     /// owned by the CLI layer (Issue 4), not the type layer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -299,14 +299,14 @@ pub struct StateFileHeader {
 
     /// Generation counter incremented every time the request is
     /// re-dispatched after a previous claim was revoked. Defaults to
-    /// `0` on pre-KT1 headers and on never-claimed requests.
+    /// `0` on pre-request-store headers and on never-claimed requests.
     #[serde(default)]
     pub dispatch_epoch: u32,
 
     /// Generation counter incremented every time the requester is
     /// respawned via F1 cold-restart re-priming (Issue 16 / Decision
     /// 5). `None` on pre-Issue-16 headers; resolves to 0 when read.
-    /// The respawn-generation cap (`kt1.respawn_generation_cap`,
+    /// The respawn-generation cap (`request_store.respawn_generation_cap`,
     /// default 2 per Issue 18) prevents cascading respawns: when
     /// `respawn_generation == cap`, F1 refuses to fire and the
     /// requester transitions to terminal `abandoned` with the F3
@@ -317,7 +317,7 @@ pub struct StateFileHeader {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub respawn_generation: Option<u32>,
 
-    // ===== Reserved KT1 fields (forward-compatibility) =====
+    // ===== Reserved request-store fields (forward-compatibility) =====
     //
     // Wire-format placeholders for follow-up features. Always
     // serialize as absent keys when `None`; reading code may parse
@@ -788,7 +788,7 @@ pub struct Event {
     /// short-circuit identical retries by comparing against this hash
     /// on subsequent calls. Absent on events written via the legacy
     /// [`crate::engine::persistence::append_event`] path or before
-    /// KT1 Issue 12 landed.
+    /// Issue 12 landed.
     ///
     /// Additive serde-optional field: omitted from serialization when
     /// `None` so pre-Issue-12 state files round-trip unchanged.
@@ -997,7 +997,7 @@ impl<'de> Deserialize<'de> for Event {
             },
         };
 
-        // Optional KT1 Issue 12 idempotency-hash field. Absent on
+        // Optional Issue 12 idempotency-hash field. Absent on
         // pre-Issue-12 events; present when written via
         // `append_event_idempotent`.
         let idempotency_hash = obj

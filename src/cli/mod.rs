@@ -135,7 +135,7 @@ pub enum Command {
         #[arg(long)]
         rationale: Option<String>,
 
-        /// Per-tick override for kt1.redelegation_cap. Applies only to
+        /// Per-tick override for request_store.redelegation_cap. Applies only to
         /// this `koto next` invocation; subsequent ticks resolve the
         /// cap through the full 5-level cascade (CLI flag > env-var >
         /// project > user > built-in default).
@@ -373,7 +373,7 @@ pub enum SessionCommand {
         /// Coordinator id that owns this request. Defaults to the
         /// parent's recorded `coordinator_of_record`, falling back to
         /// the parent's session id when the parent is itself
-        /// pre-KT1. Validated via [`ValidatedCoordId`] before write.
+        /// pre-request-store. Validated via [`ValidatedCoordId`] before write.
         #[arg(long = "coordinator-of-record")]
         coordinator_of_record: Option<String>,
     },
@@ -812,14 +812,14 @@ pub(super) fn resolve_with_data_source(
 }
 
 /// Parse a `--with-data` JSON string and check for reserved keys and
-/// reserved KT1 audit-event kinds.
+/// reserved request-store audit-event kinds.
 ///
 /// Returns the parsed `Value` on success, or a `NextError` with code
 /// `InvalidSubmission` when the JSON is malformed, contains the
 /// reserved `"gates"` key, or carries a `fields.kind` value that
-/// collides with the KT1 audit family (Decision 6 in
+/// collides with the request-store audit family (Decision 6 in
 /// DESIGN-koto-request-store): the four reserved literal names or
-/// anything starting with the `kt1.` prefix.
+/// anything starting with the `request_store.` prefix.
 ///
 /// This function contains only pure logic; callers are responsible
 /// for exiting.
@@ -1355,7 +1355,7 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
     match subcommand {
         ConfigCommand::Get { key } => {
             let resolved = config::resolve::load_config()?;
-            config::warn_if_kt1_recursion_reserved(&resolved);
+            config::warn_if_request_store_recursion_reserved(&resolved);
             match config::get_value(&resolved, &key) {
                 Some(value) => {
                     println!("{}", value);
@@ -2009,18 +2009,19 @@ fn handle_next(
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    // Resolve KT1 operator config through the full 5-level cascade,
-    // applying the per-tick `--redelegation-cap` CLI flag (if any) on
-    // top of the file+env layers already merged by load_config().
-    // Emit the `[kt1.recursion]` reserved-namespace warning at startup.
-    let kt1 = {
+    // Resolve request-store operator config through the full 5-level
+    // cascade, applying the per-tick `--redelegation-cap` CLI flag (if
+    // any) on top of the file+env layers already merged by
+    // load_config(). Emit the `[request_store.recursion]`
+    // reserved-namespace warning at startup.
+    let request_store_cfg = {
         let base = crate::config::resolve::load_config().unwrap_or_default();
-        crate::config::warn_if_kt1_recursion_reserved(&base);
-        let cli_overrides = crate::config::resolve::Kt1Overrides {
+        crate::config::warn_if_request_store_recursion_reserved(&base);
+        let cli_overrides = crate::config::resolve::RequestStoreOverrides {
             redelegation_cap,
             ..Default::default()
         };
-        crate::config::resolve::kt1_config(&base.kt1, &cli_overrides)
+        crate::config::resolve::request_store_config(&base.request_store, &cli_overrides)
     };
 
     // Issue 7: cursor GC fires on every coordinator tick boot so
@@ -2032,24 +2033,30 @@ fn handle_next(
     // gating run here too. The recovery walk reclaims a foreign lock
     // whose `started_at` is past timeout (cleaning up after a crashed
     // peer-coord compaction); the threshold check runs compaction
-    // when the index grew above `kt1.terminal_index_compact_lines`.
+    // when the index grew above `request_store.terminal_index_compact_lines`.
     // Both are best-effort: a failure logs a warning and the tick
     // proceeds. The current workflow's session id doubles as the
     // coord_id, matching the Issue 7 wiring at the scan call site.
     if let Some(home) = dirs::home_dir() {
         let koto_root = home.join(".koto");
-        if let Err(e) = crate::engine::discovery::gc_stale_cursors(&koto_root, &kt1) {
+        if let Err(e) = crate::engine::discovery::gc_stale_cursors(&koto_root, &request_store_cfg) {
             eprintln!("warning: cursor GC failed at koto next startup: {}", e);
         }
-        if let Err(e) =
-            crate::engine::terminal_index::recover_stale_compact_lock(&koto_root, &name, &kt1)
-        {
+        if let Err(e) = crate::engine::terminal_index::recover_stale_compact_lock(
+            &koto_root,
+            &name,
+            &request_store_cfg,
+        ) {
             eprintln!(
                 "warning: compact-lock recovery failed at koto next startup: {}",
                 e
             );
         }
-        match crate::engine::terminal_index::maybe_compact_terminal_index(&koto_root, &name, &kt1) {
+        match crate::engine::terminal_index::maybe_compact_terminal_index(
+            &koto_root,
+            &name,
+            &request_store_cfg,
+        ) {
             Ok(crate::engine::terminal_index::CompactionOutcome::Compacted {
                 lines_before,
                 lines_after,
@@ -2095,7 +2102,7 @@ fn handle_next(
         if coord_state_path.exists() {
             let sessions_dir = koto_root.join("sessions");
             let stale_dispatch_timeout =
-                std::time::Duration::from_secs(kt1.stale_dispatch_timeout_seconds);
+                std::time::Duration::from_secs(request_store_cfg.stale_dispatch_timeout_seconds);
             let waker = crate::engine::wake::LoggingWaker;
             match crate::engine::wake::wake_candidates_pass(
                 &koto_root,
@@ -3046,7 +3053,7 @@ fn handle_next(
                 let home = dirs::home_dir()?;
                 let koto_root = home.join(".koto");
                 let coord_id = crate::engine::types::ValidatedCoordId::new(&name).ok()?;
-                match crate::engine::discovery::scan(&koto_root, &coord_id, &kt1) {
+                match crate::engine::discovery::scan(&koto_root, &coord_id, &request_store_cfg) {
                     Ok(v) => Some(v),
                     Err(e) => {
                         eprintln!("warning: discovery scan failed: {}", e);
@@ -4564,10 +4571,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn validate_with_data_rejects_kt1_prefix() {
-        for kind in ["kt1.foo", "kt1.", "kt1.deep.kind"] {
+    fn validate_with_data_rejects_request_store_prefix() {
+        for kind in [
+            "request_store.foo",
+            "request_store.",
+            "request_store.deep.kind",
+        ] {
             let payload = format!(r#"{{"kind":"{}"}}"#, kind);
-            let err = validate_with_data_payload(&payload).expect_err("must reject kt1.* prefix");
+            let err = validate_with_data_payload(&payload)
+                .expect_err("must reject request_store.* prefix");
             assert!(err.message.contains("reserved audit-event kind"));
             assert!(err.message.contains(kind));
         }
@@ -4576,11 +4588,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn validate_with_data_accepts_template_author_kinds() {
-        // Any kind that is neither a reserved literal nor kt1.-prefixed
-        // must land on disk untouched. Verifying via the parser is
-        // enough — `handle_next`'s downstream persistence test
-        // coverage is provided elsewhere.
-        for ok in ["verdict", "review", "scrutineer", "kt", "kt1foo"] {
+        // Any kind that is neither a reserved literal nor
+        // request_store.-prefixed must land on disk untouched. Verifying
+        // via the parser is enough — `handle_next`'s downstream
+        // persistence test coverage is provided elsewhere.
+        for ok in [
+            "verdict",
+            "review",
+            "scrutineer",
+            "request",
+            "request_storefoo",
+        ] {
             let payload = format!(r#"{{"kind":"{}","note":"x"}}"#, ok);
             let v = validate_with_data_payload(&payload).expect("must accept");
             assert_eq!(v["kind"], serde_json::json!(ok));

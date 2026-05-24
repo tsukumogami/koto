@@ -40,7 +40,7 @@ jobs:
         run: cargo test -- --test-threads=1
 
   stability-tests:
-    # KT1 Issue 20: external-consumer compile-check fixture for the
+    # Issue 20: external-consumer compile-check fixture for the
     # Stage 1 frozen public surface. The `koto-stability-tests` crate
     # imports every promised export via `use koto::engine::types::*`
     # and `koto::error::Error`, plus exercises the four frozen
@@ -185,7 +185,7 @@ jobs:
           cargo test --features cloud-integration-tests --test cloud_integration_test -- --test-threads=1
 
   discovery-bench:
-    # KT1 Issue 10: criterion bench harness for the discovery scan.
+    # Issue 10: criterion bench harness for the discovery scan.
     # Runs the warm-cursor + cold-cursor groups at 100/1k/10k/26k
     # workspace sizes. Threshold gating is REPORTING-ONLY by default
     # (KOTO_BENCH_STRICT is unset); the bench emits `BREACH` lines to
@@ -212,7 +212,7 @@ jobs:
         run: cargo bench --bench discovery_scan -- --save-baseline ci
 
   recursion-caps-bench:
-    # KT1 Issue 17: criterion bench harness for the recursion-cap
+    # Issue 17: criterion bench harness for the recursion-cap
     # validator at 1k/10k/26k workspace sizes with 100 open sessions.
     # The 26k case measures the AD3.3 perf-cliff avoidance commitment
     # (30 ms p95 target). Soft-by-default like Issue 10's bench; the

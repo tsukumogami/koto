@@ -1,4 +1,4 @@
-//! Integration coverage for `koto session start` (KT1 Issue 4).
+//! Integration coverage for `koto session start` (Issue 4).
 //!
 //! Drives [`koto::cli::session::handle_start`] directly against a
 //! [`LocalBackend`] so the parse-time validation, companion-flag

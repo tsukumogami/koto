@@ -1,10 +1,10 @@
-//! Integration tests for KT1 Issue 16:
+//! Integration tests for Issue 16:
 //! `feat(respawn): F1 cold-restart re-priming + F3 fallback + respawn_generation_cap`.
 //!
 //! Covers the acceptance criteria from the issue body:
 //! all-three-preconditions positive path, three precondition guards,
 //! cap enforcement, four F3 cause classes, generation increment
-//! across cycles, pre-KT1 fixture compatibility, fixed-form
+//! across cycles, pre-request-store fixture compatibility, fixed-form
 //! resume-context prompt snapshot, agent-membership invoked after
 //! spawn, RequesterRespawn uses Issue 14's audit helper.
 
@@ -561,15 +561,15 @@ fn respawn_generation_increments_across_cycles() {
     }
 }
 
-// ----- AC: pre-KT1 fixture compatibility — round-trip ---------------------
+// ----- AC: pre-request-store fixture compatibility — round-trip ---------------------
 
 #[test]
-fn pre_kt1_fixture_compatibility() {
+fn pre_request_store_fixture_compatibility() {
     // A pre-Issue-16 header on disk has no `respawn_generation`
     // field. The serde-additive contract requires:
     //   1. Deserialize OK with respawn_generation == None.
     //   2. Round-trip on write: serialize omits the field.
-    let pre_kt1_json = serde_json::json!({
+    let pre_request_store_json = serde_json::json!({
         "schema_version": 1,
         "workflow": "legacy-wf",
         "template_hash": "deadbeef",
@@ -577,7 +577,7 @@ fn pre_kt1_fixture_compatibility() {
         "session_id": "legacy-wf",
         "dispatch_epoch": 0
     });
-    let header: StateFileHeader = serde_json::from_value(pre_kt1_json).unwrap();
+    let header: StateFileHeader = serde_json::from_value(pre_request_store_json).unwrap();
     assert_eq!(header.respawn_generation, None);
 
     // Round-trip: serialize and confirm the field is absent.

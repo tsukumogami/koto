@@ -1,4 +1,4 @@
-//! Integration tests for KT1 Issue 15:
+//! Integration tests for Issue 15:
 //! `feat(audit): wake-candidates pass + RequesterWoken emission + age-and-activity recovery`.
 //!
 //! Covers the acceptance criteria from the issue body:
@@ -110,7 +110,7 @@ fn append_child_dispatched_event(
     fields.insert("coord_id".into(), serde_json::json!(coord_id));
     fields.insert("dispatch_epoch".into(), serde_json::json!(0));
     let payload = EventPayload::EvidenceSubmitted {
-        state: "kt1.dispatch".into(),
+        state: "request_store.dispatch".into(),
         fields,
         submitter_cwd: None,
     };
@@ -401,7 +401,7 @@ fn recovery_fires_when_requester_idle_past_timeout() {
     let kids: Vec<ValidatedSessionId> = vec![ValidatedSessionId::new("parent.child-a").unwrap()];
     let fields = requester_woken_fields(&kids, "parent");
     let payload = EventPayload::EvidenceSubmitted {
-        state: "kt1.wake".into(),
+        state: "request_store.wake".into(),
         fields,
         submitter_cwd: None,
     };
@@ -453,7 +453,7 @@ fn recovery_does_not_fire_when_requester_made_progress() {
     let kids: Vec<ValidatedSessionId> = vec![ValidatedSessionId::new("parent.child-a").unwrap()];
     let fields = requester_woken_fields(&kids, "parent");
     let payload = EventPayload::EvidenceSubmitted {
-        state: "kt1.wake".into(),
+        state: "request_store.wake".into(),
         fields,
         submitter_cwd: None,
     };
@@ -499,7 +499,7 @@ fn recovery_does_not_fire_within_timeout() {
     let kids: Vec<ValidatedSessionId> = vec![ValidatedSessionId::new("parent.child-a").unwrap()];
     let fields = requester_woken_fields(&kids, "parent");
     let payload = EventPayload::EvidenceSubmitted {
-        state: "kt1.wake".into(),
+        state: "request_store.wake".into(),
         fields,
         submitter_cwd: None,
     };
@@ -681,7 +681,7 @@ fn requester_resumed_then_idle_does_not_trigger_wake_recovery() {
     let kids: Vec<ValidatedSessionId> = vec![ValidatedSessionId::new("parent.child-a").unwrap()];
     let fields = requester_woken_fields(&kids, "parent");
     let payload = EventPayload::EvidenceSubmitted {
-        state: "kt1.wake".into(),
+        state: "request_store.wake".into(),
         fields,
         submitter_cwd: None,
     };

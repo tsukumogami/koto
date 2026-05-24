@@ -84,7 +84,7 @@ fn parse_inputs(raw: &str) -> anyhow::Result<serde_json::Value> {
     Ok(value)
 }
 
-/// Implements `koto session start --parent <p>` (KT1 Issue 4).
+/// Implements `koto session start --parent <p>` (Issue 4).
 ///
 /// Two paths:
 ///
@@ -97,7 +97,7 @@ fn parse_inputs(raw: &str) -> anyhow::Result<serde_json::Value> {
 ///    require the full `role` / `template` / `inputs` companion
 ///    set, parse and validate `inputs` (1 MiB max, 128-level
 ///    nesting max — Security Considerations defense-in-depth #1),
-///    and populate the new KT1 header fields:
+///    and populate the new request-store header fields:
 ///    `needs_agent = Some(true)`, `role`, `inputs`,
 ///    `coordinator_of_record`, `requested_by`, `dispatch_epoch = 0`,
 ///    `template_name` (reusing the existing field per Decision 1
@@ -201,7 +201,7 @@ pub fn handle_start(
     // `coordinator_of_record` from it. The CLI surface treats the
     // *parent* as the spawning context: the parent's session id is
     // the subagent that's requesting the dispatch, and the parent's
-    // coordinator (or its session id if pre-KT1) is the default
+    // coordinator (or its session id if pre-request-store) is the default
     // coordinator-of-record.
     let parent_header = backend
         .read_header(validated_parent.as_str())
@@ -214,7 +214,7 @@ pub fn handle_start(
             .clone()
             .unwrap_or_else(|| parent_header.session_id.clone()),
     };
-    // If the parent itself was pre-KT1 and carries an empty
+    // If the parent itself was pre-request-store and carries an empty
     // session_id, fall back to the validated parent name so the
     // newtype constructor still has a non-empty input to validate
     // (and the resulting header records a meaningful identifier).
@@ -226,7 +226,7 @@ pub fn handle_start(
     let validated_coord = ValidatedCoordId::new(&coord_id_str)?;
 
     // `requested_by` is the spawning subagent's session id (the
-    // parent's koto session id). Pre-KT1 parents have an empty
+    // parent's koto session id). Pre-request-store parents have an empty
     // session_id; fall back to the parent name so the field carries
     // a stable identifier even on legacy state files.
     let requested_by_str = if parent_header.session_id.is_empty() {
@@ -331,7 +331,7 @@ pub fn handle_start(
     // header's coordinator_of_record / requested_by are still
     // populated for traceability but only the dispatch-request
     // branch should expose them. Clear them for the plain path so
-    // pre-KT1 readers don't observe unexpected fields on a header
+    // pre-request-store readers don't observe unexpected fields on a header
     // that isn't requesting dispatch.
     let header = if needs_agent {
         header

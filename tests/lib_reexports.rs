@@ -1,4 +1,4 @@
-//! In-tree compile-check for the KT1 Stage 1 frozen public surface
+//! In-tree compile-check for the Stage 1 frozen public surface
 //! (Issue 19 / Decision 5).
 //!
 //! Verifies that every type bunki BK2 imports resolves at its
@@ -174,7 +174,7 @@ fn koto_error_alias_carries_additive_evolution_variants() {
         observed: 11,
     };
     let _ = Error::ReservedKindCollision {
-        offending_kind: "kt1.child_dispatched".into(),
+        offending_kind: "request_store.child_dispatched".into(),
     };
     let _ = Error::ConcurrentSubmissionConflict {
         session_id: "child-c".into(),

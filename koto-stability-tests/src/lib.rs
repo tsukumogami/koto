@@ -1,5 +1,5 @@
 //! External-consumer compile-check fixture for koto's Stage 1
-//! frozen public surface (KT1 Issue 20 / Decision 5).
+//! frozen public surface (Issue 20 / Decision 5).
 //!
 //! This crate exists to catch breaking changes to the API surface
 //! bunki BK2 imports. The in-tree `tests/lib_reexports.rs` test
@@ -196,7 +196,7 @@ mod tests {
             cap: 10,
         };
         let _ = Error::ReservedKindCollision {
-            offending_kind: "kt1.child_dispatched".into(),
+            offending_kind: "request_store.child_dispatched".into(),
         };
         let _ = Error::ConcurrentSubmissionConflict {
             session_id: "child-c".into(),
