@@ -39,6 +39,28 @@ jobs:
       - name: Run tests
         run: cargo test -- --test-threads=1
 
+  stability-tests:
+    # Issue 20: external-consumer compile-check fixture for the
+    # Stage 1 frozen public surface. The `koto-stability-tests` crate
+    # imports every promised export via `use koto::engine::types::*`
+    # and `koto::error::Error`, plus exercises the four frozen
+    # SessionBackend methods through a trait object. A breaking
+    # change to the locked surface fails this job before it reaches
+    # a release.
+    #
+    # See docs/STABILITY.md for the bump protocol.
+    name: Stability Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run external-consumer stability tests
+        run: cargo test -p koto-stability-tests -- --test-threads=1
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -162,9 +184,58 @@ jobs:
           fi
           cargo test --features cloud-integration-tests --test cloud_integration_test -- --test-threads=1
 
+  discovery-bench:
+    # Issue 10: criterion bench harness for the discovery scan.
+    # Runs the warm-cursor + cold-cursor groups at 100/1k/10k/26k
+    # workspace sizes. Threshold gating is REPORTING-ONLY by default
+    # (KOTO_BENCH_STRICT is unset); the bench emits `BREACH` lines to
+    # stderr but exits 0 so the harness lands without producing a
+    # red-on-main signal while the perf-optimization issue is open.
+    # See `benches/discovery_scan.rs` file-header "Gate-enforcement
+    # mode" for the rationale and the path to strict enforcement.
+    name: Discovery Bench
+    if: ${{ github.event.pull_request.draft != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run discovery scan bench
+        # `--save-baseline ci` lets criterion compare each PR's run
+        # against the prior CI baseline. Combined with the bench's own
+        # gate (reporting-only by default), this gives a two-tier
+        # signal: criterion's regression detector AND the absolute
+        # thresholds.
+        run: cargo bench --bench discovery_scan -- --save-baseline ci
+
+  recursion-caps-bench:
+    # Issue 17: criterion bench harness for the recursion-cap
+    # validator at 1k/10k/26k workspace sizes with 100 open sessions.
+    # The 26k case measures the AD3.3 perf-cliff avoidance commitment
+    # (30 ms p95 target). Soft-by-default like Issue 10's bench; the
+    # current implementation breaches because `read_terminal_index`
+    # walks the full JSONL file — a follow-up optimization (either an
+    # O(open-sessions) counter primitive or a smarter index format)
+    # closes the gap. Once closed, flip KOTO_BENCH_STRICT=1 to harden.
+    name: Recursion Caps Bench
+    if: ${{ github.event.pull_request.draft != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run recursion caps bench
+        run: cargo bench --bench recursion_caps -- --save-baseline ci
+
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, fmt, clippy, audit, tsuku-distributed-install, cloud-integration]
+    needs: [check-artifacts, unit-tests, stability-tests, fmt, clippy, audit, tsuku-distributed-install, cloud-integration, discovery-bench, recursion-caps-bench]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -172,6 +243,7 @@ jobs:
         run: |
           if [ "${{ needs.check-artifacts.result }}" = "failure" ] || \
              [ "${{ needs.unit-tests.result }}" = "failure" ] || \
+             [ "${{ needs.stability-tests.result }}" = "failure" ] || \
              [ "${{ needs.fmt.result }}" = "failure" ] || \
              [ "${{ needs.clippy.result }}" = "failure" ] || \
              [ "${{ needs.audit.result }}" = "failure" ] || \

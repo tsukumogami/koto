@@ -478,6 +478,18 @@ fn init_child_core(
         } else {
             Some(cached.compiled.name.clone())
         },
+        needs_agent: None,
+        role: None,
+        inputs: None,
+        coordinator_of_record: None,
+        requested_by: None,
+        assignment_claim: None,
+        dispatch_epoch: 0,
+        priority: None,
+        deadline: None,
+        retry_count: None,
+        agent_config: None,
+        respawn_generation: None,
     };
 
     let init_payload = EventPayload::WorkflowInitialized {
@@ -497,12 +509,14 @@ fn init_child_core(
             timestamp: ts.clone(),
             event_type: init_payload.type_name().to_string(),
             payload: init_payload,
+            idempotency_hash: None,
         },
         Event {
             seq: 2,
             timestamp: ts.clone(),
             event_type: transition_payload.type_name().to_string(),
             payload: transition_payload,
+            idempotency_hash: None,
         },
     ];
 
@@ -615,6 +629,18 @@ Done.
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         let events = vec![Event {
             seq: 1,
@@ -625,6 +651,7 @@ Done.
                 variables: HashMap::new(),
                 spawn_entry: None,
             },
+            idempotency_hash: None,
         }];
         backend
             .init_state_file(parent, header, events)

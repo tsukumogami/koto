@@ -72,6 +72,8 @@ Every `koto next` response includes an `action` field. Dispatch on this field on
 
 Note: `directive` is absent on `done` responses. Don't expect it.
 
+Directive-bearing responses also include a top-level `unassigned_children` array. It lists child workflows that name this coordinator as their `coordinator_of_record` and need agent dispatch; each element carries `child_session_id`, `role`, `template`, optional `inputs`, `requested_by`, `created_at`, and `dispatch_epoch`. The array stays empty unless the workspace contains unassigned children for this coordinator. Treat the field as informational alongside the directive — the current state's directive is still authoritative for what to do next.
+
 ## Handling `evidence_required`
 
 This action covers three distinct situations. Distinguish them by examining `blocking_conditions` and `expects.fields` together.
@@ -101,6 +103,8 @@ koto next <name> --with-data @evidence.json
 ```
 
 The file must contain the JSON payload directly (no shell quoting needed) and must be at most 1 MB.
+
+**Dispatched-agent writes (`SubagentStop` hooks):** if you are a dispatched subagent writing back to a request-store child workflow, you MUST pass `--dispatch-epoch <n>` with the epoch baked into your spawn. Example: `koto next <child> --dispatch-epoch 0 --with-data '{"status":"completed"}'`. The koto CLI validates `presented == header.dispatch_epoch` before any persistence call and rejects mismatches with `EpochFenceViolation` (exit code 65). Operator-driven `koto next <coord_workflow>` calls on the parent workflow do NOT require the flag.
 
 ### Sub-case B: Gates failed, evidence fallback available
 
@@ -182,6 +186,26 @@ koto init <child-name> --parent <parent-name> --template <path>
 ```
 
 The `--parent` flag validates that the parent workflow exists and records the link in the child's state file. The naming convention `parent.child` is recommended but not enforced — the metadata link is what matters.
+
+### Requesting agent dispatch on a new child
+
+When the child you're spawning needs a separate agent to pick it up later (the "request store" pattern), use `koto session start` instead of `koto init`. It writes a request-store header on the child so a coordinator can later dispatch the right agent:
+
+```bash
+koto session start <child-name> \
+  --parent <parent-name> \
+  --needs-agent \
+  --role <role-name> \
+  --template <template-name> \
+  --inputs '<json>'
+```
+
+- `--needs-agent` marks the child as awaiting dispatch and **requires** the `--role`, `--template`, and `--inputs` companions. Any of those without `--needs-agent`, or `--needs-agent` without the full set, rejects at parse time.
+- `--inputs` is a JSON blob (max 1 MiB, max 128 nesting levels).
+- `--coordinator-of-record <c>` is optional; it defaults to the parent's effective coordinator.
+- Omit all four to start a plain child session without a dispatch marker — useful when the child is launched in-process by the same agent.
+
+The session id (`--parent`) and coordinator id (`--coordinator-of-record`) are validated against `^[a-zA-Z0-9][a-zA-Z0-9._-]*$` (max 255 chars) before any path operation, so paths like `../etc/passwd` or shell-metacharacter ids are rejected up front.
 
 ### Checking children
 
@@ -298,6 +322,20 @@ koto session update <name> --intent "investigate the flaky CI failure in the aut
 
 Intent strings over 1024 characters are rejected. The command exits non-zero if the session doesn't exist.
 
+## Periodic maintenance: koto workspace prune
+
+`koto workspace prune` reclaims the derived files the request-store substrate accumulates over time — stale scan cursors (`~/.koto/coordinators/<id>/scan_cursor.toml`), stale compaction locks, and stale claim sidecars (`claim.lock`). It does NOT reclaim session bodies under `~/.koto/sessions/`; per-session cleanup still routes through `koto session cleanup <session-id>`.
+
+Suggest the verb when the user reports growing `~/.koto/` disk usage, when the discovery scan starts noticeably slowing at year-2 scale, or when stale-claim recovery events show up in the audit log.
+
+Recommended cadence is **weekly to monthly** for typical workloads. See `docs/workspace-layout.md` ("Sizing your prune cadence") for the per-workload sizing math and cron snippets.
+
+Flags worth knowing: `--root <session-id>` (required; terminal-state root to prune), `--dry-run` (preview without reclaiming), `--yes` (cron-friendly; skip the confirmation prompt), `--force` (bypass the terminal-state safety gate — dangerous). Full flag set lives in `docs/guides/cli-usage.md`.
+
+```bash
+koto workspace prune --root <session-id> --dry-run
+```
+
 ## Reference material
 
 Read these on demand, not upfront. The sections above cover the common path. Consult a reference file only when you hit the specific situation it describes.
@@ -318,5 +356,7 @@ Read these on demand, not upfront. The sections above cover the common path. Con
 **Gate blocked, `agent_actionable` is `false`** — you can't override this gate yourself. Escalate to the user so they can resolve the underlying condition (for example, a required deployment that only they can trigger).
 
 **Evidence rejected (`invalid_submission`)** — one or more fields didn't pass validation. The error includes a `details` array with per-field reasons. Fix the field values and resubmit. Call `koto next <name>` without `--with-data` to re-read the `expects` schema if needed.
+
+**"reserved audit-event kind"** — your `--with-data` payload included a `fields.kind` value that collides with the request-store audit family. Four literal kinds (`ChildDispatched`, `ChildRedelegated`, `RequesterWoken`, `RequesterRespawn`) and anything starting with the `request_store.` prefix are reserved for the engine — template authors can't use them. Rename the field value to something workflow-specific (e.g., `"verdict"`, `"scrutineer"`) and resubmit.
 
 **`koto next` returns the same state repeatedly** — check `advanced` in the response. If it's `false`, the engine stopped where it already was (gates still blocking, or evidence still missing). Re-read `blocking_conditions` and `directive`.

@@ -40,6 +40,7 @@ pub fn dispatch_next(
         return Ok(NextResponse::Terminal {
             state: state.to_string(),
             advanced,
+            unassigned_children: vec![],
         });
     }
 
@@ -63,6 +64,7 @@ pub fn dispatch_next(
                 details: details.clone(),
                 advanced,
                 blocking_conditions: blocking,
+                unassigned_children: vec![],
             });
         }
         // Fall through to step 5 (accepts block -> EvidenceRequired)
@@ -85,6 +87,7 @@ pub fn dispatch_next(
                 name: integration_name.clone(),
                 available: false,
             },
+            unassigned_children: vec![],
         });
     }
 
@@ -97,6 +100,7 @@ pub fn dispatch_next(
             advanced,
             expects: es.clone(),
             blocking_conditions: blocking,
+            unassigned_children: vec![],
         });
     }
 
@@ -115,6 +119,7 @@ pub fn dispatch_next(
             options: vec![],
         },
         blocking_conditions: blocking,
+        unassigned_children: vec![],
     })
 }
 
@@ -164,6 +169,7 @@ mod tests {
             NextResponse::Terminal {
                 state: "done".to_string(),
                 advanced: false,
+                unassigned_children: vec![],
             }
         );
     }

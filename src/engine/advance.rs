@@ -1358,6 +1358,7 @@ mod tests {
                     },
                     submitter_cwd: None,
                 },
+                idempotency_hash: None,
             },
             Event {
                 seq: 2,
@@ -1372,6 +1373,7 @@ mod tests {
                     },
                     submitter_cwd: None,
                 },
+                idempotency_hash: None,
             },
         ];
 
@@ -1395,6 +1397,7 @@ mod tests {
                     },
                     submitter_cwd: None,
                 },
+                idempotency_hash: None,
             },
             Event {
                 seq: 2,
@@ -1409,6 +1412,7 @@ mod tests {
                     },
                     submitter_cwd: None,
                 },
+                idempotency_hash: None,
             },
         ];
 
@@ -1430,6 +1434,7 @@ mod tests {
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
             },
+            idempotency_hash: None,
         }];
 
         let merged = merge_epoch_evidence(&events);
@@ -3160,6 +3165,7 @@ mod tests {
             timestamp: "2026-04-01T00:00:00Z".to_string(),
             event_type: payload.type_name().to_string(),
             payload,
+            idempotency_hash: None,
         }
     }
 
@@ -4083,6 +4089,7 @@ mod tests {
                 },
                 spawn_entry: None,
             },
+            idempotency_hash: None,
         }];
 
         let mut appended: Vec<EventPayload> = Vec::new();

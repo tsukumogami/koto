@@ -1,11 +1,48 @@
 use std::collections::BTreeMap;
 
 use serde::ser::SerializeMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cli::batch_error::BatchError;
 use crate::gate::{built_in_default, GateOutcome, StructuredGateResult};
 use crate::template::types::{Gate, TemplateState, FIELD_TYPE_TASKS};
+
+/// One entry in the `unassigned_children` list returned by `koto next`.
+///
+/// Coordinators read this list to learn which child workflows need
+/// agent dispatch. The list is empty until the discovery scan (Issue 7)
+/// populates it; the element shape is locked here so consumers can
+/// compile against the contract before the scan lands.
+///
+/// Fields match Decision 1 of DESIGN-koto-request-store.md (lines
+/// 239-247): a child becomes an "unassigned child" when its header has
+/// `needs_agent: true` AND no `assignment_claim` AND its
+/// `coordinator_of_record` matches the parent reading the directive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UnassignedChild {
+    /// Full composed session id of the child workflow (e.g.
+    /// `"parent.task-1"`).
+    pub child_session_id: String,
+    /// Role identifier the coordinator should match against when
+    /// picking which agent runs the child.
+    pub role: String,
+    /// Template name or path the child was initialized from. Carries
+    /// the same value as the child header's `template_name` at
+    /// session-start time.
+    pub template: String,
+    /// Arbitrary JSON payload passed to the agent at dispatch time.
+    /// Omitted from serialization when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<serde_json::Value>,
+    /// Identifier of the principal that submitted the request.
+    pub requested_by: String,
+    /// RFC 3339 UTC timestamp captured when the child was created.
+    pub created_at: String,
+    /// Generation counter incremented every time the request is
+    /// re-dispatched after a previous claim was revoked. `0` on
+    /// never-claimed requests.
+    pub dispatch_epoch: u32,
+}
 
 /// Summary of a recorded decision, used in `koto decisions list` responses.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -31,6 +68,7 @@ pub enum NextResponse {
         advanced: bool,
         expects: ExpectsSchema,
         blocking_conditions: Vec<BlockingCondition>,
+        unassigned_children: Vec<UnassignedChild>,
     },
     GateBlocked {
         state: String,
@@ -38,6 +76,7 @@ pub enum NextResponse {
         details: Option<String>,
         advanced: bool,
         blocking_conditions: Vec<BlockingCondition>,
+        unassigned_children: Vec<UnassignedChild>,
     },
     Integration {
         state: String,
@@ -46,6 +85,7 @@ pub enum NextResponse {
         advanced: bool,
         expects: Option<ExpectsSchema>,
         integration: IntegrationOutput,
+        unassigned_children: Vec<UnassignedChild>,
     },
     IntegrationUnavailable {
         state: String,
@@ -54,10 +94,12 @@ pub enum NextResponse {
         advanced: bool,
         expects: Option<ExpectsSchema>,
         integration: IntegrationUnavailableMarker,
+        unassigned_children: Vec<UnassignedChild>,
     },
     Terminal {
         state: String,
         advanced: bool,
+        unassigned_children: Vec<UnassignedChild>,
     },
     ActionRequiresConfirmation {
         state: String,
@@ -66,6 +108,7 @@ pub enum NextResponse {
         advanced: bool,
         action_output: ActionOutput,
         expects: Option<ExpectsSchema>,
+        unassigned_children: Vec<UnassignedChild>,
     },
     /// Rejected submission — typed error envelope with optional
     /// batch-specific context. Emits `action: "error"`. Carries the
@@ -79,6 +122,7 @@ pub enum NextResponse {
         error: NextError,
         batch: Option<BatchErrorContext>,
         blocking_conditions: Vec<BlockingCondition>,
+        unassigned_children: Vec<UnassignedChild>,
     },
 }
 
@@ -124,6 +168,7 @@ impl NextResponse {
                 advanced,
                 expects,
                 blocking_conditions,
+                unassigned_children,
             } => NextResponse::EvidenceRequired {
                 state,
                 directive: f(&directive),
@@ -131,6 +176,7 @@ impl NextResponse {
                 advanced,
                 expects,
                 blocking_conditions,
+                unassigned_children,
             },
             NextResponse::GateBlocked {
                 state,
@@ -138,12 +184,14 @@ impl NextResponse {
                 details,
                 advanced,
                 blocking_conditions,
+                unassigned_children,
             } => NextResponse::GateBlocked {
                 state,
                 directive: f(&directive),
                 details: details.map(|d| f(&d)),
                 advanced,
                 blocking_conditions,
+                unassigned_children,
             },
             NextResponse::Integration {
                 state,
@@ -152,6 +200,7 @@ impl NextResponse {
                 advanced,
                 expects,
                 integration,
+                unassigned_children,
             } => NextResponse::Integration {
                 state,
                 directive: f(&directive),
@@ -159,6 +208,7 @@ impl NextResponse {
                 advanced,
                 expects,
                 integration,
+                unassigned_children,
             },
             NextResponse::IntegrationUnavailable {
                 state,
@@ -167,6 +217,7 @@ impl NextResponse {
                 advanced,
                 expects,
                 integration,
+                unassigned_children,
             } => NextResponse::IntegrationUnavailable {
                 state,
                 directive: f(&directive),
@@ -174,6 +225,7 @@ impl NextResponse {
                 advanced,
                 expects,
                 integration,
+                unassigned_children,
             },
             terminal @ NextResponse::Terminal { .. } => terminal,
             // `Error` carries no directive to substitute; return as-is.
@@ -185,6 +237,7 @@ impl NextResponse {
                 advanced,
                 action_output,
                 expects,
+                unassigned_children,
             } => NextResponse::ActionRequiresConfirmation {
                 state,
                 directive: f(&directive),
@@ -192,6 +245,7 @@ impl NextResponse {
                 advanced,
                 action_output,
                 expects,
+                unassigned_children,
             },
         }
     }
@@ -207,8 +261,9 @@ impl Serialize for NextResponse {
                 advanced,
                 expects,
                 blocking_conditions,
+                unassigned_children,
             } => {
-                let count = 7 + details.as_ref().map_or(0, |_| 1);
+                let count = 8 + details.as_ref().map_or(0, |_| 1);
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("action", "evidence_required")?;
                 map.serialize_entry("state", state)?;
@@ -219,6 +274,7 @@ impl Serialize for NextResponse {
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("expects", expects)?;
                 map.serialize_entry("blocking_conditions", blocking_conditions)?;
+                map.serialize_entry("unassigned_children", unassigned_children)?;
                 map.serialize_entry("error", &None::<()>)?;
                 map.end()
             }
@@ -228,8 +284,9 @@ impl Serialize for NextResponse {
                 details,
                 advanced,
                 blocking_conditions,
+                unassigned_children,
             } => {
-                let count = 7 + details.as_ref().map_or(0, |_| 1);
+                let count = 8 + details.as_ref().map_or(0, |_| 1);
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("action", "gate_blocked")?;
                 map.serialize_entry("state", state)?;
@@ -240,6 +297,7 @@ impl Serialize for NextResponse {
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("expects", &None::<()>)?;
                 map.serialize_entry("blocking_conditions", blocking_conditions)?;
+                map.serialize_entry("unassigned_children", unassigned_children)?;
                 map.serialize_entry("error", &None::<()>)?;
                 map.end()
             }
@@ -250,8 +308,9 @@ impl Serialize for NextResponse {
                 advanced,
                 expects,
                 integration,
+                unassigned_children,
             } => {
-                let count = 7 + details.as_ref().map_or(0, |_| 1);
+                let count = 8 + details.as_ref().map_or(0, |_| 1);
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("action", "integration")?;
                 map.serialize_entry("state", state)?;
@@ -262,6 +321,7 @@ impl Serialize for NextResponse {
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("expects", expects)?;
                 map.serialize_entry("integration", integration)?;
+                map.serialize_entry("unassigned_children", unassigned_children)?;
                 map.serialize_entry("error", &None::<()>)?;
                 map.end()
             }
@@ -272,8 +332,9 @@ impl Serialize for NextResponse {
                 advanced,
                 expects,
                 integration,
+                unassigned_children,
             } => {
-                let count = 7 + details.as_ref().map_or(0, |_| 1);
+                let count = 8 + details.as_ref().map_or(0, |_| 1);
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("action", "integration_unavailable")?;
                 map.serialize_entry("state", state)?;
@@ -284,15 +345,21 @@ impl Serialize for NextResponse {
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("expects", expects)?;
                 map.serialize_entry("integration", integration)?;
+                map.serialize_entry("unassigned_children", unassigned_children)?;
                 map.serialize_entry("error", &None::<()>)?;
                 map.end()
             }
-            NextResponse::Terminal { state, advanced } => {
-                let mut map = serializer.serialize_map(Some(5))?;
+            NextResponse::Terminal {
+                state,
+                advanced,
+                unassigned_children,
+            } => {
+                let mut map = serializer.serialize_map(Some(6))?;
                 map.serialize_entry("action", "done")?;
                 map.serialize_entry("state", state)?;
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("expects", &None::<()>)?;
+                map.serialize_entry("unassigned_children", unassigned_children)?;
                 map.serialize_entry("error", &None::<()>)?;
                 map.end()
             }
@@ -303,8 +370,9 @@ impl Serialize for NextResponse {
                 advanced,
                 action_output,
                 expects,
+                unassigned_children,
             } => {
-                let count = 7 + details.as_ref().map_or(0, |_| 1);
+                let count = 8 + details.as_ref().map_or(0, |_| 1);
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("action", "confirm")?;
                 map.serialize_entry("state", state)?;
@@ -315,6 +383,7 @@ impl Serialize for NextResponse {
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("action_output", action_output)?;
                 map.serialize_entry("expects", expects)?;
+                map.serialize_entry("unassigned_children", unassigned_children)?;
                 map.serialize_entry("error", &None::<()>)?;
                 map.end()
             }
@@ -324,6 +393,7 @@ impl Serialize for NextResponse {
                 error,
                 batch,
                 blocking_conditions,
+                unassigned_children,
             } => {
                 // Emit the error payload as a single object containing
                 // the typed NextError fields plus an optional `batch`
@@ -347,12 +417,13 @@ impl Serialize for NextResponse {
                     }
                     serde_json::Value::Object(obj)
                 };
-                let mut map = serializer.serialize_map(Some(6))?;
+                let mut map = serializer.serialize_map(Some(7))?;
                 map.serialize_entry("action", "error")?;
                 map.serialize_entry("state", state)?;
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("expects", &None::<()>)?;
                 map.serialize_entry("blocking_conditions", blocking_conditions)?;
+                map.serialize_entry("unassigned_children", unassigned_children)?;
                 map.serialize_entry("error", &error_value)?;
                 map.end()
             }
@@ -671,6 +742,7 @@ mod tests {
                 }],
             },
             blocking_conditions: vec![],
+            unassigned_children: vec![],
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -727,6 +799,7 @@ mod tests {
                 options: vec![],
             },
             blocking_conditions: vec![],
+            unassigned_children: vec![],
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -764,6 +837,7 @@ mod tests {
                     output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
                 },
             ],
+            unassigned_children: vec![],
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -800,6 +874,7 @@ mod tests {
                 name: "code_review".to_string(),
                 output: serde_json::json!({"result": "approved"}),
             },
+            unassigned_children: vec![],
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -847,6 +922,7 @@ mod tests {
                 name: "review_tool".to_string(),
                 output: serde_json::json!({"status": "done"}),
             },
+            unassigned_children: vec![],
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -869,6 +945,7 @@ mod tests {
                 name: "code_review".to_string(),
                 available: false,
             },
+            unassigned_children: vec![],
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -910,6 +987,7 @@ mod tests {
                 name: "review_tool".to_string(),
                 available: false,
             },
+            unassigned_children: vec![],
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -924,6 +1002,7 @@ mod tests {
         let resp = NextResponse::Terminal {
             state: "done".to_string(),
             advanced: true,
+            unassigned_children: vec![],
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -933,6 +1012,10 @@ mod tests {
         assert_eq!(json["advanced"], true);
         assert!(json["error"].is_null());
         assert!(json["expects"].is_null());
+        // Task #18: `unassigned_children` is present on every variant
+        // including Terminal so coordinator-side consumers have one
+        // uniform branch.
+        assert_eq!(json["unassigned_children"], serde_json::json!([]));
 
         // These fields should be absent for Terminal
         assert!(json.get("directive").is_none());
@@ -945,6 +1028,7 @@ mod tests {
         let resp = NextResponse::Terminal {
             state: "complete".to_string(),
             advanced: false,
+            unassigned_children: vec![],
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -1775,6 +1859,7 @@ mod tests {
             },
             batch: None,
             blocking_conditions: vec![],
+            unassigned_children: vec![],
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["action"], "error");
@@ -1786,6 +1871,8 @@ mod tests {
         assert!(v["error"].get("batch").is_none());
         assert!(v["expects"].is_null());
         assert_eq!(v["blocking_conditions"], serde_json::json!([]));
+        // Task #18: unassigned_children present on every variant (uniform shape).
+        assert_eq!(v["unassigned_children"], serde_json::json!([]));
     }
 
     #[test]
@@ -1805,6 +1892,7 @@ mod tests {
             },
             batch: Some(BatchErrorContext::from_batch_error(&batch_err)),
             blocking_conditions: vec![],
+            unassigned_children: vec![],
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["action"], "error");
@@ -1826,5 +1914,299 @@ mod tests {
 
         let ctx = BatchErrorContext::from_batch_error(&err);
         assert_eq!(ctx.payload, expected_batch);
+    }
+
+    // -- UnassignedChild serde tests (Issue 5) ----------------------
+
+    #[test]
+    fn unassigned_child_round_trip_all_fields() {
+        let entry = UnassignedChild {
+            child_session_id: "research-2.scrutineer-a".to_string(),
+            role: "scrutineer".to_string(),
+            template: "verdict".to_string(),
+            inputs: Some(serde_json::json!({"draft_path": "docs/draft.md"})),
+            requested_by: "research-2".to_string(),
+            created_at: "2026-05-24T14:32:01Z".to_string(),
+            dispatch_epoch: 0,
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: UnassignedChild = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, parsed);
+
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["child_session_id"], "research-2.scrutineer-a");
+        assert_eq!(value["role"], "scrutineer");
+        assert_eq!(value["template"], "verdict");
+        assert_eq!(value["inputs"]["draft_path"], "docs/draft.md");
+        assert_eq!(value["requested_by"], "research-2");
+        assert_eq!(value["created_at"], "2026-05-24T14:32:01Z");
+        assert_eq!(value["dispatch_epoch"], 0);
+    }
+
+    #[test]
+    fn unassigned_child_none_inputs_omitted_from_serialization() {
+        let entry = UnassignedChild {
+            child_session_id: "p.task".to_string(),
+            role: "worker".to_string(),
+            template: "t".to_string(),
+            inputs: None,
+            requested_by: "p".to_string(),
+            created_at: "2026-05-24T00:00:00Z".to_string(),
+            dispatch_epoch: 3,
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.contains("\"inputs\""),
+            "inputs must be omitted when None, got {}",
+            json
+        );
+        // Round-trip still works with `inputs` absent.
+        let parsed: UnassignedChild = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.inputs, None);
+        assert_eq!(parsed.dispatch_epoch, 3);
+    }
+
+    #[test]
+    fn unassigned_child_inputs_default_to_none_when_key_absent() {
+        // Additive-evolution discipline: a payload that omits `inputs`
+        // must deserialize cleanly with `inputs = None`. Mirrors how
+        // pre-request-store producers (none today, but future external writers)
+        // can emit the minimal shape.
+        let raw = r#"{
+            "child_session_id": "a.b",
+            "role": "scribe",
+            "template": "note",
+            "requested_by": "a",
+            "created_at": "2026-05-24T00:00:00Z",
+            "dispatch_epoch": 0
+        }"#;
+        let parsed: UnassignedChild = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.inputs, None);
+        assert_eq!(parsed.role, "scribe");
+    }
+
+    #[test]
+    fn directive_envelope_partial_consumer_ignores_unassigned_children() {
+        // Additive-evolution discipline (Decision 5): consumers that
+        // parse only the pre-request-store directive fields continue to function
+        // when `unassigned_children` is present at the top level.
+        //
+        // Simulate the new envelope shape: an existing `koto next`
+        // response plus a sibling `unassigned_children: []`. A consumer
+        // with a partial struct that names only the legacy fields must
+        // deserialize without error and pick up the legacy values.
+        let envelope = serde_json::json!({
+            "action": "evidence_required",
+            "state": "review",
+            "directive": "Review the code changes.",
+            "advanced": false,
+            "expects": {
+                "event_type": "evidence_submitted",
+                "fields": {}
+            },
+            "blocking_conditions": [],
+            "error": null,
+            "unassigned_children": []
+        });
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct LegacyDirective {
+            action: String,
+            state: String,
+            directive: String,
+            advanced: bool,
+        }
+
+        let parsed: LegacyDirective = serde_json::from_value(envelope).unwrap();
+        assert_eq!(parsed.action, "evidence_required");
+        assert_eq!(parsed.state, "review");
+        assert_eq!(parsed.directive, "Review the code changes.");
+        assert!(!parsed.advanced);
+    }
+
+    // -- Issue 5: directive return adds `unassigned_children` top-level field --
+
+    /// Every directive-bearing variant must include `unassigned_children`
+    /// in the serialized JSON, defaulting to `[]`. `Terminal` and `Error`
+    /// carry no directive and so do not include the field.
+    #[test]
+    fn directive_bearing_variants_emit_unassigned_children() {
+        let evidence = NextResponse::EvidenceRequired {
+            state: "s".into(),
+            directive: "d".into(),
+            details: None,
+            advanced: false,
+            expects: ExpectsSchema {
+                event_type: "evidence_submitted".into(),
+                fields: BTreeMap::new(),
+                options: vec![],
+            },
+            blocking_conditions: vec![],
+            unassigned_children: vec![],
+        };
+        let gate_blocked = NextResponse::GateBlocked {
+            state: "s".into(),
+            directive: "d".into(),
+            details: None,
+            advanced: false,
+            blocking_conditions: vec![],
+            unassigned_children: vec![],
+        };
+        let integration = NextResponse::Integration {
+            state: "s".into(),
+            directive: "d".into(),
+            details: None,
+            advanced: false,
+            expects: None,
+            integration: IntegrationOutput {
+                name: "n".into(),
+                output: serde_json::json!({}),
+            },
+            unassigned_children: vec![],
+        };
+        let integration_unavailable = NextResponse::IntegrationUnavailable {
+            state: "s".into(),
+            directive: "d".into(),
+            details: None,
+            advanced: false,
+            expects: None,
+            integration: IntegrationUnavailableMarker {
+                name: "n".into(),
+                available: false,
+            },
+            unassigned_children: vec![],
+        };
+        let confirm = NextResponse::ActionRequiresConfirmation {
+            state: "s".into(),
+            directive: "d".into(),
+            details: None,
+            advanced: false,
+            action_output: ActionOutput {
+                command: "echo".into(),
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            expects: None,
+            unassigned_children: vec![],
+        };
+
+        for resp in [
+            evidence,
+            gate_blocked,
+            integration,
+            integration_unavailable,
+            confirm,
+        ] {
+            let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
+            assert_eq!(
+                v["unassigned_children"],
+                serde_json::json!([]),
+                "missing or non-empty `unassigned_children` in {}",
+                v["action"]
+            );
+        }
+
+        // Task #18: Terminal now ALSO carries `unassigned_children`
+        // so coordinator-side consumers have a single uniform branch
+        // for the field regardless of action. The earlier Issue-5
+        // assertion that Terminal omitted the field is intentionally
+        // flipped here.
+        let terminal = NextResponse::Terminal {
+            state: "done".into(),
+            advanced: true,
+            unassigned_children: vec![],
+        };
+        let v: serde_json::Value = serde_json::to_value(&terminal).unwrap();
+        assert_eq!(v["unassigned_children"], serde_json::json!([]));
+    }
+
+    /// Pre-request-store directive content is unchanged: the serialized JSON for an
+    /// `EvidenceRequired` variant matches the pre-request-store fixture exactly
+    /// once the new `unassigned_children` field is stripped. This is the
+    /// "byte-identical workflow_directive content" check from PLAN
+    /// Issue 5's acceptance criteria.
+    #[test]
+    fn pre_request_store_directive_content_unchanged_after_stripping_new_field() {
+        // Pre-request-store expected fixture: the entire `koto next` JSON shape
+        // for an `EvidenceRequired` directive return prior to Issue 5.
+        let pre_request_store_fixture = serde_json::json!({
+            "action": "evidence_required",
+            "state": "review",
+            "directive": "Review the changes.",
+            "advanced": true,
+            "expects": {
+                "event_type": "evidence_submitted",
+                "fields": {}
+            },
+            "blocking_conditions": [],
+            "error": null
+        });
+
+        let resp = NextResponse::EvidenceRequired {
+            state: "review".into(),
+            directive: "Review the changes.".into(),
+            details: None,
+            advanced: true,
+            expects: ExpectsSchema {
+                event_type: "evidence_submitted".into(),
+                fields: BTreeMap::new(),
+                options: vec![],
+            },
+            blocking_conditions: vec![],
+            unassigned_children: vec![],
+        };
+
+        let mut emitted: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        // Strip the additive field; the remainder must equal the pre-request-store fixture.
+        let stripped = emitted
+            .as_object_mut()
+            .unwrap()
+            .remove("unassigned_children");
+        assert_eq!(stripped, Some(serde_json::json!([])));
+        assert_eq!(emitted, pre_request_store_fixture);
+    }
+
+    /// A populated `unassigned_children` list (the shape Issue 7 will
+    /// produce) flows through serialization with every element field
+    /// preserved.
+    #[test]
+    fn populated_unassigned_children_round_trips_through_directive() {
+        let entry = UnassignedChild {
+            child_session_id: "parent.task-1".into(),
+            role: "scrutineer".into(),
+            template: "verdict".into(),
+            inputs: Some(serde_json::json!({"draft_path": "docs/draft.md"})),
+            requested_by: "parent".into(),
+            created_at: "2026-05-24T14:32:01Z".into(),
+            dispatch_epoch: 2,
+        };
+        let resp = NextResponse::EvidenceRequired {
+            state: "review".into(),
+            directive: "Review.".into(),
+            details: None,
+            advanced: false,
+            expects: ExpectsSchema {
+                event_type: "evidence_submitted".into(),
+                fields: BTreeMap::new(),
+                options: vec![],
+            },
+            blocking_conditions: vec![],
+            unassigned_children: vec![entry.clone()],
+        };
+
+        let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        let arr = v["unassigned_children"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["child_session_id"], "parent.task-1");
+        assert_eq!(arr[0]["role"], "scrutineer");
+        assert_eq!(arr[0]["template"], "verdict");
+        assert_eq!(arr[0]["inputs"]["draft_path"], "docs/draft.md");
+        assert_eq!(arr[0]["requested_by"], "parent");
+        assert_eq!(arr[0]["created_at"], "2026-05-24T14:32:01Z");
+        assert_eq!(arr[0]["dispatch_epoch"], 2);
     }
 }

@@ -18,6 +18,11 @@ type scenarioContext struct {
 	exitCode int
 	stdout   string
 	stderr   string
+	// stdin is consumed by the next iRun call and then cleared. Set via
+	// the "the command stdin is" step when a scenario must answer an
+	// interactive prompt (e.g. workspace prune --force --yes asking for
+	// the "force-prune" confirmation phrase).
+	stdin string
 }
 
 var sc *scenarioContext
@@ -46,6 +51,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^I am on branch "([^"]*)"$`, iAmOnBranch)
 	ctx.Step(`^the file "([^"]*)" contains "([^"]*)"$`, theFileContains)
 	ctx.Step(`^the file "([^"]*)" contains:$`, theFileContainsDocString)
+	ctx.Step(`^the command stdin is "([^"]*)"$`, theCommandStdinIs)
 
 	// When / And steps (also used as Given for chaining)
 	ctx.Step(`^I run "([^"]*)"$`, iRun)
@@ -64,6 +70,9 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the JSON output field "([^"]*)" equals (\d+)$`, theJSONOutputFieldEqualsInt)
 	ctx.Step(`^the JSON output field "([^"]*)" is (true|false)$`, theJSONOutputFieldEqualsBool)
 	ctx.Step(`^the state file for "([^"]*)" exists$`, theStateFileExists)
+
+	// Request-store-specific steps live in steps_request_store_test.go.
+	InitializeRequestStoreScenario(ctx)
 }
 
 // aCleanKotoEnvironment initializes a git repo in the temp dir.
@@ -163,6 +172,14 @@ func theFileContainsDocString(path string, content *godog.DocString) error {
 	return os.WriteFile(full, []byte(content.Content), 0644)
 }
 
+// theCommandStdinIs stages a string to be piped to stdin on the next
+// iRun invocation. iRun consumes and clears it so subsequent commands
+// in the same scenario default back to an empty stdin.
+func theCommandStdinIs(content string) error {
+	sc.stdin = content + "\n"
+	return nil
+}
+
 // iRun executes a command, replacing "koto" with the actual binary path.
 func iRun(command string) error {
 	args := splitCommand(command)
@@ -186,6 +203,10 @@ func iRun(command string) error {
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	if sc.stdin != "" {
+		cmd.Stdin = strings.NewReader(sc.stdin)
+		sc.stdin = ""
+	}
 
 	err := cmd.Run()
 	sc.stdout = stdout.String()
@@ -343,7 +364,7 @@ func theJSONOutputFieldEqualsInt(field string, expected int) error {
 
 // theStateFileExists checks that koto-<name>.state.jsonl exists.
 func theStateFileExists(name string) error {
-	stateFile := filepath.Join(sc.tempDir, fmt.Sprintf("koto-%s.state.jsonl", name))
+	stateFile := filepath.Join(sc.tempDir, ".koto", "sessions", name, fmt.Sprintf("koto-%s.state.jsonl", name))
 	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
 		return fmt.Errorf("expected state file koto-%s.state.jsonl to exist", name)
 	}

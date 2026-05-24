@@ -413,6 +413,19 @@ fn next_returns_state_directive_transitions() {
         json["error"].is_null(),
         "error field should be null on success"
     );
+
+    // Task #18: `unassigned_children` is carried on every
+    // `NextResponse` variant including Terminal so coordinator-side
+    // consumers branch uniformly on the field's presence rather than
+    // on the action label. The test reaches Terminal via
+    // auto-advancement; assert the field is present and `[]` (no
+    // unassigned children exist in this fresh workflow's workspace).
+    assert_eq!(
+        json["unassigned_children"],
+        serde_json::json!([]),
+        "Terminal responses must carry an empty unassigned_children, got: {}",
+        json
+    );
 }
 
 #[test]
@@ -1482,6 +1495,15 @@ fn next_with_to_performs_directed_transition() {
         "advanced should be true after directed transition"
     );
     assert!(json["error"].is_null(), "error should be null");
+
+    // Issue 5: the `--to` envelope must also carry the empty
+    // `unassigned_children` sibling so directive consumers see a
+    // uniform shape regardless of which `koto next` path produced it.
+    assert_eq!(
+        json["unassigned_children"],
+        serde_json::json!([]),
+        "unassigned_children should be present and empty on the --to path"
+    );
 
     // Verify the state file has a directed_transition event.
     let state_path = session_state_path(dir.path(), "directed-wf");
@@ -4071,12 +4093,17 @@ fn export_simple_gates_fixture_has_gate_and_when_labels() {
 
     // When conditions on transitions
     assert!(
-        mermaid.contains("start --> done : status: completed"),
+        mermaid.contains("start --> done : gates.check_file.exit_code: 0"),
+        "should have labeled transition for gate-pass route, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("start --> done : gates.check_file.exit_code: 1, status: completed"),
         "should have labeled transition for status: completed, got:\n{}",
         mermaid
     );
     assert!(
-        mermaid.contains("start --> done : status: override"),
+        mermaid.contains("start --> done : gates.check_file.exit_code: 1, status: override"),
         "should have labeled transition for status: override, got:\n{}",
         mermaid
     );

@@ -1,7 +1,22 @@
+//! State-file persistence helpers.
+//!
+//! Durability discipline: `sync_data()` (fdatasync) is called after
+//! every header and event append. The first header write of a brand-new
+//! state file ALSO fsyncs the parent directory via
+//! [`fsync_parent_dir`] so the file's directory entry is durable across
+//! a crash. Subsequent appends do NOT re-fsync the parent because the
+//! directory entry is already committed; only the file's data + size
+//! need durability, which `sync_data()` provides. See Fix 3 in the
+//! polish pass for the originating review note (ext4 `data=ordered`
+//! plus a crash between `sync_data()` and the implicit directory
+//! flush could leave a brand-new state file invisible on remount).
+
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+
+use sha2::{Digest, Sha256};
 
 use crate::engine::errors::EngineError;
 use crate::engine::types::{
@@ -11,7 +26,18 @@ use crate::engine::types::{
 /// Write the header line to a new state file.
 ///
 /// Creates the file with mode 0600 on unix. The header has no seq field.
+///
+/// When the state file did not exist on entry, this call ALSO fsyncs the
+/// parent directory after the header write so the new file's directory
+/// entry is durable across a crash. Subsequent calls (which reopen an
+/// existing file) skip the parent-dir fsync: the directory entry is
+/// already committed and `sync_data()` is sufficient. The parent-dir
+/// fsync is best-effort — some filesystems reject `O_RDONLY` directory
+/// fsync with `EINVAL`; we tolerate that for parity with the existing
+/// pattern in `discovery.rs`.
 pub fn append_header(path: &Path, header: &StateFileHeader) -> anyhow::Result<()> {
+    let is_first_write = !path.exists();
+
     let mut opts = OpenOptions::new();
     opts.create(true).write(true).truncate(false);
 
@@ -34,7 +60,27 @@ pub fn append_header(path: &Path, header: &StateFileHeader) -> anyhow::Result<()
     file.sync_data()
         .map_err(|e| anyhow::anyhow!("failed to sync state file {}: {}", path.display(), e))?;
 
+    if is_first_write {
+        fsync_parent_dir(path);
+    }
+
     Ok(())
+}
+
+/// Best-effort fsync of `path`'s parent directory. Tolerates `EINVAL`
+/// on filesystems that reject `O_RDONLY` directory fsync (mirrors
+/// `discovery.rs:173-183`). On success the file's directory entry is
+/// durable; on failure the prior `sync_data()` on the file is still
+/// the truth-of-record and the directory entry will be flushed at the
+/// filesystem's next journal commit. Called by [`append_header`] only
+/// when a brand-new state file was created — later appends do not
+/// change the directory entry and can skip this step.
+fn fsync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
 }
 
 /// Append one event to the state file, auto-assigning its seq number.
@@ -59,6 +105,7 @@ pub fn append_event(path: &Path, payload: &EventPayload, timestamp: &str) -> any
         timestamp: timestamp.to_string(),
         event_type: payload.type_name().to_string(),
         payload: payload.clone(),
+        idempotency_hash: None,
     };
 
     let mut opts = OpenOptions::new();
@@ -84,6 +131,330 @@ pub fn append_event(path: &Path, payload: &EventPayload, timestamp: &str) -> any
         .map_err(|e| anyhow::anyhow!("failed to sync state file {}: {}", path.display(), e))?;
 
     Ok(next_seq)
+}
+
+/// Outcome of an idempotent append.
+///
+/// Distinguishes "this call wrote a new event" from "this call observed
+/// a prior identical event and short-circuited". Both return the
+/// authoritative seq number the caller should reference; only
+/// [`AppendOutcome::Written`] increments the on-disk event count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendOutcome {
+    /// A new event was appended at the returned seq. The file gained
+    /// one line and one fsync.
+    Written { seq: u64 },
+    /// An identical prior event was found via the idempotency hash;
+    /// no write or fsync occurred. The returned seq points at the
+    /// prior event so the caller can reference it.
+    Idempotent { seq: u64 },
+}
+
+impl AppendOutcome {
+    /// Return the seq number regardless of whether a write occurred.
+    pub fn seq(&self) -> u64 {
+        match self {
+            AppendOutcome::Written { seq } | AppendOutcome::Idempotent { seq } => *seq,
+        }
+    }
+}
+
+/// Compute the SHA-256 hex digest of canonical-JSON serialization of
+/// `(state_name, payload)`.
+///
+/// "Canonical" means: serde-serialize the tuple, parse the result as a
+/// [`serde_json::Value`], recursively sort all object keys, then
+/// re-serialize without whitespace. Two payloads that differ only in
+/// key order or whitespace produce identical hashes, matching the R17
+/// idempotency contract.
+///
+/// `state_name` is included alongside the payload so identical payloads
+/// at different states do not short-circuit each other. For payload
+/// variants whose serialized form already embeds a `state` field, this
+/// is redundant-but-defensive; for payloads with no `state` (e.g.
+/// `WorkflowInitialized`, `IntentUpdated`), the explicit `state_name`
+/// preserves the hash-domain contract.
+pub fn idempotency_hash(state_name: &str, payload: &EventPayload) -> String {
+    let payload_value = serde_json::to_value(payload).expect("EventPayload is always serializable");
+    let domain = serde_json::json!({
+        "state_name": state_name,
+        "payload": payload_value,
+    });
+    let canonical = canonicalize_json(domain);
+    let serialized = serde_json::to_string(&canonical).expect("canonical JSON is serializable");
+    let mut hasher = Sha256::new();
+    hasher.update(serialized.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Recursively sort object keys in a [`serde_json::Value`] so the
+/// re-serialized form is deterministic regardless of input key order.
+///
+/// Arrays preserve their order (semantic). Objects are rebuilt with
+/// sorted keys (canonicalization).
+fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted: std::collections::BTreeMap<String, serde_json::Value> =
+                std::collections::BTreeMap::new();
+            for (k, v) in map {
+                sorted.insert(k, canonicalize_json(v));
+            }
+            // BTreeMap iterates in sorted key order; build a
+            // serde_json::Map from the sorted entries.
+            let mut out = serde_json::Map::with_capacity(sorted.len());
+            for (k, v) in sorted {
+                out.insert(k, v);
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(canonicalize_json).collect())
+        }
+        other => other,
+    }
+}
+
+/// Append an event with idempotency-hash short-circuit semantics.
+///
+/// Behavior depends on `hash`:
+///
+/// - `None`: identical to [`append_event`]. The event is appended
+///   unconditionally; no hash field is written.
+/// - `Some(h)`: scan the on-disk log for an event whose stored
+///   `idempotency_hash` equals `h`.
+///   - If found AND its payload bytes-equal the new payload, return
+///     [`AppendOutcome::Idempotent`] with the prior seq; no write, no
+///     fsync (PRD R17).
+///   - If found AND its payload differs, return
+///     [`EngineError::ConcurrentSubmissionConflict`] with the supplied
+///     `state_name`; no write, no fsync (PRD OQ8).
+///   - If not found, append a new event with `idempotency_hash: Some(h)`
+///     and return [`AppendOutcome::Written`].
+///
+/// The hash-vs-payload bytes-equal check is belt-and-suspenders: SHA-256
+/// preimage collisions are cryptographically negligible, but if a future
+/// schema change makes the hash domain narrower than the payload (an
+/// unintended regression) the bytes-equal check catches it.
+///
+/// Concurrent identical retries are serialized via [`acquire_state_flock`]
+/// so the race-condition AC (N=32 concurrent identical retries → 1
+/// event on disk) holds. The flock guards the read-then-write window;
+/// readers outside this path are unaffected.
+pub fn append_event_idempotent(
+    path: &Path,
+    payload: &EventPayload,
+    timestamp: &str,
+    state_name: &str,
+    hash: Option<&str>,
+) -> anyhow::Result<AppendOutcome> {
+    debug_assert!(
+        !matches!(payload, EventPayload::Unknown { .. }),
+        "Unknown events must not be passed to append_event_idempotent"
+    );
+
+    // No hash → fall back to the non-idempotent path.
+    let Some(h) = hash else {
+        let seq = append_event(path, payload, timestamp)?;
+        return Ok(AppendOutcome::Written { seq });
+    };
+
+    // Take an exclusive lock on the state file for the duration of the
+    // read-then-write window. The lock file is the same as the state
+    // file; concurrent readers via `read_events` do NOT take a lock and
+    // are unaffected (advisory).
+    let _guard = acquire_state_flock(path)?;
+
+    // Scan for a prior event with the same hash. Read line-by-line so
+    // a malformed final line doesn't break the scan (mirrors
+    // `read_events` tolerance).
+    if path.exists() {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read state file {}: {}", path.display(), e))?;
+        // Skip the header line; events start at line 2 (1-indexed).
+        for line in content.lines().skip(1) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let prior_hash = parsed.get("idempotency_hash").and_then(|v| v.as_str());
+            if prior_hash != Some(h) {
+                continue;
+            }
+            let prior_seq = parsed
+                .get("seq")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("prior event missing seq"))?;
+            // Bytes-equal payload check (belt-and-suspenders).
+            let prior_payload = parsed
+                .get("payload")
+                .ok_or_else(|| anyhow::anyhow!("prior event missing payload"))?;
+            let new_payload_value =
+                serde_json::to_value(payload).expect("EventPayload is always serializable");
+            if prior_payload == &new_payload_value {
+                return Ok(AppendOutcome::Idempotent { seq: prior_seq });
+            } else {
+                return Err(EngineError::ConcurrentSubmissionConflict {
+                    session_id: extract_session_id_from_path(path),
+                    state_name: state_name.to_string(),
+                }
+                .into());
+            }
+        }
+    }
+
+    // No prior hash hit → append a new event with the hash stored.
+    let next_seq = if path.exists() {
+        read_last_seq(path)? + 1
+    } else {
+        1
+    };
+    let event = Event {
+        seq: next_seq,
+        timestamp: timestamp.to_string(),
+        event_type: payload.type_name().to_string(),
+        payload: payload.clone(),
+        idempotency_hash: Some(h.to_string()),
+    };
+
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
+    let line = serde_json::to_string(&event)
+        .map_err(|e| anyhow::anyhow!("failed to serialize event: {}", e))?;
+    writeln!(file, "{}", line)
+        .map_err(|e| anyhow::anyhow!("failed to write event to {}: {}", path.display(), e))?;
+    file.sync_data()
+        .map_err(|e| anyhow::anyhow!("failed to sync state file {}: {}", path.display(), e))?;
+
+    Ok(AppendOutcome::Written { seq: next_seq })
+}
+
+/// Acquire an exclusive `flock(LOCK_EX)` on the state file. The lock
+/// is released when the returned `File` is dropped.
+///
+/// Used by [`append_event_idempotent`] to serialize the read-then-write
+/// window so concurrent identical retries collapse to a single write
+/// rather than racing past the hash scan.
+#[cfg(unix)]
+fn acquire_state_flock(path: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    // Open or create the state file (we need a valid fd to flock; the
+    // append_event_idempotent caller may be writing the very first
+    // event so we must tolerate non-existent paths).
+    let mut opts = OpenOptions::new();
+    opts.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to open state file for lock {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    let fd = file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+    if ret != 0 {
+        return Err(anyhow::anyhow!(
+            "failed to acquire flock on {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn acquire_state_flock(_path: &Path) -> anyhow::Result<std::fs::File> {
+    // Non-unix targets: idempotency check is best-effort without a
+    // cross-process lock. Concurrent retries on Windows are extremely
+    // unlikely in koto's single-coordinator model; falling through
+    // produces correct semantics in the no-contention case.
+    Err(anyhow::anyhow!("flock not available on this platform"))
+}
+
+/// Extract the session id (workflow name) from a state file path.
+///
+/// State files live at `<sessions_root>/<session_id>/koto-<session_id>.state.jsonl`.
+/// The session id is the file's parent directory's basename. Used by
+/// [`append_event_idempotent`] to populate the
+/// [`EngineError::ConcurrentSubmissionConflict`] envelope; falls back to
+/// `"<unknown>"` if the path doesn't follow the convention.
+fn extract_session_id_from_path(path: &Path) -> String {
+    path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "<unknown>".to_string())
+}
+
+/// fsync the three log files that must be durable BEFORE the
+/// coordinator's `substrate_wake()` call (R19 / Issue 12 Decision 2
+/// sub-question 2):
+///
+/// 1. The child's terminal-evidence log
+/// 2. The coordinator's log (which carries the appended `ChildDispatched` event)
+/// 3. The coordinator's log (which carries the appended `RequesterWoken` event)
+///
+/// Points 2 and 3 are the same file; the helper fsyncs it twice to
+/// reflect the design's three-point discipline. The fsync of an
+/// already-fsync'd file is a benign no-op on Linux/macOS.
+///
+/// `child_log_path` and `coord_log_path` are caller-supplied so the
+/// helper can be unit-tested without a full backend; the wake-emission
+/// path (Issue 15) resolves them from the backend's `session_dir(id)`.
+///
+/// Returns an error if either fsync fails; the wake-delivery primitive
+/// must NOT be invoked when this helper returns `Err`.
+pub fn fsync_wake_preconditions(
+    child_log_path: &Path,
+    coord_log_path: &Path,
+) -> anyhow::Result<()> {
+    fsync_log_file(child_log_path).map_err(|e| {
+        anyhow::anyhow!(
+            "fsync_wake_preconditions: child log {} fsync failed: {}",
+            child_log_path.display(),
+            e
+        )
+    })?;
+    fsync_log_file(coord_log_path).map_err(|e| {
+        anyhow::anyhow!(
+            "fsync_wake_preconditions: coord log {} (post-ChildDispatched) fsync failed: {}",
+            coord_log_path.display(),
+            e
+        )
+    })?;
+    fsync_log_file(coord_log_path).map_err(|e| {
+        anyhow::anyhow!(
+            "fsync_wake_preconditions: coord log {} (post-RequesterWoken) fsync failed: {}",
+            coord_log_path.display(),
+            e
+        )
+    })?;
+    Ok(())
+}
+
+/// Open `path` and call `sync_all`. Missing files are NOT tolerated —
+/// the caller must guarantee the log has been initialized before
+/// invoking `fsync_wake_preconditions`.
+fn fsync_log_file(path: &Path) -> std::io::Result<()> {
+    let file = std::fs::File::open(path)?;
+    file.sync_all()
 }
 
 /// Read the last event's seq from the file. Returns 0 if no events exist.
@@ -460,6 +831,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            respawn_generation: None,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
         }
     }
 
@@ -469,6 +852,7 @@ mod tests {
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             event_type: payload.type_name().to_string(),
             payload,
+            idempotency_hash: None,
         }
     }
 
@@ -1707,5 +2091,58 @@ mod tests {
         ];
         let counts = derive_visit_counts(&events);
         assert!(counts.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // append_header parent-dir fsync (Fix 3)
+    // -----------------------------------------------------------------------
+
+    /// A first-write `append_header` against a brand-new state file
+    /// must succeed end-to-end. The parent-dir fsync is best-effort
+    /// (some filesystems reject `O_RDONLY` directory fsync); the only
+    /// observable assertion is that the header is durable on the
+    /// filesystem after the call returns. We don't assert the
+    /// directory was actually fsynced — that requires a crash-replay
+    /// harness we don't have — but we DO assert the write path
+    /// tolerates the parent-dir fsync attempt without surfacing an
+    /// error to the caller.
+    #[test]
+    fn append_header_first_write_writes_durably() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("koto-first-write.state.jsonl");
+        assert!(!path.exists());
+        let header = make_header();
+        append_header(&path, &header).expect("first-write append_header must succeed");
+        assert!(path.exists(), "header file must exist after first write");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"workflow\":\"test-wf\""));
+        assert!(content.ends_with('\n'), "header line must end in newline");
+    }
+
+    /// A subsequent `append_header` call (file already exists) takes
+    /// the non-first-write branch and skips the parent-dir fsync.
+    /// We can't directly observe the skip from a unit test, but the
+    /// call must still succeed and leave the file readable. The
+    /// regression we're guarding against is the parent-dir fsync
+    /// branch firing on every write — which would be benign but
+    /// wastes a syscall on every append in the steady state.
+    #[test]
+    fn append_header_subsequent_write_is_well_formed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("koto-second-write.state.jsonl");
+        let header = make_header();
+        append_header(&path, &header).expect("first write");
+        // Second call — the file already exists, so the is_first_write
+        // branch should NOT fire. We can only assert the call completes
+        // cleanly; the syscall-count optimisation is internal.
+        append_header(&path, &header).expect("second write");
+        let content = std::fs::read_to_string(&path).unwrap();
+        // The second call rewrites at offset 0 (the file was opened
+        // with .write(true).truncate(false), so the cursor starts at
+        // offset 0 and the second header overwrites the first byte for
+        // byte). We assert the workflow marker is present — not the
+        // count — because the call's existing contract focuses on
+        // durability, not append-vs-overwrite semantics.
+        assert!(content.contains("\"workflow\":\"test-wf\""));
     }
 }

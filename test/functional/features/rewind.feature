@@ -26,7 +26,7 @@ Feature: Rewind
       """
     And I run:
       """
-      koto next test-wf --with-data '{"status": "completed"}'
+      koto next test-wf --with-data '{"status": "completed"}' --no-cleanup
       """
     And I run "koto rewind test-wf"
     When I run "koto decisions list test-wf"

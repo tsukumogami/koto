@@ -366,6 +366,7 @@ fn next_response_error_wraps_every_rejection_variant() {
             },
             batch: Some(BatchErrorContext::from_batch_error(&batch_err)),
             blocking_conditions: vec![],
+            unassigned_children: vec![],
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["action"], "error");

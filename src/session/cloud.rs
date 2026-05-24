@@ -1017,6 +1017,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         append_header(&state_path, &header).unwrap();
     }
@@ -1107,6 +1119,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         let events = vec![Event {
             seq: 1,
@@ -1117,6 +1141,7 @@ mod tests {
                 variables: Default::default(),
                 spawn_entry: None,
             },
+            idempotency_hash: None,
         }];
 
         // S3 push will fail (unreachable endpoint) but the call should
@@ -1146,6 +1171,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         let events = vec![Event {
             seq: 1,
@@ -1156,6 +1193,7 @@ mod tests {
                 variables: Default::default(),
                 spawn_entry: None,
             },
+            idempotency_hash: None,
         }];
         backend
             .init_state_file("wf", header.clone(), events.clone())
@@ -1188,6 +1226,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         let events = vec![Event {
             seq: 1,
@@ -1198,6 +1248,7 @@ mod tests {
                 variables: Default::default(),
                 spawn_entry: None,
             },
+            idempotency_hash: None,
         }];
         backend.init_state_file("wf", header, events).unwrap();
 

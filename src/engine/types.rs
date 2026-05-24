@@ -1,6 +1,191 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::LazyLock;
+
+use regex::Regex;
+
+use crate::engine::errors::EngineError;
+
+/// Stage 1 frozen alias for `derive_state_from_log`, re-exported from
+/// [`crate::engine::persistence`] so the canonical access path is
+/// `koto::engine::types::derive_state_from_log` (Issue 19 / Decision 5).
+///
+/// The re-export is the only stability-frozen surface in
+/// `engine::types` that crosses module boundaries — every other
+/// Stage 1 export (`StateFileHeader`, `Event`, `EventPayload`,
+/// `SpawnEntrySnapshot`, `ChildSnapshot`, `CURRENT_SCHEMA_VERSION`,
+/// `AssignmentClaim`) is defined in this module directly. Breaking
+/// changes to the alias's signature require a 6-week deprecation
+/// window per `docs/STABILITY.md`; the function's body may evolve
+/// freely as long as the public signature holds.
+pub use crate::engine::persistence::derive_state_from_log;
+
+/// Compiled validation regex shared by [`ValidatedSessionId`] and
+/// [`ValidatedCoordId`].
+///
+/// Rejects any input that contains shell metacharacters, path
+/// separators, or any other byte outside `[a-zA-Z0-9._-]`, and any
+/// input that does not start with an alphanumeric (so leading `.` and
+/// leading `-` — which can be re-interpreted as hidden files or CLI
+/// flags downstream — are also rejected).
+///
+/// The pattern is the security spine for juror-2 N1/N5: every flow
+/// that lands a session or coordinator id from caller-controlled
+/// input passes through one of the two newtype constructors, which
+/// both delegate to this regex. Keep the pattern conservative — it
+/// is easier to relax later than to chase a hole through every
+/// downstream caller.
+static VALIDATED_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9._\-]*$")
+        .expect("VALIDATED_ID_RE is a constant and always parses")
+});
+
+/// Maximum byte length for a validated session or coordinator id.
+///
+/// Caps prevent log-injection via overlong inputs and keep path
+/// components within typical filesystem limits.
+const VALIDATED_ID_MAX_LEN: usize = 255;
+
+fn validate_id_input(input: &str) -> Result<(), &'static str> {
+    if input.is_empty() {
+        return Err("empty input");
+    }
+    if input.len() > VALIDATED_ID_MAX_LEN {
+        return Err("input exceeds 255 characters");
+    }
+    // Cheap structural rejections first so the regex doesn't even
+    // need to run for the common cases — also makes the error
+    // messages more specific.
+    let first = input.as_bytes()[0];
+    if first == b'.' {
+        return Err("leading dot");
+    }
+    if first == b'-' {
+        return Err("leading hyphen");
+    }
+    if !VALIDATED_ID_RE.is_match(input) {
+        return Err("contains disallowed characters");
+    }
+    Ok(())
+}
+
+/// Truncate `input` to at most 64 chars (byte-safe), appending `...`
+/// when shortening. Used to keep error messages bounded.
+fn truncate_id_for_preview(input: &str) -> String {
+    const MAX: usize = 64;
+    if input.len() <= MAX {
+        return input.to_string();
+    }
+    let mut cut = MAX;
+    while !input.is_char_boundary(cut) && cut > 0 {
+        cut -= 1;
+    }
+    format!("{}...", &input[..cut])
+}
+
+/// A session id that has passed the workspace's shell-safe validation
+/// regex.
+///
+/// Construct via [`ValidatedSessionId::new`]. Once constructed, the
+/// inner string is guaranteed to match
+/// `^[a-zA-Z0-9][a-zA-Z0-9._-]*$` and be at most
+/// [`VALIDATED_ID_MAX_LEN`] (255) bytes long — downstream path-join
+/// operations and shell-quoted contexts can rely on this without
+/// re-validating.
+///
+/// The newtype pattern makes validation un-bypassable at the type
+/// level: a function that accepts `&ValidatedSessionId` literally
+/// cannot be called with an unvalidated string. Issues 4, 6, 11, 13,
+/// 14 build on this invariant. See the design doc's Security
+/// Considerations N1 / N5.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ValidatedSessionId(String);
+
+impl ValidatedSessionId {
+    /// Construct a `ValidatedSessionId` from caller-controlled input.
+    ///
+    /// Returns [`EngineError::InvalidSessionId`] when `input` is
+    /// empty, longer than 255 bytes, starts with `.` or `-`, or
+    /// contains any character outside `[a-zA-Z0-9._-]`.
+    pub fn new(input: &str) -> Result<Self, EngineError> {
+        validate_id_input(input).map_err(|reason| EngineError::InvalidSessionId {
+            reason: reason.to_string(),
+            input_preview: truncate_id_for_preview(input),
+        })?;
+        Ok(Self(input.to_string()))
+    }
+
+    /// Borrow the inner string without re-validation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the newtype and return the inner owned string.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ValidatedSessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for ValidatedSessionId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A coordinator id that has passed the same shell-safe validation
+/// regex as [`ValidatedSessionId`].
+///
+/// Construct via [`ValidatedCoordId::new`]. See `ValidatedSessionId`
+/// for the contract — `ValidatedCoordId` shares the same regex,
+/// length cap, and Display/AsRef surface so coordinator ids and
+/// session ids are interchangeable wherever a callee only needs the
+/// shell-safety guarantee.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ValidatedCoordId(String);
+
+impl ValidatedCoordId {
+    /// Construct a `ValidatedCoordId` from caller-controlled input.
+    ///
+    /// Returns [`EngineError::InvalidCoordId`] when `input` is
+    /// empty, longer than 255 bytes, starts with `.` or `-`, or
+    /// contains any character outside `[a-zA-Z0-9._-]`.
+    pub fn new(input: &str) -> Result<Self, EngineError> {
+        validate_id_input(input).map_err(|reason| EngineError::InvalidCoordId {
+            reason: reason.to_string(),
+            input_preview: truncate_id_for_preview(input),
+        })?;
+        Ok(Self(input.to_string()))
+    }
+
+    /// Borrow the inner string without re-validation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the newtype and return the inner owned string.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ValidatedCoordId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for ValidatedCoordId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Current schema version written in every `StateFileHeader`.
 ///
@@ -72,6 +257,101 @@ pub struct StateFileHeader {
     /// Additive field: omitted when None, defaults to None on old state files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_name: Option<String>,
+
+    // ===== Request-store fields (Decision 1) =====
+    //
+    // The seven additive + four reserved fields below land the
+    // dispatch-request marker that bunki BK2 and downstream
+    // request-store components read from the on-disk header. All are
+    // `#[serde(default, skip_serializing_if = "Option::is_none")]` so
+    // pre-request-store state files round-trip unchanged.
+    /// Whether this workflow is requesting agent assignment.
+    ///
+    /// Drives the request-store: when `Some(true)` the workflow is
+    /// awaiting (or has been claimed for) an agent dispatch. `None` on
+    /// pre-request-store headers and on workflows that don't need agent
+    /// orchestration. Companion-field validation (role / inputs) is
+    /// owned by the CLI layer (Issue 4), not the type layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_agent: Option<bool>,
+
+    /// Role identifier the assigning coordinator should match against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+
+    /// Arbitrary JSON payload passed to the agent at dispatch time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<serde_json::Value>,
+
+    /// Identifier of the coordinator that owns this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_of_record: Option<String>,
+
+    /// Identifier of the principal that submitted this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+
+    /// Claim record written by the coordinator that picked up this
+    /// request. Populated as a single atomic write through the
+    /// claim sidecar (Issue 11); absent until claim time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_claim: Option<AssignmentClaim>,
+
+    /// Generation counter incremented every time the request is
+    /// re-dispatched after a previous claim was revoked. Defaults to
+    /// `0` on pre-request-store headers and on never-claimed requests.
+    #[serde(default)]
+    pub dispatch_epoch: u32,
+
+    /// Generation counter incremented every time the requester is
+    /// respawned via F1 cold-restart re-priming (Issue 16 / Decision
+    /// 5). `None` on pre-Issue-16 headers; resolves to 0 when read.
+    /// The respawn-generation cap (`request_store.respawn_generation_cap`,
+    /// default 2 per Issue 18) prevents cascading respawns: when
+    /// `respawn_generation == cap`, F1 refuses to fire and the
+    /// requester transitions to terminal `abandoned` with the F3
+    /// fallback reason `respawn_failed: respawn_generation_cap_exceeded`.
+    ///
+    /// Additive field: `#[serde(default, skip_serializing_if = ...)]`
+    /// keeps pre-Issue-16 headers round-tripping unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub respawn_generation: Option<u32>,
+
+    // ===== Reserved request-store fields (forward-compatibility) =====
+    //
+    // Wire-format placeholders for follow-up features. Always
+    // serialize as absent keys when `None`; reading code may parse
+    // them but should not act on them yet.
+    /// Reserved: dispatch priority (forward-compat placeholder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+
+    /// Reserved: optional deadline (RFC 3339 string, forward-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<String>,
+
+    /// Reserved: retry counter (forward-compat placeholder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<u32>,
+
+    /// Reserved: opaque agent configuration blob (forward-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_config: Option<serde_json::Value>,
+}
+
+/// Claim record written by the coordinator that picks up an agent
+/// dispatch request.
+///
+/// Carries the coordinator id and the RFC 3339 claim timestamp. The
+/// struct is treated as opaque by the type layer; ordering and
+/// fencing semantics live in the claim sidecar and dispatch-epoch
+/// fence (Issues 11 and 13).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssignmentClaim {
+    /// Identifier of the claiming coordinator.
+    pub coord_id: String,
+    /// RFC 3339 UTC timestamp at which the claim was recorded.
+    pub claimed_at: String,
 }
 
 /// Canonical-form snapshot of the batch task entry that spawned a
@@ -419,6 +699,28 @@ pub struct SchedulerTickSummary {
     pub reclassified: bool,
 }
 
+/// Snapshot of a child state file that `classify_task` needs to
+/// determine the child's `TaskOutcome`. Built once per tick by the
+/// scheduler and looked up by short task name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildSnapshot {
+    /// Current state name as derived from the event log.
+    pub current_state: String,
+    /// Whether the current state is terminal, per the child's own
+    /// compiled template.
+    pub terminal: bool,
+    /// Whether the current state has `failure: true`.
+    pub failure: bool,
+    /// Whether the current state has `skipped_marker: true`.
+    pub skipped_marker: bool,
+    /// `spawn_entry` recorded on the child's `WorkflowInitialized`
+    /// event, when present. Issue #12 does not yet consume this
+    /// (no R8 runtime check); later issues use it for rename
+    /// detection and respawn-entry comparison.
+    #[allow(dead_code)]
+    pub spawn_entry: Option<SpawnEntrySnapshot>,
+}
+
 impl EventPayload {
     /// Return the string name matching the serialized `type` field.
     pub fn type_name(&self) -> &'static str {
@@ -478,12 +780,26 @@ pub struct Event {
 
     /// Type-specific payload.
     pub payload: EventPayload,
+
+    /// Optional SHA-256 hex digest of canonical-JSON-serialized
+    /// `(state_name, payload)`, set when the event was written via
+    /// [`crate::engine::persistence::append_event_idempotent`]. Lets
+    /// retry-prone callers (wake-delivery, evidence submission)
+    /// short-circuit identical retries by comparing against this hash
+    /// on subsequent calls. Absent on events written via the legacy
+    /// [`crate::engine::persistence::append_event`] path or before
+    /// Issue 12 landed.
+    ///
+    /// Additive serde-optional field: omitted from serialization when
+    /// `None` so pre-Issue-12 state files round-trip unchanged.
+    pub idempotency_hash: Option<String>,
 }
 
 impl Serialize for Event {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(4))?;
+        let extra = self.idempotency_hash.as_ref().map_or(0, |_| 1);
+        let mut map = serializer.serialize_map(Some(4 + extra))?;
         map.serialize_entry("seq", &self.seq)?;
         map.serialize_entry("timestamp", &self.timestamp)?;
         // Use the stored event_type string rather than payload.type_name() so that
@@ -491,6 +807,9 @@ impl Serialize for Event {
         // instead of the static "unknown" label when serialized by koto query --events.
         map.serialize_entry("type", &self.event_type)?;
         map.serialize_entry("payload", &self.payload)?;
+        if let Some(h) = &self.idempotency_hash {
+            map.serialize_entry("idempotency_hash", h)?;
+        }
         map.end()
     }
 }
@@ -678,11 +997,20 @@ impl<'de> Deserialize<'de> for Event {
             },
         };
 
+        // Optional Issue 12 idempotency-hash field. Absent on
+        // pre-Issue-12 events; present when written via
+        // `append_event_idempotent`.
+        let idempotency_hash = obj
+            .get("idempotency_hash")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         Ok(Event {
             seq,
             timestamp,
             event_type,
             payload,
+            idempotency_hash,
         })
     }
 }
@@ -949,6 +1277,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         let parsed: StateFileHeader = serde_json::from_str(&json).unwrap();
@@ -967,6 +1307,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(json.contains("\"parent_workflow\":\"parent-wf\""));
@@ -997,6 +1349,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -1020,6 +1384,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -1041,6 +1417,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -1088,6 +1476,7 @@ mod tests {
                 variables: HashMap::new(),
                 spawn_entry: None,
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"workflow_initialized\""));
@@ -1154,6 +1543,7 @@ mod tests {
                 variables: HashMap::new(),
                 spawn_entry: Some(snapshot.clone()),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(
@@ -1225,6 +1615,7 @@ mod tests {
                 to: "gather".to_string(),
                 rationale: None,
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         let parsed: Event = serde_json::from_str(&json).unwrap();
@@ -1243,6 +1634,7 @@ mod tests {
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         let parsed: Event = serde_json::from_str(&json).unwrap();
@@ -1307,6 +1699,7 @@ mod tests {
                     "alternatives_considered": ["Parallel requests", "Queue-based processing"]
                 }),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"decision_recorded\""));
@@ -1347,6 +1740,7 @@ mod tests {
                 stdout: "Switched to a new branch 'feature'\n".to_string(),
                 stderr: String::new(),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"default_action_executed\""));
@@ -1380,6 +1774,7 @@ mod tests {
                 outcome: "passed".to_string(),
                 timestamp: "2026-04-01T00:00:00Z".to_string(),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"gate_evaluated\""));
@@ -1415,6 +1810,7 @@ mod tests {
                 actual_output: serde_json::json!({"exit_code": 1, "error": "timeout"}),
                 timestamp: "2026-04-01T00:01:00Z".to_string(),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"gate_override_recorded\""));
@@ -1478,6 +1874,7 @@ mod tests {
                 },
                 submitter_cwd: Some(PathBuf::from("/work/repo")),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(
@@ -1520,6 +1917,7 @@ mod tests {
                 timestamp: "2026-04-14T12:00:00Z".to_string(),
                 superseded_by: None,
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"batch_finalized\""));
@@ -1554,6 +1952,7 @@ mod tests {
                     timestamp: "2026-04-14T11:30:00Z".to_string(),
                 }),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(
@@ -1630,6 +2029,18 @@ mod tests {
             session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(json.contains("\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\""));
@@ -1697,6 +2108,7 @@ mod tests {
                     .to_string(),
                 size: 1024,
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"context_added\""));
@@ -1729,6 +2141,7 @@ mod tests {
                 to: "implementation".to_string(),
                 rationale: Some("Design approved by stakeholders".to_string()),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"rationale\":\"Design approved by stakeholders\""));
@@ -1747,6 +2160,7 @@ mod tests {
                 to: "implementation".to_string(),
                 rationale: None,
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(
@@ -1783,6 +2197,7 @@ mod tests {
                 to: "analysis".to_string(),
                 rationale: Some("Scope changed after review".to_string()),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"rationale\":\"Scope changed after review\""));
@@ -1801,6 +2216,7 @@ mod tests {
                 to: "analysis".to_string(),
                 rationale: None,
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(
@@ -1864,6 +2280,7 @@ mod tests {
                 type_name: "future_event".to_string(),
                 raw_payload: serde_json::json!({"field": "value"}),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1893,6 +2310,7 @@ mod tests {
                 payload: EventPayload::IntentUpdated {
                     intent: intent.to_string(),
                 },
+                idempotency_hash: None,
             }
         }
         let events = vec![
@@ -1913,5 +2331,220 @@ mod tests {
         let serialized = serde_json::to_string(&event).unwrap();
         assert!(serialized.contains("intent_updated"));
         assert!(serialized.contains("test goal"));
+    }
+
+    // ===== Issue 3: ValidatedSessionId / ValidatedCoordId newtypes =====
+
+    use super::{EngineError, ValidatedCoordId, ValidatedSessionId};
+
+    fn assert_invalid_session(input: &str, expected_reason_substr: &str) {
+        match ValidatedSessionId::new(input) {
+            Err(EngineError::InvalidSessionId { reason, .. }) => assert!(
+                reason.contains(expected_reason_substr),
+                "expected reason to contain `{}`, got `{}` (input={:?})",
+                expected_reason_substr,
+                reason,
+                input
+            ),
+            Err(other) => panic!("expected InvalidSessionId for {:?}, got {:?}", input, other),
+            Ok(v) => panic!("expected rejection for {:?}, got Ok({})", input, v),
+        }
+    }
+
+    fn assert_invalid_coord(input: &str, expected_reason_substr: &str) {
+        match ValidatedCoordId::new(input) {
+            Err(EngineError::InvalidCoordId { reason, .. }) => assert!(
+                reason.contains(expected_reason_substr),
+                "expected reason to contain `{}`, got `{}` (input={:?})",
+                expected_reason_substr,
+                reason,
+                input
+            ),
+            Err(other) => panic!("expected InvalidCoordId for {:?}, got {:?}", input, other),
+            Ok(v) => panic!("expected rejection for {:?}, got Ok({})", input, v),
+        }
+    }
+
+    #[test]
+    fn validated_session_id_accepts_typical_input() {
+        let v = ValidatedSessionId::new("scrutineer-a").expect("must accept");
+        assert_eq!(v.as_str(), "scrutineer-a");
+        assert_eq!(v.to_string(), "scrutineer-a");
+    }
+
+    #[test]
+    fn validated_session_id_accepts_alphanumeric_and_punct() {
+        // Compound identifiers used in production session names.
+        for ok in [
+            "abc",
+            "a",
+            "A1.b2_c3-d4",
+            "parent.task-1",
+            "0a",
+            "Z_z",
+            "a.b.c",
+            "0-1.2_3",
+        ] {
+            ValidatedSessionId::new(ok)
+                .unwrap_or_else(|e| panic!("expected accept for {:?}, got {:?}", ok, e));
+        }
+    }
+
+    #[test]
+    fn validated_session_id_rejects_empty() {
+        assert_invalid_session("", "empty");
+    }
+
+    #[test]
+    fn validated_session_id_rejects_leading_dot() {
+        assert_invalid_session(".hidden", "leading dot");
+    }
+
+    #[test]
+    fn validated_session_id_rejects_leading_hyphen() {
+        assert_invalid_session("-flag", "leading hyphen");
+    }
+
+    #[test]
+    fn validated_session_id_rejects_path_traversal() {
+        // Both the leading-dot branch and the embedded `/` would
+        // reject this; the constructor catches the leading-dot
+        // branch first, which is fine — the goal is that the input
+        // is never accepted.
+        assert_invalid_session("../etc/passwd", "leading dot");
+    }
+
+    #[test]
+    fn validated_session_id_rejects_shell_metacharacters() {
+        // Spaces, semicolons, and shell special characters all map
+        // to the regex's disallowed-characters branch.
+        for evil in [
+            "foo; rm -rf /",
+            "a b",
+            "a|b",
+            "a&b",
+            "a$b",
+            "a`b",
+            "a\"b",
+            "a'b",
+            "a\\b",
+            "a/b",
+            "a>b",
+            "a<b",
+            "a\nb",
+            "a\tb",
+        ] {
+            assert_invalid_session(evil, "disallowed");
+        }
+    }
+
+    #[test]
+    fn validated_session_id_rejects_overlength() {
+        let s = "a".repeat(256);
+        assert_invalid_session(&s, "exceeds 255");
+        // 255 characters must be accepted (boundary).
+        let s_ok = "a".repeat(255);
+        ValidatedSessionId::new(&s_ok).expect("255-char input must be accepted");
+    }
+
+    #[test]
+    fn validated_session_id_preview_truncates_long_input() {
+        let long_input = format!("{}!", "a".repeat(80));
+        match ValidatedSessionId::new(&long_input) {
+            Err(EngineError::InvalidSessionId { input_preview, .. }) => {
+                // 64 leading chars + literal "..." suffix.
+                assert!(
+                    input_preview.ends_with("..."),
+                    "expected truncation suffix, got {:?}",
+                    input_preview
+                );
+                assert!(
+                    input_preview.len() <= 64 + 3,
+                    "preview must be bounded, got {} chars",
+                    input_preview.len()
+                );
+            }
+            other => panic!("expected InvalidSessionId, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validated_coord_id_accepts_typical_input() {
+        let v = ValidatedCoordId::new("coord-7").expect("must accept");
+        assert_eq!(v.as_str(), "coord-7");
+        assert_eq!(v.to_string(), "coord-7");
+    }
+
+    #[test]
+    fn validated_coord_id_rejects_empty() {
+        assert_invalid_coord("", "empty");
+    }
+
+    #[test]
+    fn validated_coord_id_rejects_leading_dot() {
+        assert_invalid_coord(".hidden", "leading dot");
+    }
+
+    #[test]
+    fn validated_coord_id_rejects_leading_hyphen() {
+        assert_invalid_coord("-flag", "leading hyphen");
+    }
+
+    #[test]
+    fn validated_coord_id_rejects_shell_metacharacters() {
+        for evil in ["foo; rm -rf /", "a b", "a|b", "a/b", "a$b"] {
+            assert_invalid_coord(evil, "disallowed");
+        }
+    }
+
+    #[test]
+    fn validated_coord_id_rejects_overlength() {
+        let s = "a".repeat(256);
+        assert_invalid_coord(&s, "exceeds 255");
+        let s_ok = "a".repeat(255);
+        ValidatedCoordId::new(&s_ok).expect("255-char input must be accepted");
+    }
+
+    // ===== Issue 3: exit-code mapping for new EngineError variants =====
+
+    #[test]
+    fn engine_error_epoch_fence_violation_exit_code_is_65() {
+        let e = EngineError::EpochFenceViolation {
+            child_session_id: "child-1".to_string(),
+            expected: 4,
+            presented: 3,
+        };
+        assert_eq!(e.exit_code(), 65);
+    }
+
+    #[test]
+    fn engine_error_redelegation_cap_exceeded_exit_code_is_75() {
+        let e = EngineError::RedelegationCapExceeded {
+            child_session_id: "child-1".to_string(),
+            cap: 10,
+        };
+        assert_eq!(e.exit_code(), 75);
+    }
+
+    #[test]
+    fn engine_error_state_file_corrupted_exit_code_is_3() {
+        let e = EngineError::StateFileCorrupted("bad".to_string());
+        assert_eq!(e.exit_code(), 3);
+    }
+
+    #[test]
+    fn engine_error_invalid_session_id_exit_code_is_1() {
+        // Not pinned to a sysexit value by the design; defaults to 1.
+        let e = EngineError::InvalidSessionId {
+            reason: "test".to_string(),
+            input_preview: "x".to_string(),
+        };
+        assert_eq!(e.exit_code(), 1);
+    }
+
+    #[test]
+    fn engine_error_default_exit_code_is_1() {
+        let e = EngineError::EmptyLog;
+        assert_eq!(e.exit_code(), 1);
     }
 }

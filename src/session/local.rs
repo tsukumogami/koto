@@ -830,6 +830,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
     }
@@ -1289,6 +1301,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         let events = vec![
             Event {
@@ -1300,6 +1324,7 @@ mod tests {
                     variables: std::collections::HashMap::new(),
                     spawn_entry: None,
                 },
+                idempotency_hash: None,
             },
             Event {
                 seq: 2,
@@ -1311,6 +1336,7 @@ mod tests {
                     condition_type: "initial".to_string(),
                     skip_if_matched: None,
                 },
+                idempotency_hash: None,
             },
         ];
         (header, events)
@@ -1374,6 +1400,18 @@ mod tests {
                     session_id: String::new(),
                     intent: None,
                     template_name: None,
+                    needs_agent: None,
+                    role: None,
+                    inputs: None,
+                    coordinator_of_record: None,
+                    requested_by: None,
+                    assignment_claim: None,
+                    dispatch_epoch: 0,
+                    priority: None,
+                    deadline: None,
+                    retry_count: None,
+                    agent_config: None,
+                    respawn_generation: None,
                 };
                 let events = vec![Event {
                     seq: 1,
@@ -1384,6 +1422,7 @@ mod tests {
                         variables: std::collections::HashMap::new(),
                         spawn_entry: None,
                     },
+                    idempotency_hash: None,
                 }];
                 bar.wait();
                 b.init_state_file("race", header, events)
@@ -1807,6 +1846,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
     }
@@ -1935,6 +1986,18 @@ mod tests {
             session_id: original_session_id.to_string(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
 

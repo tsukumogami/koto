@@ -4,15 +4,42 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::KotoConfig;
+use super::{KotoConfig, RequestStoreConfig};
+
+/// Override values for the `request_store` config block that come from
+/// outside the layered config files. Each `None` means "no override at
+/// this layer", letting `request_store_config()` evaluate the
+/// precedence cascade in one place.
+///
+/// The fields mirror `RequestStoreConfig` one-to-one so a future
+/// operator-tunable dimension can be added by extending both structs
+/// together.
+#[derive(Debug, Default, Clone)]
+pub struct RequestStoreOverrides {
+    pub stale_claim_timeout_seconds: Option<u64>,
+    pub stale_dispatch_timeout_seconds: Option<u64>,
+    pub redelegation_cap: Option<u32>,
+    pub coord_cursor_ttl_days: Option<u32>,
+    pub terminal_index_compact_lines: Option<u64>,
+    pub compact_lock_timeout_seconds: Option<u64>,
+    pub directive_batch_size: Option<u32>,
+    pub respawn_generation_cap: Option<u32>,
+}
 
 /// Load and merge configuration from all sources.
 ///
 /// Precedence (highest to lowest):
-/// 1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+/// 1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+///    `KOTO_REQUEST_STORE_*` for request-store dimensions)
 /// 2. Project config (.koto/config.toml in current directory)
 /// 3. User config (~/.koto/config.toml)
 /// 4. Built-in defaults
+///
+/// The CLI-flag layer (the highest tier of the 5-level cascade) is
+/// applied per-tick in `request_store_config()`, not here --
+/// `load_config()` has no access to per-command argv. Callers that need
+/// a `RequestStoreConfig` resolved against a CLI flag should call
+/// [`request_store_config`] with the base returned here.
 pub fn load_config() -> Result<KotoConfig> {
     let mut config = KotoConfig::default();
     // Apply serde default for backend since Default trait gives empty string.
@@ -43,36 +70,195 @@ pub fn load_config() -> Result<KotoConfig> {
         config.session.cloud.secret_key = Some(val);
     }
 
+    // Layer 3b: KOTO_REQUEST_STORE_* env-var overrides for the
+    // request_store block.
+    apply_request_store_env_overrides(&mut config.request_store);
+
     Ok(config)
 }
 
-/// Load a TOML config file and deserialize it.
-fn load_config_file(path: &Path) -> Result<KotoConfig> {
+/// Resolve `RequestStoreConfig` through the full 5-level precedence
+/// cascade:
+///
+///   CLI flag > env-var > project config > user config > built-in default
+///
+/// `base` is the `RequestStoreConfig` already produced by
+/// [`load_config`] (which has merged the file layers and applied
+/// `KOTO_REQUEST_STORE_*` env-var overrides). `cli` carries the
+/// per-tick CLI-flag overrides; on a `koto next` invocation only
+/// `redelegation_cap` is settable today.
+pub fn request_store_config(
+    base: &RequestStoreConfig,
+    cli: &RequestStoreOverrides,
+) -> RequestStoreConfig {
+    let mut out = base.clone();
+    if let Some(v) = cli.stale_claim_timeout_seconds {
+        out.stale_claim_timeout_seconds = v;
+    }
+    if let Some(v) = cli.stale_dispatch_timeout_seconds {
+        out.stale_dispatch_timeout_seconds = v;
+    }
+    if let Some(v) = cli.redelegation_cap {
+        out.redelegation_cap = v;
+    }
+    if let Some(v) = cli.coord_cursor_ttl_days {
+        out.coord_cursor_ttl_days = v;
+    }
+    if let Some(v) = cli.terminal_index_compact_lines {
+        out.terminal_index_compact_lines = v;
+    }
+    if let Some(v) = cli.compact_lock_timeout_seconds {
+        out.compact_lock_timeout_seconds = v;
+    }
+    if let Some(v) = cli.directive_batch_size {
+        out.directive_batch_size = v;
+    }
+    if let Some(v) = cli.respawn_generation_cap {
+        out.respawn_generation_cap = v;
+    }
+    out
+}
+
+/// Apply `KOTO_REQUEST_STORE_*` env-var overrides to a
+/// `RequestStoreConfig` in place.
+///
+/// Env-var key spellings come from DESIGN-koto-request-store Decision 4.
+/// Unset vars leave the field untouched. Malformed integer values are
+/// silently ignored (matches the existing `AWS_*` env-var behavior).
+fn apply_request_store_env_overrides(rs: &mut RequestStoreConfig) {
+    if let Some(v) = env_parse::<u64>("KOTO_REQUEST_STORE_STALE_CLAIM_TIMEOUT_S") {
+        rs.stale_claim_timeout_seconds = v;
+    }
+    if let Some(v) = env_parse::<u64>("KOTO_REQUEST_STORE_STALE_DISPATCH_TIMEOUT_S") {
+        rs.stale_dispatch_timeout_seconds = v;
+    }
+    if let Some(v) = env_parse::<u32>("KOTO_REQUEST_STORE_REDELEGATION_CAP") {
+        rs.redelegation_cap = v;
+    }
+    if let Some(v) = env_parse::<u32>("KOTO_REQUEST_STORE_COORD_CURSOR_TTL_DAYS") {
+        rs.coord_cursor_ttl_days = v;
+    }
+    if let Some(v) = env_parse::<u64>("KOTO_REQUEST_STORE_TERMINAL_INDEX_COMPACT_LINES") {
+        rs.terminal_index_compact_lines = v;
+    }
+    if let Some(v) = env_parse::<u64>("KOTO_REQUEST_STORE_COMPACT_LOCK_TIMEOUT_S") {
+        rs.compact_lock_timeout_seconds = v;
+    }
+    if let Some(v) = env_parse::<u32>("KOTO_REQUEST_STORE_DIRECTIVE_BATCH_SIZE") {
+        rs.directive_batch_size = v;
+    }
+    if let Some(v) = env_parse::<u32>("KOTO_REQUEST_STORE_RESPAWN_GENERATION_CAP") {
+        rs.respawn_generation_cap = v;
+    }
+}
+
+fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
+    env::var(key).ok().and_then(|v| v.parse::<T>().ok())
+}
+
+/// Load a TOML config file and deserialize it. The request_store block
+/// is parsed separately from `KotoConfig` so we can distinguish "field
+/// present in the source file" from "field defaulted by serde" -- the
+/// merge step only overlays explicitly-set fields onto the target.
+fn load_config_file(path: &Path) -> Result<LoadedConfig> {
     let content = fs::read_to_string(path)?;
     let config: KotoConfig = toml::from_str(&content)?;
-    Ok(config)
+    let raw: toml::Value = content.parse()?;
+    let request_store_keys = raw
+        .as_table()
+        .and_then(|t| t.get("request_store"))
+        .and_then(|v| v.as_table())
+        .map(|t| {
+            t.iter()
+                .filter(|(_, v)| !v.is_table())
+                .map(|(k, _)| k.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let request_store_has_recursion = raw
+        .as_table()
+        .and_then(|t| t.get("request_store"))
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("recursion"))
+        .is_some();
+    Ok(LoadedConfig {
+        config,
+        request_store_keys,
+        request_store_has_recursion,
+    })
 }
 
-/// Merge source config into target. Non-default/non-empty values in source
-/// overwrite target.
-fn merge_config(target: &mut KotoConfig, source: &KotoConfig) {
-    if !source.session.backend.is_empty() {
-        target.session.backend = source.session.backend.clone();
+/// A loaded config plus metadata about which request_store fields the
+/// source file actually set. Drives the layered merge step.
+struct LoadedConfig {
+    config: KotoConfig,
+    request_store_keys: Vec<String>,
+    request_store_has_recursion: bool,
+}
+
+/// Merge source config into target. Non-default/non-empty values in
+/// source overwrite target. For `request_store`, only fields that were
+/// explicitly present in the source file are overlaid (serde defaults
+/// are not "values").
+fn merge_config(target: &mut KotoConfig, source: &LoadedConfig) {
+    if !source.config.session.backend.is_empty() {
+        target.session.backend = source.config.session.backend.clone();
     }
-    if source.session.cloud.endpoint.is_some() {
-        target.session.cloud.endpoint = source.session.cloud.endpoint.clone();
+    if source.config.session.cloud.endpoint.is_some() {
+        target.session.cloud.endpoint = source.config.session.cloud.endpoint.clone();
     }
-    if source.session.cloud.bucket.is_some() {
-        target.session.cloud.bucket = source.session.cloud.bucket.clone();
+    if source.config.session.cloud.bucket.is_some() {
+        target.session.cloud.bucket = source.config.session.cloud.bucket.clone();
     }
-    if source.session.cloud.region.is_some() {
-        target.session.cloud.region = source.session.cloud.region.clone();
+    if source.config.session.cloud.region.is_some() {
+        target.session.cloud.region = source.config.session.cloud.region.clone();
     }
-    if source.session.cloud.access_key.is_some() {
-        target.session.cloud.access_key = source.session.cloud.access_key.clone();
+    if source.config.session.cloud.access_key.is_some() {
+        target.session.cloud.access_key = source.config.session.cloud.access_key.clone();
     }
-    if source.session.cloud.secret_key.is_some() {
-        target.session.cloud.secret_key = source.session.cloud.secret_key.clone();
+    if source.config.session.cloud.secret_key.is_some() {
+        target.session.cloud.secret_key = source.config.session.cloud.secret_key.clone();
+    }
+
+    for key in &source.request_store_keys {
+        match key.as_str() {
+            "stale_claim_timeout_seconds" => {
+                target.request_store.stale_claim_timeout_seconds =
+                    source.config.request_store.stale_claim_timeout_seconds;
+            }
+            "stale_dispatch_timeout_seconds" => {
+                target.request_store.stale_dispatch_timeout_seconds =
+                    source.config.request_store.stale_dispatch_timeout_seconds;
+            }
+            "redelegation_cap" => {
+                target.request_store.redelegation_cap =
+                    source.config.request_store.redelegation_cap;
+            }
+            "coord_cursor_ttl_days" => {
+                target.request_store.coord_cursor_ttl_days =
+                    source.config.request_store.coord_cursor_ttl_days;
+            }
+            "terminal_index_compact_lines" => {
+                target.request_store.terminal_index_compact_lines =
+                    source.config.request_store.terminal_index_compact_lines;
+            }
+            "compact_lock_timeout_seconds" => {
+                target.request_store.compact_lock_timeout_seconds =
+                    source.config.request_store.compact_lock_timeout_seconds;
+            }
+            "directive_batch_size" => {
+                target.request_store.directive_batch_size =
+                    source.config.request_store.directive_batch_size;
+            }
+            "respawn_generation_cap" => {
+                target.request_store.respawn_generation_cap =
+                    source.config.request_store.respawn_generation_cap;
+            }
+            _ => {}
+        }
+    }
+    if source.request_store_has_recursion {
+        target.request_store.recursion = source.config.request_store.recursion.clone();
     }
 }
 
@@ -132,6 +318,27 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// `KOTO_REQUEST_STORE_*` env keys recognized by
+    /// `apply_request_store_env_overrides`. Listed here so tests can
+    /// clear them between runs (env vars are process-global; cargo's
+    /// parallel test runner can leak between unrelated tests).
+    const REQUEST_STORE_ENV_KEYS: &[&str] = &[
+        "KOTO_REQUEST_STORE_STALE_CLAIM_TIMEOUT_S",
+        "KOTO_REQUEST_STORE_STALE_DISPATCH_TIMEOUT_S",
+        "KOTO_REQUEST_STORE_REDELEGATION_CAP",
+        "KOTO_REQUEST_STORE_COORD_CURSOR_TTL_DAYS",
+        "KOTO_REQUEST_STORE_TERMINAL_INDEX_COMPACT_LINES",
+        "KOTO_REQUEST_STORE_COMPACT_LOCK_TIMEOUT_S",
+        "KOTO_REQUEST_STORE_DIRECTIVE_BATCH_SIZE",
+        "KOTO_REQUEST_STORE_RESPAWN_GENERATION_CAP",
+    ];
+
+    fn clear_request_store_env() {
+        for k in REQUEST_STORE_ENV_KEYS {
+            env::remove_var(k);
+        }
+    }
+
     #[test]
     fn test_load_config_defaults() {
         // With no config files, we get defaults.
@@ -143,11 +350,16 @@ mod tests {
         // Clear env vars that would interfere.
         env::remove_var("AWS_ACCESS_KEY_ID");
         env::remove_var("AWS_SECRET_ACCESS_KEY");
+        clear_request_store_env();
 
         let config = load_config().unwrap();
         assert_eq!(config.session.backend, "local");
         assert!(config.session.cloud.endpoint.is_none());
         assert!(config.session.cloud.access_key.is_none());
+        // RequestStoreConfig defaults match Decision 4's table.
+        assert_eq!(config.request_store.redelegation_cap, 3);
+        assert_eq!(config.request_store.stale_claim_timeout_seconds, 600);
+        assert_eq!(config.request_store.terminal_index_compact_lines, 100_000);
     }
 
     #[test]
@@ -155,14 +367,19 @@ mod tests {
         let mut base = KotoConfig::default();
         base.session.backend = "local".to_string();
 
-        let overlay = KotoConfig {
-            session: super::super::SessionConfig {
-                backend: "cloud".to_string(),
-                cloud: super::super::CloudConfig {
-                    bucket: Some("my-bucket".to_string()),
-                    ..Default::default()
+        let overlay = LoadedConfig {
+            config: KotoConfig {
+                session: super::super::SessionConfig {
+                    backend: "cloud".to_string(),
+                    cloud: super::super::CloudConfig {
+                        bucket: Some("my-bucket".to_string()),
+                        ..Default::default()
+                    },
                 },
+                request_store: RequestStoreConfig::default(),
             },
+            request_store_keys: vec![],
+            request_store_has_recursion: false,
         };
 
         merge_config(&mut base, &overlay);
@@ -176,7 +393,11 @@ mod tests {
         base.session.backend = "cloud".to_string();
         base.session.cloud.bucket = Some("existing".to_string());
 
-        let overlay = KotoConfig::default();
+        let overlay = LoadedConfig {
+            config: KotoConfig::default(),
+            request_store_keys: vec![],
+            request_store_has_recursion: false,
+        };
         merge_config(&mut base, &overlay);
 
         // backend stays "cloud" because overlay backend is empty string (Default)

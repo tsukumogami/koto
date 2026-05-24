@@ -15,6 +15,7 @@ pub mod session;
 pub mod task_spawn_error;
 pub mod validate_feed;
 pub mod vars;
+pub mod workspace;
 
 pub use init_child::{init_child_from_parent, TemplateCompileCache};
 pub use task_spawn_error::{SpawnErrorKind, TaskSpawnError};
@@ -133,6 +134,22 @@ pub enum Command {
         /// Optional explanation for why this directed transition was made (only used with --to)
         #[arg(long)]
         rationale: Option<String>,
+
+        /// Per-tick override for request_store.redelegation_cap. Applies only to
+        /// this `koto next` invocation; subsequent ticks resolve the
+        /// cap through the full 5-level cascade (CLI flag > env-var >
+        /// project > user > built-in default).
+        #[arg(long = "redelegation-cap")]
+        redelegation_cap: Option<u32>,
+
+        /// Dispatch epoch the writer is presenting (Issue 13 / PRD R43).
+        /// Required for `--with-data` writes against a CHILD workflow's
+        /// log: the koto CLI validates `presented == header.dispatch_epoch`
+        /// before any persistence call and rejects mismatches with
+        /// `EpochFenceViolation` (exit 65). Parent-workflow ticks
+        /// (`koto next <coord_workflow>`) do NOT require the flag.
+        #[arg(long = "dispatch-epoch")]
+        dispatch_epoch: Option<u32>,
     },
 
     /// Cancel a workflow, preventing further advancement
@@ -215,8 +232,51 @@ pub enum Command {
         subcommand: ConfigCommand,
     },
 
+    /// Workspace-level reclaim and maintenance verbs
+    Workspace {
+        #[command(subcommand)]
+        subcommand: WorkspaceCommand,
+    },
+
     /// Live terminal dashboard showing session hierarchy and state
     Dashboard(DashboardArgs),
+}
+
+/// Subverbs under `koto workspace`.
+#[derive(Subcommand)]
+pub enum WorkspaceCommand {
+    /// Reclaim a workspace tree rooted at a terminal session.
+    ///
+    /// Reads the root header, verifies the workflow reached a terminal
+    /// state (`completed` or `abandoned`), walks descendants via
+    /// `backend.list()` + parent filter, and removes the directories
+    /// after operator confirmation. Symlinked roots are rejected via
+    /// `lstat()` before any directory traversal.
+    Prune {
+        /// Root session id to prune (required).
+        #[arg(long)]
+        root: String,
+
+        /// Print the descendant set and exit 0 without reclaiming.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+
+        /// DANGER: bypasses the terminal-state safety gate. Prunes a
+        /// session tree even if a descendant is currently being
+        /// dispatched. Use only when you know the tree is abandoned
+        /// (e.g., orphan from a crashed run that never reached
+        /// terminal). A force-prune of a live tree corrupts any
+        /// coordinator still holding a claim against it. Combined
+        /// with `--yes`, this flag still triggers a second
+        /// confirmation prompt requiring the literal string
+        /// `force-prune` to proceed.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Arguments for the `koto dashboard` command.
@@ -269,6 +329,62 @@ pub enum ConfigCommand {
 
 #[derive(Subcommand)]
 pub enum SessionCommand {
+    /// Start a child session under `--parent`.
+    ///
+    /// Decision 1's request-store authoring surface: the spawning
+    /// subagent calls `koto session start --parent <p>` and either
+    /// (a) provides `--needs-agent` plus the full
+    /// `--role` / `--template` / `--inputs` companion set to enqueue
+    /// a dispatch request on the new child, or (b) leaves all four
+    /// off to start a plain child session whose header carries no
+    /// dispatch-request marker.
+    ///
+    /// Companion-flag contract (enforced at parse time):
+    ///   --needs-agent set → --role + --template + --inputs ALL required.
+    ///   Any of --role/--template/--inputs/--coordinator-of-record
+    ///     present without --needs-agent → reject naming --needs-agent.
+    Start {
+        /// Name of the new child session.
+        name: String,
+
+        /// Name of the parent workflow this session is a child of.
+        /// Validated via [`ValidatedSessionId`] before any path op.
+        #[arg(long)]
+        parent: String,
+
+        /// Mark this session as awaiting agent dispatch
+        /// (writes `needs_agent = true` to the header).
+        #[arg(long = "needs-agent")]
+        needs_agent: bool,
+
+        /// Role identifier the assigning coordinator should match
+        /// against. Required when `--needs-agent` is set.
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Template name to record in the header. Reuses the existing
+        /// `template_name` field per Decision 1 line 222 (NOT a new
+        /// field). Required when `--needs-agent` is set.
+        #[arg(long)]
+        template: Option<String>,
+
+        /// JSON inputs blob passed to the agent at dispatch time.
+        /// Required when `--needs-agent` is set.
+        ///
+        /// Rejects payloads larger than 1 MiB or with JSON nesting
+        /// deeper than 128 levels (Security Considerations
+        /// defense-in-depth #1).
+        #[arg(long)]
+        inputs: Option<String>,
+
+        /// Coordinator id that owns this request. Defaults to the
+        /// parent's recorded `coordinator_of_record`, falling back to
+        /// the parent's session id when the parent is itself
+        /// pre-request-store. Validated via [`ValidatedCoordId`] before write.
+        #[arg(long = "coordinator-of-record")]
+        coordinator_of_record: Option<String>,
+    },
+
     /// Print the absolute session directory path
     Dir {
         /// Session name
@@ -507,12 +623,13 @@ pub(super) fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
 
 /// Determine the exit code for an engine error by downcasting to EngineError.
 ///
-/// Returns exit code 3 for corrupted state files, and exit code 1 for all
-/// other errors.
+/// Delegates the per-variant mapping to [`EngineError::exit_code`] so the
+/// CLI surface and the engine layer stay in sync. Falls back to exit code
+/// 1 when the underlying error does not downcast to an `EngineError`.
 pub(super) fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
     match err.downcast_ref::<EngineError>() {
-        Some(EngineError::StateFileCorrupted(_)) => EXIT_INFRASTRUCTURE,
-        _ => 1,
+        Some(e) => e.exit_code(),
+        None => 1,
     }
 }
 
@@ -701,16 +818,24 @@ pub(super) fn resolve_with_data_source(
     })
 }
 
-/// Parse a `--with-data` JSON string and check for the reserved `"gates"` key.
+/// Parse a `--with-data` JSON string and check for reserved keys and
+/// reserved request-store audit-event kinds.
 ///
 /// Returns the parsed `Value` on success, or a `NextError` with code
-/// `InvalidSubmission` when the JSON is malformed or contains the reserved key.
-/// This function contains only pure logic; callers are responsible for exiting.
+/// `InvalidSubmission` when the JSON is malformed, contains the
+/// reserved `"gates"` key, or carries a `fields.kind` value that
+/// collides with the request-store audit family (Decision 6 in
+/// DESIGN-koto-request-store): the four reserved literal names or
+/// anything starting with the `request_store.` prefix.
+///
+/// This function contains only pure logic; callers are responsible
+/// for exiting.
 #[cfg(unix)]
 fn validate_with_data_payload(
     data_str: &str,
 ) -> Result<serde_json::Value, crate::cli::next_types::NextError> {
     use crate::cli::next_types::{NextError, NextErrorCode};
+    use crate::engine::audit;
 
     let data: serde_json::Value = serde_json::from_str(data_str).map_err(|e| NextError {
         code: NextErrorCode::InvalidSubmission,
@@ -727,7 +852,43 @@ fn validate_with_data_payload(
         });
     }
 
+    // Reserved-kind gate (Issue 14 / Decision 6). The kind is carried
+    // either at the top level (`{"kind":"..."}`) or nested under
+    // `fields` (`{"fields":{"kind":"..."}}`); both shapes are
+    // valid submission entry points that ultimately land in
+    // EventPayload::EvidenceSubmitted's `fields` map, so both have
+    // to pass the same reservation rule.
+    if let Some(kind) = extract_kind_from_submission(&data) {
+        if audit::is_reserved_kind(kind) {
+            return Err(NextError {
+                code: NextErrorCode::InvalidSubmission,
+                message: format!("reserved audit-event kind: {}", kind),
+                details: vec![],
+            });
+        }
+    }
+
     Ok(data)
+}
+
+/// Inspect a `--with-data` JSON value and pull out the `kind`
+/// discriminator if one is present.
+///
+/// Accepts two payload shapes:
+///   `{"kind": "X", ...}`          — top-level discriminator
+///   `{"fields": {"kind": "X"}, ...}` — nested under `fields`, the
+///                                     shape used internally on
+///                                     `EvidenceSubmitted` events
+///
+/// Returns `None` if neither carries a string `kind`.
+#[cfg(unix)]
+fn extract_kind_from_submission(data: &serde_json::Value) -> Option<&str> {
+    if let Some(s) = data.get("kind").and_then(|v| v.as_str()) {
+        return Some(s);
+    }
+    data.get("fields")
+        .and_then(|v| v.get("kind"))
+        .and_then(|v| v.as_str())
 }
 
 /// Execute a command with polling: run repeatedly, evaluate gates after each
@@ -842,6 +1003,8 @@ pub fn run(app: App) -> Result<()> {
             no_cleanup,
             full,
             rationale,
+            redelegation_cap,
+            dispatch_epoch,
         } => {
             let backend = build_backend()?;
             let context_store: &dyn ContextStore = &backend;
@@ -854,6 +1017,8 @@ pub fn run(app: App) -> Result<()> {
                 no_cleanup,
                 full,
                 rationale,
+                redelegation_cap,
+                dispatch_epoch,
             )
         }
         Command::Cancel { name, cleanup } => {
@@ -922,6 +1087,24 @@ pub fn run(app: App) -> Result<()> {
         Command::Session { subcommand } => {
             let backend = build_backend()?;
             match subcommand {
+                SessionCommand::Start {
+                    name,
+                    parent,
+                    needs_agent,
+                    role,
+                    template,
+                    inputs,
+                    coordinator_of_record,
+                } => session::handle_start(
+                    &backend,
+                    &name,
+                    &parent,
+                    needs_agent,
+                    role.as_deref(),
+                    template.as_deref(),
+                    inputs.as_deref(),
+                    coordinator_of_record.as_deref(),
+                ),
                 SessionCommand::Dir { name } => session::handle_dir(&backend, &name),
                 SessionCommand::List => session::handle_list(&backend),
                 SessionCommand::Cleanup { name } => {
@@ -1154,6 +1337,17 @@ pub fn run(app: App) -> Result<()> {
             }
         }
         Command::Config { subcommand } => handle_config(subcommand),
+        Command::Workspace { subcommand } => {
+            let backend = build_backend()?;
+            match subcommand {
+                WorkspaceCommand::Prune {
+                    root,
+                    dry_run,
+                    yes,
+                    force,
+                } => workspace::handle_prune(&backend, root, dry_run, yes, force),
+            }
+        }
         Command::Dashboard(args) => {
             let backend = build_backend()?;
             dashboard::run(args, &backend)
@@ -1168,6 +1362,7 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
     match subcommand {
         ConfigCommand::Get { key } => {
             let resolved = config::resolve::load_config()?;
+            config::warn_if_request_store_recursion_reserved(&resolved);
             match config::get_value(&resolved, &key) {
                 Some(value) => {
                     println!("{}", value);
@@ -1724,6 +1919,50 @@ fn append_child_completed_to_parent(
     }
 }
 
+/// Issue 8: append a workspace-wide terminal-index entry for `session_id`
+/// just before session cleanup.
+///
+/// Classifies the terminal state as `"abandoned"` when the events log
+/// carries a `WorkflowCancelled` event, otherwise `"completed"`. Stats
+/// the on-disk header for `header_mtime_ns`. Best-effort: a failure
+/// logs a warning and falls through to cleanup — the next discovery
+/// scan re-reads the header per the header-is-truth rule.
+fn append_terminal_index_for_session(
+    backend: &dyn SessionBackend,
+    session_id: &str,
+    events: &[crate::engine::types::Event],
+) {
+    let terminal_state = if events
+        .iter()
+        .any(|e| matches!(e.payload, EventPayload::WorkflowCancelled { .. }))
+    {
+        "abandoned"
+    } else {
+        "completed"
+    };
+
+    let Some(home) = dirs::home_dir() else {
+        eprintln!("warning: terminal-index append skipped: no home directory");
+        return;
+    };
+    let koto_root = home.join(".koto");
+    let state_path = backend
+        .session_dir(session_id)
+        .join(crate::session::state_file_name(session_id));
+
+    if let Err(e) = crate::engine::terminal_index::append_terminal_index(
+        &koto_root,
+        session_id,
+        terminal_state,
+        &state_path,
+    ) {
+        eprintln!(
+            "warning: terminal-index append failed for {}: {}",
+            session_id, e
+        );
+    }
+}
+
 /// Handle the `koto next` command with full output contract support.
 ///
 /// Flow:
@@ -1758,6 +1997,8 @@ fn handle_next(
     no_cleanup: bool,
     full: bool,
     rationale: Option<String>,
+    redelegation_cap: Option<u32>,
+    dispatch_epoch: Option<u32>,
 ) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
@@ -1774,6 +2015,127 @@ fn handle_next(
     use crate::gate::evaluate_gates;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+
+    // Resolve request-store operator config through the full 5-level
+    // cascade, applying the per-tick `--redelegation-cap` CLI flag (if
+    // any) on top of the file+env layers already merged by
+    // load_config(). Emit the `[request_store.recursion]`
+    // reserved-namespace warning at startup.
+    let request_store_cfg = {
+        let base = crate::config::resolve::load_config().unwrap_or_default();
+        crate::config::warn_if_request_store_recursion_reserved(&base);
+        let cli_overrides = crate::config::resolve::RequestStoreOverrides {
+            redelegation_cap,
+            ..Default::default()
+        };
+        crate::config::resolve::request_store_config(&base.request_store, &cli_overrides)
+    };
+
+    // Issue 7: cursor GC fires on every coordinator tick boot so
+    // abandoned coordinators' cursor state is reclaimed eventually.
+    // The walk is bounded by coordinator count (not session count) and
+    // tolerates a missing coordinators/ directory.
+    //
+    // Issue 9: terminal-index compaction stale-lock recovery + threshold
+    // gating run here too. The recovery walk reclaims a foreign lock
+    // whose `started_at` is past timeout (cleaning up after a crashed
+    // peer-coord compaction); the threshold check runs compaction
+    // when the index grew above `request_store.terminal_index_compact_lines`.
+    // Both are best-effort: a failure logs a warning and the tick
+    // proceeds. The current workflow's session id doubles as the
+    // coord_id, matching the Issue 7 wiring at the scan call site.
+    if let Some(home) = dirs::home_dir() {
+        let koto_root = home.join(".koto");
+        if let Err(e) = crate::engine::discovery::gc_stale_cursors(&koto_root, &request_store_cfg) {
+            eprintln!("warning: cursor GC failed at koto next startup: {}", e);
+        }
+        if let Err(e) = crate::engine::terminal_index::recover_stale_compact_lock(
+            &koto_root,
+            &name,
+            &request_store_cfg,
+        ) {
+            eprintln!(
+                "warning: compact-lock recovery failed at koto next startup: {}",
+                e
+            );
+        }
+        match crate::engine::terminal_index::maybe_compact_terminal_index(
+            &koto_root,
+            &name,
+            &request_store_cfg,
+        ) {
+            Ok(crate::engine::terminal_index::CompactionOutcome::Compacted {
+                lines_before,
+                lines_after,
+            }) => {
+                eprintln!(
+                    "info: terminal-index compacted ({} -> {} lines)",
+                    lines_before, lines_after
+                );
+            }
+            Ok(crate::engine::terminal_index::CompactionOutcome::Failed { error }) => {
+                eprintln!("warning: terminal-index compaction failed: {}", error);
+            }
+            Ok(crate::engine::terminal_index::CompactionOutcome::Skipped { .. }) => {
+                // Skipped is the steady-state common case (below
+                // threshold or peer holds the lease); silent.
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: terminal-index compaction threshold check failed: {}",
+                    e
+                );
+            }
+        }
+
+        // Issue 15: wake-candidates pass + age-and-activity recovery.
+        // Walks the coordinator's own session log for ChildDispatched
+        // events whose corresponding child reached terminal AND has no
+        // matching RequesterWoken yet; emits a RequesterWoken event
+        // covering each batch, runs the 3-point fsync sequence, invokes
+        // the substrate-wake primitive (stubbed via LoggingWaker until
+        // a concrete substrate ships), and unlinks the child's claim
+        // sidecar. The pass is O(open-dispatches), not O(workspace).
+        //
+        // Order: cursor GC → compact-recovery → maybe-compact →
+        // wake-candidates. Wake runs BEFORE the discovery scan (which
+        // happens later in the function) so a terminal child's wake
+        // emission and its parent's directive build observe consistent
+        // state.
+        let coord_state_path = koto_root
+            .join("sessions")
+            .join(&name)
+            .join(crate::session::state_file_name(&name));
+        if coord_state_path.exists() {
+            let sessions_dir = koto_root.join("sessions");
+            let stale_dispatch_timeout =
+                std::time::Duration::from_secs(request_store_cfg.stale_dispatch_timeout_seconds);
+            let waker = crate::engine::wake::LoggingWaker;
+            match crate::engine::wake::wake_candidates_pass(
+                &koto_root,
+                &sessions_dir,
+                &coord_state_path,
+                &waker,
+                stale_dispatch_timeout,
+                std::time::SystemTime::now(),
+            ) {
+                Ok(outcome) => {
+                    if outcome.events_emitted > 0 || outcome.recoveries_fired > 0 {
+                        eprintln!(
+                            "info: wake-candidates pass — {} event(s), {} wake(s), {} sidecar(s) released, {} recoveries",
+                            outcome.events_emitted,
+                            outcome.wakes_invoked,
+                            outcome.sidecars_released,
+                            outcome.recoveries_fired,
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: wake-candidates pass failed: {}", e);
+                }
+            }
+        }
+    }
 
     // 1. Mutual exclusivity check
     if with_data.is_some() && to.is_some() {
@@ -1863,6 +2225,50 @@ fn handle_next(
         };
         let json = serde_json::json!({"error": err});
         exit_with_error_code(json, err.code.exit_code());
+    }
+
+    // Detect the unclaimed-needs-agent case BEFORE derive_machine_state.
+    //
+    // A needs-agent child created via `koto session start --needs-agent
+    // ...` writes a header with `needs_agent = Some(true)` and a
+    // `WorkflowInitialized` event whose `template_path` is empty (the
+    // template is materialized later by the dispatching coordinator,
+    // not at session-start time — see `cli/session.rs::handle_start`).
+    // Until the coordinator claims and dispatches the child via the
+    // request-store protocol, `koto next <child>` cannot make progress:
+    // there is no template to read, no state to derive, no work to do.
+    //
+    // Pre-fix the path fell through to `derive_machine_state`, which
+    // returned `None` because the `WorkflowInitialized.template_path`
+    // was empty, and the caller surfaced "corrupt state file: cannot
+    // derive current state". That message blamed the session for a
+    // condition the operator can fix from the OUTSIDE (route through
+    // the coordinator's `koto next` on the parent root). Now we
+    // surface a typed error with exit code 66 (EX_NOINPUT) so callers
+    // can pattern-match and route operators to the right next step.
+    let is_unclaimed_needs_agent = header.needs_agent == Some(true)
+        && header.assignment_claim.is_none()
+        && events.iter().any(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::WorkflowInitialized { template_path, .. } if template_path.is_empty()
+            )
+        });
+    if is_unclaimed_needs_agent {
+        let json = serde_json::json!({
+            "error": {
+                "code": "needs_agent_not_dispatched",
+                "message": format!(
+                    "session '{}' is in needs-agent state and has not been claimed/dispatched yet; \
+                     the coordinator must claim and dispatch this session via the request-store \
+                     protocol before it can be ticked directly. Run `koto next` against the \
+                     parent coordinator workflow instead.",
+                    name
+                ),
+                "details": [],
+            }
+        });
+        exit_with_error_code(json, 66);
     }
 
     // Construct variable bindings from the WorkflowInitialized event.
@@ -2045,6 +2451,14 @@ fn handle_next(
                 } = &resp
                 {
                     if !no_cleanup {
+                        // Issue 8: append the terminal-index entry BEFORE
+                        // session cleanup so the workspace skip-list
+                        // observes the terminal transition. Best-effort
+                        // — a write failure here logs a warning and
+                        // falls through to cleanup; the next discovery
+                        // scan will read the header directly per the
+                        // header-is-truth rule.
+                        append_terminal_index_for_session(backend, &name, &events);
                         // Issue #134: emit ChildCompleted to parent BEFORE
                         // cleanup so the batch gate can observe outcomes
                         // for children that auto-clean on terminal. When
@@ -2089,6 +2503,66 @@ fn handle_next(
             exit_with_error_code(json, ne.code.exit_code());
         }
     };
+
+    // Issue 13: epoch fence on CHILD-log writes. The fence applies
+    // ONLY to `--with-data` writes against a child workflow's log
+    // (header.parent_workflow.is_some()). Coordinator-side ticks
+    // against the parent workflow's own log are NOT under the fence
+    // per R43's wording ("every writer to a CHILD'S log"). The check
+    // fires BEFORE any persistence write so an on-mismatch rejection
+    // never leaves partial state on disk.
+    //
+    // A missing `--dispatch-epoch` flag on a child-log write is an
+    // implicit mismatch: a writer that does not present an epoch is
+    // rejected as if it had presented the wrong epoch. The
+    // SubagentStop hook (Issue 16's spawn helper) bakes the epoch at
+    // spawn time and threads it through; a hook that omits the flag
+    // is a bug, and the fence surfaces it.
+    if with_data.is_some() && crate::engine::epoch::fence_applies_to(&header) {
+        let child_sid = match crate::engine::types::ValidatedSessionId::new(&name) {
+            Ok(v) => v,
+            Err(e) => {
+                // ValidatedSessionId::new returns EngineError::InvalidSessionId,
+                // which has its own exit code (1). Defer to it.
+                let code = e.exit_code();
+                exit_with_error_code(
+                    serde_json::json!({
+                        "error": format!("{}", e),
+                        "command": "next"
+                    }),
+                    code,
+                );
+            }
+        };
+        if let Err(e) = crate::engine::epoch::validate_epoch(&child_sid, &header, dispatch_epoch) {
+            // EpochFenceViolation maps to exit 65 (EX_DATAERR) via
+            // EngineError::exit_code. Use the typed envelope so
+            // operators reading the error see the fence-mismatch
+            // shape and can program against it.
+            let code = e.exit_code();
+            let (expected, presented) = match &e {
+                EngineError::EpochFenceViolation {
+                    expected,
+                    presented,
+                    ..
+                } => (*expected, *presented),
+                _ => unreachable!("validate_epoch returns EpochFenceViolation only"),
+            };
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": {
+                        "code": "epoch_fence_violation",
+                        "message": format!("{}", e),
+                        "child_session_id": name,
+                        "expected_dispatch_epoch": expected,
+                        "presented_dispatch_epoch": presented,
+                    },
+                    "command": "next"
+                }),
+                code,
+            );
+        }
+    }
 
     // 5. Handle --with-data (evidence submission)
     if let Some(ref data_str) = with_data {
@@ -2618,10 +3092,34 @@ fn handle_next(
                 }
             };
 
+            // Issue 7: run the discovery scan once per tick. The
+            // workflow being ticked IS the coordinator's own workflow,
+            // so its session id doubles as the coord_id for the cursor
+            // file and the candidate filter. A scan error is non-fatal
+            // — the directive still ships, just without populated
+            // `unassigned_children`. An invalid coord_id (workspace id
+            // that doesn't pass ValidatedCoordId's regex) is also
+            // non-fatal: scan returns empty.
+            let unassigned_children: Vec<crate::cli::next_types::UnassignedChild> = (|| {
+                let home = dirs::home_dir()?;
+                let koto_root = home.join(".koto");
+                let coord_id = crate::engine::types::ValidatedCoordId::new(&name).ok()?;
+                match crate::engine::discovery::scan(&koto_root, &coord_id, &request_store_cfg) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        eprintln!("warning: discovery scan failed: {}", e);
+                        None
+                    }
+                }
+            })(
+            )
+            .unwrap_or_default();
+
             let resp = match advance_result.stop_reason {
                 StopReason::Terminal => NextResponse::Terminal {
                     state: final_state.clone(),
                     advanced,
+                    unassigned_children: unassigned_children.clone(),
                 },
                 StopReason::GateBlocked(gate_results) => {
                     let blocking =
@@ -2632,6 +3130,7 @@ fn handle_next(
                         details: details.clone(),
                         advanced,
                         blocking_conditions: blocking,
+                        unassigned_children: unassigned_children.clone(),
                     }
                 }
                 StopReason::EvidenceRequired { failed_gates } => {
@@ -2653,6 +3152,7 @@ fn handle_next(
                         advanced,
                         expects: es,
                         blocking_conditions: blocking,
+                        unassigned_children: unassigned_children.clone(),
                     }
                 }
                 StopReason::UnresolvableTransition => {
@@ -2675,6 +3175,7 @@ fn handle_next(
                     advanced,
                     expects,
                     integration: IntegrationOutput { name, output },
+                    unassigned_children: unassigned_children.clone(),
                 },
                 StopReason::IntegrationUnavailable { name } => {
                     NextResponse::IntegrationUnavailable {
@@ -2687,6 +3188,7 @@ fn handle_next(
                             name,
                             available: false,
                         },
+                        unassigned_children: unassigned_children.clone(),
                     }
                 }
                 StopReason::ActionRequiresConfirmation {
@@ -2710,6 +3212,7 @@ fn handle_next(
                         stderr,
                     },
                     expects,
+                    unassigned_children: unassigned_children.clone(),
                 },
                 StopReason::CycleDetected { state: cycle_state } => {
                     // Cycle is a template bug; report as an error.
@@ -2740,6 +3243,7 @@ fn handle_next(
                         NextResponse::Terminal {
                             state: final_state.clone(),
                             advanced,
+                            unassigned_children: unassigned_children.clone(),
                         }
                     } else if let Some(ref es) = expects {
                         NextResponse::EvidenceRequired {
@@ -2749,6 +3253,7 @@ fn handle_next(
                             advanced,
                             expects: es.clone(),
                             blocking_conditions: vec![],
+                            unassigned_children: unassigned_children.clone(),
                         }
                     } else {
                         NextResponse::EvidenceRequired {
@@ -2762,6 +3267,7 @@ fn handle_next(
                                 options: vec![],
                             },
                             blocking_conditions: vec![],
+                            unassigned_children: unassigned_children.clone(),
                         }
                     }
                 }
@@ -3022,6 +3528,17 @@ fn handle_next(
             } = &resp
             {
                 if !no_cleanup {
+                    // Issue 8: append terminal-index entry BEFORE cleanup
+                    // so the workspace skip-list observes the terminal
+                    // transition. Re-read the events so a mid-tick
+                    // WorkflowCancelled is reflected in the classifier.
+                    // Best-effort: a failure logs a warning, doesn't
+                    // block cleanup.
+                    if let Ok((_, post_events)) = backend.read_events(&name) {
+                        append_terminal_index_for_session(backend, &name, &post_events);
+                    } else {
+                        append_terminal_index_for_session(backend, &name, &[]);
+                    }
                     // Issue #134: emit ChildCompleted to parent BEFORE
                     // cleanup so the batch gate can observe outcomes for
                     // children that auto-clean on terminal. When the
@@ -3073,6 +3590,8 @@ fn handle_next(
     _no_cleanup: bool,
     _full: bool,
     _rationale: Option<String>,
+    _redelegation_cap: Option<u32>,
+    _dispatch_epoch: Option<u32>,
 ) -> Result<()> {
     exit_with_error_code(
         serde_json::json!({
@@ -4060,5 +4579,90 @@ mod tests {
             "error message should mention 'reserved': {}",
             err.message
         );
+    }
+
+    // ----- Issue 14: reserved audit-event kind rejection (Decision 6) -----
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_rejects_all_four_reserved_literal_kinds() {
+        use crate::cli::next_types::NextErrorCode;
+        use crate::engine::audit::RESERVED_KINDS;
+
+        for kind in RESERVED_KINDS {
+            // Top-level discriminator shape.
+            let payload = format!(r#"{{"kind":"{}"}}"#, kind);
+            let err = validate_with_data_payload(&payload)
+                .expect_err("must reject reserved kind at parse time");
+            assert_eq!(err.code, NextErrorCode::InvalidSubmission);
+            assert!(
+                err.message.contains("reserved audit-event kind"),
+                "expected reserved-kind error, got: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(kind),
+                "error must name the offending kind {}, got: {}",
+                kind,
+                err.message
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_rejects_nested_reserved_kinds() {
+        use crate::engine::audit::CHILD_DISPATCHED;
+        // EvidenceSubmitted-shaped payload with `kind` inside `fields`.
+        let payload = format!(r#"{{"fields":{{"kind":"{}"}}}}"#, CHILD_DISPATCHED);
+        let err = validate_with_data_payload(&payload).expect_err("must reject nested kind");
+        assert!(err.message.contains("reserved audit-event kind"));
+        assert!(err.message.contains(CHILD_DISPATCHED));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_rejects_request_store_prefix() {
+        for kind in [
+            "request_store.foo",
+            "request_store.",
+            "request_store.deep.kind",
+        ] {
+            let payload = format!(r#"{{"kind":"{}"}}"#, kind);
+            let err = validate_with_data_payload(&payload)
+                .expect_err("must reject request_store.* prefix");
+            assert!(err.message.contains("reserved audit-event kind"));
+            assert!(err.message.contains(kind));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_accepts_template_author_kinds() {
+        // Any kind that is neither a reserved literal nor
+        // request_store.-prefixed must land on disk untouched. Verifying
+        // via the parser is enough — `handle_next`'s downstream
+        // persistence test coverage is provided elsewhere.
+        for ok in [
+            "verdict",
+            "review",
+            "scrutineer",
+            "request",
+            "request_storefoo",
+        ] {
+            let payload = format!(r#"{{"kind":"{}","note":"x"}}"#, ok);
+            let v = validate_with_data_payload(&payload).expect("must accept");
+            assert_eq!(v["kind"], serde_json::json!(ok));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_accepts_payload_without_kind() {
+        // Payloads that don't carry a `kind` at all are unaffected by
+        // the reserved-kind gate (they hit the existing schema-side
+        // validation downstream).
+        let v = validate_with_data_payload(r#"{"note":"hello"}"#).expect("must accept");
+        assert_eq!(v["note"], serde_json::json!("hello"));
     }
 }

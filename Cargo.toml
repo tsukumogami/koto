@@ -1,6 +1,19 @@
+[workspace]
+# Issue 20: register the external-consumer fixture crate as a
+# workspace member so `cargo test -p koto-stability-tests` resolves
+# the koto dependency via `path = ".."`. The koto crate itself
+# remains the workspace root package (this is a hybrid layout —
+# `[package]` below + `[workspace]` here).
+members = ["koto-stability-tests"]
+
 [package]
 name = "koto"
-version = "0.9.1-dev"
+# Issue 20: MAJOR bump from 0.9.1-dev → 0.10.0 marks the
+# Stage 1 stability lockdown release. Per koto's 0.x semver
+# discipline, MINOR is treated as MAJOR (Cargo convention for
+# pre-1.0 crates). See CHANGELOG.md for the release notes and
+# docs/STABILITY.md for the bump protocol.
+version = "0.10.0"
 edition = "2021"
 description = "Workflow orchestration engine for AI coding agents"
 license = "MIT"
@@ -37,8 +50,29 @@ wait-timeout = "0.2"
 [dev-dependencies]
 assert_cmd = "2"
 assert_fs = "1"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+filetime = "0.2"
 predicates = "3.1.4"
 tempfile = "3"
+
+# Issue 10: criterion bench harness for the discovery scan.
+# `harness = false` lets the bench provide its own `main()` (criterion's
+# default macro). The custom main reports thresholds AFTER criterion's
+# measurement so a regression fails CI on a non-zero exit (see
+# `benches/discovery_scan.rs`).
+[[bench]]
+name = "discovery_scan"
+harness = false
+
+# Issue 17: criterion bench harness for the recursion-cap validator.
+# Hard-gates the 26k workspace / 100 open sessions case at 30 ms p95
+# (AD3.3 perf-cliff avoidance). Unlike Issue 10's bench (soft-by-
+# default), this one fails CI on a breach because the
+# terminal-index filter is supposed to make it fast — a slow result
+# means the filter is misimplemented.
+[[bench]]
+name = "recursion_caps"
+harness = false
 
 [features]
 cloud-integration-tests = []

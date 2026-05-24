@@ -49,7 +49,9 @@ use crate::cli::task_spawn_error::TaskSpawnError;
 use crate::engine::batch_validation::TaskEntry;
 use crate::engine::persistence::derive_state_from_log;
 use crate::engine::scheduler_warning::SchedulerWarning;
-use crate::engine::types::{Event, EventPayload, SpawnEntrySnapshot, TerminalOutcome};
+use crate::engine::types::{
+    ChildSnapshot, Event, EventPayload, SpawnEntrySnapshot, TerminalOutcome,
+};
 use crate::session::SessionBackend;
 use crate::template::types::{CompiledTemplate, FailurePolicy, MaterializeChildrenSpec};
 
@@ -527,28 +529,6 @@ impl TaskClassification {
             TaskClassification::Skipped => TaskOutcome::Skipped,
         }
     }
-}
-
-/// Snapshot of a child state file that `classify_task` needs to
-/// determine the child's `TaskOutcome`. Built once per tick by the
-/// scheduler and looked up by short task name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ChildSnapshot {
-    /// Current state name as derived from the event log.
-    pub current_state: String,
-    /// Whether the current state is terminal, per the child's own
-    /// compiled template.
-    pub terminal: bool,
-    /// Whether the current state has `failure: true`.
-    pub failure: bool,
-    /// Whether the current state has `skipped_marker: true`.
-    pub skipped_marker: bool,
-    /// `spawn_entry` recorded on the child's `WorkflowInitialized`
-    /// event, when present. Issue #12 does not yet consume this
-    /// (no R8 runtime check); later issues use it for rename
-    /// detection and respawn-entry comparison.
-    #[allow(dead_code)]
-    pub spawn_entry: Option<SpawnEntrySnapshot>,
 }
 
 /// Classify a single task.
@@ -3756,6 +3736,7 @@ mod tests {
                 },
                 timestamp: "2026-04-14T00:00:00Z".to_string(),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(
@@ -3831,6 +3812,7 @@ mod tests {
                 timestamp: ts.to_string(),
                 superseded_by: None,
             },
+            idempotency_hash: None,
         }
     }
 
@@ -3849,6 +3831,7 @@ mod tests {
                 fields,
                 submitter_cwd: None,
             },
+            idempotency_hash: None,
         }
     }
 
@@ -4020,6 +4003,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
     }
@@ -4132,6 +4127,18 @@ mod tests {
             session_id: String::new(),
             intent: None,
             template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
         // Append a WorkflowInitialized event so the file is
@@ -4245,6 +4252,7 @@ mod tests {
                 outcome,
                 final_state: final_state.to_string(),
             },
+            idempotency_hash: None,
         }
     }
 
@@ -4368,6 +4376,7 @@ mod tests {
                 outcome: TerminalOutcome::Success,
                 final_state: "done".to_string(),
             },
+            idempotency_hash: None,
         };
         let json = serde_json::to_string(&ev).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4393,6 +4402,7 @@ mod tests {
                 condition_type: "gate".to_string(),
                 skip_if_matched: None,
             },
+            idempotency_hash: None,
         }];
         assert_eq!(last_rewind_seq(&events), None);
     }
@@ -4410,6 +4420,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                 },
+                idempotency_hash: None,
             },
             Event {
                 seq: 2,
@@ -4420,6 +4431,7 @@ mod tests {
                     to: "a".to_string(),
                     rationale: None,
                 },
+                idempotency_hash: None,
             },
             Event {
                 seq: 3,
@@ -4431,6 +4443,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                 },
+                idempotency_hash: None,
             },
             Event {
                 seq: 4,
@@ -4441,6 +4454,7 @@ mod tests {
                     to: "a".to_string(),
                     rationale: None,
                 },
+                idempotency_hash: None,
             },
         ];
         assert_eq!(last_rewind_seq(&events), Some(4));
