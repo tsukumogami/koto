@@ -1,0 +1,437 @@
+//! `koto workspace prune` -- operator-facing workspace reclaim verb.
+//!
+//! Reads the root header, validates the workflow has reached a terminal
+//! state (`completed` or `abandoned`), walks descendants via
+//! `backend.list()` + parent filter, and reclaims after operator
+//! confirmation. Symlinked roots reject via `lstat()` before any
+//! directory traversal; `fs::remove_dir_all` (the underlying reclaim
+//! primitive) does not follow symlinks inside the descendant tree, so
+//! a symlink whose target lives outside `~/.koto/` cannot be removed
+//! through this verb.
+//!
+//! The verb intentionally does NOT consult `coordinator_of_record`:
+//! KT1 workspaces can be pruned by any operator regardless of which
+//! coordinator (if any) is currently dispatching to the tree (Decision
+//! 4 line 578). It also does NOT mutate
+//! `~/.koto/_terminal_index.jsonl` -- Issue 9 owns terminal-index
+//! compaction.
+//!
+//! TODO(issue-3): switch the `--root` validator to `ValidatedSessionId::new`
+//! once Issue 3 lands. The current site reuses `validate_session_id()`
+//! from `src/session/validate.rs` which already implements the same
+//! character allowlist; the refactor is type-signature only.
+
+use std::io::{self, Write};
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use serde_json::json;
+
+use crate::engine::persistence::derive_machine_state;
+use crate::engine::types::{EventPayload, StateFileHeader};
+use crate::session::{validate::validate_session_id, SessionBackend, SessionInfo};
+use crate::template::types::CompiledTemplate;
+
+use super::exit_with_error_code;
+
+/// Outcome of the terminal-state gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalStatus {
+    /// Workflow reached a terminal state in the compiled template.
+    Completed,
+    /// Workflow was cancelled (a `WorkflowCancelled` event is in the log).
+    Abandoned,
+    /// Workflow has not reached a terminal state; the variant carries
+    /// the derived current state name for operator-facing messaging.
+    NonTerminal { current_state: String },
+}
+
+impl TerminalStatus {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Abandoned)
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Completed => "completed".to_string(),
+            Self::Abandoned => "abandoned".to_string(),
+            Self::NonTerminal { current_state } => {
+                format!("not terminal (current state: {})", current_state)
+            }
+        }
+    }
+}
+
+/// Handle `koto workspace prune --root <id> [--dry-run] [--yes] [--force]`.
+///
+/// Returns on success; on caller errors (invalid root, non-terminal
+/// without `--force`, symlinked root, declined confirmation) calls
+/// `exit_with_error_code` and never returns.
+pub fn handle_prune(
+    backend: &dyn SessionBackend,
+    root: String,
+    dry_run: bool,
+    yes: bool,
+    force: bool,
+) -> Result<()> {
+    // 1. Parse-time validation. Reject injection attempts before any
+    //    filesystem operation.
+    if let Err(e) = validate_session_id(&root) {
+        exit_with_error_code(
+            json!({
+                "error": format!("invalid --root: {}", e),
+                "command": "workspace prune",
+            }),
+            2,
+        );
+    }
+
+    // 2. Symlink refusal: `lstat()` the root session directory BEFORE
+    //    opening anything. A symlinked root is a workspace-escape
+    //    vector and must be rejected categorically.
+    let root_dir = backend.session_dir(&root);
+    reject_if_symlink(&root_dir);
+
+    // 3. Existence check. Operator may have typoed the id.
+    if !backend.exists(&root) {
+        exit_with_error_code(
+            json!({
+                "error": format!("session '{}' not found", root),
+                "command": "workspace prune",
+            }),
+            2,
+        );
+    }
+
+    // 4. Read header + events; derive terminal status.
+    let (header, events) = backend
+        .read_events(&root)
+        .map_err(|e| anyhow::anyhow!("failed to read state file for '{}': {}", root, e))?;
+    let status = derive_terminal_status(&header, &events)?;
+
+    // 5. Terminal-state gate.
+    if !status.is_terminal() && !force {
+        exit_with_error_code(
+            json!({
+                "error": format!(
+                    "session '{}' is {}; use --force to prune anyway",
+                    root,
+                    status.describe()
+                ),
+                "command": "workspace prune",
+            }),
+            2,
+        );
+    }
+
+    // 6. Enumerate descendants via backend.list() + parent filter.
+    //    Includes transitive descendants (BFS).
+    let all_sessions = backend
+        .list()
+        .with_context(|| "failed to list sessions for descendant walk")?;
+    let descendants = collect_descendants(&root, &all_sessions);
+
+    // 7. Compute non-terminal sessions in the to-be-pruned set. Operator
+    //    visibility before any confirmation prompt.
+    let non_terminal_in_set = non_terminal_sessions(
+        backend,
+        std::iter::once(root.as_str()).chain(descendants.iter().map(String::as_str)),
+    );
+
+    // 8. Print preview (descendant set + non-terminal warnings).
+    print_preview(&root, &descendants, &non_terminal_in_set, &status);
+
+    // 9. Dry-run exits 0 here without reclaiming.
+    if dry_run {
+        return Ok(());
+    }
+
+    // 10. Confirmation prompt. `--yes` skips. Issue 18 will plumb
+    //     `KOTO_KT1_PRUNE_CONFIRM=1` as another bypass through this
+    //     same `prompt_required` parameter.
+    let prompt_required = !yes;
+    if !confirm_prune(prompt_required)? {
+        exit_with_error_code(
+            json!({
+                "error": "prune aborted by operator",
+                "command": "workspace prune",
+            }),
+            2,
+        );
+    }
+
+    // 11. Reclaim. Descendants first so a partial failure leaves the
+    //     root visible in `koto workflows`.
+    for id in &descendants {
+        backend
+            .cleanup(id)
+            .with_context(|| format!("failed to remove descendant session '{}'", id))?;
+    }
+    backend
+        .cleanup(&root)
+        .with_context(|| format!("failed to remove root session '{}'", root))?;
+
+    println!(
+        "{}",
+        json!({
+            "name": root,
+            "pruned": true,
+            "descendants_removed": descendants.len(),
+        })
+    );
+
+    Ok(())
+}
+
+/// `lstat()` the candidate path; if it is a symlink, reject with a
+/// clear error. This catches both an attacker-crafted root pointing
+/// outside `~/.koto/` and the legitimate-but-disallowed case of an
+/// operator symlinking a session directory into the workspace.
+fn reject_if_symlink(path: &Path) {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            exit_with_error_code(
+                json!({
+                    "error": format!(
+                        "symlink not permitted: {}",
+                        path.display()
+                    ),
+                    "command": "workspace prune",
+                }),
+                2,
+            );
+        }
+        // Path doesn't exist yet: that's caller-error, surfaced below
+        // by the `backend.exists()` check. Other I/O errors are surfaced
+        // there too.
+        _ => {}
+    }
+}
+
+/// Walk events + header to determine whether the root has reached a
+/// terminal state. `WorkflowCancelled` events take precedence (the
+/// workflow was explicitly aborted); otherwise compare the derived
+/// current state against the compiled template's `terminal` flag.
+fn derive_terminal_status(
+    header: &StateFileHeader,
+    events: &[crate::engine::types::Event],
+) -> Result<TerminalStatus> {
+    if events
+        .iter()
+        .any(|e| matches!(e.payload, EventPayload::WorkflowCancelled { .. }))
+    {
+        return Ok(TerminalStatus::Abandoned);
+    }
+
+    let machine_state = derive_machine_state(header, events).ok_or_else(|| {
+        anyhow::anyhow!(
+            "corrupt state file: cannot derive current state for header.workflow={}",
+            header.workflow
+        )
+    })?;
+
+    let template_bytes = std::fs::read(&machine_state.template_path)
+        .with_context(|| format!("failed to read template at {}", machine_state.template_path))?;
+    let compiled: CompiledTemplate =
+        serde_json::from_slice(&template_bytes).with_context(|| {
+            format!(
+                "failed to parse template at {}",
+                machine_state.template_path
+            )
+        })?;
+
+    let is_terminal = compiled
+        .states
+        .get(&machine_state.current_state)
+        .is_some_and(|s| s.terminal);
+    if is_terminal {
+        Ok(TerminalStatus::Completed)
+    } else {
+        Ok(TerminalStatus::NonTerminal {
+            current_state: machine_state.current_state,
+        })
+    }
+}
+
+/// BFS over `SessionInfo.parent_workflow` to collect every transitive
+/// descendant of `root`. Result is in BFS order (children before
+/// grandchildren), which is also the safe removal order: leaves last
+/// would mean a failed removal mid-tree leaves orphaned children
+/// pointing at a removed parent.
+fn collect_descendants(root: &str, sessions: &[SessionInfo]) -> Vec<String> {
+    let mut descendants = Vec::new();
+    let mut frontier: Vec<String> = vec![root.to_string()];
+    while let Some(parent) = frontier.pop() {
+        for s in sessions {
+            if s.parent_workflow.as_deref() == Some(parent.as_str()) {
+                descendants.push(s.id.clone());
+                frontier.push(s.id.clone());
+            }
+        }
+    }
+    descendants
+}
+
+/// Filter the candidate set to sessions whose terminal status is
+/// non-terminal. Returns a sorted vector for stable operator-facing
+/// output. Errors during inspection are skipped silently -- a session
+/// we cannot read is a session we cannot warn about, but the reclaim
+/// step will surface the underlying issue.
+fn non_terminal_sessions<'a, I>(backend: &dyn SessionBackend, candidates: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut out: Vec<String> = candidates
+        .into_iter()
+        .filter(|id| {
+            let Ok((header, events)) = backend.read_events(id) else {
+                return false;
+            };
+            match derive_terminal_status(&header, &events) {
+                Ok(status) => !status.is_terminal(),
+                Err(_) => false,
+            }
+        })
+        .map(|s| s.to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Print operator-facing preview of what's about to be reclaimed.
+///
+/// Always emits to stdout (the verb's primary output channel). The
+/// preview lists the root + descendant count, and explicitly names
+/// any non-terminal sessions in the to-be-pruned set so the operator
+/// can abort if `--force` is masking a live session.
+fn print_preview(
+    root: &str,
+    descendants: &[String],
+    non_terminal_in_set: &[String],
+    status: &TerminalStatus,
+) {
+    println!("root: {} ({})", root, status.describe());
+    if descendants.is_empty() {
+        println!("descendants: (none)");
+    } else {
+        println!("descendants ({}):", descendants.len());
+        for d in descendants {
+            println!("  {}", d);
+        }
+    }
+    if !non_terminal_in_set.is_empty() {
+        println!();
+        println!("WARNING: the following sessions in the prune set are non-terminal:");
+        for id in non_terminal_in_set {
+            println!("  {}", id);
+        }
+    }
+}
+
+/// Prompt the operator for confirmation, returning whether to proceed.
+///
+/// `prompt_required = false` means the caller has already gathered
+/// consent (e.g. `--yes` on the CLI, or Issue 18's
+/// `KOTO_KT1_PRUNE_CONFIRM=1` env-var bypass) and the prompt is
+/// skipped. With `prompt_required = true`, the function writes the
+/// prompt to stdout, reads one line from stdin, and returns true on
+/// `y`/`yes` (case-insensitive, trimmed). EOF on stdin counts as
+/// negative consent.
+fn confirm_prune(prompt_required: bool) -> io::Result<bool> {
+    if !prompt_required {
+        return Ok(true);
+    }
+    print!("Proceed with prune? [y/N] ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    let n = io::stdin().read_line(&mut input)?;
+    if n == 0 {
+        return Ok(false); // EOF
+    }
+    let trimmed = input.trim().to_lowercase();
+    Ok(trimmed == "y" || trimmed == "yes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_descendants_finds_direct_and_transitive_children() {
+        let sessions = vec![
+            SessionInfo {
+                id: "root".to_string(),
+                created_at: "t0".to_string(),
+                template_hash: "h0".to_string(),
+                parent_workflow: None,
+            },
+            SessionInfo {
+                id: "child-a".to_string(),
+                created_at: "t1".to_string(),
+                template_hash: "h0".to_string(),
+                parent_workflow: Some("root".to_string()),
+            },
+            SessionInfo {
+                id: "child-b".to_string(),
+                created_at: "t1".to_string(),
+                template_hash: "h0".to_string(),
+                parent_workflow: Some("root".to_string()),
+            },
+            SessionInfo {
+                id: "grandchild".to_string(),
+                created_at: "t2".to_string(),
+                template_hash: "h0".to_string(),
+                parent_workflow: Some("child-a".to_string()),
+            },
+            SessionInfo {
+                id: "unrelated".to_string(),
+                created_at: "t0".to_string(),
+                template_hash: "h0".to_string(),
+                parent_workflow: None,
+            },
+        ];
+
+        let descendants = collect_descendants("root", &sessions);
+        assert_eq!(descendants.len(), 3);
+        assert!(descendants.contains(&"child-a".to_string()));
+        assert!(descendants.contains(&"child-b".to_string()));
+        assert!(descendants.contains(&"grandchild".to_string()));
+        assert!(!descendants.contains(&"unrelated".to_string()));
+        assert!(!descendants.contains(&"root".to_string()));
+    }
+
+    #[test]
+    fn collect_descendants_empty_when_no_children() {
+        let sessions = vec![SessionInfo {
+            id: "lonely".to_string(),
+            created_at: "t0".to_string(),
+            template_hash: "h0".to_string(),
+            parent_workflow: None,
+        }];
+        let descendants = collect_descendants("lonely", &sessions);
+        assert!(descendants.is_empty());
+    }
+
+    #[test]
+    fn terminal_status_describes_each_variant() {
+        assert_eq!(TerminalStatus::Completed.describe(), "completed");
+        assert_eq!(TerminalStatus::Abandoned.describe(), "abandoned");
+        assert_eq!(
+            TerminalStatus::NonTerminal {
+                current_state: "review".to_string()
+            }
+            .describe(),
+            "not terminal (current state: review)"
+        );
+    }
+
+    #[test]
+    fn terminal_status_is_terminal() {
+        assert!(TerminalStatus::Completed.is_terminal());
+        assert!(TerminalStatus::Abandoned.is_terminal());
+        assert!(!TerminalStatus::NonTerminal {
+            current_state: "s".to_string()
+        }
+        .is_terminal());
+    }
+}

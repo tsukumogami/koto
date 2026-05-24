@@ -15,6 +15,7 @@ pub mod session;
 pub mod task_spawn_error;
 pub mod validate_feed;
 pub mod vars;
+pub mod workspace;
 
 pub use init_child::{init_child_from_parent, TemplateCompileCache};
 pub use task_spawn_error::{SpawnErrorKind, TaskSpawnError};
@@ -222,8 +223,44 @@ pub enum Command {
         subcommand: ConfigCommand,
     },
 
+    /// Workspace-level reclaim and maintenance verbs
+    Workspace {
+        #[command(subcommand)]
+        subcommand: WorkspaceCommand,
+    },
+
     /// Live terminal dashboard showing session hierarchy and state
     Dashboard(DashboardArgs),
+}
+
+/// Subverbs under `koto workspace`.
+#[derive(Subcommand)]
+pub enum WorkspaceCommand {
+    /// Reclaim a workspace tree rooted at a terminal session.
+    ///
+    /// Reads the root header, verifies the workflow reached a terminal
+    /// state (`completed` or `abandoned`), walks descendants via
+    /// `backend.list()` + parent filter, and removes the directories
+    /// after operator confirmation. Symlinked roots are rejected via
+    /// `lstat()` before any directory traversal.
+    Prune {
+        /// Root session id to prune (required).
+        #[arg(long)]
+        root: String,
+
+        /// Print the descendant set and exit 0 without reclaiming.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+
+        /// Bypass the terminal-state safety gate. Still requires
+        /// `--yes` or an interactive confirmation.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Arguments for the `koto dashboard` command.
@@ -1163,6 +1200,17 @@ pub fn run(app: App) -> Result<()> {
             }
         }
         Command::Config { subcommand } => handle_config(subcommand),
+        Command::Workspace { subcommand } => {
+            let backend = build_backend()?;
+            match subcommand {
+                WorkspaceCommand::Prune {
+                    root,
+                    dry_run,
+                    yes,
+                    force,
+                } => workspace::handle_prune(&backend, root, dry_run, yes, force),
+            }
+        }
         Command::Dashboard(args) => {
             let backend = build_backend()?;
             dashboard::run(args, &backend)
