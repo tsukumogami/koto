@@ -37,6 +37,7 @@ wait-timeout = "0.2"
 [dev-dependencies]
 assert_cmd = "2"
 assert_fs = "1"
+filetime = "0.2"
 predicates = "3.1.4"
 tempfile = "3"
 

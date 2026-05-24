@@ -3,6 +3,7 @@
 pub mod advance;
 pub mod audit;
 pub mod batch_validation;
+pub mod discovery;
 pub mod errors;
 pub mod evidence;
 pub mod path_resolution;

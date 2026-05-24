@@ -171,12 +171,32 @@ pub fn handle_prune(
         .cleanup(&root)
         .with_context(|| format!("failed to remove root session '{}'", root))?;
 
+    // 12. Issue 7: invoke the cursor GC walk so stale coordinator
+    //     cursors are reclaimed as part of prune. A GC failure is
+    //     non-fatal — the prune already succeeded, we surface the
+    //     count as 0 on error and let `koto next` startup retry.
+    let cursors_gc = match (|| -> anyhow::Result<usize> {
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+        let kt1 = crate::config::resolve::load_config()
+            .unwrap_or_default()
+            .kt1;
+        crate::engine::discovery::gc_stale_cursors(&home.join(".koto"), &kt1)
+    })() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("warning: cursor GC failed during workspace prune: {}", e);
+            0
+        }
+    };
+
     println!(
         "{}",
         json!({
             "name": root,
             "pruned": true,
             "descendants_removed": descendants.len(),
+            "cursors_gc": cursors_gc,
         })
     );
 
