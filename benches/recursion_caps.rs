@@ -214,6 +214,7 @@ fn base_header(id: &str, parent: Option<&str>) -> StateFileHeader {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        respawn_generation: None,
     }
 }
 
