@@ -154,24 +154,64 @@ pub fn state_file_name(id: &str) -> String {
 /// with file tools. Future backends (cloud, git) will implement this
 /// trait alongside sync methods added when those features ship.
 pub trait SessionBackend: Send + Sync {
+    /// # Stability: Stage 1 — Frozen (Issue 19 / Decision 5)
+    ///
+    /// `create` is part of the four-method `SessionBackend` surface
+    /// bunki BK2 imports. Breaking changes — signature changes,
+    /// removal, or rename — require a 6-week deprecation window per
+    /// `docs/STABILITY.md`. Adding NEW methods to the trait is
+    /// permitted in minor releases (additive-only policy).
+    ///
     /// Create a new session directory. Returns the path.
     fn create(&self, id: &str) -> anyhow::Result<PathBuf>;
 
+    /// # Stability: additive-only (Issue 19 / Decision 5)
+    ///
+    /// Not part of the Stage 1 frozen four; downstream consumers
+    /// should not depend on this method's exact signature across
+    /// minor releases. Additive evolution of the trait is permitted.
+    ///
     /// Return the session directory path (no I/O, just path computation).
     fn session_dir(&self, id: &str) -> PathBuf;
 
+    /// # Stability: additive-only (Issue 19 / Decision 5)
+    ///
+    /// Not part of the Stage 1 frozen four; signature evolution is
+    /// permitted in minor releases.
+    ///
     /// Check if a session exists (state file present, not just directory).
     fn exists(&self, id: &str) -> bool;
 
+    /// # Stability: additive-only (Issue 19 / Decision 5)
+    ///
+    /// Not part of the Stage 1 frozen four; signature evolution is
+    /// permitted in minor releases.
+    ///
     /// Remove all session artifacts. Idempotent on missing directories.
     fn cleanup(&self, id: &str) -> anyhow::Result<()>;
 
+    /// # Stability: Stage 1 — Frozen (Issue 19 / Decision 5)
+    ///
+    /// `list` is part of the four-method `SessionBackend` surface
+    /// bunki BK2 imports. Breaking changes require a 6-week
+    /// deprecation window per `docs/STABILITY.md`.
+    ///
     /// List all sessions with metadata extracted from state file headers.
     fn list(&self) -> anyhow::Result<Vec<SessionInfo>>;
 
+    /// # Stability: additive-only (Issue 19 / Decision 5)
+    ///
+    /// Not part of the Stage 1 frozen four; signature evolution is
+    /// permitted in minor releases.
+    ///
     /// Append a header line to a new state file.
     fn append_header(&self, id: &str, header: &StateFileHeader) -> anyhow::Result<()>;
 
+    /// # Stability: additive-only (Issue 19 / Decision 5)
+    ///
+    /// Not part of the Stage 1 frozen four; signature evolution is
+    /// permitted in minor releases.
+    ///
     /// Append an event to the state file.
     fn append_event(&self, id: &str, payload: &EventPayload, timestamp: &str)
         -> anyhow::Result<()>;
@@ -200,6 +240,13 @@ pub trait SessionBackend: Send + Sync {
     /// On Linux this uses `renameat2(RENAME_NOREPLACE)` for a single-
     /// syscall fail-if-exists check. On other Unixes it uses POSIX
     /// `link()` followed by `unlink()` of the tempfile.
+    ///
+    /// # Stability: Stage 1 — Frozen (Issue 19 / Decision 5)
+    ///
+    /// `init_state_file` is part of the four-method `SessionBackend`
+    /// surface bunki BK2 imports. Breaking changes — signature
+    /// changes, removal, or rename — require a 6-week deprecation
+    /// window per `docs/STABILITY.md`.
     fn init_state_file(
         &self,
         id: &str,
@@ -207,9 +254,20 @@ pub trait SessionBackend: Send + Sync {
         initial_events: Vec<Event>,
     ) -> Result<(), SessionError>;
 
+    /// # Stability: Stage 1 — Frozen (Issue 19 / Decision 5)
+    ///
+    /// `read_events` is part of the four-method `SessionBackend`
+    /// surface bunki BK2 imports. Breaking changes require a 6-week
+    /// deprecation window per `docs/STABILITY.md`.
+    ///
     /// Read all events from the state file.
     fn read_events(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)>;
 
+    /// # Stability: additive-only (Issue 19 / Decision 5)
+    ///
+    /// Not part of the Stage 1 frozen four; signature evolution is
+    /// permitted in minor releases.
+    ///
     /// Read just the header from the state file.
     fn read_header(&self, id: &str) -> anyhow::Result<StateFileHeader>;
 
@@ -238,6 +296,11 @@ pub trait SessionBackend: Send + Sync {
     /// Callers that do NOT care about cross-host ordering should
     /// continue to use `append_event`; this method is specifically for
     /// the narrow retry-failed / batch-resolve paths.
+    ///
+    /// # Stability: additive-only (Issue 19 / Decision 5)
+    ///
+    /// Not part of the Stage 1 frozen four; signature evolution is
+    /// permitted in minor releases.
     fn ensure_pushed(&self, id: &str) -> Result<(), SessionError>;
 
     /// Rename a session from `from` to `to`, updating the state file
@@ -250,6 +313,11 @@ pub trait SessionBackend: Send + Sync {
     /// `.`).
     ///
     /// Returns `Err` if `from` doesn't exist or `to` already exists.
+    ///
+    /// # Stability: additive-only (Issue 19 / Decision 5)
+    ///
+    /// Not part of the Stage 1 frozen four; signature evolution is
+    /// permitted in minor releases.
     fn relocate(&self, from: &str, to: &str) -> anyhow::Result<()>;
 
     /// Acquire a non-blocking advisory `flock(LOCK_EX | LOCK_NB)` on
@@ -291,6 +359,11 @@ pub trait SessionBackend: Send + Sync {
     /// Not supported. koto targets Unix-like systems; on non-Unix
     /// targets this method returns a `SessionError::Other` describing
     /// the platform limitation.
+    ///
+    /// # Stability: additive-only (Issue 19 / Decision 5)
+    ///
+    /// Not part of the Stage 1 frozen four; signature evolution is
+    /// permitted in minor releases.
     fn lock_state_file(&self, id: &str) -> Result<SessionLock, SessionError>;
 }
 
