@@ -189,9 +189,31 @@ jobs:
         # thresholds.
         run: cargo bench --bench discovery_scan -- --save-baseline ci
 
+  recursion-caps-bench:
+    # KT1 Issue 17: criterion bench harness for the recursion-cap
+    # validator at 1k/10k/26k workspace sizes with 100 open sessions.
+    # The 26k case measures the AD3.3 perf-cliff avoidance commitment
+    # (30 ms p95 target). Soft-by-default like Issue 10's bench; the
+    # current implementation breaches because `read_terminal_index`
+    # walks the full JSONL file — a follow-up optimization (either an
+    # O(open-sessions) counter primitive or a smarter index format)
+    # closes the gap. Once closed, flip KOTO_BENCH_STRICT=1 to harden.
+    name: Recursion Caps Bench
+    if: ${{ github.event.pull_request.draft != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run recursion caps bench
+        run: cargo bench --bench recursion_caps -- --save-baseline ci
+
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, fmt, clippy, audit, tsuku-distributed-install, cloud-integration, discovery-bench]
+    needs: [check-artifacts, unit-tests, fmt, clippy, audit, tsuku-distributed-install, cloud-integration, discovery-bench, recursion-caps-bench]
     if: always()
     runs-on: ubuntu-latest
     steps:

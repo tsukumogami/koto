@@ -242,6 +242,63 @@ pub fn handle_start(
         None => None,
     };
 
+    // -- Recursion-cap enforcement (Issue 17, PRD R29) --
+    //
+    // The three hard-coded dimensions (depth, fanout, total-unassigned)
+    // fire ONLY for --needs-agent spawns; plain `koto session start`
+    // doesn't participate in the request-store protocol and isn't
+    // subject to the caps. Validation runs BEFORE any disk write so a
+    // cap rejection leaves no on-disk side effects.
+    if needs_agent {
+        // The total-unassigned counter consults the terminal index at
+        // `<koto_root>/_terminal_index.jsonl`. `koto_root` is the
+        // workspace root the SessionBackend uses; for the LocalBackend
+        // that's `<base_dir>/..` (the `.koto` directory containing the
+        // `sessions/` subdir). Fall back to `~/.koto` when the home
+        // directory is resolvable; on substrates that don't have a
+        // standard home we leave `koto_root` as the literal `.koto`
+        // path which simply means the terminal-index filter sees an
+        // empty index (safe over-count, never an under-count).
+        let koto_root = dirs::home_dir()
+            .map(|h| h.join(".koto"))
+            .unwrap_or_else(|| std::path::PathBuf::from(".koto"));
+        let outcome = crate::engine::caps::validate_recursion_caps(
+            backend,
+            validated_parent.as_str(),
+            &koto_root,
+        )
+        .map_err(|e| anyhow::anyhow!("recursion-cap validation failed: {}", e))?;
+        // Emit warn-level logs for any soft-cap hits. Each dimension
+        // is reported independently so operators reading the log see
+        // which threshold was crossed.
+        for warn in outcome.warnings() {
+            if let crate::engine::caps::CapEvaluation::Warn {
+                dimension,
+                threshold,
+                observed,
+            } = warn
+            {
+                eprintln!(
+                    "warning: recursion-cap soft threshold reached ({dimension}): observed {observed}, warn at {threshold}"
+                );
+            }
+        }
+        // Hard-reject short-circuit. The orchestrator already evaluated
+        // all three dimensions; pull the first rejecting one and
+        // surface it as a typed EngineError mapped to exit code 64
+        // (EX_USAGE).
+        if let Some(crate::engine::caps::CapEvaluation::Reject {
+            dimension,
+            threshold,
+            observed,
+        }) = outcome.first_reject()
+        {
+            return Err(anyhow::anyhow!(
+                "recursion cap exceeded ({dimension}): observed {observed}, hard reject at {threshold}"
+            ));
+        }
+    }
+
     // -- Compose the header --
     let ts = now_iso8601();
     let template_name = template.map(|s| s.to_string());
