@@ -1,0 +1,379 @@
+//! KT1 reserved audit-event kinds and typed payload-shape helpers.
+//!
+//! Decision 6 (DESIGN-koto-request-store) commits to **reusing**
+//! [`EventPayload::EvidenceSubmitted`] rather than adding new
+//! `EventPayload` variants for the KT1 audit family — PRD D10
+//! requires zero new variants. The audit family is therefore keyed
+//! off a reserved `fields.kind` discriminator on every
+//! `EvidenceSubmitted` event.
+//!
+//! Four canonical reserved kinds are exposed here, plus the `kt1.`
+//! prefix reservation. Template authors cannot use any of these as a
+//! `fields.kind` value on `koto next --with-data` submissions —
+//! [`is_reserved_kind`] is consumed by the CLI parser to reject
+//! collisions at write time with [`crate::engine::errors::EngineError::ReservedKindCollision`].
+//!
+//! [`wake_payload_summary`] takes
+//! `&[crate::engine::types::ValidatedSessionId]` rather than
+//! `&[String]` as a structural mitigation for security touch-up #5:
+//! unvalidated session ids literally cannot flow into the
+//! human-readable narrative, pre-paying the future-template-registry
+//! hardening called out in the design's Security Considerations
+//! carve-outs.
+//!
+//! See DESIGN-koto-request-store.md Decision 6 (lines 801-806 for
+//! the wire-shape table) and Security Considerations >
+//! `wake_payload_summary` content discipline (lines 2011-2025).
+
+use std::collections::HashMap;
+
+use serde_json::{json, Value};
+
+use crate::engine::types::ValidatedSessionId;
+
+/// `fields.kind` value for the audit event emitted when a coordinator
+/// dispatches a child to fulfill a request.
+pub const CHILD_DISPATCHED: &str = "ChildDispatched";
+
+/// `fields.kind` value for the audit event emitted when a previously
+/// dispatched child is re-dispatched after its claim expires or its
+/// agent fails (PRD R29 redelegation cap counts these).
+pub const CHILD_REDELEGATED: &str = "ChildRedelegated";
+
+/// `fields.kind` value for the audit event emitted when a parent
+/// session is "woken" because at least one of its children reached
+/// a terminal state (PRD R30 wake-candidates).
+pub const REQUESTER_WOKEN: &str = "RequesterWoken";
+
+/// `fields.kind` value for the audit event emitted when a child
+/// session is respawned to retry the requester's work after a
+/// terminal child failure (PRD R31 respawn).
+pub const REQUESTER_RESPAWN: &str = "RequesterRespawn";
+
+/// Prefix reserved for KT1 audit-event kinds.
+///
+/// Template authors cannot submit a `fields.kind` whose value starts
+/// with this prefix; the reservation gives koto headroom to add
+/// future audit kinds without shadowing template-author code.
+pub const KT1_PREFIX: &str = "kt1.";
+
+/// Canonical list of reserved literal kinds.
+///
+/// Used by [`is_reserved_kind`] and by table-driven tests; kept
+/// `const` so it stays in sync with the four `CHILD_*` /
+/// `REQUESTER_*` constants above.
+pub const RESERVED_KINDS: &[&str] = &[
+    CHILD_DISPATCHED,
+    CHILD_REDELEGATED,
+    REQUESTER_WOKEN,
+    REQUESTER_RESPAWN,
+];
+
+/// Return `true` when `kind` collides with the KT1 audit family.
+///
+/// A collision means any of:
+/// 1. exact match against one of the four reserved literal names; OR
+/// 2. starts with the `kt1.` prefix.
+///
+/// The CLI parser-rejection hook (`validate_with_data_payload` in
+/// `src/cli/mod.rs`) consumes this predicate to reject offending
+/// `koto next --with-data` payloads before any disk write.
+pub fn is_reserved_kind(kind: &str) -> bool {
+    if kind.starts_with(KT1_PREFIX) {
+        return true;
+    }
+    RESERVED_KINDS.contains(&kind)
+}
+
+/// Build the `fields` map for a `ChildDispatched` audit event.
+///
+/// Wire shape (Decision 6 / design lines 801-806):
+/// ```json
+/// {
+///   "kind": "ChildDispatched",
+///   "child_session_id": "<child>",
+///   "coord_id": "<coordinator>",
+///   "dispatch_epoch": <n>
+/// }
+/// ```
+pub fn child_dispatched_fields(
+    child_session_id: &ValidatedSessionId,
+    coord_id: &str,
+    dispatch_epoch: u32,
+) -> HashMap<String, Value> {
+    let mut fields = HashMap::with_capacity(4);
+    fields.insert("kind".to_string(), json!(CHILD_DISPATCHED));
+    fields.insert(
+        "child_session_id".to_string(),
+        json!(child_session_id.as_str()),
+    );
+    fields.insert("coord_id".to_string(), json!(coord_id));
+    fields.insert("dispatch_epoch".to_string(), json!(dispatch_epoch));
+    fields
+}
+
+/// Build the `fields` map for a `ChildRedelegated` audit event.
+///
+/// Wire shape (Decision 6):
+/// ```json
+/// {
+///   "kind": "ChildRedelegated",
+///   "child_session_id": "<child>",
+///   "coord_id": "<coordinator>",
+///   "dispatch_epoch": <n>,
+///   "respawn_generation": <g>
+/// }
+/// ```
+pub fn child_redelegated_fields(
+    child_session_id: &ValidatedSessionId,
+    coord_id: &str,
+    dispatch_epoch: u32,
+    respawn_generation: u32,
+) -> HashMap<String, Value> {
+    let mut fields = HashMap::with_capacity(5);
+    fields.insert("kind".to_string(), json!(CHILD_REDELEGATED));
+    fields.insert(
+        "child_session_id".to_string(),
+        json!(child_session_id.as_str()),
+    );
+    fields.insert("coord_id".to_string(), json!(coord_id));
+    fields.insert("dispatch_epoch".to_string(), json!(dispatch_epoch));
+    fields.insert("respawn_generation".to_string(), json!(respawn_generation));
+    fields
+}
+
+/// Build the `fields` map for a `RequesterWoken` audit event.
+///
+/// Emitted on the requester's log when one or more children reach a
+/// terminal state, signaling the wake-candidates pass (PRD R30).
+/// Wire shape (Decision 6):
+/// ```json
+/// {
+///   "kind": "RequesterWoken",
+///   "summary": "N children completed",
+///   "child_count": <n>
+/// }
+/// ```
+///
+/// Note: the `summary` field is built via [`wake_payload_summary`]
+/// so the narrative cannot quote unvalidated ids — the helper
+/// signature takes `&[ValidatedSessionId]` rather than `&[String]`.
+pub fn requester_woken_fields(child_ids: &[ValidatedSessionId]) -> HashMap<String, Value> {
+    let mut fields = HashMap::with_capacity(3);
+    fields.insert("kind".to_string(), json!(REQUESTER_WOKEN));
+    fields.insert(
+        "summary".to_string(),
+        json!(wake_payload_summary(child_ids)),
+    );
+    fields.insert("child_count".to_string(), json!(child_ids.len()));
+    fields
+}
+
+/// Build the `fields` map for a `RequesterRespawn` audit event.
+///
+/// Wire shape (Decision 6):
+/// ```json
+/// {
+///   "kind": "RequesterRespawn",
+///   "child_session_id": "<child>",
+///   "respawn_generation": <g>
+/// }
+/// ```
+pub fn requester_respawn_fields(
+    child_session_id: &ValidatedSessionId,
+    respawn_generation: u32,
+) -> HashMap<String, Value> {
+    let mut fields = HashMap::with_capacity(3);
+    fields.insert("kind".to_string(), json!(REQUESTER_RESPAWN));
+    fields.insert(
+        "child_session_id".to_string(),
+        json!(child_session_id.as_str()),
+    );
+    fields.insert("respawn_generation".to_string(), json!(respawn_generation));
+    fields
+}
+
+/// Build the human-readable `summary` string carried on a
+/// `RequesterWoken` audit event.
+///
+/// **Signature is load-bearing.** Takes
+/// `&[ValidatedSessionId]` (not `&[String]` or `&[&str]`) so a
+/// caller cannot pass an unvalidated id — closing the
+/// future-template-registry risk surface called out in Security
+/// Considerations carve-outs. The function never quotes raw ids; it
+/// emits a count-only narrative.
+///
+/// Output shape:
+/// - 0 children → `"no children completed"`
+/// - 1 child   → `"1 child completed"`
+/// - N > 1     → `"N children completed"`
+pub fn wake_payload_summary(child_ids: &[ValidatedSessionId]) -> String {
+    match child_ids.len() {
+        0 => "no children completed".to_string(),
+        1 => "1 child completed".to_string(),
+        n => format!("{} children completed", n),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::types::{EventPayload, ValidatedSessionId};
+
+    fn sid(s: &str) -> ValidatedSessionId {
+        ValidatedSessionId::new(s).expect("test id must be valid")
+    }
+
+    // ---- is_reserved_kind ----
+
+    #[test]
+    fn reserved_literals_collide() {
+        for kind in RESERVED_KINDS {
+            assert!(
+                is_reserved_kind(kind),
+                "literal {:?} must be flagged as reserved",
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn kt1_prefix_collides() {
+        assert!(is_reserved_kind("kt1.foo"));
+        assert!(is_reserved_kind("kt1."));
+        assert!(is_reserved_kind("kt1.anything.with.dots"));
+    }
+
+    #[test]
+    fn template_author_kinds_do_not_collide() {
+        for ok in [
+            "verdict",
+            "review",
+            "scrutineer",
+            "child-completed",
+            "kt",
+            "kt1",
+        ] {
+            assert!(
+                !is_reserved_kind(ok),
+                "{:?} must NOT be flagged as reserved",
+                ok
+            );
+        }
+    }
+
+    #[test]
+    fn case_sensitive_reservation() {
+        // Reserved-name matching is case-sensitive — "childdispatched"
+        // (all-lowercase) is NOT a collision. Template authors can
+        // still author lowercase analogues if they want to.
+        assert!(!is_reserved_kind("childdispatched"));
+        assert!(!is_reserved_kind("CHILD_DISPATCHED"));
+    }
+
+    // ---- typed builders + round-trip ----
+
+    #[test]
+    fn child_dispatched_round_trips_through_evidence_submitted() {
+        let child = sid("parent.task-a");
+        let fields = child_dispatched_fields(&child, "coord-7", 3);
+        assert_eq!(fields["kind"], json!("ChildDispatched"));
+        assert_eq!(fields["child_session_id"], json!("parent.task-a"));
+        assert_eq!(fields["coord_id"], json!("coord-7"));
+        assert_eq!(fields["dispatch_epoch"], json!(3));
+
+        let payload = EventPayload::EvidenceSubmitted {
+            state: "dispatch".to_string(),
+            fields,
+            submitter_cwd: None,
+        };
+        let s = serde_json::to_string(&payload).unwrap();
+        let parsed: EventPayload = serde_json::from_str(&s).unwrap();
+        assert_eq!(payload, parsed);
+    }
+
+    #[test]
+    fn child_redelegated_round_trips_through_evidence_submitted() {
+        let child = sid("parent.task-a");
+        let fields = child_redelegated_fields(&child, "coord-7", 4, 2);
+        assert_eq!(fields["kind"], json!("ChildRedelegated"));
+        assert_eq!(fields["respawn_generation"], json!(2));
+        let payload = EventPayload::EvidenceSubmitted {
+            state: "dispatch".to_string(),
+            fields,
+            submitter_cwd: None,
+        };
+        let s = serde_json::to_string(&payload).unwrap();
+        let parsed: EventPayload = serde_json::from_str(&s).unwrap();
+        assert_eq!(payload, parsed);
+    }
+
+    #[test]
+    fn requester_woken_round_trips_through_evidence_submitted() {
+        let kids = [sid("parent.task-a"), sid("parent.task-b")];
+        let fields = requester_woken_fields(&kids);
+        assert_eq!(fields["kind"], json!("RequesterWoken"));
+        assert_eq!(fields["child_count"], json!(2));
+        assert_eq!(fields["summary"], json!("2 children completed"));
+        let payload = EventPayload::EvidenceSubmitted {
+            state: "wake".to_string(),
+            fields,
+            submitter_cwd: None,
+        };
+        let s = serde_json::to_string(&payload).unwrap();
+        let parsed: EventPayload = serde_json::from_str(&s).unwrap();
+        assert_eq!(payload, parsed);
+    }
+
+    #[test]
+    fn requester_respawn_round_trips_through_evidence_submitted() {
+        let child = sid("parent.task-a");
+        let fields = requester_respawn_fields(&child, 5);
+        assert_eq!(fields["kind"], json!("RequesterRespawn"));
+        assert_eq!(fields["respawn_generation"], json!(5));
+        let payload = EventPayload::EvidenceSubmitted {
+            state: "respawn".to_string(),
+            fields,
+            submitter_cwd: None,
+        };
+        let s = serde_json::to_string(&payload).unwrap();
+        let parsed: EventPayload = serde_json::from_str(&s).unwrap();
+        assert_eq!(payload, parsed);
+    }
+
+    // ---- wake_payload_summary ----
+
+    #[test]
+    fn wake_payload_summary_zero_children() {
+        let kids: Vec<ValidatedSessionId> = vec![];
+        assert_eq!(wake_payload_summary(&kids), "no children completed");
+    }
+
+    #[test]
+    fn wake_payload_summary_one_child() {
+        let kids = [sid("scrutineer-a")];
+        assert_eq!(wake_payload_summary(&kids), "1 child completed");
+    }
+
+    #[test]
+    fn wake_payload_summary_many_children() {
+        let kids = [
+            sid("scrutineer-a"),
+            sid("scrutineer-b"),
+            sid("scrutineer-c"),
+        ];
+        assert_eq!(wake_payload_summary(&kids), "3 children completed");
+    }
+
+    #[test]
+    fn wake_payload_summary_never_quotes_ids() {
+        let kids = [sid("dangerous-id-1"), sid("dangerous-id-2")];
+        let summary = wake_payload_summary(&kids);
+        // Structural guarantee from the signature: the function can
+        // only see the ids through ValidatedSessionId, but it also
+        // chooses never to interpolate them. Verify both halves.
+        assert!(!summary.contains("dangerous-id-1"));
+        assert!(!summary.contains("dangerous-id-2"));
+        assert_eq!(summary, "2 children completed");
+    }
+}

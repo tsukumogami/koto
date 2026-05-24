@@ -313,6 +313,62 @@ pub enum ConfigCommand {
 
 #[derive(Subcommand)]
 pub enum SessionCommand {
+    /// Start a child session under `--parent`.
+    ///
+    /// Decision 1's request-store authoring surface: the spawning
+    /// subagent calls `koto session start --parent <p>` and either
+    /// (a) provides `--needs-agent` plus the full
+    /// `--role` / `--template` / `--inputs` companion set to enqueue
+    /// a dispatch request on the new child, or (b) leaves all four
+    /// off to start a plain child session whose header carries no
+    /// dispatch-request marker.
+    ///
+    /// Companion-flag contract (enforced at parse time):
+    ///   --needs-agent set → --role + --template + --inputs ALL required.
+    ///   Any of --role/--template/--inputs/--coordinator-of-record
+    ///     present without --needs-agent → reject naming --needs-agent.
+    Start {
+        /// Name of the new child session.
+        name: String,
+
+        /// Name of the parent workflow this session is a child of.
+        /// Validated via [`ValidatedSessionId`] before any path op.
+        #[arg(long)]
+        parent: String,
+
+        /// Mark this session as awaiting agent dispatch
+        /// (writes `needs_agent = true` to the header).
+        #[arg(long = "needs-agent")]
+        needs_agent: bool,
+
+        /// Role identifier the assigning coordinator should match
+        /// against. Required when `--needs-agent` is set.
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Template name to record in the header. Reuses the existing
+        /// `template_name` field per Decision 1 line 222 (NOT a new
+        /// field). Required when `--needs-agent` is set.
+        #[arg(long)]
+        template: Option<String>,
+
+        /// JSON inputs blob passed to the agent at dispatch time.
+        /// Required when `--needs-agent` is set.
+        ///
+        /// Rejects payloads larger than 1 MiB or with JSON nesting
+        /// deeper than 128 levels (Security Considerations
+        /// defense-in-depth #1).
+        #[arg(long)]
+        inputs: Option<String>,
+
+        /// Coordinator id that owns this request. Defaults to the
+        /// parent's recorded `coordinator_of_record`, falling back to
+        /// the parent's session id when the parent is itself
+        /// pre-KT1. Validated via [`ValidatedCoordId`] before write.
+        #[arg(long = "coordinator-of-record")]
+        coordinator_of_record: Option<String>,
+    },
+
     /// Print the absolute session directory path
     Dir {
         /// Session name
@@ -746,16 +802,24 @@ pub(super) fn resolve_with_data_source(
     })
 }
 
-/// Parse a `--with-data` JSON string and check for the reserved `"gates"` key.
+/// Parse a `--with-data` JSON string and check for reserved keys and
+/// reserved KT1 audit-event kinds.
 ///
 /// Returns the parsed `Value` on success, or a `NextError` with code
-/// `InvalidSubmission` when the JSON is malformed or contains the reserved key.
-/// This function contains only pure logic; callers are responsible for exiting.
+/// `InvalidSubmission` when the JSON is malformed, contains the
+/// reserved `"gates"` key, or carries a `fields.kind` value that
+/// collides with the KT1 audit family (Decision 6 in
+/// DESIGN-koto-request-store): the four reserved literal names or
+/// anything starting with the `kt1.` prefix.
+///
+/// This function contains only pure logic; callers are responsible
+/// for exiting.
 #[cfg(unix)]
 fn validate_with_data_payload(
     data_str: &str,
 ) -> Result<serde_json::Value, crate::cli::next_types::NextError> {
     use crate::cli::next_types::{NextError, NextErrorCode};
+    use crate::engine::audit;
 
     let data: serde_json::Value = serde_json::from_str(data_str).map_err(|e| NextError {
         code: NextErrorCode::InvalidSubmission,
@@ -772,7 +836,43 @@ fn validate_with_data_payload(
         });
     }
 
+    // Reserved-kind gate (Issue 14 / Decision 6). The kind is carried
+    // either at the top level (`{"kind":"..."}`) or nested under
+    // `fields` (`{"fields":{"kind":"..."}}`); both shapes are
+    // valid submission entry points that ultimately land in
+    // EventPayload::EvidenceSubmitted's `fields` map, so both have
+    // to pass the same reservation rule.
+    if let Some(kind) = extract_kind_from_submission(&data) {
+        if audit::is_reserved_kind(kind) {
+            return Err(NextError {
+                code: NextErrorCode::InvalidSubmission,
+                message: format!("reserved audit-event kind: {}", kind),
+                details: vec![],
+            });
+        }
+    }
+
     Ok(data)
+}
+
+/// Inspect a `--with-data` JSON value and pull out the `kind`
+/// discriminator if one is present.
+///
+/// Accepts two payload shapes:
+///   `{"kind": "X", ...}`          — top-level discriminator
+///   `{"fields": {"kind": "X"}, ...}` — nested under `fields`, the
+///                                     shape used internally on
+///                                     `EvidenceSubmitted` events
+///
+/// Returns `None` if neither carries a string `kind`.
+#[cfg(unix)]
+fn extract_kind_from_submission(data: &serde_json::Value) -> Option<&str> {
+    if let Some(s) = data.get("kind").and_then(|v| v.as_str()) {
+        return Some(s);
+    }
+    data.get("fields")
+        .and_then(|v| v.get("kind"))
+        .and_then(|v| v.as_str())
 }
 
 /// Execute a command with polling: run repeatedly, evaluate gates after each
@@ -969,6 +1069,24 @@ pub fn run(app: App) -> Result<()> {
         Command::Session { subcommand } => {
             let backend = build_backend()?;
             match subcommand {
+                SessionCommand::Start {
+                    name,
+                    parent,
+                    needs_agent,
+                    role,
+                    template,
+                    inputs,
+                    coordinator_of_record,
+                } => session::handle_start(
+                    &backend,
+                    &name,
+                    &parent,
+                    needs_agent,
+                    role.as_deref(),
+                    template.as_deref(),
+                    inputs.as_deref(),
+                    coordinator_of_record.as_deref(),
+                ),
                 SessionCommand::Dir { name } => session::handle_dir(&backend, &name),
                 SessionCommand::List => session::handle_list(&backend),
                 SessionCommand::Cleanup { name } => {
@@ -4142,5 +4260,79 @@ mod tests {
             "error message should mention 'reserved': {}",
             err.message
         );
+    }
+
+    // ----- Issue 14: reserved audit-event kind rejection (Decision 6) -----
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_rejects_all_four_reserved_literal_kinds() {
+        use crate::cli::next_types::NextErrorCode;
+        use crate::engine::audit::RESERVED_KINDS;
+
+        for kind in RESERVED_KINDS {
+            // Top-level discriminator shape.
+            let payload = format!(r#"{{"kind":"{}"}}"#, kind);
+            let err = validate_with_data_payload(&payload)
+                .expect_err("must reject reserved kind at parse time");
+            assert_eq!(err.code, NextErrorCode::InvalidSubmission);
+            assert!(
+                err.message.contains("reserved audit-event kind"),
+                "expected reserved-kind error, got: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(kind),
+                "error must name the offending kind {}, got: {}",
+                kind,
+                err.message
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_rejects_nested_reserved_kinds() {
+        use crate::engine::audit::CHILD_DISPATCHED;
+        // EvidenceSubmitted-shaped payload with `kind` inside `fields`.
+        let payload = format!(r#"{{"fields":{{"kind":"{}"}}}}"#, CHILD_DISPATCHED);
+        let err = validate_with_data_payload(&payload).expect_err("must reject nested kind");
+        assert!(err.message.contains("reserved audit-event kind"));
+        assert!(err.message.contains(CHILD_DISPATCHED));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_rejects_kt1_prefix() {
+        for kind in ["kt1.foo", "kt1.", "kt1.deep.kind"] {
+            let payload = format!(r#"{{"kind":"{}"}}"#, kind);
+            let err = validate_with_data_payload(&payload).expect_err("must reject kt1.* prefix");
+            assert!(err.message.contains("reserved audit-event kind"));
+            assert!(err.message.contains(kind));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_accepts_template_author_kinds() {
+        // Any kind that is neither a reserved literal nor kt1.-prefixed
+        // must land on disk untouched. Verifying via the parser is
+        // enough — `handle_next`'s downstream persistence test
+        // coverage is provided elsewhere.
+        for ok in ["verdict", "review", "scrutineer", "kt", "kt1foo"] {
+            let payload = format!(r#"{{"kind":"{}","note":"x"}}"#, ok);
+            let v = validate_with_data_payload(&payload).expect("must accept");
+            assert_eq!(v["kind"], serde_json::json!(ok));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_with_data_accepts_payload_without_kind() {
+        // Payloads that don't carry a `kind` at all are unaffected by
+        // the reserved-kind gate (they hit the existing schema-side
+        // validation downstream).
+        let v = validate_with_data_payload(r#"{"note":"hello"}"#).expect("must accept");
+        assert_eq!(v["note"], serde_json::json!("hello"));
     }
 }

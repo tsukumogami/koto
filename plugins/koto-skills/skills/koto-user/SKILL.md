@@ -185,6 +185,26 @@ koto init <child-name> --parent <parent-name> --template <path>
 
 The `--parent` flag validates that the parent workflow exists and records the link in the child's state file. The naming convention `parent.child` is recommended but not enforced — the metadata link is what matters.
 
+### Requesting agent dispatch on a new child
+
+When the child you're spawning needs a separate agent to pick it up later (the "request store" pattern), use `koto session start` instead of `koto init`. It writes a request-store header on the child so a coordinator can later dispatch the right agent:
+
+```bash
+koto session start <child-name> \
+  --parent <parent-name> \
+  --needs-agent \
+  --role <role-name> \
+  --template <template-name> \
+  --inputs '<json>'
+```
+
+- `--needs-agent` marks the child as awaiting dispatch and **requires** the `--role`, `--template`, and `--inputs` companions. Any of those without `--needs-agent`, or `--needs-agent` without the full set, rejects at parse time.
+- `--inputs` is a JSON blob (max 1 MiB, max 128 nesting levels).
+- `--coordinator-of-record <c>` is optional; it defaults to the parent's effective coordinator.
+- Omit all four to start a plain child session without a dispatch marker — useful when the child is launched in-process by the same agent.
+
+The session id (`--parent`) and coordinator id (`--coordinator-of-record`) are validated against `^[a-zA-Z0-9][a-zA-Z0-9._-]*$` (max 255 chars) before any path operation, so paths like `../etc/passwd` or shell-metacharacter ids are rejected up front.
+
 ### Checking children
 
 List a parent's children:
@@ -320,5 +340,7 @@ Read these on demand, not upfront. The sections above cover the common path. Con
 **Gate blocked, `agent_actionable` is `false`** — you can't override this gate yourself. Escalate to the user so they can resolve the underlying condition (for example, a required deployment that only they can trigger).
 
 **Evidence rejected (`invalid_submission`)** — one or more fields didn't pass validation. The error includes a `details` array with per-field reasons. Fix the field values and resubmit. Call `koto next <name>` without `--with-data` to re-read the `expects` schema if needed.
+
+**"reserved audit-event kind"** — your `--with-data` payload included a `fields.kind` value that collides with the KT1 audit family. Four literal kinds (`ChildDispatched`, `ChildRedelegated`, `RequesterWoken`, `RequesterRespawn`) and anything starting with the `kt1.` prefix are reserved for the engine — template authors can't use them. Rename the field value to something workflow-specific (e.g., `"verdict"`, `"scrutineer"`) and resubmit.
 
 **`koto next` returns the same state repeatedly** — check `advanced` in the response. If it's `false`, the engine stopped where it already was (gates still blocking, or evidence still missing). Re-read `blocking_conditions` and `directive`.
