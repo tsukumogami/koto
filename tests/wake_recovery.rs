@@ -399,7 +399,8 @@ fn recovery_fires_when_requester_idle_past_timeout() {
     // stale woken_at.
     let woken_at_str = format_rfc3339_millis(now_minus(700)); // 700s ago > 600s timeout
     let kids: Vec<ValidatedSessionId> = vec![ValidatedSessionId::new("parent.child-a").unwrap()];
-    let fields = requester_woken_fields(&kids, "parent");
+    let epochs: Vec<u32> = vec![0];
+    let fields = requester_woken_fields(&kids, &epochs, "parent");
     let payload = EventPayload::EvidenceSubmitted {
         state: "request_store.wake".into(),
         fields,
@@ -451,7 +452,8 @@ fn recovery_does_not_fire_when_requester_made_progress() {
     // RequesterWoken emitted 700s ago.
     let woken_at_str = format_rfc3339_millis(now_minus(700));
     let kids: Vec<ValidatedSessionId> = vec![ValidatedSessionId::new("parent.child-a").unwrap()];
-    let fields = requester_woken_fields(&kids, "parent");
+    let epochs: Vec<u32> = vec![0];
+    let fields = requester_woken_fields(&kids, &epochs, "parent");
     let payload = EventPayload::EvidenceSubmitted {
         state: "request_store.wake".into(),
         fields,
@@ -497,7 +499,8 @@ fn recovery_does_not_fire_within_timeout() {
     // RequesterWoken emitted 10s ago (well under 600s timeout).
     let woken_at_str = format_rfc3339_millis(now_minus(10));
     let kids: Vec<ValidatedSessionId> = vec![ValidatedSessionId::new("parent.child-a").unwrap()];
-    let fields = requester_woken_fields(&kids, "parent");
+    let epochs: Vec<u32> = vec![0];
+    let fields = requester_woken_fields(&kids, &epochs, "parent");
     let payload = EventPayload::EvidenceSubmitted {
         state: "request_store.wake".into(),
         fields,
@@ -679,7 +682,8 @@ fn requester_resumed_then_idle_does_not_trigger_wake_recovery() {
     // RequesterWoken from 1 hour ago.
     let woken_at_str = format_rfc3339_millis(now_minus(3600));
     let kids: Vec<ValidatedSessionId> = vec![ValidatedSessionId::new("parent.child-a").unwrap()];
-    let fields = requester_woken_fields(&kids, "parent");
+    let epochs: Vec<u32> = vec![0];
+    let fields = requester_woken_fields(&kids, &epochs, "parent");
     let payload = EventPayload::EvidenceSubmitted {
         state: "request_store.wake".into(),
         fields,

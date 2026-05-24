@@ -208,6 +208,69 @@ ships.
 
 ---
 
+## Rollback to 0.9.x
+
+The forward path is well-defined: `StateFileHeader` evolves additively
+under serde-default `Option<T>` fields, and `EventPayload` accepts new
+variants via the `Unknown` catch-all. A 0.9.x reader can parse a
+0.10.0 state file without losing data — new fields and variants are
+preserved in the on-disk representation and re-decode losslessly when
+a newer reader picks them up again.
+
+**Reverse compatibility (0.10.0 → 0.9.x) is NOT officially supported.**
+Once a workspace has been touched by 0.10.0 it should remain on
+0.10.0. The retained-reader policy in the major-bump protocol above
+does not extend to minor-version downgrade.
+
+If a downgrade is unavoidable (e.g., a 0.10.0 regression forces a
+roll-back to 0.9.x for an emergency patch), the operator should
+first remove the request-store derived files that 0.9.x has no
+machinery to understand:
+
+```bash
+# Run these BEFORE downgrading the koto binary.
+rm -f ~/.koto/_terminal_index.jsonl
+rm -f ~/.koto/_terminal_index.compact.lock
+rm -rf ~/.koto/coordinators/
+find ~/.koto/sessions/ -name claim.lock -delete
+```
+
+What 0.9.x will silently ignore on read (additive 0.10.0 header fields
+that `serde(default)` to `None` when absent and that 0.9.x doesn't
+look at): `parent_workflow`, `requested_by`, `assignment_claim`,
+`coordinator_of_record`, `needs_agent`, `role`, `inputs`,
+`dispatch_epoch`, `respawn_generation`. These remain on disk after
+the downgrade; 0.9.x just doesn't read them. They become live again
+on re-upgrade.
+
+**One-way doors** — fields that 0.9.x cannot "undo" even if it ignored
+them on read:
+
+- `assignment_claim` on a header — 0.9.x has no claim-honoring
+  machinery, so a session whose dispatched agent is mid-flight when
+  the downgrade happens loses claim coherence. The sidecar removal
+  above masks the disk side of this, but the in-memory coordinator
+  state on the 0.9.x process won't know to back off.
+- `dispatch_epoch` writes on a `ChildDispatched` event — 0.9.x cannot
+  match wake events to specific epochs (Fix 1 in the 0.10.0 polish
+  pass), so a re-dispatched child will not surface a second wake on
+  the 0.9.x side.
+- `respawn_generation` on a header — 0.9.x has no F1 cold-restart
+  re-priming machinery (Issue 16); a respawned child carries the
+  generation forward but 0.9.x will treat it as a normal session.
+
+If you've made progress on a dispatched child under 0.10.0 and then
+downgrade to 0.9.x, the safest path is to manually `koto session
+cleanup` the affected children before the downgrade so the parent's
+coordinator state on 0.9.x doesn't depend on request-store-specific
+fields it can't interpret.
+
+**Recommendation:** pin 0.10.0 once upgraded. If a regression is
+discovered, file an issue against the 0.10.0 patch line rather than
+attempting a downgrade.
+
+---
+
 ## Operator-facing references
 
 - `docs/workspace-layout.md` — operator catalog of request-store derived files

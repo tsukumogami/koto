@@ -96,12 +96,20 @@ impl SubstrateWaker for LoggingWaker {
 /// Single open dispatch identified by the wake-candidates walk.
 ///
 /// "Open" means: the coordinator's log carries a `ChildDispatched` for
-/// `child_session_id`, AND no later `RequesterWoken` on this log has
-/// the same `child_session_id` in its `child_session_ids` array.
+/// `(child_session_id, dispatch_epoch)`, AND no later `RequesterWoken`
+/// on this log has the same `(child_session_id, dispatch_epoch)` pair
+/// in its parallel `child_session_ids` / `child_dispatch_epochs`
+/// arrays. The epoch is part of the key so a session that is
+/// dispatched, terminalized, woken, then re-dispatched (header epoch
+/// bumps under recovery) gets a fresh wake at the new epoch instead of
+/// being silently filtered by the prior wake's bare-id record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenDispatch {
     /// The dispatched child's session id.
     pub child_session_id: ValidatedSessionId,
+    /// Dispatch epoch from the `ChildDispatched` event's `fields` map.
+    /// Part of the wake-filter key alongside `child_session_id`.
+    pub dispatch_epoch: u32,
     /// The session id of the principal that originally requested the
     /// child. Read from the child's header's `requested_by` field at
     /// dispatch time. Used to populate the wake's `requested_by` field
@@ -120,6 +128,11 @@ pub struct OpenDispatch {
 pub struct WakeCandidate {
     /// The dispatched child's session id.
     pub child_session_id: ValidatedSessionId,
+    /// Dispatch epoch carried through from the corresponding
+    /// [`OpenDispatch`]. Emitted into the `RequesterWoken` event's
+    /// `child_dispatch_epochs` array so future wake passes can match
+    /// (id, epoch) and not collide on bare id.
+    pub dispatch_epoch: u32,
     /// Resolved requester session id from the dispatch's header.
     pub requested_by: String,
 }
@@ -145,35 +158,53 @@ pub struct WakeEmissionOutcome {
 /// Walk a coord's session log and return the set of currently open
 /// dispatches.
 ///
-/// "Open" means: the log carries a `ChildDispatched` event for
-/// `child_session_id` AND no later `RequesterWoken` event has the
-/// same id in its `child_session_ids` array.
+/// "Open" means: the log carries a `ChildDispatched` event for the
+/// `(child_session_id, dispatch_epoch)` pair AND no later
+/// `RequesterWoken` event carries that same pair in its parallel
+/// `child_session_ids` / `child_dispatch_epochs` arrays. Keying on the
+/// pair instead of the bare id is what lets a re-dispatched child
+/// (header epoch bumped under recovery) get a fresh wake; bare-id
+/// keying would silently drop the second wake against the first
+/// wake's record.
 ///
 /// Pure function over events; no I/O beyond what the caller already
 /// passed in. Callers typically derive `events` from
 /// [`crate::engine::persistence::read_events`].
 pub fn find_open_dispatches(events: &[Event]) -> Vec<OpenDispatch> {
-    let mut already_woken: HashSet<String> = HashSet::new();
-    // First pass: collect every child_session_id that appears in a
-    // later RequesterWoken's `child_session_ids` array.
+    let mut already_woken: HashSet<(String, u32)> = HashSet::new();
+    // First pass: collect every (child_session_id, dispatch_epoch) pair
+    // that appears in a later RequesterWoken event. Pre-fix-1 wakes
+    // (no child_dispatch_epochs array) are treated as covering epoch 0
+    // so the on-disk audit log remains backward-compatible.
     for event in events {
-        if let Some(kind) = event_kind(event) {
-            if kind == REQUESTER_WOKEN {
-                if let Some(EventPayload::EvidenceSubmitted { fields, .. }) = Some(&event.payload) {
-                    if let Some(arr) = fields.get("child_session_ids").and_then(|v| v.as_array()) {
-                        for item in arr {
-                            if let Some(s) = item.as_str() {
-                                already_woken.insert(s.to_string());
-                            }
-                        }
-                    }
-                }
-            }
+        if event_kind(event) != Some(REQUESTER_WOKEN) {
+            continue;
+        }
+        let EventPayload::EvidenceSubmitted { fields, .. } = &event.payload else {
+            continue;
+        };
+        let Some(ids_arr) = fields.get("child_session_ids").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let epochs_arr = fields
+            .get("child_dispatch_epochs")
+            .and_then(|v| v.as_array());
+        for (idx, item) in ids_arr.iter().enumerate() {
+            let Some(id_str) = item.as_str() else {
+                continue;
+            };
+            let epoch = epochs_arr
+                .and_then(|arr| arr.get(idx))
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(0);
+            already_woken.insert((id_str.to_string(), epoch));
         }
     }
 
-    // Second pass: collect every ChildDispatched whose child_session_id
-    // is NOT in the already-woken set.
+    // Second pass: collect every ChildDispatched whose
+    // (child_session_id, dispatch_epoch) pair is NOT in the
+    // already-woken set.
     let mut open: Vec<OpenDispatch> = Vec::new();
     for event in events {
         if event_kind(event) != Some(CHILD_DISPATCHED) {
@@ -185,7 +216,12 @@ pub fn find_open_dispatches(events: &[Event]) -> Vec<OpenDispatch> {
         let Some(child_str) = fields.get("child_session_id").and_then(|v| v.as_str()) else {
             continue;
         };
-        if already_woken.contains(child_str) {
+        let dispatch_epoch = fields
+            .get("dispatch_epoch")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(0);
+        if already_woken.contains(&(child_str.to_string(), dispatch_epoch)) {
             continue;
         }
         let Ok(child_id) = ValidatedSessionId::new(child_str) else {
@@ -198,6 +234,7 @@ pub fn find_open_dispatches(events: &[Event]) -> Vec<OpenDispatch> {
         // populate as empty here and let the caller resolve.
         open.push(OpenDispatch {
             child_session_id: child_id,
+            dispatch_epoch,
             requested_by: String::new(),
             dispatch_seq: event.seq,
         });
@@ -255,6 +292,7 @@ pub fn find_wake_candidates(
         }
         candidates.push(WakeCandidate {
             child_session_id: o.child_session_id.clone(),
+            dispatch_epoch: o.dispatch_epoch,
             requested_by,
         });
     }
@@ -275,6 +313,7 @@ fn emit_one_wake_batch(
     sessions_dir: &Path,
     requested_by: &str,
     children: &[ValidatedSessionId],
+    epochs: &[u32],
     waker: &dyn SubstrateWaker,
     now: SystemTime,
 ) -> Result<(usize, usize, usize)> {
@@ -282,7 +321,12 @@ fn emit_one_wake_batch(
     if children.is_empty() {
         return Ok((0, 0, 0));
     }
-    let fields = requester_woken_fields(children, requested_by);
+    debug_assert_eq!(
+        children.len(),
+        epochs.len(),
+        "emit_one_wake_batch: epochs.len() must equal children.len()"
+    );
+    let fields = requester_woken_fields(children, epochs, requested_by);
     let payload = EventPayload::EvidenceSubmitted {
         state: "request_store.wake".to_string(),
         fields,
@@ -332,7 +376,7 @@ fn emit_one_wake_batch(
                 child.as_str(),
                 e
             );
-        } else if !sidecar_existed_before_release_via_check(&child_dir) {
+        } else if !sidecar_still_present(&child_dir) {
             sidecars_released += 1;
         }
     }
@@ -340,10 +384,13 @@ fn emit_one_wake_batch(
     Ok((1, wakes, sidecars_released))
 }
 
-/// Check the post-state of a sidecar release: returns `true` when the
-/// sidecar file no longer exists (so the release succeeded). Used to
-/// derive the `sidecars_released` count.
-fn sidecar_existed_before_release_via_check(child_dir: &Path) -> bool {
+/// Check whether the claim sidecar still exists on disk at the time
+/// of the call. Returns `true` when the file is present, `false` when
+/// `release_sidecar` succeeded in unlinking it (or it was already
+/// absent). The caller in `emit_one_wake_batch` negates the return to
+/// derive the `sidecars_released` count: a successful release leaves
+/// the sidecar absent, which is the `!sidecar_still_present` branch.
+fn sidecar_still_present(child_dir: &Path) -> bool {
     crate::engine::claim::sidecar_path(child_dir).exists()
 }
 
@@ -477,25 +524,27 @@ pub fn wake_candidates_pass(
     let open = find_open_dispatches(&events);
     let candidates = find_wake_candidates(koto_root, sessions_dir, &open);
 
-    // Group candidates by requested_by.
-    let mut by_requester: std::collections::BTreeMap<String, Vec<ValidatedSessionId>> =
+    // Group candidates by requested_by, threading dispatch_epoch in
+    // parallel so the emitted RequesterWoken carries the matching
+    // (id, epoch) pairs.
+    let mut by_requester: std::collections::BTreeMap<String, (Vec<ValidatedSessionId>, Vec<u32>)> =
         std::collections::BTreeMap::new();
     for c in candidates {
-        by_requester
-            .entry(c.requested_by)
-            .or_default()
-            .push(c.child_session_id);
+        let entry = by_requester.entry(c.requested_by).or_default();
+        entry.0.push(c.child_session_id);
+        entry.1.push(c.dispatch_epoch);
     }
 
     let mut events_emitted = 0usize;
     let mut wakes_invoked = recovery_wakes;
     let mut sidecars_released = 0usize;
-    for (requested_by, kids) in by_requester {
+    for (requested_by, (kids, epochs)) in by_requester {
         let (e, w, s) = emit_one_wake_batch(
             coord_state_file,
             sessions_dir,
             &requested_by,
             &kids,
+            &epochs,
             waker,
             now,
         )?;
@@ -623,11 +672,20 @@ mod tests {
     }
 
     fn build_child_dispatched_event(seq: u64, child_id: &str, timestamp: &str) -> Event {
+        build_child_dispatched_event_with_epoch(seq, child_id, 0, timestamp)
+    }
+
+    fn build_child_dispatched_event_with_epoch(
+        seq: u64,
+        child_id: &str,
+        dispatch_epoch: u32,
+        timestamp: &str,
+    ) -> Event {
         let mut fields: HashMap<String, serde_json::Value> = HashMap::new();
         fields.insert("kind".into(), serde_json::json!("ChildDispatched"));
         fields.insert("child_session_id".into(), serde_json::json!(child_id));
         fields.insert("coord_id".into(), serde_json::json!("coord-1"));
-        fields.insert("dispatch_epoch".into(), serde_json::json!(0));
+        fields.insert("dispatch_epoch".into(), serde_json::json!(dispatch_epoch));
         Event {
             seq,
             timestamp: timestamp.into(),
@@ -647,9 +705,24 @@ mod tests {
         requested_by: &str,
         timestamp: &str,
     ) -> Event {
+        // Default to all-zero epochs for the legacy convenience builder;
+        // tests covering re-dispatch supply epochs via the explicit
+        // builder below.
+        let epochs: Vec<u32> = vec![0; children.len()];
+        build_requester_woken_event_with_epochs(seq, children, &epochs, requested_by, timestamp)
+    }
+
+    fn build_requester_woken_event_with_epochs(
+        seq: u64,
+        children: &[&str],
+        epochs: &[u32],
+        requested_by: &str,
+        timestamp: &str,
+    ) -> Event {
         let mut fields: HashMap<String, serde_json::Value> = HashMap::new();
         fields.insert("kind".into(), serde_json::json!("RequesterWoken"));
         fields.insert("child_session_ids".into(), serde_json::json!(children));
+        fields.insert("child_dispatch_epochs".into(), serde_json::json!(epochs));
         fields.insert("requested_by".into(), serde_json::json!(requested_by));
         fields.insert("child_count".into(), serde_json::json!(children.len()));
         fields.insert(
@@ -721,6 +794,136 @@ mod tests {
         let open = find_open_dispatches(&events);
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].child_session_id.as_str(), "parent.task-c");
+    }
+
+    /// Regression test for the wake-filter (id, epoch) keying fix.
+    ///
+    /// Scenario: dispatch child A at epoch 0 → A terminal → wake fires
+    /// → epoch bumps via header rewrite → re-dispatch A at epoch 1 →
+    /// A terminal → a SECOND wake must fire (the prior wake recorded
+    /// `(A, 0)`, not bare `A`).
+    ///
+    /// Pre-fix bug: `already_woken` was keyed on bare `child_session_id`,
+    /// so the second `ChildDispatched(A, epoch=1)` was filtered against
+    /// the first wake's record and the second wake was silently
+    /// dropped. Post-fix the (id, epoch) pair survives the filter.
+    #[test]
+    fn find_open_dispatches_re_dispatch_at_higher_epoch_is_not_filtered_by_prior_wake() {
+        let events = vec![
+            // Epoch 0 dispatch + wake.
+            build_child_dispatched_event_with_epoch(
+                1,
+                "parent.task-a",
+                0,
+                "2026-05-24T00:00:01.000Z",
+            ),
+            build_requester_woken_event_with_epochs(
+                2,
+                &["parent.task-a"],
+                &[0],
+                "parent",
+                "2026-05-24T00:00:02.000Z",
+            ),
+            // Epoch 1 re-dispatch (no second wake yet).
+            build_child_dispatched_event_with_epoch(
+                3,
+                "parent.task-a",
+                1,
+                "2026-05-24T00:00:03.000Z",
+            ),
+        ];
+        let open = find_open_dispatches(&events);
+        assert_eq!(open.len(), 1, "second dispatch must surface as open");
+        assert_eq!(open[0].child_session_id.as_str(), "parent.task-a");
+        assert_eq!(open[0].dispatch_epoch, 1);
+    }
+
+    /// Companion to the regression test: after the SECOND wake fires
+    /// (covering the epoch=1 record), both (A, 0) and (A, 1) are
+    /// filtered and no further opens surface.
+    #[test]
+    fn find_open_dispatches_both_epoch_wakes_filter_completely() {
+        let events = vec![
+            build_child_dispatched_event_with_epoch(
+                1,
+                "parent.task-a",
+                0,
+                "2026-05-24T00:00:01.000Z",
+            ),
+            build_requester_woken_event_with_epochs(
+                2,
+                &["parent.task-a"],
+                &[0],
+                "parent",
+                "2026-05-24T00:00:02.000Z",
+            ),
+            build_child_dispatched_event_with_epoch(
+                3,
+                "parent.task-a",
+                1,
+                "2026-05-24T00:00:03.000Z",
+            ),
+            build_requester_woken_event_with_epochs(
+                4,
+                &["parent.task-a"],
+                &[1],
+                "parent",
+                "2026-05-24T00:00:04.000Z",
+            ),
+        ];
+        let open = find_open_dispatches(&events);
+        assert!(open.is_empty(), "both wakes should cover both dispatches");
+    }
+
+    /// Backward-compat: legacy `RequesterWoken` events written before
+    /// this fix do NOT carry a `child_dispatch_epochs` array. Pre-fix
+    /// wake records cover epoch 0 (the only epoch that existed on
+    /// disk pre-fix), so a legacy wake-of-A still filters
+    /// `ChildDispatched(A, epoch=0)` and DOES NOT filter
+    /// `ChildDispatched(A, epoch=1)`.
+    #[test]
+    fn find_open_dispatches_legacy_wake_without_epochs_array_covers_epoch_zero() {
+        // Hand-build a legacy wake event with no child_dispatch_epochs
+        // field, simulating an on-disk record from before this fix.
+        let mut legacy_wake_fields: HashMap<String, serde_json::Value> = HashMap::new();
+        legacy_wake_fields.insert("kind".into(), serde_json::json!("RequesterWoken"));
+        legacy_wake_fields.insert(
+            "child_session_ids".into(),
+            serde_json::json!(["parent.task-a"]),
+        );
+        legacy_wake_fields.insert("requested_by".into(), serde_json::json!("parent"));
+        legacy_wake_fields.insert("child_count".into(), serde_json::json!(1));
+        legacy_wake_fields.insert("summary".into(), serde_json::json!("1 children completed"));
+        let legacy_wake = Event {
+            seq: 2,
+            timestamp: "2026-05-24T00:00:02.000Z".into(),
+            event_type: "evidence_submitted".into(),
+            payload: EventPayload::EvidenceSubmitted {
+                state: "request_store.wake".into(),
+                fields: legacy_wake_fields,
+                submitter_cwd: None,
+            },
+            idempotency_hash: None,
+        };
+        let events = vec![
+            build_child_dispatched_event_with_epoch(
+                1,
+                "parent.task-a",
+                0,
+                "2026-05-24T00:00:01.000Z",
+            ),
+            legacy_wake,
+            build_child_dispatched_event_with_epoch(
+                3,
+                "parent.task-a",
+                1,
+                "2026-05-24T00:00:03.000Z",
+            ),
+        ];
+        let open = find_open_dispatches(&events);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].child_session_id.as_str(), "parent.task-a");
+        assert_eq!(open[0].dispatch_epoch, 1);
     }
 
     #[test]

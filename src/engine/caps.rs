@@ -313,7 +313,10 @@ pub fn measure_total_unassigned(
         // The header-is-truth rule (Issue 8's discovery integration)
         // says the index can lag the header; here we accept that lag
         // because a stale terminal entry is the safer direction
-        // (under-count) for the cap check.
+        // (under-count) for the cap check. See
+        // `src/engine/discovery.rs:393-405` for the header-is-truth
+        // fallthrough rule used by the scan path; caps deliberately
+        // diverges (accepts under-count as the safer direction).
         if terminal.contains_key(&info.id) {
             continue;
         }

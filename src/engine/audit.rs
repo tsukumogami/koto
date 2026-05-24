@@ -156,6 +156,7 @@ pub fn child_redelegated_fields(
 ///   "summary": "N children completed",
 ///   "child_count": <n>,
 ///   "child_session_ids": ["<child-1>", "<child-2>"],
+///   "child_dispatch_epochs": [<e1>, <e2>],
 ///   "requested_by": "<parent-session-id>"
 /// }
 /// ```
@@ -164,14 +165,24 @@ pub fn child_redelegated_fields(
 /// is `child_session_ids`; `summary` is purely human-readable
 /// scaffolding. The wake-candidates pass (Issue 15) consumes
 /// `child_session_ids` to determine which `ChildDispatched` events
-/// have already been woken. The helper signature takes
+/// have already been woken; `child_dispatch_epochs` is the parallel
+/// array of epochs so a re-dispatched child (same id, higher epoch)
+/// gets a fresh wake instead of being silently filtered by the bare-id
+/// match against an earlier wake. The helper signature takes
 /// `&[ValidatedSessionId]` so unvalidated ids cannot flow into either
-/// the array or the summary string.
+/// the array or the summary string. `epochs.len()` must equal
+/// `child_ids.len()`.
 pub fn requester_woken_fields(
     child_ids: &[ValidatedSessionId],
+    epochs: &[u32],
     requested_by: &str,
 ) -> HashMap<String, Value> {
-    let mut fields = HashMap::with_capacity(5);
+    debug_assert_eq!(
+        child_ids.len(),
+        epochs.len(),
+        "requester_woken_fields: epochs.len() must equal child_ids.len()"
+    );
+    let mut fields = HashMap::with_capacity(6);
     fields.insert("kind".to_string(), json!(REQUESTER_WOKEN));
     fields.insert(
         "summary".to_string(),
@@ -185,6 +196,7 @@ pub fn requester_woken_fields(
             .map(|id| id.as_str().to_string())
             .collect::<Vec<_>>()),
     );
+    fields.insert("child_dispatch_epochs".to_string(), json!(epochs));
     fields.insert("requested_by".to_string(), json!(requested_by));
     fields
 }
@@ -361,7 +373,8 @@ mod tests {
     #[test]
     fn requester_woken_round_trips_through_evidence_submitted() {
         let kids = [sid("parent.task-a"), sid("parent.task-b")];
-        let fields = requester_woken_fields(&kids, "parent");
+        let epochs = [0u32, 1u32];
+        let fields = requester_woken_fields(&kids, &epochs, "parent");
         assert_eq!(fields["kind"], json!("RequesterWoken"));
         assert_eq!(fields["child_count"], json!(2));
         assert_eq!(fields["summary"], json!("2 children completed"));
@@ -369,6 +382,7 @@ mod tests {
             fields["child_session_ids"],
             json!(["parent.task-a", "parent.task-b"])
         );
+        assert_eq!(fields["child_dispatch_epochs"], json!([0, 1]));
         assert_eq!(fields["requested_by"], json!("parent"));
         let payload = EventPayload::EvidenceSubmitted {
             state: "wake".to_string(),

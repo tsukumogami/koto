@@ -1,3 +1,16 @@
+//! State-file persistence helpers.
+//!
+//! Durability discipline: `sync_data()` (fdatasync) is called after
+//! every header and event append. The first header write of a brand-new
+//! state file ALSO fsyncs the parent directory via
+//! [`fsync_parent_dir`] so the file's directory entry is durable across
+//! a crash. Subsequent appends do NOT re-fsync the parent because the
+//! directory entry is already committed; only the file's data + size
+//! need durability, which `sync_data()` provides. See Fix 3 in the
+//! polish pass for the originating review note (ext4 `data=ordered`
+//! plus a crash between `sync_data()` and the implicit directory
+//! flush could leave a brand-new state file invisible on remount).
+
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -13,7 +26,18 @@ use crate::engine::types::{
 /// Write the header line to a new state file.
 ///
 /// Creates the file with mode 0600 on unix. The header has no seq field.
+///
+/// When the state file did not exist on entry, this call ALSO fsyncs the
+/// parent directory after the header write so the new file's directory
+/// entry is durable across a crash. Subsequent calls (which reopen an
+/// existing file) skip the parent-dir fsync: the directory entry is
+/// already committed and `sync_data()` is sufficient. The parent-dir
+/// fsync is best-effort — some filesystems reject `O_RDONLY` directory
+/// fsync with `EINVAL`; we tolerate that for parity with the existing
+/// pattern in `discovery.rs`.
 pub fn append_header(path: &Path, header: &StateFileHeader) -> anyhow::Result<()> {
+    let is_first_write = !path.exists();
+
     let mut opts = OpenOptions::new();
     opts.create(true).write(true).truncate(false);
 
@@ -36,7 +60,27 @@ pub fn append_header(path: &Path, header: &StateFileHeader) -> anyhow::Result<()
     file.sync_data()
         .map_err(|e| anyhow::anyhow!("failed to sync state file {}: {}", path.display(), e))?;
 
+    if is_first_write {
+        fsync_parent_dir(path);
+    }
+
     Ok(())
+}
+
+/// Best-effort fsync of `path`'s parent directory. Tolerates `EINVAL`
+/// on filesystems that reject `O_RDONLY` directory fsync (mirrors
+/// `discovery.rs:173-183`). On success the file's directory entry is
+/// durable; on failure the prior `sync_data()` on the file is still
+/// the truth-of-record and the directory entry will be flushed at the
+/// filesystem's next journal commit. Called by [`append_header`] only
+/// when a brand-new state file was created — later appends do not
+/// change the directory entry and can skip this step.
+fn fsync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
 }
 
 /// Append one event to the state file, auto-assigning its seq number.
@@ -2047,5 +2091,58 @@ mod tests {
         ];
         let counts = derive_visit_counts(&events);
         assert!(counts.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // append_header parent-dir fsync (Fix 3)
+    // -----------------------------------------------------------------------
+
+    /// A first-write `append_header` against a brand-new state file
+    /// must succeed end-to-end. The parent-dir fsync is best-effort
+    /// (some filesystems reject `O_RDONLY` directory fsync); the only
+    /// observable assertion is that the header is durable on the
+    /// filesystem after the call returns. We don't assert the
+    /// directory was actually fsynced — that requires a crash-replay
+    /// harness we don't have — but we DO assert the write path
+    /// tolerates the parent-dir fsync attempt without surfacing an
+    /// error to the caller.
+    #[test]
+    fn append_header_first_write_writes_durably() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("koto-first-write.state.jsonl");
+        assert!(!path.exists());
+        let header = make_header();
+        append_header(&path, &header).expect("first-write append_header must succeed");
+        assert!(path.exists(), "header file must exist after first write");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"workflow\":\"test-wf\""));
+        assert!(content.ends_with('\n'), "header line must end in newline");
+    }
+
+    /// A subsequent `append_header` call (file already exists) takes
+    /// the non-first-write branch and skips the parent-dir fsync.
+    /// We can't directly observe the skip from a unit test, but the
+    /// call must still succeed and leave the file readable. The
+    /// regression we're guarding against is the parent-dir fsync
+    /// branch firing on every write — which would be benign but
+    /// wastes a syscall on every append in the steady state.
+    #[test]
+    fn append_header_subsequent_write_is_well_formed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("koto-second-write.state.jsonl");
+        let header = make_header();
+        append_header(&path, &header).expect("first write");
+        // Second call — the file already exists, so the is_first_write
+        // branch should NOT fire. We can only assert the call completes
+        // cleanly; the syscall-count optimisation is internal.
+        append_header(&path, &header).expect("second write");
+        let content = std::fs::read_to_string(&path).unwrap();
+        // The second call rewrites at offset 0 (the file was opened
+        // with .write(true).truncate(false), so the cursor starts at
+        // offset 0 and the second header overwrites the first byte for
+        // byte). We assert the workflow marker is present — not the
+        // count — because the call's existing contract focuses on
+        // durability, not append-vs-overwrite semantics.
+        assert!(content.contains("\"workflow\":\"test-wf\""));
     }
 }

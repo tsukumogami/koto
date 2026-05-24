@@ -160,6 +160,23 @@ pub fn handle_prune(
         );
     }
 
+    // 10b. Second confirmation when --force is combined with --yes.
+    //      --yes alone covers the normal --terminal path; --force
+    //      bypasses the terminal-state gate and is destructive enough
+    //      to warrant a second explicit gate even when the operator
+    //      pre-consented. Requires typing the literal string
+    //      "force-prune" — exact match, no fuzziness, no case
+    //      insensitivity. EOF on stdin is treated as negative consent.
+    if yes && force && !confirm_force_prune()? {
+        exit_with_error_code(
+            json!({
+                "error": "force-prune aborted: confirmation phrase not entered",
+                "command": "workspace prune",
+            }),
+            2,
+        );
+    }
+
     // 11. Reclaim. Descendants first so a partial failure leaves the
     //     root visible in `koto workflows`.
     for id in &descendants {
@@ -273,11 +290,13 @@ fn derive_terminal_status(
     }
 }
 
-/// BFS over `SessionInfo.parent_workflow` to collect every transitive
-/// descendant of `root`. Result is in BFS order (children before
-/// grandchildren), which is also the safe removal order: leaves last
-/// would mean a failed removal mid-tree leaves orphaned children
-/// pointing at a removed parent.
+/// DFS over `SessionInfo.parent_workflow` to collect every transitive
+/// descendant of `root`. Removal safety depends on root-removed-last
+/// (the caller in `handle_prune` removes descendants first then the
+/// root), NOT on visit order — a failed removal mid-tree just leaves
+/// children rooted at a still-present parent until the next prune
+/// retry. The visit order is DFS as an implementation detail of
+/// `Vec::pop()`; BFS would be equally safe.
 fn collect_descendants(root: &str, sessions: &[SessionInfo]) -> Vec<String> {
     let mut descendants = Vec::new();
     let mut frontier: Vec<String> = vec![root.to_string()];
@@ -370,6 +389,34 @@ fn confirm_prune(prompt_required: bool) -> io::Result<bool> {
     }
     let trimmed = input.trim().to_lowercase();
     Ok(trimmed == "y" || trimmed == "yes")
+}
+
+/// Second-tier confirmation gate for `--yes --force`. Fires AFTER
+/// [`confirm_prune`] returns true and requires the operator to type
+/// the literal string `force-prune` (exact match, no case folding)
+/// before the destructive prune executes.
+///
+/// The terminal-state safety gate (refusing to prune a non-terminal
+/// root without `--force`) is the first line of defense. `--yes` lets
+/// cron skip the standard y/N prompt. The combination of `--yes` AND
+/// `--force` removes both gates; this helper is the manual override
+/// that ensures the operator INTENDS to force-prune and isn't running
+/// a templated cron with `--force` baked in by accident.
+fn confirm_force_prune() -> io::Result<bool> {
+    println!();
+    println!("WARNING: --force bypasses the terminal-state safety gate.");
+    println!(
+        "         A force-prune of a live tree corrupts any coordinator still holding a claim."
+    );
+    print!("Type 'force-prune' to confirm: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    let n = io::stdin().read_line(&mut input)?;
+    if n == 0 {
+        return Ok(false); // EOF
+    }
+    // Trim trailing newline but keep case + body. Exact match only.
+    Ok(input.trim_end_matches(['\n', '\r']) == "force-prune")
 }
 
 #[cfg(test)]

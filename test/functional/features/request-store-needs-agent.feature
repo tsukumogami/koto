@@ -80,3 +80,22 @@ Feature: koto session start --needs-agent companion-flag validation
     Then the exit code is 0
     And the JSON output field "name" equals "child"
     And the JSON output field "needs_agent" is false
+
+  Scenario: koto next on unclaimed needs-agent child surfaces typed error
+    # An unclaimed needs-agent session has needs_agent=true,
+    # assignment_claim=null, and a WorkflowInitialized event with
+    # empty template_path (the coordinator fills it later via the
+    # request-store dispatch path). Ticking the child directly with
+    # `koto next` cannot make progress; pre-fix the path surfaced
+    # "corrupt state file: cannot derive current state", which blamed
+    # the child for what is actually an operator-routing issue.
+    # Post-fix the path returns exit code 66 (EX_NOINPUT) with a
+    # `needs_agent_not_dispatched` typed error.
+    Given I run:
+      """
+      koto session start unclaimed-child --parent parent --needs-agent --role reviewer --template verdict --inputs {} --coordinator-of-record parent
+      """
+    When I run "koto next unclaimed-child"
+    Then the exit code is 66
+    And the output contains "needs_agent_not_dispatched"
+    And the output contains "has not been claimed/dispatched yet"

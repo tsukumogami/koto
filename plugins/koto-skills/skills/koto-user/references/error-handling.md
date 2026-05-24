@@ -70,11 +70,18 @@ All `koto next` error codes, their exit codes, and what to do:
 | `workflow_not_initialized` | 2 | No | Named workflow does not exist | Run `koto init` first, or check the workflow name |
 | `template_error` | 3 | No | Template parse failure, hash mismatch, or cycle detected | Report to user; this requires human intervention |
 | `persistence_error` | 3 | No | State file I/O failure or corruption | Report to user; this is an infrastructure problem |
+| `needs_agent_not_dispatched` | 66 | No | `koto next` was called against a `--needs-agent` child that the coordinator has not yet claimed/dispatched | Stop ticking the child directly; route through the coordinator's `koto next` on the parent root instead |
 
 Note: `gate_blocked` and `integration_unavailable` appear both as `error.code` values
 (when `koto next` produces an error response) and as `action` values (when `koto next`
 produces a successful response). The successful response shape includes `blocking_conditions`
 detail; the error shape does not. Check the exit code to distinguish them.
+
+Exit code 66 corresponds to `EX_NOINPUT` from sysexits.h — the session
+has no usable input (no template path yet) because it is awaiting
+dispatch. This is distinct from `persistence_error` (exit 3, infra
+issue) because the fix is an operator-routing one: tick the parent,
+not the child.
 
 ---
 

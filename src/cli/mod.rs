@@ -265,8 +265,15 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         yes: bool,
 
-        /// Bypass the terminal-state safety gate. Still requires
-        /// `--yes` or an interactive confirmation.
+        /// DANGER: bypasses the terminal-state safety gate. Prunes a
+        /// session tree even if a descendant is currently being
+        /// dispatched. Use only when you know the tree is abandoned
+        /// (e.g., orphan from a crashed run that never reached
+        /// terminal). A force-prune of a live tree corrupts any
+        /// coordinator still holding a claim against it. Combined
+        /// with `--yes`, this flag still triggers a second
+        /// confirmation prompt requiring the literal string
+        /// `force-prune` to proceed.
         #[arg(long)]
         force: bool,
     },
@@ -2218,6 +2225,50 @@ fn handle_next(
         };
         let json = serde_json::json!({"error": err});
         exit_with_error_code(json, err.code.exit_code());
+    }
+
+    // Detect the unclaimed-needs-agent case BEFORE derive_machine_state.
+    //
+    // A needs-agent child created via `koto session start --needs-agent
+    // ...` writes a header with `needs_agent = Some(true)` and a
+    // `WorkflowInitialized` event whose `template_path` is empty (the
+    // template is materialized later by the dispatching coordinator,
+    // not at session-start time — see `cli/session.rs::handle_start`).
+    // Until the coordinator claims and dispatches the child via the
+    // request-store protocol, `koto next <child>` cannot make progress:
+    // there is no template to read, no state to derive, no work to do.
+    //
+    // Pre-fix the path fell through to `derive_machine_state`, which
+    // returned `None` because the `WorkflowInitialized.template_path`
+    // was empty, and the caller surfaced "corrupt state file: cannot
+    // derive current state". That message blamed the session for a
+    // condition the operator can fix from the OUTSIDE (route through
+    // the coordinator's `koto next` on the parent root). Now we
+    // surface a typed error with exit code 66 (EX_NOINPUT) so callers
+    // can pattern-match and route operators to the right next step.
+    let is_unclaimed_needs_agent = header.needs_agent == Some(true)
+        && header.assignment_claim.is_none()
+        && events.iter().any(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::WorkflowInitialized { template_path, .. } if template_path.is_empty()
+            )
+        });
+    if is_unclaimed_needs_agent {
+        let json = serde_json::json!({
+            "error": {
+                "code": "needs_agent_not_dispatched",
+                "message": format!(
+                    "session '{}' is in needs-agent state and has not been claimed/dispatched yet; \
+                     the coordinator must claim and dispatch this session via the request-store \
+                     protocol before it can be ticked directly. Run `koto next` against the \
+                     parent coordinator workflow instead.",
+                    name
+                ),
+                "details": [],
+            }
+        });
+        exit_with_error_code(json, 66);
     }
 
     // Construct variable bindings from the WorkflowInitialized event.

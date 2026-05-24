@@ -143,6 +143,91 @@ The verb does NOT delete session directories under
 `~/.koto/sessions/`. Session cleanup is the
 operator-driven `koto session cleanup <session-id>` path.
 
+### Sizing your prune cadence
+
+Concrete per-session on-disk costs (measurements taken on the
+reference Linux/ext4 setup, average-case workloads):
+
+- **State-file header line:** ~500 bytes (varies with `requested_by`,
+  `coordinator_of_record`, `assignment_claim` populated).
+- **Event log:** typically 5-50 KB per session depending on workflow
+  depth. A 5-state linear workflow with one `evidence_submitted` per
+  state lands around 5 KB; a /shirabe:design workflow with parallel
+  dispatch and per-state confirmations lands around 30-50 KB.
+- **Claim sidecar (`claim.lock`):** ~150 bytes (request-store dispatched
+  children only; plain children carry no sidecar).
+- **Per-coordinator scan cursor (`scan_cursor.toml`):** ~200 bytes.
+
+We use a 10 KB per-session estimate below as the typical median when
+mixing /work-on, /design, and /decision workflows.
+
+**Worked example — 100 workflows/day at typical depth:**
+
+- 100 × 10 KB = ~1 MB/day = ~7 MB/week = ~30 MB/month.
+- Weekly prune cadence keeps the workspace under ~7 MB steady-state.
+- Monthly prune cadence keeps it under ~30 MB.
+
+**Worked example — 1000 workflows/day at typical depth:**
+
+- 1000 × 10 KB = ~10 MB/day = ~70 MB/week = ~300 MB/month.
+- Weekly prune cadence keeps the workspace under ~70 MB steady-state.
+- Daily prune cadence keeps it under ~10 MB.
+
+**Recommended cadence by workload tier:**
+
+| Workload | Typical workflows/day | Recommended cadence |
+|----------|----------------------|---------------------|
+| Low (solo, occasional) | 1-10 | Monthly |
+| Medium (active solo / small team) | 10-200 | Weekly |
+| High (team or CI-driven) | 200-2000 | Daily |
+| Very high (LLM agents at scale) | > 2000 | Twice-daily or hourly |
+
+The cron snippet above runs once a week. For higher cadences, switch
+the cron expression to `0 2 * * *` (daily) or `0 */6 * * *`
+(every 6 hours).
+
+### Sizing the stale-claim timeout
+
+The `request_store.stale_claim_timeout_seconds` config dimension
+(default 600s / 10 min) controls when Issue 11's recovery walk
+treats a still-held claim as stale and unlinks the sidecar so a
+fresh coordinator can re-claim. Set this too low and you'll
+false-positive on legitimate long-running work; set it too high and
+a crashed coordinator's sidecar lingers, blocking the affected
+children indefinitely.
+
+**Typical claim-to-terminal durations by workload type:**
+
+- **Short tool runs (lints, formatters, status checks):** 30-60s.
+- **Medium reviews (/work-on, /design subroutines):** 2-5 min.
+- **Long /decision phases (multi-agent bake-offs, peer review):**
+  5-30 min.
+- **Respawn-heavy workloads (LLM-driven loops with retries):**
+  can legitimately exceed 30 min.
+
+**Cost of a false-redelegation** (timeout fires while the original
+agent is still working): both the original AND the re-dispatched
+agent burn LLM tokens; the audit log records spurious
+`ChildRedelegated` events; idempotency-hash collisions can surface
+on the next event-write attempt; in extreme cases the original's
+terminal write races the re-dispatch's claim. None corrupt state —
+the request-store contract handles the race — but the operational
+noise is high.
+
+**Recommendation:** set the timeout to your **typical claim duration
+plus a 3-5x safety multiplier**.
+
+- Medium-depth review workloads → keep the default 600s (10 min).
+- Long-decision workloads → bump to **3600s (60 min) or higher**.
+- Respawn-heavy LLM workloads → bump to **7200s+ (2 hours)** and
+  rely on the substrate's own crash-detection rather than the
+  request-store timeout.
+
+```bash
+# Set the timeout to 1 hour for long-decision workloads
+koto config set request_store.stale_claim_timeout_seconds 3600 --user
+```
+
 ## When to delete manually
 
 The supported flow is `koto workspace prune`. Manual deletion is a

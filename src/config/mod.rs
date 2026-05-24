@@ -187,6 +187,58 @@ pub fn set_value_in_toml(doc: &mut toml::Value, key: &str, value: &str) -> Resul
             let cloud_table = cloud.as_table_mut().ok_or("cloud is not a table")?;
             cloud_table.insert(field.to_string(), toml::Value::String(value.to_string()));
         }
+        "request_store.stale_claim_timeout_seconds"
+        | "request_store.stale_dispatch_timeout_seconds"
+        | "request_store.coord_cursor_ttl_days"
+        | "request_store.terminal_index_compact_lines"
+        | "request_store.compact_lock_timeout_seconds"
+        | "request_store.directive_batch_size"
+        | "request_store.respawn_generation_cap"
+        | "request_store.redelegation_cap" => {
+            let field = key.strip_prefix("request_store.").unwrap();
+            let parsed: i64 = value
+                .parse()
+                .map_err(|e| format!("value for {} must parse as an integer: {}", key, e))?;
+            if parsed < 0 {
+                return Err(format!(
+                    "value for {} must be non-negative (got {})",
+                    key, parsed
+                ));
+            }
+            let rs = table
+                .entry("request_store")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            let rs_table = rs.as_table_mut().ok_or("request_store is not a table")?;
+            rs_table.insert(field.to_string(), toml::Value::Integer(parsed));
+        }
+        k if k.starts_with("request_store.recursion.") => {
+            // The recursion namespace is reserved-but-ignored at V1
+            // (the runtime caps are hard-coded in src/engine/caps.rs).
+            // We still let operators write under it so they can stage
+            // intended values for the V1.1 promotion. Values are
+            // parsed as integers when they look like integers, falling
+            // back to a string write otherwise; the resolver emits a
+            // warn-level log on read.
+            let field = k.strip_prefix("request_store.recursion.").unwrap();
+            if field.is_empty() || field.contains('.') {
+                return Err(format!("unknown config key: {}", key));
+            }
+            let toml_value = match value.parse::<i64>() {
+                Ok(n) => toml::Value::Integer(n),
+                Err(_) => toml::Value::String(value.to_string()),
+            };
+            let rs = table
+                .entry("request_store")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            let rs_table = rs.as_table_mut().ok_or("request_store is not a table")?;
+            let recursion = rs_table
+                .entry("recursion")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            let recursion_table = recursion
+                .as_table_mut()
+                .ok_or("request_store.recursion is not a table")?;
+            recursion_table.insert(field.to_string(), toml_value);
+        }
         _ => return Err(format!("unknown config key: {}", key)),
     }
     Ok(())
@@ -217,6 +269,38 @@ pub fn unset_value_in_toml(doc: &mut toml::Value, key: &str) -> Result<bool, Str
                     if let Some(cloud) = st.get_mut("cloud") {
                         if let Some(ct) = cloud.as_table_mut() {
                             return Ok(ct.remove(field).is_some());
+                        }
+                    }
+                }
+            }
+            Ok(false)
+        }
+        "request_store.stale_claim_timeout_seconds"
+        | "request_store.stale_dispatch_timeout_seconds"
+        | "request_store.coord_cursor_ttl_days"
+        | "request_store.terminal_index_compact_lines"
+        | "request_store.compact_lock_timeout_seconds"
+        | "request_store.directive_batch_size"
+        | "request_store.respawn_generation_cap"
+        | "request_store.redelegation_cap" => {
+            let field = key.strip_prefix("request_store.").unwrap();
+            if let Some(rs) = table.get_mut("request_store") {
+                if let Some(rs_table) = rs.as_table_mut() {
+                    return Ok(rs_table.remove(field).is_some());
+                }
+            }
+            Ok(false)
+        }
+        k if k.starts_with("request_store.recursion.") => {
+            let field = k.strip_prefix("request_store.recursion.").unwrap();
+            if field.is_empty() || field.contains('.') {
+                return Err(format!("unknown config key: {}", key));
+            }
+            if let Some(rs) = table.get_mut("request_store") {
+                if let Some(rs_table) = rs.as_table_mut() {
+                    if let Some(recursion) = rs_table.get_mut("recursion") {
+                        if let Some(recursion_table) = recursion.as_table_mut() {
+                            return Ok(recursion_table.remove(field).is_some());
                         }
                     }
                 }
@@ -380,5 +464,146 @@ mod tests {
         let redacted = redact(&config);
         assert!(redacted.session.cloud.access_key.is_none());
         assert!(redacted.session.cloud.secret_key.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // request_store.* set/unset coverage (Fix 4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_value_request_store_redelegation_cap() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        set_value_in_toml(&mut doc, "request_store.redelegation_cap", "5").unwrap();
+        let cfg: KotoConfig = doc.try_into().unwrap();
+        assert_eq!(cfg.request_store.redelegation_cap, 5);
+    }
+
+    #[test]
+    fn test_set_value_request_store_all_top_level_dimensions() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        set_value_in_toml(
+            &mut doc,
+            "request_store.stale_claim_timeout_seconds",
+            "1200",
+        )
+        .unwrap();
+        set_value_in_toml(
+            &mut doc,
+            "request_store.stale_dispatch_timeout_seconds",
+            "900",
+        )
+        .unwrap();
+        set_value_in_toml(&mut doc, "request_store.coord_cursor_ttl_days", "14").unwrap();
+        set_value_in_toml(
+            &mut doc,
+            "request_store.terminal_index_compact_lines",
+            "50000",
+        )
+        .unwrap();
+        set_value_in_toml(
+            &mut doc,
+            "request_store.compact_lock_timeout_seconds",
+            "7200",
+        )
+        .unwrap();
+        set_value_in_toml(&mut doc, "request_store.directive_batch_size", "100").unwrap();
+        set_value_in_toml(&mut doc, "request_store.respawn_generation_cap", "3").unwrap();
+        let cfg: KotoConfig = doc.try_into().unwrap();
+        assert_eq!(cfg.request_store.stale_claim_timeout_seconds, 1200);
+        assert_eq!(cfg.request_store.stale_dispatch_timeout_seconds, 900);
+        assert_eq!(cfg.request_store.coord_cursor_ttl_days, 14);
+        assert_eq!(cfg.request_store.terminal_index_compact_lines, 50_000);
+        assert_eq!(cfg.request_store.compact_lock_timeout_seconds, 7200);
+        assert_eq!(cfg.request_store.directive_batch_size, 100);
+        assert_eq!(cfg.request_store.respawn_generation_cap, 3);
+    }
+
+    #[test]
+    fn test_set_value_request_store_recursion_nested_namespace() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        set_value_in_toml(&mut doc, "request_store.recursion.max_depth", "10").unwrap();
+        set_value_in_toml(&mut doc, "request_store.recursion.max_breadth", "20").unwrap();
+        let cfg: KotoConfig = doc.try_into().unwrap();
+        // The recursion table parses into Option<toml::Value> by Decision 4;
+        // we assert it's present + carries the two keys.
+        let recursion = cfg
+            .request_store
+            .recursion
+            .as_ref()
+            .expect("recursion table must parse");
+        let recursion_table = recursion.as_table().expect("recursion is a table");
+        assert_eq!(
+            recursion_table
+                .get("max_depth")
+                .and_then(|v| v.as_integer()),
+            Some(10)
+        );
+        assert_eq!(
+            recursion_table
+                .get("max_breadth")
+                .and_then(|v| v.as_integer()),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn test_set_value_request_store_rejects_non_integer() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        let err = set_value_in_toml(&mut doc, "request_store.redelegation_cap", "five")
+            .expect_err("string must reject");
+        assert!(err.contains("must parse as an integer"));
+    }
+
+    #[test]
+    fn test_set_value_request_store_rejects_negative() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        let err = set_value_in_toml(&mut doc, "request_store.redelegation_cap", "-1")
+            .expect_err("negative must reject");
+        assert!(err.contains("non-negative"));
+    }
+
+    #[test]
+    fn test_set_value_request_store_bogus_key_rejects() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        let err = set_value_in_toml(&mut doc, "request_store.bogus", "5")
+            .expect_err("unknown key must reject");
+        assert!(err.contains("unknown config key"));
+    }
+
+    #[test]
+    fn test_set_value_request_store_recursion_deep_nesting_rejects() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        let err = set_value_in_toml(&mut doc, "request_store.recursion.a.b", "5")
+            .expect_err("deeper nesting must reject");
+        assert!(err.contains("unknown config key"));
+    }
+
+    #[test]
+    fn test_get_value_request_store_after_set() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        set_value_in_toml(&mut doc, "request_store.redelegation_cap", "7").unwrap();
+        let cfg: KotoConfig = doc.try_into().unwrap();
+        assert_eq!(
+            get_value(&cfg, "request_store.redelegation_cap"),
+            Some("7".to_string())
+        );
+    }
+
+    #[test]
+    fn test_unset_value_request_store_round_trips() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        set_value_in_toml(&mut doc, "request_store.redelegation_cap", "5").unwrap();
+        let removed = unset_value_in_toml(&mut doc, "request_store.redelegation_cap").unwrap();
+        assert!(removed);
+        let again = unset_value_in_toml(&mut doc, "request_store.redelegation_cap").unwrap();
+        assert!(!again, "second unset returns false");
+    }
+
+    #[test]
+    fn test_unset_value_request_store_recursion() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        set_value_in_toml(&mut doc, "request_store.recursion.max_depth", "10").unwrap();
+        let removed = unset_value_in_toml(&mut doc, "request_store.recursion.max_depth").unwrap();
+        assert!(removed);
     }
 }

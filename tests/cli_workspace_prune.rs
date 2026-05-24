@@ -193,6 +193,10 @@ fn cancelled_workflow_proceeds_with_yes() {
 
 #[test]
 fn force_bypasses_terminal_gate_with_yes() {
+    // `--yes --force` triggers the polish-pass second confirmation
+    // prompt that demands the literal `force-prune` string before the
+    // destructive operation runs. We drive stdin with the phrase to
+    // satisfy the prompt.
     let dir = TempDir::new().unwrap();
     init_workflow(dir.path(), "live-wf", non_terminal_template());
 
@@ -205,15 +209,70 @@ fn force_bypasses_terminal_gate_with_yes() {
             "--force",
             "--yes",
         ])
+        .write_stdin("force-prune\n")
         .output()
         .unwrap();
     assert!(
         out.status.success(),
-        "--force --yes must bypass terminal gate: stdout={} stderr={}",
+        "--force --yes (with force-prune phrase) must bypass terminal gate: stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!session_dir(dir.path(), "live-wf").exists());
+}
+
+#[test]
+fn force_yes_aborts_when_phrase_not_entered() {
+    // The polish-pass second confirmation: --yes --force without the
+    // literal "force-prune" phrase aborts at exit code 2 and leaves
+    // the session intact.
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "live-wf", non_terminal_template());
+
+    let out = koto_cmd(dir.path())
+        .args([
+            "workspace",
+            "prune",
+            "--root",
+            "live-wf",
+            "--force",
+            "--yes",
+        ])
+        .write_stdin("yes\n") // Wrong phrase.
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--yes --force without 'force-prune' phrase must abort with exit 2"
+    );
+    assert!(
+        session_dir(dir.path(), "live-wf").exists(),
+        "session must remain when force-prune phrase is not entered"
+    );
+}
+
+#[test]
+fn force_yes_aborts_on_empty_stdin() {
+    // EOF on stdin counts as negative consent to the second
+    // confirmation, same as the first confirmation.
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "live-wf", non_terminal_template());
+
+    let out = koto_cmd(dir.path())
+        .args([
+            "workspace",
+            "prune",
+            "--root",
+            "live-wf",
+            "--force",
+            "--yes",
+        ])
+        .write_stdin("")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(session_dir(dir.path(), "live-wf").exists());
 }
 
 #[test]

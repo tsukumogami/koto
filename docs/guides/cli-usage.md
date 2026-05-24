@@ -740,6 +740,93 @@ koto version
 {"version":"0.1.0","commit":"abc1234","built_at":"2026-03-14T00:00:00Z"}
 ```
 
+### workspace prune
+
+Reclaims a workspace tree rooted at a terminal session. The verb reads the root header, verifies the workflow has reached a terminal state (`completed` or `abandoned`), walks descendants via the session backend's `list()` filtered by `parent_workflow`, and removes the directories after operator confirmation.
+
+```bash
+koto workspace prune --root <session-id> [--dry-run] [--yes] [--force]
+```
+
+**Required:**
+- `--root <session-id>` -- Root session id of the tree to prune. Must be a valid session id (the same allowlist `session start` enforces).
+
+**Optional:**
+- `--dry-run` -- Print the descendant set and exit 0 without reclaiming. Useful for inspecting what would be removed before committing.
+- `--yes` -- Skip the interactive confirmation prompt. Required for cron-friendly invocation.
+- `--force` -- Bypass the terminal-state safety gate. Allows pruning a tree whose root has NOT reached a terminal state. **Dangerous: a force-prune of a tree that still has a coordinator holding a claim corrupts that coordinator's view of the workspace.** Combining `--yes` with `--force` adds a second confirmation prompt that requires typing the literal string `force-prune` to proceed.
+
+**Symlink refusal:** the verb `lstat()`s the root before any directory traversal. A root that is a symlink (pointing inside or outside `~/.koto/`) is rejected categorically with exit code 2 — this is a workspace-escape mitigation.
+
+**Terminal-state safety gate:** without `--force`, the verb refuses to prune a tree whose root has not reached `completed` or `abandoned`. The error names the current state so the operator can decide whether to wait or force.
+
+**JSON output (success):**
+
+```json
+{
+  "name": "my-workflow",
+  "pruned": true,
+  "descendants_removed": 3,
+  "cursors_gc": 1
+}
+```
+
+`cursors_gc` is the count of stale `~/.koto/coordinators/<id>/scan_cursor.toml` files reclaimed as part of the prune run. See `docs/workspace-layout.md` for the full derived-file catalog and the prune-cadence sizing guide.
+
+**Cron-friendly invocation:**
+
+```bash
+# Weekly Sunday at 02:00, suppressing the JSON output to silence cron mail.
+0 2 * * 0 /usr/local/bin/koto workspace prune --root <id> --yes >/dev/null 2>&1
+```
+
+### session start
+
+Creates a child session under a named parent. Drives two distinct on-disk shapes via a companion-flag contract.
+
+```bash
+koto session start <name> --parent <parent>
+  [--needs-agent --role <r> --template <t> --inputs <json>]
+  [--coordinator-of-record <coord-id>]
+```
+
+**Required positional:**
+- `<name>` -- Name of the new child session. Validated against the same allowlist used by `koto init`.
+
+**Required flag:**
+- `--parent <parent>` -- Name of the parent workflow this session is a child of. Validated as a session id.
+
+**Companion-flag contract for the request-store dispatch flow:**
+- `--needs-agent` (boolean) -- Mark the session as awaiting agent dispatch. Writes `needs_agent = true` to the header.
+- `--role <r>`, `--template <t>`, `--inputs <json>` -- All three are REQUIRED when `--needs-agent` is set. Any of them passed WITHOUT `--needs-agent` is rejected with a parse-time error naming the missing companion.
+- `--coordinator-of-record <coord-id>` -- Optional. Defaults to the parent's recorded `coordinator_of_record`, falling back to the parent's session id when the parent is itself pre-request-store.
+
+**Two shapes:**
+1. **Plain start** — `--needs-agent` omitted and all four dispatch flags omitted. The header carries no dispatch-request marker.
+2. **Dispatch-request start** — `--needs-agent` set along with `--role`, `--template`, `--inputs`. The header writes the dispatch-request fields; a coordinator can claim the session via the request-store protocol on its next `koto next` tick.
+
+**Inputs validation:** `--inputs` must be valid JSON, ≤ 1 MiB, and nested ≤ 128 levels deep. Rejection is exit code 2.
+
+**JSON output:**
+
+```json
+{
+  "name": "task-42-child-a",
+  "parent": "task-42",
+  "needs_agent": true
+}
+```
+
+When a `koto next` tick lands on a needs-agent child that has not yet been claimed, koto returns exit code 66 (EX_NOINPUT) with the typed error `needs_agent_not_dispatched` rather than the historical `corrupt state file` message. Route ticks through the coordinator's `koto next` on the parent root instead.
+
+### next --redelegation-cap
+
+The `koto next` verb accepts `--redelegation-cap <n>` to override the resolved `request_store.redelegation_cap` (default 3) for the current tick. Useful for one-off operator-driven retries when a respawn-heavy workload temporarily exceeds the steady-state cap. The override does NOT persist; subsequent ticks fall back to the resolved value.
+
+### next --dispatch-epoch
+
+The `koto next` verb accepts `--dispatch-epoch <n>` to write the current tick's `ChildDispatched` audit event with the supplied dispatch epoch. Used by recovery walks (Issue 11 cases 3b/3c) when a header rewrite has bumped a child's epoch and the coordinator's log needs to record the bump as a fresh dispatch.
+
 ## Typical agent workflow
 
 The standard loop for an AI agent dispatches on the `action` field:
