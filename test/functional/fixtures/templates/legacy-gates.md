@@ -10,15 +10,7 @@ states:
       ci_check:
         type: command
         command: "true"
-    accepts:
-      status:
-        type: enum
-        values: [done]
-        required: true
     transitions:
-      - target: complete
-        when:
-          status: done
       - target: complete
   complete:
     terminal: true
