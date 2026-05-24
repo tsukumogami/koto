@@ -39,6 +39,28 @@ jobs:
       - name: Run tests
         run: cargo test -- --test-threads=1
 
+  stability-tests:
+    # KT1 Issue 20: external-consumer compile-check fixture for the
+    # Stage 1 frozen public surface. The `koto-stability-tests` crate
+    # imports every promised export via `use koto::engine::types::*`
+    # and `koto::error::Error`, plus exercises the four frozen
+    # SessionBackend methods through a trait object. A breaking
+    # change to the locked surface fails this job before it reaches
+    # a release.
+    #
+    # See docs/STABILITY.md for the bump protocol.
+    name: Stability Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run external-consumer stability tests
+        run: cargo test -p koto-stability-tests -- --test-threads=1
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -213,7 +235,7 @@ jobs:
 
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, fmt, clippy, audit, tsuku-distributed-install, cloud-integration, discovery-bench, recursion-caps-bench]
+    needs: [check-artifacts, unit-tests, stability-tests, fmt, clippy, audit, tsuku-distributed-install, cloud-integration, discovery-bench, recursion-caps-bench]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -221,6 +243,7 @@ jobs:
         run: |
           if [ "${{ needs.check-artifacts.result }}" = "failure" ] || \
              [ "${{ needs.unit-tests.result }}" = "failure" ] || \
+             [ "${{ needs.stability-tests.result }}" = "failure" ] || \
              [ "${{ needs.fmt.result }}" = "failure" ] || \
              [ "${{ needs.clippy.result }}" = "failure" ] || \
              [ "${{ needs.audit.result }}" = "failure" ] || \

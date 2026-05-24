@@ -1,0 +1,27 @@
+[package]
+name = "koto-stability-tests"
+# Independent versioning — this fixture crate is not published. The
+# version is pinned at 0.0.0 so it never accidentally surfaces in a
+# release artifact. Bumping it has no effect on koto's semver.
+version = "0.0.0"
+edition = "2021"
+description = "External-consumer compile-check fixture for koto's Stage 1 frozen public surface (KT1 Issue 20)"
+publish = false
+
+[dependencies]
+# KT1 Issue 20: depend on koto via `path = ".."` so workspace-internal
+# `cargo test -p koto-stability-tests` resolves against the
+# in-source koto build. The alternative (`version = "0.10.0"`,
+# registry-pin) breaks workspace-internal verification until the
+# crate is actually published; path-dep is the right call for an
+# internal compile-check fixture.
+koto = { path = ".." }
+
+[dev-dependencies]
+# tempfile is the only runtime dep the smoke test needs — it gives
+# LocalBackend a real-but-disposable koto_root. Inherits the version
+# bound from koto's own dev-dep on tempfile (3.x).
+tempfile = "3"
+# serde_json is used by the EventPayload::Unknown smoke test which
+# constructs a raw payload value. Matches koto's own serde_json pin.
+serde_json = "1"
