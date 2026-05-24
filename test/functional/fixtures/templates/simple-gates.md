@@ -21,11 +21,15 @@ states:
     transitions:
       - target: done
         when:
+          gates.check_file.exit_code: 0
+      - target: done
+        when:
+          gates.check_file.exit_code: 1
           status: completed
       - target: done
         when:
+          gates.check_file.exit_code: 1
           status: override
-      - target: done
   done:
     terminal: true
 ---

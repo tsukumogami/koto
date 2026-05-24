@@ -4093,12 +4093,17 @@ fn export_simple_gates_fixture_has_gate_and_when_labels() {
 
     // When conditions on transitions
     assert!(
-        mermaid.contains("start --> done : status: completed"),
+        mermaid.contains("start --> done : gates.check_file.exit_code: 0"),
+        "should have labeled transition for gate-pass route, got:\n{}",
+        mermaid
+    );
+    assert!(
+        mermaid.contains("start --> done : gates.check_file.exit_code: 1, status: completed"),
         "should have labeled transition for status: completed, got:\n{}",
         mermaid
     );
     assert!(
-        mermaid.contains("start --> done : status: override"),
+        mermaid.contains("start --> done : gates.check_file.exit_code: 1, status: override"),
         "should have labeled transition for status: override, got:\n{}",
         mermaid
     );
