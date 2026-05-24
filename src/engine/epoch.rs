@@ -152,6 +152,7 @@ mod tests {
             requested_by: Some("requester-1".into()),
             assignment_claim: None,
             dispatch_epoch: epoch,
+            respawn_generation: None,
             priority: None,
             deadline: None,
             retry_count: None,

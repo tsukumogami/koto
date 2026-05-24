@@ -324,6 +324,7 @@ pub fn handle_start(
         deadline: None,
         retry_count: None,
         agent_config: None,
+        respawn_generation: None,
     };
 
     // For a plain `koto session start` (no `--needs-agent`), the

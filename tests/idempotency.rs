@@ -50,6 +50,7 @@ fn write_session_file(dir: &Path, session_id: &str) -> PathBuf {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        respawn_generation: None,
     };
     append_header(&path, &header).unwrap();
     path

@@ -400,6 +400,7 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
         deadline: None,
         retry_count: None,
         agent_config: None,
+        respawn_generation: None,
     };
     seed_backend
         .init_state_file(parent, parent_header, Vec::new())
@@ -430,6 +431,7 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
         deadline: None,
         retry_count: None,
         agent_config: None,
+        respawn_generation: None,
     };
     let init_event = Event {
         seq: 1,

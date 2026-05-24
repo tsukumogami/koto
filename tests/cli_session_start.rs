@@ -45,6 +45,7 @@ fn init_parent_backend(dir: &std::path::Path, parent: &str) -> LocalBackend {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        respawn_generation: None,
     };
     let init_payload = EventPayload::WorkflowInitialized {
         template_path: String::new(),
