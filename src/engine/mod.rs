@@ -3,6 +3,8 @@
 pub mod advance;
 pub mod audit;
 pub mod batch_validation;
+#[cfg(unix)]
+pub mod claim;
 pub mod discovery;
 pub mod errors;
 pub mod evidence;
