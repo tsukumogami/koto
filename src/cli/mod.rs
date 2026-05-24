@@ -1901,6 +1901,50 @@ fn append_child_completed_to_parent(
     }
 }
 
+/// Issue 8: append a workspace-wide terminal-index entry for `session_id`
+/// just before session cleanup.
+///
+/// Classifies the terminal state as `"abandoned"` when the events log
+/// carries a `WorkflowCancelled` event, otherwise `"completed"`. Stats
+/// the on-disk header for `header_mtime_ns`. Best-effort: a failure
+/// logs a warning and falls through to cleanup — the next discovery
+/// scan re-reads the header per the header-is-truth rule.
+fn append_terminal_index_for_session(
+    backend: &dyn SessionBackend,
+    session_id: &str,
+    events: &[crate::engine::types::Event],
+) {
+    let terminal_state = if events
+        .iter()
+        .any(|e| matches!(e.payload, EventPayload::WorkflowCancelled { .. }))
+    {
+        "abandoned"
+    } else {
+        "completed"
+    };
+
+    let Some(home) = dirs::home_dir() else {
+        eprintln!("warning: terminal-index append skipped: no home directory");
+        return;
+    };
+    let koto_root = home.join(".koto");
+    let state_path = backend
+        .session_dir(session_id)
+        .join(crate::session::state_file_name(session_id));
+
+    if let Err(e) = crate::engine::terminal_index::append_terminal_index(
+        &koto_root,
+        session_id,
+        terminal_state,
+        &state_path,
+    ) {
+        eprintln!(
+            "warning: terminal-index append failed for {}: {}",
+            session_id, e
+        );
+    }
+}
+
 /// Handle the `koto next` command with full output contract support.
 ///
 /// Flow:
@@ -2248,6 +2292,14 @@ fn handle_next(
                 } = &resp
                 {
                     if !no_cleanup {
+                        // Issue 8: append the terminal-index entry BEFORE
+                        // session cleanup so the workspace skip-list
+                        // observes the terminal transition. Best-effort
+                        // — a write failure here logs a warning and
+                        // falls through to cleanup; the next discovery
+                        // scan will read the header directly per the
+                        // header-is-truth rule.
+                        append_terminal_index_for_session(backend, &name, &events);
                         // Issue #134: emit ChildCompleted to parent BEFORE
                         // cleanup so the batch gate can observe outcomes
                         // for children that auto-clean on terminal. When
@@ -3255,6 +3307,17 @@ fn handle_next(
             } = &resp
             {
                 if !no_cleanup {
+                    // Issue 8: append terminal-index entry BEFORE cleanup
+                    // so the workspace skip-list observes the terminal
+                    // transition. Re-read the events so a mid-tick
+                    // WorkflowCancelled is reflected in the classifier.
+                    // Best-effort: a failure logs a warning, doesn't
+                    // block cleanup.
+                    if let Ok((_, post_events)) = backend.read_events(&name) {
+                        append_terminal_index_for_session(backend, &name, &post_events);
+                    } else {
+                        append_terminal_index_for_session(backend, &name, &[]);
+                    }
                     // Issue #134: emit ChildCompleted to parent BEFORE
                     // cleanup so the batch gate can observe outcomes for
                     // children that auto-clean on terminal. When the

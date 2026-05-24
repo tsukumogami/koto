@@ -50,6 +50,7 @@ use serde::{Deserialize, Serialize};
 use crate::cli::next_types::UnassignedChild;
 use crate::config::Kt1Config;
 use crate::engine::persistence::read_header;
+use crate::engine::terminal_index::{header_mtime_unix_nanos, read_terminal_index};
 use crate::engine::types::{StateFileHeader, ValidatedCoordId};
 use crate::session::{state_file_name, validate::validate_session_id};
 
@@ -321,6 +322,13 @@ pub fn scan(
     let cursor = read_cursor(koto_root, coord_id.as_str(), cfg.coord_cursor_ttl_days);
     let boundary_set: HashSet<&str> = cursor.seen_at_boundary.iter().map(String::as_str).collect();
 
+    // Terminal-index filter (Issue 8): build the dedup'd
+    // `session_id -> max-mtime entry` map once per scan. The map is
+    // consulted in the walk loop with the header-is-truth fallthrough
+    // rule — a stale index entry (lower mtime than the on-disk header)
+    // does NOT skip the session.
+    let terminal_by_id = read_terminal_index(koto_root);
+
     // Walk the workspace; collect (mtime, session_id, header) for every
     // session whose mtime is admitted by the walk rule. The candidate
     // filter narrows further; the cursor update needs every admitted
@@ -363,6 +371,20 @@ pub fn scan(
         };
         if !walk_admits(mtime, &session_id, &cursor, &boundary_set) {
             continue;
+        }
+        // Terminal-index skip with header-is-truth fallthrough
+        // (Issue 8 / Decision 3). When the index records this session
+        // as terminal AND its `header_mtime_ns` is at least as recent
+        // as the disk header's mtime, the session is settled — skip
+        // it. When the disk header's mtime exceeds the index entry
+        // (e.g., a recovery walk bumped `dispatch_epoch` per Issue 11
+        // cases 3b/3c), the header is truth and the scan re-surfaces
+        // the session for re-evaluation.
+        if let Some(idx_entry) = terminal_by_id.get(&session_id) {
+            let disk_mtime_ns = header_mtime_unix_nanos(&state_path).unwrap_or(0);
+            if idx_entry.header_mtime_ns >= disk_mtime_ns {
+                continue;
+            }
         }
         let header = match read_header(&state_path) {
             Ok(h) => h,
