@@ -116,12 +116,16 @@ fn requester_woken_fields_round_trip() {
         sid("parent.task-b"),
         sid("parent.task-c"),
     ];
-    let fields = requester_woken_fields(&kids);
+    let fields = requester_woken_fields(&kids, "parent");
     let event = evidence_event(3, fields);
     let s = serde_json::to_string(&event).unwrap();
     assert!(s.contains("\"kind\":\"RequesterWoken\""));
     assert!(s.contains("\"summary\":\"3 children completed\""));
     assert!(s.contains("\"child_count\":3"));
+    assert!(
+        s.contains("\"child_session_ids\":[\"parent.task-a\",\"parent.task-b\",\"parent.task-c\"]")
+    );
+    assert!(s.contains("\"requested_by\":\"parent\""));
     let parsed: Event = serde_json::from_str(&s).unwrap();
     assert_eq!(event, parsed);
 }

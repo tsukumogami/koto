@@ -2073,6 +2073,54 @@ fn handle_next(
                 );
             }
         }
+
+        // Issue 15: wake-candidates pass + age-and-activity recovery.
+        // Walks the coordinator's own session log for ChildDispatched
+        // events whose corresponding child reached terminal AND has no
+        // matching RequesterWoken yet; emits a RequesterWoken event
+        // covering each batch, runs the 3-point fsync sequence, invokes
+        // the substrate-wake primitive (stubbed via LoggingWaker until
+        // a concrete substrate ships), and unlinks the child's claim
+        // sidecar. The pass is O(open-dispatches), not O(workspace).
+        //
+        // Order: cursor GC → compact-recovery → maybe-compact →
+        // wake-candidates. Wake runs BEFORE the discovery scan (which
+        // happens later in the function) so a terminal child's wake
+        // emission and its parent's directive build observe consistent
+        // state.
+        let coord_state_path = koto_root
+            .join("sessions")
+            .join(&name)
+            .join(crate::session::state_file_name(&name));
+        if coord_state_path.exists() {
+            let sessions_dir = koto_root.join("sessions");
+            let stale_dispatch_timeout =
+                std::time::Duration::from_secs(kt1.stale_dispatch_timeout_seconds);
+            let waker = crate::engine::wake::LoggingWaker;
+            match crate::engine::wake::wake_candidates_pass(
+                &koto_root,
+                &sessions_dir,
+                &coord_state_path,
+                &waker,
+                stale_dispatch_timeout,
+                std::time::SystemTime::now(),
+            ) {
+                Ok(outcome) => {
+                    if outcome.events_emitted > 0 || outcome.recoveries_fired > 0 {
+                        eprintln!(
+                            "info: wake-candidates pass — {} event(s), {} wake(s), {} sidecar(s) released, {} recoveries",
+                            outcome.events_emitted,
+                            outcome.wakes_invoked,
+                            outcome.sidecars_released,
+                            outcome.recoveries_fired,
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: wake-candidates pass failed: {}", e);
+                }
+            }
+        }
     }
 
     // 1. Mutual exclusivity check
