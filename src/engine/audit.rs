@@ -188,25 +188,55 @@ pub fn requester_woken_fields(
 
 /// Build the `fields` map for a `RequesterRespawn` audit event.
 ///
-/// Wire shape (Decision 6):
+/// Emitted on the requester's own log when F1 cold-restart re-priming
+/// (Issue 16 / Decision 5) spawns a fresh subagent to replace one
+/// whose substrate transcript has expired.
+///
+/// Wire shape (Decision 6 / design line 806):
 /// ```json
 /// {
 ///   "kind": "RequesterRespawn",
 ///   "child_session_id": "<child>",
-///   "respawn_generation": <g>
+///   "respawn_generation": <g>,
+///   "reason": "transcript_expired",
+///   "prior_coordinator_of_record": "<prior-coord>",
+///   "new_coordinator_of_record": "<new-coord>",
+///   "respawned_at": "<rfc3339-millis>"
 /// }
 /// ```
+///
+/// `reason` carries the F1 trigger label (`transcript_expired`) on a
+/// successful respawn, OR an F3 fallback reason
+/// (`respawn_failed: <cause>`) when F1 refuses to fire. The
+/// `prior_coordinator_of_record` and `new_coordinator_of_record`
+/// fields are typically the same value in the single-coordinator
+/// model but design line 806 reserves them as distinct so a future
+/// hand-off can record both sides.
 pub fn requester_respawn_fields(
     child_session_id: &ValidatedSessionId,
     respawn_generation: u32,
+    reason: &str,
+    prior_coordinator_of_record: &str,
+    new_coordinator_of_record: &str,
+    respawned_at: &str,
 ) -> HashMap<String, Value> {
-    let mut fields = HashMap::with_capacity(3);
+    let mut fields = HashMap::with_capacity(7);
     fields.insert("kind".to_string(), json!(REQUESTER_RESPAWN));
     fields.insert(
         "child_session_id".to_string(),
         json!(child_session_id.as_str()),
     );
     fields.insert("respawn_generation".to_string(), json!(respawn_generation));
+    fields.insert("reason".to_string(), json!(reason));
+    fields.insert(
+        "prior_coordinator_of_record".to_string(),
+        json!(prior_coordinator_of_record),
+    );
+    fields.insert(
+        "new_coordinator_of_record".to_string(),
+        json!(new_coordinator_of_record),
+    );
+    fields.insert("respawned_at".to_string(), json!(respawned_at));
     fields
 }
 
@@ -350,9 +380,20 @@ mod tests {
     #[test]
     fn requester_respawn_round_trips_through_evidence_submitted() {
         let child = sid("parent.task-a");
-        let fields = requester_respawn_fields(&child, 5);
+        let fields = requester_respawn_fields(
+            &child,
+            5,
+            "transcript_expired",
+            "old-coord",
+            "new-coord",
+            "2026-05-24T00:00:00.000Z",
+        );
         assert_eq!(fields["kind"], json!("RequesterRespawn"));
         assert_eq!(fields["respawn_generation"], json!(5));
+        assert_eq!(fields["reason"], json!("transcript_expired"));
+        assert_eq!(fields["prior_coordinator_of_record"], json!("old-coord"));
+        assert_eq!(fields["new_coordinator_of_record"], json!("new-coord"));
+        assert_eq!(fields["respawned_at"], json!("2026-05-24T00:00:00.000Z"));
         let payload = EventPayload::EvidenceSubmitted {
             state: "respawn".to_string(),
             fields,

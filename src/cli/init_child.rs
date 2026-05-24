@@ -489,6 +489,7 @@ fn init_child_core(
         deadline: None,
         retry_count: None,
         agent_config: None,
+        respawn_generation: None,
     };
 
     let init_payload = EventPayload::WorkflowInitialized {
@@ -639,6 +640,7 @@ Done.
             deadline: None,
             retry_count: None,
             agent_config: None,
+            respawn_generation: None,
         };
         let events = vec![Event {
             seq: 1,

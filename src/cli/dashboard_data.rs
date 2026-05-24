@@ -342,6 +342,7 @@ fn make_empty_header() -> StateFileHeader {
         requested_by: None,
         assignment_claim: None,
         dispatch_epoch: 0,
+        respawn_generation: None,
         priority: None,
         deadline: None,
         retry_count: None,
@@ -730,6 +731,7 @@ mod tests {
             requested_by: None,
             assignment_claim: None,
             dispatch_epoch: 0,
+            respawn_generation: None,
             priority: None,
             deadline: None,
             retry_count: None,
@@ -1266,6 +1268,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            respawn_generation: None,
         };
         append_header(&state_path, &header).unwrap();
 

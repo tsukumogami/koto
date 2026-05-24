@@ -4014,6 +4014,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
     }
@@ -4137,6 +4138,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
         // Append a WorkflowInitialized event so the file is

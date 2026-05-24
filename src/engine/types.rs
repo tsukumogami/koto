@@ -291,6 +291,20 @@ pub struct StateFileHeader {
     #[serde(default)]
     pub dispatch_epoch: u32,
 
+    /// Generation counter incremented every time the requester is
+    /// respawned via F1 cold-restart re-priming (Issue 16 / Decision
+    /// 5). `None` on pre-Issue-16 headers; resolves to 0 when read.
+    /// The respawn-generation cap (`kt1.respawn_generation_cap`,
+    /// default 2 per Issue 18) prevents cascading respawns: when
+    /// `respawn_generation == cap`, F1 refuses to fire and the
+    /// requester transitions to terminal `abandoned` with the F3
+    /// fallback reason `respawn_failed: respawn_generation_cap_exceeded`.
+    ///
+    /// Additive field: `#[serde(default, skip_serializing_if = ...)]`
+    /// keeps pre-Issue-16 headers round-tripping unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub respawn_generation: Option<u32>,
+
     // ===== Reserved KT1 fields (forward-compatibility) =====
     //
     // Wire-format placeholders for follow-up features. Always
@@ -1262,6 +1276,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         let parsed: StateFileHeader = serde_json::from_str(&json).unwrap();
@@ -1291,6 +1306,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(json.contains("\"parent_workflow\":\"parent-wf\""));
@@ -1332,6 +1348,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -1366,6 +1383,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -1398,6 +1416,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(
@@ -2009,6 +2028,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         assert!(json.contains("\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\""));

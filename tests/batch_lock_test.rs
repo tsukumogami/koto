@@ -59,6 +59,7 @@ fn init_backend(dir: &std::path::Path, id: &str) -> LocalBackend {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        respawn_generation: None,
     };
     let events = vec![Event {
         seq: 1,

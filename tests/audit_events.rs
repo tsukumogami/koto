@@ -133,11 +133,21 @@ fn requester_woken_fields_round_trip() {
 #[test]
 fn requester_respawn_fields_round_trip() {
     let child = sid("parent.task-a");
-    let fields = requester_respawn_fields(&child, 7);
+    let fields = requester_respawn_fields(
+        &child,
+        7,
+        "transcript_expired",
+        "coord-old",
+        "coord-new",
+        "2026-05-24T00:00:00.000Z",
+    );
     let event = evidence_event(4, fields);
     let s = serde_json::to_string(&event).unwrap();
     assert!(s.contains("\"kind\":\"RequesterRespawn\""));
     assert!(s.contains("\"respawn_generation\":7"));
+    assert!(s.contains("\"reason\":\"transcript_expired\""));
+    assert!(s.contains("\"prior_coordinator_of_record\":\"coord-old\""));
+    assert!(s.contains("\"new_coordinator_of_record\":\"coord-new\""));
     let parsed: Event = serde_json::from_str(&s).unwrap();
     assert_eq!(event, parsed);
 }

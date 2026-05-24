@@ -508,6 +508,7 @@ mod tests {
             requested_by: None,
             assignment_claim: None,
             dispatch_epoch: 0,
+            respawn_generation: None,
             priority: None,
             deadline: None,
             retry_count: None,
