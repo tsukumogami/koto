@@ -2706,6 +2706,7 @@ fn handle_next(
                         details: details.clone(),
                         advanced,
                         blocking_conditions: blocking,
+                        unassigned_children: vec![],
                     }
                 }
                 StopReason::EvidenceRequired { failed_gates } => {
@@ -2727,6 +2728,7 @@ fn handle_next(
                         advanced,
                         expects: es,
                         blocking_conditions: blocking,
+                        unassigned_children: vec![],
                     }
                 }
                 StopReason::UnresolvableTransition => {
@@ -2749,6 +2751,7 @@ fn handle_next(
                     advanced,
                     expects,
                     integration: IntegrationOutput { name, output },
+                    unassigned_children: vec![],
                 },
                 StopReason::IntegrationUnavailable { name } => {
                     NextResponse::IntegrationUnavailable {
@@ -2761,6 +2764,7 @@ fn handle_next(
                             name,
                             available: false,
                         },
+                        unassigned_children: vec![],
                     }
                 }
                 StopReason::ActionRequiresConfirmation {
@@ -2784,6 +2788,7 @@ fn handle_next(
                         stderr,
                     },
                     expects,
+                    unassigned_children: vec![],
                 },
                 StopReason::CycleDetected { state: cycle_state } => {
                     // Cycle is a template bug; report as an error.
@@ -2823,6 +2828,7 @@ fn handle_next(
                             advanced,
                             expects: es.clone(),
                             blocking_conditions: vec![],
+                            unassigned_children: vec![],
                         }
                     } else {
                         NextResponse::EvidenceRequired {
@@ -2836,6 +2842,7 @@ fn handle_next(
                                 options: vec![],
                             },
                             blocking_conditions: vec![],
+                            unassigned_children: vec![],
                         }
                     }
                 }
