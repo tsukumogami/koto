@@ -412,6 +412,11 @@ fn confirm_force_prune() -> io::Result<bool> {
     io::stdout().flush()?;
     let mut input = String::new();
     let n = io::stdin().read_line(&mut input)?;
+    // Print a newline so subsequent stdout (the success JSON or an
+    // error payload) lands on a fresh line. Without this, piped stdin
+    // (no terminal echo) leaves the prompt and the next println on the
+    // same physical line, mangling downstream JSON parsers.
+    println!();
     if n == 0 {
         return Ok(false); // EOF
     }

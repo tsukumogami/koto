@@ -58,6 +58,7 @@ Feature: koto workspace prune reclaims terminal session trees
     Given a clean koto environment
     And the template "decisions" exists
     And I run "koto init wip-wf --template .koto/templates/decisions.md"
+    And the command stdin is "force-prune"
     When I run "koto workspace prune --root wip-wf --force --yes"
     Then the exit code is 0
     And the JSON output field "pruned" is true
