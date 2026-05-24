@@ -551,12 +551,13 @@ pub(super) fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
 
 /// Determine the exit code for an engine error by downcasting to EngineError.
 ///
-/// Returns exit code 3 for corrupted state files, and exit code 1 for all
-/// other errors.
+/// Delegates the per-variant mapping to [`EngineError::exit_code`] so the
+/// CLI surface and the engine layer stay in sync. Falls back to exit code
+/// 1 when the underlying error does not downcast to an `EngineError`.
 pub(super) fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
     match err.downcast_ref::<EngineError>() {
-        Some(EngineError::StateFileCorrupted(_)) => EXIT_INFRASTRUCTURE,
-        _ => 1,
+        Some(e) => e.exit_code(),
+        None => 1,
     }
 }
 
