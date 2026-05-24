@@ -7,6 +7,18 @@ use regex::Regex;
 
 use crate::engine::errors::EngineError;
 
+/// Stage 1 frozen alias for `derive_state_from_log`, re-exported from
+/// [`crate::engine::persistence`] so the canonical access path is
+/// `koto::engine::types::derive_state_from_log` (Issue 19 / Decision 5).
+///
+/// The re-export is the only stability-frozen surface in
+/// `engine::types` that crosses module boundaries — every other
+/// Stage 1 export (`StateFileHeader`, `Event`, `EventPayload`,
+/// `SpawnEntrySnapshot`, `ChildSnapshot`, `CURRENT_SCHEMA_VERSION`,
+/// `AssignmentClaim`) is defined in this module directly. Breaking
+/// changes to the alias's signature require a 6-week deprecation
+/// window per `docs/STABILITY.md`; the function's body may evolve
+/// freely as long as the public signature holds.
 pub use crate::engine::persistence::derive_state_from_log;
 
 /// Compiled validation regex shared by [`ValidatedSessionId`] and
