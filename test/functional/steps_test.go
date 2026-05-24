@@ -64,6 +64,9 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the JSON output field "([^"]*)" equals (\d+)$`, theJSONOutputFieldEqualsInt)
 	ctx.Step(`^the JSON output field "([^"]*)" is (true|false)$`, theJSONOutputFieldEqualsBool)
 	ctx.Step(`^the state file for "([^"]*)" exists$`, theStateFileExists)
+
+	// Request-store-specific steps live in steps_request_store_test.go.
+	InitializeRequestStoreScenario(ctx)
 }
 
 // aCleanKotoEnvironment initializes a git repo in the temp dir.
