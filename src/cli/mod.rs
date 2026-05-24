@@ -2015,10 +2015,51 @@ fn handle_next(
     // abandoned coordinators' cursor state is reclaimed eventually.
     // The walk is bounded by coordinator count (not session count) and
     // tolerates a missing coordinators/ directory.
+    //
+    // Issue 9: terminal-index compaction stale-lock recovery + threshold
+    // gating run here too. The recovery walk reclaims a foreign lock
+    // whose `started_at` is past timeout (cleaning up after a crashed
+    // peer-coord compaction); the threshold check runs compaction
+    // when the index grew above `kt1.terminal_index_compact_lines`.
+    // Both are best-effort: a failure logs a warning and the tick
+    // proceeds. The current workflow's session id doubles as the
+    // coord_id, matching the Issue 7 wiring at the scan call site.
     if let Some(home) = dirs::home_dir() {
         let koto_root = home.join(".koto");
         if let Err(e) = crate::engine::discovery::gc_stale_cursors(&koto_root, &kt1) {
             eprintln!("warning: cursor GC failed at koto next startup: {}", e);
+        }
+        if let Err(e) =
+            crate::engine::terminal_index::recover_stale_compact_lock(&koto_root, &name, &kt1)
+        {
+            eprintln!(
+                "warning: compact-lock recovery failed at koto next startup: {}",
+                e
+            );
+        }
+        match crate::engine::terminal_index::maybe_compact_terminal_index(&koto_root, &name, &kt1) {
+            Ok(crate::engine::terminal_index::CompactionOutcome::Compacted {
+                lines_before,
+                lines_after,
+            }) => {
+                eprintln!(
+                    "info: terminal-index compacted ({} -> {} lines)",
+                    lines_before, lines_after
+                );
+            }
+            Ok(crate::engine::terminal_index::CompactionOutcome::Failed { error }) => {
+                eprintln!("warning: terminal-index compaction failed: {}", error);
+            }
+            Ok(crate::engine::terminal_index::CompactionOutcome::Skipped { .. }) => {
+                // Skipped is the steady-state common case (below
+                // threshold or peer holds the lease); silent.
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: terminal-index compaction threshold check failed: {}",
+                    e
+                );
+            }
         }
     }
 
