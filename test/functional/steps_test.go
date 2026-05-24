@@ -346,7 +346,7 @@ func theJSONOutputFieldEqualsInt(field string, expected int) error {
 
 // theStateFileExists checks that koto-<name>.state.jsonl exists.
 func theStateFileExists(name string) error {
-	stateFile := filepath.Join(sc.tempDir, fmt.Sprintf("koto-%s.state.jsonl", name))
+	stateFile := filepath.Join(sc.tempDir, ".koto", "sessions", name, fmt.Sprintf("koto-%s.state.jsonl", name))
 	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
 		return fmt.Errorf("expected state file koto-%s.state.jsonl to exist", name)
 	}
