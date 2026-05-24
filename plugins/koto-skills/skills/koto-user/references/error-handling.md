@@ -71,6 +71,7 @@ All `koto next` error codes, their exit codes, and what to do:
 | `template_error` | 3 | No | Template parse failure, hash mismatch, or cycle detected | Report to user; this requires human intervention |
 | `persistence_error` | 3 | No | State file I/O failure or corruption | Report to user; this is an infrastructure problem |
 | `needs_agent_not_dispatched` | 66 | No | `koto next` was called against a `--needs-agent` child that the coordinator has not yet claimed/dispatched | Stop ticking the child directly; route through the coordinator's `koto next` on the parent root instead |
+| `recursion_cap_exceeded` | 64 | No | `koto session start --needs-agent` would push the workflow tree past one of the three recursion caps (`depth`, `fanout`, or `total_unassigned`) | Surface the cap dimension and threshold to the user; restructure the dispatch fanout (collapse a level, batch siblings, or split into separate trees) before retrying |
 
 Note: `gate_blocked` and `integration_unavailable` appear both as `error.code` values
 (when `koto next` produces an error response) and as `action` values (when `koto next`
@@ -82,6 +83,17 @@ has no usable input (no template path yet) because it is awaiting
 dispatch. This is distinct from `persistence_error` (exit 3, infra
 issue) because the fix is an operator-routing one: tick the parent,
 not the child.
+
+Exit code 64 corresponds to `EX_USAGE` from sysexits.h — the caller's
+spawn request would violate a hard recursion cap and no retry will
+help until the dispatch shape changes. The three dimensions are
+`depth` (parent chain length), `fanout` (per-parent unclaimed children),
+and `total_unassigned` (workspace-wide unclaimed children). The
+thresholds are hard-coded constants at V1 — operators cannot raise
+them via config. The reserved `[request_store.recursion]` namespace
+exists for a future V1.1 promotion to operator-configurable caps, but
+at V1 the fix is always structural: restructure the workflow rather
+than chase a config override.
 
 ---
 

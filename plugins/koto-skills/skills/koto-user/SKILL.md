@@ -322,6 +322,20 @@ koto session update <name> --intent "investigate the flaky CI failure in the aut
 
 Intent strings over 1024 characters are rejected. The command exits non-zero if the session doesn't exist.
 
+## Periodic maintenance: koto workspace prune
+
+`koto workspace prune` reclaims the derived files the request-store substrate accumulates over time — stale scan cursors (`~/.koto/coordinators/<id>/scan_cursor.toml`), stale compaction locks, and stale claim sidecars (`claim.lock`). It does NOT reclaim session bodies under `~/.koto/sessions/`; per-session cleanup still routes through `koto session cleanup <session-id>`.
+
+Suggest the verb when the user reports growing `~/.koto/` disk usage, when the discovery scan starts noticeably slowing at year-2 scale, or when stale-claim recovery events show up in the audit log.
+
+Recommended cadence is **weekly to monthly** for typical workloads. See `docs/workspace-layout.md` ("Sizing your prune cadence") for the per-workload sizing math and cron snippets.
+
+Flags worth knowing: `--root <session-id>` (required; terminal-state root to prune), `--dry-run` (preview without reclaiming), `--yes` (cron-friendly; skip the confirmation prompt), `--force` (bypass the terminal-state safety gate — dangerous). Full flag set lives in `docs/guides/cli-usage.md`.
+
+```bash
+koto workspace prune --root <session-id> --dry-run
+```
+
 ## Reference material
 
 Read these on demand, not upfront. The sections above cover the common path. Consult a reference file only when you hit the specific situation it describes.
