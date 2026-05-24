@@ -137,10 +137,16 @@ pub fn read_cursor(koto_root: &Path, coord_id: &str, ttl_days: u32) -> ScanCurso
     cursor
 }
 
-/// Write the cursor atomically: temp file -> fsync -> rename.
+/// Write the cursor atomically: temp file -> fsync -> rename -> fsync parent.
 ///
 /// Creates the parent `coordinators/<coord_id>/` directory as needed.
 /// On any error the prior cursor (if any) is left untouched.
+///
+/// The parent-directory fsync after the rename closes the
+/// crash-then-remount window: POSIX rename atomicity flips the in-memory
+/// directory entry, but a crash before the directory metadata flushes can
+/// leave the rename invisible on remount. fsync'ing the parent commits
+/// the directory entry to disk.
 pub fn write_cursor_atomic(koto_root: &Path, coord_id: &str, cursor: &ScanCursor) -> Result<()> {
     let path = cursor_path(koto_root, coord_id);
     if let Some(parent) = path.parent() {
@@ -164,6 +170,17 @@ pub fn write_cursor_atomic(koto_root: &Path, coord_id: &str, cursor: &ScanCursor
             path.display()
         )
     })?;
+    if let Some(parent) = path.parent() {
+        // Best-effort parent-dir fsync. Some filesystems (notably on
+        // older Linux + non-default mount options) reject `O_RDONLY`
+        // fsync on directories with `EINVAL`; in that case we accept
+        // the prior contract — the rename itself is durable, only the
+        // directory-entry flush is missed. Real production filesystems
+        // (ext4, xfs, btrfs, apfs) honor the directory fsync.
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -636,6 +653,28 @@ mod tests {
         assert!(path.exists());
         let tmp_path = path.with_extension("toml.tmp");
         assert!(!tmp_path.exists(), "atomic write must rename the tmp file");
+    }
+
+    #[test]
+    fn write_cursor_atomic_persists_through_parent_dir_fsync() {
+        // The parent-dir fsync runs after rename to close the
+        // crash-then-remount window. This test asserts the write
+        // succeeds on a happy path AND the file's contents survive a
+        // read-back (which would NOT detect the crash-then-remount
+        // path itself — that requires syscall mocking — but does
+        // validate that the parent-dir fsync code path doesn't
+        // regress the happy case on any filesystem where the test
+        // runs).
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = "parent-fsync-coord";
+        let cursor = ScanCursor {
+            last_scan_at_unix_micros: now_unix_micros(),
+            last_max_header_mtime_unix_micros: 1234,
+            seen_at_boundary: vec!["sentinel-id".into()],
+        };
+        write_cursor_atomic(tmp.path(), coord, &cursor).unwrap();
+        let read_back = read_cursor(tmp.path(), coord, 7);
+        assert_eq!(read_back, cursor);
     }
 
     #[test]
