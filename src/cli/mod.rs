@@ -2900,6 +2900,7 @@ fn handle_next(
                 StopReason::Terminal => NextResponse::Terminal {
                     state: final_state.clone(),
                     advanced,
+                    unassigned_children: unassigned_children.clone(),
                 },
                 StopReason::GateBlocked(gate_results) => {
                     let blocking =
@@ -3023,6 +3024,7 @@ fn handle_next(
                         NextResponse::Terminal {
                             state: final_state.clone(),
                             advanced,
+                            unassigned_children: unassigned_children.clone(),
                         }
                     } else if let Some(ref es) = expects {
                         NextResponse::EvidenceRequired {

@@ -40,6 +40,7 @@ pub fn dispatch_next(
         return Ok(NextResponse::Terminal {
             state: state.to_string(),
             advanced,
+            unassigned_children: vec![],
         });
     }
 
@@ -168,6 +169,7 @@ mod tests {
             NextResponse::Terminal {
                 state: "done".to_string(),
                 advanced: false,
+                unassigned_children: vec![],
             }
         );
     }

@@ -99,6 +99,7 @@ pub enum NextResponse {
     Terminal {
         state: String,
         advanced: bool,
+        unassigned_children: Vec<UnassignedChild>,
     },
     ActionRequiresConfirmation {
         state: String,
@@ -121,6 +122,7 @@ pub enum NextResponse {
         error: NextError,
         batch: Option<BatchErrorContext>,
         blocking_conditions: Vec<BlockingCondition>,
+        unassigned_children: Vec<UnassignedChild>,
     },
 }
 
@@ -347,12 +349,17 @@ impl Serialize for NextResponse {
                 map.serialize_entry("error", &None::<()>)?;
                 map.end()
             }
-            NextResponse::Terminal { state, advanced } => {
-                let mut map = serializer.serialize_map(Some(5))?;
+            NextResponse::Terminal {
+                state,
+                advanced,
+                unassigned_children,
+            } => {
+                let mut map = serializer.serialize_map(Some(6))?;
                 map.serialize_entry("action", "done")?;
                 map.serialize_entry("state", state)?;
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("expects", &None::<()>)?;
+                map.serialize_entry("unassigned_children", unassigned_children)?;
                 map.serialize_entry("error", &None::<()>)?;
                 map.end()
             }
@@ -386,6 +393,7 @@ impl Serialize for NextResponse {
                 error,
                 batch,
                 blocking_conditions,
+                unassigned_children,
             } => {
                 // Emit the error payload as a single object containing
                 // the typed NextError fields plus an optional `batch`
@@ -409,12 +417,13 @@ impl Serialize for NextResponse {
                     }
                     serde_json::Value::Object(obj)
                 };
-                let mut map = serializer.serialize_map(Some(6))?;
+                let mut map = serializer.serialize_map(Some(7))?;
                 map.serialize_entry("action", "error")?;
                 map.serialize_entry("state", state)?;
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("expects", &None::<()>)?;
                 map.serialize_entry("blocking_conditions", blocking_conditions)?;
+                map.serialize_entry("unassigned_children", unassigned_children)?;
                 map.serialize_entry("error", &error_value)?;
                 map.end()
             }
@@ -993,6 +1002,7 @@ mod tests {
         let resp = NextResponse::Terminal {
             state: "done".to_string(),
             advanced: true,
+            unassigned_children: vec![],
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -1002,6 +1012,10 @@ mod tests {
         assert_eq!(json["advanced"], true);
         assert!(json["error"].is_null());
         assert!(json["expects"].is_null());
+        // Task #18: `unassigned_children` is present on every variant
+        // including Terminal so coordinator-side consumers have one
+        // uniform branch.
+        assert_eq!(json["unassigned_children"], serde_json::json!([]));
 
         // These fields should be absent for Terminal
         assert!(json.get("directive").is_none());
@@ -1014,6 +1028,7 @@ mod tests {
         let resp = NextResponse::Terminal {
             state: "complete".to_string(),
             advanced: false,
+            unassigned_children: vec![],
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -1844,6 +1859,7 @@ mod tests {
             },
             batch: None,
             blocking_conditions: vec![],
+            unassigned_children: vec![],
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["action"], "error");
@@ -1855,6 +1871,8 @@ mod tests {
         assert!(v["error"].get("batch").is_none());
         assert!(v["expects"].is_null());
         assert_eq!(v["blocking_conditions"], serde_json::json!([]));
+        // Task #18: unassigned_children present on every variant (uniform shape).
+        assert_eq!(v["unassigned_children"], serde_json::json!([]));
     }
 
     #[test]
@@ -1874,6 +1892,7 @@ mod tests {
             },
             batch: Some(BatchErrorContext::from_batch_error(&batch_err)),
             blocking_conditions: vec![],
+            unassigned_children: vec![],
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["action"], "error");
@@ -2091,13 +2110,18 @@ mod tests {
             );
         }
 
-        // Terminal carries no directive and so no `unassigned_children`.
+        // Task #18: Terminal now ALSO carries `unassigned_children`
+        // so coordinator-side consumers have a single uniform branch
+        // for the field regardless of action. The earlier Issue-5
+        // assertion that Terminal omitted the field is intentionally
+        // flipped here.
         let terminal = NextResponse::Terminal {
             state: "done".into(),
             advanced: true,
+            unassigned_children: vec![],
         };
         let v: serde_json::Value = serde_json::to_value(&terminal).unwrap();
-        assert!(v.get("unassigned_children").is_none());
+        assert_eq!(v["unassigned_children"], serde_json::json!([]));
     }
 
     /// Pre-KT1 directive content is unchanged: the serialized JSON for an
