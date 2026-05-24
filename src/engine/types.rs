@@ -1,8 +1,179 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::LazyLock;
+
+use regex::Regex;
+
+use crate::engine::errors::EngineError;
 
 pub use crate::engine::persistence::derive_state_from_log;
+
+/// Compiled validation regex shared by [`ValidatedSessionId`] and
+/// [`ValidatedCoordId`].
+///
+/// Rejects any input that contains shell metacharacters, path
+/// separators, or any other byte outside `[a-zA-Z0-9._-]`, and any
+/// input that does not start with an alphanumeric (so leading `.` and
+/// leading `-` — which can be re-interpreted as hidden files or CLI
+/// flags downstream — are also rejected).
+///
+/// The pattern is the security spine for juror-2 N1/N5: every flow
+/// that lands a session or coordinator id from caller-controlled
+/// input passes through one of the two newtype constructors, which
+/// both delegate to this regex. Keep the pattern conservative — it
+/// is easier to relax later than to chase a hole through every
+/// downstream caller.
+static VALIDATED_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9._\-]*$")
+        .expect("VALIDATED_ID_RE is a constant and always parses")
+});
+
+/// Maximum byte length for a validated session or coordinator id.
+///
+/// Caps prevent log-injection via overlong inputs and keep path
+/// components within typical filesystem limits.
+const VALIDATED_ID_MAX_LEN: usize = 255;
+
+fn validate_id_input(input: &str) -> Result<(), &'static str> {
+    if input.is_empty() {
+        return Err("empty input");
+    }
+    if input.len() > VALIDATED_ID_MAX_LEN {
+        return Err("input exceeds 255 characters");
+    }
+    // Cheap structural rejections first so the regex doesn't even
+    // need to run for the common cases — also makes the error
+    // messages more specific.
+    let first = input.as_bytes()[0];
+    if first == b'.' {
+        return Err("leading dot");
+    }
+    if first == b'-' {
+        return Err("leading hyphen");
+    }
+    if !VALIDATED_ID_RE.is_match(input) {
+        return Err("contains disallowed characters");
+    }
+    Ok(())
+}
+
+/// Truncate `input` to at most 64 chars (byte-safe), appending `...`
+/// when shortening. Used to keep error messages bounded.
+fn truncate_id_for_preview(input: &str) -> String {
+    const MAX: usize = 64;
+    if input.len() <= MAX {
+        return input.to_string();
+    }
+    let mut cut = MAX;
+    while !input.is_char_boundary(cut) && cut > 0 {
+        cut -= 1;
+    }
+    format!("{}...", &input[..cut])
+}
+
+/// A session id that has passed the workspace's shell-safe validation
+/// regex.
+///
+/// Construct via [`ValidatedSessionId::new`]. Once constructed, the
+/// inner string is guaranteed to match
+/// `^[a-zA-Z0-9][a-zA-Z0-9._-]*$` and be at most
+/// [`VALIDATED_ID_MAX_LEN`] (255) bytes long — downstream path-join
+/// operations and shell-quoted contexts can rely on this without
+/// re-validating.
+///
+/// The newtype pattern makes validation un-bypassable at the type
+/// level: a function that accepts `&ValidatedSessionId` literally
+/// cannot be called with an unvalidated string. Issues 4, 6, 11, 13,
+/// 14 build on this invariant. See the design doc's Security
+/// Considerations N1 / N5.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ValidatedSessionId(String);
+
+impl ValidatedSessionId {
+    /// Construct a `ValidatedSessionId` from caller-controlled input.
+    ///
+    /// Returns [`EngineError::InvalidSessionId`] when `input` is
+    /// empty, longer than 255 bytes, starts with `.` or `-`, or
+    /// contains any character outside `[a-zA-Z0-9._-]`.
+    pub fn new(input: &str) -> Result<Self, EngineError> {
+        validate_id_input(input).map_err(|reason| EngineError::InvalidSessionId {
+            reason: reason.to_string(),
+            input_preview: truncate_id_for_preview(input),
+        })?;
+        Ok(Self(input.to_string()))
+    }
+
+    /// Borrow the inner string without re-validation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the newtype and return the inner owned string.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ValidatedSessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for ValidatedSessionId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A coordinator id that has passed the same shell-safe validation
+/// regex as [`ValidatedSessionId`].
+///
+/// Construct via [`ValidatedCoordId::new`]. See `ValidatedSessionId`
+/// for the contract — `ValidatedCoordId` shares the same regex,
+/// length cap, and Display/AsRef surface so coordinator ids and
+/// session ids are interchangeable wherever a callee only needs the
+/// shell-safety guarantee.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ValidatedCoordId(String);
+
+impl ValidatedCoordId {
+    /// Construct a `ValidatedCoordId` from caller-controlled input.
+    ///
+    /// Returns [`EngineError::InvalidCoordId`] when `input` is
+    /// empty, longer than 255 bytes, starts with `.` or `-`, or
+    /// contains any character outside `[a-zA-Z0-9._-]`.
+    pub fn new(input: &str) -> Result<Self, EngineError> {
+        validate_id_input(input).map_err(|reason| EngineError::InvalidCoordId {
+            reason: reason.to_string(),
+            input_preview: truncate_id_for_preview(input),
+        })?;
+        Ok(Self(input.to_string()))
+    }
+
+    /// Borrow the inner string without re-validation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the newtype and return the inner owned string.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ValidatedCoordId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for ValidatedCoordId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Current schema version written in every `StateFileHeader`.
 ///
@@ -2084,5 +2255,220 @@ mod tests {
         let serialized = serde_json::to_string(&event).unwrap();
         assert!(serialized.contains("intent_updated"));
         assert!(serialized.contains("test goal"));
+    }
+
+    // ===== Issue 3: ValidatedSessionId / ValidatedCoordId newtypes =====
+
+    use super::{EngineError, ValidatedCoordId, ValidatedSessionId};
+
+    fn assert_invalid_session(input: &str, expected_reason_substr: &str) {
+        match ValidatedSessionId::new(input) {
+            Err(EngineError::InvalidSessionId { reason, .. }) => assert!(
+                reason.contains(expected_reason_substr),
+                "expected reason to contain `{}`, got `{}` (input={:?})",
+                expected_reason_substr,
+                reason,
+                input
+            ),
+            Err(other) => panic!("expected InvalidSessionId for {:?}, got {:?}", input, other),
+            Ok(v) => panic!("expected rejection for {:?}, got Ok({})", input, v),
+        }
+    }
+
+    fn assert_invalid_coord(input: &str, expected_reason_substr: &str) {
+        match ValidatedCoordId::new(input) {
+            Err(EngineError::InvalidCoordId { reason, .. }) => assert!(
+                reason.contains(expected_reason_substr),
+                "expected reason to contain `{}`, got `{}` (input={:?})",
+                expected_reason_substr,
+                reason,
+                input
+            ),
+            Err(other) => panic!("expected InvalidCoordId for {:?}, got {:?}", input, other),
+            Ok(v) => panic!("expected rejection for {:?}, got Ok({})", input, v),
+        }
+    }
+
+    #[test]
+    fn validated_session_id_accepts_typical_input() {
+        let v = ValidatedSessionId::new("scrutineer-a").expect("must accept");
+        assert_eq!(v.as_str(), "scrutineer-a");
+        assert_eq!(v.to_string(), "scrutineer-a");
+    }
+
+    #[test]
+    fn validated_session_id_accepts_alphanumeric_and_punct() {
+        // Compound identifiers used in production session names.
+        for ok in [
+            "abc",
+            "a",
+            "A1.b2_c3-d4",
+            "parent.task-1",
+            "0a",
+            "Z_z",
+            "a.b.c",
+            "0-1.2_3",
+        ] {
+            ValidatedSessionId::new(ok)
+                .unwrap_or_else(|e| panic!("expected accept for {:?}, got {:?}", ok, e));
+        }
+    }
+
+    #[test]
+    fn validated_session_id_rejects_empty() {
+        assert_invalid_session("", "empty");
+    }
+
+    #[test]
+    fn validated_session_id_rejects_leading_dot() {
+        assert_invalid_session(".hidden", "leading dot");
+    }
+
+    #[test]
+    fn validated_session_id_rejects_leading_hyphen() {
+        assert_invalid_session("-flag", "leading hyphen");
+    }
+
+    #[test]
+    fn validated_session_id_rejects_path_traversal() {
+        // Both the leading-dot branch and the embedded `/` would
+        // reject this; the constructor catches the leading-dot
+        // branch first, which is fine — the goal is that the input
+        // is never accepted.
+        assert_invalid_session("../etc/passwd", "leading dot");
+    }
+
+    #[test]
+    fn validated_session_id_rejects_shell_metacharacters() {
+        // Spaces, semicolons, and shell special characters all map
+        // to the regex's disallowed-characters branch.
+        for evil in [
+            "foo; rm -rf /",
+            "a b",
+            "a|b",
+            "a&b",
+            "a$b",
+            "a`b",
+            "a\"b",
+            "a'b",
+            "a\\b",
+            "a/b",
+            "a>b",
+            "a<b",
+            "a\nb",
+            "a\tb",
+        ] {
+            assert_invalid_session(evil, "disallowed");
+        }
+    }
+
+    #[test]
+    fn validated_session_id_rejects_overlength() {
+        let s = "a".repeat(256);
+        assert_invalid_session(&s, "exceeds 255");
+        // 255 characters must be accepted (boundary).
+        let s_ok = "a".repeat(255);
+        ValidatedSessionId::new(&s_ok).expect("255-char input must be accepted");
+    }
+
+    #[test]
+    fn validated_session_id_preview_truncates_long_input() {
+        let long_input = format!("{}!", "a".repeat(80));
+        match ValidatedSessionId::new(&long_input) {
+            Err(EngineError::InvalidSessionId { input_preview, .. }) => {
+                // 64 leading chars + literal "..." suffix.
+                assert!(
+                    input_preview.ends_with("..."),
+                    "expected truncation suffix, got {:?}",
+                    input_preview
+                );
+                assert!(
+                    input_preview.len() <= 64 + 3,
+                    "preview must be bounded, got {} chars",
+                    input_preview.len()
+                );
+            }
+            other => panic!("expected InvalidSessionId, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validated_coord_id_accepts_typical_input() {
+        let v = ValidatedCoordId::new("coord-7").expect("must accept");
+        assert_eq!(v.as_str(), "coord-7");
+        assert_eq!(v.to_string(), "coord-7");
+    }
+
+    #[test]
+    fn validated_coord_id_rejects_empty() {
+        assert_invalid_coord("", "empty");
+    }
+
+    #[test]
+    fn validated_coord_id_rejects_leading_dot() {
+        assert_invalid_coord(".hidden", "leading dot");
+    }
+
+    #[test]
+    fn validated_coord_id_rejects_leading_hyphen() {
+        assert_invalid_coord("-flag", "leading hyphen");
+    }
+
+    #[test]
+    fn validated_coord_id_rejects_shell_metacharacters() {
+        for evil in ["foo; rm -rf /", "a b", "a|b", "a/b", "a$b"] {
+            assert_invalid_coord(evil, "disallowed");
+        }
+    }
+
+    #[test]
+    fn validated_coord_id_rejects_overlength() {
+        let s = "a".repeat(256);
+        assert_invalid_coord(&s, "exceeds 255");
+        let s_ok = "a".repeat(255);
+        ValidatedCoordId::new(&s_ok).expect("255-char input must be accepted");
+    }
+
+    // ===== Issue 3: exit-code mapping for new EngineError variants =====
+
+    #[test]
+    fn engine_error_epoch_fence_violation_exit_code_is_65() {
+        let e = EngineError::EpochFenceViolation {
+            child_session_id: "child-1".to_string(),
+            expected: 4,
+            presented: 3,
+        };
+        assert_eq!(e.exit_code(), 65);
+    }
+
+    #[test]
+    fn engine_error_redelegation_cap_exceeded_exit_code_is_75() {
+        let e = EngineError::RedelegationCapExceeded {
+            child_session_id: "child-1".to_string(),
+            cap: 10,
+        };
+        assert_eq!(e.exit_code(), 75);
+    }
+
+    #[test]
+    fn engine_error_state_file_corrupted_exit_code_is_3() {
+        let e = EngineError::StateFileCorrupted("bad".to_string());
+        assert_eq!(e.exit_code(), 3);
+    }
+
+    #[test]
+    fn engine_error_invalid_session_id_exit_code_is_1() {
+        // Not pinned to a sysexit value by the design; defaults to 1.
+        let e = EngineError::InvalidSessionId {
+            reason: "test".to_string(),
+            input_preview: "x".to_string(),
+        };
+        assert_eq!(e.exit_code(), 1);
+    }
+
+    #[test]
+    fn engine_error_default_exit_code_is_1() {
+        let e = EngineError::EmptyLog;
+        assert_eq!(e.exit_code(), 1);
     }
 }

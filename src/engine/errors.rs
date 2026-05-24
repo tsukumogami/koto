@@ -21,4 +21,97 @@ pub enum EngineError {
 
     #[error("incompatible schema version: found {found}, max supported {max_supported}")]
     IncompatibleSchemaVersion { found: u32, max_supported: u32 },
+
+    /// Per-write epoch fence rejected a dispatch attempt because the
+    /// presented dispatch epoch did not match the value recorded on
+    /// the child's [`crate::engine::types::StateFileHeader`].
+    ///
+    /// Maps to BSD sysexit code `EX_DATAERR` (65) at the CLI boundary —
+    /// the input data (the presented epoch) is invalid; the caller
+    /// should not retry without re-reading the header. Drives PRD R43.
+    #[error("epoch fence violation for {child_session_id}: expected dispatch_epoch={expected}, presented={presented}")]
+    EpochFenceViolation {
+        /// Child session id whose header carries the authoritative
+        /// `dispatch_epoch`.
+        child_session_id: String,
+        /// The `dispatch_epoch` value currently on the child's header
+        /// (the authoritative epoch the writer was expected to fence
+        /// against).
+        expected: u32,
+        /// The `dispatch_epoch` value the writer presented.
+        presented: u32,
+    },
+
+    /// Redelegation cap reached for a child — the substrate refuses
+    /// to spawn another generation because the configured limit on
+    /// re-dispatches has been exhausted for this child.
+    ///
+    /// Maps to BSD sysexit code `EX_TEMPFAIL` (75) at the CLI
+    /// boundary — the failure is operator-tunable (raise the cap or
+    /// reset the child) rather than a permanent data error. Drives
+    /// PRD R29.
+    #[error("redelegation cap exceeded for {child_session_id}: cap={cap}")]
+    RedelegationCapExceeded {
+        /// Child session id whose respawn generation has reached the
+        /// configured cap.
+        child_session_id: String,
+        /// The cap value that was exceeded.
+        cap: u32,
+    },
+
+    /// Caller-supplied session id failed the validation regex used
+    /// by [`crate::engine::types::ValidatedSessionId`].
+    ///
+    /// The `input_preview` is truncated to 64 characters to keep log
+    /// output bounded; overlong inputs should not be able to spam
+    /// audit logs through this error.
+    #[error("invalid session id ({reason}): {input_preview}")]
+    InvalidSessionId {
+        /// Human-readable rejection reason (e.g. `"empty input"`,
+        /// `"leading dot"`, `"contains shell metacharacters"`).
+        reason: String,
+        /// First up-to-64 characters of the rejected input, with the
+        /// rest replaced by `...` when truncated.
+        input_preview: String,
+    },
+
+    /// Caller-supplied coordinator id failed the validation regex
+    /// used by [`crate::engine::types::ValidatedCoordId`].
+    ///
+    /// The `input_preview` is truncated to 64 characters to keep log
+    /// output bounded; overlong inputs should not be able to spam
+    /// audit logs through this error.
+    #[error("invalid coord id ({reason}): {input_preview}")]
+    InvalidCoordId {
+        /// Human-readable rejection reason.
+        reason: String,
+        /// First up-to-64 characters of the rejected input, with the
+        /// rest replaced by `...` when truncated.
+        input_preview: String,
+    },
+}
+
+impl EngineError {
+    /// Return the BSD sysexit-style exit code associated with this
+    /// error variant. The CLI boundary calls this from
+    /// `exit_code_for_engine_error` when dispatching exit codes for
+    /// engine errors.
+    ///
+    /// Mapping:
+    /// - `EpochFenceViolation` → 65 (`EX_DATAERR`)
+    /// - `RedelegationCapExceeded` → 75 (`EX_TEMPFAIL`)
+    /// - `StateFileCorrupted` → 3 (legacy `EXIT_INFRASTRUCTURE`)
+    /// - other variants → 1 (generic error)
+    ///
+    /// Variants without a documented sysexit code intentionally fall
+    /// back to 1; only the variants the design pins to specific codes
+    /// are special-cased here.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            EngineError::EpochFenceViolation { .. } => 65,
+            EngineError::RedelegationCapExceeded { .. } => 75,
+            EngineError::StateFileCorrupted(_) => 3,
+            _ => 1,
+        }
+    }
 }
