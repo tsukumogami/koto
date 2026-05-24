@@ -144,28 +144,45 @@ pub fn child_redelegated_fields(
 
 /// Build the `fields` map for a `RequesterWoken` audit event.
 ///
-/// Emitted on the requester's log when one or more children reach a
-/// terminal state, signaling the wake-candidates pass (PRD R30).
-/// Wire shape (Decision 6):
+/// Emitted on the coordinator's own log when one or more dispatched
+/// children reach a terminal state, signaling the wake-candidates pass
+/// (PRD R30). Wire shape (Decision 6 / design line 805):
 /// ```json
 /// {
 ///   "kind": "RequesterWoken",
 ///   "summary": "N children completed",
-///   "child_count": <n>
+///   "child_count": <n>,
+///   "child_session_ids": ["<child-1>", "<child-2>"],
+///   "requested_by": "<parent-session-id>"
 /// }
 /// ```
 ///
-/// Note: the `summary` field is built via [`wake_payload_summary`]
-/// so the narrative cannot quote unvalidated ids — the helper
-/// signature takes `&[ValidatedSessionId]` rather than `&[String]`.
-pub fn requester_woken_fields(child_ids: &[ValidatedSessionId]) -> HashMap<String, Value> {
-    let mut fields = HashMap::with_capacity(3);
+/// Per design line 2024 the canonical machine-readable wake payload
+/// is `child_session_ids`; `summary` is purely human-readable
+/// scaffolding. The wake-candidates pass (Issue 15) consumes
+/// `child_session_ids` to determine which `ChildDispatched` events
+/// have already been woken. The helper signature takes
+/// `&[ValidatedSessionId]` so unvalidated ids cannot flow into either
+/// the array or the summary string.
+pub fn requester_woken_fields(
+    child_ids: &[ValidatedSessionId],
+    requested_by: &str,
+) -> HashMap<String, Value> {
+    let mut fields = HashMap::with_capacity(5);
     fields.insert("kind".to_string(), json!(REQUESTER_WOKEN));
     fields.insert(
         "summary".to_string(),
         json!(wake_payload_summary(child_ids)),
     );
     fields.insert("child_count".to_string(), json!(child_ids.len()));
+    fields.insert(
+        "child_session_ids".to_string(),
+        json!(child_ids
+            .iter()
+            .map(|id| id.as_str().to_string())
+            .collect::<Vec<_>>()),
+    );
+    fields.insert("requested_by".to_string(), json!(requested_by));
     fields
 }
 
@@ -311,10 +328,15 @@ mod tests {
     #[test]
     fn requester_woken_round_trips_through_evidence_submitted() {
         let kids = [sid("parent.task-a"), sid("parent.task-b")];
-        let fields = requester_woken_fields(&kids);
+        let fields = requester_woken_fields(&kids, "parent");
         assert_eq!(fields["kind"], json!("RequesterWoken"));
         assert_eq!(fields["child_count"], json!(2));
         assert_eq!(fields["summary"], json!("2 children completed"));
+        assert_eq!(
+            fields["child_session_ids"],
+            json!(["parent.task-a", "parent.task-b"])
+        );
+        assert_eq!(fields["requested_by"], json!("parent"));
         let payload = EventPayload::EvidenceSubmitted {
             state: "wake".to_string(),
             fields,

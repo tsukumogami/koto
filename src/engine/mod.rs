@@ -15,3 +15,5 @@ pub mod scheduler_warning;
 pub mod substitute;
 pub mod terminal_index;
 pub mod types;
+#[cfg(unix)]
+pub mod wake;
