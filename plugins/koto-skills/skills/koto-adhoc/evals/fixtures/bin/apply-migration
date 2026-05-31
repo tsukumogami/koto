@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# apply-migration - hermetic shim for the ad-hoc acceptance fixture.
+#
+# Stands in for "run the migration into the target datastore". No network, no
+# real database: it reads the source count from the snapshot file ($1) and
+# writes the same count to the target count file ($2), simulating a clean,
+# lossless migration. The agent never needs real infrastructure.
+#
+# Usage: apply-migration <source-count-file> <target-count-file>
+set -euo pipefail
+
+src="${1:-}"
+dst="${2:-}"
+if [ -z "$src" ] || [ -z "$dst" ]; then
+  echo "apply-migration: usage: apply-migration <source-count-file> <target-count-file>" >&2
+  exit 2
+fi
+if [ ! -f "$src" ]; then
+  echo "apply-migration: source snapshot not found at $src (run snapshot-source first)" >&2
+  exit 1
+fi
+
+count="$(cat "$src")"
+echo "$count" > "$dst"
+echo "apply-migration: migrated $count rows into target (written to $dst)"

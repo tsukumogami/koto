@@ -51,6 +51,42 @@
         "Response does NOT author or pipe an inline workflow definition for a task that already has a matching template",
         "Response refers to the koto-user run loop (`koto next`) for executing the workflow"
       ]
+    },
+    {
+      "id": 5,
+      "name": "adhoc-acceptance-execute",
+      "tier": 2,
+      "scenario": "adhoc-acceptance",
+      "fixture_dir": "fixtures/adhoc-acceptance",
+      "prompt": "Read inputs/TASK.md and carry it out using the koto-adhoc skill. There is no koto template for this task. Author a workflow definition, run it inline with `koto init <name> --from-stdin`, then drive it to completion with the `koto next` run loop. So the run stays inspectable for the rewind step, pass `--no-cleanup` on the final `koto next` that reaches the terminal state (koto otherwise auto-removes a session the moment it completes). After it reaches the terminal `done` state, run `koto rewind <name>` to walk the session back to the prior state and confirm `koto next` resumes from there. The domain tools (snapshot-source, apply-migration, verify-counts) and koto are on PATH. Actually execute every command — do not just describe what you would do.",
+      "expected_output": "The agent decomposes the fixed cutover task into an ordered koto workflow with a verification gate at the count-match boundary, pipes it into `koto init --from-stdin` (exit 0, a session starts), drives the `koto next` loop to a terminal `action: \"done\"` state, and runs `koto rewind` (exit 0) to walk the session back to a prior state. The gate that holds the workflow until `verify-counts` passes sits at the real verification boundary, distinct from the agent merely asserting the counts matched.",
+      "files": [],
+      "fixtures": {
+        "task_brief": "inputs/TASK.md",
+        "tools_on_path": ["koto", "snapshot-source", "apply-migration", "verify-counts"],
+        "fixtures_bin": "fixtures/bin"
+      },
+      "threshold": {
+        "runs": 3,
+        "mechanical": "all assertions pass on every run (3/3)",
+        "llm_judged": "passes in at least 2 of 3 runs"
+      },
+      "mechanical_assertions": [
+        "VALIDITY: `koto init <name> --from-stdin` with the authored definition exits 0 and prints a session JSON object (`{\"name\": ..., \"state\": ...}`); a syntactically invalid definition would have exited non-zero with no session, so a clean exit proves the definition compiled and validated on the strict path.",
+        "TERMINAL: driving the `koto next <name>` run loop reaches a terminal state — the final `koto next` (passed `--no-cleanup` so the completed session is preserved) returns `action: \"done\"` and exits 0, and `koto status <name>` then reports `is_terminal: true`.",
+        "REWIND: from the preserved terminal state, `koto rewind <name>` exits 0 and returns the session to a prior state (the `state` field in its JSON, or the subsequent `koto status` `current_state`, is an earlier state than before the rewind), and a follow-up `koto next` resumes from there with exit 0.",
+        "STRUCTURE: the authored definition is decomposed into more than one state (not a single monolithic state) and declares at least one gate."
+      ],
+      "llm_judged_assertions": [
+        "QUALITY: the gate that blocks progress sits at the real verification boundary — it is routed on the result of `verify-counts` (the count-match check), i.e. `gates.<name>.exit_code` on a `command` gate that runs `verify-counts`, NOT an agent-submitted boolean such as `{\"verified\": true}`. This is a quality check on gate placement, distinct from the VALIDITY check that the definition merely compiles: a definition can be valid yet gate on the wrong (agent-asserted) thing."
+      ],
+      "assertions": [
+        "VALIDITY (mechanical): `koto init <name> --from-stdin` exits 0 and prints a session JSON object, proving the authored definition compiled and validated on the strict path.",
+        "TERMINAL (mechanical): the `koto next <name>` run loop reaches a terminal state — the final `koto next` (with `--no-cleanup`) returns `action: \"done\"` and `koto status` then reports `is_terminal: true`.",
+        "REWIND (mechanical): `koto rewind <name>` exits 0 and returns the preserved session to a prior state, and a follow-up `koto next` resumes from there.",
+        "STRUCTURE (mechanical): the authored definition has more than one state and declares at least one gate.",
+        "QUALITY (LLM-judged): the gate sits at the real verification boundary — routed on `verify-counts`'s exit code (`gates.<name>.exit_code`), not on an agent-asserted boolean. Distinct from VALIDITY: a valid definition can still gate on the wrong thing."
+      ]
     }
   ]
 }

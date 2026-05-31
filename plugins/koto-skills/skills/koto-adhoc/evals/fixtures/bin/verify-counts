@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# verify-counts - hermetic shim for the ad-hoc acceptance fixture.
+#
+# This is the real verification boundary of the fixed task: the migration must
+# not be recorded as complete until the target row count matches the source row
+# count. It compares the two count files and exits 0 on a match, 1 on a
+# mismatch. A koto `command` gate routed on this exit code is the gate the
+# acceptance eval checks for.
+#
+# Usage: verify-counts <source-count-file> <target-count-file>
+set -euo pipefail
+
+src="${1:-}"
+dst="${2:-}"
+if [ -z "$src" ] || [ -z "$dst" ]; then
+  echo "verify-counts: usage: verify-counts <source-count-file> <target-count-file>" >&2
+  exit 2
+fi
+if [ ! -f "$src" ] || [ ! -f "$dst" ]; then
+  echo "verify-counts: counts not yet available (need both $src and $dst)" >&2
+  exit 1
+fi
+
+src_count="$(cat "$src")"
+dst_count="$(cat "$dst")"
+if [ "$src_count" = "$dst_count" ]; then
+  echo "verify-counts: MATCH source=$src_count target=$dst_count"
+  exit 0
+fi
+echo "verify-counts: MISMATCH source=$src_count target=$dst_count" >&2
+exit 1
