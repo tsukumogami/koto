@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 problem: |
   koto can only run a workflow from a pre-authored, compiled template, so an
   agent facing a novel complex task cannot get koto's ordered, recoverable,
@@ -28,7 +28,7 @@ rationale: |
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context and Problem Statement
 
