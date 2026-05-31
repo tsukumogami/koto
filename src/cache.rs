@@ -26,10 +26,19 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex_encode(hasher.finalize())
 }
 
-/// Core cache logic with an explicit cache directory.
+/// Core cache logic with an explicit output directory.
 ///
-/// The cache key is SHA256 of the compiled JSON. Returns `(cache_path, hash)`.
-fn compile_cached_into(
+/// The cache key is SHA256 of the compiled JSON. The compiled artifact is
+/// written to `<dir>/<sha256>.json` and `(artifact_path, hash)` is returned.
+///
+/// `dir` is parameterized so callers can target a location other than the
+/// global cache. The file-template path uses the global cache (via
+/// [`compile_cached`]); the inline (`koto init --from-stdin`) path passes
+/// the *session directory* so the compiled artifact becomes durable session
+/// state that survives `~/.cache` eviction and session relocation. The
+/// content-addressed `hash` is identical regardless of `dir` — only the
+/// returned path differs.
+pub fn compile_cached_into(
     source_path: &Path,
     dir: &Path,
     strict: bool,

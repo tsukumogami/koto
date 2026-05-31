@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# snapshot-source - hermetic shim for the ad-hoc acceptance fixture.
+#
+# Stands in for "take a row-count snapshot of the source datastore". No network,
+# no real database: it writes a deterministic source row count to the path given
+# as $1 so a later verification step can compare against the migrated target.
+#
+# Usage: snapshot-source <count-file>
+set -euo pipefail
+
+out="${1:-}"
+if [ -z "$out" ]; then
+  echo "snapshot-source: missing output path" >&2
+  exit 2
+fi
+
+# Deterministic source population for the fixture.
+echo "1000" > "$out"
+echo "snapshot-source: source row count = 1000 (written to $out)"

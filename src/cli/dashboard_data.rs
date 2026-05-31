@@ -238,7 +238,10 @@ pub fn read_session(path: &Path) -> CachedSession {
     let current_state = derive_state_from_log(&events);
 
     // Derive machine state to get the template path for terminal detection.
-    let is_terminal = match derive_machine_state(&header, &events) {
+    // The state file lives inside the session directory, so its parent is
+    // the resolution base for a session-relative template_path.
+    let session_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let is_terminal = match derive_machine_state(&header, &events, session_dir) {
         Some(machine_state) => {
             is_terminal_state(&machine_state.template_path, &machine_state.current_state)
         }
@@ -439,7 +442,10 @@ pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
     };
 
     // Load compiled template once (best-effort, None on any error).
-    let compiled = derive_machine_state(&header, &events).and_then(|ms| {
+    // The state file's parent directory is the session dir, the
+    // resolution base for a session-relative template_path.
+    let session_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let compiled = derive_machine_state(&header, &events, session_dir).and_then(|ms| {
         std::fs::read(&ms.template_path).ok().and_then(|bytes| {
             serde_json::from_slice::<crate::template::types::CompiledTemplate>(&bytes).ok()
         })

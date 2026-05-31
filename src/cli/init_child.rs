@@ -41,6 +41,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
+
 use crate::cache::compile_cached;
 use crate::cli::task_spawn_error::{SpawnErrorKind, TaskSpawnError};
 use crate::engine::types::{
@@ -542,9 +544,247 @@ fn init_child_core(
     Ok(())
 }
 
+/// Fixed filename for the human-readable source persisted by the inline
+/// (`koto init --from-stdin`) path. The original extension is metadata,
+/// never a path component — a recorded extension is never concatenated
+/// into a filesystem path, so a hostile `<name>` or extension cannot
+/// encode traversal (see the design's Security Considerations). Issue 1
+/// wires up the compiled-artifact storage and session-relative resolution;
+/// the source-write (`koto init --from-stdin`) lands in Issue 2 and reuses
+/// this constant.
+pub(crate) const INLINE_SOURCE_FILENAME: &str = "source";
+
+/// Initialize a top-level workflow whose compiled artifact is stored
+/// **inside the session directory** and recorded as a **session-relative**
+/// `template_path`.
+///
+/// This is the engine seam for the inline (`koto init --from-stdin`) path.
+/// Unlike [`init_child_from_parent`], which records the absolute
+/// `~/.cache/koto/<sha>.json` cache path, this helper:
+///
+/// 1. creates the session directory (so `ensure_koto_root` sets 0700),
+/// 2. compiles `source_path` *into* the session directory via
+///    [`compile_cached_into`] in **strict** mode, and
+/// 3. records only the artifact's filename (`<sha256>.json`) as the
+///    `WorkflowInitialized.template_path`.
+///
+/// Because the recorded path is relative, [`derive_machine_state`] resolves
+/// it against the session directory at read time, so the compiled artifact
+/// survives `~/.cache` eviction and survives session `relocate` (which
+/// renames the whole directory but does not rewrite the event log). The
+/// content-addressed `template_hash` is identical to what the cache path
+/// would produce — only the recorded path string differs.
+///
+/// `source_path` must already exist on disk; the stdin→source-file write is
+/// the CLI surface added in Issue 2. The persisted human-readable source
+/// (under [`INLINE_SOURCE_FILENAME`]) is likewise Issue 2's concern.
+///
+/// [`derive_machine_state`]: crate::engine::persistence::derive_machine_state
+/// [`compile_cached_into`]: crate::cache::compile_cached_into
+pub fn init_inline_into_session(
+    backend: &dyn SessionBackend,
+    name: &str,
+    source_path: &Path,
+    vars: &[String],
+) -> anyhow::Result<()> {
+    // Create the session directory first: compile_cached_into would
+    // create it too, but going through the backend also applies the
+    // 0700 koto-root permissions and the session-id validation that
+    // guards `<name>` against traversal.
+    let session_dir = backend.create(name)?;
+
+    // Compile strictly into the session directory. The artifact lands at
+    // <session_dir>/<sha256>.json and the hash is content-addressed over
+    // the compiled JSON bytes (identical to the global-cache path).
+    let (artifact_path, hash) = crate::cache::compile_cached_into(source_path, &session_dir, true)?;
+
+    // Read the freshly written artifact back so we can resolve variables
+    // against the compiled template's declarations.
+    let content = std::fs::read_to_string(&artifact_path).with_context(|| {
+        format!(
+            "failed to read compiled artifact {}",
+            artifact_path.display()
+        )
+    })?;
+    let compiled: CompiledTemplate = serde_json::from_str(&content).with_context(|| {
+        format!(
+            "failed to parse compiled artifact {}",
+            artifact_path.display()
+        )
+    })?;
+
+    let variables = crate::cli::resolve_variables(vars, &compiled.variables)
+        .map_err(|msg| anyhow::anyhow!("{}{}", VAR_RESOLUTION_MSG_PREFIX, msg))?;
+
+    // Record the artifact as a SESSION-RELATIVE path: just the filename.
+    // derive_machine_state resolves it against the session dir at read
+    // time. file_name() is safe — compile_cached_into always names the
+    // artifact `<sha256>.json` directly under `session_dir`.
+    let relative_template_path = artifact_path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "compiled artifact path has no file name: {}",
+                artifact_path.display()
+            )
+        })?;
+
+    let ts = now_iso8601();
+    let initial_state = compiled.initial_state.clone();
+
+    let header = StateFileHeader {
+        schema_version: 1,
+        workflow: name.to_string(),
+        template_hash: hash,
+        created_at: ts.clone(),
+        parent_workflow: None,
+        // The compiled artifact lives in the session dir, not a source
+        // tree, so there is no parent source dir for the batch resolver.
+        template_source_dir: None,
+        session_id: generate_session_id(),
+        intent: None,
+        template_name: if compiled.name.is_empty() {
+            None
+        } else {
+            Some(compiled.name.clone())
+        },
+        needs_agent: None,
+        role: None,
+        inputs: None,
+        coordinator_of_record: None,
+        requested_by: None,
+        assignment_claim: None,
+        dispatch_epoch: 0,
+        priority: None,
+        deadline: None,
+        retry_count: None,
+        agent_config: None,
+        respawn_generation: None,
+    };
+
+    let init_payload = EventPayload::WorkflowInitialized {
+        template_path: relative_template_path,
+        variables,
+        spawn_entry: None,
+    };
+    let transition_payload = EventPayload::Transitioned {
+        from: None,
+        to: initial_state.clone(),
+        condition_type: "auto".to_string(),
+        skip_if_matched: None,
+    };
+    let initial_events = vec![
+        Event {
+            seq: 1,
+            timestamp: ts.clone(),
+            event_type: init_payload.type_name().to_string(),
+            payload: init_payload,
+            idempotency_hash: None,
+        },
+        Event {
+            seq: 2,
+            timestamp: ts.clone(),
+            event_type: transition_payload.type_name().to_string(),
+            payload: transition_payload,
+            idempotency_hash: None,
+        },
+    ];
+
+    backend
+        .init_state_file(name, header, initial_events)
+        .map_err(|e| anyhow::anyhow!("failed to initialize inline session {:?}: {}", name, e))?;
+
+    Ok(())
+}
+
+/// Drive the full inline (`koto init --from-stdin`) flow from a raw byte
+/// buffer read off stdin: strict-compile the definition into the session
+/// directory, start the session, and persist the human-readable source
+/// alongside it for audit.
+///
+/// The definition bytes are first written to a private temp file so the
+/// existing path-based compile helper ([`init_inline_into_session`]) can
+/// consume them without inventing a second compile entry point. On a
+/// successful compile + init, the *same* bytes are written into the session
+/// directory under the **fixed** [`INLINE_SOURCE_FILENAME`] convention — the
+/// original extension (if any) is never concatenated into a path, so a
+/// hostile definition cannot smuggle `source/../../x`-style traversal.
+///
+/// Failure semantics (acceptance guard): on a strict-validation /
+/// compile failure nothing persists. [`init_inline_into_session`] creates the
+/// session directory before compiling, but does **not** write a state file
+/// when the compile fails; this helper removes that bare directory so no
+/// half-built session is left behind. The error is propagated verbatim from
+/// the compiler, so it already names the failing element (state / transition
+/// / gate) rather than a generic "invalid template".
+pub fn init_inline_from_stdin_bytes(
+    backend: &dyn SessionBackend,
+    name: &str,
+    source_bytes: &[u8],
+    vars: &[String],
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    // Materialize the stdin bytes to a private temp file. The compile
+    // helper is path-based; this temp file is purely an internal bridge
+    // and is dropped (deleted) at the end of this function. It is NOT the
+    // persisted audit source — that is written into the session dir below.
+    let mut tmp = tempfile::Builder::new()
+        .prefix("koto-inline-")
+        .suffix(".src")
+        .tempfile()
+        .context("failed to create temp file for inline definition")?;
+    tmp.write_all(source_bytes)
+        .context("failed to write inline definition to temp file")?;
+    tmp.flush()
+        .context("failed to flush inline definition temp file")?;
+
+    // Strict-compile into the session dir and start the session. On
+    // failure the compiler error (element-named) propagates; we then tear
+    // down the bare session directory so nothing half-built persists.
+    if let Err(e) = init_inline_into_session(backend, name, tmp.path(), vars) {
+        // Best-effort cleanup of the session dir init_inline_into_session
+        // created before compiling. `exists()` checks for the STATE FILE,
+        // which is absent on a compile failure, so the session is not
+        // registered — but the directory (and possibly the compiled
+        // artifact) may linger. Remove it. Ignore cleanup errors: the
+        // compile error is the one the caller must see.
+        let session_dir = backend.session_dir(name);
+        if session_dir.exists() {
+            let _ = std::fs::remove_dir_all(&session_dir);
+        }
+        return Err(e);
+    }
+
+    // Compile + init succeeded: persist the readable source under the
+    // FIXED filename. join() with a constant literal cannot escape the
+    // session dir, and `name` already passed validate_session_id /
+    // validate_workflow_name (no `/`, `..`, or `~`).
+    let session_dir = backend.session_dir(name);
+    let source_path = session_dir.join(INLINE_SOURCE_FILENAME);
+    std::fs::write(&source_path, source_bytes).with_context(|| {
+        format!(
+            "failed to persist inline source at {}",
+            source_path.display()
+        )
+    })?;
+
+    // Match the 0600 posture of the state file / compiled artifact: the
+    // persisted source is a secret-bearing audit copy.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::sha256_hex;
     use crate::session::local::LocalBackend;
     use std::io::Write;
     use tempfile::TempDir;
@@ -909,5 +1149,272 @@ Done.
             }
             other => panic!("expected WorkflowInitialized, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Inline session-local storage (Issue 1)
+    // -----------------------------------------------------------------------
+
+    const INLINE_TEMPLATE: &str = r#"---
+name: inline-wf
+version: "1.0"
+initial_state: gather
+states:
+  gather:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## gather
+
+Gather things.
+
+## done
+
+Done.
+"#;
+
+    /// The compiled artifact is written under the session directory and the
+    /// `WorkflowInitialized.template_path` is recorded as a session-relative
+    /// filename (no directory component, no absolute cache path).
+    #[test]
+    fn inline_init_stores_artifact_in_session_dir_with_relative_path() {
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let tpl_dir = TempDir::new().expect("templates dir");
+        let backend = backend_in(sessions.path());
+
+        let source = write_template(tpl_dir.path(), "inline.md", INLINE_TEMPLATE);
+
+        init_inline_into_session(&backend, "inline-wf", &source, &[]).expect("inline init");
+
+        let (header, events) = backend.read_events("inline-wf").expect("read events");
+
+        // The recorded template_path must be RELATIVE (the bare filename),
+        // not the absolute cache path the --template path would record.
+        let recorded = match &events[0].payload {
+            EventPayload::WorkflowInitialized { template_path, .. } => template_path.clone(),
+            other => panic!("expected WorkflowInitialized, got {:?}", other),
+        };
+        assert!(
+            !Path::new(&recorded).is_absolute(),
+            "inline template_path must be session-relative, got {:?}",
+            recorded
+        );
+        assert!(
+            !recorded.contains('/'),
+            "inline template_path must be a bare filename, got {:?}",
+            recorded
+        );
+        assert!(
+            recorded.ends_with(".json"),
+            "artifact must be the compiled JSON, got {:?}",
+            recorded
+        );
+
+        // The artifact must physically live inside the session directory.
+        let session_dir = backend.session_dir("inline-wf");
+        let artifact = session_dir.join(&recorded);
+        assert!(
+            artifact.exists(),
+            "compiled artifact must exist under the session dir at {}",
+            artifact.display()
+        );
+
+        // The header hash must be the SHA-256 of the on-disk artifact bytes.
+        let bytes = std::fs::read(&artifact).expect("read artifact");
+        assert_eq!(
+            header.template_hash,
+            sha256_hex(&bytes),
+            "template_hash must be content-addressed over the artifact bytes"
+        );
+    }
+
+    /// `derive_machine_state` resolves the session-relative path against the
+    /// session directory, yielding a directly-readable absolute path whose
+    /// bytes hash to the recorded `template_hash` — and that holds across
+    /// repeated reads with the global cache emptied between each, proving the
+    /// run does not depend on `~/.cache`.
+    #[test]
+    fn inline_artifact_survives_cache_eviction_across_repeated_reads() {
+        use crate::engine::persistence::derive_machine_state;
+
+        let cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let tpl_dir = TempDir::new().expect("templates dir");
+        let backend = backend_in(sessions.path());
+
+        let source = write_template(tpl_dir.path(), "inline.md", INLINE_TEMPLATE);
+        init_inline_into_session(&backend, "inline-wf", &source, &[]).expect("inline init");
+
+        let (header, events) = backend.read_events("inline-wf").expect("read events");
+        let session_dir = backend.session_dir("inline-wf");
+
+        for tick in 0..3 {
+            // Empty the global cache between ticks: a cache-dependent run
+            // would break here. The session-local artifact must not.
+            let cache_dir = cache._tmp.path().join("koto");
+            if cache_dir.exists() {
+                std::fs::remove_dir_all(&cache_dir).expect("evict cache");
+            }
+            assert!(
+                !cache_dir.exists(),
+                "precondition: cache must be empty on tick {}",
+                tick
+            );
+
+            let ms =
+                derive_machine_state(&header, &events, &session_dir).expect("derive machine state");
+
+            // The resolved path is absolute (session dir is absolute) and
+            // reads back to bytes that hash to the recorded template_hash.
+            let bytes = std::fs::read(&ms.template_path).unwrap_or_else(|e| {
+                panic!(
+                    "tick {}: failed to read resolved template {}: {}",
+                    tick, ms.template_path, e
+                )
+            });
+            assert_eq!(
+                sha256_hex(&bytes),
+                ms.template_hash,
+                "tick {}: hash verification must pass against the session-local artifact",
+                tick
+            );
+        }
+    }
+
+    /// After a session `relocate` (which renames the whole directory and
+    /// rewrites only the header, not the event-log `template_path`), the
+    /// session-relative path still resolves against the new directory and
+    /// still hash-verifies.
+    #[test]
+    fn inline_artifact_resolves_after_relocate() {
+        use crate::engine::persistence::derive_machine_state;
+
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let tpl_dir = TempDir::new().expect("templates dir");
+        let backend = backend_in(sessions.path());
+
+        let source = write_template(tpl_dir.path(), "inline.md", INLINE_TEMPLATE);
+        init_inline_into_session(&backend, "inline-old", &source, &[]).expect("inline init");
+
+        backend
+            .relocate("inline-old", "inline-new")
+            .expect("relocate");
+
+        let (header, events) = backend
+            .read_events("inline-new")
+            .expect("read relocated events");
+        let session_dir = backend.session_dir("inline-new");
+
+        let ms =
+            derive_machine_state(&header, &events, &session_dir).expect("derive machine state");
+
+        // The resolved path points into the NEW session dir, and the bytes
+        // still hash-verify — the relocation gap is closed because the
+        // recorded path is relative, not the (now-dangling) absolute path.
+        assert!(
+            ms.template_path.contains("inline-new"),
+            "resolved path must point into the relocated dir, got {}",
+            ms.template_path
+        );
+        let bytes = std::fs::read(&ms.template_path).expect("read relocated artifact");
+        assert_eq!(
+            sha256_hex(&bytes),
+            ms.template_hash,
+            "hash verification must pass after relocate"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Inline stdin-bytes flow (Issue 2)
+    // -----------------------------------------------------------------------
+
+    /// A definition with a state whose transition target does not exist:
+    /// strict compilation fails and names the failing state + target.
+    const BAD_TARGET_TEMPLATE: &str = r#"---
+name: inline-bad
+version: "1.0"
+initial_state: gather
+states:
+  gather:
+    transitions:
+      - target: nowhere
+  done:
+    terminal: true
+---
+
+## gather
+
+Gather.
+
+## done
+
+Done.
+"#;
+
+    /// The bytes-based seam compiles a valid definition into the session
+    /// dir, starts the session, and persists the readable source under the
+    /// fixed [`INLINE_SOURCE_FILENAME`] byte-for-byte identical to input.
+    #[test]
+    fn inline_from_stdin_bytes_persists_byte_identical_source() {
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let backend = backend_in(sessions.path());
+
+        let input = INLINE_TEMPLATE.as_bytes();
+        init_inline_from_stdin_bytes(&backend, "inline-wf", input, &[]).expect("inline init");
+
+        // Session started: state file exists.
+        assert!(backend.exists("inline-wf"), "session must be registered");
+
+        // Readable source persisted under the FIXED filename.
+        let source_path = backend
+            .session_dir("inline-wf")
+            .join(INLINE_SOURCE_FILENAME);
+        assert!(
+            source_path.exists(),
+            "source must be persisted under the fixed filename"
+        );
+        let recovered = std::fs::read(&source_path).expect("read persisted source");
+        assert_eq!(
+            recovered, input,
+            "persisted source must be byte-for-byte identical to stdin input"
+        );
+    }
+
+    /// A definition failing strict validation creates NO session and leaves
+    /// no half-built session directory; the error names the failing element.
+    #[test]
+    fn inline_from_stdin_bytes_strict_failure_creates_no_session() {
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let backend = backend_in(sessions.path());
+
+        let err = init_inline_from_stdin_bytes(
+            &backend,
+            "inline-bad",
+            BAD_TARGET_TEMPLATE.as_bytes(),
+            &[],
+        )
+        .expect_err("strict validation must fail");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gather") && msg.contains("nowhere"),
+            "error must name the failing state and target, got: {}",
+            msg
+        );
+        assert!(
+            !backend.exists("inline-bad"),
+            "strict failure must register no session"
+        );
+        assert!(
+            !backend.session_dir("inline-bad").exists(),
+            "strict failure must leave no half-built session directory"
+        );
     }
 }

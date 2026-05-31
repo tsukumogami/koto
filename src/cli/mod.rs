@@ -93,9 +93,21 @@ pub enum Command {
         /// Workflow name
         name: String,
 
-        /// Path to template file
+        /// Path to template file (mutually exclusive with --from-stdin)
         #[arg(long)]
-        template: String,
+        template: Option<String>,
+
+        /// Read an inline workflow definition from standard input,
+        /// strict-compile it into the session directory, and start the
+        /// session in one invocation. Mutually exclusive with --template;
+        /// rejects --allow-legacy-gates (the inline path is strict-only).
+        #[arg(long)]
+        from_stdin: bool,
+
+        /// Permit legacy gate patterns (no gates.* routing) when compiling.
+        /// Not allowed on the --from-stdin path, which is strict-only.
+        #[arg(long)]
+        allow_legacy_gates: bool,
 
         /// Set a template variable (repeatable)
         #[arg(long = "var", value_name = "KEY=VALUE")]
@@ -982,19 +994,74 @@ pub fn run(app: App) -> Result<()> {
         Command::Init {
             name,
             template,
+            from_stdin,
+            allow_legacy_gates,
             vars,
             parent,
             intent,
         } => {
             let backend = build_backend()?;
-            handle_init(
-                &backend,
-                &name,
-                &template,
-                &vars,
-                parent.as_deref(),
-                intent.as_deref(),
-            )
+            if from_stdin {
+                // --from-stdin is the inline (strict-only) path. Reject the
+                // two incompatible flag combinations before reading stdin
+                // or touching the filesystem.
+                if template.is_some() {
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": "--from-stdin and --template are mutually exclusive: \
+                                      pass exactly one",
+                            "command": "init"
+                        }),
+                        2,
+                    );
+                }
+                if allow_legacy_gates {
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": "--from-stdin rejects --allow-legacy-gates: \
+                                      the inline path is strict-only",
+                            "command": "init"
+                        }),
+                        2,
+                    );
+                }
+                if parent.is_some() {
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": "--from-stdin does not support --parent: \
+                                      inline definitions start top-level workflows",
+                            "command": "init"
+                        }),
+                        2,
+                    );
+                }
+
+                // Read the full definition off stdin (mirrors the
+                // `koto context add` stdin idiom: read-to-end, no sentinel).
+                let mut source_bytes = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::stdin(), &mut source_bytes)
+                    .map_err(|e| anyhow::anyhow!("failed to read stdin: {}", e))?;
+
+                handle_init_inline(&backend, &name, &source_bytes, &vars, intent.as_deref())
+            } else {
+                let template = template.unwrap_or_else(|| {
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": "koto init requires --template <path> or --from-stdin",
+                            "command": "init"
+                        }),
+                        2,
+                    )
+                });
+                handle_init(
+                    &backend,
+                    &name,
+                    &template,
+                    &vars,
+                    parent.as_deref(),
+                    intent.as_deref(),
+                )
+            }
         }
         Command::Next {
             name,
@@ -1580,6 +1647,113 @@ fn handle_init(
     Ok(())
 }
 
+/// Handle the inline `koto init <name> --from-stdin` path.
+///
+/// Mirrors [`handle_init`]'s CLI responsibilities — name validation,
+/// collision pre-check, intent recording, and the `{ name, state }` JSON
+/// stdout line — but bridges a stdin definition through the strict inline
+/// engine seam ([`init_child::init_inline_from_stdin_bytes`]) instead of a
+/// `--template` file path.
+///
+/// Error mapping:
+/// - invalid workflow name / variable-resolution failure → exit 2 (caller
+///   error), matching the file path.
+/// - already-exists → exit 1 with the same "already exists" guidance.
+/// - strict-validation / compile failure → exit 1; the message is the
+///   compiler's verbatim error, which names the failing element (state /
+///   transition / gate) rather than a generic "invalid template".
+fn handle_init_inline(
+    backend: &dyn SessionBackend,
+    name: &str,
+    source_bytes: &[u8],
+    vars: &[String],
+    intent: Option<&str>,
+) -> Result<()> {
+    // Validate workflow name before any filesystem operation. Guards
+    // `<name>` against path traversal (no `/`, `..`, or `~`).
+    if let Err(msg) = crate::discover::validate_workflow_name(name) {
+        exit_with_error_code(
+            serde_json::json!({
+                "error": msg,
+                "command": "init",
+                "allowed_pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+            }),
+            2,
+        );
+    }
+
+    // Best-effort collision pre-check (the atomic init_state_file inside
+    // the seam is still authoritative for the racers case).
+    if backend.exists(name) {
+        exit_with_error(serde_json::json!({
+            "error": format!(
+                "workflow '{}' already exists; run `koto session cleanup {}` to reuse the name, \
+                 or `koto cancel --cleanup {}` to stop a running workflow first",
+                name, name, name
+            ),
+            "command": "init"
+        }));
+    }
+
+    if let Err(e) = init_child::init_inline_from_stdin_bytes(backend, name, source_bytes, vars) {
+        // Variable-resolution failures are caller errors (exit 2); a
+        // strict-compile / validation failure or any I/O error is exit 1.
+        // The seam prefixes var-resolution errors so we can classify them
+        // the same way the file path does.
+        let msg = e.to_string();
+        let is_var_error = msg.starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
+        let body = serde_json::json!({
+            "error": if is_var_error {
+                msg.strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
+                    .unwrap_or(&msg)
+                    .to_string()
+            } else {
+                msg.clone()
+            },
+            "command": "init"
+        });
+        if is_var_error {
+            exit_with_error_code(body, 2);
+        } else {
+            exit_with_error(body);
+        }
+    }
+
+    // If --intent was provided, append an IntentUpdated event.
+    if let Some(intent_str) = intent {
+        if let Err(e) = session::handle_update(backend, name, intent_str) {
+            eprintln!("warning: failed to record intent: {}", e);
+        }
+    }
+
+    // Recover the initial state for the `{ name, state }` stdout line,
+    // identical to the file path.
+    let (_header, events) = backend
+        .read_events(name)
+        .map_err(|e| anyhow::anyhow!("failed to read newly initialized workflow: {}", e))?;
+    let initial_state = events
+        .iter()
+        .find_map(|e| match &e.payload {
+            EventPayload::Transitioned { to, .. } => Some(to.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "newly initialized workflow {:?} has no Transitioned event",
+                name
+            )
+        })?;
+
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "name": name,
+            "state": initial_state
+        }))?
+    );
+    Ok(())
+}
+
 /// Handle the `koto rewind` command.
 fn handle_rewind(
     backend: &dyn SessionBackend,
@@ -1700,10 +1874,11 @@ fn rewind_relocate_children(
     events_after: &[Event],
 ) -> (Option<String>, usize) {
     // Load the compiled template to check for materialize_children.
-    let machine_state = match derive_machine_state(header, events_after) {
-        Some(ms) => ms,
-        None => return (None, 0),
-    };
+    let machine_state =
+        match derive_machine_state(header, events_after, &backend.session_dir(parent_name)) {
+            Some(ms) => ms,
+            None => return (None, 0),
+        };
     let template_bytes = match std::fs::read(&machine_state.template_path) {
         Ok(b) => b,
         Err(_) => return (None, 0),
@@ -2286,7 +2461,7 @@ fn handle_next(
         }
     };
 
-    let machine_state = match derive_machine_state(&header, &events) {
+    let machine_state = match derive_machine_state(&header, &events, &backend.session_dir(&name)) {
         Some(ms) => ms,
         None => {
             let ne = NextError {
@@ -3663,7 +3838,7 @@ fn handle_decisions_record(
     };
 
     // Derive current state
-    let machine_state = match derive_machine_state(&header, &events) {
+    let machine_state = match derive_machine_state(&header, &events, &backend.session_dir(&name)) {
         Some(ms) => ms,
         None => {
             exit_with_error(serde_json::json!({
@@ -3925,7 +4100,7 @@ fn handle_status(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         }
     };
 
-    let machine_state = match derive_machine_state(&header, &events) {
+    let machine_state = match derive_machine_state(&header, &events, &backend.session_dir(name)) {
         Some(ms) => ms,
         None => {
             exit_with_error_code(
@@ -4108,24 +4283,26 @@ fn annotate_children_with_batch_view(
     // doesn't exist or isn't batch-scoped, return the rows unchanged.
     let view = if backend.exists(parent_name) {
         match backend.read_events(parent_name) {
-            Ok((header, events)) => match derive_machine_state(&header, &events) {
-                Some(machine_state) => {
-                    let compiled_opt: Option<CompiledTemplate> =
-                        std::fs::read(&machine_state.template_path)
-                            .ok()
-                            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-                    compiled_opt.and_then(|compiled| {
-                        crate::cli::batch_view::derive_batch_view(
-                            backend,
-                            &events,
-                            &compiled,
-                            &machine_state.current_state,
-                            parent_name,
-                        )
-                    })
+            Ok((header, events)) => {
+                match derive_machine_state(&header, &events, &backend.session_dir(parent_name)) {
+                    Some(machine_state) => {
+                        let compiled_opt: Option<CompiledTemplate> =
+                            std::fs::read(&machine_state.template_path)
+                                .ok()
+                                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+                        compiled_opt.and_then(|compiled| {
+                            crate::cli::batch_view::derive_batch_view(
+                                backend,
+                                &events,
+                                &compiled,
+                                &machine_state.current_state,
+                                parent_name,
+                            )
+                        })
+                    }
+                    None => None,
                 }
-                None => None,
-            },
+            }
             Err(_) => None,
         }
     } else {
@@ -4248,7 +4425,7 @@ fn handle_cancel(backend: &dyn SessionBackend, name: &str, cleanup: bool) -> Res
     }
 
     // Derive current state and check if terminal.
-    let machine_state = match derive_machine_state(&header, &events) {
+    let machine_state = match derive_machine_state(&header, &events, &backend.session_dir(name)) {
         Some(ms) => ms,
         None => {
             exit_with_error(serde_json::json!({

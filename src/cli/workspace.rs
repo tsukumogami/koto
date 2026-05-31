@@ -107,7 +107,7 @@ pub fn handle_prune(
     let (header, events) = backend
         .read_events(&root)
         .map_err(|e| anyhow::anyhow!("failed to read state file for '{}': {}", root, e))?;
-    let status = derive_terminal_status(&header, &events)?;
+    let status = derive_terminal_status(&header, &events, &root_dir)?;
 
     // 5. Terminal-state gate.
     if !status.is_terminal() && !force {
@@ -252,6 +252,7 @@ fn reject_if_symlink(path: &Path) {
 fn derive_terminal_status(
     header: &StateFileHeader,
     events: &[crate::engine::types::Event],
+    session_dir: &Path,
 ) -> Result<TerminalStatus> {
     if events
         .iter()
@@ -260,7 +261,7 @@ fn derive_terminal_status(
         return Ok(TerminalStatus::Abandoned);
     }
 
-    let machine_state = derive_machine_state(header, events).ok_or_else(|| {
+    let machine_state = derive_machine_state(header, events, session_dir).ok_or_else(|| {
         anyhow::anyhow!(
             "corrupt state file: cannot derive current state for header.workflow={}",
             header.workflow
@@ -326,7 +327,7 @@ where
             let Ok((header, events)) = backend.read_events(id) else {
                 return false;
             };
-            match derive_terminal_status(&header, &events) {
+            match derive_terminal_status(&header, &events, &backend.session_dir(id)) {
                 Ok(status) => !status.is_terminal(),
                 Err(_) => false,
             }

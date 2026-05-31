@@ -1,0 +1,92 @@
+{
+  "skill_name": "koto-adhoc",
+  "evals": [
+    {
+      "id": 1,
+      "name": "decompose-and-run-via-from-stdin",
+      "prompt": "I have a one-off task: migrate a service from one database to another. It has clear phases (snapshot the old DB, run the migration, verify row counts match, cut traffic over) and I want koto to govern the order and keep an audit trail. There's no template for this. The koto binary is on PATH. How do I get koto to run this?",
+      "expected_output": "Agent decomposes the task into ordered states and runs it inline via `koto init <name> --from-stdin`, piping a workflow definition on stdin. It does NOT tell the user to write and save a template file first, and it does NOT redirect to koto-author (this is a one-off with no matching template).",
+      "files": [],
+      "assertions": [
+        "Response uses `koto init` with `--from-stdin` to run the inline definition (the ephemeral path), not `--template` pointing at a saved file",
+        "Response pipes a workflow definition on stdin rather than telling the user to author and commit a durable template file first",
+        "Response decomposes the task into multiple ordered states (does not put the whole task in one monolithic state)",
+        "Response explains that after init the agent drives the workflow with the `koto next` run loop (per koto-user)",
+        "Response does NOT redirect this one-off task to koto-author"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "gate-at-verification-boundary",
+      "prompt": "I'm decomposing a one-off dependency-upgrade task into a koto workflow to run with `koto init --from-stdin`. The workflow must not record the change in the changelog until the test suite actually passes against the new version. How should I express that the suite must pass before proceeding?",
+      "expected_output": "Agent puts a gate at the real verification boundary (the test suite passing), routed with a gates.<name>.<field> when clause so the engine resolves it. It distinguishes a gate (objective, machine-checked) from agent-submitted evidence, and notes the strict --from-stdin path requires gates.* routing.",
+      "files": [],
+      "assertions": [
+        "Response uses a gate (e.g., a `command` gate) at the verification boundary rather than an agent-asserted evidence field for the objective 'tests pass' check",
+        "Response routes the gate with a `gates.<name>.<field>` when clause (e.g., `gates.suite.exit_code: 0`) so the engine resolves the transition",
+        "Response notes that the `--from-stdin` path is strict and a gate without `gates.*` routing is rejected",
+        "Response does NOT suggest using `--allow-legacy-gates` on the `--from-stdin` path"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "repeated-authoring-redirect-to-koto-author",
+      "prompt": "Over the past week I've used `koto init --from-stdin` three times to run essentially the same release-checklist workflow, re-typing almost the same definition each time. It works, but it's getting repetitive. Should I keep doing this?",
+      "expected_output": "Agent recognizes this is no longer a one-off and steers the user to koto-author to build a durable, committed template, rather than continuing to re-pipe near-identical definitions. It explains that --from-stdin is for ephemeral one-offs and a recurring workflow shape belongs in a durable template.",
+      "files": [],
+      "assertions": [
+        "Response recommends switching to koto-author to author a durable template for this recurring workflow",
+        "Response explains that `--from-stdin` is for one-off tasks and should not be a standing substitute for a durable template",
+        "Response does NOT recommend continuing to re-pipe the same definition via `--from-stdin` as the durable solution"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "negative-existing-template-redirect",
+      "prompt": "I already have a koto template for our code-review workflow at `.koto/review.md`. I need to start a session and run it on PR 512. How do I do that?",
+      "expected_output": "Agent recognizes a template already exists, so this is a plain workflow-execution task: run it with `koto init --template` and the koto-user run loop. It does NOT author an inline --from-stdin definition for a task that already has a template.",
+      "files": [],
+      "assertions": [
+        "Response uses `koto init` with `--template .koto/review.md` (the existing template), not `--from-stdin`",
+        "Response does NOT author or pipe an inline workflow definition for a task that already has a matching template",
+        "Response refers to the koto-user run loop (`koto next`) for executing the workflow"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "adhoc-acceptance-execute",
+      "tier": 2,
+      "scenario": "adhoc-acceptance",
+      "fixture_dir": "fixtures/adhoc-acceptance",
+      "prompt": "Read inputs/TASK.md and carry it out using the koto-adhoc skill. There is no koto template for this task. Author a workflow definition, run it inline with `koto init <name> --from-stdin`, then drive it to completion with the `koto next` run loop. So the run stays inspectable for the rewind step, pass `--no-cleanup` on the final `koto next` that reaches the terminal state (koto otherwise auto-removes a session the moment it completes). After it reaches the terminal `done` state, run `koto rewind <name>` to walk the session back to the prior state and confirm `koto next` resumes from there. The domain tools (snapshot-source, apply-migration, verify-counts) and koto are on PATH. Actually execute every command — do not just describe what you would do.",
+      "expected_output": "The agent decomposes the fixed cutover task into an ordered koto workflow with a verification gate at the count-match boundary, pipes it into `koto init --from-stdin` (exit 0, a session starts), drives the `koto next` loop to a terminal `action: \"done\"` state, and runs `koto rewind` (exit 0) to walk the session back to a prior state. The gate that holds the workflow until `verify-counts` passes sits at the real verification boundary, distinct from the agent merely asserting the counts matched.",
+      "files": [],
+      "fixtures": {
+        "task_brief": "inputs/TASK.md",
+        "tools_on_path": ["koto", "snapshot-source", "apply-migration", "verify-counts"],
+        "fixtures_bin": "fixtures/bin"
+      },
+      "threshold": {
+        "runs": 3,
+        "mechanical": "all assertions pass on every run (3/3)",
+        "llm_judged": "passes in at least 2 of 3 runs"
+      },
+      "mechanical_assertions": [
+        "VALIDITY: `koto init <name> --from-stdin` with the authored definition exits 0 and prints a session JSON object (`{\"name\": ..., \"state\": ...}`); a syntactically invalid definition would have exited non-zero with no session, so a clean exit proves the definition compiled and validated on the strict path.",
+        "TERMINAL: driving the `koto next <name>` run loop reaches a terminal state — the final `koto next` (passed `--no-cleanup` so the completed session is preserved) returns `action: \"done\"` and exits 0, and `koto status <name>` then reports `is_terminal: true`.",
+        "REWIND: from the preserved terminal state, `koto rewind <name>` exits 0 and returns the session to a prior state (the `state` field in its JSON, or the subsequent `koto status` `current_state`, is an earlier state than before the rewind), and a follow-up `koto next` resumes from there with exit 0.",
+        "STRUCTURE: the authored definition is decomposed into more than one state (not a single monolithic state) and declares at least one gate."
+      ],
+      "llm_judged_assertions": [
+        "QUALITY: the gate that blocks progress sits at the real verification boundary — it is routed on the result of `verify-counts` (the count-match check), i.e. `gates.<name>.exit_code` on a `command` gate that runs `verify-counts`, NOT an agent-submitted boolean such as `{\"verified\": true}`. This is a quality check on gate placement, distinct from the VALIDITY check that the definition merely compiles: a definition can be valid yet gate on the wrong (agent-asserted) thing."
+      ],
+      "assertions": [
+        "VALIDITY (mechanical): `koto init <name> --from-stdin` exits 0 and prints a session JSON object, proving the authored definition compiled and validated on the strict path.",
+        "TERMINAL (mechanical): the `koto next <name>` run loop reaches a terminal state — the final `koto next` (with `--no-cleanup`) returns `action: \"done\"` and `koto status` then reports `is_terminal: true`.",
+        "REWIND (mechanical): `koto rewind <name>` exits 0 and returns the preserved session to a prior state, and a follow-up `koto next` resumes from there.",
+        "STRUCTURE (mechanical): the authored definition has more than one state and declares at least one gate.",
+        "QUALITY (LLM-judged): the gate sits at the real verification boundary — routed on `verify-counts`'s exit code (`gates.<name>.exit_code`), not on an agent-asserted boolean. Distinct from VALIDITY: a valid definition can still gate on the wrong thing."
+      ]
+    }
+  ]
+}

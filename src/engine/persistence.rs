@@ -772,11 +772,53 @@ pub fn derive_last_gate_evaluated(events: &[Event], gate: &str) -> Option<serde_
     })
 }
 
+/// Resolve a `template_path` recorded on a `WorkflowInitialized` event
+/// against a session directory.
+///
+/// The inline (`--from-stdin`) path stores the compiled artifact *inside*
+/// the session directory and records a **session-relative** `template_path`
+/// (e.g. just `<sha256>.json`). The file-template (`--template <path>`)
+/// path records an **absolute** `~/.cache/koto/<sha256>.json` path. This
+/// helper is the single resolution seam: a relative path is joined against
+/// `session_dir`; an absolute path passes through unchanged.
+///
+/// This mirrors the "absolute passes through" convention of
+/// [`crate::engine::path_resolution::resolve_template_path`], but uses a
+/// distinct resolution base — the session directory rather than the parent
+/// source dir / submitter cwd — so the two resolvers stay independent.
+///
+/// An empty `template_path` (the unclaimed needs-agent placeholder) passes
+/// through unchanged: callers detect and reject that case separately, and
+/// joining it against the session dir would silently produce the session
+/// directory itself.
+fn resolve_template_path_in_session(template_path: &str, session_dir: &Path) -> String {
+    if template_path.is_empty() {
+        return template_path.to_string();
+    }
+    let path = Path::new(template_path);
+    if path.is_absolute() {
+        template_path.to_string()
+    } else {
+        session_dir.join(path).to_string_lossy().into_owned()
+    }
+}
+
 /// Derive full machine state from header and event log.
 ///
 /// Uses `derive_state_from_log` for the current state, and extracts
 /// template info from the header and workflow_initialized event.
-pub fn derive_machine_state(header: &StateFileHeader, events: &[Event]) -> Option<MachineState> {
+///
+/// `session_dir` is the directory the session's state file lives in. A
+/// session-relative `template_path` (used by the inline `--from-stdin`
+/// path so the compiled artifact survives `~/.cache` eviction and session
+/// relocation) is resolved against it here, once, so every reader inherits
+/// an absolute, directly-readable path. Absolute `template_path` values
+/// (the `--template <file>` path) pass through unchanged.
+pub fn derive_machine_state(
+    header: &StateFileHeader,
+    events: &[Event],
+    session_dir: &Path,
+) -> Option<MachineState> {
     let current_state = derive_state_from_log(events)?;
 
     // Find the template_path from the workflow_initialized event.
@@ -784,6 +826,8 @@ pub fn derive_machine_state(header: &StateFileHeader, events: &[Event]) -> Optio
         EventPayload::WorkflowInitialized { template_path, .. } => Some(template_path.clone()),
         _ => None,
     })?;
+
+    let template_path = resolve_template_path_in_session(&template_path, session_dir);
 
     Some(MachineState {
         current_state,
@@ -1385,16 +1429,81 @@ mod tests {
             ),
         ];
 
-        let ms = derive_machine_state(&header, &events).unwrap();
+        // An absolute template_path (the --template <file> path) must
+        // pass through derive_machine_state unchanged regardless of the
+        // session dir supplied.
+        let ms = derive_machine_state(&header, &events, Path::new("/sessions/test-wf")).unwrap();
         assert_eq!(ms.current_state, "gather");
         assert_eq!(ms.template_path, "/cache/abc.json");
         assert_eq!(ms.template_hash, "deadbeef");
     }
 
     #[test]
+    fn derive_machine_state_resolves_relative_path_against_session_dir() {
+        let header = make_header();
+        let events = vec![
+            make_event(
+                1,
+                EventPayload::WorkflowInitialized {
+                    // A session-relative path (the --from-stdin path): just
+                    // the content-addressed filename, no directory.
+                    template_path: "abc123.json".to_string(),
+                    variables: HashMap::new(),
+                    spawn_entry: None,
+                },
+            ),
+            make_event(
+                2,
+                EventPayload::Transitioned {
+                    from: None,
+                    to: "gather".to_string(),
+                    condition_type: "auto".to_string(),
+                    skip_if_matched: None,
+                },
+            ),
+        ];
+
+        let session_dir = Path::new("/home/x/.koto/sessions/test-wf");
+        let ms = derive_machine_state(&header, &events, session_dir).unwrap();
+        assert_eq!(
+            ms.template_path, "/home/x/.koto/sessions/test-wf/abc123.json",
+            "a relative template_path must be joined against the session dir"
+        );
+    }
+
+    #[test]
+    fn derive_machine_state_passes_empty_template_path_through() {
+        // The unclaimed needs-agent placeholder records an empty
+        // template_path; it must not be joined against the session dir
+        // (which would silently yield the session directory itself).
+        let header = make_header();
+        let events = vec![
+            make_event(
+                1,
+                EventPayload::WorkflowInitialized {
+                    template_path: String::new(),
+                    variables: HashMap::new(),
+                    spawn_entry: None,
+                },
+            ),
+            make_event(
+                2,
+                EventPayload::Transitioned {
+                    from: None,
+                    to: "gather".to_string(),
+                    condition_type: "auto".to_string(),
+                    skip_if_matched: None,
+                },
+            ),
+        ];
+        let ms = derive_machine_state(&header, &events, Path::new("/sessions/test-wf")).unwrap();
+        assert_eq!(ms.template_path, "");
+    }
+
+    #[test]
     fn derive_machine_state_returns_none_for_empty() {
         let header = make_header();
-        assert!(derive_machine_state(&header, &[]).is_none());
+        assert!(derive_machine_state(&header, &[], Path::new("/sessions/test-wf")).is_none());
     }
 
     #[test]
@@ -1409,7 +1518,7 @@ mod tests {
             },
         )];
         // Only init event, no transitioned -- no current state derivable
-        assert!(derive_machine_state(&header, &events).is_none());
+        assert!(derive_machine_state(&header, &events, Path::new("/sessions/test-wf")).is_none());
     }
 
     // -----------------------------------------------------------------------
