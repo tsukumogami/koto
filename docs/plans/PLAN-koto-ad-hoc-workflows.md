@@ -1,6 +1,6 @@
 ---
 schema: plan/v1
-status: Draft
+status: Active
 execution_mode: single-pr
 upstream: docs/designs/DESIGN-koto-ad-hoc-workflows.md
 milestone: "koto ad-hoc workflows"
@@ -11,7 +11,7 @@ issue_count: 4
 
 ## Status
 
-Draft
+Active
 
 ## Scope Summary
 
