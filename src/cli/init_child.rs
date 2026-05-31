@@ -552,7 +552,6 @@ fn init_child_core(
 /// wires up the compiled-artifact storage and session-relative resolution;
 /// the source-write (`koto init --from-stdin`) lands in Issue 2 and reuses
 /// this constant.
-#[allow(dead_code)]
 pub(crate) const INLINE_SOURCE_FILENAME: &str = "source";
 
 /// Initialize a top-level workflow whose compiled artifact is stored
@@ -695,6 +694,89 @@ pub fn init_inline_into_session(
     backend
         .init_state_file(name, header, initial_events)
         .map_err(|e| anyhow::anyhow!("failed to initialize inline session {:?}: {}", name, e))?;
+
+    Ok(())
+}
+
+/// Drive the full inline (`koto init --from-stdin`) flow from a raw byte
+/// buffer read off stdin: strict-compile the definition into the session
+/// directory, start the session, and persist the human-readable source
+/// alongside it for audit.
+///
+/// The definition bytes are first written to a private temp file so the
+/// existing path-based compile helper ([`init_inline_into_session`]) can
+/// consume them without inventing a second compile entry point. On a
+/// successful compile + init, the *same* bytes are written into the session
+/// directory under the **fixed** [`INLINE_SOURCE_FILENAME`] convention — the
+/// original extension (if any) is never concatenated into a path, so a
+/// hostile definition cannot smuggle `source/../../x`-style traversal.
+///
+/// Failure semantics (acceptance guard): on a strict-validation /
+/// compile failure nothing persists. [`init_inline_into_session`] creates the
+/// session directory before compiling, but does **not** write a state file
+/// when the compile fails; this helper removes that bare directory so no
+/// half-built session is left behind. The error is propagated verbatim from
+/// the compiler, so it already names the failing element (state / transition
+/// / gate) rather than a generic "invalid template".
+pub fn init_inline_from_stdin_bytes(
+    backend: &dyn SessionBackend,
+    name: &str,
+    source_bytes: &[u8],
+    vars: &[String],
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    // Materialize the stdin bytes to a private temp file. The compile
+    // helper is path-based; this temp file is purely an internal bridge
+    // and is dropped (deleted) at the end of this function. It is NOT the
+    // persisted audit source — that is written into the session dir below.
+    let mut tmp = tempfile::Builder::new()
+        .prefix("koto-inline-")
+        .suffix(".src")
+        .tempfile()
+        .context("failed to create temp file for inline definition")?;
+    tmp.write_all(source_bytes)
+        .context("failed to write inline definition to temp file")?;
+    tmp.flush()
+        .context("failed to flush inline definition temp file")?;
+
+    // Strict-compile into the session dir and start the session. On
+    // failure the compiler error (element-named) propagates; we then tear
+    // down the bare session directory so nothing half-built persists.
+    if let Err(e) = init_inline_into_session(backend, name, tmp.path(), vars) {
+        // Best-effort cleanup of the session dir init_inline_into_session
+        // created before compiling. `exists()` checks for the STATE FILE,
+        // which is absent on a compile failure, so the session is not
+        // registered — but the directory (and possibly the compiled
+        // artifact) may linger. Remove it. Ignore cleanup errors: the
+        // compile error is the one the caller must see.
+        let session_dir = backend.session_dir(name);
+        if session_dir.exists() {
+            let _ = std::fs::remove_dir_all(&session_dir);
+        }
+        return Err(e);
+    }
+
+    // Compile + init succeeded: persist the readable source under the
+    // FIXED filename. join() with a constant literal cannot escape the
+    // session dir, and `name` already passed validate_session_id /
+    // validate_workflow_name (no `/`, `..`, or `~`).
+    let session_dir = backend.session_dir(name);
+    let source_path = session_dir.join(INLINE_SOURCE_FILENAME);
+    std::fs::write(&source_path, source_bytes).with_context(|| {
+        format!(
+            "failed to persist inline source at {}",
+            source_path.display()
+        )
+    })?;
+
+    // Match the 0600 posture of the state file / compiled artifact: the
+    // persisted source is a secret-bearing audit copy.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o600));
+    }
 
     Ok(())
 }
@@ -1244,6 +1326,95 @@ Done.
             sha256_hex(&bytes),
             ms.template_hash,
             "hash verification must pass after relocate"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Inline stdin-bytes flow (Issue 2)
+    // -----------------------------------------------------------------------
+
+    /// A definition with a state whose transition target does not exist:
+    /// strict compilation fails and names the failing state + target.
+    const BAD_TARGET_TEMPLATE: &str = r#"---
+name: inline-bad
+version: "1.0"
+initial_state: gather
+states:
+  gather:
+    transitions:
+      - target: nowhere
+  done:
+    terminal: true
+---
+
+## gather
+
+Gather.
+
+## done
+
+Done.
+"#;
+
+    /// The bytes-based seam compiles a valid definition into the session
+    /// dir, starts the session, and persists the readable source under the
+    /// fixed [`INLINE_SOURCE_FILENAME`] byte-for-byte identical to input.
+    #[test]
+    fn inline_from_stdin_bytes_persists_byte_identical_source() {
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let backend = backend_in(sessions.path());
+
+        let input = INLINE_TEMPLATE.as_bytes();
+        init_inline_from_stdin_bytes(&backend, "inline-wf", input, &[]).expect("inline init");
+
+        // Session started: state file exists.
+        assert!(backend.exists("inline-wf"), "session must be registered");
+
+        // Readable source persisted under the FIXED filename.
+        let source_path = backend
+            .session_dir("inline-wf")
+            .join(INLINE_SOURCE_FILENAME);
+        assert!(
+            source_path.exists(),
+            "source must be persisted under the fixed filename"
+        );
+        let recovered = std::fs::read(&source_path).expect("read persisted source");
+        assert_eq!(
+            recovered, input,
+            "persisted source must be byte-for-byte identical to stdin input"
+        );
+    }
+
+    /// A definition failing strict validation creates NO session and leaves
+    /// no half-built session directory; the error names the failing element.
+    #[test]
+    fn inline_from_stdin_bytes_strict_failure_creates_no_session() {
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let backend = backend_in(sessions.path());
+
+        let err = init_inline_from_stdin_bytes(
+            &backend,
+            "inline-bad",
+            BAD_TARGET_TEMPLATE.as_bytes(),
+            &[],
+        )
+        .expect_err("strict validation must fail");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gather") && msg.contains("nowhere"),
+            "error must name the failing state and target, got: {}",
+            msg
+        );
+        assert!(
+            !backend.exists("inline-bad"),
+            "strict failure must register no session"
+        );
+        assert!(
+            !backend.session_dir("inline-bad").exists(),
+            "strict failure must leave no half-built session directory"
         );
     }
 }

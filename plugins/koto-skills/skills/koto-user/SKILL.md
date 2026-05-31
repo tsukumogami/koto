@@ -44,6 +44,7 @@ koto init <name> --template <path>
 - `<path>` is the path to the template file (e.g., `${CLAUDE_SKILL_DIR}/koto-templates/my-workflow.md`)
 - Supply template variables with `--var KEY=VALUE` (repeatable)
 - Returns `{"name": "<name>", "state": "<initial_state>"}` on success
+- For a novel one-off task with no template, pipe a definition inline with `koto init <name> --from-stdin` (strict-only; mutually exclusive with `--template`). See the [command reference](references/command-reference.md#koto-init) for the full contract. The run loop below is identical once the session starts.
 
 **2. Execute the action loop**
 
