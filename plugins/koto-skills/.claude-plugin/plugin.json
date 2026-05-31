@@ -6,6 +6,7 @@
     "name": "tsukumogami"
   },
   "skills": [
+    "./skills/koto-adhoc",
     "./skills/koto-author",
     "./skills/koto-user"
   ]
