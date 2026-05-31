@@ -160,7 +160,7 @@ pub fn handle_overrides_record(
         }
     };
 
-    let machine_state = match derive_machine_state(&header, &events) {
+    let machine_state = match derive_machine_state(&header, &events, &backend.session_dir(&name)) {
         Some(ms) => ms,
         None => {
             // EXIT_INFRASTRUCTURE (3) is correct here; handle_decisions_record uses 1 by

@@ -1700,10 +1700,11 @@ fn rewind_relocate_children(
     events_after: &[Event],
 ) -> (Option<String>, usize) {
     // Load the compiled template to check for materialize_children.
-    let machine_state = match derive_machine_state(header, events_after) {
-        Some(ms) => ms,
-        None => return (None, 0),
-    };
+    let machine_state =
+        match derive_machine_state(header, events_after, &backend.session_dir(parent_name)) {
+            Some(ms) => ms,
+            None => return (None, 0),
+        };
     let template_bytes = match std::fs::read(&machine_state.template_path) {
         Ok(b) => b,
         Err(_) => return (None, 0),
@@ -2286,7 +2287,7 @@ fn handle_next(
         }
     };
 
-    let machine_state = match derive_machine_state(&header, &events) {
+    let machine_state = match derive_machine_state(&header, &events, &backend.session_dir(&name)) {
         Some(ms) => ms,
         None => {
             let ne = NextError {
@@ -3663,7 +3664,7 @@ fn handle_decisions_record(
     };
 
     // Derive current state
-    let machine_state = match derive_machine_state(&header, &events) {
+    let machine_state = match derive_machine_state(&header, &events, &backend.session_dir(&name)) {
         Some(ms) => ms,
         None => {
             exit_with_error(serde_json::json!({
@@ -3925,7 +3926,7 @@ fn handle_status(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         }
     };
 
-    let machine_state = match derive_machine_state(&header, &events) {
+    let machine_state = match derive_machine_state(&header, &events, &backend.session_dir(name)) {
         Some(ms) => ms,
         None => {
             exit_with_error_code(
@@ -4108,24 +4109,26 @@ fn annotate_children_with_batch_view(
     // doesn't exist or isn't batch-scoped, return the rows unchanged.
     let view = if backend.exists(parent_name) {
         match backend.read_events(parent_name) {
-            Ok((header, events)) => match derive_machine_state(&header, &events) {
-                Some(machine_state) => {
-                    let compiled_opt: Option<CompiledTemplate> =
-                        std::fs::read(&machine_state.template_path)
-                            .ok()
-                            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-                    compiled_opt.and_then(|compiled| {
-                        crate::cli::batch_view::derive_batch_view(
-                            backend,
-                            &events,
-                            &compiled,
-                            &machine_state.current_state,
-                            parent_name,
-                        )
-                    })
+            Ok((header, events)) => {
+                match derive_machine_state(&header, &events, &backend.session_dir(parent_name)) {
+                    Some(machine_state) => {
+                        let compiled_opt: Option<CompiledTemplate> =
+                            std::fs::read(&machine_state.template_path)
+                                .ok()
+                                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+                        compiled_opt.and_then(|compiled| {
+                            crate::cli::batch_view::derive_batch_view(
+                                backend,
+                                &events,
+                                &compiled,
+                                &machine_state.current_state,
+                                parent_name,
+                            )
+                        })
+                    }
+                    None => None,
                 }
-                None => None,
-            },
+            }
             Err(_) => None,
         }
     } else {
@@ -4248,7 +4251,7 @@ fn handle_cancel(backend: &dyn SessionBackend, name: &str, cleanup: bool) -> Res
     }
 
     // Derive current state and check if terminal.
-    let machine_state = match derive_machine_state(&header, &events) {
+    let machine_state = match derive_machine_state(&header, &events, &backend.session_dir(name)) {
         Some(ms) => ms,
         None => {
             exit_with_error(serde_json::json!({
