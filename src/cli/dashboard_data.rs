@@ -18,6 +18,165 @@ use crate::engine::types::is_leap;
 use crate::engine::types::StateFileHeader;
 use crate::session::{state_file_name, SessionBackend};
 
+pub use liveness::{attention_key, classify_liveness, Liveness};
+
+/// Read-time liveness classification for dashboard sessions.
+///
+/// Liveness is derived entirely from data already loaded into [`CachedSession`]
+/// (the events' last timestamp, plus `is_terminal` / `is_blocked` /
+/// `current_state`). Nothing is written to disk and nothing migrates: every
+/// classification is a pure function of the append-only log the dashboard
+/// already reads.
+pub mod liveness {
+    use std::cmp::Reverse;
+    use std::time::{Duration, SystemTime};
+
+    use super::CachedSession;
+
+    /// A session younger than this is freshly active.
+    pub const ACTIVE_WINDOW: Duration = Duration::from_secs(5 * 60);
+    /// A session that advanced but has been silent at least this long is stalled.
+    pub const STALLED_THRESHOLD: Duration = Duration::from_secs(2 * 60 * 60);
+    /// An idle session older than this is treated as abandoned (recedes).
+    pub const ABANDONED: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+    /// Closed liveness vocabulary for a session, derived at read time.
+    ///
+    /// The three `NeedsYou*` variants are the attention band: a human decision
+    /// is what unblocks them. `Active`/`Idle` are healthy live work. `Pending`
+    /// is a run that never advanced (cruft, not a stuck decision). `Done` is
+    /// terminal success.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Liveness {
+        /// Waiting on a gate that has not passed. Needs a human.
+        NeedsYouBlocked,
+        /// Terminal in a failed/error state. Needs a human.
+        NeedsYouFailed,
+        /// Advanced, then went silent past the stalled threshold. Needs a human.
+        NeedsYouStalled,
+        /// Non-terminal and recently active (idle < active window).
+        Active,
+        /// Non-terminal, idle between the active window and the stalled threshold.
+        Idle,
+        /// Never advanced past `WorkflowInitialized` (`current_state == None`).
+        Pending,
+        /// Terminal, not failed.
+        Done,
+    }
+
+    /// Idle duration for a session: `now - last_event_at`, clamped to zero on
+    /// clock skew / future timestamps. Falls back to the file mtime when the log
+    /// carried no parseable event timestamp.
+    pub fn idle_for(session: &CachedSession, now: SystemTime) -> Duration {
+        let reference = session.last_event_at.unwrap_or(session.mtime);
+        now.duration_since(reference).unwrap_or(Duration::ZERO)
+    }
+
+    /// Classify a session's liveness using the design precedence D1-D7.
+    ///
+    /// Terminal, failed, blocked, and never-started are all resolved BEFORE any
+    /// idle test (the load-bearing R4 rule): a gate-blocked or never-advanced
+    /// session is never classified as stalled.
+    pub fn classify_liveness(session: &CachedSession, now: SystemTime) -> Liveness {
+        // D1 / D2: terminal resolves first (Done vs failed).
+        if session.is_terminal {
+            if is_failed_state(session.current_state.as_deref()) {
+                return Liveness::NeedsYouFailed;
+            }
+            return Liveness::Done;
+        }
+
+        // D3: blocked beats any idle test.
+        if session.is_blocked {
+            return Liveness::NeedsYouBlocked;
+        }
+
+        // D4: never advanced (only a WorkflowInitialized event). Never needs-you.
+        if session.current_state.is_none() {
+            return Liveness::Pending;
+        }
+
+        // From here current_state == Some and the session is live; consult idle.
+        let idle = idle_for(session, now);
+
+        // D5: advanced then went silent past the stalled threshold.
+        if idle >= STALLED_THRESHOLD {
+            return Liveness::NeedsYouStalled;
+        }
+
+        // D6: recently active.
+        if idle < ACTIVE_WINDOW {
+            return Liveness::Active;
+        }
+
+        // D7: between the active window and the stalled threshold.
+        Liveness::Idle
+    }
+
+    /// Attention sort key `(band, Reverse(idle))`.
+    ///
+    /// Band order: NeedsYou* (0) -> Active (1) -> Idle + fresh Pending (2) ->
+    /// receded (3). Within a band, longest-idle sorts first (most-waiting /
+    /// most-dead first). A fresh `Pending` (idle < active window) stays in band 2
+    /// so a brand-new session is visible; an older `Pending` recedes to band 3.
+    pub fn attention_key(liveness: Liveness, idle: Duration) -> (u8, Reverse<Duration>) {
+        let band = match liveness {
+            Liveness::NeedsYouBlocked | Liveness::NeedsYouFailed | Liveness::NeedsYouStalled => 0,
+            Liveness::Active => 1,
+            Liveness::Idle => {
+                if idle >= ABANDONED {
+                    3
+                } else {
+                    2
+                }
+            }
+            Liveness::Pending => {
+                if idle < ACTIVE_WINDOW {
+                    2
+                } else {
+                    3
+                }
+            }
+            Liveness::Done => 3,
+        };
+        (band, Reverse(idle))
+    }
+
+    /// True when a session's liveness places it in the receded (hidden-by-default)
+    /// band: Done, an abandoned Idle, or a stale (non-fresh) Pending.
+    pub fn is_receded(liveness: Liveness, idle: Duration) -> bool {
+        attention_key(liveness, idle).0 == 3
+    }
+
+    /// Return true if `state` contains "failed" or "error" (case-insensitive),
+    /// matching the existing `classify_status` rule.
+    fn is_failed_state(state: Option<&str>) -> bool {
+        state
+            .map(|s| {
+                let lower = s.to_lowercase();
+                lower.contains("failed") || lower.contains("error")
+            })
+            .unwrap_or(false)
+    }
+
+    /// Priority list of variable keys to surface as a session's salient var.
+    const SALIENT_KEYS: &[&str] = &["issue", "target", "name", "task", "query"];
+
+    /// Pick the most salient variable value from a `WorkflowInitialized`
+    /// variables map, in key-priority order. Returns `None` when no priority key
+    /// is present (or its value is empty).
+    pub fn salient_var(variables: &std::collections::HashMap<String, String>) -> Option<String> {
+        for key in SALIENT_KEYS {
+            if let Some(value) = variables.get(*key) {
+                if !value.is_empty() {
+                    return Some(value.clone());
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Lightweight snapshot of one session's derived state, held in the tree.
 pub struct CachedSession {
     /// Full header from the first line of the state file.
@@ -43,6 +202,14 @@ pub struct CachedSession {
     pub mtime: SystemTime,
     /// Path to the state file; used for re-reads on mtime change.
     pub state_path: PathBuf,
+    /// Wall-clock time of the final event in the log, parsed from its RFC 3339
+    /// timestamp. Drives read-time liveness (idle = now - last_event_at). `None`
+    /// when the log has no parseable events; liveness then falls back to `mtime`.
+    pub last_event_at: Option<SystemTime>,
+    /// The most salient `WorkflowInitialized.variables` value, chosen by the
+    /// key-priority list in [`liveness::salient_var`]. Folded into the label by
+    /// `derive_label`; `None` when no priority key was present.
+    pub salient_var: Option<String>,
 }
 
 /// Hierarchical view of all sessions visible to the dashboard.
@@ -213,6 +380,8 @@ pub fn read_session(path: &Path) -> CachedSession {
                 intent: None,
                 mtime,
                 state_path: path.to_path_buf(),
+                last_event_at: None,
+                salient_var: None,
             };
         }
     };
@@ -230,6 +399,8 @@ pub fn read_session(path: &Path) -> CachedSession {
                 intent,
                 mtime,
                 state_path: path.to_path_buf(),
+                last_event_at: None,
+                salient_var: None,
             };
         }
     };
@@ -296,6 +467,21 @@ pub fn read_session(path: &Path) -> CachedSession {
 
     let intent = derive_intent(&events).or_else(|| header.intent.clone());
 
+    // Capture the tail event's timestamp (already parsed for current_state) so
+    // liveness can measure idle from last activity with no extra IO. For a
+    // rewound session the tail is the post-rewind event, so it reads as fresh.
+    let last_event_at = events
+        .last()
+        .and_then(|e| parse_timestamp_to_systemtime(&e.timestamp));
+
+    // Pick the most salient variable from the WorkflowInitialized event, if any.
+    let salient_var = events.iter().find_map(|e| match &e.payload {
+        crate::engine::types::EventPayload::WorkflowInitialized { variables, .. } => {
+            liveness::salient_var(variables)
+        }
+        _ => None,
+    });
+
     CachedSession {
         header,
         current_state,
@@ -304,6 +490,8 @@ pub fn read_session(path: &Path) -> CachedSession {
         intent,
         mtime,
         state_path: path.to_path_buf(),
+        last_event_at,
+        salient_var,
     }
 }
 
@@ -649,44 +837,45 @@ fn build_gate_condition(
     None
 }
 
-/// Compute the elapsed time since an ISO 8601 UTC timestamp string.
+/// Parse an RFC 3339 / ISO 8601 UTC timestamp string into a `SystemTime`.
 ///
-/// Falls back to `Duration::ZERO` on any parse error.
-pub(crate) fn compute_elapsed_since(timestamp: &str) -> Duration {
-    // Parse RFC 3339 / ISO 8601 timestamp manually.
-    // Format: YYYY-MM-DDTHH:MM:SS[.mmm]Z
-    let parse = || -> Option<Duration> {
-        let t = timestamp.trim_end_matches('Z');
-        let (date_part, time_part) = t.split_once('T')?;
-        let mut date_parts = date_part.split('-');
-        let year: u64 = date_parts.next()?.parse().ok()?;
-        let month: u64 = date_parts.next()?.parse().ok()?;
-        let day: u64 = date_parts.next()?.parse().ok()?;
+/// Format: `YYYY-MM-DDTHH:MM:SS[.mmm]Z`. Returns `None` on any parse error.
+pub(crate) fn parse_timestamp_to_systemtime(timestamp: &str) -> Option<SystemTime> {
+    let t = timestamp.trim_end_matches('Z');
+    let (date_part, time_part) = t.split_once('T')?;
+    let mut date_parts = date_part.split('-');
+    let year: u64 = date_parts.next()?.parse().ok()?;
+    let month: u64 = date_parts.next()?.parse().ok()?;
+    let day: u64 = date_parts.next()?.parse().ok()?;
 
-        let (hms, frac) = if let Some((hms, frac)) = time_part.split_once('.') {
-            (hms, frac)
-        } else {
-            (time_part, "0")
-        };
-
-        let mut hms_parts = hms.split(':');
-        let hour: u64 = hms_parts.next()?.parse().ok()?;
-        let minute: u64 = hms_parts.next()?.parse().ok()?;
-        let second: u64 = hms_parts.next()?.parse().ok()?;
-
-        let millis: u64 = {
-            let frac_str = format!("{:0<3}", &frac[..frac.len().min(3)]);
-            frac_str.parse().ok()?
-        };
-
-        let days = days_since_epoch(year, month, day)?;
-        let secs = days * 86400 + hour * 3600 + minute * 60 + second;
-        let event_time = SystemTime::UNIX_EPOCH + Duration::from_millis(secs * 1000 + millis);
-
-        SystemTime::now().duration_since(event_time).ok()
+    let (hms, frac) = if let Some((hms, frac)) = time_part.split_once('.') {
+        (hms, frac)
+    } else {
+        (time_part, "0")
     };
 
-    parse().unwrap_or(Duration::ZERO)
+    let mut hms_parts = hms.split(':');
+    let hour: u64 = hms_parts.next()?.parse().ok()?;
+    let minute: u64 = hms_parts.next()?.parse().ok()?;
+    let second: u64 = hms_parts.next()?.parse().ok()?;
+
+    let millis: u64 = {
+        let frac_str = format!("{:0<3}", &frac[..frac.len().min(3)]);
+        frac_str.parse().ok()?
+    };
+
+    let days = days_since_epoch(year, month, day)?;
+    let secs = days * 86400 + hour * 3600 + minute * 60 + second;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_millis(secs * 1000 + millis))
+}
+
+/// Compute the elapsed time since an ISO 8601 UTC timestamp string.
+///
+/// Falls back to `Duration::ZERO` on any parse error or future timestamp.
+pub(crate) fn compute_elapsed_since(timestamp: &str) -> Duration {
+    parse_timestamp_to_systemtime(timestamp)
+        .and_then(|event_time| SystemTime::now().duration_since(event_time).ok())
+        .unwrap_or(Duration::ZERO)
 }
 
 /// Compute days since Unix epoch for a given year/month/day (Gregorian).
@@ -712,6 +901,7 @@ fn days_since_epoch(year: u64, month: u64, day: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::liveness::idle_for;
     use super::*;
     use crate::engine::persistence::{append_event, append_header};
     use crate::engine::types::{EventPayload, StateFileHeader};
@@ -873,6 +1063,8 @@ mod tests {
                 intent: None,
                 mtime,
                 state_path: path,
+                last_event_at: None,
+                salient_var: None,
             },
         );
 
@@ -904,6 +1096,8 @@ mod tests {
                 intent: None,
                 mtime: old_mtime,
                 state_path: path.clone(),
+                last_event_at: None,
+                salient_var: None,
             },
         );
 
@@ -935,6 +1129,8 @@ mod tests {
                 intent: None,
                 mtime: current_mtime,
                 state_path: path.clone(),
+                last_event_at: None,
+                salient_var: None,
             },
         );
 
@@ -1113,6 +1309,8 @@ mod tests {
                 intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::from("/nonexistent"),
+                last_event_at: None,
+                salient_var: None,
             },
         );
 
@@ -1163,6 +1361,8 @@ mod tests {
                 intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
+                last_event_at: None,
+                salient_var: None,
             },
         );
         sessions.insert(
@@ -1175,6 +1375,8 @@ mod tests {
                 intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
+                last_event_at: None,
+                salient_var: None,
             },
         );
 
@@ -1197,6 +1399,8 @@ mod tests {
                 intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
+                last_event_at: None,
+                salient_var: None,
             },
         );
         sessions.insert(
@@ -1209,6 +1413,8 @@ mod tests {
                 intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
+                last_event_at: None,
+                salient_var: None,
             },
         );
 
@@ -1232,6 +1438,8 @@ mod tests {
                 intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
+                last_event_at: None,
+                salient_var: None,
             },
         );
 
@@ -1301,5 +1509,166 @@ mod tests {
         assert!(d.gate_name.is_none());
         // New fields should be present.
         assert!(d.history.len() > 0 || d.remaining.is_empty() || true); // history may vary
+    }
+
+    // -----------------------------------------------------------------------
+    // I1: liveness classification (classify_liveness precedence D1-D7)
+    // -----------------------------------------------------------------------
+
+    /// Build a CachedSession with explicit liveness inputs for classifier tests.
+    /// `idle` is applied by setting `last_event_at = now - idle`.
+    fn liveness_session(
+        current_state: Option<&str>,
+        is_terminal: bool,
+        is_blocked: bool,
+        last_event_at: Option<SystemTime>,
+    ) -> CachedSession {
+        CachedSession {
+            header: make_header("liveness", None),
+            current_state: current_state.map(|s| s.to_string()),
+            is_terminal,
+            is_blocked,
+            intent: None,
+            mtime: SystemTime::UNIX_EPOCH,
+            state_path: PathBuf::new(),
+            last_event_at,
+            salient_var: None,
+        }
+    }
+
+    #[test]
+    fn classify_liveness_blocked_beats_stalled() {
+        let now = SystemTime::now();
+        // Gate-blocked session quiet for 3h (> stalled threshold) must be
+        // NeedsYouBlocked, never NeedsYouStalled.
+        let quiet = now - Duration::from_secs(3 * 60 * 60);
+        let s = liveness_session(Some("build"), false, true, Some(quiet));
+        assert_eq!(classify_liveness(&s, now), Liveness::NeedsYouBlocked);
+    }
+
+    #[test]
+    fn classify_liveness_terminal_beats_idle() {
+        let now = SystemTime::now();
+        // Terminal session quiet for a long time is Done, never Idle/Stalled.
+        let quiet = now - Duration::from_secs(10 * 60 * 60);
+        let s = liveness_session(Some("done"), true, false, Some(quiet));
+        assert_eq!(classify_liveness(&s, now), Liveness::Done);
+    }
+
+    #[test]
+    fn classify_liveness_terminal_failed_is_needs_you_failed() {
+        let now = SystemTime::now();
+        let s = liveness_session(Some("build-failed"), true, false, Some(now));
+        assert_eq!(classify_liveness(&s, now), Liveness::NeedsYouFailed);
+    }
+
+    #[test]
+    fn classify_liveness_never_advanced_is_pending_not_stalled() {
+        let now = SystemTime::now();
+        // current_state == None, quiet for 3h: must be Pending, NOT stalled.
+        let quiet = now - Duration::from_secs(3 * 60 * 60);
+        let s = liveness_session(None, false, false, Some(quiet));
+        assert_eq!(classify_liveness(&s, now), Liveness::Pending);
+    }
+
+    #[test]
+    fn classify_liveness_advanced_then_silent_is_stalled() {
+        let now = SystemTime::now();
+        let quiet = now - Duration::from_secs(3 * 60 * 60);
+        let s = liveness_session(Some("implement"), false, false, Some(quiet));
+        assert_eq!(classify_liveness(&s, now), Liveness::NeedsYouStalled);
+    }
+
+    #[test]
+    fn classify_liveness_recent_is_active() {
+        let now = SystemTime::now();
+        let recent = now - Duration::from_secs(30);
+        let s = liveness_session(Some("implement"), false, false, Some(recent));
+        assert_eq!(classify_liveness(&s, now), Liveness::Active);
+    }
+
+    #[test]
+    fn classify_liveness_between_thresholds_is_idle() {
+        let now = SystemTime::now();
+        // 30 minutes: > active window (5m), < stalled threshold (2h).
+        let mid = now - Duration::from_secs(30 * 60);
+        let s = liveness_session(Some("implement"), false, false, Some(mid));
+        assert_eq!(classify_liveness(&s, now), Liveness::Idle);
+    }
+
+    #[test]
+    fn classify_liveness_rewound_reads_fresh_from_tail() {
+        let now = SystemTime::now();
+        // After a rewind, last_event_at is the post-rewind tail event, which is
+        // recent — so the session reads as Active even if created long ago.
+        let recent_tail = now - Duration::from_secs(10);
+        let s = liveness_session(Some("review"), false, false, Some(recent_tail));
+        assert_eq!(classify_liveness(&s, now), Liveness::Active);
+    }
+
+    #[test]
+    fn classify_liveness_future_timestamp_clamps_to_zero_idle() {
+        let now = SystemTime::now();
+        // A future last_event_at (clock skew) clamps idle to zero -> Active.
+        let future = now + Duration::from_secs(60 * 60);
+        let s = liveness_session(Some("implement"), false, false, Some(future));
+        assert_eq!(idle_for(&s, now), Duration::ZERO);
+        assert_eq!(classify_liveness(&s, now), Liveness::Active);
+    }
+
+    #[test]
+    fn classify_liveness_falls_back_to_mtime_when_no_event_ts() {
+        let now = SystemTime::now();
+        let mut s = liveness_session(Some("implement"), false, false, None);
+        // No last_event_at: idle measured from mtime (recent here -> Active).
+        s.mtime = now - Duration::from_secs(15);
+        assert_eq!(classify_liveness(&s, now), Liveness::Active);
+    }
+
+    // -----------------------------------------------------------------------
+    // I1: attention_key band ordering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn attention_key_band_order() {
+        // NeedsYou (0) < Active (1) < Idle/fresh-Pending (2) < receded (3).
+        let needs_you = attention_key(Liveness::NeedsYouBlocked, Duration::from_secs(60)).0;
+        let active = attention_key(Liveness::Active, Duration::from_secs(60)).0;
+        let idle = attention_key(Liveness::Idle, Duration::from_secs(60 * 30)).0;
+        let done = attention_key(Liveness::Done, Duration::ZERO).0;
+        assert!(needs_you < active);
+        assert!(active < idle);
+        assert!(idle < done);
+    }
+
+    #[test]
+    fn attention_key_fresh_pending_visible_stale_pending_recedes() {
+        // A fresh Pending (idle < active window) stays in band 2 (visible).
+        let fresh = attention_key(Liveness::Pending, Duration::from_secs(60)).0;
+        assert_eq!(fresh, 2);
+        // An older Pending recedes to band 3.
+        let stale = attention_key(Liveness::Pending, Duration::from_secs(10 * 60)).0;
+        assert_eq!(stale, 3);
+    }
+
+    #[test]
+    fn attention_key_abandoned_idle_recedes() {
+        // Idle younger than abandoned stays visible (band 2).
+        let visible = attention_key(Liveness::Idle, Duration::from_secs(30 * 60)).0;
+        assert_eq!(visible, 2);
+        // Idle older than abandoned (7d) recedes to band 3.
+        let abandoned = attention_key(Liveness::Idle, Duration::from_secs(8 * 24 * 60 * 60)).0;
+        assert_eq!(abandoned, 3);
+    }
+
+    #[test]
+    fn attention_key_within_band_longest_idle_first() {
+        // Within a band, Reverse(idle) means longer idle sorts first.
+        let longer = attention_key(Liveness::NeedsYouStalled, Duration::from_secs(5 * 60 * 60));
+        let shorter = attention_key(Liveness::NeedsYouStalled, Duration::from_secs(3 * 60 * 60));
+        assert!(
+            longer < shorter,
+            "longer idle must sort ahead within a band"
+        );
     }
 }

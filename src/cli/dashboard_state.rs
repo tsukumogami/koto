@@ -530,6 +530,8 @@ mod tests {
             intent: None,
             mtime: SystemTime::UNIX_EPOCH,
             state_path: PathBuf::new(),
+            last_event_at: None,
+            salient_var: None,
         }
     }
 
@@ -987,11 +989,11 @@ mod tests {
     fn visible_rows_health_severity_ordering() {
         let mut state = DashboardAppState::new(500);
 
-        let mut make_session_blocked = |name: &str,
-                                        parent: Option<&str>,
-                                        state_str: Option<&str>,
-                                        is_terminal: bool,
-                                        is_blocked: bool| {
+        let make_session_blocked = |name: &str,
+                                    parent: Option<&str>,
+                                    state_str: Option<&str>,
+                                    is_terminal: bool,
+                                    is_blocked: bool| {
             let mut s = make_session(name, parent, state_str, is_terminal);
             s.is_blocked = is_blocked;
             s

@@ -463,6 +463,8 @@ mod tests {
                 intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
+                last_event_at: None,
+                salient_var: None,
             },
         );
 
@@ -737,6 +739,8 @@ mod tests {
                 intent: None,
                 mtime: SystemTime::UNIX_EPOCH,
                 state_path: PathBuf::new(),
+                last_event_at: None,
+                salient_var: None,
             },
         );
         state.tree.roots = vec!["my-workflow".to_string()];

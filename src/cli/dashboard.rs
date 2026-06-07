@@ -229,6 +229,8 @@ mod tests {
             intent: None,
             mtime: SystemTime::UNIX_EPOCH,
             state_path: PathBuf::new(),
+            last_event_at: None,
+            salient_var: None,
         }
     }
 
