@@ -102,6 +102,63 @@ Gets the current state directive. Submits evidence when `--with-data` is provide
 
 **Error output:** structured `NextError` JSON on stderr (see `error-handling.md`).
 
+### Converging a fan-out (reading child results)
+
+When a coordinator has fanned work out to children (a state with a
+`materialize_children` hook), `koto next <parent>` is also the converge point.
+There is no separate converge command and no new response shape — convergence
+rides the existing `children-complete` gate and the `gate_blocked` directive.
+
+**Blocked until results are in.** While any non-skipped child has not yet
+produced a result, `koto next <parent>` returns `action: "gate_blocked"` and the
+parent is **not** advanced past the state. The gate output lives at
+`blocking_conditions[0].output` and carries three converge fields alongside the
+existing batch aggregate:
+
+| Field | Meaning |
+|---|---|
+| `results_in` | `true` once every non-skipped child's result is available to read. |
+| `converge_blocked` | `true` while the batch is terminal-complete but at least one non-skipped child's result is still missing. This is the converge-specific block — distinct from "children still running". |
+| `outstanding` | Array naming the children still missing a result, by their fan-out identity (`<parent>.<task>`). Empty once `results_in` is `true`. |
+
+The `children-complete` blocking condition is in the `temporal` (retry-later)
+category: re-tick `koto next <parent>` after the named `outstanding` children
+finish. A `skipped` child never appears in `outstanding` — it carries a
+synthesized skipped-status default result and does not hold the gate.
+
+**Cleared: results inline, no child log opened.** When the last result lands,
+`results_in` becomes `true`, the gate passes, the parent advances, and the
+cleared directive carries every child's result inline. Each entry in the gate
+output's `children[]` array gains a `result` object:
+
+```json
+{
+  "children": [
+    {
+      "name": "coord.task-1", "outcome": "success",
+      "state": "done", "complete": true,
+      "result": {
+        "status": "success",
+        "summary": "implemented and tested the parser change",
+        "payload": { "files_changed": 3 }
+      }
+    }
+  ]
+}
+```
+
+The coordinator reads each child's `status` / `summary` / optional `payload`
+straight from its own directive — it never runs `koto query` or `koto next`
+against a child to learn what the child produced. `status` is one of `success`
+/ `failure` / `skipped` (the same classification as the child's terminal
+outcome); `summary` is always present (a default is synthesized when the child's
+terminal state declares no summary field); `payload` is omitted when the child
+recorded none.
+
+A child that is itself a coordinator converges its own children through this
+same gate and then carries its own result up to its parent identically — the
+read is uniform at every depth.
+
 ---
 
 ## koto cancel

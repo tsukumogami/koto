@@ -12,7 +12,7 @@ One agent (or one thread) holds responsibility for ticking the coordinator via `
 - Workers never re-tick the parent. They drive a child to a terminal state and exit.
 - A parent tick is serialized via an advisory flock on the parent's state file. A concurrent `koto next <parent>` returns a `concurrent_tick` error envelope; back off and retry.
 
-The coordinator's job on each tick is: read `scheduler.materialized_children`, figure out which children are new, dispatch workers against those children, and check `blocking_conditions[0].output` for completion.
+The coordinator's job on each tick is: read `scheduler.materialized_children`, figure out which children are new, dispatch workers against those children, and check `blocking_conditions[0].output` for completion. Once the children are terminal, the same gate output is also where the coordinator reads each child's result inline — see "Converging: reading child results" below.
 
 **Do not manually initialize batch children.** The scheduler owns the child lifecycle: it creates sessions using the composed name `<parent>.<task>`, registers them in the batch tracker, and monitors them for completion. A workflow initialized manually with `koto init <parent>.<task>` is invisible to the batch tracker even if the name matches — the scheduler will spawn a fresh instance on its next tick, discarding the manually-driven work. Always let the coordinator spawn children through the `tasks` submission.
 
@@ -121,6 +121,46 @@ Entry outcomes:
 | `any_spawn_failed` | ≥ 1 spawn failure | Fine-grained routing; folded into `needs_attention`. |
 
 Per-child entries in `output.children[]` mirror the data in `materialized_children` but from the gate-observer's perspective. Failed children carry a `reason` string and `reason_source` (one of `failure_reason`, `state_name`, `skipped`, `not_spawned`) so agents can tell where the reason came from.
+
+## Converging: reading child results
+
+The aggregate above answers "did the children finish, and how did each one classify." Convergence answers a different question: "what did each child actually produce." Both ride the same `children-complete` gate — there is no separate converge command and no new response shape.
+
+After the coordinator has dispatched its workers, the `children-complete` gate does not pass the moment the children reach terminal states. It holds until every non-skipped child's result is readable. Three converge fields on `blocking_conditions[0].output` carry this, alongside the aggregate booleans:
+
+| Field | Meaning |
+|---|---|
+| `results_in` | `true` once every non-skipped child's result is available to read. |
+| `converge_blocked` | `true` while the batch is terminal-complete but at least one non-skipped child's result is still missing. This is the converge-specific block — distinct from `all_complete: false`, which means children are still running. |
+| `outstanding` | Children still missing a result, named by fan-out identity (`<parent>.<task>`). Empty once `results_in` is `true`. |
+
+While `outstanding` is non-empty the gate is `gate_blocked` in the `temporal` (retry-later) category: re-tick `koto next <parent>` after the named children finish writing their results. A `skipped` child never appears in `outstanding` — it carries a synthesized skipped-status default result and does not hold the gate.
+
+When the last result lands, `results_in` flips to `true`, the gate passes, the parent advances, and each entry in `output.children[]` gains a `result` object:
+
+```json
+{
+  "children": [
+    {
+      "name": "coord.task-1", "outcome": "success",
+      "state": "done", "complete": true,
+      "result": {
+        "status": "success",
+        "summary": "implemented and tested the parser change",
+        "payload": {"files_changed": 3}
+      }
+    }
+  ]
+}
+```
+
+The coordinator reads each child's `status` / `summary` / optional `payload` straight from this array — it does not tick the child, run `koto status <child>`, or open the child's log to learn what the child produced. Field notes:
+
+- `status` is `success` / `failure` / `skipped` (the same classification as the child's terminal `outcome`).
+- `summary` is always present; a default is synthesized when the child's terminal state declared no summary.
+- `payload` is omitted when the child recorded none.
+
+This is reading results, distinct from the completion / outcome classification covered above: the aggregate routes the parent (advance vs. retry), the per-child `result` is what the parent reports or acts on. A child that is itself a coordinator converges its own children through this same gate and carries its own result up identically — the read is uniform at every depth.
 
 ## `reserved_actions`: the retry-discovery surface
 
@@ -255,6 +295,8 @@ Multiple surfaces expose batch state. Use the right one for the question you're 
 | "What happened to each submitted task this tick?" | `scheduler.feedback.entries` (keyed by short task name). |
 | "Did this task's spawn fail, and why?" | `scheduler.errored[]` (typed per-task errors) and `materialized_children[*].outcome == "spawn_failed"`. |
 | "Did the gate pass / should the parent advance?" | `blocking_conditions[0].output.all_complete` (and aggregate booleans for routing). |
+| "Are every child's results in yet, and which children am I waiting on?" | `blocking_conditions[0].output.results_in` / `converge_blocked` / `outstanding`. |
+| "What did each child produce (status / summary / payload)?" | `blocking_conditions[0].output.children[*].result` — read inline once `results_in` is `true`; never tick or query the child. |
 | "What reason should I render for a failed child?" | `blocking_conditions[0].output.children[*].reason` with `reason_source` as the provenance tag. |
 | "Which children are eligible for retry, and how do I invoke it?" | `reserved_actions[0].applies_to` and `reserved_actions[0].invocation`. |
 | "Is this the final batch outcome?" | `batch_final_view.summary` on the terminal `done` response. |

@@ -2,6 +2,8 @@
 
 Workflow orchestration engine for AI coding agents. Enforces execution order through a state machine, persists progress atomically, and makes every state transition recoverable.
 
+## Repo Visibility: Public
+
 ## Repository Structure
 
 ```

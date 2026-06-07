@@ -35,7 +35,7 @@ use crate::cache::{compile_cached, sha256_hex};
 use crate::discover::find_workflows_with_metadata;
 use crate::engine::errors::EngineError;
 use crate::engine::persistence::{derive_decisions, derive_machine_state, derive_state_from_log};
-use crate::engine::types::{now_iso8601, Event, EventPayload, TerminalOutcome};
+use crate::engine::types::{now_iso8601, Event, EventPayload, TerminalOutcome, WorkflowResult};
 use crate::session::context::ContextStore;
 use crate::session::local::LocalBackend;
 use crate::session::{Backend, SessionBackend, SessionError};
@@ -2100,6 +2100,121 @@ enum ChildCompletedAppend {
     AppendFailed,
 }
 
+/// Project a final state's compiled template flags into the
+/// [`TerminalOutcome`] classification.
+///
+/// This is the single source of truth for the outcome a child carries
+/// on its terminal tick: the same value flows into the child-log
+/// `RequestStoreResult` event, the parent's `ChildCompleted`, and the
+/// converge read (DESIGN-request-store-converge.md Decision 2). An
+/// unknown final state (not in the compiled template) defaults to
+/// `Success`, matching the pre-feature projection.
+#[cfg(unix)]
+fn project_terminal_outcome(compiled: &CompiledTemplate, final_state: &str) -> TerminalOutcome {
+    let (failure, skipped_marker) = match compiled.states.get(final_state) {
+        Some(s) => (s.failure, s.skipped_marker),
+        None => (false, false),
+    };
+    if failure {
+        TerminalOutcome::Failure
+    } else if skipped_marker {
+        TerminalOutcome::Skipped
+    } else {
+        TerminalOutcome::Success
+    }
+}
+
+/// Append the auto-promoted [`WorkflowResult`] to the CHILD's own
+/// session event log as a `RequestStoreResult` event
+/// (DESIGN-request-store-converge.md Decision 3, AC1).
+///
+/// This is the durable record of the child's result: it rides the same
+/// terminal tick — and the same atomic `O_APPEND` discipline
+/// ([`SessionBackend::append_event`]) — that the terminal evidence and
+/// the `ChildCompleted` notification already use. The result is
+/// synthesized from data the completion path already holds via
+/// [`synthesize_workflow_result`], so no extra agent step is required.
+///
+/// Returns `true` when the event was durably appended, which is exactly
+/// the condition under which the terminal-index entry may set
+/// `has_result: true` (the "has_result true implies a durable result is
+/// readable" invariant). A failed append logs a warning and returns
+/// `false`; the converge read then falls back to the copy carried on
+/// the parent's `ChildCompleted.result`.
+#[cfg(unix)]
+fn append_request_store_result_to_child(
+    backend: &dyn SessionBackend,
+    child_name: &str,
+    compiled: &CompiledTemplate,
+    final_state: &str,
+    child_events: &[Event],
+) -> bool {
+    let outcome = project_terminal_outcome(compiled, final_state);
+    let result = synthesize_workflow_result(outcome, final_state, child_events);
+    let payload = EventPayload::RequestStoreResult { result };
+    match backend.append_event(child_name, &payload, &now_iso8601()) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!(
+                "warning: failed to append request_store.result to child {}'s log; \
+                 the converge read will fall back to the parent's ChildCompleted copy: {}",
+                child_name, e
+            );
+            false
+        }
+    }
+}
+
+/// Synthesize a [`WorkflowResult`] from the data the completion path
+/// already holds on a child's terminal tick
+/// (DESIGN-request-store-converge.md Decision 1 / 2).
+///
+/// `status` is the same [`TerminalOutcome`] the completion path already
+/// projects. `summary` is read from a conventionally-named `summary`
+/// field on the latest terminal `EvidenceSubmitted` event, falling back
+/// to a final-state-derived default so every completion is resultful.
+/// `payload` carries the latest terminal evidence fields as an opaque
+/// JSON object when present.
+///
+/// Walking-skeleton scope (Issue 1): synthesizes purely from the
+/// `TerminalOutcome` projection plus the child's own evidence events;
+/// later issues thicken the convention and the `accepts`-block lookup.
+#[cfg(unix)]
+fn synthesize_workflow_result(
+    outcome: TerminalOutcome,
+    final_state: &str,
+    child_events: &[Event],
+) -> WorkflowResult {
+    // Latest EvidenceSubmitted fields for the terminal state, if any.
+    let terminal_fields = child_events.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::EvidenceSubmitted { state, fields, .. } if state == final_state => {
+            Some(fields.clone())
+        }
+        _ => None,
+    });
+
+    let summary = terminal_fields
+        .as_ref()
+        .and_then(|f| f.get("summary"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| match outcome {
+            TerminalOutcome::Success => format!("completed at {}", final_state),
+            TerminalOutcome::Failure => format!("failed at {}", final_state),
+            TerminalOutcome::Skipped => format!("skipped at {}", final_state),
+        });
+
+    let payload = terminal_fields
+        .filter(|f| !f.is_empty())
+        .map(|f| serde_json::Value::Object(f.into_iter().collect()));
+
+    WorkflowResult {
+        status: outcome,
+        summary,
+        payload,
+    }
+}
+
 /// Issue #134: append a `ChildCompleted` event to the parent's log just
 /// before a child session's auto-cleanup runs.
 ///
@@ -2128,6 +2243,7 @@ fn append_child_completed_to_parent(
     child_header: &crate::engine::types::StateFileHeader,
     compiled: &CompiledTemplate,
     final_state: &str,
+    child_events: &[Event],
 ) -> ChildCompletedAppend {
     let parent_name = match child_header.parent_workflow.as_deref() {
         Some(p) => p,
@@ -2141,17 +2257,7 @@ fn append_child_completed_to_parent(
     }
 
     // Project the final state's template flags into the outcome enum.
-    let (failure, skipped_marker) = match compiled.states.get(final_state) {
-        Some(s) => (s.failure, s.skipped_marker),
-        None => (false, false),
-    };
-    let outcome = if failure {
-        TerminalOutcome::Failure
-    } else if skipped_marker {
-        TerminalOutcome::Skipped
-    } else {
-        TerminalOutcome::Success
-    };
+    let outcome = project_terminal_outcome(compiled, final_state);
 
     // Derive the short task name — the piece after `<parent>.`.
     let prefix = format!("{}.", parent_name);
@@ -2163,11 +2269,19 @@ fn append_child_completed_to_parent(
         child_name.to_string()
     };
 
+    // Auto-promote the child's result from the same terminal evidence
+    // and outcome projection the completion path already holds, and
+    // carry a copy on the parent's log so the converge gate can read it
+    // after the child session is auto-cleaned
+    // (DESIGN-request-store-converge.md Decision 3).
+    let result = synthesize_workflow_result(outcome, final_state, child_events);
+
     let payload = EventPayload::ChildCompleted {
         child_name: child_name.to_string(),
         task_name,
         outcome,
         final_state: final_state.to_string(),
+        result: Some(result),
     };
     match backend.append_event(parent_name, &payload, &now_iso8601()) {
         Ok(_) => ChildCompletedAppend::Notified,
@@ -2194,6 +2308,7 @@ fn append_terminal_index_for_session(
     backend: &dyn SessionBackend,
     session_id: &str,
     events: &[crate::engine::types::Event],
+    has_result: bool,
 ) {
     let terminal_state = if events
         .iter()
@@ -2218,6 +2333,12 @@ fn append_terminal_index_for_session(
         session_id,
         terminal_state,
         &state_path,
+        // Done-bit: true only when a `request_store.result` event was
+        // durably appended to the child's own log on this terminal tick.
+        // This preserves the "has_result true implies a durable result
+        // is readable" invariant (DESIGN-request-store-converge.md
+        // Decision 3, AC1).
+        has_result,
     ) {
         eprintln!(
             "warning: terminal-index append failed for {}: {}",
@@ -2714,6 +2835,21 @@ fn handle_next(
                 } = &resp
                 {
                     if !no_cleanup {
+                        // Issue 3: append the durable `request_store.result`
+                        // event to the CHILD's OWN log BEFORE cleanup, on
+                        // the same terminal tick and under the same atomic
+                        // append discipline as the terminal evidence
+                        // (DESIGN-request-store-converge.md Decision 3,
+                        // AC1). The boolean it returns is the done-bit the
+                        // index entry records, preserving the "has_result
+                        // implies a durable result is readable" invariant.
+                        let has_result = append_request_store_result_to_child(
+                            backend,
+                            &name,
+                            &compiled,
+                            final_state,
+                            &events,
+                        );
                         // Issue 8: append the terminal-index entry BEFORE
                         // session cleanup so the workspace skip-list
                         // observes the terminal transition. Best-effort
@@ -2721,7 +2857,7 @@ fn handle_next(
                         // falls through to cleanup; the next discovery
                         // scan will read the header directly per the
                         // header-is-truth rule.
-                        append_terminal_index_for_session(backend, &name, &events);
+                        append_terminal_index_for_session(backend, &name, &events, has_result);
                         // Issue #134: emit ChildCompleted to parent BEFORE
                         // cleanup so the batch gate can observe outcomes
                         // for children that auto-clean on terminal. When
@@ -2734,6 +2870,7 @@ fn handle_next(
                             &header,
                             &compiled,
                             final_state,
+                            &events,
                         );
                         if !matches!(append_result, ChildCompletedAppend::AppendFailed) {
                             if let Err(e) = backend.cleanup(&name) {
@@ -3637,14 +3774,26 @@ fn handle_next(
                 let (_, post_events) = backend
                     .read_events(&name)
                     .unwrap_or((header.clone(), Vec::new()));
-                let (all_complete, gate_output) = crate::cli::batch::build_children_complete_output(
-                    backend,
-                    &name,
-                    &post_events,
-                    &compiled,
-                    final_state,
-                    None,
-                );
+                let (_converge_passes, gate_output) =
+                    crate::cli::batch::build_children_complete_output(
+                        backend,
+                        &name,
+                        &post_events,
+                        &compiled,
+                        final_state,
+                        None,
+                    );
+                // Finalization tracks terminal completion, not the
+                // converge pass-predicate: a batch is "finalized" once
+                // every child reached a terminal outcome, independent of
+                // whether the converge gate has cleared its results-in
+                // conjunct. Read the `all_complete` field from the gate
+                // output rather than the returned converge bool
+                // (DESIGN-request-store-converge.md Decision 4).
+                let all_complete = gate_output
+                    .get("all_complete")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if crate::cli::batch::should_append_batch_finalized(&post_events, all_complete) {
                     if let Some(view) =
                         crate::cli::batch::BatchFinalView::from_gate_output(&gate_output)
@@ -3797,11 +3946,28 @@ fn handle_next(
                     // WorkflowCancelled is reflected in the classifier.
                     // Best-effort: a failure logs a warning, doesn't
                     // block cleanup.
-                    if let Ok((_, post_events)) = backend.read_events(&name) {
-                        append_terminal_index_for_session(backend, &name, &post_events);
-                    } else {
-                        append_terminal_index_for_session(backend, &name, &[]);
-                    }
+                    // Re-read once and reuse: the terminal-index append
+                    // needs a WorkflowCancelled-aware classifier, and the
+                    // child-completed result synthesis reads the terminal
+                    // evidence from the same events.
+                    let post_events = backend
+                        .read_events(&name)
+                        .map(|(_, ev)| ev)
+                        .unwrap_or_default();
+                    // Issue 3: durable result on the child's OWN log,
+                    // appended BEFORE cleanup on the same terminal tick
+                    // (DESIGN-request-store-converge.md Decision 3, AC1).
+                    // The boolean is the index done-bit, preserving the
+                    // "has_result implies a durable result is readable"
+                    // invariant.
+                    let has_result = append_request_store_result_to_child(
+                        backend,
+                        &name,
+                        &compiled,
+                        final_state,
+                        &post_events,
+                    );
+                    append_terminal_index_for_session(backend, &name, &post_events, has_result);
                     // Issue #134: emit ChildCompleted to parent BEFORE
                     // cleanup so the batch gate can observe outcomes for
                     // children that auto-clean on terminal. When the
@@ -3814,6 +3980,7 @@ fn handle_next(
                         &header,
                         &compiled,
                         final_state,
+                        &post_events,
                     );
                     if !matches!(append_result, ChildCompletedAppend::AppendFailed) {
                         if let Err(e) = backend.cleanup(&name) {
@@ -4315,7 +4482,12 @@ fn evaluate_children_complete(
 ) -> crate::gate::StructuredGateResult {
     use crate::gate::{GateOutcome, StructuredGateResult};
 
-    let (all_complete, output) = crate::cli::batch::build_children_complete_output(
+    // The returned bool is the converge pass-predicate: terminal
+    // completion AND every non-skipped child's result is dereferenceable.
+    // The gate is non-passing (GateBlocked) while any child is still
+    // running OR any non-skipped child's result has not landed
+    // (DESIGN-request-store-converge.md Decision 4).
+    let (converge_passes, output) = crate::cli::batch::build_children_complete_output(
         backend,
         workflow_name,
         parent_events,
@@ -4333,7 +4505,7 @@ fn evaluate_children_complete(
     let total = output.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
     let outcome = if total == 0 && error_str.starts_with("failed to list sessions") {
         GateOutcome::Error
-    } else if all_complete {
+    } else if converge_passes {
         GateOutcome::Passed
     } else {
         GateOutcome::Failed
@@ -5087,5 +5259,171 @@ Done.
         // validation downstream).
         let v = validate_with_data_payload(r#"{"note":"hello"}"#).expect("must accept");
         assert_eq!(v["note"], serde_json::json!("hello"));
+    }
+
+    #[cfg(unix)]
+    fn evidence_event(seq: u64, state: &str, fields: &[(&str, serde_json::Value)]) -> Event {
+        Event {
+            seq,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "evidence_submitted".to_string(),
+            payload: EventPayload::EvidenceSubmitted {
+                state: state.to_string(),
+                fields: fields
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect(),
+                submitter_cwd: None,
+            },
+            idempotency_hash: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synthesize_workflow_result_uses_evidence_summary_field() {
+        // A terminal EvidenceSubmitted carrying a `summary` field: the
+        // synthesized result reuses it verbatim and inlines the evidence
+        // fields as the opaque payload.
+        let events = vec![evidence_event(
+            1,
+            "done",
+            &[
+                ("summary", serde_json::json!("evaluated 42")),
+                ("score", serde_json::json!(42)),
+            ],
+        )];
+        let r = synthesize_workflow_result(TerminalOutcome::Success, "done", &events);
+        assert_eq!(r.status, TerminalOutcome::Success);
+        assert_eq!(r.summary, "evaluated 42");
+        let payload = r.payload.expect("non-empty evidence fields become payload");
+        assert_eq!(payload["score"], 42);
+        assert_eq!(payload["summary"], "evaluated 42");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synthesize_workflow_result_falls_back_to_final_state_default() {
+        // No `summary` field and no evidence for the terminal state: the
+        // summary falls back to an outcome/final-state-derived default
+        // and the empty-fields filter leaves payload as None.
+        let events = vec![evidence_event(1, "other_state", &[])];
+        let r = synthesize_workflow_result(TerminalOutcome::Failure, "failed", &events);
+        assert_eq!(r.status, TerminalOutcome::Failure);
+        assert_eq!(r.summary, "failed at failed");
+        assert!(
+            r.payload.is_none(),
+            "no terminal-state evidence means no payload"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synthesize_workflow_result_empty_terminal_fields_yield_no_payload() {
+        // Evidence exists for the terminal state but carries no fields:
+        // the `!is_empty()` filter must drop it so payload stays None,
+        // while the summary still gets the final-state-derived default.
+        let events = vec![evidence_event(1, "done", &[])];
+        let r = synthesize_workflow_result(TerminalOutcome::Skipped, "done", &events);
+        assert_eq!(r.summary, "skipped at done");
+        assert!(
+            r.payload.is_none(),
+            "empty evidence fields must be filtered to None"
+        );
+    }
+
+    /// AC1 + has_result done-bit: appending the durable result to the
+    /// child's OWN log returns `true` (the value the terminal-index
+    /// append records as `has_result`), and the synthesized
+    /// `WorkflowResult` is readable back from the child's log as a
+    /// `RequestStoreResult` event — proving "has_result true implies a
+    /// durable result is readable" and that no transcript replay is
+    /// needed to recover the result.
+    #[cfg(unix)]
+    #[test]
+    fn append_request_store_result_writes_durable_child_log_event() {
+        use crate::template::types::{CompiledTemplate, TemplateState};
+        use std::collections::BTreeMap;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        backend
+            .init_state_file(
+                "child",
+                crate::engine::types::StateFileHeader {
+                    schema_version: 1,
+                    workflow: "child".to_string(),
+                    template_hash: "h".to_string(),
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    parent_workflow: Some("parent".to_string()),
+                    template_source_dir: None,
+                    session_id: String::new(),
+                    intent: None,
+                    template_name: None,
+                    needs_agent: None,
+                    role: None,
+                    inputs: None,
+                    coordinator_of_record: None,
+                    requested_by: None,
+                    assignment_claim: None,
+                    dispatch_epoch: 0,
+                    priority: None,
+                    deadline: None,
+                    retry_count: None,
+                    agent_config: None,
+                    respawn_generation: None,
+                },
+                vec![],
+            )
+            .unwrap();
+
+        // Terminal evidence carrying a summary + structured fields.
+        let events = vec![evidence_event(
+            1,
+            "done",
+            &[
+                ("summary", serde_json::json!("child evaluated 7")),
+                ("score", serde_json::json!(7)),
+            ],
+        )];
+
+        // A compiled template whose terminal `done` state is a plain
+        // success (no failure / skipped_marker flags).
+        let mut states = BTreeMap::new();
+        states.insert("done".to_string(), TemplateState::default());
+        let compiled = CompiledTemplate {
+            format_version: 1,
+            name: "child".to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            initial_state: "done".to_string(),
+            variables: BTreeMap::new(),
+            states,
+        };
+
+        let has_result =
+            append_request_store_result_to_child(&backend, "child", &compiled, "done", &events);
+        assert!(
+            has_result,
+            "a successful child-log append is the has_result done-bit"
+        );
+
+        // The durable result must now be readable from the child's OWN
+        // log as a RequestStoreResult event — no transcript replay.
+        let (_, child_events) = backend.read_events("child").unwrap();
+        let result = child_events
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::RequestStoreResult { result } => Some(result.clone()),
+                _ => None,
+            })
+            .expect("RequestStoreResult event must be on the child's own log");
+        assert_eq!(result.status, TerminalOutcome::Success);
+        assert_eq!(result.summary, "child evaluated 7");
+        assert_eq!(
+            result.payload.expect("evidence fields ride the payload")["score"],
+            7
+        );
     }
 }
