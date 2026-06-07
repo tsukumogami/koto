@@ -1,5 +1,6 @@
 ---
-status: Current
+status: Superseded
+superseded_by: docs/designs/current/DESIGN-migrate-koto-go-to-rust.md
 spawned_from:
   issue: 18
   repo: tsukumogami/koto

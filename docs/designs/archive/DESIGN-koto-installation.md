@@ -1,5 +1,6 @@
 ---
-status: Current
+status: Superseded
+superseded_by: docs/designs/current/DESIGN-migrate-koto-go-to-rust.md
 problem: |
   koto has a working engine, template compiler, and cache, but no way to install the binary. Users must clone the repo and run go build. There are no pre-built binaries, no release process, and no standard installation channel.
 decision: |

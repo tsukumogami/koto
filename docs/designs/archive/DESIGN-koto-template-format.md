@@ -1,5 +1,6 @@
 ---
-status: Current
+status: Superseded
+superseded_by: docs/designs/current/DESIGN-migrate-koto-go-to-rust.md
 problem: |
   koto templates must serve two audiences: humans who write and maintain workflow
   definitions, and the engine that executes them deterministically. A single format
