@@ -614,12 +614,35 @@ pub enum EventPayload {
         /// The child's final state name. Used by the gate's
         /// `failure_mode` projection when `outcome == Failure`.
         final_state: String,
+        /// Copy of the child's auto-promoted [`WorkflowResult`], carried
+        /// on the parent's log so the converge gate can read it without
+        /// opening the (possibly auto-cleaned) child session
+        /// (DESIGN-request-store-converge.md Decision 3).
+        ///
+        /// Additive field: serde-optional, omitted from the wire when
+        /// `None`, so pre-feature parent logs round-trip unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<WorkflowResult>,
     },
     /// Emitted by `koto session update --intent` to update the workflow's
     /// stated goal concurrently with execution. Multiple events may appear;
     /// the last one wins (see `derive_intent`).
     IntentUpdated {
         intent: String,
+    },
+    /// Emitted on a child's own session log when it reaches a terminal
+    /// state, carrying the auto-promoted [`WorkflowResult`] envelope
+    /// (DESIGN-request-store-converge.md Decision 3, wire `type:
+    /// "request_store.result"`, in the reserved `request_store.*`
+    /// namespace).
+    ///
+    /// The child log is the durable record for `koto query` / `koto
+    /// status`; a copy also rides the parent's [`ChildCompleted`] event
+    /// so the result survives the child session's auto-cleanup. Unknown
+    /// to older koto builds, the event falls through the [`Unknown`]
+    /// fallthrough.
+    RequestStoreResult {
+        result: WorkflowResult,
     },
     /// Catch-all for event type strings not recognized by this koto version.
     ///
@@ -657,6 +680,30 @@ pub enum TerminalOutcome {
     Success,
     Failure,
     Skipped,
+}
+
+/// Typed minimal result envelope auto-promoted from a child's terminal
+/// evidence on its completion tick (DESIGN-request-store-converge.md
+/// Decision 2).
+///
+/// `status` reuses the existing [`TerminalOutcome`] verbatim — it is
+/// the same classification the completion path already projects for
+/// [`EventPayload::ChildCompleted`], so a parent reads any child's
+/// outcome uniformly with no new enum. `summary` is a single
+/// human-readable end-of-work statement. `payload` is an optional
+/// opaque `serde_json::Value` carrying structured detail (e.g. the
+/// terminal evidence fields); it is omitted from the wire when `None`
+/// via `skip_serializing_if`, matching koto's additive-field idiom.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowResult {
+    /// Terminal outcome classification, serialized as snake_case
+    /// (`"success"`, `"failure"`, `"skipped"`).
+    pub status: TerminalOutcome,
+    /// Bounded human-readable end-of-work statement.
+    pub summary: String,
+    /// Optional structured detail. Omitted from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 /// Reference to the event that superseded a stale `BatchFinalized`.
@@ -741,6 +788,7 @@ impl EventPayload {
             EventPayload::BatchFinalized { .. } => "batch_finalized",
             EventPayload::ChildCompleted { .. } => "child_completed",
             EventPayload::IntentUpdated { .. } => "intent_updated",
+            EventPayload::RequestStoreResult { .. } => "request_store.result",
             EventPayload::Unknown { .. } => "unknown",
         }
     }
@@ -984,12 +1032,18 @@ impl<'de> Deserialize<'de> for Event {
                     task_name: p.task_name,
                     outcome: p.outcome,
                     final_state: p.final_state,
+                    result: p.result,
                 }
             }
             "intent_updated" => {
                 let p: IntentUpdatedPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
                 EventPayload::IntentUpdated { intent: p.intent }
+            }
+            "request_store.result" => {
+                let p: RequestStoreResultPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::RequestStoreResult { result: p.result }
             }
             other => EventPayload::Unknown {
                 type_name: other.to_string(),
@@ -1134,11 +1188,18 @@ struct ChildCompletedPayload {
     task_name: String,
     outcome: TerminalOutcome,
     final_state: String,
+    #[serde(default)]
+    result: Option<WorkflowResult>,
 }
 
 #[derive(Deserialize)]
 struct IntentUpdatedPayload {
     intent: String,
+}
+
+#[derive(Deserialize)]
+struct RequestStoreResultPayload {
+    result: WorkflowResult,
 }
 
 /// Metadata about a workflow, derived from the state file header.
@@ -2546,5 +2607,111 @@ mod tests {
     fn engine_error_default_exit_code_is_1() {
         let e = EngineError::EmptyLog;
         assert_eq!(e.exit_code(), 1);
+    }
+
+    // ===== request-store-converge: WorkflowResult + RequestStoreResult =====
+
+    #[test]
+    fn workflow_result_round_trips_with_snake_case_status() {
+        let wr = WorkflowResult {
+            status: TerminalOutcome::Success,
+            summary: "did the thing".to_string(),
+            payload: Some(serde_json::json!({"k": "v"})),
+        };
+        let json = serde_json::to_value(&wr).unwrap();
+        assert_eq!(json["status"], "success");
+        assert_eq!(json["summary"], "did the thing");
+        assert_eq!(json["payload"]["k"], "v");
+        let back: WorkflowResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back, wr);
+    }
+
+    #[test]
+    fn workflow_result_omits_payload_when_none() {
+        let wr = WorkflowResult {
+            status: TerminalOutcome::Failure,
+            summary: "boom".to_string(),
+            payload: None,
+        };
+        let json = serde_json::to_value(&wr).unwrap();
+        assert!(
+            json.get("payload").is_none(),
+            "payload must be omitted from the wire when None"
+        );
+        let back: WorkflowResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back, wr);
+    }
+
+    #[test]
+    fn request_store_result_event_round_trips() {
+        let e = Event {
+            seq: 9,
+            timestamp: "2026-06-07T00:00:00Z".to_string(),
+            event_type: "request_store.result".to_string(),
+            payload: EventPayload::RequestStoreResult {
+                result: WorkflowResult {
+                    status: TerminalOutcome::Skipped,
+                    summary: "skipped upstream".to_string(),
+                    payload: None,
+                },
+            },
+            idempotency_hash: None,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(val["type"], "request_store.result");
+        assert_eq!(val["payload"]["result"]["status"], "skipped");
+        let back: Event = serde_json::from_str(&json).unwrap();
+        match back.payload {
+            EventPayload::RequestStoreResult { result } => {
+                assert_eq!(result.status, TerminalOutcome::Skipped);
+                assert_eq!(result.summary, "skipped upstream");
+            }
+            other => panic!("expected RequestStoreResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn child_completed_with_result_round_trips() {
+        let e = Event {
+            seq: 4,
+            timestamp: "2026-06-07T00:00:00Z".to_string(),
+            event_type: "child_completed".to_string(),
+            payload: EventPayload::ChildCompleted {
+                child_name: "parent.alpha".to_string(),
+                task_name: "alpha".to_string(),
+                outcome: TerminalOutcome::Success,
+                final_state: "done".to_string(),
+                result: Some(WorkflowResult {
+                    status: TerminalOutcome::Success,
+                    summary: "alpha done".to_string(),
+                    payload: None,
+                }),
+            },
+            idempotency_hash: None,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Event = serde_json::from_str(&json).unwrap();
+        match back.payload {
+            EventPayload::ChildCompleted { result, .. } => {
+                let r = result.expect("result must round-trip");
+                assert_eq!(r.summary, "alpha done");
+            }
+            other => panic!("expected ChildCompleted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pre_feature_child_completed_without_result_deserializes_to_none() {
+        // A parent log written before this feature carries no `result`
+        // key; the additive serde-optional field must default to None.
+        let json = r#"{"seq":2,"timestamp":"2026-01-01T00:00:00Z","type":"child_completed","payload":{"child_name":"p.a","task_name":"a","outcome":"success","final_state":"done"}}"#;
+        let parsed: Event = serde_json::from_str(json).expect("pre-feature log must parse");
+        match parsed.payload {
+            EventPayload::ChildCompleted { result, .. } => {
+                assert!(result.is_none(), "absent result must default to None");
+            }
+            other => panic!("expected ChildCompleted, got {:?}", other),
+        }
     }
 }

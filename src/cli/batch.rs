@@ -50,7 +50,7 @@ use crate::engine::batch_validation::TaskEntry;
 use crate::engine::persistence::derive_state_from_log;
 use crate::engine::scheduler_warning::SchedulerWarning;
 use crate::engine::types::{
-    ChildSnapshot, Event, EventPayload, SpawnEntrySnapshot, TerminalOutcome,
+    ChildSnapshot, Event, EventPayload, SpawnEntrySnapshot, TerminalOutcome, WorkflowResult,
 };
 use crate::session::SessionBackend;
 use crate::template::types::{CompiledTemplate, FailurePolicy, MaterializeChildrenSpec};
@@ -2050,6 +2050,15 @@ pub struct ChildGateEntry {
     /// for successful or non-terminal children.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_source: Option<String>,
+    /// The child's auto-promoted result, inlined at the converge point
+    /// so a parent reads it without opening the child's log
+    /// (DESIGN-request-store-converge.md Decision 3 / 4).
+    ///
+    /// Walking-skeleton scope (Issue 1): read from the parent's own
+    /// `ChildCompleted.result`. Omitted when the child carries no
+    /// promoted result (e.g. a pre-feature parent log).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<WorkflowResult>,
 }
 
 /// Snapshot of the `children-complete` gate output captured at the
@@ -2298,6 +2307,13 @@ pub fn build_children_complete_output(
     // rewind — those belong to relocated children from a prior epoch.
     let epoch_boundary = last_rewind_seq(events);
     let mut event_snapshots: HashMap<String, (TerminalOutcome, String)> = HashMap::new();
+    // Walking-skeleton converge read: the auto-promoted result copy
+    // carried on the parent's own `ChildCompleted.result`, keyed by
+    // composed child name (`<parent>.<task>`) so it inlines into the
+    // matching gate entry without opening the child's log
+    // (DESIGN-request-store-converge.md Decision 3 / 4). Latest event
+    // per child wins, mirroring `event_snapshots`.
+    let mut result_by_child: HashMap<String, WorkflowResult> = HashMap::new();
     for ev in events {
         // Skip events from superseded epochs.
         if let Some(boundary) = epoch_boundary {
@@ -2306,13 +2322,17 @@ pub fn build_children_complete_output(
             }
         }
         if let EventPayload::ChildCompleted {
+            child_name,
             task_name,
             outcome,
             final_state,
-            ..
+            result,
         } = &ev.payload
         {
             event_snapshots.insert(task_name.clone(), (*outcome, final_state.clone()));
+            if let Some(r) = result {
+                result_by_child.insert(child_name.clone(), r.clone());
+            }
         }
     }
     for (task_name, (outcome, final_state)) in event_snapshots {
@@ -2405,6 +2425,23 @@ pub fn build_children_complete_output(
     let any_spawn_failed = spawn_failed_count > 0;
     let needs_attention = any_failed || any_skipped || any_spawn_failed;
 
+    // Inline each child's auto-promoted result, read from the parent's
+    // own `ChildCompleted.result` (keyed by composed child name) — the
+    // converge read never opens or replays a child log
+    // (DESIGN-request-store-converge.md Decision 3 / 4). The hook path
+    // names entries by their composed `<parent>.<task>` identity; the
+    // no-hook fallback path may name a cleaned-up child by its short
+    // task name, so try the composed form too.
+    for entry in &mut entries {
+        let composed = format!("{}.{}", parent_name, entry.name);
+        if let Some(r) = result_by_child
+            .get(&entry.name)
+            .or_else(|| result_by_child.get(&composed))
+        {
+            entry.result = Some(r.clone());
+        }
+    }
+
     let children_json: Vec<serde_json::Value> = entries.iter().map(child_entry_to_json).collect();
 
     (
@@ -2458,6 +2495,12 @@ fn child_entry_to_json(entry: &ChildGateEntry) -> serde_json::Value {
     }
     if let Some(rs) = &entry.reason_source {
         obj.insert("reason_source".to_string(), serde_json::json!(rs));
+    }
+    if let Some(r) = &entry.result {
+        obj.insert(
+            "result".to_string(),
+            serde_json::to_value(r).unwrap_or(serde_json::Value::Null),
+        );
     }
     serde_json::Value::Object(obj)
 }
@@ -2520,6 +2563,7 @@ fn build_entries_from_tasks(
             blocked_by: None,
             skipped_because_chain: Vec::new(),
             reason_source: None,
+            result: None,
         };
 
         match outcome {
@@ -2701,6 +2745,7 @@ fn build_entries_from_disk(
             blocked_by: None,
             skipped_because_chain: Vec::new(),
             reason_source: None,
+            result: None,
         };
         match outcome {
             TaskOutcome::Failure => {
@@ -2866,6 +2911,7 @@ pub fn derive_batch_phase(events: &[Event]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::template::types::TemplateState;
 
     fn task(name: &str, waits_on: &[&str]) -> TaskEntry {
         TaskEntry {
@@ -3280,6 +3326,7 @@ mod tests {
                 blocked_by: None,
                 skipped_because_chain: Vec::new(),
                 reason_source: None,
+                result: None,
             },
             ChildGateEntry {
                 name: "parent.b".to_string(),
@@ -3291,6 +3338,7 @@ mod tests {
                 blocked_by: None,
                 skipped_because_chain: Vec::new(),
                 reason_source: Some("not_spawned".to_string()),
+                result: None,
             },
         ];
         let agg = aggregates(&mut entries);
@@ -3319,6 +3367,7 @@ mod tests {
                 blocked_by: None,
                 skipped_because_chain: Vec::new(),
                 reason_source: None,
+                result: None,
             },
             ChildGateEntry {
                 name: "parent.b".to_string(),
@@ -3330,6 +3379,7 @@ mod tests {
                 blocked_by: None,
                 skipped_because_chain: Vec::new(),
                 reason_source: Some("state_name".to_string()),
+                result: None,
             },
         ];
         let agg = aggregates(&mut entries);
@@ -3501,6 +3551,7 @@ mod tests {
             blocked_by: None,
             skipped_because_chain: Vec::new(),
             reason_source: Some("state_name".to_string()),
+            result: None,
         };
         let entry_skipped = ChildGateEntry {
             name: "p.b".to_string(),
@@ -3512,6 +3563,7 @@ mod tests {
             blocked_by: None,
             skipped_because_chain: vec!["p.a".to_string()],
             reason_source: Some("skipped".to_string()),
+            result: None,
         };
         let entry_not_spawned = ChildGateEntry {
             name: "p.c".to_string(),
@@ -3523,6 +3575,7 @@ mod tests {
             blocked_by: None,
             skipped_because_chain: Vec::new(),
             reason_source: Some("not_spawned".to_string()),
+            result: None,
         };
         for (entry, want) in [
             (&entry_state_name, "state_name"),
@@ -3541,6 +3594,7 @@ mod tests {
         // path emits; verify its JSON round-trip through ChildGateEntry.
         let entry_failure_reason = ChildGateEntry {
             reason_source: Some("failure_reason".to_string()),
+            result: None,
             ..entry_state_name.clone()
         };
         let j = child_entry_to_json(&entry_failure_reason);
@@ -4251,9 +4305,141 @@ mod tests {
                 task_name: task_name.to_string(),
                 outcome,
                 final_state: final_state.to_string(),
+                result: None,
             },
             idempotency_hash: None,
         }
+    }
+
+    /// AC5: a parent reads a completed child's auto-promoted result
+    /// from its OWN `ChildCompleted.result` event, with the child
+    /// session absent from disk (already auto-cleaned). The gate output
+    /// inlines the result without the child log ever being opened or
+    /// replayed.
+    #[test]
+    fn gate_inlines_child_result_without_replaying_child_log() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        // A parent session on disk, no materialize_children hook (so the
+        // fallback classification path runs), carrying a ChildCompleted
+        // event whose `result` was auto-promoted on the child's terminal
+        // tick. The child `parent.alpha` is deliberately NOT created on
+        // disk: it has been auto-cleaned, so the only place the result
+        // can be read from is the parent's own log.
+        let parent_header = StateFileHeader {
+            schema_version: 1,
+            workflow: "parent".to_string(),
+            template_hash: "testhash".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: None,
+            template_source_dir: None,
+            session_id: String::new(),
+            intent: None,
+            template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
+        };
+        backend
+            .init_state_file("parent", parent_header, vec![])
+            .unwrap();
+        // The parent dispatched one child, `alpha`, recorded as the
+        // submitted task list on the converge state's evidence.
+        backend
+            .append_event(
+                "parent",
+                &EventPayload::EvidenceSubmitted {
+                    state: "converge".to_string(),
+                    fields: HashMap::from([(
+                        "tasks".to_string(),
+                        serde_json::json!([{"name": "alpha", "waits_on": []}]),
+                    )]),
+                    submitter_cwd: None,
+                },
+                "2026-01-01T00:00:01Z",
+            )
+            .unwrap();
+        // The child completed and was auto-cleaned; its auto-promoted
+        // result rode the parent's ChildCompleted event.
+        backend
+            .append_event(
+                "parent",
+                &EventPayload::ChildCompleted {
+                    child_name: "parent.alpha".to_string(),
+                    task_name: "alpha".to_string(),
+                    outcome: TerminalOutcome::Success,
+                    final_state: "done".to_string(),
+                    result: Some(WorkflowResult {
+                        status: TerminalOutcome::Success,
+                        summary: "alpha evaluated 42".to_string(),
+                        payload: Some(serde_json::json!({"score": 42})),
+                    }),
+                },
+                "2026-01-01T00:00:02Z",
+            )
+            .unwrap();
+
+        assert!(
+            !backend.exists("parent.alpha"),
+            "child must be absent from disk so the result can only come \
+             from the parent's own ChildCompleted.result"
+        );
+
+        let (_, parent_events) = backend.read_events("parent").unwrap();
+
+        // Compiled template: the converge state declares a
+        // materialize_children hook so the task-driven classification
+        // path runs and names entries by composed `<parent>.<task>`.
+        let converge = TemplateState {
+            materialize_children: Some(MaterializeChildrenSpec {
+                from_field: "tasks".to_string(),
+                default_template: "child.md".to_string(),
+                failure_policy: FailurePolicy::SkipDependents,
+            }),
+            ..TemplateState::default()
+        };
+        let mut states = BTreeMap::new();
+        states.insert("converge".to_string(), converge);
+        let template = CompiledTemplate {
+            format_version: 1,
+            name: "parent".to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            initial_state: "converge".to_string(),
+            variables: BTreeMap::new(),
+            states,
+        };
+
+        let (_all_complete, output) = build_children_complete_output(
+            &backend,
+            "parent",
+            &parent_events,
+            &template,
+            "converge",
+            None,
+        );
+
+        let children = output["children"].as_array().expect("children array");
+        let entry = children
+            .iter()
+            .find(|c| c["name"] == "parent.alpha")
+            .expect("entry for the cleaned-up child");
+        assert_eq!(
+            entry["result"]["summary"], "alpha evaluated 42",
+            "the child's result must be inlined from the parent's own log"
+        );
+        assert_eq!(entry["result"]["status"], "success");
+        assert_eq!(entry["result"]["payload"]["score"], 42);
     }
 
     #[test]
@@ -4375,6 +4561,7 @@ mod tests {
                 task_name: "alpha".to_string(),
                 outcome: TerminalOutcome::Success,
                 final_state: "done".to_string(),
+                result: None,
             },
             idempotency_hash: None,
         };

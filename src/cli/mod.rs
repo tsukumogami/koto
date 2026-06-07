@@ -35,7 +35,7 @@ use crate::cache::{compile_cached, sha256_hex};
 use crate::discover::find_workflows_with_metadata;
 use crate::engine::errors::EngineError;
 use crate::engine::persistence::{derive_decisions, derive_machine_state, derive_state_from_log};
-use crate::engine::types::{now_iso8601, Event, EventPayload, TerminalOutcome};
+use crate::engine::types::{now_iso8601, Event, EventPayload, TerminalOutcome, WorkflowResult};
 use crate::session::context::ContextStore;
 use crate::session::local::LocalBackend;
 use crate::session::{Backend, SessionBackend, SessionError};
@@ -2121,6 +2121,56 @@ enum ChildCompletedAppend {
 /// state. The `children-complete` gate evaluator replays these events
 /// to recover per-task outcomes after cleanup has removed the child's
 /// state file from disk.
+/// Synthesize a [`WorkflowResult`] from the data the completion path
+/// already holds on a child's terminal tick
+/// (DESIGN-request-store-converge.md Decision 1 / 2).
+///
+/// `status` is the same [`TerminalOutcome`] the completion path already
+/// projects. `summary` is read from a conventionally-named `summary`
+/// field on the latest terminal `EvidenceSubmitted` event, falling back
+/// to a final-state-derived default so every completion is resultful.
+/// `payload` carries the latest terminal evidence fields as an opaque
+/// JSON object when present.
+///
+/// Walking-skeleton scope (Issue 1): synthesizes purely from the
+/// `TerminalOutcome` projection plus the child's own evidence events;
+/// later issues thicken the convention and the `accepts`-block lookup.
+#[cfg(unix)]
+fn synthesize_workflow_result(
+    outcome: TerminalOutcome,
+    final_state: &str,
+    child_events: &[Event],
+) -> WorkflowResult {
+    // Latest EvidenceSubmitted fields for the terminal state, if any.
+    let terminal_fields = child_events.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::EvidenceSubmitted { state, fields, .. } if state == final_state => {
+            Some(fields.clone())
+        }
+        _ => None,
+    });
+
+    let summary = terminal_fields
+        .as_ref()
+        .and_then(|f| f.get("summary"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| match outcome {
+            TerminalOutcome::Success => format!("completed at {}", final_state),
+            TerminalOutcome::Failure => format!("failed at {}", final_state),
+            TerminalOutcome::Skipped => format!("skipped at {}", final_state),
+        });
+
+    let payload = terminal_fields
+        .filter(|f| !f.is_empty())
+        .map(|f| serde_json::Value::Object(f.into_iter().collect()));
+
+    WorkflowResult {
+        status: outcome,
+        summary,
+        payload,
+    }
+}
+
 #[cfg(unix)]
 fn append_child_completed_to_parent(
     backend: &dyn SessionBackend,
@@ -2128,6 +2178,7 @@ fn append_child_completed_to_parent(
     child_header: &crate::engine::types::StateFileHeader,
     compiled: &CompiledTemplate,
     final_state: &str,
+    child_events: &[Event],
 ) -> ChildCompletedAppend {
     let parent_name = match child_header.parent_workflow.as_deref() {
         Some(p) => p,
@@ -2163,11 +2214,19 @@ fn append_child_completed_to_parent(
         child_name.to_string()
     };
 
+    // Auto-promote the child's result from the same terminal evidence
+    // and outcome projection the completion path already holds, and
+    // carry a copy on the parent's log so the converge gate can read it
+    // after the child session is auto-cleaned
+    // (DESIGN-request-store-converge.md Decision 3).
+    let result = synthesize_workflow_result(outcome, final_state, child_events);
+
     let payload = EventPayload::ChildCompleted {
         child_name: child_name.to_string(),
         task_name,
         outcome,
         final_state: final_state.to_string(),
+        result: Some(result),
     };
     match backend.append_event(parent_name, &payload, &now_iso8601()) {
         Ok(_) => ChildCompletedAppend::Notified,
@@ -2734,6 +2793,7 @@ fn handle_next(
                             &header,
                             &compiled,
                             final_state,
+                            &events,
                         );
                         if !matches!(append_result, ChildCompletedAppend::AppendFailed) {
                             if let Err(e) = backend.cleanup(&name) {
@@ -3797,11 +3857,15 @@ fn handle_next(
                     // WorkflowCancelled is reflected in the classifier.
                     // Best-effort: a failure logs a warning, doesn't
                     // block cleanup.
-                    if let Ok((_, post_events)) = backend.read_events(&name) {
-                        append_terminal_index_for_session(backend, &name, &post_events);
-                    } else {
-                        append_terminal_index_for_session(backend, &name, &[]);
-                    }
+                    // Re-read once and reuse: the terminal-index append
+                    // needs a WorkflowCancelled-aware classifier, and the
+                    // child-completed result synthesis reads the terminal
+                    // evidence from the same events.
+                    let post_events = backend
+                        .read_events(&name)
+                        .map(|(_, ev)| ev)
+                        .unwrap_or_default();
+                    append_terminal_index_for_session(backend, &name, &post_events);
                     // Issue #134: emit ChildCompleted to parent BEFORE
                     // cleanup so the batch gate can observe outcomes for
                     // children that auto-clean on terminal. When the
@@ -3814,6 +3878,7 @@ fn handle_next(
                         &header,
                         &compiled,
                         final_state,
+                        &post_events,
                     );
                     if !matches!(append_result, ChildCompletedAppend::AppendFailed) {
                         if let Err(e) = backend.cleanup(&name) {

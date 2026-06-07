@@ -636,6 +636,7 @@ mod tests {
                     blocked_by: None,
                     skipped_because_chain: vec![],
                     reason_source: None,
+                    result: None,
                 },
                 ChildGateEntry {
                     name: "p.B".to_string(),
@@ -647,6 +648,7 @@ mod tests {
                     blocked_by: None,
                     skipped_because_chain: vec![],
                     reason_source: Some("state_name".to_string()),
+                    result: None,
                 },
                 ChildGateEntry {
                     name: "p.C".to_string(),
@@ -658,6 +660,7 @@ mod tests {
                     blocked_by: None,
                     skipped_because_chain: vec!["p.B".to_string()],
                     reason_source: Some("skipped".to_string()),
+                    result: None,
                 },
             ],
         };
