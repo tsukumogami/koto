@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Draft
+status: Accepted
 problem: |
   As koto session count grows, the dashboard can no longer answer the
   one question a developer brings to it -- "which session needs me
@@ -8,18 +8,20 @@ problem: |
   sessions are labeled only by opaque IDs, and live work is buried
   under finished and never-started noise.
 outcome: |
-  A developer opens the dashboard and immediately sees which sessions
-  are alive and which need attention -- stalled work is visibly
-  distinct from progressing work, each session is recognizable by what
-  it is doing, and finished or abandoned sessions stay out of the way.
-  The list stays readable as session count grows.
+  Opening the dashboard, the developer's first answer is whether
+  anything needs them: needs-you sessions lead, ordered by urgency.
+  Life is measured from last activity, so a silent run looks distinct
+  from an advancing one and a parked run is not mistaken for a dead
+  one; rows are recognizable by their work; finished and abandoned
+  sessions recede on their own -- so the needs-you set stays small and
+  trustworthy as sessions accumulate.
 ---
 
 # BRIEF: Session legibility in the local dashboard
 
 ## Status
 
-Draft
+Accepted
 
 Framing for the local-scope slice of the session-legibility work,
 reframed from a five-field metadata addition to the dashboard UX
@@ -62,32 +64,37 @@ legible becomes harder to read the more work there is.
 ## User Outcome
 
 A developer opens the dashboard and, without reading a single log,
-sees the shape of their work: which sessions are alive, which have
-gone quiet, which are done.
+gets one answer first: *is the ball in my court?* The view leads with
+the sessions that need a decision -- an agent waiting on input, a run
+that failed -- and orders them so the most urgent sits on top. When
+nothing needs them, that reads instantly too.
 
-A session that has stopped making progress is visibly distinct from
-one that is advancing, so the one that needs attention stands out
-instead of hiding. Each session is recognizable by what it is doing --
-the developer reads the list and knows which work each row is, rather
-than decoding identifiers. And the sessions that no longer need
-attention -- finished, abandoned, never-started -- stay out of the way
-unless the developer asks for them.
+The dashboard tells alive from dead honestly. A session's life is
+measured from when it last *did* something, not from when it was
+created, so a run that has gone silent is visibly distinct from one
+advancing right now -- and a session legitimately parked, waiting on a
+slow step, is not mistaken for one that died. Each session is
+recognizable by the work it is doing rather than by an opaque
+identifier. And the sessions that no longer need attention -- finished,
+idle, abandoned -- recede on their own and stop accumulating, instead
+of being filtered around forever.
 
-The decisive change is that this holds *as the session count grows*.
-The dashboard surfaces the live, attention-worthy sessions instead of
-drowning them, so it stays useful on the hundredth session the way it
-was on the third.
+The decisive change is trust at scale. The "needs you" set stays small
+and honest -- every session in it genuinely wants a decision -- so the
+developer keeps believing it. The dashboard surfaces the few live,
+attention-worthy sessions instead of drowning them, and it holds that
+way on the thousandth session as well as the third.
 
 ## User Journeys
 
-### Triage the active set
+### Land on what needs a decision
 
-A developer who has several sessions in flight steps away, comes back,
-and opens the dashboard to find the one that is stuck or waiting on
-them. They scan the list and immediately tell the sessions still
-advancing apart from the ones that have gone quiet -- the stalled one
-stands out -- and they go straight to it without opening every session
-to check which is which.
+A developer with several sessions in flight steps away and comes back.
+The first thing the dashboard shows is the short list of sessions
+waiting on them -- an agent stopped for input, a run that failed --
+ordered with the most urgent on top. They act on the top one without
+scanning past anything that does not need them; if that list is empty,
+they see that everything is clear and move on.
 
 ### Recognize a session by its work
 
@@ -95,16 +102,17 @@ A developer wants to check on a specific piece of work -- the change
 they kicked off earlier. They scan the session list and find it by
 what it is, reading a label that names the work, rather than mapping a
 cryptic id back to the task in their head or opening sessions one by
-one until they hit the right one.
+one until they hit the right one. A session names itself from the
+moment it starts, not only once someone fills in a description.
 
-### Declutter to the live set
+### Trust that the quiet ones are really quiet
 
-A developer's session list has grown dominated by old, finished, and
-never-started sessions. They want to focus on what is live. The
-default view keeps the finished and abandoned sessions out of the way,
-so what they see is the handful of sessions actually in progress --
-and they can still call up the hidden ones deliberately when they need
-the history.
+A developer's attention stays on the live set because the finished,
+idle, and abandoned sessions have receded on their own -- they are not
+filtered around by hand every time, and, just as important, a run that
+actually died is not quietly receding among them but surfaces as
+something that needs a look. When the developer does want history, the
+receded set is one deliberate step away, not gone.
 
 ## Scope Boundary
 
@@ -138,23 +146,37 @@ the history.
 
 ## Open Questions
 
-- **The silently-dropped sessions.** Running the list against a real
-  `~/.koto` showed the dashboard surfacing only a small fraction of
-  the session directories on disk; the rest are dropped without a
-  trace. The PRD must settle whether that is a parsing/correctness bug
-  to fix or expected unreadable cruft to garbage-collect -- and whether
-  fixing it is part of "noise reduction" or a precondition for it.
-- **The staleness model.** What defines "stale" -- a fixed idle
-  threshold, a threshold that varies by workflow or state, or
-  something the user configures -- and whether the signal is computed
-  when the list is read or recorded on the session. Deferred to the
-  PRD and its design.
-- **The label strategy.** Whether the human-readable label populates
-  the descriptive field that already exists, is derived from the
-  workflow and current state, or is a new field -- and what writes it.
-- **The noise-reduction surface.** Whether decluttering is a default
-  filter on the view, an explicit prune / garbage-collect action, or
-  both.
+- **The staleness model.** How "alive vs dead" is decided. The signal
+  is time-since-last-activity rather than since-creation, but the PRD
+  must settle the shape: a grace window before a quiet session is
+  called stale (so a brief pause does not flap), how the threshold is
+  chosen (fixed, per-workflow, or configurable), and -- the
+  load-bearing rule -- that a session legitimately parked on a gate
+  must not be classified as dead just because it has been quiet.
+- **"Waiting on you" as a state.** Whether the dashboard's lead state
+  -- a session that needs a human decision -- is a status the session
+  records, or one the dashboard derives from the event log at read
+  time. This decides how much, if anything, gets written to the
+  session versus computed on display.
+- **Recede by decay vs. filter, and the dropped sessions.** Whether
+  finished and abandoned sessions leave the default view by aging out
+  on their own (auto-archive) or by a filter applied each time -- and,
+  relatedly, why so many session directories are silently dropped from
+  the list today (a parsing bug to fix, or dead cruft an auto-archive
+  would carry off anyway).
+- **The label chain.** How a session names itself: deriving a label
+  from what already exists (workflow, current state, a distinguishing
+  variable), and/or giving the descriptive field a sensible default at
+  session start so it stops being empty -- with a fallback order that
+  guarantees a row is never just a bare id.
+- **Ordering and grouping the attention set.** How the needs-you set
+  is ranked (by urgency and age), and whether related sessions fold
+  together -- for instance a blocked parent standing in for the
+  children waiting on it -- so the set stays short.
+- **Pull vs. push.** Whether "what needs me" is only the dashboard a
+  developer opens, or whether the strongest case -- a session blocked
+  on a decision past the grace window -- also earns a single,
+  sparingly-used notification.
 
 ## References
 
