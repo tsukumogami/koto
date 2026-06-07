@@ -1,5 +1,5 @@
 ---
-status: Draft
+status: Accepted
 upstream: docs/briefs/BRIEF-request-store-converge.md
 problem: |
   koto can fan a workflow out to child workflows and learn which children
@@ -28,7 +28,13 @@ motivating_context: |
 
 ## Status
 
-Draft
+Accepted
+
+Phase 4 jury (completeness, clarity, testability) returned all-PASS after
+one self-correction defining the converge set (R5, AC5). The downstream
+design owns the result-payload field set (D2), the terminal-evidence
+promotion mechanism (D1), and the result storage and pointer mechanism
+(D3); this PRD fixes the requirements and constraints.
 
 ## Problem Statement
 
@@ -151,12 +157,15 @@ is readable.
   parent's `koto next` directive surfaces the closed results of the
   parent's children inline, so the coordinator reads every child's outcome
   from its own directive without opening any child session.
-- **R5** — The converge point stays blocked until the results it waits on
-  are recorded. While blocked, the directive identifies which children's
-  results are still outstanding. The parent does not advance past the
-  converge point until its required children's results are in. The converge
-  point reuses koto's existing gate-blocked directive surface rather than
-  introducing a new top-level response shape.
+- **R5** — The converge point waits on a well-defined set of children: the
+  parent's linked children that participate in the fan-out being converged
+  (the same children the parent discovers as needing an agent and
+  dispatches). The converge point stays blocked until every child in that
+  set has recorded a result. While blocked, the directive identifies which
+  children in the set are still outstanding, and the parent is not advanced
+  past the converge point. The converge point reuses koto's existing
+  gate-blocked directive surface rather than introducing a new top-level
+  response shape.
 - **R6** — Convergence is uniform and recursive. A workflow that is itself
   a child converges its own children through R4–R5 and produces its own
   closed result through R1–R3 for its parent to read. A leaf (no children),
@@ -209,11 +218,13 @@ is readable.
   `koto next` at its converge point, receives each child's closed result
   inline in the directive. The test asserts the results appear in the
   directive output and that no child session log was read to produce them.
-- [ ] **AC5 (R5)** — A parent whose converge point has at least one
-  outstanding child result receives a blocked converge directive that names
-  the outstanding child(ren), and the parent is not advanced past the
-  converge point. Once the last required child records its result, the next
-  `koto next` clears the converge point and surfaces all results.
+- [ ] **AC5 (R5)** — A parent whose converge set has at least one child
+  that has not recorded a result receives a blocked converge directive that
+  names the outstanding child(ren) by their identity in the fan-out, and
+  the parent is not advanced past the converge point. Once the last child in
+  the converge set records its result, the next `koto next` clears the
+  converge point and surfaces all results. A test asserts the blocked-set
+  membership matches the parent's linked dispatched children.
 - [ ] **AC6 (R5)** — The converge point is surfaced through koto's existing
   gate-blocked directive surface; no new top-level `koto next` response
   variant and no new top-level command noun are introduced. A test inspects
