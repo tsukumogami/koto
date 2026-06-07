@@ -80,8 +80,8 @@ session conflict: local version 7 (machine a1b2c3), remote version 6 (machine d4
 Resolve by picking a side:
 
 ```bash
-koto session resolve --keep local   # force-upload your version
-koto session resolve --keep remote  # download the other machine's version
+koto session resolve <name> --keep local   # force-upload your version
+koto session resolve <name> --keep remote  # download the other machine's version
 ```
 
 ## Config reference

@@ -124,11 +124,11 @@ cadence. The verb is idempotent and tolerates a missing workspace.
 
 ```bash
 # Manual prune (dry-run first if you want a preview)
-koto workspace prune --dry-run
-koto workspace prune
+koto workspace prune --root <session-id> --dry-run
+koto workspace prune --root <session-id>
 
 # Cron the prune to fire every Sunday at 02:00
-0 2 * * 0 /usr/local/bin/koto workspace prune >/dev/null 2>&1
+0 2 * * 0 /usr/local/bin/koto workspace prune --root <session-id> --yes >/dev/null 2>&1
 ```
 
 `koto workspace prune` reclaims:

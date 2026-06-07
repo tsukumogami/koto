@@ -8,7 +8,7 @@ Run this checklist before any release that changes files under `plugins/`. If yo
 
 ## Prerequisites
 
-- koto binary built from the branch under test (`go build -o koto ./cmd/koto`)
+- koto binary built from the branch under test (`cargo build` produces the `koto` binary at `target/debug/koto`)
 - `koto` on PATH (verify with `koto version`)
 - Claude Code v1.0.33 or later (plugin support required)
 - A clean test directory with no existing `.koto/` subdirectory and no active koto sessions (`koto session list` returns empty)
@@ -49,7 +49,7 @@ Install the koto-skills plugin from the marketplace in a fresh project.
 
 ## Test 2: Skill Invocation and Workflow Loop
 
-Trigger the hello-koto skill and verify the full init / next / execute / transition / done cycle.
+Trigger the hello-koto skill and verify the full init / next / execute / directed-transition / done cycle.
 
 ### Steps
 
@@ -59,22 +59,22 @@ Trigger the hello-koto skill and verify the full init / next / execute / transit
    ```
 2. Observe the agent's actions. It should:
    - Copy the template to `.koto/templates/hello-koto.md`
-   - Run `koto init --template .koto/templates/hello-koto.md --name hello --var SPIRIT_NAME=Hasami`
-   - Run `koto next` and receive the awakening directive
+   - Run `koto init hello --template .koto/templates/hello-koto.md --var SPIRIT_NAME=Hasami`
+   - Run `koto next hello` and receive the awakening directive
    - Submit a greeting from Hasami via `koto context add hello spirit-greeting.txt`
-   - Run `koto transition eternal`
-   - Run `koto next` and receive the done response
+   - Run `koto next hello --to eternal`
+   - Run `koto next hello` and receive the done response
    - Output a completion message
 
 ### Pass Criteria
 
 - [ ] Template file exists at `.koto/templates/hello-koto.md` after the skill runs
-- [ ] `koto init` returns `{"state":"awakening"}` (or output containing `"awakening"`)
-- [ ] `koto next` returns a directive mentioning the spirit name "Hasami"
+- [ ] `koto init hello` returns `{"name":"hello","state":"awakening"}` (or output containing `"awakening"`)
+- [ ] `koto next hello` returns a directive mentioning the spirit name "Hasami"
 - [ ] Greeting content was submitted via `koto context add hello spirit-greeting.txt`
 - [ ] `koto context exists hello spirit-greeting.txt` exits 0 (content key exists)
-- [ ] `koto transition eternal` succeeds (context-exists gate passes)
-- [ ] Final `koto next` returns `{"action":"done"}` (or output containing `"done"`)
+- [ ] `koto next hello --to eternal` succeeds (context-exists gate passes)
+- [ ] Final `koto next hello` returns `{"action":"done"}` (or output containing `"done"`)
 - [ ] The agent outputs a completion message to the user
 - [ ] Session appears in `koto session list` during the workflow and is cleaned up on completion
 
@@ -84,7 +84,7 @@ Trigger the hello-koto skill and verify the full init / next / execute / transit
 - `koto init` fails (template not found, compilation error)
 - Gate check fails even though content was submitted via `koto context add`
 - Agent gets stuck in a loop or doesn't reach the terminal state
-- Agent skips the `koto transition` step and jumps ahead
+- Agent skips the `koto next hello --to eternal` step and jumps ahead
 
 ## Test 3: Stop Hook Behavior
 
@@ -93,7 +93,7 @@ Verify the Stop hook detects an active workflow and outputs a resume reminder.
 ### Steps
 
 1. Start a workflow but stop the session before it completes:
-   - Run `koto init --template .koto/templates/hello-koto.md --name hook-test --var SPIRIT_NAME=TestSpirit`
+   - Run `koto init hook-test --template .koto/templates/hello-koto.md --var SPIRIT_NAME=TestSpirit`
    - Confirm the session exists: `koto session list` should show `hook-test`
    - Do NOT submit content via `koto context add` (leave the workflow mid-progress)
 2. Stop the Claude Code session (Ctrl+C or `/stop`).
@@ -134,7 +134,7 @@ Verify the Stop hook fails silently when koto isn't available or no workflow is 
    ```
 2. Run the hook command directly:
    ```bash
-   koto workflows 2>/dev/null | grep -q '"path"' && echo 'Active koto workflow detected. Run koto next to continue.'
+   koto workflows 2>/dev/null | grep -q '"name"' && echo 'Active koto workflow detected. Run koto next to continue.'
    ```
 3. Restore PATH:
    ```bash
@@ -149,7 +149,7 @@ Verify the Stop hook fails silently when koto isn't available or no workflow is 
    ```
 2. Run the hook command directly:
    ```bash
-   koto workflows 2>/dev/null | grep -q '"path"' && echo 'Active koto workflow detected. Run koto next to continue.'
+   koto workflows 2>/dev/null | grep -q '"name"' && echo 'Active koto workflow detected. Run koto next to continue.'
    ```
 
 ### Pass Criteria

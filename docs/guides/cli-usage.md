@@ -548,11 +548,11 @@ Exits 0 and prints the value if set. Exits 1 if the key is unset.
 
 #### config set
 
-Writes a value to user config (default) or project config.
+Writes a value to project config (default) or user config.
 
 ```bash
 koto config set <key> <value>
-koto config set --project <key> <value>
+koto config set --user <key> <value>
 ```
 
 **Positional arguments:**
@@ -560,18 +560,22 @@ koto config set --project <key> <value>
 - `<value>` -- Value to set.
 
 **Optional flags:**
-- `--project` -- Write to `.koto/config.toml` instead of `~/.koto/config.toml`. Fails if the key isn't on the project config allowlist.
+- `--user` -- Write to `~/.koto/config.toml` instead of `.koto/config.toml`. Without this flag, the value is written to project config, which fails if the key isn't on the project config allowlist.
 
 #### config unset
 
-Removes a key from user config.
+Removes a key from project config (default) or user config.
 
 ```bash
 koto config unset <key>
+koto config unset --user <key>
 ```
 
 **Positional argument:**
 - `<key>` -- Dotted config key to remove.
+
+**Optional flags:**
+- `--user` -- Remove from `~/.koto/config.toml` instead of `.koto/config.toml`.
 
 #### config list
 
@@ -679,7 +683,7 @@ After resolving, normal operations resume.
 Opens a live TUI showing all sessions for the current repository. Unlike other koto commands, `dashboard` outputs to the terminal rather than JSON, so it's not suitable for agent use.
 
 ```bash
-koto dashboard [<name>] [--once] [--interval <ms>]
+koto dashboard [<name>] [--once] [--interval <ms>] [--status <liveness>] [--needs-you] [--all]
 ```
 
 **Positional argument:**
@@ -688,6 +692,9 @@ koto dashboard [<name>] [--once] [--interval <ms>]
 **Optional flags:**
 - `--once` -- Print a snapshot and exit. Outputs tab-separated lines, one per session, then exits 0. Exits 0 even when the session directory is empty.
 - `--interval <ms>` -- Override the default 500ms poll interval. Only affects the live TUI mode.
+- `--status <liveness>` -- (`--once` only) Filter to a single liveness state. One of: `needs-you-blocked`, `needs-you-failed`, `needs-you-stalled`, `active`, `idle`, `pending`, `done`.
+- `--needs-you` -- (`--once` only) Show only sessions in the needs-you band (blocked, failed, or stalled).
+- `--all` -- (`--once` only) Include the receded set (done and abandoned sessions), which is excluded by default.
 
 **TUI navigation:**
 
@@ -703,13 +710,13 @@ The TUI shows all sessions as a tree with each session's current state, elapsed 
 
 **`--once` output format:**
 
-Each line is tab-separated with four fields:
+Each line is tab-separated with eight fields:
 
 ```
-<name>\t<current_state>\t<elapsed>\t<status_bucket>
+<id>\t<current_state>\t<elapsed>\t<status_bucket>\t<intent>\t<template>\t<idle>\t<liveness>
 ```
 
-The `status_bucket` column uses one of five values: `running`, `done`, `failed`, `blocked`, or `unknown`.
+The `status_bucket` column (field 4) uses one of five values: `running`, `done`, `failed`, `blocked`, or `unknown`. The `liveness` column (field 8) carries the machine-readable liveness token (e.g. `needs-you-blocked`, `active`, `idle`) used by `--status`. Fields 5-7 (`intent`, `template`, `idle`) are sanitized of tabs and newlines.
 
 **Examples:**
 

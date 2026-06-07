@@ -19,7 +19,7 @@ goals: |
 
 ## Status
 
-In Progress
+Complete
 
 ## Problem Statement
 

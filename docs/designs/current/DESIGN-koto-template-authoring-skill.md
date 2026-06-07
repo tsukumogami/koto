@@ -372,7 +372,7 @@ Intermediate artifacts during authoring:
 
 Note: the integration_check directive should also verify that the output directory
 is within the expected target path (no path traversal) and that the template doesn't
-contain command gates with unsanitized variable interpolation.
+contain command gates that splice untrusted data into the shell command.
 | done | none | none | (terminal) |
 
 ## Implementation Approach
@@ -381,7 +381,7 @@ contain command gates with unsanitized variable interpolation.
 
 Write the condensed format guide and graded example templates. These are
 self-contained and don't depend on the skill or template. The format guide
-should include a security note warning against variable interpolation in
+should include a security note warning against splicing untrusted data into
 command gate strings.
 
 The existing hello-koto template can serve as the simple example (or its
@@ -473,13 +473,18 @@ All four security dimensions were assessed:
   material are all bundled in the plugin.
 - **Data exposure**: no user data is transmitted. All artifacts stay local.
 
-One concern surfaced during review: koto's command gate implementation performs
-`{{VARIABLE}}` substitution in command strings before passing them to `sh -c`.
-Templates with command gates that interpolate user-supplied values could enable
-shell injection. This is a pre-existing koto concern (not introduced by this
-design), but the authoring skill amplifies it by teaching agents to write command
-gates. The condensed format guide should explicitly warn about this and recommend
-`context-exists` gates over command gates when checking for user-supplied paths.
+One concern surfaced during review around command gates. Note that koto's command
+gate implementation does NOT interpolate `{{VARIABLE}}` into command strings: the
+gate's `command` is passed verbatim to `sh -c` (see `evaluate_command_gate` in
+`src/gate.rs`), so there is no koto-side variable-substitution injection vector.
+The real concern is that any command gate runs an arbitrary shell command, and a
+template author who hand-writes a command that embeds untrusted data (for example,
+a path or value the author splices in when writing the template) can introduce
+shell injection the same way any shell script can. This is a pre-existing property
+of running shell commands, not introduced by this design, but the authoring skill
+amplifies it by teaching agents to write command gates. The condensed format guide
+should explicitly warn about this and recommend `context-exists` gates over command
+gates when checking for user-supplied paths.
 
 Produced templates should be reviewed by a human before deployment. The compiler
 validates structure but not intent -- a structurally valid template with a
