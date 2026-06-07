@@ -2479,12 +2479,66 @@ pub fn build_children_complete_output(
         {
             entry.result = Some(r.clone());
         }
+        // A `Skipped` child with no evidence never produces an
+        // auto-promoted result via the dual-source dereference above (it
+        // had no terminal evidence to promote, and may have been spawned
+        // directly into its skip marker). Synthesize the skipped-status
+        // default-summary result inline so the converge always surfaces a
+        // typed result for a skipped child — and so the predicate below
+        // never treats a legitimately-skipped child as outstanding
+        // (DESIGN-request-store-converge.md Decision 4, AC1).
+        if entry.result.is_none() && matches!(entry.outcome, TaskOutcome::Skipped) {
+            entry.result = Some(WorkflowResult {
+                status: TerminalOutcome::Skipped,
+                summary: if entry.state.is_empty() {
+                    "skipped".to_string()
+                } else {
+                    format!("skipped at {}", entry.state)
+                },
+                payload: None,
+            });
+        }
     }
+
+    // Converge pass-predicate (DESIGN-request-store-converge.md Decision 4,
+    // AC1/AC2/AC3). The `children-complete` gate is the converge point: it
+    // must not pass while any non-skipped child in the dispatched set has
+    // NO result available.
+    //
+    // CRITICAL: the blocking decision keys on the DEREFERENCED
+    // `entry.result.is_none()` — the authoritative "is a result available
+    // from EITHER the live child log OR the parent `ChildCompleted.result`
+    // copy" — NOT on the raw terminal-index `has_result` flag. AC1's
+    // literal wording says "has_result == false"; we deviate deliberately.
+    // `has_result` is gated on the child-log append succeeding, but a
+    // result can still be readable from the parent copy when that append
+    // failed (`has_result == false`). Keying on the flag alone would block
+    // a converge FOREVER for a child whose child-log append failed yet
+    // whose parent copy is present. The merge above is exactly that
+    // dual-source dereference, so `entry.result` is the correct authority.
+    // (`has_result` remains useful only as a cheap scan hint upstream.)
+    //
+    // A `Skipped` child never blocks: it carries a synthesized
+    // skipped-status default-summary result (above) and is excluded here.
+    let outstanding: Vec<String> = entries
+        .iter()
+        .filter(|e| !matches!(e.outcome, TaskOutcome::Skipped) && e.result.is_none())
+        .map(|e| e.name.clone())
+        .collect();
+    let results_in = outstanding.is_empty();
+
+    // The gate passes only when terminal completion AND every non-skipped
+    // child's result is in. `all_complete` already encodes terminal
+    // completion (no pending/blocked/spawn_failed); the converge gate adds
+    // the results-in conjunct so the parent is not advanced until results
+    // land (AC2: parent NOT advanced while non-passing; AC3: cleared
+    // directive carries every result inline).
+    let converge_passes = all_complete && results_in;
 
     let children_json: Vec<serde_json::Value> = entries.iter().map(child_entry_to_json).collect();
 
     (
-        all_complete,
+        converge_passes,
         serde_json::json!({
             "total": total,
             "completed": completed,
@@ -2494,12 +2548,25 @@ pub fn build_children_complete_output(
             "skipped": skipped,
             "blocked": blocked,
             "spawn_failed": spawn_failed_count,
+            // `all_complete` retains its terminal-completion meaning so
+            // existing consumers (e.g. should_append_batch_finalized) and
+            // tests are unaffected; the converge conjunct is surfaced
+            // separately via `results_in` / `converge_blocked`.
             "all_complete": all_complete,
             "all_success": all_success,
             "any_failed": any_failed,
             "any_skipped": any_skipped,
             "any_spawn_failed": any_spawn_failed,
             "needs_attention": needs_attention,
+            // Converge surface (DESIGN Decision 4): `results_in` is true
+            // once every non-skipped child's result is dereferenceable;
+            // `converge_blocked` is the gate-non-passing signal;
+            // `outstanding` names the blocking children by their fan-out
+            // identity (composed `<parent>.<task>`) for the GateBlocked
+            // blocking_condition (AC2).
+            "results_in": results_in,
+            "converge_blocked": all_complete && !results_in,
+            "outstanding": outstanding,
             "children": children_json,
             "error": error_message,
         }),
@@ -4906,6 +4973,533 @@ mod tests {
             entry["result"]["summary"], "parent fallback used",
             "with a corrupt child log, the converge falls back to the \
              parent's ChildCompleted.result copy"
+        );
+    }
+
+    // --------- Issue 4: converge pass-predicate, outstanding set,
+    //           recursion + concurrency ------------------------------
+
+    /// Helper: initialise a converge parent on disk with a submitted task
+    /// list `tasks` (composed `parent.<name>`), no on-disk children. The
+    /// parent's `materialize_children` evidence enumerates the dispatched
+    /// set, so `build_children_complete_output` reports exactly that set.
+    #[cfg(test)]
+    fn setup_converge_parent(
+        backend: &crate::session::local::LocalBackend,
+        parent: &str,
+        task_names: &[&str],
+    ) {
+        backend
+            .init_state_file(parent, child_header_for("", parent), vec![])
+            .unwrap();
+        let tasks_json: Vec<serde_json::Value> = task_names
+            .iter()
+            .map(|n| serde_json::json!({"name": n, "waits_on": []}))
+            .collect();
+        backend
+            .append_event(
+                parent,
+                &EventPayload::EvidenceSubmitted {
+                    state: "converge".to_string(),
+                    fields: HashMap::from([(
+                        "tasks".to_string(),
+                        serde_json::Value::Array(tasks_json),
+                    )]),
+                    submitter_cwd: None,
+                },
+                "2026-01-01T00:00:01Z",
+            )
+            .unwrap();
+    }
+
+    /// Helper: append a `ChildCompleted` event to `parent` for a
+    /// cleaned-up child, optionally carrying an auto-promoted result. When
+    /// `with_result` is true the child's result rides the parent copy
+    /// (`ChildCompleted.result`); when false the child is terminal but has
+    /// NO result available from either source (simulating a result whose
+    /// promotion has not yet landed).
+    #[cfg(test)]
+    fn append_child_completed(
+        backend: &crate::session::local::LocalBackend,
+        parent: &str,
+        task_name: &str,
+        outcome: TerminalOutcome,
+        final_state: &str,
+        with_result: bool,
+        ts: &str,
+    ) {
+        let result = if with_result {
+            Some(WorkflowResult {
+                status: outcome,
+                summary: format!("{} result", task_name),
+                payload: None,
+            })
+        } else {
+            None
+        };
+        backend
+            .append_event(
+                parent,
+                &EventPayload::ChildCompleted {
+                    child_name: format!("{}.{}", parent, task_name),
+                    task_name: task_name.to_string(),
+                    outcome,
+                    final_state: final_state.to_string(),
+                    result,
+                },
+                ts,
+            )
+            .unwrap();
+    }
+
+    /// AC1/AC2: the converge gate is NON-PASSING while a non-skipped child
+    /// in the dispatched set has no dereferenceable result, and the
+    /// outstanding set names exactly that child by its fan-out identity.
+    /// The other child's result IS in, proving the predicate keys on the
+    /// per-child dereferenced `entry.result`, not on terminal completion.
+    #[test]
+    fn converge_blocked_while_non_skipped_child_lacks_result() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        setup_converge_parent(&backend, "parent", &["alpha", "beta"]);
+        // alpha terminal WITH result; beta terminal but NO result.
+        append_child_completed(
+            &backend,
+            "parent",
+            "alpha",
+            TerminalOutcome::Success,
+            "done",
+            true,
+            "2026-01-01T00:00:02Z",
+        );
+        append_child_completed(
+            &backend,
+            "parent",
+            "beta",
+            TerminalOutcome::Success,
+            "done",
+            false,
+            "2026-01-01T00:00:03Z",
+        );
+
+        let (_, parent_events) = backend.read_events("parent").unwrap();
+        let template = converge_template("parent");
+        let (converge_passes, output) = build_children_complete_output(
+            &backend,
+            "parent",
+            &parent_events,
+            &template,
+            "converge",
+            None,
+        );
+
+        assert!(
+            !converge_passes,
+            "gate must be non-passing while beta has no result"
+        );
+        // Terminal completion IS satisfied (both children terminal) — only
+        // the results-in conjunct is missing, proving the predicate keys on
+        // dereferenced entry.result, not terminal completion alone.
+        assert_eq!(output["all_complete"], true);
+        assert_eq!(output["results_in"], false);
+        assert_eq!(output["converge_blocked"], true);
+        let outstanding = output["outstanding"].as_array().unwrap();
+        assert_eq!(
+            outstanding.len(),
+            1,
+            "exactly one child outstanding: {:?}",
+            outstanding
+        );
+        assert_eq!(
+            outstanding[0], "parent.beta",
+            "outstanding names the child by composed fan-out identity"
+        );
+    }
+
+    /// AC3: when the last result lands, the gate passes and every child's
+    /// result is inlined into the cleared directive output.
+    #[test]
+    fn converge_passes_and_inlines_all_results_when_last_lands() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        setup_converge_parent(&backend, "parent", &["alpha", "beta"]);
+        append_child_completed(
+            &backend,
+            "parent",
+            "alpha",
+            TerminalOutcome::Success,
+            "done",
+            true,
+            "2026-01-01T00:00:02Z",
+        );
+        append_child_completed(
+            &backend,
+            "parent",
+            "beta",
+            TerminalOutcome::Success,
+            "done",
+            true,
+            "2026-01-01T00:00:03Z",
+        );
+
+        let (_, parent_events) = backend.read_events("parent").unwrap();
+        let template = converge_template("parent");
+        let (converge_passes, output) = build_children_complete_output(
+            &backend,
+            "parent",
+            &parent_events,
+            &template,
+            "converge",
+            None,
+        );
+
+        assert!(converge_passes, "gate passes once every result is in");
+        assert_eq!(output["results_in"], true);
+        assert_eq!(output["converge_blocked"], false);
+        assert_eq!(output["outstanding"].as_array().unwrap().len(), 0);
+        // Every child's result is inlined in the cleared output.
+        let children = output["children"].as_array().unwrap();
+        for name in ["parent.alpha", "parent.beta"] {
+            let entry = children.iter().find(|c| c["name"] == name).unwrap();
+            assert!(
+                entry["result"].is_object(),
+                "{} result must be inlined in the cleared directive",
+                name
+            );
+        }
+    }
+
+    /// AC1: a `Skipped` child with no evidence carries a skipped-status
+    /// default-summary result inline and does NOT keep the set outstanding.
+    /// With the only other child resultful, the gate passes.
+    #[test]
+    fn skipped_child_carries_default_result_and_does_not_block() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        setup_converge_parent(&backend, "parent", &["alpha", "skipme"]);
+        append_child_completed(
+            &backend,
+            "parent",
+            "alpha",
+            TerminalOutcome::Success,
+            "done",
+            true,
+            "2026-01-01T00:00:02Z",
+        );
+        // skipme is terminal-skipped with NO result available from either
+        // source — it must NOT block the converge.
+        append_child_completed(
+            &backend,
+            "parent",
+            "skipme",
+            TerminalOutcome::Skipped,
+            "skipped",
+            false,
+            "2026-01-01T00:00:03Z",
+        );
+
+        let (_, parent_events) = backend.read_events("parent").unwrap();
+        let template = converge_template("parent");
+        let (converge_passes, output) = build_children_complete_output(
+            &backend,
+            "parent",
+            &parent_events,
+            &template,
+            "converge",
+            None,
+        );
+
+        assert!(
+            converge_passes,
+            "a resultless skipped child must not keep the gate blocked"
+        );
+        assert_eq!(output["outstanding"].as_array().unwrap().len(), 0);
+        let children = output["children"].as_array().unwrap();
+        let skip_entry = children
+            .iter()
+            .find(|c| c["name"] == "parent.skipme")
+            .unwrap();
+        assert_eq!(
+            skip_entry["result"]["status"], "skipped",
+            "skipped child carries a synthesized skipped-status default result"
+        );
+        assert!(
+            skip_entry["result"]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("skipped"),
+            "skipped default summary present"
+        );
+    }
+
+    /// AC4: the blocked/outstanding set equals exactly the children the
+    /// parent dispatched (`parent_workflow == parent`). A child of a
+    /// DIFFERENT parent that is resultless must not appear in this parent's
+    /// outstanding set.
+    #[test]
+    fn outstanding_set_equals_dispatched_children_only() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        setup_converge_parent(&backend, "parent", &["alpha"]);
+        // alpha is dispatched by `parent` and is resultless → outstanding.
+        append_child_completed(
+            &backend,
+            "parent",
+            "alpha",
+            TerminalOutcome::Success,
+            "done",
+            false,
+            "2026-01-01T00:00:02Z",
+        );
+
+        // A separate parent `other` with its own resultless child. This
+        // child must never leak into `parent`'s converge set.
+        setup_converge_parent(&backend, "other", &["gamma"]);
+        append_child_completed(
+            &backend,
+            "other",
+            "gamma",
+            TerminalOutcome::Success,
+            "done",
+            false,
+            "2026-01-01T00:00:02Z",
+        );
+
+        let (_, parent_events) = backend.read_events("parent").unwrap();
+        let template = converge_template("parent");
+        let (_passes, output) = build_children_complete_output(
+            &backend,
+            "parent",
+            &parent_events,
+            &template,
+            "converge",
+            None,
+        );
+
+        let outstanding: Vec<&str> = output["outstanding"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            outstanding,
+            vec!["parent.alpha"],
+            "outstanding set is exactly the children parent dispatched"
+        );
+    }
+
+    /// AC5: three-level recursion. A mid-level coordinator converges its
+    /// own children through the SAME gate, then auto-promotes its own
+    /// result up to the top-level parent identically — there is no
+    /// depth-specific code path. We exercise the gate at the mid level
+    /// (mid converges its leaves) and at the top level (top converges
+    /// mid), asserting identical pass/inline behavior at both depths.
+    #[test]
+    fn three_level_recursion_converges_identically_at_each_depth() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        // Mid-level coordinator `top.mid` converging two leaves.
+        setup_converge_parent(&backend, "top.mid", &["leaf1", "leaf2"]);
+        append_child_completed(
+            &backend,
+            "top.mid",
+            "leaf1",
+            TerminalOutcome::Success,
+            "done",
+            true,
+            "2026-01-01T00:00:02Z",
+        );
+        append_child_completed(
+            &backend,
+            "top.mid",
+            "leaf2",
+            TerminalOutcome::Success,
+            "done",
+            true,
+            "2026-01-01T00:00:03Z",
+        );
+
+        // The mid-level gate converges its leaves through the same gate.
+        let (_, mid_events) = backend.read_events("top.mid").unwrap();
+        let mid_template = converge_template("top.mid");
+        let (mid_passes, mid_out) = build_children_complete_output(
+            &backend,
+            "top.mid",
+            &mid_events,
+            &mid_template,
+            "converge",
+            None,
+        );
+        assert!(mid_passes, "mid-level coordinator converges its leaves");
+        assert_eq!(mid_out["results_in"], true);
+
+        // Top-level parent `top` converging `mid`. The mid coordinator
+        // auto-promotes its own result up identically (carried on top's
+        // ChildCompleted.result), so the top gate clears the same way.
+        setup_converge_parent(&backend, "top", &["mid"]);
+        append_child_completed(
+            &backend,
+            "top",
+            "mid",
+            TerminalOutcome::Success,
+            "done",
+            true,
+            "2026-01-01T00:00:04Z",
+        );
+        let (_, top_events) = backend.read_events("top").unwrap();
+        let top_template = converge_template("top");
+        let (top_passes, top_out) = build_children_complete_output(
+            &backend,
+            "top",
+            &top_events,
+            &top_template,
+            "converge",
+            None,
+        );
+        assert!(
+            top_passes,
+            "top-level parent converges the mid coordinator identically"
+        );
+        let top_children = top_out["children"].as_array().unwrap();
+        let mid_entry = top_children
+            .iter()
+            .find(|c| c["name"] == "top.mid")
+            .unwrap();
+        assert!(
+            mid_entry["result"].is_object(),
+            "mid coordinator's own result is inlined at the top depth"
+        );
+    }
+
+    /// AC6: N concurrent completions. Each child's result is a single
+    /// atomic `ChildCompleted` event append; the converge point observes
+    /// every result fully-formed (never a partial/interleaved result), and
+    /// the gate clears exactly when the last of the N lands. We drive N=8
+    /// children, asserting that with N-1 results in the gate is still
+    /// blocked with exactly one outstanding, and once the Nth lands the
+    /// gate passes with every result inlined intact.
+    #[test]
+    fn n_concurrent_completions_each_result_observed_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        let names: Vec<String> = (0..8).map(|i| format!("c{}", i)).collect();
+        let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        setup_converge_parent(&backend, "parent", &name_refs);
+
+        // First N-1 land with results; the last is terminal but resultless.
+        for (i, n) in names.iter().enumerate() {
+            let with_result = i < names.len() - 1;
+            append_child_completed(
+                &backend,
+                "parent",
+                n,
+                TerminalOutcome::Success,
+                "done",
+                with_result,
+                &format!("2026-01-01T00:00:{:02}Z", 10 + i),
+            );
+        }
+
+        let (_, parent_events) = backend.read_events("parent").unwrap();
+        let template = converge_template("parent");
+        let (passes_before, out_before) = build_children_complete_output(
+            &backend,
+            "parent",
+            &parent_events,
+            &template,
+            "converge",
+            None,
+        );
+        assert!(!passes_before, "blocked until the last result lands");
+        let outstanding = out_before["outstanding"].as_array().unwrap();
+        assert_eq!(
+            outstanding.len(),
+            1,
+            "exactly one child outstanding with N-1 results in"
+        );
+        assert_eq!(outstanding[0], "parent.c7");
+
+        // The Nth result lands as one more atomic append (latest
+        // ChildCompleted per child wins).
+        append_child_completed(
+            &backend,
+            "parent",
+            "c7",
+            TerminalOutcome::Success,
+            "done",
+            true,
+            "2026-01-01T00:00:30Z",
+        );
+        let (_, parent_events) = backend.read_events("parent").unwrap();
+        let (passes_after, out_after) = build_children_complete_output(
+            &backend,
+            "parent",
+            &parent_events,
+            &template,
+            "converge",
+            None,
+        );
+        assert!(passes_after, "gate clears when the last result lands");
+        let children = out_after["children"].as_array().unwrap();
+        assert_eq!(children.len(), 8, "every child present");
+        for c in children {
+            // No partial/interleaved result: each inlined result is a
+            // complete typed envelope with a non-empty summary.
+            let summary = c["result"]["summary"].as_str().unwrap();
+            assert!(!summary.is_empty(), "each result observed fully-formed");
+            assert_eq!(c["result"]["status"], "success");
+        }
+    }
+
+    /// AC7: result promotion handles a terminal state whose `accepts`
+    /// block has no summary field by falling back to a final-state-derived
+    /// default summary. This is `synthesize_workflow_result`'s job (covered
+    /// in mod.rs tests); here we verify the converge gate surfaces the
+    /// final-state-derived default for a skipped child with no evidence,
+    /// confirming the gate never produces a summary-less result.
+    #[test]
+    fn converge_surfaces_default_summary_when_no_accepts_summary_field() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        setup_converge_parent(&backend, "parent", &["skipme"]);
+        append_child_completed(
+            &backend,
+            "parent",
+            "skipme",
+            TerminalOutcome::Skipped,
+            "skip_state",
+            false,
+            "2026-01-01T00:00:02Z",
+        );
+
+        let (_, parent_events) = backend.read_events("parent").unwrap();
+        let template = converge_template("parent");
+        let (_passes, output) = build_children_complete_output(
+            &backend,
+            "parent",
+            &parent_events,
+            &template,
+            "converge",
+            None,
+        );
+
+        let children = output["children"].as_array().unwrap();
+        let entry = children
+            .iter()
+            .find(|c| c["name"] == "parent.skipme")
+            .unwrap();
+        let summary = entry["result"]["summary"].as_str().unwrap();
+        assert!(
+            !summary.is_empty(),
+            "a result must always carry a non-empty default summary"
         );
     }
 

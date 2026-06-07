@@ -3774,14 +3774,26 @@ fn handle_next(
                 let (_, post_events) = backend
                     .read_events(&name)
                     .unwrap_or((header.clone(), Vec::new()));
-                let (all_complete, gate_output) = crate::cli::batch::build_children_complete_output(
-                    backend,
-                    &name,
-                    &post_events,
-                    &compiled,
-                    final_state,
-                    None,
-                );
+                let (_converge_passes, gate_output) =
+                    crate::cli::batch::build_children_complete_output(
+                        backend,
+                        &name,
+                        &post_events,
+                        &compiled,
+                        final_state,
+                        None,
+                    );
+                // Finalization tracks terminal completion, not the
+                // converge pass-predicate: a batch is "finalized" once
+                // every child reached a terminal outcome, independent of
+                // whether the converge gate has cleared its results-in
+                // conjunct. Read the `all_complete` field from the gate
+                // output rather than the returned converge bool
+                // (DESIGN-request-store-converge.md Decision 4).
+                let all_complete = gate_output
+                    .get("all_complete")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if crate::cli::batch::should_append_batch_finalized(&post_events, all_complete) {
                     if let Some(view) =
                         crate::cli::batch::BatchFinalView::from_gate_output(&gate_output)
@@ -4470,7 +4482,12 @@ fn evaluate_children_complete(
 ) -> crate::gate::StructuredGateResult {
     use crate::gate::{GateOutcome, StructuredGateResult};
 
-    let (all_complete, output) = crate::cli::batch::build_children_complete_output(
+    // The returned bool is the converge pass-predicate: terminal
+    // completion AND every non-skipped child's result is dereferenceable.
+    // The gate is non-passing (GateBlocked) while any child is still
+    // running OR any non-skipped child's result has not landed
+    // (DESIGN-request-store-converge.md Decision 4).
+    let (converge_passes, output) = crate::cli::batch::build_children_complete_output(
         backend,
         workflow_name,
         parent_events,
@@ -4488,7 +4505,7 @@ fn evaluate_children_complete(
     let total = output.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
     let outcome = if total == 0 && error_str.starts_with("failed to list sessions") {
         GateOutcome::Error
-    } else if all_complete {
+    } else if converge_passes {
         GateOutcome::Passed
     } else {
         GateOutcome::Failed
