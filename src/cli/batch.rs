@@ -2210,6 +2210,15 @@ pub fn build_children_complete_output(
     // session id. Non-composed children (legacy `koto init --parent`
     // without a batch hook) key both fields to the raw id.
     let mut task_to_session_id: HashMap<String, String> = HashMap::new();
+    // Live-child converge read: each on-disk child's auto-promoted
+    // result, read from its OWN `request_store.result` event, keyed by
+    // raw session id (DESIGN-request-store-converge.md Decision 3, AC2).
+    // This is the preferred dereference source while the child session
+    // still exists; the parent's `ChildCompleted.result` copy is the
+    // fallback once the child has been auto-cleaned. The targeted event
+    // is read directly — no working/session transcript is ever replayed
+    // (AC3).
+    let mut result_by_session: HashMap<String, WorkflowResult> = HashMap::new();
     match backend.list() {
         Ok(sessions) => {
             let child_prefix = format!("{}.", parent_name);
@@ -2253,6 +2262,20 @@ pub fn build_children_complete_output(
                     EventPayload::WorkflowInitialized { spawn_entry, .. } => spawn_entry.clone(),
                     _ => None,
                 });
+                // Dereference the live child's auto-promoted result from
+                // its OWN log: the latest `request_store.result` event
+                // (AC2). A malformed event would have fallen through the
+                // `Unknown` arm during deserialization and is simply not
+                // matched here, so it is skipped under the existing
+                // skip-and-continue discipline rather than aborting the
+                // converge (AC4 / AC5). No transcript is replayed — only
+                // the targeted event is read (AC3).
+                if let Some(r) = child_events.iter().rev().find_map(|e| match &e.payload {
+                    EventPayload::RequestStoreResult { result } => Some(result.clone()),
+                    _ => None,
+                }) {
+                    result_by_session.insert(info.id.clone(), r);
+                }
                 on_disk_order.push(task_name.clone());
                 on_disk.insert(
                     task_name,
@@ -2425,16 +2448,30 @@ pub fn build_children_complete_output(
     let any_spawn_failed = spawn_failed_count > 0;
     let needs_attention = any_failed || any_skipped || any_spawn_failed;
 
-    // Inline each child's auto-promoted result, read from the parent's
-    // own `ChildCompleted.result` — the converge read never opens or
-    // replays a child log (DESIGN-request-store-converge.md Decision 3 /
-    // 4). Both keys are the child's full session id: `result_by_child`
-    // is keyed by `ChildCompleted.child_name`, and `entry.name` is set
-    // to that same composed `<parent>.<task>` identity (the raw session
-    // id for legacy non-composed children) by both entry builders. So a
-    // direct `entry.name` lookup is the only key that can match.
+    // Inline each child's auto-promoted result with a dual-source
+    // dereference (DESIGN-request-store-converge.md Decision 3 / 4, AC2).
+    // The converge read never opens or replays a child working log — it
+    // reads only the targeted `request_store.result` event (live child)
+    // or the `ChildCompleted.result` copy (cleaned-up child):
+    //
+    //   * PREFER the live child's own `request_store.result` event
+    //     (`result_by_session`), populated above while the on-disk child
+    //     session still exists. This is the durable record on the child's
+    //     own log.
+    //   * FALL BACK to the parent's `ChildCompleted.result`
+    //     (`result_by_child`) when the child has been auto-cleaned and is
+    //     no longer on disk — the existing Issue 1 path.
+    //
+    // Both maps are keyed by the child's full session id: `entry.name` is
+    // the composed `<parent>.<task>` identity (the raw session id for
+    // legacy non-composed children) set by both entry builders;
+    // `result_by_session` is keyed by the on-disk `info.id` (the same
+    // composed id) and `result_by_child` by `ChildCompleted.child_name`.
     for entry in &mut entries {
-        if let Some(r) = result_by_child.get(&entry.name) {
+        if let Some(r) = result_by_session
+            .get(&entry.name)
+            .or_else(|| result_by_child.get(&entry.name))
+        {
             entry.result = Some(r.clone());
         }
     }
@@ -4437,6 +4474,301 @@ mod tests {
         );
         assert_eq!(entry["result"]["status"], "success");
         assert_eq!(entry["result"]["payload"]["score"], 42);
+    }
+
+    /// Helper: a child header with `parent` as its parent_workflow.
+    #[cfg(test)]
+    fn child_header_for(parent: &str, child: &str) -> StateFileHeader {
+        StateFileHeader {
+            schema_version: 1,
+            workflow: child.to_string(),
+            template_hash: "h".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: Some(parent.to_string()),
+            template_source_dir: None,
+            session_id: String::new(),
+            intent: None,
+            template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
+        }
+    }
+
+    /// Helper: compiled parent template whose `converge` state declares a
+    /// `materialize_children` hook so entries are named by composed
+    /// `<parent>.<task>` identity.
+    #[cfg(test)]
+    fn converge_template(parent: &str) -> CompiledTemplate {
+        let converge = TemplateState {
+            materialize_children: Some(MaterializeChildrenSpec {
+                from_field: "tasks".to_string(),
+                default_template: "child.md".to_string(),
+                failure_policy: FailurePolicy::SkipDependents,
+            }),
+            ..TemplateState::default()
+        };
+        let mut states = BTreeMap::new();
+        states.insert("converge".to_string(), converge);
+        CompiledTemplate {
+            format_version: 1,
+            name: parent.to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            initial_state: "converge".to_string(),
+            variables: BTreeMap::new(),
+            states,
+        }
+    }
+
+    /// Helper: parent session with a `converge` state whose evidence
+    /// lists `tasks`, plus a terminal child of the parent still live on
+    /// disk carrying its own `request_store.result` event.
+    #[cfg(test)]
+    fn setup_parent_with_live_terminal_child(
+        backend: &crate::session::local::LocalBackend,
+        child_result_event: EventPayload,
+    ) {
+        backend
+            .init_state_file("parent", child_header_for("", "parent"), vec![])
+            .unwrap();
+        // strip parent_workflow on the parent itself.
+        // (init via child_header_for("",..) set parent_workflow=Some(""))
+        // Overwrite by re-initialising is awkward; instead the list scan
+        // filters on parent_workflow == Some("parent"), and a parent
+        // with parent_workflow Some("") is simply not its own child, so
+        // it is harmless. Append the converge evidence next.
+        backend
+            .append_event(
+                "parent",
+                &EventPayload::EvidenceSubmitted {
+                    state: "converge".to_string(),
+                    fields: HashMap::from([(
+                        "tasks".to_string(),
+                        serde_json::json!([{"name": "alpha", "waits_on": []}]),
+                    )]),
+                    submitter_cwd: None,
+                },
+                "2026-01-01T00:00:01Z",
+            )
+            .unwrap();
+
+        // The child session, still LIVE on disk (not cleaned up). It is
+        // terminal and carries its own request_store.result event.
+        backend
+            .init_state_file(
+                "parent.alpha",
+                child_header_for("parent", "parent.alpha"),
+                vec![],
+            )
+            .unwrap();
+        backend
+            .append_event(
+                "parent.alpha",
+                &EventPayload::WorkflowInitialized {
+                    template_path: "child.md".to_string(),
+                    variables: HashMap::new(),
+                    spawn_entry: None,
+                },
+                "2026-01-01T00:00:02Z",
+            )
+            .unwrap();
+        backend
+            .append_event("parent.alpha", &child_result_event, "2026-01-01T00:00:03Z")
+            .unwrap();
+    }
+
+    /// AC2 (live-child dereference): when the child session STILL EXISTS,
+    /// the converge read dereferences the result from the child's OWN
+    /// `request_store.result` event, NOT from the parent's
+    /// `ChildCompleted.result`. Here the two copies carry different
+    /// summaries; the live child's value must win.
+    #[test]
+    fn gate_prefers_live_child_request_store_result_over_parent_copy() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        setup_parent_with_live_terminal_child(
+            &backend,
+            EventPayload::RequestStoreResult {
+                result: WorkflowResult {
+                    status: TerminalOutcome::Success,
+                    summary: "LIVE child-log result".to_string(),
+                    payload: Some(serde_json::json!({"score": 99})),
+                },
+            },
+        );
+        // Also append a ChildCompleted to the parent carrying a DIFFERENT
+        // summary, so we can prove the live child's event is preferred.
+        backend
+            .append_event(
+                "parent",
+                &EventPayload::ChildCompleted {
+                    child_name: "parent.alpha".to_string(),
+                    task_name: "alpha".to_string(),
+                    outcome: TerminalOutcome::Success,
+                    final_state: "done".to_string(),
+                    result: Some(WorkflowResult {
+                        status: TerminalOutcome::Success,
+                        summary: "STALE parent copy".to_string(),
+                        payload: None,
+                    }),
+                },
+                "2026-01-01T00:00:04Z",
+            )
+            .unwrap();
+
+        assert!(
+            backend.exists("parent.alpha"),
+            "child must be live on disk for this test"
+        );
+
+        let (_, parent_events) = backend.read_events("parent").unwrap();
+        let template = converge_template("parent");
+        let (_all_complete, output) = build_children_complete_output(
+            &backend,
+            "parent",
+            &parent_events,
+            &template,
+            "converge",
+            None,
+        );
+
+        let children = output["children"].as_array().expect("children array");
+        let entry = children
+            .iter()
+            .find(|c| c["name"] == "parent.alpha")
+            .expect("entry for the live child");
+        assert_eq!(
+            entry["result"]["summary"], "LIVE child-log result",
+            "the live child's own request_store.result event must be preferred \
+             over the parent's ChildCompleted.result copy"
+        );
+        assert_eq!(entry["result"]["payload"]["score"], 99);
+    }
+
+    /// AC4 (malformed-event skip): a `request_store.result` line that
+    /// fails to parse falls through the `Unknown` arm during
+    /// deserialization, so the converge read never matches it and simply
+    /// falls back to the parent's `ChildCompleted.result` — the converge
+    /// is not aborted (skip-and-continue discipline).
+    #[test]
+    fn gate_skips_malformed_child_result_and_falls_back_to_parent_copy() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        // Live child whose state-file carries a request_store.result LINE
+        // with a malformed payload (missing required `status`). Write it
+        // raw so deserialization routes it through the Unknown arm.
+        backend
+            .init_state_file("parent", child_header_for("", "parent"), vec![])
+            .unwrap();
+        backend
+            .append_event(
+                "parent",
+                &EventPayload::EvidenceSubmitted {
+                    state: "converge".to_string(),
+                    fields: HashMap::from([(
+                        "tasks".to_string(),
+                        serde_json::json!([{"name": "alpha", "waits_on": []}]),
+                    )]),
+                    submitter_cwd: None,
+                },
+                "2026-01-01T00:00:01Z",
+            )
+            .unwrap();
+        // The parent's fallback copy.
+        backend
+            .append_event(
+                "parent",
+                &EventPayload::ChildCompleted {
+                    child_name: "parent.alpha".to_string(),
+                    task_name: "alpha".to_string(),
+                    outcome: TerminalOutcome::Success,
+                    final_state: "done".to_string(),
+                    result: Some(WorkflowResult {
+                        status: TerminalOutcome::Success,
+                        summary: "parent fallback used".to_string(),
+                        payload: None,
+                    }),
+                },
+                "2026-01-01T00:00:02Z",
+            )
+            .unwrap();
+
+        // Live child with a WorkflowInitialized event, then a malformed
+        // request_store.result line appended directly to the state file.
+        backend
+            .init_state_file(
+                "parent.alpha",
+                child_header_for("parent", "parent.alpha"),
+                vec![],
+            )
+            .unwrap();
+        backend
+            .append_event(
+                "parent.alpha",
+                &EventPayload::WorkflowInitialized {
+                    template_path: "child.md".to_string(),
+                    variables: HashMap::new(),
+                    spawn_entry: None,
+                },
+                "2026-01-01T00:00:03Z",
+            )
+            .unwrap();
+        let child_path = tmp
+            .path()
+            .join("parent.alpha")
+            .join(state_file_name("parent.alpha"));
+        // `status` omitted -> WorkflowResult deserialization fails ->
+        // the event routes through the Unknown arm, so it is never
+        // matched as RequestStoreResult by the converge read.
+        let malformed = r#"{"seq":2,"timestamp":"2026-01-01T00:00:04Z","type":"request_store.result","payload":{"summary":"unparseable"}}"#;
+        let mut existing = std::fs::read_to_string(&child_path).unwrap();
+        existing.push_str(malformed);
+        existing.push('\n');
+        std::fs::write(&child_path, existing).unwrap();
+
+        assert!(backend.exists("parent.alpha"));
+        // Sanity: the malformed line round-trips as an Unknown event, not
+        // a RequestStoreResult.
+        let (_, child_events) = backend.read_events("parent.alpha").unwrap();
+        assert!(
+            child_events
+                .iter()
+                .all(|e| !matches!(e.payload, EventPayload::RequestStoreResult { .. })),
+            "malformed line must not deserialize as RequestStoreResult"
+        );
+
+        let (_, parent_events) = backend.read_events("parent").unwrap();
+        let template = converge_template("parent");
+        let (_all_complete, output) = build_children_complete_output(
+            &backend,
+            "parent",
+            &parent_events,
+            &template,
+            "converge",
+            None,
+        );
+
+        let children = output["children"].as_array().expect("children array");
+        let entry = children
+            .iter()
+            .find(|c| c["name"] == "parent.alpha")
+            .expect("entry must still be produced; converge not aborted");
+        assert_eq!(
+            entry["result"]["summary"], "parent fallback used",
+            "malformed live result is skipped; the parent's copy is used"
+        );
     }
 
     #[test]
