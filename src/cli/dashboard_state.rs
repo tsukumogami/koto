@@ -4,13 +4,15 @@
 //! Provides cursor movement, keyboard dispatch, and depth-first tree
 //! flattening via `visible_rows()`.
 
-use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::cli::dashboard_data::{compute_elapsed_since, DetailData, SessionTree};
+use crate::cli::dashboard_data::liveness::{attention_key, idle_for, is_receded};
+use crate::cli::dashboard_data::{
+    classify_liveness, derive_label, CachedSession, DetailData, Liveness, SessionTree,
+};
 
 /// Which tab is active in the detail pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,9 +62,10 @@ pub struct RowDescriptor {
     pub display_name: String,
     /// Current state derived from the event log, or `None` when unknown.
     pub state: Option<String>,
-    /// Elapsed duration — passed as `Duration::from_secs(0)` here;
-    /// Issue 5 wires up actual timing via mtime.
+    /// Idle duration (time since last activity), used for the time column.
     pub elapsed: Duration,
+    /// Read-time liveness classification for this row.
+    pub liveness: Liveness,
     /// Aggregate child counts for coordinator rows; `None` for leaf sessions.
     pub task_counts: Option<TaskCounts>,
 }
@@ -107,6 +110,11 @@ pub struct DashboardAppState {
 
     /// Which tab is currently selected in the detail pane.
     pub active_tab: DashboardTab,
+
+    /// When `true`, the receded set (done + abandoned + stale-pending) is
+    /// included in `visible_rows`. Toggled with `a`. Default `false`, matching
+    /// the `--once` default and the TUI's attention-first view.
+    pub show_receded: bool,
 }
 
 impl DashboardAppState {
@@ -129,6 +137,7 @@ impl DashboardAppState {
             detail_cache_mtime: None,
             detail_cache_session: None,
             active_tab: DashboardTab::Summary,
+            show_receded: false,
         }
     }
 
@@ -148,6 +157,12 @@ impl DashboardAppState {
             // lands exactly on poll_every_n_ticks (the check boundary).
             (_, KeyCode::Char('r'), _) => {
                 self.tick_count = self.poll_every_n_ticks.saturating_sub(1);
+            }
+
+            // Toggle the receded (done + abandoned) set in/out of the list.
+            (_, KeyCode::Char('a'), _) => {
+                self.show_receded = !self.show_receded;
+                self.clamp_cursor();
             }
 
             // List-view navigation updates focused_id.
@@ -346,39 +361,104 @@ impl DashboardAppState {
 
     /// Build a depth-first ordered list of visible rows.
     ///
-    /// Roots appear at depth 0, sorted by health severity. When a session is
-    /// in `expanded`, its children follow immediately at depth+1 with tree
-    /// connectors (`├─ `/`└─ `), also sorted by health severity.
+    /// Roots appear at depth 0, sorted by attention band (needs-you -> active ->
+    /// idle/fresh-pending -> receded), longest-idle first within a band. The
+    /// receded set (done + abandoned + stale pending) is excluded by default and
+    /// included only when `show_receded` is set. When a root is in `expanded`,
+    /// its children follow immediately at depth+1 with tree connectors, ordered
+    /// by the same attention key.
     pub fn visible_rows(&self) -> Vec<RowDescriptor> {
+        let now = SystemTime::now();
         let mut rows = Vec::new();
 
-        // Sort roots by health severity.
+        // Sort roots by attention key.
         let mut sorted_roots: Vec<&String> = self.tree.roots.iter().collect();
         sorted_roots.sort_by_key(|id| {
             self.tree
                 .sessions
                 .get(*id)
-                .map(session_sort_key)
-                .unwrap_or((3, Reverse(SystemTime::UNIX_EPOCH)))
+                .map(|s| session_sort_key(s, now))
+                .unwrap_or(receded_fallback_key())
         });
 
         for root_id in sorted_roots {
-            self.append_rows_for_session(root_id, &[], &mut rows);
+            // Apply the read-time default filter: skip receded roots unless the
+            // user has revealed them.
+            if !self.show_receded {
+                if let Some(s) = self.tree.sessions.get(root_id.as_str()) {
+                    let liveness = classify_liveness(s, now);
+                    let idle = idle_for(s, now);
+                    if is_receded(liveness, idle) {
+                        continue;
+                    }
+                }
+            }
+            self.append_rows_for_session(root_id, None, &[], &mut rows, now);
         }
 
         rows
     }
 
+    /// Count the receded sessions (done + abandoned idle + stale pending) so the
+    /// render layer can show a collapsed summary. Counts every session in the
+    /// tree, regardless of `show_receded`.
+    pub fn receded_summary(&self) -> RecededSummary {
+        let now = SystemTime::now();
+        let mut done = 0usize;
+        let mut abandoned = 0usize;
+        for s in self.tree.sessions.values() {
+            let liveness = classify_liveness(s, now);
+            let idle = idle_for(s, now);
+            if !is_receded(liveness, idle) {
+                continue;
+            }
+            if liveness == Liveness::Done {
+                done += 1;
+            } else {
+                abandoned += 1;
+            }
+        }
+        RecededSummary { done, abandoned }
+    }
+
+    /// Count the sessions in each non-receded liveness band, for the all-clear
+    /// row when nothing needs the user.
+    pub fn live_summary(&self) -> LiveSummary {
+        let now = SystemTime::now();
+        let mut needs_you = 0usize;
+        let mut active = 0usize;
+        let mut idle = 0usize;
+        for s in self.tree.sessions.values() {
+            let liveness = classify_liveness(s, now);
+            let idle_dur = idle_for(s, now);
+            match attention_key(liveness, idle_dur).0 {
+                0 => needs_you += 1,
+                1 => active += 1,
+                2 => idle += 1,
+                _ => {}
+            }
+        }
+        LiveSummary {
+            needs_you,
+            active,
+            idle,
+        }
+    }
+
     /// Recursively append rows for a session and, if expanded, its children.
     ///
+    /// `parent_label` is the derived label of the parent row (when this is a
+    /// child), used to prefix child labels as `parent ▸ leaf`.
     /// `ancestor_is_last[i]` is `true` when the ancestor at depth `i` was the
     /// last child of its own parent. This drives the `│ `/`  ` prefix and
     /// `├─ `/`└─ ` connector at the current level.
     fn append_rows_for_session(
         &self,
         session_id: &str,
+        parent_label: Option<&str>,
         ancestor_is_last: &[bool],
         rows: &mut Vec<RowDescriptor>,
+        now: SystemTime,
     ) {
         let depth = ancestor_is_last.len();
 
@@ -401,9 +481,19 @@ impl DashboardAppState {
 
         let session = self.tree.sessions.get(session_id);
         let state = session.and_then(|s| s.current_state.clone());
-        let elapsed = session
-            .map(|s| compute_elapsed_since(&s.header.created_at))
-            .unwrap_or(Duration::ZERO);
+        let elapsed = session.map(|s| idle_for(s, now)).unwrap_or(Duration::ZERO);
+        let liveness = session
+            .map(|s| classify_liveness(s, now))
+            .unwrap_or(Liveness::Pending);
+
+        // Leaf label, with parent prefix for child rows (`parent ▸ leaf`).
+        let leaf_label = session
+            .map(|s| derive_label(s, session_id))
+            .unwrap_or_else(|| session_id.to_string());
+        let display_name = match parent_label {
+            Some(parent) => format!("{parent} \u{25b8} {leaf_label}"),
+            None => leaf_label.clone(),
+        };
 
         let task_counts = if self.session_has_children(session_id) {
             Some(self.task_counts_for_root(session_id))
@@ -415,9 +505,10 @@ impl DashboardAppState {
             indent_depth: depth,
             connector,
             session_id: session_id.to_string(),
-            display_name: session_id.to_string(),
+            display_name,
             state,
             elapsed,
+            liveness,
             task_counts,
         });
 
@@ -434,8 +525,8 @@ impl DashboardAppState {
                 self.tree
                     .sessions
                     .get(*id)
-                    .map(session_sort_key)
-                    .unwrap_or((3, Reverse(SystemTime::UNIX_EPOCH)))
+                    .map(|s| session_sort_key(s, now))
+                    .unwrap_or(receded_fallback_key())
             });
 
             let child_count = children.len();
@@ -443,33 +534,63 @@ impl DashboardAppState {
                 let is_last = i == child_count - 1;
                 let mut new_ancestors = ancestor_is_last.to_vec();
                 new_ancestors.push(is_last);
-                self.append_rows_for_session(child_id, &new_ancestors, rows);
+                self.append_rows_for_session(
+                    child_id,
+                    Some(&leaf_label),
+                    &new_ancestors,
+                    rows,
+                    now,
+                );
             }
         }
     }
 }
 
-/// Sort key for health-severity ordering.
+/// Collapsed counts for the receded (hidden-by-default) set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecededSummary {
+    /// Sessions in a terminal, non-failed (`Done`) state.
+    pub done: usize,
+    /// Abandoned idle + stale pending sessions.
+    pub abandoned: usize,
+}
+
+impl RecededSummary {
+    /// Total receded sessions.
+    pub fn total(&self) -> usize {
+        self.done + self.abandoned
+    }
+}
+
+/// Counts of live (non-receded) sessions per attention band, for the all-clear
+/// row shown when no session needs the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveSummary {
+    /// Sessions in the needs-you band.
+    pub needs_you: usize,
+    /// Active sessions.
+    pub active: usize,
+    /// Idle (non-abandoned) + fresh-pending sessions.
+    pub idle: usize,
+}
+
+/// Attention sort key for a session: `(band, Reverse(idle))`.
 ///
-/// Priority buckets: failed=0, blocked=1, running=2, unknown=3, done=4.
-/// Within each bucket, sessions are ordered by most-recent mtime descending.
+/// Bands: needs-you (0) -> active (1) -> idle/fresh-pending (2) -> receded (3).
+/// Within a band, longest-idle sorts first.
 pub(crate) fn session_sort_key(
-    session: &crate::cli::dashboard_data::CachedSession,
-) -> (u8, Reverse<SystemTime>) {
-    let bucket = if session.is_terminal {
-        if is_failed_state(session.current_state.as_deref()) {
-            0 // failed
-        } else {
-            4 // done
-        }
-    } else if session.is_blocked {
-        1 // blocked
-    } else if session.current_state.is_some() {
-        2 // running
-    } else {
-        3 // unknown/pending
-    };
-    (bucket, Reverse(session.mtime))
+    session: &CachedSession,
+    now: SystemTime,
+) -> (u8, std::cmp::Reverse<Duration>) {
+    let liveness = classify_liveness(session, now);
+    let idle = idle_for(session, now);
+    attention_key(liveness, idle)
+}
+
+/// Fallback sort key for a session id missing from the tree: receded band,
+/// zero idle (sorts last within the receded band).
+fn receded_fallback_key() -> (u8, std::cmp::Reverse<Duration>) {
+    (3, std::cmp::Reverse(Duration::ZERO))
 }
 
 /// Return true if `state` contains "failed" or "error" (case-insensitive).
@@ -522,6 +643,9 @@ mod tests {
         current_state: Option<&str>,
         is_terminal: bool,
     ) -> CachedSession {
+        // Default to a fresh last_event_at so non-terminal sessions read as
+        // Active / fresh-Pending (visible by default). Tests that want a stale
+        // / abandoned session override `last_event_at` after construction.
         CachedSession {
             header: make_header(name, parent),
             current_state: current_state.map(|s| s.to_string()),
@@ -530,7 +654,7 @@ mod tests {
             intent: None,
             mtime: SystemTime::UNIX_EPOCH,
             state_path: PathBuf::new(),
-            last_event_at: None,
+            last_event_at: Some(SystemTime::now()),
             salient_var: None,
         }
     }
@@ -982,70 +1106,170 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // health-severity ordering
+    // I3: attention-band ordering + receded partition
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn visible_rows_health_severity_ordering() {
+    /// Build a tree with one session per attention band for ordering tests.
+    /// Returns the state (roots populated, not pre-sorted).
+    fn attention_band_state() -> DashboardAppState {
         let mut state = DashboardAppState::new(500);
 
-        let make_session_blocked = |name: &str,
-                                    parent: Option<&str>,
-                                    state_str: Option<&str>,
-                                    is_terminal: bool,
-                                    is_blocked: bool| {
-            let mut s = make_session(name, parent, state_str, is_terminal);
-            s.is_blocked = is_blocked;
-            s
-        };
+        let make_blocked =
+            |name: &str, state_str: Option<&str>, is_terminal: bool, is_blocked: bool| {
+                let mut s = make_session(name, None, state_str, is_terminal);
+                s.is_blocked = is_blocked;
+                s
+            };
 
-        state.tree.sessions.insert(
-            "s-done".to_string(),
-            make_session_blocked("s-done", None, Some("done"), true, false),
-        );
+        // Band 0 (needs-you): failed (terminal+failed) and blocked.
         state.tree.sessions.insert(
             "s-failed".to_string(),
-            make_session_blocked("s-failed", None, Some("failed"), true, false),
-        );
-        state.tree.sessions.insert(
-            "s-running".to_string(),
-            make_session_blocked("s-running", None, Some("gather"), false, false),
+            make_blocked("s-failed", Some("failed"), true, false),
         );
         state.tree.sessions.insert(
             "s-blocked".to_string(),
-            make_session_blocked("s-blocked", None, Some("waiting"), false, true),
+            make_blocked("s-blocked", Some("waiting"), false, true),
         );
+        // Band 1 (active): fresh, non-terminal, has state.
         state.tree.sessions.insert(
-            "s-unknown".to_string(),
-            make_session_blocked("s-unknown", None, None, false, false),
+            "s-active".to_string(),
+            make_blocked("s-active", Some("gather"), false, false),
+        );
+        // Band 2 (fresh pending): non-terminal, no state, fresh.
+        state.tree.sessions.insert(
+            "s-pending".to_string(),
+            make_blocked("s-pending", None, false, false),
+        );
+        // Band 3 (receded): done (terminal, not failed).
+        state.tree.sessions.insert(
+            "s-done".to_string(),
+            make_blocked("s-done", Some("done"), true, false),
         );
 
-        // Let visible_rows sort — do not pre-sort roots.
         state.tree.roots = state.tree.sessions.keys().cloned().collect();
+        state
+    }
 
+    #[test]
+    fn visible_rows_needs_you_sorts_ahead_of_active_idle() {
+        let state = attention_band_state();
         let rows = state.visible_rows();
-        assert_eq!(rows.len(), 5);
-
         let positions: std::collections::HashMap<&str, usize> = rows
             .iter()
             .enumerate()
             .map(|(i, r)| (r.session_id.as_str(), i))
             .collect();
+
+        // needs-you (failed, blocked) lead, then active, then fresh pending.
+        assert!(positions["s-failed"] < positions["s-active"]);
+        assert!(positions["s-blocked"] < positions["s-active"]);
+        assert!(positions["s-active"] < positions["s-pending"]);
+    }
+
+    #[test]
+    fn visible_rows_receded_excluded_by_default() {
+        let state = attention_band_state();
+        let rows = state.visible_rows();
+        // s-done is receded and must not appear by default.
         assert!(
-            positions["s-failed"] < positions["s-blocked"],
-            "failed must come before blocked"
+            !rows.iter().any(|r| r.session_id == "s-done"),
+            "receded (done) session must be excluded from the default view"
+        );
+        // The four live sessions are shown.
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn visible_rows_reveal_toggle_includes_receded() {
+        let mut state = attention_band_state();
+        state.show_receded = true;
+        let rows = state.visible_rows();
+        assert!(
+            rows.iter().any(|r| r.session_id == "s-done"),
+            "revealing receded set must include the done session"
+        );
+        assert_eq!(rows.len(), 5);
+    }
+
+    #[test]
+    fn a_key_toggles_show_receded() {
+        let mut state = attention_band_state();
+        assert!(!state.show_receded);
+        state.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(state.show_receded);
+        state.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(!state.show_receded);
+    }
+
+    #[test]
+    fn visible_rows_ordering_is_deterministic() {
+        let state = attention_band_state();
+        let first: Vec<String> = state
+            .visible_rows()
+            .iter()
+            .map(|r| r.session_id.clone())
+            .collect();
+        let second: Vec<String> = state
+            .visible_rows()
+            .iter()
+            .map(|r| r.session_id.clone())
+            .collect();
+        assert_eq!(first, second, "ordering must be deterministic");
+    }
+
+    #[test]
+    fn receded_summary_counts_done_and_abandoned() {
+        let mut state = attention_band_state();
+        // Add a stale (non-fresh) Pending: never advanced, idle past the active
+        // window. This recedes into the abandoned bucket.
+        let mut stale_pending = make_session("s-stale-pending", None, None, false);
+        stale_pending.last_event_at = Some(SystemTime::now() - Duration::from_secs(60 * 60));
+        state
+            .tree
+            .sessions
+            .insert("s-stale-pending".to_string(), stale_pending);
+        state.tree.roots.push("s-stale-pending".to_string());
+
+        let summary = state.receded_summary();
+        assert_eq!(summary.done, 1, "one done session");
+        assert_eq!(
+            summary.abandoned, 1,
+            "one stale-pending (abandoned) session"
+        );
+        assert_eq!(summary.total(), 2);
+    }
+
+    #[test]
+    fn live_summary_counts_bands() {
+        let state = attention_band_state();
+        let summary = state.live_summary();
+        assert_eq!(summary.needs_you, 2, "failed + blocked");
+        assert_eq!(summary.active, 1);
+        assert_eq!(summary.idle, 1, "fresh pending counts as band-2 idle");
+    }
+
+    #[test]
+    fn child_row_label_prefixes_parent() {
+        let mut state = DashboardAppState::new(500);
+        let mut parent = make_session("parent", None, Some("coordinate"), false);
+        parent.header.template_name = Some("batch".to_string());
+        let mut child = make_session("child", Some("parent"), Some("implement"), false);
+        child.header.template_name = Some("work-on".to_string());
+        state.tree.sessions.insert("parent".to_string(), parent);
+        state.tree.sessions.insert("child".to_string(), child);
+        state.tree.roots = vec!["parent".to_string()];
+        state.expanded.insert("parent".to_string());
+
+        let rows = state.visible_rows();
+        let child_row = rows.iter().find(|r| r.session_id == "child").unwrap();
+        assert!(
+            child_row.display_name.contains('\u{25b8}'),
+            "child label must include the parent-prefix separator; got {:?}",
+            child_row.display_name
         );
         assert!(
-            positions["s-blocked"] < positions["s-running"],
-            "blocked must come before running"
-        );
-        assert!(
-            positions["s-running"] < positions["s-unknown"],
-            "running must come before unknown"
-        );
-        assert!(
-            positions["s-unknown"] < positions["s-done"],
-            "unknown must come before done"
+            child_row.display_name.contains("work-on"),
+            "child label must include its own leaf label"
         );
     }
 }
