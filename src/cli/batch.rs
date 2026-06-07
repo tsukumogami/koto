@@ -2264,12 +2264,17 @@ pub fn build_children_complete_output(
                 });
                 // Dereference the live child's auto-promoted result from
                 // its OWN log: the latest `request_store.result` event
-                // (AC2). A malformed event would have fallen through the
-                // `Unknown` arm during deserialization and is simply not
-                // matched here, so it is skipped under the existing
-                // skip-and-continue discipline rather than aborting the
-                // converge (AC4 / AC5). No transcript is replayed — only
-                // the targeted event is read (AC3).
+                // (AC2). A malformed result event (e.g. one missing the
+                // required `result` field) is a serde DESERIALIZATION
+                // FAILURE, not the `Unknown` arm (which only catches
+                // unrecognized type STRINGS). Such a failure is absorbed
+                // here, not propagated: a corrupt child log makes
+                // `read_events` return `Err` above, so this dereference
+                // simply finds no `request_store.result` and the converge
+                // falls back to the parent's `ChildCompleted.result` copy
+                // (`result_by_child`, merged below) rather than aborting
+                // (AC4 / AC5). No transcript is replayed — only the
+                // targeted event is read (AC3).
                 if let Some(r) = child_events.iter().rev().find_map(|e| match &e.payload {
                     EventPayload::RequestStoreResult { result } => Some(result.clone()),
                     _ => None,
@@ -4656,19 +4661,28 @@ mod tests {
         assert_eq!(entry["result"]["payload"]["score"], 99);
     }
 
-    /// AC4 (malformed-event skip): a `request_store.result` line that
-    /// fails to parse falls through the `Unknown` arm during
-    /// deserialization, so the converge read never matches it and simply
-    /// falls back to the parent's `ChildCompleted.result` — the converge
-    /// is not aborted (skip-and-continue discipline).
+    /// AC4 (malformed-event skip): a `request_store.result` line with a
+    /// malformed payload is a serde DESERIALIZATION FAILURE on that
+    /// event — NOT the `Unknown` arm (which only catches unrecognized
+    /// type STRINGS). Here the malformed line is the LAST line of the
+    /// child log, so `read_events` recovers it under the truncated-final-
+    /// line discipline (warn + return events up to it). The dereference
+    /// then finds no `request_store.result`, and the converge falls back
+    /// to the parent's `ChildCompleted.result` copy — the converge is
+    /// not aborted. (The mid-log variant, where the malformed line is
+    /// followed by valid lines and `read_events` returns `Err`, is
+    /// covered by
+    /// `mid_log_malformed_child_result_still_falls_back_to_parent_copy`.)
     #[test]
     fn gate_skips_malformed_child_result_and_falls_back_to_parent_copy() {
         let tmp = TempDir::new().unwrap();
         let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
 
         // Live child whose state-file carries a request_store.result LINE
-        // with a malformed payload (missing required `status`). Write it
-        // raw so deserialization routes it through the Unknown arm.
+        // with a malformed payload (missing the required `result` field).
+        // Write it raw so deserialization of that event FAILS (it does
+        // not route through the Unknown arm — the type string is
+        // recognized).
         backend
             .init_state_file("parent", child_header_for("", "parent"), vec![])
             .unwrap();
@@ -4729,9 +4743,11 @@ mod tests {
             .path()
             .join("parent.alpha")
             .join(state_file_name("parent.alpha"));
-        // `status` omitted -> WorkflowResult deserialization fails ->
-        // the event routes through the Unknown arm, so it is never
-        // matched as RequestStoreResult by the converge read.
+        // `result` field omitted -> RequestStoreResultPayload
+        // deserialization FAILS for this event. Because this is the LAST
+        // line, `read_events` recovers it as a truncated final line and
+        // returns the events before it; the converge read then finds no
+        // RequestStoreResult and uses the parent fallback.
         let malformed = r#"{"seq":2,"timestamp":"2026-01-01T00:00:04Z","type":"request_store.result","payload":{"summary":"unparseable"}}"#;
         let mut existing = std::fs::read_to_string(&child_path).unwrap();
         existing.push_str(malformed);
@@ -4739,14 +4755,16 @@ mod tests {
         std::fs::write(&child_path, existing).unwrap();
 
         assert!(backend.exists("parent.alpha"));
-        // Sanity: the malformed line round-trips as an Unknown event, not
-        // a RequestStoreResult.
+        // Sanity: with the malformed line as the final line, `read_events`
+        // recovers (truncated-final-line discipline) and returns only the
+        // valid events before it, so no RequestStoreResult is present.
         let (_, child_events) = backend.read_events("parent.alpha").unwrap();
         assert!(
             child_events
                 .iter()
                 .all(|e| !matches!(e.payload, EventPayload::RequestStoreResult { .. })),
-            "malformed line must not deserialize as RequestStoreResult"
+            "the malformed final line is dropped by read_events recovery, \
+             so no RequestStoreResult event is returned"
         );
 
         let (_, parent_events) = backend.read_events("parent").unwrap();
@@ -4768,6 +4786,126 @@ mod tests {
         assert_eq!(
             entry["result"]["summary"], "parent fallback used",
             "malformed live result is skipped; the parent's copy is used"
+        );
+    }
+
+    /// AC4 (malformed-event skip, NON-final position): a malformed
+    /// `request_store.result` line in the MIDDLE of the child log
+    /// (followed by valid lines) is NOT the truncated-final-line case —
+    /// `read_events` returns `Err(StateFileCorrupted)` for that child.
+    /// The converge absorbs the corrupt-read error (the child becomes a
+    /// non-terminal placeholder) and does NOT abort: the dual-source
+    /// result merge still inlines the child's result from the parent's
+    /// `ChildCompleted.result` copy, keyed by the entry's composed name.
+    /// This locks in that a corrupt child log at any position keeps the
+    /// converge producing the child entry from the parent copy.
+    #[test]
+    fn mid_log_malformed_child_result_still_falls_back_to_parent_copy() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        backend
+            .init_state_file("parent", child_header_for("", "parent"), vec![])
+            .unwrap();
+        backend
+            .append_event(
+                "parent",
+                &EventPayload::EvidenceSubmitted {
+                    state: "converge".to_string(),
+                    fields: HashMap::from([(
+                        "tasks".to_string(),
+                        serde_json::json!([{"name": "alpha", "waits_on": []}]),
+                    )]),
+                    submitter_cwd: None,
+                },
+                "2026-01-01T00:00:01Z",
+            )
+            .unwrap();
+        // The parent's fallback copy.
+        backend
+            .append_event(
+                "parent",
+                &EventPayload::ChildCompleted {
+                    child_name: "parent.alpha".to_string(),
+                    task_name: "alpha".to_string(),
+                    outcome: TerminalOutcome::Success,
+                    final_state: "done".to_string(),
+                    result: Some(WorkflowResult {
+                        status: TerminalOutcome::Success,
+                        summary: "parent fallback used".to_string(),
+                        payload: None,
+                    }),
+                },
+                "2026-01-01T00:00:02Z",
+            )
+            .unwrap();
+
+        // Live child: a valid WorkflowInitialized, then a malformed
+        // request_store.result line (missing the `result` field) that is
+        // NOT the last line, followed by a valid transitioned event.
+        backend
+            .init_state_file(
+                "parent.alpha",
+                child_header_for("parent", "parent.alpha"),
+                vec![],
+            )
+            .unwrap();
+        backend
+            .append_event(
+                "parent.alpha",
+                &EventPayload::WorkflowInitialized {
+                    template_path: "child.md".to_string(),
+                    variables: HashMap::new(),
+                    spawn_entry: None,
+                },
+                "2026-01-01T00:00:03Z",
+            )
+            .unwrap();
+        let child_path = tmp
+            .path()
+            .join("parent.alpha")
+            .join(state_file_name("parent.alpha"));
+        // Malformed at seq=2 (missing `result`), valid transitioned at
+        // seq=3 AFTER it. Because the malformed line is not last,
+        // `read_events` treats it as corruption and returns Err.
+        let malformed = r#"{"seq":2,"timestamp":"2026-01-01T00:00:04Z","type":"request_store.result","payload":{"summary":"unparseable"}}"#;
+        let valid_after = r#"{"seq":3,"timestamp":"2026-01-01T00:00:05Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"manual"}}"#;
+        let mut existing = std::fs::read_to_string(&child_path).unwrap();
+        existing.push_str(malformed);
+        existing.push('\n');
+        existing.push_str(valid_after);
+        existing.push('\n');
+        std::fs::write(&child_path, existing).unwrap();
+
+        assert!(backend.exists("parent.alpha"));
+        // The corrupt mid-log line makes the child read fail entirely
+        // (NOT the truncated-final-line recovery path).
+        assert!(
+            backend.read_events("parent.alpha").is_err(),
+            "a malformed non-final line must make read_events return Err \
+             (corruption), distinguishing it from the final-line case"
+        );
+
+        let (_, parent_events) = backend.read_events("parent").unwrap();
+        let template = converge_template("parent");
+        let (_all_complete, output) = build_children_complete_output(
+            &backend,
+            "parent",
+            &parent_events,
+            &template,
+            "converge",
+            None,
+        );
+
+        let children = output["children"].as_array().expect("children array");
+        let entry = children
+            .iter()
+            .find(|c| c["name"] == "parent.alpha")
+            .expect("entry must still be produced; converge not aborted");
+        assert_eq!(
+            entry["result"]["summary"], "parent fallback used",
+            "with a corrupt child log, the converge falls back to the \
+             parent's ChildCompleted.result copy"
         );
     }
 

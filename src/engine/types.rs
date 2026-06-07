@@ -630,17 +630,19 @@ pub enum EventPayload {
     IntentUpdated {
         intent: String,
     },
-    /// Reserved variant carrying the auto-promoted [`WorkflowResult`]
-    /// envelope on a child's own session log (wire `type:
-    /// "request_store.result"`, in the reserved `request_store.*`
-    /// namespace; DESIGN-request-store-converge.md Decision 3).
+    /// Carries the auto-promoted [`WorkflowResult`] envelope on a child's
+    /// own session log (wire `type: "request_store.result"`, in the
+    /// reserved `request_store.*` namespace;
+    /// DESIGN-request-store-converge.md Decision 3).
     ///
-    /// No producer emits this variant yet — Issue 1 (the walking
-    /// skeleton) only defines the type and its serde round-trip. The
-    /// durable child-log emit lands in a later issue; until then the
-    /// converge gate reads the result from the copy that rides the
-    /// parent's [`ChildCompleted`] event. Unknown to older koto builds,
-    /// the event falls through the [`Unknown`] fallthrough.
+    /// Emitted by `append_request_store_result_to_child` on the child's
+    /// own session log at the terminal tick (Issue 3). The converge gate
+    /// prefers this durable child-log copy and falls back to the copy
+    /// that rides the parent's [`ChildCompleted`] event once the child
+    /// has been auto-cleaned. Unknown to older koto builds, the event
+    /// falls through the [`Unknown`] fallthrough (the type STRING is
+    /// unrecognized there — distinct from a malformed payload on a
+    /// recognized type, which is a deserialization failure).
     RequestStoreResult {
         result: WorkflowResult,
     },
