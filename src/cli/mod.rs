@@ -304,6 +304,19 @@ pub struct DashboardArgs {
     /// Poll interval in milliseconds (default: 500)
     #[arg(long)]
     pub interval: Option<u64>,
+
+    /// (--once) Filter to a single liveness state: needs-you-blocked,
+    /// needs-you-failed, needs-you-stalled, active, idle, pending, done
+    #[arg(long, value_name = "LIVENESS")]
+    pub status: Option<String>,
+
+    /// (--once) Show only sessions in the needs-you band (blocked/failed/stalled)
+    #[arg(long)]
+    pub needs_you: bool,
+
+    /// (--once) Include the receded set (done + abandoned); default excludes it
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Subcommand)]
