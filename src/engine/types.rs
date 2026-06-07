@@ -630,17 +630,17 @@ pub enum EventPayload {
     IntentUpdated {
         intent: String,
     },
-    /// Emitted on a child's own session log when it reaches a terminal
-    /// state, carrying the auto-promoted [`WorkflowResult`] envelope
-    /// (DESIGN-request-store-converge.md Decision 3, wire `type:
+    /// Reserved variant carrying the auto-promoted [`WorkflowResult`]
+    /// envelope on a child's own session log (wire `type:
     /// "request_store.result"`, in the reserved `request_store.*`
-    /// namespace).
+    /// namespace; DESIGN-request-store-converge.md Decision 3).
     ///
-    /// The child log is the durable record for `koto query` / `koto
-    /// status`; a copy also rides the parent's [`ChildCompleted`] event
-    /// so the result survives the child session's auto-cleanup. Unknown
-    /// to older koto builds, the event falls through the [`Unknown`]
-    /// fallthrough.
+    /// No producer emits this variant yet — Issue 1 (the walking
+    /// skeleton) only defines the type and its serde round-trip. The
+    /// durable child-log emit lands in a later issue; until then the
+    /// converge gate reads the result from the copy that rides the
+    /// parent's [`ChildCompleted`] event. Unknown to older koto builds,
+    /// the event falls through the [`Unknown`] fallthrough.
     RequestStoreResult {
         result: WorkflowResult,
     },
@@ -699,7 +699,8 @@ pub struct WorkflowResult {
     /// Terminal outcome classification, serialized as snake_case
     /// (`"success"`, `"failure"`, `"skipped"`).
     pub status: TerminalOutcome,
-    /// Bounded human-readable end-of-work statement.
+    /// Human-readable end-of-work statement. Length-bounding is
+    /// deferred to a later issue; Issue 1 stores the raw summary.
     pub summary: String,
     /// Optional structured detail. Omitted from the wire when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2319,6 +2320,28 @@ mod tests {
             other => panic!("expected Unknown, got {:?}", other),
         }
         assert_eq!(parsed.event_type, "pause_requested");
+    }
+
+    #[test]
+    fn unrecognized_request_store_event_deserializes_to_unknown() {
+        // `request_store.result` is recognized, but the reserved
+        // `request_store.*` namespace is open-ended. A future sibling
+        // type this build doesn't know must degrade to Unknown rather
+        // than erroring — the Phase-1 forward-compat contract.
+        let json = r#"{"seq":7,"timestamp":"2026-01-01T00:00:00Z","type":"request_store.checkpoint","payload":{"note":"future"}}"#;
+        let parsed: Event = serde_json::from_str(json)
+            .expect("unrecognized request_store.* type must parse without error");
+        match parsed.payload {
+            EventPayload::Unknown {
+                type_name,
+                raw_payload,
+            } => {
+                assert_eq!(type_name, "request_store.checkpoint");
+                assert_eq!(raw_payload["note"], "future");
+            }
+            other => panic!("expected Unknown, got {:?}", other),
+        }
+        assert_eq!(parsed.event_type, "request_store.checkpoint");
     }
 
     #[test]

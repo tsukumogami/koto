@@ -2100,27 +2100,6 @@ enum ChildCompletedAppend {
     AppendFailed,
 }
 
-/// Issue #134: append a `ChildCompleted` event to the parent's log just
-/// before a child session's auto-cleanup runs.
-///
-/// Called from both terminal cleanup sites in [`handle_next`] (the `--to`
-/// path and the advance-loop path). The return value tells the caller
-/// whether cleanup is safe:
-///
-/// * [`ChildCompletedAppend::NoParent`] — no parent to notify (standalone
-///   child, or the parent was already cleaned up). Cleanup proceeds.
-/// * [`ChildCompletedAppend::Notified`] — event durably appended.
-///   Cleanup proceeds.
-/// * [`ChildCompletedAppend::AppendFailed`] — parent exists but the
-///   append failed. Caller MUST skip cleanup so the next parent tick
-///   can classify the child from its on-disk state. A warning is
-///   logged here; the caller does not re-log.
-///
-/// The event projects the outcome classification (`Success`, `Failure`,
-/// `Skipped`) from the child's compiled template flags on the final
-/// state. The `children-complete` gate evaluator replays these events
-/// to recover per-task outcomes after cleanup has removed the child's
-/// state file from disk.
 /// Synthesize a [`WorkflowResult`] from the data the completion path
 /// already holds on a child's terminal tick
 /// (DESIGN-request-store-converge.md Decision 1 / 2).
@@ -2171,6 +2150,27 @@ fn synthesize_workflow_result(
     }
 }
 
+/// Issue #134: append a `ChildCompleted` event to the parent's log just
+/// before a child session's auto-cleanup runs.
+///
+/// Called from both terminal cleanup sites in [`handle_next`] (the `--to`
+/// path and the advance-loop path). The return value tells the caller
+/// whether cleanup is safe:
+///
+/// * [`ChildCompletedAppend::NoParent`] — no parent to notify (standalone
+///   child, or the parent was already cleaned up). Cleanup proceeds.
+/// * [`ChildCompletedAppend::Notified`] — event durably appended.
+///   Cleanup proceeds.
+/// * [`ChildCompletedAppend::AppendFailed`] — parent exists but the
+///   append failed. Caller MUST skip cleanup so the next parent tick
+///   can classify the child from its on-disk state. A warning is
+///   logged here; the caller does not re-log.
+///
+/// The event projects the outcome classification (`Success`, `Failure`,
+/// `Skipped`) from the child's compiled template flags on the final
+/// state. The `children-complete` gate evaluator replays these events
+/// to recover per-task outcomes after cleanup has removed the child's
+/// state file from disk.
 #[cfg(unix)]
 fn append_child_completed_to_parent(
     backend: &dyn SessionBackend,
@@ -5152,5 +5152,76 @@ Done.
         // validation downstream).
         let v = validate_with_data_payload(r#"{"note":"hello"}"#).expect("must accept");
         assert_eq!(v["note"], serde_json::json!("hello"));
+    }
+
+    #[cfg(unix)]
+    fn evidence_event(seq: u64, state: &str, fields: &[(&str, serde_json::Value)]) -> Event {
+        Event {
+            seq,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "evidence_submitted".to_string(),
+            payload: EventPayload::EvidenceSubmitted {
+                state: state.to_string(),
+                fields: fields
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect(),
+                submitter_cwd: None,
+            },
+            idempotency_hash: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synthesize_workflow_result_uses_evidence_summary_field() {
+        // A terminal EvidenceSubmitted carrying a `summary` field: the
+        // synthesized result reuses it verbatim and inlines the evidence
+        // fields as the opaque payload.
+        let events = vec![evidence_event(
+            1,
+            "done",
+            &[
+                ("summary", serde_json::json!("evaluated 42")),
+                ("score", serde_json::json!(42)),
+            ],
+        )];
+        let r = synthesize_workflow_result(TerminalOutcome::Success, "done", &events);
+        assert_eq!(r.status, TerminalOutcome::Success);
+        assert_eq!(r.summary, "evaluated 42");
+        let payload = r.payload.expect("non-empty evidence fields become payload");
+        assert_eq!(payload["score"], 42);
+        assert_eq!(payload["summary"], "evaluated 42");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synthesize_workflow_result_falls_back_to_final_state_default() {
+        // No `summary` field and no evidence for the terminal state: the
+        // summary falls back to an outcome/final-state-derived default
+        // and the empty-fields filter leaves payload as None.
+        let events = vec![evidence_event(1, "other_state", &[])];
+        let r = synthesize_workflow_result(TerminalOutcome::Failure, "failed", &events);
+        assert_eq!(r.status, TerminalOutcome::Failure);
+        assert_eq!(r.summary, "failed at failed");
+        assert!(
+            r.payload.is_none(),
+            "no terminal-state evidence means no payload"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synthesize_workflow_result_empty_terminal_fields_yield_no_payload() {
+        // Evidence exists for the terminal state but carries no fields:
+        // the `!is_empty()` filter must drop it so payload stays None,
+        // while the summary still gets the final-state-derived default.
+        let events = vec![evidence_event(1, "done", &[])];
+        let r = synthesize_workflow_result(TerminalOutcome::Skipped, "done", &events);
+        assert_eq!(r.summary, "skipped at done");
+        assert!(
+            r.payload.is_none(),
+            "empty evidence fields must be filtered to None"
+        );
     }
 }

@@ -2426,18 +2426,15 @@ pub fn build_children_complete_output(
     let needs_attention = any_failed || any_skipped || any_spawn_failed;
 
     // Inline each child's auto-promoted result, read from the parent's
-    // own `ChildCompleted.result` (keyed by composed child name) — the
-    // converge read never opens or replays a child log
-    // (DESIGN-request-store-converge.md Decision 3 / 4). The hook path
-    // names entries by their composed `<parent>.<task>` identity; the
-    // no-hook fallback path may name a cleaned-up child by its short
-    // task name, so try the composed form too.
+    // own `ChildCompleted.result` — the converge read never opens or
+    // replays a child log (DESIGN-request-store-converge.md Decision 3 /
+    // 4). Both keys are the child's full session id: `result_by_child`
+    // is keyed by `ChildCompleted.child_name`, and `entry.name` is set
+    // to that same composed `<parent>.<task>` identity (the raw session
+    // id for legacy non-composed children) by both entry builders. So a
+    // direct `entry.name` lookup is the only key that can match.
     for entry in &mut entries {
-        let composed = format!("{}.{}", parent_name, entry.name);
-        if let Some(r) = result_by_child
-            .get(&entry.name)
-            .or_else(|| result_by_child.get(&composed))
-        {
+        if let Some(r) = result_by_child.get(&entry.name) {
             entry.result = Some(r.clone());
         }
     }
