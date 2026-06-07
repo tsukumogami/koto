@@ -121,23 +121,18 @@ pub mod liveness {
     /// so a brand-new session is visible; an older `Pending` recedes to band 3.
     pub fn attention_key(liveness: Liveness, idle: Duration) -> (u8, Reverse<Duration>) {
         let band = match liveness {
+            Liveness::Done => 3,
+            // Any session silent past the abandoned threshold is cruft, not an
+            // attention item -- it recedes regardless of its needs-you sub-state.
+            // A run blocked or stalled for weeks is abandoned, not "waiting on
+            // you"; this keeps the needs-you band to genuinely recent items.
+            // (Receded sessions remain reachable via `--all` / the reveal toggle.)
+            _ if idle >= ABANDONED => 3,
             Liveness::NeedsYouBlocked | Liveness::NeedsYouFailed | Liveness::NeedsYouStalled => 0,
             Liveness::Active => 1,
-            Liveness::Idle => {
-                if idle >= ABANDONED {
-                    3
-                } else {
-                    2
-                }
-            }
-            Liveness::Pending => {
-                if idle < ACTIVE_WINDOW {
-                    2
-                } else {
-                    3
-                }
-            }
-            Liveness::Done => 3,
+            Liveness::Idle => 2,
+            Liveness::Pending if idle < ACTIVE_WINDOW => 2,
+            Liveness::Pending => 3,
         };
         (band, Reverse(idle))
     }
@@ -1771,6 +1766,28 @@ mod tests {
         // Idle older than abandoned (7d) recedes to band 3.
         let abandoned = attention_key(Liveness::Idle, Duration::from_secs(8 * 24 * 60 * 60)).0;
         assert_eq!(abandoned, 3);
+    }
+
+    #[test]
+    fn attention_key_abandoned_needsyou_recedes() {
+        // A recent needs-you session leads (band 0)...
+        let recent = attention_key(Liveness::NeedsYouStalled, Duration::from_secs(3 * 60 * 60)).0;
+        assert_eq!(recent, 0);
+        let recent_blocked =
+            attention_key(Liveness::NeedsYouBlocked, Duration::from_secs(3 * 60 * 60)).0;
+        assert_eq!(recent_blocked, 0);
+        // ...but once silent past the abandoned threshold (7d) it recedes,
+        // regardless of being stalled or blocked -- a run dead for weeks is not
+        // "waiting on you".
+        let dead = 8 * 24 * 60 * 60;
+        assert_eq!(
+            attention_key(Liveness::NeedsYouStalled, Duration::from_secs(dead)).0,
+            3
+        );
+        assert_eq!(
+            attention_key(Liveness::NeedsYouBlocked, Duration::from_secs(dead)).0,
+            3
+        );
     }
 
     #[test]
