@@ -1,7 +1,7 @@
 ---
 topic: request-store-converge
 chain_started: 2026-06-07T16:16:41Z
-last_updated: 2026-06-07T16:21:53Z
+last_updated: 2026-06-07T16:29:21Z
 phase_pointer: phase-2
 exit: UNSET
 exit_artifacts: []
@@ -21,14 +21,24 @@ worktree_rebases: []
 worktree_divergences: []
 chain_ran:
   - brief
+  - prd
 child_snapshots:
   brief:
     status: Accepted
     content_hash: 1d5753e9f6f8f57f173366a9c5d546561d09aba8
     captured_at: 2026-06-07T16:21:53Z
+  prd:
+    status: Accepted
+    content_hash: 79eb648b53b288fd4b6c00f81956405ddc90115a
+    captured_at: 2026-06-07T16:29:21Z
+post_prd_reeval:
+  chain_revised: false
+  note: "P1 fires, P2 does-not-fire, P3 fires; complexity Complex; matches projection; /design stays"
+plan_complexity: Complex
+open_design_decisions: [D1 result-via-completion-path, D2 typed-minimal-envelope, D3 result-storage+pointer-lean-index]
 parent_orchestration:
-  active_child: prd
-  dispatched_at: 2026-06-07T16:23:31Z
+  active_child: design
+  dispatched_at: 2026-06-07T16:29:21Z
 ---
 
 # Scope state: request-store-converge

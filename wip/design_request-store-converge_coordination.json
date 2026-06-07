@@ -1,0 +1,13 @@
+{
+  "topic": "request-store-converge",
+  "execution_note": "Phase 2 run INLINE — subagents cannot spawn subagents.",
+  "decisions": [
+    {"id": 1, "question": "How is a child's result recorded on completion: auto-promote vs explicit step?", "status": "complete", "complexity": "standard", "chosen": "1A auto-promote terminal evidence", "report_file": "wip/design_request-store-converge_decision_1_report.md"},
+    {"id": 2, "question": "Result-envelope type and exact field set?", "status": "complete", "complexity": "standard", "chosen": "2A typed minimal envelope {status:TerminalOutcome, summary:String, payload:Option<Value>}", "report_file": "wip/design_request-store-converge_decision_2_report.md"},
+    {"id": 3, "question": "Result storage location + dereference, index stays lean?", "status": "complete", "complexity": "critical", "chosen": "3A result on child session log (request_store.result event) + bounded has_result flag in index + result copy on parent ChildCompleted to survive cleanup", "report_file": "wip/design_request-store-converge_decision_3_report.md"},
+    {"id": 4, "question": "Converge surfacing via GateBlocked; converge-set definition?", "status": "complete", "complexity": "standard", "chosen": "4A reuse children-complete gate + GateBlocked; result field on each child entry", "report_file": "wip/design_request-store-converge_decision_4_report.md"}
+  ],
+  "cross_validation": "passed",
+  "cross_validation_note": "No conflicts. D1/D2/D3 share the TerminalOutcome projection; D3's cleanup-race resolution (result on parent ChildCompleted) is exactly what D4 dereferences. Decisions mutually reinforce.",
+  "round": 0
+}
