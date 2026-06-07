@@ -99,7 +99,7 @@ fn writer_round_trips_through_reader() {
         &make_unassigned_child_header("scrutineer-a"),
         now_micros() - 1_000_000,
     );
-    append_terminal_index(tmp.path(), "scrutineer-a", "completed", &header_path).unwrap();
+    append_terminal_index(tmp.path(), "scrutineer-a", "completed", &header_path, false).unwrap();
 
     let map = read_terminal_index(tmp.path());
     let entry = map.get("scrutineer-a").expect("must round-trip");
@@ -153,6 +153,7 @@ fn discovery_skips_session_listed_in_terminal_index() {
             terminal_at: "2026-05-24T14:35:01.000Z".into(),
             header_mtime_ns: terminal_disk_ns,
             terminal_state: "completed".into(),
+            has_result: false,
         },
     )
     .unwrap();
@@ -200,6 +201,7 @@ fn discovery_resurfaces_session_when_disk_header_mtime_exceeds_index() {
             terminal_at: "2026-05-24T14:35:01.000Z".into(),
             header_mtime_ns: stale_ns,
             terminal_state: "completed".into(),
+            has_result: false,
         },
     )
     .unwrap();
@@ -240,6 +242,7 @@ fn multi_writer_same_session_dedups_to_higher_mtime() {
             terminal_at: "2026-05-24T14:35:01.000Z".into(),
             header_mtime_ns: disk_ns.saturating_sub(500_000_000),
             terminal_state: "abandoned".into(),
+            has_result: false,
         },
     )
     .unwrap();
@@ -251,6 +254,7 @@ fn multi_writer_same_session_dedups_to_higher_mtime() {
             terminal_at: "2026-05-24T14:35:05.000Z".into(),
             header_mtime_ns: disk_ns,
             terminal_state: "completed".into(),
+            has_result: false,
         },
     )
     .unwrap();

@@ -33,6 +33,7 @@ fn fixture_entry(sid: &str, mtime_ns: u64, state: &str) -> TerminalIndexEntry {
         terminal_at: "2026-05-24T14:35:01.000Z".to_string(),
         header_mtime_ns: mtime_ns,
         terminal_state: state.to_string(),
+        has_result: false,
     }
 }
 
@@ -253,6 +254,7 @@ fn compaction_error_path_releases_lease_and_removes_temp_when_file_too_long() {
         terminal_at: "2026-05-24T14:35:01.000Z".to_string(),
         header_mtime_ns: 9999,
         terminal_state: "completed".to_string(),
+        has_result: false,
     };
     let mut huge_line = serde_json::to_string(&huge_entry).unwrap();
     huge_line.push('\n');

@@ -2277,6 +2277,10 @@ fn append_terminal_index_for_session(
         session_id,
         terminal_state,
         &state_path,
+        // Done-bit defaults to false here: the terminal-tick synthesis
+        // does not yet wire result knowledge through this path (issue 3
+        // attaches the result to the child log; issue 4 reads the flag).
+        false,
     ) {
         eprintln!(
             "warning: terminal-index append failed for {}: {}",

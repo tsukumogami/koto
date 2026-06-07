@@ -123,6 +123,7 @@ fn append_terminal_index_for(koto_root: &Path, child_id: &str) {
         terminal_at: "2026-05-24T00:00:05.000Z".into(),
         header_mtime_ns: 1_000_000,
         terminal_state: "completed".into(),
+        has_result: false,
     };
     append_terminal_index_entry(koto_root, &entry).unwrap();
 }

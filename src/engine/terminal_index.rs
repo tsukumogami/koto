@@ -84,6 +84,24 @@ pub struct TerminalIndexEntry {
     /// revoked via the redelegation-cap-exceeded recovery path (Issue
     /// 11 cases 3b/3c).
     pub terminal_state: String,
+    /// Done-bit signalling that a `WorkflowResult` envelope exists for
+    /// this terminal session. The hot discovery scan reads this O(1)
+    /// boolean to know a result is available WITHOUT carrying any
+    /// result content in the index line — the full result lives on the
+    /// child log and on the parent's `ChildCompleted`. Omitted from the
+    /// JSONL when `false` (the common case) and defaulted to `false`
+    /// when an older line lacks the key, so the change is purely
+    /// additive and older index lines round-trip unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub has_result: bool,
+}
+
+/// Serde `skip_serializing_if` predicate: omit a `bool` field from the
+/// wire form when it is `false`. Keeps the index line minimal — a
+/// `false` `has_result` adds zero bytes — and pairs with `#[serde(default)]`
+/// so older lines without the key deserialize to `false`.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Return the path to the terminal-index file under `koto_root`.
@@ -136,11 +154,17 @@ pub fn header_mtime_unix_nanos(header_path: &Path) -> Result<u64> {
 /// Security Considerations release-time enforcement #3): each append
 /// is a fresh `O_APPEND` open whose offset the kernel resolves
 /// atomically against any concurrent appender's write.
+/// `has_result` is the done-bit: pass `true` when a `WorkflowResult`
+/// envelope was attached for this terminal session so the hot
+/// discovery scan can cheaply tell a result exists. The flag carries
+/// no result content — that lives on the child log and the parent's
+/// `ChildCompleted`. Callers without result knowledge pass `false`.
 pub fn append_terminal_index(
     koto_root: &Path,
     session_id: &str,
     terminal_state: &str,
     header_path: &Path,
+    has_result: bool,
 ) -> Result<()> {
     // Best-effort mtime read; a stat failure falls through to 0 so a
     // stripped/missing header doesn't drop the index entry on the floor.
@@ -150,6 +174,7 @@ pub fn append_terminal_index(
         terminal_at: now_iso8601_millis(),
         header_mtime_ns,
         terminal_state: terminal_state.to_string(),
+        has_result,
     };
     append_terminal_index_entry(koto_root, &entry)
 }
@@ -850,6 +875,7 @@ mod tests {
             terminal_at: "2026-05-24T14:35:01.000Z".to_string(),
             header_mtime_ns: mtime_ns,
             terminal_state: state.to_string(),
+            has_result: false,
         }
     }
 
@@ -1041,6 +1067,7 @@ mod tests {
                     terminal_at: "2026-05-24T14:35:01.000Z".to_string(),
                     header_mtime_ns: 1_000_000_000 + i as u64,
                     terminal_state: "completed".to_string(),
+                    has_result: false,
                 };
                 append_terminal_index_entry(&root_c, &e).unwrap();
             }));
@@ -1096,6 +1123,7 @@ mod tests {
             terminal_at: "2026-05-24T14:35:01.000Z".to_string(),
             header_mtime_ns: mtime_ns,
             terminal_state: "completed".to_string(),
+            has_result: false,
         }
     }
 
@@ -1381,5 +1409,74 @@ mod tests {
             "started_at must be ISO 8601 with ms precision: {}",
             parsed.started_at
         );
+    }
+
+    // ===== Issue 2: bounded has_result done-bit =====
+
+    #[test]
+    fn has_result_line_stays_within_pipe_buf_for_large_result_child() {
+        // The done-bit is O(1) bytes: result content never enters the
+        // index line. Even a child that produced a multi-kilobyte
+        // result serializes to a line well under MAX_INDEX_LINE_BYTES,
+        // because only the boolean flag — not the result — is stored.
+        let e = TerminalIndexEntry {
+            // Realistic-length session id.
+            session_id: "scrutineer-batch-7f3a9c2e-child-014".to_string(),
+            terminal_at: "2026-05-24T14:35:01.123Z".to_string(),
+            header_mtime_ns: 1_716_579_999_123_456_789,
+            terminal_state: "completed".to_string(),
+            has_result: true,
+        };
+        let mut line = serde_json::to_string(&e).unwrap();
+        line.push('\n');
+        assert!(
+            line.len() < MAX_INDEX_LINE_BYTES,
+            "index line with has_result=true must stay under PIPE_BUF ({} >= {})",
+            line.len(),
+            MAX_INDEX_LINE_BYTES
+        );
+        // The flag is present on the wire when true.
+        assert!(line.contains("\"has_result\":true"));
+        // Sanity: the entire line is a tiny fraction of the bound — the
+        // result content is NOT carried here.
+        assert!(line.len() < 256, "index line is O(1) bytes: {}", line.len());
+    }
+
+    #[test]
+    fn has_result_round_trips_and_defaults_false_on_older_lines() {
+        // Round-trip true: serialize -> deserialize preserves the flag.
+        let e = TerminalIndexEntry {
+            session_id: "s1".to_string(),
+            terminal_at: "2026-05-24T14:35:01.000Z".to_string(),
+            header_mtime_ns: 42,
+            terminal_state: "completed".to_string(),
+            has_result: true,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let back: TerminalIndexEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+        assert!(back.has_result);
+
+        // false omits the key from the wire form (skip_serializing_if).
+        let e_false = TerminalIndexEntry {
+            has_result: false,
+            ..e.clone()
+        };
+        let json_false = serde_json::to_string(&e_false).unwrap();
+        assert!(
+            !json_false.contains("has_result"),
+            "has_result=false must be omitted from the wire form: {}",
+            json_false
+        );
+
+        // Older index line WITHOUT the has_result key deserializes to
+        // false (serde default) — the change is purely additive.
+        let older = r#"{"session_id":"s2","terminal_at":"2026-05-24T00:00:00.000Z","header_mtime_ns":7,"terminal_state":"completed"}"#;
+        let parsed: TerminalIndexEntry = serde_json::from_str(older).unwrap();
+        assert!(
+            !parsed.has_result,
+            "older line without has_result must default to false"
+        );
+        assert_eq!(parsed.session_id, "s2");
     }
 }

@@ -440,6 +440,7 @@ fn total_unassigned_consults_terminal_index() {
             terminal_at: "2026-05-24T14:35:01.000Z".into(),
             header_mtime_ns: mtime_ns,
             terminal_state: "completed".into(),
+            has_result: false,
         };
         append_terminal_index_entry(&root, &entry).unwrap();
     }
