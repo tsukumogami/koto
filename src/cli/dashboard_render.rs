@@ -154,6 +154,13 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
         );
     }
 
+    // Trailing note for sessions whose state file failed to parse, so they are
+    // surfaced rather than silently dropped.
+    if state.tree.unreadable > 0 {
+        let note = format!("\u{26a0} {} unreadable session(s)", state.tree.unreadable);
+        rows.push(Row::new(vec![Cell::from(note)]).style(Style::default().fg(Color::Red)));
+    }
+
     let row_count = rows.len();
 
     let header = Row::new(vec![
@@ -528,6 +535,7 @@ mod tests {
                 state_path: PathBuf::new(),
                 last_event_at: None,
                 salient_var: None,
+                is_unreadable: false,
             },
         );
 
@@ -804,6 +812,7 @@ mod tests {
                 state_path: PathBuf::new(),
                 last_event_at: None,
                 salient_var: None,
+                is_unreadable: false,
             },
         );
         state.tree.roots = vec!["my-workflow".to_string()];
@@ -1079,6 +1088,7 @@ mod tests {
             state_path: PathBuf::new(),
             last_event_at,
             salient_var: None,
+            is_unreadable: false,
         }
     }
 

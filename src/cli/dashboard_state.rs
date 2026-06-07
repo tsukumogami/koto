@@ -656,6 +656,7 @@ mod tests {
             state_path: PathBuf::new(),
             last_event_at: Some(SystemTime::now()),
             salient_var: None,
+            is_unreadable: false,
         }
     }
 

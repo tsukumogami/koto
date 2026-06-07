@@ -210,6 +210,10 @@ pub struct CachedSession {
     /// key-priority list in [`liveness::salient_var`]. Folded into the label by
     /// `derive_label`; `None` when no priority key was present.
     pub salient_var: Option<String>,
+    /// True when the session's header could not be parsed (corrupt/unreadable
+    /// state file). Such sessions are surfaced in the `unreadable` tally rather
+    /// than silently dropped.
+    pub is_unreadable: bool,
 }
 
 /// Hierarchical view of all sessions visible to the dashboard.
@@ -218,6 +222,10 @@ pub struct SessionTree {
     pub sessions: HashMap<String, CachedSession>,
     /// Names of root sessions (those with no parent, or whose parent is absent).
     pub roots: Vec<String>,
+    /// Count of session dirs whose header failed to parse on the last refresh.
+    /// Surfaced as a trailing note (TUI) / count (`--once`) instead of dropping
+    /// the sessions silently.
+    pub unreadable: usize,
 }
 
 impl SessionTree {
@@ -226,6 +234,7 @@ impl SessionTree {
         Self {
             sessions: HashMap::new(),
             roots: Vec::new(),
+            unreadable: 0,
         }
     }
 }
@@ -382,6 +391,7 @@ pub fn read_session(path: &Path) -> CachedSession {
                 state_path: path.to_path_buf(),
                 last_event_at: None,
                 salient_var: None,
+                is_unreadable: true,
             };
         }
     };
@@ -401,6 +411,7 @@ pub fn read_session(path: &Path) -> CachedSession {
                 state_path: path.to_path_buf(),
                 last_event_at: None,
                 salient_var: None,
+                is_unreadable: false,
             };
         }
     };
@@ -492,6 +503,7 @@ pub fn read_session(path: &Path) -> CachedSession {
         state_path: path.to_path_buf(),
         last_event_at,
         salient_var,
+        is_unreadable: false,
     }
 }
 
@@ -637,6 +649,12 @@ pub fn refresh(tree: &mut SessionTree, backend: &dyn SessionBackend) -> Result<(
     if session_set_changed || !diff.changed.is_empty() {
         tree.roots = rebuild_roots(&tree.sessions);
     }
+
+    // Recompute the unreadable tally directly from the backend: sessions whose
+    // header fails to parse are excluded from `backend.list()` (and thus from
+    // the tree), so they must be counted at the directory level to be surfaced
+    // rather than silently dropped.
+    tree.unreadable = backend.count_unreadable();
 
     Ok(())
 }
@@ -1112,6 +1130,7 @@ mod tests {
                 state_path: path,
                 last_event_at: None,
                 salient_var: None,
+                is_unreadable: false,
             },
         );
 
@@ -1145,6 +1164,7 @@ mod tests {
                 state_path: path.clone(),
                 last_event_at: None,
                 salient_var: None,
+                is_unreadable: false,
             },
         );
 
@@ -1178,6 +1198,7 @@ mod tests {
                 state_path: path.clone(),
                 last_event_at: None,
                 salient_var: None,
+                is_unreadable: false,
             },
         );
 
@@ -1358,6 +1379,7 @@ mod tests {
                 state_path: PathBuf::from("/nonexistent"),
                 last_event_at: None,
                 salient_var: None,
+                is_unreadable: false,
             },
         );
 
@@ -1392,6 +1414,43 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // I7: surface unparseable sessions in the refresh tally
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn refresh_counts_unparseable_session_instead_of_dropping() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(dir.path().to_path_buf());
+
+        // A readable session and a session whose state file has a corrupt header.
+        backend.create("good").unwrap();
+        write_minimal_state_file(&dir.path().join("good"), "good");
+
+        backend.create("corrupt").unwrap();
+        let corrupt_path = dir.path().join("corrupt").join(state_file_name("corrupt"));
+        std::fs::write(&corrupt_path, "this is not valid jsonl header\n").unwrap();
+
+        let mut tree = SessionTree::new();
+        refresh(&mut tree, &backend).unwrap();
+
+        // The corrupt session is excluded from the readable tree (its header
+        // does not parse) but is surfaced via the unreadable tally rather than
+        // being silently dropped.
+        assert_eq!(
+            tree.unreadable, 1,
+            "exactly one session should be counted as unreadable"
+        );
+        assert!(
+            tree.sessions.contains_key("good"),
+            "the readable session must be present in the tree"
+        );
+        assert!(
+            !tree.sessions.contains_key("corrupt"),
+            "the corrupt session is not in the readable tree (its header does not parse)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // rebuild_roots: parent-child relationships
     // -----------------------------------------------------------------------
 
@@ -1410,6 +1469,7 @@ mod tests {
                 state_path: PathBuf::new(),
                 last_event_at: None,
                 salient_var: None,
+                is_unreadable: false,
             },
         );
         sessions.insert(
@@ -1424,6 +1484,7 @@ mod tests {
                 state_path: PathBuf::new(),
                 last_event_at: None,
                 salient_var: None,
+                is_unreadable: false,
             },
         );
 
@@ -1448,6 +1509,7 @@ mod tests {
                 state_path: PathBuf::new(),
                 last_event_at: None,
                 salient_var: None,
+                is_unreadable: false,
             },
         );
         sessions.insert(
@@ -1462,6 +1524,7 @@ mod tests {
                 state_path: PathBuf::new(),
                 last_event_at: None,
                 salient_var: None,
+                is_unreadable: false,
             },
         );
 
@@ -1487,6 +1550,7 @@ mod tests {
                 state_path: PathBuf::new(),
                 last_event_at: None,
                 salient_var: None,
+                is_unreadable: false,
             },
         );
 
@@ -1554,8 +1618,8 @@ mod tests {
         let d = detail.unwrap();
         assert_eq!(d.session_id, session_name);
         assert!(d.gate_name.is_none());
-        // New fields should be present.
-        assert!(d.history.len() > 0 || d.remaining.is_empty() || true); // history may vary
+        // The detail struct is populated; history/remaining contents may vary
+        // by template, so we only assert the call succeeded above.
     }
 
     // -----------------------------------------------------------------------
@@ -1580,6 +1644,7 @@ mod tests {
             state_path: PathBuf::new(),
             last_event_at,
             salient_var: None,
+            is_unreadable: false,
         }
     }
 
@@ -1742,6 +1807,7 @@ mod tests {
             state_path: PathBuf::new(),
             last_event_at: None,
             salient_var: salient_var.map(|s| s.to_string()),
+            is_unreadable: false,
         }
     }
 

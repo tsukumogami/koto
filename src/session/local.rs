@@ -131,6 +131,38 @@ impl SessionBackend for LocalBackend {
         Ok(results)
     }
 
+    fn count_unreadable(&self) -> usize {
+        let entries = match fs::read_dir(&self.base_dir) {
+            Ok(entries) => entries,
+            Err(_) => return 0,
+        };
+
+        let mut count = 0;
+        for entry in entries.flatten() {
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if !is_dir {
+                continue;
+            }
+            let dir_name = match entry.file_name().to_str() {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            // Skip epoch-branched sessions, mirroring the dashboard scan filter.
+            if dir_name.contains('~') {
+                continue;
+            }
+            let state_path = entry.path().join(state_file_name(&dir_name));
+            if !state_path.exists() {
+                continue;
+            }
+            // Present but unparseable header: this is the silent-drop case.
+            if persistence::read_header(&state_path).is_err() {
+                count += 1;
+            }
+        }
+        count
+    }
+
     fn append_header(&self, id: &str, header: &StateFileHeader) -> anyhow::Result<()> {
         let path = self.base_dir.join(id).join(state_file_name(id));
         persistence::append_header(&path, header)
@@ -975,6 +1007,33 @@ mod tests {
     }
 
     // -- scenario 8: list returns sessions with metadata --
+
+    #[test]
+    fn count_unreadable_counts_corrupt_headers_only() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+
+        // Two readable sessions.
+        write_state_file(tmp.path(), "good-a", "2026-01-01T00:00:00Z");
+        write_state_file(tmp.path(), "good-b", "2026-01-02T00:00:00Z");
+
+        // One session whose header does not parse.
+        let corrupt_dir = tmp.path().join("corrupt");
+        fs::create_dir_all(&corrupt_dir).unwrap();
+        fs::write(
+            corrupt_dir.join(state_file_name("corrupt")),
+            "not valid json header\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            backend.count_unreadable(),
+            1,
+            "only the corrupt session should be counted"
+        );
+        // The readable sessions are still listed; the corrupt one is not.
+        assert_eq!(backend.list().unwrap().len(), 2);
+    }
 
     #[test]
     fn list_returns_sessions_with_metadata() {

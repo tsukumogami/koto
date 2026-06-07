@@ -151,6 +151,12 @@ fn run_once(args: &DashboardArgs, tree: &SessionTree) {
     for (session_id, session, liveness, idle) in rows {
         println!("{}", format_once_line(session_id, session, liveness, idle));
     }
+
+    // Surface unparseable sessions as a trailing note on stderr so the
+    // tab-separated stdout contract stays clean for positional readers.
+    if tree.unreadable > 0 {
+        eprintln!("note: {} unreadable session(s) skipped", tree.unreadable);
+    }
 }
 
 /// Build a single `--once` line for a session. First six columns match the
@@ -315,6 +321,7 @@ mod tests {
             state_path: PathBuf::new(),
             last_event_at: None,
             salient_var: None,
+            is_unreadable: false,
         }
     }
 

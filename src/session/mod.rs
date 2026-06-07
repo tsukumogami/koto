@@ -201,6 +201,21 @@ pub trait SessionBackend: Send + Sync {
 
     /// # Stability: additive-only (Issue 19 / Decision 5)
     ///
+    /// Count session directories whose state file is present but whose header
+    /// fails to parse. These sessions are silently excluded from [`list`], so
+    /// surfacing them as a tally lets callers (e.g. the dashboard) report
+    /// unreadable sessions instead of dropping them without a trace.
+    ///
+    /// The default implementation returns `0` for backends that cannot
+    /// enumerate raw directories.
+    ///
+    /// [`list`]: SessionBackend::list
+    fn count_unreadable(&self) -> usize {
+        0
+    }
+
+    /// # Stability: additive-only (Issue 19 / Decision 5)
+    ///
     /// Not part of the Stage 1 frozen four; signature evolution is
     /// permitted in minor releases.
     ///
@@ -411,6 +426,13 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.list(),
             Backend::Cloud(b) => b.list(),
+        }
+    }
+
+    fn count_unreadable(&self) -> usize {
+        match self {
+            Backend::Local(b) => b.count_unreadable(),
+            Backend::Cloud(b) => b.count_unreadable(),
         }
     }
 
