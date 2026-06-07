@@ -495,6 +495,53 @@ pub fn read_session(path: &Path) -> CachedSession {
     }
 }
 
+/// Derive a human-readable label for a session row.
+///
+/// Total fallback chain (each rung checked non-empty before falling through);
+/// never panics and never returns a bare session id when a template name is
+/// known:
+///
+/// 1. `intent` (last `IntentUpdated` event, including the init default)
+/// 2. `template_name · salient_var · current_state`
+/// 3. `template_name · current_state`
+/// 4. `untitled (template_name)`
+/// 5. `session_id` — only when even `template_name` is empty (corrupt header)
+///
+/// `session_id` is the display id (the tree key / session name), used solely as
+/// the last-resort rung.
+pub fn derive_label(session: &CachedSession, session_id: &str) -> String {
+    const SEP: &str = " \u{b7} "; // " · "
+
+    // Rung 1: explicit intent.
+    if let Some(intent) = session.intent.as_deref() {
+        if !intent.is_empty() {
+            return intent.to_string();
+        }
+    }
+
+    let template_name = session.header.template_name.as_deref().unwrap_or("");
+
+    // Rungs 2-4 require a non-empty template name.
+    if !template_name.is_empty() {
+        let current_state = session.current_state.as_deref().unwrap_or("");
+        let salient = session.salient_var.as_deref().unwrap_or("");
+
+        // Rung 2: template · salient_var · current_state.
+        if !salient.is_empty() && !current_state.is_empty() {
+            return format!("{template_name}{SEP}{salient}{SEP}{current_state}");
+        }
+        // Rung 3: template · current_state.
+        if !current_state.is_empty() {
+            return format!("{template_name}{SEP}{current_state}");
+        }
+        // Rung 4: untitled (template).
+        return format!("untitled ({template_name})");
+    }
+
+    // Rung 5: bare id, only when the header carried no template name.
+    session_id.to_string()
+}
+
 /// Check whether `state_name` is a terminal state in the compiled template at `template_path`.
 ///
 /// Returns `false` on any I/O or parse error (graceful degradation).
@@ -1670,5 +1717,86 @@ mod tests {
             longer < shorter,
             "longer idle must sort ahead within a band"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // I2: derive_label (total fallback chain, never a bare id)
+    // -----------------------------------------------------------------------
+
+    /// Build a session for label tests with explicit label inputs.
+    fn label_session(
+        intent: Option<&str>,
+        template_name: Option<&str>,
+        current_state: Option<&str>,
+        salient_var: Option<&str>,
+    ) -> CachedSession {
+        let mut header = make_header("display-id", None);
+        header.template_name = template_name.map(|s| s.to_string());
+        CachedSession {
+            header,
+            current_state: current_state.map(|s| s.to_string()),
+            is_terminal: false,
+            is_blocked: false,
+            intent: intent.map(|s| s.to_string()),
+            mtime: SystemTime::UNIX_EPOCH,
+            state_path: PathBuf::new(),
+            last_event_at: None,
+            salient_var: salient_var.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn derive_label_rung1_intent_wins() {
+        let s = label_session(
+            Some("Fix the login bug"),
+            Some("work-on"),
+            Some("implement"),
+            None,
+        );
+        assert_eq!(derive_label(&s, "session-7"), "Fix the login bug");
+    }
+
+    #[test]
+    fn derive_label_rung2_template_salient_state() {
+        let s = label_session(None, Some("work-on"), Some("implement"), Some("issue-42"));
+        assert_eq!(
+            derive_label(&s, "session-7"),
+            "work-on \u{b7} issue-42 \u{b7} implement"
+        );
+    }
+
+    #[test]
+    fn derive_label_rung3_template_state_when_no_salient() {
+        let s = label_session(None, Some("work-on"), Some("implement"), None);
+        assert_eq!(derive_label(&s, "session-7"), "work-on \u{b7} implement");
+    }
+
+    #[test]
+    fn derive_label_rung4_untitled_template_when_no_state() {
+        // Freshly WorkflowInitialized: template known, no current_state.
+        let s = label_session(None, Some("work-on"), None, None);
+        assert_eq!(derive_label(&s, "session-7"), "untitled (work-on)");
+    }
+
+    #[test]
+    fn derive_label_never_bare_id_when_template_and_state_known() {
+        let s = label_session(None, Some("work-on"), Some("implement"), None);
+        let label = derive_label(&s, "session-7");
+        assert_ne!(label, "session-7", "must never fall back to bare id");
+        assert!(label.contains("work-on"));
+    }
+
+    #[test]
+    fn derive_label_rung5_bare_id_only_when_template_empty() {
+        // Corrupt header: no template name at all -> bare id is the last resort.
+        let s = label_session(None, None, Some("implement"), None);
+        assert_eq!(derive_label(&s, "session-7"), "session-7");
+    }
+
+    #[test]
+    fn derive_label_empty_intent_falls_through() {
+        // An empty intent string must not short-circuit the chain.
+        let s = label_session(Some(""), Some("work-on"), Some("implement"), None);
+        assert_eq!(derive_label(&s, "session-7"), "work-on \u{b7} implement");
     }
 }
