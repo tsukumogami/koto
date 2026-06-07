@@ -18,11 +18,39 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::cli::dashboard_data::{DetailData, SessionTree};
+use crate::cli::dashboard_data::{DetailData, Liveness, SessionTree};
 use crate::cli::dashboard_state::{DashboardAppState, DashboardTab, TaskCounts};
 
 /// Maximum number of evidence entries rendered in the detail pane.
 const EVIDENCE_DISPLAY_CAP: usize = 3;
+
+/// Glyph prefix for a liveness band, shown ahead of the idle time.
+fn liveness_glyph(liveness: Liveness) -> &'static str {
+    match liveness {
+        Liveness::NeedsYouBlocked => "\u{25cf}", // ● needs you (blocked)
+        Liveness::NeedsYouFailed => "\u{2717}",  // ✗ failed
+        Liveness::NeedsYouStalled => "\u{25cb}", // ○ stalled
+        Liveness::Active => "\u{25b6}",          // ▶ active
+        Liveness::Idle => "\u{00b7}",            // · idle
+        Liveness::Pending => "\u{2026}",         // … starting
+        Liveness::Done => "\u{2713}",            // ✓ done
+    }
+}
+
+/// Display style for a liveness band: needs-you bright, active bright, idle
+/// normal, stalled/done dim.
+fn liveness_style(liveness: Liveness) -> Style {
+    match liveness {
+        Liveness::NeedsYouBlocked | Liveness::NeedsYouFailed => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        Liveness::Active => Style::default().fg(Color::Green),
+        Liveness::Idle => Style::default(),
+        Liveness::NeedsYouStalled | Liveness::Pending | Liveness::Done => {
+            Style::default().add_modifier(Modifier::DIM)
+        }
+    }
+}
 
 /// Draw the full dashboard to `f`.
 ///
@@ -64,10 +92,9 @@ pub fn render_frame(f: &mut Frame<'_>, state: &DashboardAppState) {
 /// Render the session list as a 4-column table with cursor highlighting and scrollbar.
 fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layout::Rect) {
     let rows_data = state.visible_rows();
-    let row_count = rows_data.len();
 
     // Reserve 1 column for border and 1 for scrollbar on the right (2 total overhead).
-    // Column widths: State=12, Elapsed=9, Tasks=10, plus separators.
+    // Column widths: State=12, Idle=9, Tasks=10, plus separators.
     // Name fills the remaining space via Constraint::Min(0).
     let widths: Vec<Constraint> = vec![
         Constraint::Min(0),
@@ -76,28 +103,63 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
         Constraint::Length(10),
     ];
 
-    let rows: Vec<Row> = rows_data
-        .iter()
-        .map(|row| {
-            let name_cell = format!("{}{}", row.connector, row.display_name);
+    let mut rows: Vec<Row> = Vec::new();
 
-            let state_cell = row.state.as_deref().unwrap_or("-").to_string();
-            let elapsed_cell = format_duration(row.elapsed);
-            let tasks_cell = format_task_counts(row.task_counts.as_ref());
+    // R6 zero-state: when nothing needs the user, lead with an explicit
+    // all-clear row instead of letting absence be inferred. This synthetic row
+    // shifts the selectable session rows down by one; `cursor_offset` keeps the
+    // cursor (which indexes into `visible_rows`) pointed at the right session.
+    let live = state.live_summary();
+    let mut cursor_offset = 0usize;
+    if live.needs_you == 0 {
+        let msg = format!(
+            "Nothing needs you \u{2014} {} active, {} idle",
+            live.active, live.idle
+        );
+        rows.push(Row::new(vec![Cell::from(msg)]).style(Style::default().fg(Color::Green)));
+        cursor_offset = 1;
+    }
 
+    for row in &rows_data {
+        let name_cell = format!("{}{}", row.connector, row.display_name);
+
+        let state_cell = row.state.as_deref().unwrap_or("-").to_string();
+        let elapsed_cell = format!(
+            "{} {}",
+            liveness_glyph(row.liveness),
+            format_duration(row.elapsed)
+        );
+        let tasks_cell = format_task_counts(row.task_counts.as_ref());
+
+        rows.push(
             Row::new(vec![
                 Cell::from(name_cell),
                 Cell::from(state_cell),
                 Cell::from(elapsed_cell),
                 Cell::from(tasks_cell),
             ])
-        })
-        .collect();
+            .style(liveness_style(row.liveness)),
+        );
+    }
+
+    // Trailing collapsed summary for the receded set (hidden by default).
+    let receded = state.receded_summary();
+    if receded.total() > 0 && !state.show_receded {
+        let summary = format!(
+            "\u{2713} {} done \u{00b7} {} abandoned \u{2014} press a / --all",
+            receded.done, receded.abandoned
+        );
+        rows.push(
+            Row::new(vec![Cell::from(summary)]).style(Style::default().add_modifier(Modifier::DIM)),
+        );
+    }
+
+    let row_count = rows.len();
 
     let header = Row::new(vec![
         Cell::from("Name").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("State").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Elapsed").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("Idle").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Tasks").style(Style::default().add_modifier(Modifier::BOLD)),
     ]);
 
@@ -115,7 +177,7 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
         );
 
     let mut table_state = TableState::default();
-    table_state.select(Some(state.cursor_idx));
+    table_state.select(Some(state.cursor_idx + cursor_offset));
 
     f.render_stateful_widget(table, area, &mut table_state);
 
@@ -124,7 +186,8 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
     let visible_height = area.height.saturating_sub(3) as usize;
     if row_count > visible_height {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        let mut scrollbar_state = ScrollbarState::new(row_count).position(state.cursor_idx);
+        let mut scrollbar_state =
+            ScrollbarState::new(row_count).position(state.cursor_idx + cursor_offset);
         f.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
     }
 }
@@ -966,6 +1029,177 @@ mod tests {
             right.contains("No remaining") || right.contains("remaining"),
             "Remaining tab should show empty message; got: {:?}",
             &right[..right.len().min(300)]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // I4: attention-aware list rendering (list-only mode at width 78)
+    // -----------------------------------------------------------------------
+
+    fn render_session(
+        template_name: Option<&str>,
+        current_state: Option<&str>,
+        intent: Option<&str>,
+        is_terminal: bool,
+        is_blocked: bool,
+        last_event_at: Option<std::time::SystemTime>,
+    ) -> crate::cli::dashboard_data::CachedSession {
+        use crate::engine::types::StateFileHeader;
+        use std::path::PathBuf;
+        use std::time::SystemTime;
+        crate::cli::dashboard_data::CachedSession {
+            header: StateFileHeader {
+                schema_version: 1,
+                workflow: "wf".to_string(),
+                template_hash: "abc".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                parent_workflow: None,
+                template_source_dir: None,
+                session_id: String::new(),
+                intent: None,
+                template_name: template_name.map(|s| s.to_string()),
+                needs_agent: None,
+                role: None,
+                inputs: None,
+                coordinator_of_record: None,
+                requested_by: None,
+                assignment_claim: None,
+                dispatch_epoch: 0,
+                priority: None,
+                deadline: None,
+                retry_count: None,
+                agent_config: None,
+                respawn_generation: None,
+            },
+            current_state: current_state.map(|s| s.to_string()),
+            is_terminal,
+            is_blocked,
+            intent: intent.map(|s| s.to_string()),
+            mtime: SystemTime::UNIX_EPOCH,
+            state_path: PathBuf::new(),
+            last_event_at,
+            salient_var: None,
+        }
+    }
+
+    #[test]
+    fn render_list_shows_label_as_name_not_bare_id() {
+        let mut state = DashboardAppState::new(500);
+        // A blocked session with a template + state but no intent: label must be
+        // derived (e.g. "work-on · implement"), never the bare id "sess-xyz".
+        state.tree.sessions.insert(
+            "sess-xyz".to_string(),
+            render_session(
+                Some("work-on"),
+                Some("implement"),
+                None,
+                false,
+                true,
+                Some(std::time::SystemTime::now()),
+            ),
+        );
+        state.tree.roots = vec!["sess-xyz".to_string()];
+
+        // Width 78 keeps the list full-width (no detail split), so the Name
+        // column has room for the label.
+        let backend = TestBackend::new(78, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let list = region_to_string(&buffer, 0..24, 0..78);
+        assert!(
+            list.contains("work-on"),
+            "list must show the derived label; got: {:?}",
+            &list[..list.len().min(300)]
+        );
+        assert!(
+            !list.contains("sess-xyz"),
+            "list must not show the bare session id; got: {:?}",
+            &list[..list.len().min(300)]
+        );
+    }
+
+    #[test]
+    fn render_list_shows_idle_column_header() {
+        let state = empty_state();
+        let backend = TestBackend::new(78, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let header = region_to_string(&buffer, 1..2, 0..78);
+        assert!(
+            header.contains("Idle"),
+            "time column header should read 'Idle'; got: {:?}",
+            header
+        );
+    }
+
+    #[test]
+    fn render_list_collapses_receded_into_summary_row() {
+        let mut state = DashboardAppState::new(500);
+        // One blocked (needs-you) session and one done session (receded).
+        state.tree.sessions.insert(
+            "live".to_string(),
+            render_session(
+                Some("work-on"),
+                Some("implement"),
+                None,
+                false,
+                true,
+                Some(std::time::SystemTime::now()),
+            ),
+        );
+        state.tree.sessions.insert(
+            "finished".to_string(),
+            render_session(
+                Some("work-on"),
+                Some("done"),
+                None,
+                true,
+                false,
+                Some(std::time::SystemTime::now()),
+            ),
+        );
+        state.tree.roots = vec!["live".to_string(), "finished".to_string()];
+
+        let backend = TestBackend::new(78, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let list = region_to_string(&buffer, 0..24, 0..78);
+        assert!(
+            list.contains("done") && list.contains("abandoned"),
+            "receded set must collapse to a summary row; got: {:?}",
+            &list[..list.len().min(400)]
+        );
+    }
+
+    #[test]
+    fn render_list_shows_all_clear_row_when_nothing_needs_you() {
+        let mut state = DashboardAppState::new(500);
+        // A single active session: nobody needs the user.
+        state.tree.sessions.insert(
+            "live".to_string(),
+            render_session(
+                Some("work-on"),
+                Some("implement"),
+                None,
+                false,
+                false,
+                Some(std::time::SystemTime::now()),
+            ),
+        );
+        state.tree.roots = vec!["live".to_string()];
+
+        let backend = TestBackend::new(78, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let list = region_to_string(&buffer, 0..24, 0..78);
+        assert!(
+            list.contains("Nothing needs you"),
+            "all-clear row must render when needs-you band is empty; got: {:?}",
+            &list[..list.len().min(400)]
         );
     }
 }
