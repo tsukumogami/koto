@@ -57,6 +57,8 @@ Submit the task list: `koto next {{SESSION_NAME}} --with-data @tasks.json`.
 
 Then drive every entry the response reports as `materialized_children[*]` with `ready_to_drive: true AND outcome != spawn_failed`. Re-tick the parent after any child completes so the scheduler picks up newly-ready dependents.
 
+The `children-complete` gate holds in `gate_blocked` (`temporal`) until every non-skipped child's result is in. While `output.outstanding` names children, keep re-ticking `koto next {{SESSION_NAME}}`. When `output.results_in` is `true` the gate passes and each `output.children[]` entry carries a `result`. Read each child's outcome inline — for `coord.task-1` that is `output.children[0].result.status` (e.g. `success`) and `output.children[0].result.summary` — without ticking or querying the child. That converged read feeds the summary you write in `summarize`.
+
 <!-- details -->
 
 The `scheduler.feedback.entries` map tells you exactly how every submitted task was handled (`accepted`, `already_running`, `already_terminal_success`, `already_terminal_failure`, `already_skipped`, `blocked`, `errored`, `respawning`). The children-complete gate output routes the parent: `all_success: true` advances to `summarize`, `needs_attention: true` advances to `analyze_failures`. Without a `needs_attention` branch, a failed batch would satisfy `all_complete: true` and slide past the retry window (compile warning W4 catches that footgun).

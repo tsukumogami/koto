@@ -89,6 +89,19 @@
         "Response mentions that the parent can check children with `koto workflows --children release-plan` or `koto status`",
         "Response does NOT suggest manual state file editing or workarounds instead of `--parent`"
       ]
+    },
+    {
+      "id": 8,
+      "name": "converge-read-child-result-inline",
+      "prompt": "I'm running a parent koto workflow called 'coord'. `koto next coord` returned:\n```json\n{\"action\":\"gate_blocked\",\"state\":\"converge\",\"directive\":\"All children finished; their results are in.\",\"blocking_conditions\":[{\"name\":\"children-done\",\"type\":\"children-complete\",\"status\":\"failed\",\"category\":\"temporal\",\"agent_actionable\":true,\"output\":{\"total\":2,\"all_complete\":true,\"results_in\":true,\"converge_blocked\":false,\"outstanding\":[],\"children\":[{\"name\":\"coord.task-1\",\"state\":\"done\",\"complete\":true,\"outcome\":\"success\",\"result\":{\"status\":\"success\",\"summary\":\"implemented and tested the parser change\",\"payload\":{\"files_changed\":3}}},{\"name\":\"coord.task-2\",\"state\":\"done\",\"complete\":true,\"outcome\":\"success\",\"result\":{\"status\":\"success\",\"summary\":\"updated the docs\"}}],\"error\":\"\"}}],\"advanced\":false}\n```\nWhat did `coord.task-1` produce, and how do I read it?",
+      "expected_output": "Agent reads task-1's result inline from the gate output's children[] array: status `success` and summary `implemented and tested the parser change`. It does NOT run koto status, koto next, or koto query against the child to get the result.",
+      "files": [],
+      "assertions": [
+        "Response reports that `coord.task-1` has status `success`",
+        "Response reports the summary `implemented and tested the parser change` for `coord.task-1`",
+        "Response reads the result inline from the gate output's `children[]` array (the `result` object), not from a separate command",
+        "Response does NOT suggest running `koto status coord.task-1`, `koto next coord.task-1`, or `koto query coord.task-1` to obtain the result"
+      ]
     }
   ]
 }

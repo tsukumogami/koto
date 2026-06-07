@@ -259,7 +259,7 @@ actionable (the agent can record an override).
 - `output` carries the structured result from the gate runner:
   - `command` gates: `{"exit_code": <int>, "error": "<string>"}`
   - `context-exists` gates: `{"exists": false, "error": "<string>"}`
-  - `children-complete` gates: `{"total": <int>, "completed": <int>, "pending": <int>, "success": <int>, "failed": <int>, "skipped": <int>, "blocked": <int>, "spawn_failed": <int>, "all_complete": <bool>, "all_success": <bool>, "any_failed": <bool>, "any_skipped": <bool>, "any_spawn_failed": <bool>, "needs_attention": <bool>, "children": [...], "error": "<string>"}`. Each `children[]` entry has `{"name", "state", "complete", "outcome"}`; failed children add `failure_mode` and `reason_source`; skipped children add `skipped_because`, `skipped_because_chain`, `reason_source`; blocked children add `blocked_by`.
+  - `children-complete` gates: `{"total": <int>, "completed": <int>, "pending": <int>, "success": <int>, "failed": <int>, "skipped": <int>, "blocked": <int>, "spawn_failed": <int>, "all_complete": <bool>, "all_success": <bool>, "any_failed": <bool>, "any_skipped": <bool>, "any_spawn_failed": <bool>, "needs_attention": <bool>, "results_in": <bool>, "converge_blocked": <bool>, "outstanding": ["<parent>.<task>", ...], "children": [...], "error": "<string>"}`. The converge fields (`results_in` / `converge_blocked` / `outstanding`) gate result-reading: the gate holds until every non-skipped child's result is in (`results_in: true`, `outstanding: []`). Each `children[]` entry has `{"name", "state", "complete", "outcome"}`; failed children add `failure_mode` and `reason_source`; skipped children add `skipped_because`, `skipped_because_chain`, `reason_source`; blocked children add `blocked_by`. Once `results_in` is `true`, every non-skipped entry also gains a `result` object `{"status": "success"|"failure"|"skipped", "summary": "<string>", "payload": <any, omitted when absent>}` the coordinator reads inline.
 - `blocking_conditions` only includes gates that failed; passing gates are excluded.
 
 ---
@@ -467,6 +467,9 @@ finished yet. This is a temporal condition — it resolves on its own as childre
         "any_skipped": false,
         "any_spawn_failed": false,
         "needs_attention": false,
+        "results_in": false,
+        "converge_blocked": false,
+        "outstanding": ["explore.r3"],
         "children": [
           {"name": "explore.r1", "state": "done", "complete": true, "outcome": "success"},
           {"name": "explore.r2", "state": "done", "complete": true, "outcome": "success"},
@@ -483,12 +486,21 @@ finished yet. This is a temporal condition — it resolves on its own as childre
 **Decision points:**
 - `category: "temporal"` — don't try to fix anything. The children will finish on their
   own. Poll `koto next` again later.
-- `output.all_complete` is `false` — at least one child is still running.
+- `output.all_complete` is `false` — at least one child is still running. `outstanding`
+  names which children the gate is waiting on (`explore.r3` here), by fan-out identity.
 - `output.children` gives per-child detail. Use `koto status <child>` or
   `koto context get <child> <key>` for deeper inspection.
 - `agent_actionable: true` — you can override with `koto overrides record` if you need
   to proceed before all children finish. The override pretends all children are done.
 - Don't retry in a tight loop. Children are running their own workflows and need time.
+- The gate also holds for convergence after children go terminal: if every child is
+  terminal but a result hasn't landed yet, `all_complete` is `true`, `results_in` is
+  `false`, `converge_blocked` is `true`, and `outstanding` names the children whose
+  result is still missing. Re-tick `koto next <parent>` — this clears on its own.
+- Once `results_in` is `true` the gate passes, the parent advances, and each
+  `children[]` entry carries a `result` object (`status` / `summary` / optional
+  `payload`). Read each child's result straight from that array — do not tick or query
+  the child to learn what it produced.
 
 ---
 
