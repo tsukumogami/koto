@@ -1,5 +1,5 @@
 ---
-status: Planned
+status: Current
 upstream: docs/prds/PRD-request-store-converge.md
 problem: |
   koto v0.10.0 ships the fan-out half of coordinator-and-delegates: child
@@ -40,7 +40,7 @@ rationale: |
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 

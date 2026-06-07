@@ -1,5 +1,5 @@
 ---
-status: In Progress
+status: Done
 upstream: docs/briefs/BRIEF-request-store-converge.md
 problem: |
   koto can fan a workflow out to child workflows and learn which children
@@ -28,7 +28,7 @@ motivating_context: |
 
 ## Status
 
-In Progress
+Done
 
 Phase 4 jury (completeness, clarity, testability) returned all-PASS after
 one self-correction defining the converge set (R5, AC5). The downstream

@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Accepted
+status: Done
 problem: |
   koto can fan a workflow out to child workflows and learn that each
   child finished, but not what it produced. Completion records only a
@@ -24,7 +24,7 @@ motivating_context: |
 
 ## Status
 
-Accepted
+Done
 
 Phase 4 jury returned all-PASS (content-quality and structural-format).
 The downstream PRD owns the result-payload schema, the
