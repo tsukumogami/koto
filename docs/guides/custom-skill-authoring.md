@@ -62,7 +62,7 @@ A few things to note about this template:
 - **Gates** are conditions that must be satisfied before a transition. The `context-exists` type checks whether a key exists in the content store. The `command` type runs a shell command and checks the exit code.
 - **Variables** are interpolated at runtime using `{{VARIABLE_NAME}}` syntax. The agent supplies them via `--var KEY=VALUE` on `koto init`.
 
-For the full template format, see [docs/designs/current/DESIGN-koto-template-format.md](../designs/current/DESIGN-koto-template-format.md).
+The supported gate types are `command`, `context-exists`, `context-matches`, and `children-complete`. For full template-authoring guidance, use the `koto-author` skill (in the koto-skills plugin), which compiles and validates templates interactively.
 
 ## Step 2: Validate the template
 
