@@ -2565,6 +2565,13 @@ pub fn build_children_complete_output(
             // identity (composed `<parent>.<task>`) for the GateBlocked
             // blocking_condition (AC2).
             "results_in": results_in,
+            // `converge_blocked` == `all_complete && !results_in`: blocked
+            // SPECIFICALLY on results (every child is terminal but at least
+            // one non-skipped child's result is not yet dereferenceable).
+            // This is NOT the same as `!converge_passes`, which is ALSO true
+            // while children are still running (`!all_complete`). Keep the
+            // distinction so a future consolidation never mislabels a
+            // still-running batch as converge-blocked.
             "converge_blocked": all_complete && !results_in,
             "outstanding": outstanding,
             "children": children_json,
@@ -5254,7 +5261,10 @@ mod tests {
 
     /// AC1: a `Skipped` child with no evidence carries a skipped-status
     /// default-summary result inline and does NOT keep the set outstanding.
-    /// With the only other child resultful, the gate passes.
+    /// With the only other child resultful, the gate passes. The
+    /// `summary.contains("skipped")` assertion below also subsumes the
+    /// "gate never surfaces a summary-less result for a skipped child"
+    /// property (it is strictly stronger than a non-empty check).
     #[test]
     fn skipped_child_carries_default_result_and_does_not_block() {
         let tmp = TempDir::new().unwrap();
@@ -5458,15 +5468,24 @@ mod tests {
         );
     }
 
-    /// AC6: N concurrent completions. Each child's result is a single
-    /// atomic `ChildCompleted` event append; the converge point observes
-    /// every result fully-formed (never a partial/interleaved result), and
-    /// the gate clears exactly when the last of the N lands. We drive N=8
-    /// children, asserting that with N-1 results in the gate is still
-    /// blocked with exactly one outstanding, and once the Nth lands the
-    /// gate passes with every result inlined intact.
+    /// AC6: N completions, each result fully-formed at converge. Each
+    /// child's result is a single `ChildCompleted` event append and the
+    /// converge read takes the latest such event per child under the
+    /// `O_APPEND` discipline, so every inlined result is a complete typed
+    /// envelope (never a partial or half-written one) and the gate clears
+    /// exactly when the last of the N lands. We drive N=8 children,
+    /// asserting that with N-1 results in the gate is still blocked with
+    /// exactly one outstanding, and once the Nth lands the gate passes with
+    /// every result inlined intact.
+    ///
+    /// Scope note: this validates per-completion result integrity under the
+    /// sequential-append discipline (latest `ChildCompleted` wins). It does
+    /// NOT spawn OS-level concurrent writers or exercise append
+    /// interleaving; it appends the N completions in order. The atomicity of
+    /// a single overlength-bounded append against true concurrent writers is
+    /// owned by the terminal-index PIPE_BUF tests, not this one.
     #[test]
-    fn n_concurrent_completions_each_result_observed_atomically() {
+    fn n_completions_each_result_fully_formed_at_converge() {
         let tmp = TempDir::new().unwrap();
         let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
 
@@ -5539,50 +5558,15 @@ mod tests {
         }
     }
 
-    /// AC7: result promotion handles a terminal state whose `accepts`
-    /// block has no summary field by falling back to a final-state-derived
-    /// default summary. This is `synthesize_workflow_result`'s job (covered
-    /// in mod.rs tests); here we verify the converge gate surfaces the
-    /// final-state-derived default for a skipped child with no evidence,
-    /// confirming the gate never produces a summary-less result.
-    #[test]
-    fn converge_surfaces_default_summary_when_no_accepts_summary_field() {
-        let tmp = TempDir::new().unwrap();
-        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
-
-        setup_converge_parent(&backend, "parent", &["skipme"]);
-        append_child_completed(
-            &backend,
-            "parent",
-            "skipme",
-            TerminalOutcome::Skipped,
-            "skip_state",
-            false,
-            "2026-01-01T00:00:02Z",
-        );
-
-        let (_, parent_events) = backend.read_events("parent").unwrap();
-        let template = converge_template("parent");
-        let (_passes, output) = build_children_complete_output(
-            &backend,
-            "parent",
-            &parent_events,
-            &template,
-            "converge",
-            None,
-        );
-
-        let children = output["children"].as_array().unwrap();
-        let entry = children
-            .iter()
-            .find(|c| c["name"] == "parent.skipme")
-            .unwrap();
-        let summary = entry["result"]["summary"].as_str().unwrap();
-        assert!(
-            !summary.is_empty(),
-            "a result must always carry a non-empty default summary"
-        );
-    }
+    // NOTE: a separate `converge_surfaces_default_summary_when_no_accepts_summary_field`
+    // test was removed as redundant. Its only assertion — the gate never
+    // surfaces a summary-less result for a skipped child with no evidence —
+    // is strictly subsumed by `skipped_child_carries_default_result_and_does_not_block`
+    // above, which asserts the stronger `summary.contains("skipped")` on the
+    // same skipped-with-no-evidence path. The final-state-derived default for
+    // a missing `accepts` summary field is the promotion path's concern and
+    // is covered directly by `synthesize_workflow_result_falls_back_to_final_state_default`
+    // in `src/cli/mod.rs`.
 
     #[test]
     fn augment_snapshots_adds_synthetic_entries_for_cleaned_children() {
