@@ -185,6 +185,7 @@ fn build_workspace(tmp: &Path, total: usize, seed: u64) -> (LocalBackend, PathBu
             terminal_at: "2026-05-24T14:35:01.000Z".into(),
             header_mtime_ns: mtime_ns,
             terminal_state: "completed".into(),
+            has_result: false,
         };
         append_terminal_index_entry(&koto_root, &entry).unwrap();
     }
