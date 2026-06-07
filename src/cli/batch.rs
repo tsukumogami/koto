@@ -5117,6 +5117,87 @@ mod tests {
         );
     }
 
+    /// AC1 (deliberate `has_result`-flag deviation): the converge gate keys
+    /// on the DEREFERENCED `entry.result`, NOT on the raw
+    /// `TerminalIndexEntry.has_result` flag. A non-skipped, terminal child
+    /// whose OWN child-log `request_store.result` append FAILED has
+    /// `has_result == false` and yields NOTHING from the live source — yet
+    /// its result is still readable from the parent's `ChildCompleted.result`
+    /// copy. Such a child must NOT be outstanding and must NOT block the
+    /// converge (keying on the raw flag would block it forever). Here the
+    /// child is absent from disk (no live `request_store.result` source) but
+    /// the parent copy is present, so `results_in == true` and the gate
+    /// passes with the result inlined from the parent copy.
+    #[test]
+    fn child_with_only_parent_copy_result_does_not_block_converge() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+
+        setup_converge_parent(&backend, "parent", &["alpha"]);
+        // alpha is a non-skipped, terminal child. It has NO live
+        // `request_store.result` event of its own (the child-log append
+        // failed: `has_result` would be false / the live dereference source
+        // yields nothing). Modeled by leaving it absent from disk so the
+        // ONLY result source is the parent's `ChildCompleted.result` copy.
+        append_child_completed(
+            &backend,
+            "parent",
+            "alpha",
+            TerminalOutcome::Success,
+            "done",
+            true,
+            "2026-01-01T00:00:02Z",
+        );
+
+        // Confirm the live source genuinely yields nothing: the child is
+        // not on disk, so the only place its result can come from is the
+        // parent copy (`has_result == false` for the live source).
+        assert!(
+            !backend.exists("parent.alpha"),
+            "child must be absent from disk so the live request_store.result \
+             source yields nothing and only the parent copy is available"
+        );
+
+        let (_, parent_events) = backend.read_events("parent").unwrap();
+        let template = converge_template("parent");
+        let (converge_passes, output) = build_children_complete_output(
+            &backend,
+            "parent",
+            &parent_events,
+            &template,
+            "converge",
+            None,
+        );
+
+        // The child does NOT block: gate passes, results are in, and the
+        // outstanding set is empty (keying on the raw has_result flag would
+        // have left it outstanding forever).
+        assert!(
+            converge_passes,
+            "a non-skipped child whose result is readable only from the \
+             parent copy must not block the converge"
+        );
+        assert_eq!(output["all_complete"], true);
+        assert_eq!(output["results_in"], true);
+        assert_eq!(output["converge_blocked"], false);
+        assert_eq!(
+            output["outstanding"].as_array().unwrap().len(),
+            0,
+            "the child must NOT appear in the outstanding set"
+        );
+        // The result is inlined from the parent's ChildCompleted.result copy.
+        let children = output["children"].as_array().unwrap();
+        let entry = children
+            .iter()
+            .find(|c| c["name"] == "parent.alpha")
+            .expect("entry for the child");
+        assert_eq!(
+            entry["result"]["summary"], "alpha result",
+            "the child's result must be inlined from the parent copy"
+        );
+        assert_eq!(entry["result"]["status"], "success");
+    }
+
     /// AC3: when the last result lands, the gate passes and every child's
     /// result is inlined into the cleared directive output.
     #[test]
