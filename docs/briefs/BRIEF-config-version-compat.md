@@ -4,11 +4,13 @@ status: Accepted
 problem: |
   Tools that embed koto -- importing its library, driving its CLI, or
   reading its session logs -- must stay compatible with it across
-  releases. koto exposes no stable surface that says what it is
-  compatible with: its config carries runtime tuning and nothing about
-  versioning. So a dependent tool hard-codes an assumption about koto's
-  behavior and breaks silently when koto moves, or pins to an exact
-  build and churns on every release.
+  releases. koto versions its on-disk contract internally (a schema
+  version gates the session-log format and STABILITY.md documents the
+  bump protocol), but none of that is queryable at the boundary: a
+  consumer cannot ask koto what contract version it honors and pin
+  against the answer. `koto version` reports the build, which moves
+  every release. So a dependent tool reverse-engineers compatibility or
+  over-pins, and breaks silently when koto moves.
 outcome: |
   A tool that embeds koto can ask koto what it is compatible with and
   get a stable answer it pins against. When koto changes in a way that
@@ -39,22 +41,26 @@ on it. They import its library, drive its CLI, and read the session
 event logs it writes, and they must keep working as koto evolves
 across releases.
 
-The problem is that koto gives them nothing stable to build that
-dependency on. There is no surface that answers "what is this koto
-compatible with?" -- its configuration carries session and
-request-store tuning, and says nothing about versioning or
-compatibility. A dependent tool is left with two bad options. It can
-hard-code an assumption about how koto behaves; that assumption rots
-silently the day koto changes, and the breakage shows up at runtime,
-far from its cause. Or it can pin to an exact koto build and refuse
-anything else; now it churns on every koto release, even the ones that
-changed nothing it depends on.
+koto is not silent about compatibility -- it just does not expose it
+where a consumer can use it. Internally a schema version
+(`CURRENT_SCHEMA_VERSION`) gates the session-log format, every log
+header carries the schema version it was written at, and `STABILITY.md`
+documents the protocol by which that version bumps and which surfaces
+are frozen. But all of that lives inside koto: the schema version is a
+constant and a number stamped in log files, and the contract is prose
+in a doc. There is no surface a dependent tool can read at the boundary
+that answers "what contract version is this koto?" -- `koto version`
+reports the build version, which moves on every release whether the
+contract changed or not.
 
-Either way the coupling is implicit and fragile. There is no point of
-record where koto states the contract it honors, so a consumer can
-neither depend on stability nor detect a real change deliberately. The
-compatibility relationship between koto and the tools built on it
-exists only as folklore in each consumer's code.
+So a dependent tool is left with two bad options. It can
+reverse-engineer compatibility -- parse a log header, read
+`STABILITY.md`, or guess from the release version -- and that inference
+rots silently the day koto changes, with the breakage showing up at
+runtime far from its cause. Or it can pin to an exact koto build and
+churn on every release, even the ones that changed nothing it depends
+on. The compatibility koto already tracks internally never reaches the
+consumers that need it as a value they can pin against.
 
 ## User Outcome
 
@@ -138,19 +144,23 @@ that the release deliberately set, not one inferred after the fact.
   version that moves independently of koto's release version, or a
   capability set -- and how it maps to the behavior consumers actually
   depend on. Deferred to the PRD and its design.
-- **Where the surface lives.** Whether consumers read it through a koto
-  CLI query, a field on the existing config surface, the session-log
-  header koto already writes, or a dedicated file -- and whether more
-  than one form is warranted for library versus CLI versus log-reading
-  consumers.
+- **Where the surface lives.** Whether consumers read it through the
+  existing `koto version` output (which already has a `--json` mode), a
+  new CLI query, a field on the config surface, the session-log header
+  koto already writes, or a dedicated file -- and whether more than one
+  form is warranted for library versus CLI versus log-reading consumers.
 - **Whether the statement is authored or derived.** Whether the
   compatibility value is set deliberately at release time or computed
   from koto's own version, and how it is kept honest across releases.
 
 ## References
 
+- `docs/STABILITY.md` -- koto's existing stability contract and the
+  `CURRENT_SCHEMA_VERSION` bump protocol this surface would publish.
+- `src/engine/types.rs` -- `CURRENT_SCHEMA_VERSION` and the
+  `schema_version` log-header field that already version the on-disk
+  contract internally.
+- `src/cli/mod.rs` -- the existing `koto version` command (with a
+  `--json` mode) that reports the build version today.
 - `docs/designs/current/DESIGN-config-and-cloud-sync.md` -- the design
-  for the configuration substrate this builds on.
-- `src/config/mod.rs`, `src/config/resolve.rs` -- the shipped config
-  types and the cascade resolution this surface would extend or sit
-  alongside.
+  for the configuration substrate this work sits alongside.
