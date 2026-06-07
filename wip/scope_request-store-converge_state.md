@@ -26,6 +26,9 @@ child_snapshots:
     status: Accepted
     content_hash: 1d5753e9f6f8f57f173366a9c5d546561d09aba8
     captured_at: 2026-06-07T16:21:53Z
+parent_orchestration:
+  active_child: prd
+  dispatched_at: 2026-06-07T16:23:31Z
 ---
 
 # Scope state: request-store-converge
