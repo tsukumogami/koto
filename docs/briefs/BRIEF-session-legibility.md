@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Accepted
+status: Done
 problem: |
   As koto session count grows, the dashboard can no longer answer the
   one question a developer brings to it -- "which session needs me
@@ -21,7 +21,7 @@ outcome: |
 
 ## Status
 
-Accepted
+Done
 
 Framing for the local-scope slice of the session-legibility work,
 reframed from a five-field metadata addition to the dashboard UX

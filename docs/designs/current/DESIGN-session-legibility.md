@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Current
 upstream: docs/prds/PRD-session-legibility.md
 problem: |
   The local dashboard renders every session as a flat, id-sorted, equal-weight
@@ -35,7 +35,7 @@ rationale: |
 
 ## Status
 
-Accepted
+Current
 
 Design for PRD-session-legibility. Settles the mechanism forks the PRD
 deferred: stored-vs-derived liveness, recede-by-decay-vs-filter, the label

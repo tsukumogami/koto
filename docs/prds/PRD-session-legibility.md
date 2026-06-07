@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: Done
 problem: |
   Developers running koto accumulate sessions fast -- every workflow run,
   child spawn, and experiment leaves one behind. The dashboard lists them
@@ -23,7 +23,7 @@ goals: |
 
 ## Status
 
-Accepted
+Done
 
 Requirements for the local-scope dashboard legibility work, derived from the
 accepted `docs/briefs/BRIEF-session-legibility.md`. Mechanism choices
