@@ -808,9 +808,12 @@ mod tests {
                 is_terminal: false,
                 is_blocked: false,
                 intent: None,
-                mtime: SystemTime::UNIX_EPOCH,
+                // A live session (recent last activity) so it stays in the
+                // default (non-receded) view -- an ancient timestamp would
+                // recede past the abandoned threshold and hide the name.
+                mtime: SystemTime::now(),
                 state_path: PathBuf::new(),
-                last_event_at: None,
+                last_event_at: Some(SystemTime::now()),
                 salient_var: None,
                 is_unreadable: false,
             },
