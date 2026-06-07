@@ -304,6 +304,19 @@ pub struct DashboardArgs {
     /// Poll interval in milliseconds (default: 500)
     #[arg(long)]
     pub interval: Option<u64>,
+
+    /// (--once) Filter to a single liveness state: needs-you-blocked,
+    /// needs-you-failed, needs-you-stalled, active, idle, pending, done
+    #[arg(long, value_name = "LIVENESS")]
+    pub status: Option<String>,
+
+    /// (--once) Show only sessions in the needs-you band (blocked/failed/stalled)
+    #[arg(long)]
+    pub needs_you: bool,
+
+    /// (--once) Include the receded set (done + abandoned); default excludes it
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Subcommand)]
@@ -1510,6 +1523,74 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
 /// that work. The initial state is recovered from the on-disk header
 /// after a successful spawn so the JSON `{ name, state }` stdout line
 /// stays byte-compatible with the previous implementation.
+/// Derive a default intent string for a session that was created without an
+/// explicit `--intent`, from the compiled `template`:
+///
+/// 1. the template `description` (first non-empty line), else
+/// 2. the initial state's `directive` (first non-empty line), else
+/// 3. the template `name`.
+///
+/// Returns `None` only when all three are empty (a degenerate template), so a
+/// caller can skip recording.
+fn derive_default_intent(template: &CompiledTemplate) -> Option<String> {
+    let first_line = |s: &str| -> Option<String> {
+        s.lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .map(|l| l.to_string())
+    };
+
+    if let Some(desc) = first_line(&template.description) {
+        return Some(desc);
+    }
+    if let Some(state) = template.states.get(&template.initial_state) {
+        if let Some(directive) = first_line(&state.directive) {
+            return Some(directive);
+        }
+    }
+    if !template.name.is_empty() {
+        return Some(template.name.clone());
+    }
+    None
+}
+
+/// Record a default `IntentUpdated` event for a freshly initialized session
+/// that had no explicit `--intent`. Best-effort: reads the just-written
+/// `WorkflowInitialized` event for the template path, derives a default intent,
+/// and appends it. Failures are logged as warnings and never abort init.
+fn record_default_intent(backend: &dyn SessionBackend, name: &str) {
+    let (header, events) = match backend.read_events(name) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("warning: failed to read session for default intent: {}", e);
+            return;
+        }
+    };
+
+    // Resolve the (possibly session-relative) template path the same way the
+    // dashboard does, so this works regardless of how the artifact was stored.
+    let session_dir = backend.session_dir(name);
+    let Some(machine_state) =
+        crate::engine::persistence::derive_machine_state(&header, &events, &session_dir)
+    else {
+        return;
+    };
+
+    let template = match load_compiled_template(&machine_state.template_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("warning: failed to load template for default intent: {}", e);
+            return;
+        }
+    };
+
+    if let Some(intent) = derive_default_intent(&template) {
+        if let Err(e) = session::handle_update(backend, name, &intent) {
+            eprintln!("warning: failed to record default intent: {}", e);
+        }
+    }
+}
+
 fn handle_init(
     backend: &dyn SessionBackend,
     name: &str,
@@ -1609,12 +1690,16 @@ fn handle_init(
         }
     }
 
-    // If --intent was provided, append an IntentUpdated event.
+    // If --intent was provided, append an IntentUpdated event. Otherwise,
+    // record a default intent derived from the template so the session
+    // self-names (R8).
     if let Some(intent_str) = intent {
         if let Err(e) = session::handle_update(backend, name, intent_str) {
             // Non-fatal: log a warning but do not abort the init.
             eprintln!("warning: failed to record intent: {}", e);
         }
+    } else {
+        record_default_intent(backend, name);
     }
 
     // Recover the initial state by reading back the header/events we
@@ -1719,11 +1804,14 @@ fn handle_init_inline(
         }
     }
 
-    // If --intent was provided, append an IntentUpdated event.
+    // If --intent was provided, append an IntentUpdated event. Otherwise,
+    // record a default intent derived from the template (R8).
     if let Some(intent_str) = intent {
         if let Err(e) = session::handle_update(backend, name, intent_str) {
             eprintln!("warning: failed to record intent: {}", e);
         }
+    } else {
+        record_default_intent(backend, name);
     }
 
     // Recover the initial state for the `{ name, state }` stdout line,
@@ -4562,6 +4650,164 @@ mod tests {
             err.contains("--format html requires --output"),
             "got: {}",
             err
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // I6: default intent at init (derive_default_intent)
+    // -----------------------------------------------------------------------
+
+    fn template_for_intent(
+        name: &str,
+        description: &str,
+        initial_directive: &str,
+    ) -> CompiledTemplate {
+        use crate::template::types::TemplateState;
+        use std::collections::BTreeMap;
+        let mut states = BTreeMap::new();
+        states.insert(
+            "start".to_string(),
+            TemplateState {
+                directive: initial_directive.to_string(),
+                ..TemplateState::default()
+            },
+        );
+        CompiledTemplate {
+            format_version: 1,
+            name: name.to_string(),
+            version: "1.0".to_string(),
+            description: description.to_string(),
+            initial_state: "start".to_string(),
+            variables: BTreeMap::new(),
+            states,
+        }
+    }
+
+    #[test]
+    fn derive_default_intent_prefers_description() {
+        let t = template_for_intent("work-on", "Implement a GitHub issue", "Begin work.");
+        assert_eq!(
+            derive_default_intent(&t),
+            Some("Implement a GitHub issue".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_default_intent_falls_back_to_directive_first_line() {
+        let t = template_for_intent("work-on", "", "Read the issue.\nThen plan.");
+        assert_eq!(
+            derive_default_intent(&t),
+            Some("Read the issue.".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_default_intent_falls_back_to_name() {
+        let t = template_for_intent("work-on", "", "");
+        assert_eq!(derive_default_intent(&t), Some("work-on".to_string()));
+    }
+
+    #[test]
+    fn derive_default_intent_none_when_all_empty() {
+        let t = template_for_intent("", "", "");
+        assert_eq!(derive_default_intent(&t), None);
+    }
+
+    #[test]
+    fn derive_default_intent_description_first_nonempty_line() {
+        let t = template_for_intent("work-on", "\n   \nReal description", "x");
+        assert_eq!(
+            derive_default_intent(&t),
+            Some("Real description".to_string())
+        );
+    }
+
+    /// RAII guard pointing XDG_CACHE_HOME at a temp dir for init tests.
+    struct CacheGuard {
+        _tmp: tempfile::TempDir,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl CacheGuard {
+        fn new() -> Self {
+            let tmp = tempfile::TempDir::new().expect("tmp cache");
+            let prev = std::env::var_os("XDG_CACHE_HOME");
+            std::env::set_var("XDG_CACHE_HOME", tmp.path());
+            Self { _tmp: tmp, prev }
+        }
+    }
+
+    impl Drop for CacheGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+        }
+    }
+
+    const INTENT_TEMPLATE: &str = r#"---
+name: intent-wf
+version: "1.0"
+description: Implement a GitHub issue end to end
+initial_state: gather
+states:
+  gather:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## gather
+
+Gather things.
+
+## done
+
+Done.
+"#;
+
+    #[test]
+    fn init_without_intent_records_default_from_description() {
+        let _cache = CacheGuard::new();
+        let sessions = tempfile::TempDir::new().expect("sessions dir");
+        let backend = LocalBackend::with_base_dir(sessions.path().to_path_buf());
+
+        // Init with no --intent: a default intent should be recorded.
+        handle_init_inline(&backend, "intent-wf", INTENT_TEMPLATE.as_bytes(), &[], None)
+            .expect("inline init");
+
+        let (_h, events) = backend.read_events("intent-wf").expect("read events");
+        let intent = crate::engine::types::derive_intent(&events);
+        assert_eq!(
+            intent,
+            Some("Implement a GitHub issue end to end".to_string()),
+            "default intent must be derived from the template description"
+        );
+    }
+
+    #[test]
+    fn init_with_explicit_intent_wins_over_default() {
+        let _cache = CacheGuard::new();
+        let sessions = tempfile::TempDir::new().expect("sessions dir");
+        let backend = LocalBackend::with_base_dir(sessions.path().to_path_buf());
+
+        handle_init_inline(
+            &backend,
+            "intent-wf2",
+            INTENT_TEMPLATE.as_bytes(),
+            &[],
+            Some("My explicit intent"),
+        )
+        .expect("inline init");
+
+        let (_h, events) = backend.read_events("intent-wf2").expect("read events");
+        let intent = crate::engine::types::derive_intent(&events);
+        assert_eq!(
+            intent,
+            Some("My explicit intent".to_string()),
+            "explicit --intent must win over the template default"
         );
     }
 

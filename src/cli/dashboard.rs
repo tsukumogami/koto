@@ -15,7 +15,10 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use crate::cli::dashboard_data::{self, compute_elapsed_since, CachedSession, SessionTree};
+use crate::cli::dashboard_data::liveness::{attention_key, idle_for, is_receded};
+use crate::cli::dashboard_data::{
+    self, classify_liveness, compute_elapsed_since, CachedSession, Liveness, SessionTree,
+};
 use crate::cli::dashboard_render::render_frame;
 use crate::cli::dashboard_state::DashboardAppState;
 use crate::cli::DashboardArgs;
@@ -53,6 +56,26 @@ fn classify_status(session: &CachedSession) -> &'static str {
     }
 }
 
+/// Stable machine-readable liveness token for the `--once` `liveness` column
+/// and the `--status` filter. Kebab-case so it is shell-friendly.
+fn liveness_token(liveness: Liveness) -> &'static str {
+    match liveness {
+        Liveness::NeedsYouBlocked => "needs-you-blocked",
+        Liveness::NeedsYouFailed => "needs-you-failed",
+        Liveness::NeedsYouStalled => "needs-you-stalled",
+        Liveness::Active => "active",
+        Liveness::Idle => "idle",
+        Liveness::Pending => "pending",
+        Liveness::Done => "done",
+    }
+}
+
+/// Replace tab and newline characters with single spaces so an appended column
+/// value can never break the tab-separated `--once` contract.
+fn sanitize_field(s: &str) -> String {
+    s.replace(['\t', '\n', '\r'], " ")
+}
+
 /// Format an elapsed duration as a compact human-readable string.
 ///
 /// Mirrors the format used by the render layer: `"0s"`, `"{s}s"`, `"{m}m{s}s"`, `"{h}h{m}m"`.
@@ -72,38 +95,105 @@ fn format_elapsed(secs: u64) -> String {
     }
 }
 
+/// Print the `--once` tab-separated feed.
+///
+/// Columns: `id, current_state, elapsed, status, intent, template` (the
+/// original six, unchanged for positional compatibility) plus appended
+/// `idle, liveness` (columns 7-8). Rows are emitted in attention order. The
+/// receded set is excluded by default; `--all` includes it. `--status` /
+/// `--needs-you` filter the rows. Appended fields are sanitized of tabs and
+/// newlines so the tab-separated contract holds.
+fn run_once(args: &DashboardArgs, tree: &SessionTree) {
+    use std::time::SystemTime;
+
+    let now = SystemTime::now();
+
+    // Build (session_id, &session, liveness, idle) tuples, applying filters.
+    let mut rows: Vec<(&str, &CachedSession, Liveness, std::time::Duration)> = Vec::new();
+    for (session_id, session) in tree.sessions.iter() {
+        // Optional name filter (matches the legacy behavior).
+        if let Some(ref filter) = args.name {
+            if session_id != filter {
+                continue;
+            }
+        }
+
+        let liveness = classify_liveness(session, now);
+        let idle = idle_for(session, now);
+
+        // Default excludes the receded set unless --all.
+        if !args.all && is_receded(liveness, idle) {
+            continue;
+        }
+
+        // --needs-you: only the needs-you band.
+        if args.needs_you && attention_key(liveness, idle).0 != 0 {
+            continue;
+        }
+
+        // --status <liveness>: exact liveness token match.
+        if let Some(ref status) = args.status {
+            if liveness_token(liveness) != status.as_str() {
+                continue;
+            }
+        }
+
+        rows.push((session_id.as_str(), session, liveness, idle));
+    }
+
+    // Attention order; tie-break on session id for determinism.
+    rows.sort_by(|a, b| {
+        attention_key(a.2, a.3)
+            .cmp(&attention_key(b.2, b.3))
+            .then_with(|| a.0.cmp(b.0))
+    });
+
+    for (session_id, session, liveness, idle) in rows {
+        println!("{}", format_once_line(session_id, session, liveness, idle));
+    }
+
+    // Surface unparseable sessions as a trailing note on stderr so the
+    // tab-separated stdout contract stays clean for positional readers.
+    if tree.unreadable > 0 {
+        eprintln!("note: {} unreadable session(s) skipped", tree.unreadable);
+    }
+}
+
+/// Build a single `--once` line for a session. First six columns match the
+/// legacy positional contract; columns 7-8 are the appended `idle` and
+/// `liveness`. Appended/interpolated fields are sanitized of tabs/newlines.
+fn format_once_line(
+    session_id: &str,
+    session: &CachedSession,
+    liveness: Liveness,
+    idle: std::time::Duration,
+) -> String {
+    let current_state = session.current_state.as_deref().unwrap_or("");
+    let elapsed_secs = compute_elapsed_since(&session.header.created_at).as_secs();
+    let elapsed = format_elapsed(elapsed_secs);
+    let status_bucket = classify_status(session);
+    let idle_str = format_elapsed(idle.as_secs());
+    let liveness_str = liveness_token(liveness);
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        session_id,
+        sanitize_field(current_state),
+        elapsed,
+        status_bucket,
+        sanitize_field(session.intent.as_deref().unwrap_or("")),
+        sanitize_field(session.header.template_name.as_deref().unwrap_or("")),
+        sanitize_field(&idle_str),
+        liveness_str,
+    )
+}
+
 /// Entry point called from the CLI dispatch in `src/cli/mod.rs`.
 pub fn run(args: DashboardArgs, backend: &dyn SessionBackend) -> Result<()> {
     // --once: print tab-separated lines and exit without a TUI.
     if args.once {
         let mut tree = SessionTree::new();
         dashboard_data::refresh(&mut tree, backend)?;
-        // Collect and sort all session IDs for deterministic output.
-        let mut all_ids: Vec<&str> = tree.sessions.keys().map(|s| s.as_str()).collect();
-        all_ids.sort();
-        for session_id in all_ids {
-            // Apply optional name filter.
-            if let Some(ref filter) = args.name {
-                if session_id != filter {
-                    continue;
-                }
-            }
-            if let Some(session) = tree.sessions.get(session_id) {
-                let current_state = session.current_state.as_deref().unwrap_or("").to_string();
-                let elapsed_secs = compute_elapsed_since(&session.header.created_at).as_secs();
-                let elapsed = format_elapsed(elapsed_secs);
-                let status_bucket = classify_status(session);
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
-                    session_id,
-                    current_state,
-                    elapsed,
-                    status_bucket,
-                    session.intent.as_deref().unwrap_or(""),
-                    session.header.template_name.as_deref().unwrap_or(""),
-                );
-            }
-        }
+        run_once(&args, &tree);
         return Ok(());
     }
 
@@ -229,6 +319,9 @@ mod tests {
             intent: None,
             mtime: SystemTime::UNIX_EPOCH,
             state_path: PathBuf::new(),
+            last_event_at: None,
+            salient_var: None,
+            is_unreadable: false,
         }
     }
 
@@ -290,5 +383,189 @@ mod tests {
     #[test]
     fn format_elapsed_hours() {
         assert_eq!(format_elapsed(3661), "1h1m");
+    }
+
+    // -----------------------------------------------------------------------
+    // I5: --once appended columns + filters
+    // -----------------------------------------------------------------------
+
+    fn once_session(
+        template_name: Option<&str>,
+        current_state: Option<&str>,
+        intent: Option<&str>,
+        is_terminal: bool,
+        is_blocked: bool,
+    ) -> CachedSession {
+        let mut s = make_session_with_blocked(current_state, is_terminal, is_blocked);
+        s.header.template_name = template_name.map(|t| t.to_string());
+        s.intent = intent.map(|i| i.to_string());
+        // Fresh last_event_at so non-terminal sessions read as Active.
+        s.last_event_at = Some(std::time::SystemTime::now());
+        s
+    }
+
+    #[test]
+    fn once_line_keeps_first_six_columns_and_appends_two() {
+        let s = once_session(
+            Some("work-on"),
+            Some("implement"),
+            Some("fix bug"),
+            false,
+            false,
+        );
+        let line = format_once_line("sess-1", &s, Liveness::Active, std::time::Duration::ZERO);
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(
+            cols.len(),
+            8,
+            "must emit exactly eight tab-separated columns"
+        );
+        // First six unchanged from the legacy contract.
+        assert_eq!(cols[0], "sess-1");
+        assert_eq!(cols[1], "implement");
+        assert_eq!(cols[3], "running"); // classify_status bucket
+        assert_eq!(cols[4], "fix bug"); // intent
+        assert_eq!(cols[5], "work-on"); // template
+                                        // Appended columns 7-8.
+        assert_eq!(cols[7], "active", "column 8 is the liveness token");
+    }
+
+    #[test]
+    fn once_line_sanitizes_tabs_and_newlines_in_appended_fields() {
+        let s = once_session(
+            Some("tmpl\twith\ttabs"),
+            Some("state\nbreak"),
+            Some("intent\twith\ttab"),
+            false,
+            false,
+        );
+        let line = format_once_line("sess-2", &s, Liveness::Active, std::time::Duration::ZERO);
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(
+            cols.len(),
+            8,
+            "embedded tabs/newlines must not add columns; got: {:?}",
+            cols
+        );
+        assert!(!cols[4].contains('\n') && !cols[5].contains('\n'));
+    }
+
+    #[test]
+    fn liveness_token_is_kebab_case_for_each_variant() {
+        assert_eq!(
+            liveness_token(Liveness::NeedsYouBlocked),
+            "needs-you-blocked"
+        );
+        assert_eq!(liveness_token(Liveness::NeedsYouFailed), "needs-you-failed");
+        assert_eq!(
+            liveness_token(Liveness::NeedsYouStalled),
+            "needs-you-stalled"
+        );
+        assert_eq!(liveness_token(Liveness::Active), "active");
+        assert_eq!(liveness_token(Liveness::Idle), "idle");
+        assert_eq!(liveness_token(Liveness::Pending), "pending");
+        assert_eq!(liveness_token(Liveness::Done), "done");
+    }
+
+    /// Build a tree-backed run_once filter test by exercising the same predicate
+    /// logic run_once uses. We construct a small tree and assert which session
+    /// ids survive each filter.
+    fn surviving_ids(args: &DashboardArgs, tree: &SessionTree) -> Vec<String> {
+        use crate::cli::dashboard_data::liveness::{attention_key, idle_for, is_receded};
+        use std::time::SystemTime;
+        let now = SystemTime::now();
+        let mut out: Vec<String> = Vec::new();
+        for (id, session) in tree.sessions.iter() {
+            if let Some(ref filter) = args.name {
+                if id != filter {
+                    continue;
+                }
+            }
+            let liveness = classify_liveness(session, now);
+            let idle = idle_for(session, now);
+            if !args.all && is_receded(liveness, idle) {
+                continue;
+            }
+            if args.needs_you && attention_key(liveness, idle).0 != 0 {
+                continue;
+            }
+            if let Some(ref status) = args.status {
+                if liveness_token(liveness) != status.as_str() {
+                    continue;
+                }
+            }
+            out.push(id.clone());
+        }
+        out.sort();
+        out
+    }
+
+    fn dashboard_args(needs_you: bool, all: bool, status: Option<&str>) -> DashboardArgs {
+        DashboardArgs {
+            name: None,
+            once: true,
+            interval: None,
+            status: status.map(|s| s.to_string()),
+            needs_you,
+            all,
+        }
+    }
+
+    fn once_tree() -> SessionTree {
+        let mut tree = SessionTree::new();
+        // blocked (needs-you), active, done (receded).
+        tree.sessions.insert(
+            "s-blocked".to_string(),
+            once_session(Some("work-on"), Some("build"), None, false, true),
+        );
+        tree.sessions.insert(
+            "s-active".to_string(),
+            once_session(Some("work-on"), Some("implement"), None, false, false),
+        );
+        tree.sessions.insert(
+            "s-done".to_string(),
+            once_session(Some("work-on"), Some("done"), None, true, false),
+        );
+        tree
+    }
+
+    #[test]
+    fn once_default_excludes_receded() {
+        let tree = once_tree();
+        let ids = surviving_ids(&dashboard_args(false, false, None), &tree);
+        assert!(
+            !ids.contains(&"s-done".to_string()),
+            "done is receded by default"
+        );
+        assert!(ids.contains(&"s-blocked".to_string()));
+        assert!(ids.contains(&"s-active".to_string()));
+    }
+
+    #[test]
+    fn once_all_includes_receded() {
+        let tree = once_tree();
+        let ids = surviving_ids(&dashboard_args(false, true, None), &tree);
+        assert!(
+            ids.contains(&"s-done".to_string()),
+            "--all includes receded"
+        );
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn once_status_blocked_restricts_output() {
+        let tree = once_tree();
+        let ids = surviving_ids(
+            &dashboard_args(false, false, Some("needs-you-blocked")),
+            &tree,
+        );
+        assert_eq!(ids, vec!["s-blocked".to_string()]);
+    }
+
+    #[test]
+    fn once_needs_you_keeps_only_needs_you_band() {
+        let tree = once_tree();
+        let ids = surviving_ids(&dashboard_args(true, false, None), &tree);
+        assert_eq!(ids, vec!["s-blocked".to_string()]);
     }
 }

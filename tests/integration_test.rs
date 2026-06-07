@@ -126,14 +126,24 @@ fn init_creates_state_file() {
     let state_path = session_state_path(dir.path(), "my-wf");
     assert!(state_path.exists(), "state file should be created");
 
-    // Verify the state file has exactly 3 lines: header + workflow_initialized + transitioned.
+    // Verify the state file has exactly 4 lines: header + workflow_initialized
+    // + transitioned + the default intent_updated event recorded at init when
+    // no --intent is supplied.
     let state_content = std::fs::read_to_string(&state_path).unwrap();
     let lines: Vec<&str> = state_content.lines().collect();
     assert_eq!(
         lines.len(),
-        3,
-        "state file should have 3 lines (header + 2 events), got {}",
+        4,
+        "state file should have 4 lines (header + 3 events), got {}",
         lines.len()
+    );
+    // The final event is the default intent.
+    let last_event: serde_json::Value =
+        serde_json::from_str(lines[3]).expect("last event should be valid JSON");
+    assert_eq!(
+        last_event["type"].as_str(),
+        Some("intent_updated"),
+        "the default intent event should be recorded at init"
     );
 
     // Verify the header line has schema_version.
@@ -471,9 +481,11 @@ fn rewind_appends_rewind_event() {
         .unwrap();
 
     // Append a transitioned event so there are 2+ state-changing events,
-    // making rewind possible (init writes header + workflow_initialized + transitioned).
+    // making rewind possible. Init writes header + workflow_initialized (seq 1)
+    // + transitioned (seq 2) + the default intent_updated (seq 3), so the manual
+    // transition is seq 4.
     let state_path = session_state_path(dir.path(), "rewind-wf");
-    let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
+    let extra_event = r#"{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .append(true)
@@ -867,7 +879,7 @@ fn rewind_event_has_from_and_to_in_payload() {
 
     // Append a transitioned event so rewind is possible.
     let state_path = session_state_path(dir.path(), "payload-wf");
-    let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
+    let extra_event = r#"{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -6919,7 +6931,7 @@ fn rewind_parent_includes_children_array() {
 
     // Append a transition event so rewind has somewhere to go back to.
     let state_path = session_state_path(dir.path(), "parent-rewind");
-    let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
+    let extra_event = r#"{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -6980,7 +6992,7 @@ fn rewind_workflow_no_children_returns_empty_array() {
 
     // Append a transition event so rewind is possible.
     let state_path = session_state_path(dir.path(), "solo-rewind");
-    let extra_event = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
+    let extra_event = r#"{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"start","to":"done","condition_type":"gate"}}"#;
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()

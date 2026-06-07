@@ -303,7 +303,10 @@ fn non_batch_rewind_unchanged() {
     let (ok, _, stderr) = run_koto(tmp.path(), &["init", "simple-wf", "--template", src_str]);
     assert!(ok, "init failed: {}", stderr);
 
-    // Append transition events manually to advance to "middle".
+    // Append a transition event manually to advance to "middle". After `init`
+    // the log holds seq 1 (workflow_initialized), seq 2 (transition to the
+    // initial state), and seq 3 (the default intent_updated event recorded when
+    // no --intent is supplied), so the manual transition is seq 4.
     let state_path = session_state_path(tmp.path(), "simple-wf");
     {
         use std::io::Write;
@@ -313,7 +316,7 @@ fn non_batch_rewind_unchanged() {
             .unwrap();
         writeln!(
             f,
-            r#"{{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{{"from":"start","to":"middle","condition_type":"gate"}}}}"#
+            r#"{{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{{"from":"start","to":"middle","condition_type":"gate"}}}}"#
         )
         .unwrap();
     }
