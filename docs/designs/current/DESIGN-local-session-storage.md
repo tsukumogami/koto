@@ -28,6 +28,8 @@ rationale: |
 
 Current
 
+> **Note:** The `~/.koto/sessions/{repo-id}/{name}/` layout (Decisions 2/5) was later flattened to `~/.koto/sessions/<id>/`; repo-id scoping was removed by the dashboard/session-legibility work (see `LocalBackend::new` + `migrate_if_needed`).
+
 ## Context and problem statement
 
 koto's workflow engine produces temporary artifacts during execution: engine state

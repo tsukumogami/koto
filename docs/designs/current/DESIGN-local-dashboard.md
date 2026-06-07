@@ -61,6 +61,8 @@ rationale: |
 
 Implemented
 
+> **Note:** Superseded in part by DESIGN-session-legibility (PR #166): the `--once` output now has 8 columns (adds `idle`, `liveness`) and the list is attention-ordered, not health-severity sorted.
+
 ## Context and Problem Statement
 
 koto sessions accumulate state in JSONL files — one file per session, written

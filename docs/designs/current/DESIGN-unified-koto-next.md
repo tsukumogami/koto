@@ -1,5 +1,5 @@
 ---
-status: Planned
+status: Current
 upstream: docs/prds/PRD-unified-koto-next.md
 problem: |
   koto's three core systems — CLI contract, state model, and workflow definition format —
@@ -30,7 +30,7 @@ rationale: |
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 

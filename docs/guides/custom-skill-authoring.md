@@ -62,7 +62,7 @@ A few things to note about this template:
 - **Gates** are conditions that must be satisfied before a transition. The `context-exists` type checks whether a key exists in the content store. The `command` type runs a shell command and checks the exit code.
 - **Variables** are interpolated at runtime using `{{VARIABLE_NAME}}` syntax. The agent supplies them via `--var KEY=VALUE` on `koto init`.
 
-For the full template format, see [docs/designs/current/DESIGN-koto-template-format.md](../designs/current/DESIGN-koto-template-format.md).
+The supported gate types are `command`, `context-exists`, `context-matches`, and `children-complete`. For full template-authoring guidance, use the `koto-author` skill (in the koto-skills plugin), which compiles and validates templates interactively.
 
 ## Step 2: Validate the template
 
@@ -190,7 +190,7 @@ Use `.koto/templates/hello-koto.md` as the `--template` path in all koto command
 
 #### Execution loop
 
-The step-by-step koto command sequence. This is the core of the skill. Walk the agent through `koto init`, `koto next`, executing the directive, and `koto transition` for each state.
+The step-by-step koto command sequence. This is the core of the skill. Walk the agent through `koto init`, `koto next`, executing the directive, and directed transitions (`koto next <name> --to <state>`) for each state.
 
 Include the exact commands, flag values, and expected JSON responses. The agent needs to know what success looks like.
 
@@ -199,17 +199,17 @@ Include the exact commands, flag values, and expected JSON responses. The agent 
 
 ### 1. Initialize the workflow
 
-    koto init --template .koto/templates/hello-koto.md --name hello --var SPIRIT_NAME=<name>
+    koto init hello --template .koto/templates/hello-koto.md --var SPIRIT_NAME=<name>
 
-Returns `{"state":"awakening"}`. The template is compiled and cached on first init.
+Returns `{"name":"hello","state":"awakening"}`. The template is compiled and cached on first init.
 
 ### 2. Get the current directive
 
-    koto next
+    koto next hello
 
 Returns:
 
-    {"action":"execute","state":"awakening","directive":"You are <name>..."}
+    {"action":"evidence_required","state":"awakening","directive":"You are <name>...","advanced":false,"expects":{...},"blocking_conditions":[],"error":null}
 
 ### 3. Execute the directive
 
@@ -217,18 +217,18 @@ Create the greeting file.
 
 ### 4. Transition to the terminal state
 
-    koto transition eternal
+    koto next hello --to eternal
 
 ### 5. Confirm completion
 
-    koto next
+    koto next hello
 
-Returns `{"action":"done","state":"eternal","message":"workflow complete"}`.
+Returns `{"action":"done","state":"eternal","advanced":true,"expects":null,"error":null}`.
 ```
 
 #### Evidence keys
 
-Document each gate from the template. The agent needs to know what conditions must hold before calling `koto transition`.
+Document each gate from the template. The agent needs to know what conditions must hold before requesting a directed transition with `koto next <name> --to <state>`.
 
 ```markdown
 The `awakening` state has one gate:
@@ -244,7 +244,7 @@ Each gate type produces structured output matching its schema (see [Gate output 
 
 #### Response schemas
 
-Document the JSON shapes returned by `koto next` and `koto transition` so the agent can parse them correctly. See the hello-koto SKILL.md for examples. You can also point to the [CLI usage guide](cli-usage.md) for the full command reference.
+Document the JSON shapes returned by `koto next` (including directed transitions via `koto next <name> --to <state>`) so the agent can parse them correctly. See the hello-koto SKILL.md for examples. You can also point to the [CLI usage guide](cli-usage.md) for the full command reference.
 
 #### Error handling
 
@@ -267,7 +267,7 @@ How to pick up an interrupted workflow. koto state files persist across sessions
 If the session is interrupted mid-workflow:
 
 1. Run `koto workflows` to check for active state files.
-2. Run `koto next` to get the current directive.
+2. Run `koto next <name>` to get the current directive.
 3. Continue from wherever the workflow left off.
 ```
 
@@ -293,7 +293,7 @@ your-project/
 Commit them to your repo. Anyone who clones the project gets the skill automatically -- Claude Code discovers `.claude/skills/` on startup. The template already lives at a stable path, so no copy step is needed. Your SKILL.md can reference the template directly:
 
 ```bash
-koto init --template .claude/skills/my-workflow/my-workflow.md --name my-workflow
+koto init my-workflow --template .claude/skills/my-workflow/my-workflow.md
 ```
 
 This is the simplest path. No plugin infrastructure, no extra setup. Just two files in your repo.
@@ -417,7 +417,7 @@ gates:
     pattern: "^## Step \\d+"
 ```
 
-These gates are evaluated automatically when the agent calls `koto next` or `koto transition`. They replace the older pattern of using `command` gates with `test -f` checks against the session directory.
+These gates are evaluated automatically when the agent calls `koto next` (including directed transitions via `koto next <name> --to <state>`). They replace the older pattern of using `command` gates with `test -f` checks against the session directory.
 
 ### Gate output schemas
 
@@ -580,11 +580,11 @@ When a user invokes `/hello-koto Hasami`:
 
 1. Agent reads the SKILL.md.
 2. Copies the template to `.koto/templates/hello-koto.md` if needed.
-3. Runs `koto init --template .koto/templates/hello-koto.md --name hello --var SPIRIT_NAME=Hasami`.
-4. Runs `koto next` -- gets the awakening directive.
+3. Runs `koto init hello --template .koto/templates/hello-koto.md --var SPIRIT_NAME=Hasami`.
+4. Runs `koto next hello` -- gets the awakening directive.
 5. Submits the greeting via `koto context add hello spirit-greeting.txt`.
-6. Runs `koto transition eternal` -- the `context-exists` gate passes.
-7. Runs `koto next` -- gets `{"action":"done"}`.
+6. Runs `koto next hello --to eternal` -- the `context-exists` gate passes.
+7. Runs `koto next hello` -- gets `{"action":"done"}`.
 8. Reports completion to the user.
 
 ## Cross-platform support

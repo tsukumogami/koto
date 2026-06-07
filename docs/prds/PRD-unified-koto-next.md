@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Done
 problem: |
   koto's state evolution requires multiple CLI commands: koto next to read the current
   directive, koto transition to advance state, and planned features like cross-agent
@@ -24,7 +24,7 @@ source_issue: 43
 
 ## Status
 
-Accepted
+Done
 
 ## Problem Statement
 

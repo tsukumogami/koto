@@ -12,7 +12,7 @@ The `error` field is a human-readable message. The `command` field identifies wh
 
 ### init
 
-**Workflow already exists** — a `koto-<name>.state.jsonl` file exists in the current directory:
+**Workflow already exists** — a session for this name already exists under `~/.koto/sessions/<repo-id>/<name>/` (its `koto-<name>.state.jsonl` state file is present):
 
 ```json
 {"error":"workflow 'my-workflow' already exists","command":"init"}
@@ -53,16 +53,19 @@ Domain errors use this shape:
 }
 ```
 
-The `details` array is empty when the error isn't field-specific. The six error codes:
+The `details` array is empty when the error isn't field-specific. The nine error codes:
 
 | Code | Exit | Meaning |
 |------|:----:|---------|
 | `gate_blocked` | 1 | One or more command gates failed or timed out. Transient -- may resolve on retry. |
 | `integration_unavailable` | 1 | The state declares an integration but no runner is available. Transient. |
+| `concurrent_access` | 1 | Another `koto next` invocation is already running on this workflow. Transient -- wait and retry. |
 | `invalid_submission` | 2 | The `--with-data` payload is malformed, too large, or fails schema validation. Caller must fix the payload. |
 | `precondition_failed` | 2 | A logical precondition wasn't met: `--with-data` and `--to` used together, `--to` targets an invalid state, or the state has no `accepts` block. |
 | `terminal_state` | 2 | Evidence was submitted to a terminal state. The workflow is already done. |
 | `workflow_not_initialized` | 2 | No state file found for the given workflow name. |
+| `template_error` | 3 | A structural template problem: cycle detected, chain limit reached, ambiguous transition, dead-end state, unresolvable transition, or unknown state. |
+| `persistence_error` | 3 | A disk I/O failure while reading or writing the state file. |
 
 Exit code 1 means transient -- the agent can retry without changing its behavior. Exit code 2 means the agent must change something (fix the payload, pick a different target, etc.).
 

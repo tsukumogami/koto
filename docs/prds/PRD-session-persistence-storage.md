@@ -1,5 +1,5 @@
 ---
-status: In Progress
+status: Done
 problem: |
   koto stores workflow session state (engine state files, research artifacts, plans,
   decision reports) in a wip/ directory committed to git feature branches. This works
@@ -20,7 +20,7 @@ goals: |
 
 ## Status
 
-In Progress
+Done
 
 ## Problem statement
 
@@ -245,19 +245,19 @@ the upload on the next state-mutating command automatically.
 - [x] Content-aware gates (`koto-context-exists: X`) evaluate against koto's content store
 - [x] Shell gates can call `koto context exists` as a fallback
 - [x] Default backend stores context in `~/.koto/sessions/<name>/` (opaque to agents)
-- [ ] Cloud backend syncs both state and context to S3-compatible store on state-mutating commands
-- [ ] `koto context add` triggers cloud sync when cloud backend is configured
-- [ ] On a new machine, `koto next` automatically downloads remote session (state + context)
-- [ ] Diverged local and remote versions produce a conflict error (not silent overwrite)
+- [x] Cloud backend syncs both state and context to S3-compatible store on state-mutating commands
+- [x] `koto context add` triggers cloud sync when cloud backend is configured
+- [x] On a new machine, `koto next` automatically downloads remote session (state + context)
+- [x] Diverged local and remote versions produce a conflict error (not silent overwrite)
 - [ ] Git backend stores context as files in the git working tree at the configured path
-- [ ] `koto config get/set` reads and writes configuration values
-- [ ] Backend selection follows precedence: project config > user config > default
+- [x] `koto config get/set` reads and writes configuration values
+- [x] Backend selection follows precedence: project config > user config > default
 - [x] `koto session list` shows all local sessions with names and timestamps
 - [x] `koto session cleanup <name>` removes local and cloud artifacts
 - [x] Workflow completion triggers automatic session cleanup (content + state)
 - [x] `--no-cleanup` flag preserves session on workflow completion
-- [ ] Cloud sync failure logs a warning and doesn't block the workflow
-- [ ] `koto session resolve --keep local|remote` resolves version conflicts
+- [x] Cloud sync failure logs a warning and doesn't block the workflow
+- [x] `koto session resolve --keep local|remote` resolves version conflicts
 - [x] Templates using `{{SESSION_DIR}}` resolve to the session path
 - [ ] Content-aware gates work with all backends (local, cloud, git)
 
