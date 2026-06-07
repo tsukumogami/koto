@@ -772,18 +772,86 @@ are suppressed to prevent log bloat.
 
 ---
 
+## Dashboard `--once` Feed
+
+`koto dashboard --once` prints one tab-separated line per session and exits (no TUI).
+It is the scripting surface over the session feed. The dashboard derives all of the
+columns below at read time from the data already in this contract (the event log,
+header, and computed current state) — nothing new is written to disk.
+
+### Columns
+
+Lines are tab-separated. The first six columns are stable and positionally compatible
+with earlier koto releases; columns 7 and 8 were appended additively.
+
+| # | Column | Description |
+|---|--------|-------------|
+| 1 | `id` | Session name (the tree key). |
+| 2 | `current_state` | Current state derived from the event log; empty when the run never advanced. |
+| 3 | `elapsed` | Time since session creation (`created_at`), compact form (e.g. `2m5s`, `1h1m`). |
+| 4 | `status` | Coarse bucket: `done`, `failed`, `blocked`, `running`, or `unknown`. |
+| 5 | `intent` | Derived intent (last `IntentUpdated`, including the init default). |
+| 6 | `template` | Template name from the header. |
+| 7 | `idle` | **(appended)** Time since the last event (last activity), compact form. |
+| 8 | `liveness` | **(appended)** Read-time liveness token (see vocabulary below). |
+
+Appended fields are sanitized of tab, carriage-return, and newline characters so the
+tab-separated contract holds. Rows are emitted in attention order (needs-you band
+first, then active, then idle/fresh-pending), longest-idle first within a band.
+
+A consumer reading only the first six fields is unaffected. A consumer that asserts a
+strict column count must expect eight.
+
+### Liveness Vocabulary
+
+`liveness` is one of the following tokens, computed from last-activity recency with
+blocked / terminal / never-started resolved before any idle threshold:
+
+| Token | Meaning |
+|-------|---------|
+| `needs-you-blocked` | Waiting on a gate that has not passed. A human decision unblocks it. |
+| `needs-you-failed` | Terminal in a failed/error state. Needs attention. |
+| `needs-you-stalled` | Advanced, then went silent past the stalled threshold (default 2h). |
+| `active` | Non-terminal and recently active (idle below the active window, default 5m). |
+| `idle` | Non-terminal, idle between the active window and the stalled threshold. |
+| `pending` | Never advanced past `workflow_initialized` (no current state). |
+| `done` | Terminal, not failed. |
+
+Default thresholds: active window 5m, stalled 2h, abandoned 7d.
+
+### Filtering and the Receded Set
+
+By default the feed excludes the *receded* set — terminal `done` sessions plus
+abandoned/stale ones — matching the TUI's attention-first view. Flags:
+
+| Flag | Effect |
+|------|--------|
+| `--all` | Include the receded set (done + abandoned + stale pending). |
+| `--status <token>` | Emit only sessions whose `liveness` equals the given token. |
+| `--needs-you` | Emit only sessions in the needs-you band (blocked / failed / stalled). |
+
+Sessions whose state file header fails to parse are excluded from the feed (they are
+not valid sessions) but are reported as a trailing `note:` on stderr, so they are
+surfaced rather than silently dropped.
+
 ## Lifecycle Metadata Surface
 
-Session-level metadata — ownership, summary description, project tag, computed current
-state — is not part of this contract's current scope. These fields would belong to a
-session registry layer above the raw event log, not to the per-session JSONL file itself.
+Session-level liveness — whether a session is active, idle, blocked, stalled, failed,
+pending, or done — is **derived at read time** by the dashboard from this contract's
+event log (last-event recency plus the computed terminal/blocked state). It is not a
+stored field and requires no migration; see the Dashboard `--once` Feed above for the
+vocabulary.
 
-When lifecycle metadata is introduced, the `StateFileHeader` at line 1 is the natural
-surface. Adding optional header fields (e.g., `owner`, `summary`, `project`) follows
-the same non-breaking rules as additive optional event fields: `serde(default)` ensures
-older readers tolerate their absence.
+Other session-level metadata — ownership, project tag, a stored summary — is not part
+of this contract's current scope. Such fields would belong to a session registry layer
+above the raw event log, not to the per-session JSONL file itself.
 
-Consumers should not expect lifecycle metadata in the event stream itself.
+When such metadata is introduced, the `StateFileHeader` at line 1 is the natural
+surface. Adding optional header fields (e.g., `owner`, `project`) follows the same
+non-breaking rules as additive optional event fields: `serde(default)` ensures older
+readers tolerate their absence.
+
+Consumers should not expect stored lifecycle metadata in the event stream itself.
 
 ## Known Gaps
 
