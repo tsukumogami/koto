@@ -121,8 +121,13 @@ impl SessionBackend for LocalBackend {
                         parent_workflow: header.parent_workflow,
                     });
                 }
-                Err(e) => {
-                    eprintln!("warning: skipping session {}: {}", state_path.display(), e);
+                Err(_) => {
+                    // Silently skip sessions with an unreadable/corrupt header.
+                    // `list()` is called on every dashboard refresh tick, so
+                    // emitting a per-session warning here would flood the TUI's
+                    // alternate screen via stderr. Unreadable sessions are
+                    // tallied separately by `count_unreadable()` and surfaced
+                    // once (the `--once` note and the TUI's rendered count).
                 }
             }
         }

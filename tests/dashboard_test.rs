@@ -21,6 +21,19 @@ fn write_template(dir: &Path, name: &str, content: &str) -> String {
     path.to_str().unwrap().to_string()
 }
 
+/// Create a session directory whose state file has an unparseable header.
+/// The dashboard read path must skip it silently (counting it as unreadable)
+/// rather than emitting a per-session warning.
+fn write_corrupt_session(sessions_dir: &Path, id: &str) {
+    let session_dir = sessions_dir.join(id);
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join(format!("koto-{}.state.jsonl", id)),
+        "not a valid header line\n",
+    )
+    .unwrap();
+}
+
 /// Template that auto-advances to terminal "done" state.
 fn terminal_template() -> &'static str {
     r#"---
@@ -96,6 +109,69 @@ fn dashboard_once_empty_dir_exits_zero_with_no_output() {
         .assert()
         .success()
         .stdout("");
+}
+
+/// Regression guard: a sessions base containing corrupt sessions must NOT
+/// produce per-session `warning: skipping session ...` lines on stderr. The
+/// dashboard read path (`list()`) is invoked on every TUI refresh tick, so a
+/// per-session eprintln there floods the alternate screen. Unreadable sessions
+/// are surfaced exactly once via the `note: N unreadable session(s) skipped`
+/// line computed from the tally. This test exercises the shared `--once` read
+/// path (same `list()` call the TUI refresh uses) at the binary's stderr
+/// boundary.
+#[test]
+fn dashboard_once_corrupt_sessions_emit_count_note_not_per_session_warnings() {
+    let dir = TempDir::new().unwrap();
+    let sessions_dir = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+
+    // Two sessions whose headers do not parse.
+    write_corrupt_session(&sessions_dir, "corrupt-alpha");
+    write_corrupt_session(&sessions_dir, "corrupt-beta");
+
+    let output = koto_cmd(dir.path())
+        .args(["dashboard", "--once"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "dashboard --once should exit 0 even with corrupt sessions; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    // The flood: zero per-session warnings, regardless of corrupt count.
+    assert_eq!(
+        stderr.matches("warning: skipping session").count(),
+        0,
+        "per-session corrupt warnings must not be printed on the read path; \
+         stderr was:\n{stderr}"
+    );
+
+    // The correct surfacing: exactly one tally note covering both sessions.
+    let note_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("unreadable session(s) skipped"))
+        .collect();
+    assert_eq!(
+        note_lines.len(),
+        1,
+        "exactly one tally note expected; stderr was:\n{stderr}"
+    );
+    assert_eq!(
+        note_lines[0].trim(),
+        "note: 2 unreadable session(s) skipped",
+        "tally must report both corrupt sessions"
+    );
+
+    // The corrupt sessions are excluded from the tab-separated stdout contract.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("corrupt-alpha") && !stdout.contains("corrupt-beta"),
+        "corrupt sessions must not appear in stdout; stdout was:\n{stdout}"
+    );
 }
 
 #[test]
