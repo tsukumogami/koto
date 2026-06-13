@@ -4,6 +4,10 @@ name: Validate doc formats
 # authority for artifact-doc format checks (frontmatter, sections, issues-table
 # rows, etc.) on the docs changed in a PR. Docs that carry a `schema:` field are
 # validated; docs predating that convention are skipped with a notice.
+#
+# Pinned to @main so this repo always runs the current engine without per-release
+# pin bumps. The validator is per-file and changed-files-only, so a new engine
+# check only ever affects PRs that touch docs.
 
 on:
   pull_request:
@@ -12,4 +16,4 @@ on:
 
 jobs:
   validate:
-    uses: tsukumogami/shirabe/.github/workflows/validate-docs.yml@v0.11.0
+    uses: tsukumogami/shirabe/.github/workflows/validate-docs.yml@main
