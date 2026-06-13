@@ -1,0 +1,15 @@
+name: Validate doc formats
+
+# Calls shirabe's reusable per-file document validator so the engine is the
+# authority for artifact-doc format checks (frontmatter, sections, issues-table
+# rows, etc.) on the docs changed in a PR. Docs that carry a `schema:` field are
+# validated; docs predating that convention are skipped with a notice.
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+
+jobs:
+  validate:
+    uses: tsukumogami/shirabe/.github/workflows/validate-docs.yml@v0.11.0
