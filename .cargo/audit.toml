@@ -1,0 +1,27 @@
+# cargo-audit configuration
+#
+# See https://github.com/rustsec/rustsec/blob/main/cargo-audit/audit.toml.example
+
+[advisories]
+# Scoped, temporary ignores. Remove each entry once the transitive constraint
+# allows a patched release.
+#
+# RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml DoS advisories (quadratic
+# attribute-duplicate check; unbounded namespace-declaration allocation in
+# NsReader). Both are fixed in quick-xml >= 0.41.0, but quick-xml reaches us
+# only transitively through rust-s3 -> aws-creds, which pin `quick-xml = "0.38"`.
+# The latest published rust-s3 (0.37.2) still carries that pin, so no reachable
+# release lets us upgrade quick-xml without an upstream rust-s3 change.
+#
+# Reachability: quick-xml here only parses XML that rust-s3 receives from the
+# configured S3-compatible endpoint (error and list responses). Triggering
+# either DoS requires the object-storage endpoint to return crafted XML, i.e. a
+# trusted, operator-configured backend rather than arbitrary attacker input, so
+# the practical exposure for koto is low.
+#
+# TODO: drop these once rust-s3/aws-creds ship a release that permits
+# quick-xml >= 0.41.0, then `cargo update -p quick-xml`.
+ignore = [
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
