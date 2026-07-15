@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Accepted
+status: Done
 problem: |
   When an operator drives a koto workflow inside Claude Code, the workflow's
   live state is invisible in the surface the operator is already watching.
@@ -20,16 +20,15 @@ outcome: |
 
 ## Status
 
-Accepted
+Done
 
-Framing for Feature 1 (the walking skeleton) of the upstream
-`ROADMAP-koto-agent-surface-legibility`. The surface decision is settled
-upstream (`ADR-koto-native-workflows-rendering`, Accepted): koto produces the
+Framing for the walking-skeleton slice of koto's native Claude Code
+`/workflows` rendering. The surface decision is settled: koto produces the
 artifacts Claude Code's `/workflows` renders natively -- there is no koto
-skill, reader, or parallel surface. This brief carries that framing into the
-koto repo so the downstream PRD and DESIGN pin the mechanism. The requirements
-(what to build) belong to `PRD-native-workflows-render`; the mechanism (how)
-belongs to `DESIGN-native-workflows-render`.
+skill, reader, or parallel surface. This brief captures that framing so the
+downstream PRD and DESIGN pin the mechanism. The requirements (what to build)
+belong to `PRD-native-workflows-render`; the mechanism (how) belongs to
+`DESIGN-native-workflows-render`.
 
 ## Problem Statement
 
@@ -115,17 +114,11 @@ and any existing `/workflows` screen is untouched.
   rendered smoke check, and atomic-write-as-hardening (Feature 4).
 - File lifecycle: retention/rotation and crash-staleness reconciliation
   (Feature 5).
-- Any koto skill, reader, MCP server, or parallel surface (settled out by the
-  ADR).
-- Re-deciding the surface, or editing the upstream STRATEGY / ROADMAP / ADR.
+- Any koto skill, reader, MCP server, or parallel surface (settled out of
+  scope).
+- Re-deciding the settled surface decision.
 
 ## References
 
-- `ROADMAP-koto-agent-surface-legibility` (upstream, Active) -- Feature 1 is
-  this brief's scope.
-- `STRATEGY-koto-agent-surface-legibility` (upstream, Accepted) -- the bet and
-  building blocks.
-- `ADR-koto-native-workflows-rendering` (upstream, Accepted) -- the settled
-  surface decision.
 - `PRD-native-workflows-render` -- the requirements derived from this brief.
 - `DESIGN-native-workflows-render` -- the mechanism that satisfies them.

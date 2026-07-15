@@ -67,6 +67,6 @@ the emitted file.
 - The write is atomic (temp-then-rename), so a `/workflows` reopen never sees a
   half-written file.
 - The `/workflows` file format is an undocumented, version-coupled Claude Code
-  surface (see `ADR-koto-native-workflows-rendering`). A guard that fails loudly
-  when it drifts is scoped to a later feature; if the manual check stops
-  rendering after a Claude Code update, that is the expected signal to add it.
+  surface. A guard that fails loudly when it drifts is scoped to a later slice;
+  if the manual check stops rendering after a Claude Code update, that is the
+  expected signal to add it.

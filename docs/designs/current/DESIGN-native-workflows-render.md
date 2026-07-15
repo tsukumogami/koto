@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 upstream: docs/prds/PRD-native-workflows-render.md
 problem: |
   koto must render a single, non-hierarchical session as a native entry in
@@ -38,22 +38,22 @@ rationale: |
 
 ## Status
 
-Planned
+Current
 
-Mechanism design for Feature 1 of `ROADMAP-koto-agent-surface-legibility`,
-settling the forks left open by the Accepted `PRD-native-workflows-render`. The
-surface decision (koto produces the native artifact; no skill or reader) is
-settled upstream in `ADR-koto-native-workflows-rendering` and is not reopened
-here. This design pins the shared foundation the whole roadmap rides on: the
-extensible file contract, the commit-funnel hook seam, and the context-store
-publish/discover key schema.
+Mechanism design for the walking-skeleton slice of koto's native Claude Code
+`/workflows` rendering, settling the forks left open by the Accepted
+`PRD-native-workflows-render`. The surface decision (koto produces the native
+artifact; no skill or reader) is settled and is not reopened here. This design
+pins the shared foundation the later slices build on: the extensible file
+contract, the commit-funnel hook seam, and the context-store publish/discover
+key schema.
 
 ## Context and Problem Statement
 
 Claude Code's `/workflows` screen reads `<projectDir>/<sessionId>/workflows/*.json`
 on open, `JSON.parse`s each file, applies field defaults, sorts by `startTime`,
 and renders each as a run entry -- with no registry, signature, or validation
-(established empirically against Claude Code v2.1.209 and recorded in the ADR).
+(established empirically against Claude Code v2.1.209).
 The directory is keyed by the *viewing* session's id, which an external koto
 process cannot self-discover; the verified way to learn it is a `SessionStart`
 hook. The screen is refresh-on-open, not live.
@@ -92,7 +92,7 @@ Concrete seams this design builds on (koto working tree):
 ## Decision Drivers
 
 - **Cover every commit path uniformly** without instrumenting individual
-  commands (the strategy's explicit "hook the one funnel" rule).
+  commands (the explicit "hook the one funnel, not each command" rule).
 - **koto's model is the source of truth**: the projection is a derivation, not a
   second store; reuse the read seam rather than reimplement it.
 - **Do not box out Feature 3**: the context-store key and discovery walk must be
@@ -168,12 +168,13 @@ walking to this ancestor's published key -- so the same mechanism serves F1's
 single session and F3's tree, and the opt-in stays "presence of a published
 location," not config.
 
-- *Rejected: the hook shells out `koto context add <koto-session> ...`.* This is
-  the ADR's literal phrasing, but it presumes the hook knows the koto session id,
-  which does not exist at `SessionStart`. It also appends a `context_added` event
-  (a state commit) into a possibly-nonexistent session, creating a malformed
-  session dir. The env-var handoff resolves the bootstrapping gap the ADR left
-  implicit while preserving its intent (the location lives in the context store).
+- *Rejected: the hook shells out `koto context add <koto-session> ...`.* The
+  most direct "publish into the context store" phrasing, but it presumes the
+  hook knows the koto session id, which does not exist at `SessionStart`. It also
+  appends a `context_added` event (a state commit) into a possibly-nonexistent
+  session, creating a malformed session dir. The env-var handoff resolves that
+  bootstrapping gap while preserving the intent (the location lives in the
+  context store).
 - *Rejected: a fixed pseudo-session key (e.g. `__claude_host__`).* Collides
   across concurrent Claude Code sessions, each of which has its own `/workflows`
   directory. Keying discovery off the session's own store (seeded from the
@@ -183,10 +184,10 @@ An explicit `koto workflows publish --dir <dir> [--session <id>]` subcommand is
 *also* provided (Solution Architecture) for the case where a caller does know
 the target session and for scripted verification; it writes the same key without
 appending an event. The env-var handoff is the default F1 path; the subcommand is
-the explicit escape hatch and the ADR-literal publish surface.
+the explicit escape hatch and publish surface.
 
 The `KOTO_WORKFLOWS_DIR` handoff is the one accepted point of coupling to Claude
-Code's (undocumented) session model, consistent with the ADR's accepted cost. If
+Code's (undocumented) session model -- an accepted cost of going native. If
 Claude Code cannot make the variable visible to a koto process, the documented
 fallback is the explicit `koto workflows publish` call from the hook; either way
 the location ends up in the context store, and koto core reads only the store.
@@ -209,8 +210,8 @@ ancestor walk, just exercised over a real tree.
 - *Rejected: an unprefixed key (`workflows-dir`).* Risks colliding with user
   context keys and does not group the reserved surface; harder to reason about
   when F3/F4/F5 add sibling reserved keys.
-- *Rejected: publish only at the root and compose downward.* The strategy
-  already rejected root-only composition (it leaves deep progress stale); the
+- *Rejected: publish only at the root and compose downward.* Root-only
+  composition is already rejected (it leaves deep progress stale); the
   per-session-writes-to-nearest-published-ancestor model is the settled shape.
 
 ### Fork E -- The file contract shape
@@ -243,17 +244,17 @@ renders `completed`; terminal-and-failure (name matches the `classify_status`
 failure heuristic, or the template's `failure` flag) renders `failed`; anything
 else renders `running`. A session writes its terminal state on the terminal
 commit, before koto's cleanup deletes its state file, so the finished entry
-persists (R9). The three genuinely ambiguous cases the strategy calls out
-(missing/changed template, an unnamed failure state, a cancelled session) are
-handled at F1 only to the extent the common path requires -- a cancelled session
-(a `WorkflowCancelled` event) renders terminal rather than a stuck `running`;
-the finer inference (Block 2's net-new work) is Feature 2/4/5 scope and is noted
-as a known limitation here, not silently assumed solved.
+persists (R9). Three genuinely ambiguous cases (missing/changed template, an
+unnamed failure state, a cancelled session) are handled at F1 only to the
+extent the common path requires -- a cancelled session (a `WorkflowCancelled`
+event) renders terminal rather than a stuck `running`; the finer inference is
+later-slice scope and is noted as a known limitation here, not silently assumed
+solved.
 
-- *Rejected: solve all three ambiguous cases now.* The ADR assigns that
-  net-new inference to Block 2 (Feature 2's mapping and Feature 4's guard);
-  pulling it into F1 widens the skeleton past its purpose. F1 must only satisfy
-  "graceful completion reads done," which the common-path mapping does.
+- *Rejected: solve all three ambiguous cases now.* The finer inference belongs
+  to the later mapping and guard slices; pulling it into F1 widens the skeleton
+  past its purpose. F1 must only satisfy "graceful completion reads done," which
+  the common-path mapping does.
 
 ### Fork G -- Write atomicity and directory creation
 
@@ -402,40 +403,38 @@ three independent enough to land in any order behind the fourth.
 - **Undocumented-surface isolation.** The coupling to Claude Code's file shape
   and hook payload is confined to `contract.rs` and the hook script; koto's
   event log, engine, and dashboard do not depend on any of it, so a future
-  Claude Code change touches only the projection layer (the ADR's core-isolation
-  property). The guard that makes such a change fail loudly is Feature 4.
+  Claude Code change touches only the projection layer (the core-isolation
+  property). The guard that makes such a change fail loudly is a later slice.
 
 ## Consequences
 
 - koto gains a per-commit, opt-in materialization side effect on the local
   commit funnel. Cost on the default (no-location) path is one env read plus, at
   most, one `ctx_exists` probe; on the enabled path it is a read-seam
-  re-derivation plus an atomic write per commit (the strategy's accepted
-  per-advance cost).
+  re-derivation plus an atomic write per commit (the accepted per-advance cost).
 - The context-store key `workflows/publish-location` and the self-then-ancestor
   walk are now a shipped contract Feature 3 extends without change -- the "don't
   box out F3" obligation is discharged in F1.
 - Internal coordinator writes that bypass the trait (respawn/wake/claim, via
   `persistence::append_event` directly) do not materialize. Harmless for F1
-  (they are not operator-facing session commits); Feature 3 revisits whether any
-  need to, when hierarchy rendering is in scope.
+  (they are not operator-facing session commits); the hierarchy slice revisits
+  whether any need to, when hierarchy rendering is in scope.
 - Known limitations carried forward (not regressions): the finer terminal
-  inference for the three ambiguous cases is Feature 2/4/5; the version/fixture
-  guard and rendered smoke check are Feature 4; retention and crash-staleness
-  are Feature 5. Each is named in the roadmap and out of F1 scope.
+  inference for the three ambiguous cases, the version/fixture guard and
+  rendered smoke check, and retention and crash-staleness are all later-slice
+  scope and out of F1.
 - If Claude Code cannot expose `KOTO_WORKFLOWS_DIR` to a koto process, the
   documented fallback (`koto workflows publish` from the hook) keeps the design
   intact, since koto core reads only the context store.
 
 ## References
 
-- `PRD-native-workflows-render` (upstream) -- the requirements this design
-  satisfies.
-- `ADR-koto-native-workflows-rendering` (upstream, Accepted) -- the settled
-  surface decision and empirical addendum (Claude Code v2.1.209 render
-  mechanics).
-- `STRATEGY-koto-agent-surface-legibility` (upstream, Accepted) -- Blocks 1-3
-  (materialize / mapping / publish-discover).
+- `PRD-native-workflows-render` -- the requirements this design satisfies.
+- The `/workflows` render mechanics this design relies on were established
+  empirically against Claude Code v2.1.209 (the screen globs
+  `<projectDir>/<sessionId>/workflows/*.json`, defaults every field, sorts by
+  `startTime`, and renders with no registry or validation); see the Context
+  section above.
 - koto seams: `src/session/mod.rs` (`SessionBackend`), `src/session/local.rs`
   (`append_event`, context store), `src/engine/types.rs` (`StateFileHeader`),
   `src/engine/caps.rs` (`measure_depth_from_parent`), `src/cli/dashboard_data.rs`

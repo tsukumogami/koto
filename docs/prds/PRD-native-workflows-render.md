@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: Done
 upstream: docs/briefs/BRIEF-native-workflows-render.md
 problem: |
   An operator driving a koto session inside Claude Code cannot see the
@@ -19,14 +19,14 @@ goals: |
 
 ## Status
 
-Accepted
+Done
 
-Requirements for Feature 1 of `ROADMAP-koto-agent-surface-legibility`, derived
-from the Accepted `BRIEF-native-workflows-render`. The surface decision is
-settled in `ADR-koto-native-workflows-rendering` (koto produces the native
-artifact; no skill or reader). Mechanism choices -- the exact hook seam, the
-file shape, the context-store key, terminal inference -- are settled downstream
-in `DESIGN-native-workflows-render`; this PRD fixes the WHAT and the
+Requirements for the walking-skeleton slice of koto's native Claude Code
+`/workflows` rendering, derived from the Accepted `BRIEF-native-workflows-render`.
+The surface decision is settled (koto produces the native artifact; no skill or
+reader). Mechanism choices -- the exact hook seam, the file shape, the
+context-store key, terminal inference -- are settled downstream in
+`DESIGN-native-workflows-render`; this PRD fixes the WHAT and the
 acceptance contract.
 
 ## Problem Statement
@@ -190,8 +190,8 @@ are built on top.
   contract is extensible so F2 adds fields rather than reshaping.
 - **Atomic write lands in F1, the guard lands in F4.** Atomic write is cheap
   and prevents torn reads, so it is a correctness floor here; the version/
-  fixture guard and rendered smoke check are heavier hardening and stay in
-  Feature 4 per the roadmap's sequencing.
+  fixture guard and rendered smoke check are heavier hardening and stay in the
+  later hardening slice.
 - **Opt-in is presence of a published location, not config.** koto config is
   not inherited by child sessions, so a config flag could not enable a whole
   hierarchy; the presence of a published location is the per-hierarchy enable.
@@ -199,4 +199,4 @@ are built on top.
 - **The context-store key schema is chosen up front for Feature 3.** Even
   though F1 has a single session, the key is namespaced and discovery is an
   ancestor walk, so Feature 3 adds hierarchy without changing the shipped key
-  (R5) -- the roadmap's explicit "don't box F3 out" obligation.
+  (R5) -- the explicit "don't box the hierarchy slice out" obligation.
