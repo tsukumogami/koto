@@ -11,6 +11,7 @@ pub mod export;
 pub mod gate;
 pub mod session;
 pub mod template;
+pub mod workflows_surface;
 
 // ===== Stage 1 frozen public surface (Issue 19 / Decision 5) =====
 //
