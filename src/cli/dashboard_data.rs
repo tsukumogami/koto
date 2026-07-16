@@ -11,7 +11,7 @@ use anyhow::Result;
 
 use crate::engine::persistence::{
     derive_last_gate_evaluated, derive_machine_state, derive_state_from_log, is_terminal_state,
-    read_events, read_header,
+    latest_epoch_gate_failed, read_events, read_header,
 };
 use crate::engine::types::derive_intent;
 use crate::engine::types::is_leap;
@@ -420,50 +420,14 @@ pub fn read_session(path: &Path) -> CachedSession {
     };
 
     // Detect blocked: non-terminal session whose most recent gate evaluation in
-    // the current epoch did not pass.
-    let is_blocked = if !is_terminal {
-        if let Some(ref cs) = current_state {
-            let epoch_start = events.iter().enumerate().rev().find_map(|(idx, e)| {
-                let to = match &e.payload {
-                    crate::engine::types::EventPayload::Transitioned { to, .. } => {
-                        Some(to.as_str())
-                    }
-                    crate::engine::types::EventPayload::DirectedTransition { to, .. } => {
-                        Some(to.as_str())
-                    }
-                    crate::engine::types::EventPayload::Rewound { to, .. } => Some(to.as_str()),
-                    _ => None,
-                };
-                if to == Some(cs.as_str()) {
-                    Some(idx)
-                } else {
-                    None
-                }
-            });
-            if let Some(start) = epoch_start {
-                events[start + 1..]
-                    .iter()
-                    .rev()
-                    .find_map(|e| {
-                        if let crate::engine::types::EventPayload::GateEvaluated {
-                            outcome, ..
-                        } = &e.payload
-                        {
-                            Some(outcome != "passed")
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(false)
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    // the current epoch did not pass. The epoch-scoped predicate is the shared
+    // `latest_epoch_gate_failed` helper, which the `/workflows` projection
+    // writer also calls so the two classify a blocked session identically.
+    let is_blocked = !is_terminal
+        && current_state
+            .as_ref()
+            .map(|cs| latest_epoch_gate_failed(&events, cs))
+            .unwrap_or(false);
 
     let intent = derive_intent(&events).or_else(|| header.intent.clone());
 

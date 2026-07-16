@@ -18,7 +18,12 @@ pub mod discover;
 pub mod materialize;
 pub mod project;
 
-pub use contract::{workflow_filename, RenderStatus, WorkflowFile, CONTRACT_VERSION};
+pub use contract::{
+    workflow_filename, Phase, ProgressNode, RenderStatus, WorkflowFile, CONTRACT_VERSION,
+};
 pub use discover::{publish_location, resolve_publish_location, PUBLISH_LOCATION_KEY};
 pub use materialize::{materialize_after_commit, WORKFLOWS_DIR_ENV};
-pub use project::{derive_minimal_projection, Projection};
+pub use project::{
+    derive_enriched_projection, derive_minimal_projection, ordered_phases, per_state_outcomes,
+    EnrichedProjection, PhaseEntry, PhaseStatus, Projection,
+};

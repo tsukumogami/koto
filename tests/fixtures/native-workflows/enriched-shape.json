@@ -1,0 +1,80 @@
+{
+  "id": "koto-11111111-2222-4333-8444-555555555555",
+  "name": "impl-feature · verify",
+  "status": "blocked",
+  "startTime": 1700000000000,
+  "phases": [
+    {
+      "title": "Gather context",
+      "detail": "evidence: files"
+    },
+    {
+      "title": "Implement",
+      "detail": "done"
+    },
+    {
+      "title": "Verify",
+      "detail": "gate tests-pass: FAIL"
+    },
+    {
+      "title": "Review"
+    }
+  ],
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Gather context"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "Gather context",
+      "phaseIndex": 1,
+      "phaseTitle": "Gather context",
+      "state": "done",
+      "promptPreview": "Read the issue and map the module.",
+      "resultPreview": "evidence: files"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Implement"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "Implement",
+      "phaseIndex": 2,
+      "phaseTitle": "Implement",
+      "state": "done",
+      "promptPreview": "Implement the change per the gathered context."
+    },
+    {
+      "type": "workflow_phase",
+      "index": 3,
+      "title": "Verify"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "Verify",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "state": "progress",
+      "promptPreview": "Run the test suite and submit the result.",
+      "resultPreview": "gate tests-pass: FAIL"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 4,
+      "title": "Review"
+    }
+  ],
+  "koto": {
+    "sessionId": "11111111-2222-4333-8444-555555555555",
+    "workflow": "impl-feature",
+    "currentState": "verify",
+    "contractVersion": 2
+  }
+}
