@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 
 use crate::engine::persistence::{
-    derive_last_gate_evaluated, derive_machine_state, derive_state_from_log, read_events,
-    read_header,
+    derive_last_gate_evaluated, derive_machine_state, derive_state_from_log, is_terminal_state,
+    read_events, read_header,
 };
 use crate::engine::types::derive_intent;
 use crate::engine::types::is_leap;
@@ -32,6 +32,7 @@ pub mod liveness {
     use std::time::{Duration, SystemTime};
 
     use super::CachedSession;
+    use crate::engine::persistence::is_failed_state;
 
     /// A session younger than this is freshly active.
     pub const ACTIVE_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -143,16 +144,9 @@ pub mod liveness {
         attention_key(liveness, idle).0 == 3
     }
 
-    /// Return true if `state` contains "failed" or "error" (case-insensitive),
-    /// matching the existing `classify_status` rule.
-    fn is_failed_state(state: Option<&str>) -> bool {
-        state
-            .map(|s| {
-                let lower = s.to_lowercase();
-                lower.contains("failed") || lower.contains("error")
-            })
-            .unwrap_or(false)
-    }
+    // `is_failed_state` now lives in `crate::engine::persistence` as the single
+    // shared implementation (imported above); the `/workflows` projection
+    // writer reuses the same function.
 
     /// Priority list of variable keys to surface as a session's salient var.
     const SALIENT_KEYS: &[&str] = &["issue", "target", "name", "task", "query"];
@@ -549,24 +543,9 @@ pub fn derive_label(session: &CachedSession, session_id: &str) -> String {
     session_id.to_string()
 }
 
-/// Check whether `state_name` is a terminal state in the compiled template at `template_path`.
-///
-/// Returns `false` on any I/O or parse error (graceful degradation).
-fn is_terminal_state(template_path: &str, state_name: &str) -> bool {
-    let bytes = match std::fs::read(template_path) {
-        Ok(b) => b,
-        Err(_) => return false,
-    };
-    let compiled: crate::template::types::CompiledTemplate = match serde_json::from_slice(&bytes) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    compiled
-        .states
-        .get(state_name)
-        .map(|s| s.terminal)
-        .unwrap_or(false)
-}
+// `is_terminal_state` now lives in `crate::engine::persistence` as the single
+// shared implementation (imported above); the `/workflows` projection writer
+// reuses the same function.
 
 /// Construct an empty `StateFileHeader` for error fallback cases.
 fn make_empty_header() -> StateFileHeader {

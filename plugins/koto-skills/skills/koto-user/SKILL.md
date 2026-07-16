@@ -337,6 +337,28 @@ Flags worth knowing: `--root <session-id>` (required; terminal-state root to pru
 koto workspace prune --root <session-id> --dry-run
 ```
 
+## Native Claude Code `/workflows` rendering
+
+When a koto session runs inside a Claude Code session, it can appear as a native entry in Claude Code's `/workflows` screen — no separate command or window. This is opt-in and rides the state-commit path: on each advance, koto writes its own `koto-<uuid>.json` (session name, current state, running/done) into the Claude Code session's workflows directory, and the operator sees it on the next `/workflows` reopen.
+
+Enabling it takes one thing: koto must know the target directory. The koto-skills plugin ships a `SessionStart` hook that derives the directory (`<projectDir>/<sessionId>/workflows`) and announces it. koto sessions render into it when **`KOTO_WORKFLOWS_DIR`** is set in their environment:
+
+```bash
+export KOTO_WORKFLOWS_DIR="<projectDir>/<sessionId>/workflows"   # the hook announces the exact path
+```
+
+With that set, no further action is needed — `koto next`, `koto rewind`, and directed transitions all refresh the entry. With it unset (and no published location), koto writes nothing and its default behavior is unchanged.
+
+You can also publish a location explicitly (e.g. for a specific session id):
+
+```bash
+koto workflows publish --dir <workflows-dir> --session <session-id>
+```
+
+`workflows publish` records the directory in the session's context store under the reserved key `workflows/publish-location`; it writes no event. koto resolves the directory on each commit by walking from the session up its parent chain to the nearest published location, so a child session renders into an ancestor's published directory automatically.
+
+To verify the path end-to-end without a live Claude Code TUI, run `scripts/verify-native-workflows.sh`; the manual TUI procedure is in `docs/guides/native-workflows-verification.md`.
+
 ## Reference material
 
 Read these on demand, not upfront. The sections above cover the common path. Consult a reference file only when you hit the specific situation it describes.

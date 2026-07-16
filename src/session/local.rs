@@ -181,6 +181,11 @@ impl SessionBackend for LocalBackend {
     ) -> anyhow::Result<()> {
         let path = self.base_dir.join(id).join(state_file_name(id));
         persistence::append_event(&path, payload, timestamp)?;
+        // Materialize the native Claude Code `/workflows` artifact off the one
+        // commit funnel (opt-in, best-effort: never fails the commit). `self`
+        // is both the SessionBackend (header chain) and the ContextStore
+        // (published locations). See `crate::workflows_surface`.
+        crate::workflows_surface::materialize_after_commit(self, self, id);
         Ok(())
     }
 

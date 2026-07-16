@@ -200,6 +200,10 @@ pub enum Command {
         /// Show only orphaned workflows whose parent no longer exists
         #[arg(long, group = "filter")]
         orphaned: bool,
+
+        /// Optional sub-command; when absent, list workflows (the default).
+        #[command(subcommand)]
+        action: Option<WorkflowsAction>,
     },
 
     /// Template management subcommands
@@ -465,6 +469,23 @@ pub enum ChildrenPolicy {
 }
 
 #[derive(Subcommand)]
+pub enum WorkflowsAction {
+    /// Publish a Claude Code session's `/workflows` directory so koto sessions
+    /// driven in that session render into it natively (opt-in). Records the
+    /// directory in the target session's context store; writes no event.
+    Publish {
+        /// Absolute path to the Claude Code session's `/workflows` directory.
+        #[arg(long)]
+        dir: String,
+
+        /// koto session id whose context store records the location. When
+        /// omitted, falls back to the `KOTO_WORKFLOWS_HOST_SESSION` env var.
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ContextCommand {
     /// Store content under a key (reads from stdin or --from-file)
     Add {
@@ -682,6 +703,25 @@ fn build_backend() -> Result<Backend> {
         }
         other => {
             anyhow::bail!("unknown backend: {other}")
+        }
+    }
+}
+
+/// Dispatch `koto workflows <action>` sub-commands.
+fn handle_workflows_action(action: WorkflowsAction) -> Result<()> {
+    match action {
+        WorkflowsAction::Publish { dir, session } => {
+            let backend = build_backend()?;
+            let session_id = match session {
+                Some(s) => s,
+                None => std::env::var("KOTO_WORKFLOWS_HOST_SESSION").map_err(|_| {
+                    anyhow::anyhow!(
+                        "workflows publish: --session is required unless KOTO_WORKFLOWS_HOST_SESSION is set"
+                    )
+                })?,
+            };
+            crate::workflows_surface::publish_location(&backend, &session_id, &dir)?;
+            Ok(())
         }
     }
 }
@@ -1117,7 +1157,11 @@ pub fn run(app: App) -> Result<()> {
             roots,
             children,
             orphaned,
+            action,
         } => {
+            if let Some(action) = action {
+                return handle_workflows_action(action);
+            }
             let backend = build_backend()?;
             let metadata = match find_workflows_with_metadata(&backend) {
                 Ok(m) => m,

@@ -836,6 +836,41 @@ pub fn derive_machine_state(
     })
 }
 
+/// Check whether `state_name` is a terminal state in the compiled template at
+/// `template_path`.
+///
+/// Returns `false` on any I/O or parse error (graceful degradation). This is
+/// the single implementation shared by the dashboard read seam and the
+/// `/workflows` projection writer.
+pub fn is_terminal_state(template_path: &str, state_name: &str) -> bool {
+    let bytes = match std::fs::read(template_path) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let compiled: crate::template::types::CompiledTemplate = match serde_json::from_slice(&bytes) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    compiled
+        .states
+        .get(state_name)
+        .map(|s| s.terminal)
+        .unwrap_or(false)
+}
+
+/// Return true if `state` names a failure terminal, matching the dashboard's
+/// `classify_status` rule: the state name contains "failed" or "error"
+/// (case-insensitive). Shared by the dashboard read seam and the `/workflows`
+/// projection writer so both classify failure identically.
+pub fn is_failed_state(state: Option<&str>) -> bool {
+    state
+        .map(|s| {
+            let lower = s.to_lowercase();
+            lower.contains("failed") || lower.contains("error")
+        })
+        .unwrap_or(false)
+}
+
 /// Derive per-state visit counts from the event log.
 ///
 /// Counts the number of times each state has been entered via Transitioned,

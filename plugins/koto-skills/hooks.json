@@ -1,5 +1,11 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start-workflows.sh\""
+      }
+    ],
     "Stop": [
       {
         "type": "command",
