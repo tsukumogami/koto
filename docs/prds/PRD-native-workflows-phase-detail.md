@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: Done
 upstream: docs/briefs/BRIEF-native-workflows-phase-detail.md
 problem: |
   Feature 1 renders a koto session in Claude Code's `/workflows` as a bare
@@ -23,7 +23,7 @@ goals: |
 
 ## Status
 
-Accepted
+Done
 
 Requirements for Feature 2 of the koto-agent-surface-legibility roadmap,
 derived from the Accepted `BRIEF-native-workflows-phase-detail`. The surface

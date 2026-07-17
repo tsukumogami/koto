@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Accepted
+status: Done
 problem: |
   Feature 1 made a koto session appear in Claude Code's `/workflows` screen,
   but the entry carries only a bare status -- name plus running/done. The
@@ -22,7 +22,7 @@ outcome: |
 
 ## Status
 
-Accepted
+Done
 
 Framing for Feature 2 of the koto-agent-surface-legibility roadmap -- the first
 value-adding increment over the Feature 1 walking skeleton. The surface

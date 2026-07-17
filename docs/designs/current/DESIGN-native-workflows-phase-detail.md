@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 upstream: docs/prds/PRD-native-workflows-phase-detail.md
 problem: |
   Feature 1 emits a bare-status projection into Claude Code's `/workflows`
@@ -48,7 +48,7 @@ rationale: |
 
 ## Status
 
-Planned
+Current
 
 Mechanism design for Feature 2 of the koto-agent-surface-legibility roadmap:
 the koto-model -> `/workflows` field mapping that enriches Feature 1's
