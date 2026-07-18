@@ -199,7 +199,7 @@ fn resolve_target_dir(
         let env_dir = env_dir.trim().to_string();
         if !env_dir.is_empty() {
             if !discover::has_published_location(store, session_id) {
-                // Best-effort: self-publish so F3 descendants can discover it.
+                // Best-effort: self-publish so hierarchy descendants can discover it.
                 let _ = discover::publish_location(store, session_id, &env_dir);
             }
             return Some(PathBuf::from(env_dir));

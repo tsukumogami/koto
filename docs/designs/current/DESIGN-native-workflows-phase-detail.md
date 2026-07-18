@@ -3,13 +3,13 @@ schema: design/v1
 status: Current
 upstream: docs/prds/PRD-native-workflows-phase-detail.md
 problem: |
-  Feature 1 emits a bare-status projection into Claude Code's `/workflows`
-  (name + running/done/failed). Feature 2 must enrich that single-session
+  The initial render emits a bare-status projection into Claude Code's `/workflows`
+  (name + running/done/failed). This change must enrich that single-session
   projection into the session's real structure -- ordered phases with the
   active one marked, the active directive/label, per-phase evidence and gate
   outcomes, and a gate-blocked -> blocked status -- by reusing koto's dashboard
-  detail read seam and extending F1's `koto-<uuid>.json` contract additively,
-  without reopening F1's commit-funnel hook, publish/discover, atomic write, or
+  detail read seam and extending the initial `koto-<uuid>.json` contract additively,
+  without reopening the initial commit-funnel hook, publish/discover, atomic write, or
   opt-in.
 decision: |
   Add a richer projection built by reusing the dashboard read seam
@@ -24,23 +24,23 @@ decision: |
   unreachable states in template order; the current state is the active phase.
   Map koto's blocked-in-current-epoch to a new `blocked` render status. All new
   fields are additive under a bumped `contractVersion: 2`; a committed shape
-  fixture pins the enriched shape for Feature 4's guard.
+  fixture pins the enriched shape for the future drift-guard.
 rationale: |
   The dashboard already derives exactly these fields (`read_detail` returns
   directive, evidence, gate outcome, and the blocked classification), so
-  reusing it keeps koto's model the single source of truth and matches F1's
-  "reuse the read seam" driver; `read_detail` is current-epoch-scoped, so a
+  reusing it keeps koto's model the single source of truth and matches the
+  initial render's "reuse the read seam" driver; `read_detail` is current-epoch-scoped, so a
   small full-log per-state bucketing over the same event payloads supplies the
   completed-phase outcomes it does not carry. Claude Code's `/workflows` run
   schema renders `phases[]` + `workflowProgress[]` as an ordered phase tree with
   per-step outcomes and supports a `blocked` status (established empirically
-  against the same surface F1 pinned), so emitting those fields is the native
-  mapping -- and it stays additive over F1 because F1's top-level fields and
+  against the same surface the initial render pinned), so emitting those fields is the native
+  mapping -- and it stays additive over the initial render because its top-level fields and
   `koto` block are untouched. Structural (template-order) phase ordering is
   chosen over runtime-visited order because the phase skeleton must be stable
   across the refresh-on-open lifetime of the entry: the operator sees a
   consistent list that fills in, not a list that reshuffles as history grows.
-  A per-session file of phase-steps does not collide with Feature 3, which
+  A per-session file of phase-steps does not collide with a future hierarchy, which
   renders each session as its own separate entry (no nested single-run).
 ---
 
@@ -50,17 +50,17 @@ rationale: |
 
 Current
 
-Mechanism design for Feature 2 of the koto-agent-surface-legibility roadmap:
-the koto-model -> `/workflows` field mapping that enriches Feature 1's
+Mechanism design for the phase-detail enrichment:
+the koto-model -> `/workflows` field mapping that enriches the initial render's
 single-session projection. It settles the forks left open by the Accepted
-`PRD-native-workflows-phase-detail`. The surface decision and F1's foundation
-(commit-funnel hook, context-store publish/discover, extensible contract,
+`PRD-native-workflows-phase-detail`. The surface decision and the initial render's
+foundation (commit-funnel hook, context-store publish/discover, extensible contract,
 atomic write, opt-in) are settled and are not reopened here; this design pins
-the derivation and the on-disk field mapping F2 adds on top.
+the derivation and the on-disk field mapping this change adds on top.
 
 ## Context and Problem Statement
 
-Feature 1 shipped the `workflows_surface` module (koto working tree):
+The initial render shipped the `workflows_surface` module (koto working tree):
 
 - `contract.rs` -- the serde `WorkflowFile` (top-level `id`, `name`, `status`,
   `startTime`; nested `koto` block with `sessionId`, `workflow`,
@@ -76,7 +76,7 @@ Feature 1 shipped the `workflows_surface` module (koto working tree):
   `LocalBackend::append_event` (the single commit funnel), the opt-in gate, the
   stable `startTime`, and the atomic temp-then-rename write + `create_dir_all`.
 
-F1 deliberately emitted the thinnest projection. The information F2 needs is
+The initial render deliberately emitted the thinnest projection. The information this change needs is
 already derived elsewhere in koto: the dashboard's detail read seam,
 `read_detail(path, session_id) -> Option<DetailData>` in `src/cli/dashboard_data.rs`,
 returns per-session structure -- `current_state`, `directive` (from the compiled
@@ -89,8 +89,8 @@ that to the `blocked` bucket.
 
 Claude Code's `/workflows` screen globs `<projectDir>/<sessionId>/workflows/*.json`,
 `JSON.parse`s each file, defaults every field, sorts by `startTime`, and renders
-each as a run entry (the surface F1 pinned empirically; unchanged here). Beyond
-the top-level fields F1 emits, a run entry renders two structures that carry
+each as a run entry (the surface the initial render pinned empirically; unchanged here). Beyond
+the top-level fields the initial render emits, a run entry renders two structures that carry
 phase/step detail (established empirically against the same Claude Code surface,
 v2.1.x):
 
@@ -106,7 +106,7 @@ v2.1.x):
 
 A run entry's top-level `status` renders `running`, `completed`, `failed`, and
 `blocked`. The problem is to project koto's per-session detail onto these
-fields -- for one non-hierarchical session -- additively over F1's shape.
+fields -- for one non-hierarchical session -- additively over the initial shape.
 
 Concrete seams this design builds on:
 
@@ -117,7 +117,7 @@ Concrete seams this design builds on:
 - Compiled template: `crate::template::types::CompiledTemplate` (`initial_state`,
   `states: BTreeMap<String, TemplateState>`, each `TemplateState` carrying
   `directive`, `transitions: Vec<Transition>` with `target`, and `terminal`).
-- F1 module: `WorkflowFile` / `KotoBlock` / `RenderStatus` in `contract.rs`,
+- Initial-render module: `WorkflowFile` / `KotoBlock` / `RenderStatus` in `contract.rs`,
   `Projection` in `project.rs`, the writer in `materialize.rs`.
 
 ## Decision Drivers
@@ -125,10 +125,10 @@ Concrete seams this design builds on:
 - **Reuse the read seam; koto's model stays the single source of truth.** The
   richer fields must be a derivation over the same helpers the dashboard uses,
   in the same layer -- not a parallel re-read that can drift from koto's
-  terminal/blocked semantics (the PRD's R5, F1's carried-forward driver).
-- **Additive over F1; F1's shape and render preserved.** F1 defined a minimal
-  valid shape and a `contractVersion`; F2 adds fields and bumps the version, and
-  never breaks F1's top-level fields or `koto` block (R6).
+  terminal/blocked semantics (the PRD's R5, the initial render's carried-forward driver).
+- **Additive over the initial render; its shape and render preserved.** The initial render defined a minimal
+  valid shape and a `contractVersion`; this change adds fields and bumps the version, and
+  never breaks the initial top-level fields or `koto` block (R6).
 - **Native mapping onto the `/workflows` schema.** Emit the fields the screen
   already renders for phase/step detail (`phases`, `workflowProgress`,
   `status: blocked`) rather than inventing koto-only fields the screen ignores.
@@ -136,11 +136,11 @@ Concrete seams this design builds on:
   refresh-on-open; the ordered phase list must not reshuffle as the session
   advances, so ordering is derived from the template structure, not from runtime
   history.
-- **Do not box out Feature 3 or Feature 4.** The per-session phase-step model
-  must not collide with F3's per-session-entry hierarchy model, and the enriched
-  shape must be pinned by a fixture F4's guard can adopt (R7).
+- **Do not box out future hierarchies or the drift-guard hardening.** The per-session phase-step model
+  must not collide with a future per-session-entry hierarchy model, and the enriched
+  shape must be pinned by a fixture the future guard can adopt (R7).
 - **Best-effort, non-breaking.** Any per-field derivation failure degrades to an
-  omitted/empty field and never fails the commit (R10, mirroring F1).
+  omitted/empty field and never fails the commit (R10, mirroring the initial render).
 
 ## Considered Options
 
@@ -209,11 +209,11 @@ directive), and R3 (per-phase outcomes) together.
   outcomes cramped into a single `detail` string. Emitting both is only
   marginally more code (both are built from the same ordered phase list) and is
   the shape the surface is built to render.
-- *Note on Feature 3.* The `workflow_agent` steps here represent the phases of
-  one koto session -- not delegate sessions. Feature 3 renders each session
+- *Note on hierarchies.* The `workflow_agent` steps here represent the phases of
+  one koto session -- not delegate sessions. A future hierarchy renders each session
   (coordinator, delegates, grandchildren) as its own separate
   `koto-<uuid>.json` entry, per the settled "no nested single-run" decision, so
-  F2's per-session phase-steps and F3's per-session entries do not collide.
+  this change's per-session phase-steps and a future hierarchy's per-session entries do not collide.
 
 ### Fork C -- Where the completed-phase outcomes come from
 
@@ -221,7 +221,7 @@ directive), and R3 (per-phase outcomes) together.
 per-state bucketing for completed phases.** `read_detail` already returns the
 active phase's `directive`, current-epoch `evidence`, and the latest gate
 outcome -- everything the active phase needs. It is current-epoch-scoped, so it
-does not carry the outcomes of phases the session left behind. For those, F2
+does not carry the outcomes of phases the session left behind. For those, this change
 adds a small derivation over the *full* event log that buckets, per state, the
 most recent `GateEvaluated` outcome and the `EvidenceSubmitted` entries recorded
 while in that state, reusing the exact `EventPayload` matching `read_detail`
@@ -230,7 +230,7 @@ model.
 
 - *Rejected: widen `read_detail` to return all epochs.* `read_detail` is a
   dashboard seam with a current-epoch contract several dashboard callers depend
-  on; widening it risks those callers. F2 adds its per-state bucketing in the
+  on; widening it risks those callers. This change adds its per-state bucketing in the
   `workflows_surface` layer (calling the same pure helpers), leaving the
   dashboard seam's contract intact.
 - *Rejected: reimplement the derivations in the materializer.* Duplicates
@@ -252,36 +252,36 @@ terminal (completed/failed) > blocked > running -- matching the dashboard.
   has a precise blocked signal (the failed-gate predicate); a heuristic would
   diverge from the dashboard's classification.
 
-### Fork E -- Contract extension and the Feature 4 fixture
+### Fork E -- Contract extension and the drift-guard fixture
 
 **Chosen: additive fields under a bumped `contractVersion: 2`, pinned by a
 committed shape fixture.** The new fields (`phases`, `workflowProgress`, and the
 `blocked` status value, plus any koto-block additions) are added to
-`WorkflowFile` as additive serde fields; F1's `id`/`name`/`status`/`startTime`
+`WorkflowFile` as additive serde fields; the initial `id`/`name`/`status`/`startTime`
 and the `koto` block keep their shape and meaning. `CONTRACT_VERSION` bumps
 1 -> 2. A committed JSON fixture of a representative enriched file (a multi-phase
 session: some phases done with outcomes, one active with a directive, one
 blocked variant) plus a contract test that asserts the emitted shape against it
-gives Feature 4's guard a stable anchor (R7). F1's minimal shape remains a valid
+gives the future drift-guard a stable anchor (R7). The initial minimal shape remains a valid
 `contractVersion: 1`-compatible subset for readers that ignore the new fields.
 
-- *Rejected: reshape the file or rename F1 fields.* Breaks F1's render and F1's
+- *Rejected: reshape the file or rename the initial fields.* Breaks the initial render and the initial
   readers; the contract was designed to be extended, not reshaped.
-- *Rejected: defer the fixture to Feature 4.* The roadmap makes F2 responsible
-  for extending F4's fixture whenever it changes the shape; deferring would
-  leave F4 under-covering the shape F2 introduced.
+- *Rejected: defer the fixture to the drift-guard hardening.* The shape-change / drift-guard obligation makes this change responsible
+  for extending the future fixture whenever it changes the shape; deferring would
+  leave the future guard under-covering the shape this change introduced.
 
 ## Decision Outcome
 
-On each `SessionBackend::append_event` (unchanged F1 funnel and opt-in gate),
+On each `SessionBackend::append_event` (unchanged initial funnel and opt-in gate),
 the materializer builds the enriched projection and writes it into the resolved
 `/workflows` directory as `koto-<uuid>.json` (unchanged filename, atomic write,
 mkdir):
 
-1. **Resolve the target directory** -- unchanged F1 path (env self-publish +
+1. **Resolve the target directory** -- unchanged initial path (env self-publish +
    self-then-ancestor walk; no location -> write nothing).
 2. **Derive the enriched projection:**
-   a. The F1 minimal fields (display name, current state, terminal/failed) via
+   a. The initial minimal fields (display name, current state, terminal/failed) via
       the existing `derive_minimal_projection` helpers.
    b. The active-phase detail (directive, current evidence, latest gate,
       blocked) via the `read_detail` read seam.
@@ -294,14 +294,14 @@ mkdir):
    `phases[]` (title = human phase label, detail = outcome/directive line), and
    `workflowProgress[]` (a `workflow_phase` marker per phase + a `workflow_agent`
    step per visited/active phase). All additive; `contractVersion: 2`.
-4. **Write atomically** -- unchanged F1 writer.
+4. **Write atomically** -- unchanged initial writer.
 
 This satisfies every PRD requirement: R1 (ordered phases via Fork A +
 `workflow_phase` markers; active marked), R2 (active directive via `read_detail`
 into the active step/phase detail), R3 (per-phase outcomes via Fork C into
 per-phase `detail` / `resultPreview`), R4 (blocked via Fork D), R5 (reuse the
 read seam, Forks C/D), R6 (additive contract, Fork E), R7 (fixture, Fork E),
-R8/R9/R10 (F1 foundation and default path untouched; best-effort derivation).
+R8/R9/R10 (the initial foundation and default path untouched; best-effort derivation).
 
 ## Solution Architecture
 
@@ -328,22 +328,22 @@ helpers it reuses (lifted to shared visibility if currently private to `cli/`).
   as the blocked predicate to a shared location) so the materializer and the
   dashboard share one derivation. No change to the dashboard's public behavior.
 
-Data/control flow on a commit (delta over F1 in *italic*):
+Data/control flow on a commit (delta over the initial render in *italic*):
 
 ```
 koto next / --to / rewind / exit
   -> SessionBackend::append_event (LocalBackend)
        -> persistence::append_event  (state file written)
        -> materialize_after_commit(self, id)
-            gate: opt-in?  no -> return                     (F1, unchanged)
-            dir = resolve_publish_location(...)             (F1, unchanged)
-            proj = derive_minimal_projection(...)           (F1, unchanged)
+            gate: opt-in?  no -> return                     (initial, unchanged)
+            dir = resolve_publish_location(...)             (initial, unchanged)
+            proj = derive_minimal_projection(...)           (initial, unchanged)
             detail = read_detail(state_path, id)            (new: active-phase detail)
             phases = ordered_phases(compiled_template)      (new: Fork A)
             outcomes = per_state_outcomes(events)           (new: Fork C)
-            file = WorkflowFile{ ...F1 fields, status(+blocked),
+            file = WorkflowFile{ ...initial fields, status(+blocked),
                                  phases, workflowProgress }  (new: Forks B/D/E)
-            atomic-write koto-<uuid>.json                   (F1, unchanged)
+            atomic-write koto-<uuid>.json                   (initial, unchanged)
 ```
 
 ## Implementation Approach
@@ -353,7 +353,7 @@ Dependency-ordered, each step landing tests:
 1. **Contract extension** (`contract.rs`): `Phase`, `ProgressNode`, the
    `phases`/`workflowProgress` fields, `RenderStatus::Blocked`, bump to
    `CONTRACT_VERSION = 2`; unit tests over the serialized shape (keys, the two
-   progress node types, `status: blocked`, additive-over-F1). No behavior change
+   progress node types, `status: blocked`, additive over the initial shape). No behavior change
    to the writer yet.
 2. **Ordered phases + per-state outcomes** (`project.rs`): the Fork A structural
    walk and the Fork C full-log bucketing, as pure functions over the compiled
@@ -368,16 +368,16 @@ Dependency-ordered, each step landing tests:
    file (multi-phase ordered + active marked + completed outcomes; active
    directive present; gate-blocked -> `status: blocked`).
 5. **Shape fixture + verification harness** (Fork E; `tests/` or `scripts/`): a
-   committed enriched-shape JSON fixture and a contract test pinning it for F4;
+   committed enriched-shape JSON fixture and a contract test pinning it for the future guard;
    extend `scripts/verify-native-workflows.sh` and the verification guide to
-   exercise the F2 properties alongside F1's four checks (no regression).
+   exercise the enriched properties alongside the initial four checks (no regression).
 
 ## Security Considerations
 
-- **No new inputs or seams.** F2 adds derivation and fields over F1's existing
+- **No new inputs or seams.** This change adds derivation and fields over the initial
   commit-funnel side effect; it opens no new file, socket, env var, or CLI
   surface. The `/workflows` directory value, the filename, and the opt-in gate
-  are F1's, unchanged.
+  are the initial render's, unchanged.
 - **Directive/evidence content is koto's own log data.** The directive comes
   from the compiled template; evidence and gate outcomes come from the session's
   own event log. They are serialized as JSON string *values* (never as keys or
@@ -387,11 +387,11 @@ Dependency-ordered, each step landing tests:
 - **Undocumented-surface isolation preserved.** The coupling to Claude Code's
   `phases`/`workflowProgress` shape stays confined to `contract.rs` (and the
   fixture); koto's engine, event log, and dashboard do not depend on it. The
-  guard that fails loudly on drift remains Feature 4; F2 pins the shape fixture
-  F4 will guard against.
+  guard that fails loudly on drift remains the future drift-guard; this change pins the shape fixture
+  that guard will use.
 - **Best-effort containment.** A derivation failure (unreadable template,
   malformed epoch) degrades the affected field to empty/omitted and never fails
-  the commit or writes an invalid file (R10), the same discipline F1 applies.
+  the commit or writes an invalid file (R10), the same discipline the initial render applies.
 
 ## Consequences
 
@@ -400,31 +400,29 @@ Dependency-ordered, each step landing tests:
   enabled path; the default (no-location) path is unchanged -- it still returns
   after the cheap opt-in probe.
 - `koto-<uuid>.json` grows from a status line to a phase tree. The file contract
-  is now `contractVersion: 2`; F1's `contractVersion: 1` fields remain a valid
-  subset, so a reader that ignores the new fields still renders F1's entry.
-- A committed enriched-shape fixture now exists; Feature 4's guard adopts it as
-  its anchor, discharging the roadmap's F2 shape-change obligation.
+  is now `contractVersion: 2`; the initial `contractVersion: 1` fields remain a valid
+  subset, so a reader that ignores the new fields still renders the initial entry.
+- A committed enriched-shape fixture now exists; the future drift-guard adopts it as
+  its anchor, discharging the shape-change obligation.
 - Carried-forward limitations (not regressions): branch/loop-heavy templates
   have no single linear phase order (the structural walk emits a stable,
   sensible one and reflects loops/rewinds in per-phase status); the finer
-  terminal-inference edge cases F1 noted remain later-slice scope; per-agent
-  hierarchy detail is Feature 3.
+  terminal-inference edge cases the initial render noted remain later-slice scope; per-agent
+  hierarchy detail is a future hierarchy.
 - If a future Claude Code version changes the `phases`/`workflowProgress` shape,
-  only `contract.rs` and the fixture change -- the core-isolation property F1
+  only `contract.rs` and the fixture change -- the core-isolation property the initial render
   established is preserved.
 
 ## References
 
 - `PRD-native-workflows-phase-detail` -- the requirements this design satisfies.
-- `DESIGN-native-workflows-render` -- Feature 1's design, whose
+- `DESIGN-native-workflows-render` -- the initial render's design, whose
   `workflows_surface` module and contract this design extends.
-- `ROADMAP-koto-agent-surface-legibility` (Feature 2, and the F2/F4 shape-change
-  soft coupling) -- the roadmap feature and obligation this design implements.
 - koto seams: `src/cli/dashboard_data.rs` (`read_detail`, `DetailData`,
   `read_session`'s `is_blocked`), `src/cli/dashboard.rs` (`classify_status`
   blocked bucket), `src/engine/persistence.rs` (pure state/terminal helpers),
   `src/template/types.rs` (`CompiledTemplate`, `TemplateState`, `Transition`),
-  `src/workflows_surface/` (F1's contract/project/materialize).
+  `src/workflows_surface/` (the initial contract/project/materialize).
 - The `/workflows` `phases` / `workflowProgress` / `blocked` render fields were
   established empirically against the same undocumented Claude Code surface
-  Feature 1 pinned (v2.1.x); the guard that makes drift fail loudly is Feature 4.
+  the initial render pinned (v2.1.x); the guard that makes drift fail loudly is a later slice.

@@ -1,9 +1,8 @@
-//! koto's native Claude Code `/workflows` surface (Feature 1: walking skeleton).
+//! koto's native Claude Code `/workflows` surface (the initial single-session render).
 //!
 //! koto renders a session as a native entry in Claude Code's `/workflows`
 //! screen by producing the artifacts that screen already reads -- there is no
-//! skill, reader, or parallel surface (see
-//! `docs/decisions/ADR-koto-native-workflows-rendering.md`, upstream). On each
+//! skill, reader, or parallel surface (the settled surface decision). On each
 //! state-commit a participating session writes its own `koto-<uuid>.json` into
 //! the `/workflows` directory a hosting Claude Code session published.
 //!

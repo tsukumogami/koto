@@ -2,8 +2,8 @@
 schema: brief/v1
 status: Done
 problem: |
-  Feature 1 made a koto session appear in Claude Code's `/workflows` screen,
-  but the entry carries only a bare status -- name plus running/done. The
+  The initial render made a koto session appear in Claude Code's `/workflows`
+  screen, but the entry carries only a bare status -- name plus running/done. The
   operator can see *that* a koto session is running, not *what it is doing*:
   which phase it is in, what the current step is asking for, what the last
   completed step produced, or whether it is stuck waiting on a failed gate. The
@@ -15,7 +15,7 @@ outcome: |
   with the active one marked, the active phase's directive, and each completed
   phase's evidence or gate outcome. A session blocked on a failed gate reads as
   blocked -- not running, not done. No new command, skill, or window; the
-  richer detail rides the same file F1 already writes.
+  richer detail rides the same file the initial render already writes.
 ---
 
 # BRIEF: real phase/agent detail in the rendered `/workflows` entry
@@ -24,21 +24,22 @@ outcome: |
 
 Done
 
-Framing for Feature 2 of the koto-agent-surface-legibility roadmap -- the first
-value-adding increment over the Feature 1 walking skeleton. The surface
-decision is settled upstream (koto produces `/workflows`'s native artifacts; no
-skill or reader), and F1 landed the foundation this feature extends: the
+Framing for the phase-detail enrichment -- the first value-adding increment over
+the initial single-session slice. The surface decision is settled (koto produces
+`/workflows`'s native artifacts; no skill or reader), and the initial render
+landed the foundation this feature extends: the
 `workflows_surface` module, materialization on the commit funnel, the
 context-store publish/discover, and the extensible `koto-<uuid>.json` contract.
-This brief captures F2's framing; the requirements belong to
+This brief captures this change's framing; the requirements belong to
 `PRD-native-workflows-phase-detail` and the field mapping to
 `DESIGN-native-workflows-phase-detail`.
 
 ## Problem Statement
 
-Feature 1 proved the end-to-end path: a hosting Claude Code session publishes a
-`/workflows` directory, a koto session writes `koto-<uuid>.json` there on every
-state-commit, and `/workflows` renders it. But F1 deliberately carried the
+The initial render proved the end-to-end path: a hosting Claude Code session
+publishes a `/workflows` directory, a koto session writes `koto-<uuid>.json`
+there on every state-commit, and `/workflows` renders it. But the initial render
+deliberately carried the
 thinnest projection -- the session's name, its current state, and a
 running/done/failed status. That answers "is a koto session running?" It does
 not answer the question the operator actually has while watching a workflow:
@@ -49,13 +50,12 @@ koto already holds the answer. Its per-session model has the ordered phases
 submitted, the gate outcomes, and human-readable labels -- and koto's own
 dashboard renders exactly this detail. Claude Code's `/workflows` screen is
 itself built to show a run as a tree of phases and steps with their outcomes.
-What is missing is the projection between the two: F1 emits a bare status where
-the screen is ready to render structure koto already has.
+What is missing is the projection between the two: the initial render emits a
+bare status where the screen is ready to render structure koto already has.
 
-This feature closes that gap for one session. It does not add hierarchies
-(Feature 3), hardening (Feature 4), or lifecycle (Feature 5); it enriches the
-single-session projection F1 emits from a status into the session's real
-structure.
+This feature closes that gap for one session. It does not add hierarchies,
+hardening, or lifecycle; it enriches the single-session projection the initial
+render emits from a status into the session's real structure.
 
 ## User Outcome
 
@@ -69,7 +69,7 @@ gate outcome it cleared. If the session is blocked on a gate that did not pass,
 the entry reads *blocked* -- distinct from a still-advancing *running* and from
 a finished *done*. When the operator reopens `/workflows` after the session
 advances, the marked phase moves and the newly completed phase shows its
-outcome. Nothing else about F1 changes: the same file, written on the same
+outcome. Nothing else about the initial render changes: the same file, written on the same
 commit funnel, opt-in by the same published location, with koto's default path
 untouched when no host participates.
 
@@ -117,33 +117,31 @@ directive updates.
 - Deriving the richer fields by reusing koto's existing per-session detail read
   seam (the dashboard's `read_detail` derivation), in the same layer -- a
   reuse, not a second derivation.
-- Extending the F1 file contract *additively*: new fields, a bumped contract
-  version, F1's shape and render preserved.
-- Noting/extending the contract's shape fixture so Feature 4's guard can
-  validate the enriched shape (the roadmap's stated soft coupling).
-- Extending F1's end-to-end verification harness to exercise the new
+- Extending the initial file contract *additively*: new fields, a bumped
+  contract version, the existing shape and render preserved.
+- Noting/extending the contract's shape fixture so the future drift-guard can
+  validate the enriched shape (the stated soft coupling).
+- Extending the initial end-to-end verification harness to exercise the new
   properties.
 
 **Out:**
 
-- Hierarchies -- coordinator and delegates each rendering as their own entries
-  (Feature 3).
+- Hierarchies -- coordinator and delegates each rendering as their own entries.
 - Hardening: the version/fixture guard over the undocumented surface and the
-  rendered smoke check (Feature 4). F2 documents the extended shape and extends
-  the fixture so F4 can pick it up, but does not build the guard.
-- File lifecycle: retention/rotation and crash-staleness (Feature 5).
+  rendered smoke check. This change documents the extended shape and extends
+  the fixture so the future guard can pick it up, but does not build the guard.
+- File lifecycle: retention/rotation and crash-staleness.
 - Nested single-run rendering (delegates as agents under one run), MCP, and any
-  koto skill, reader, or parallel surface (settled out by the ADR).
-- Re-deciding the settled surface, or reopening F1's commit-funnel hook,
-  context-store publish/discover, atomic write, or opt-in mechanism.
+  koto skill, reader, or parallel surface (settled by the surface decision).
+- Re-deciding the settled surface, or reopening the initial render's
+  commit-funnel hook, context-store publish/discover, atomic write, or opt-in
+  mechanism.
 
 ## References
 
-- `ROADMAP-koto-agent-surface-legibility` (Feature 2) -- the roadmap feature
-  this brief frames.
 - `BRIEF-native-workflows-render` / `PRD-native-workflows-render` /
-  `DESIGN-native-workflows-render` -- Feature 1's chain, whose foundation this
-  feature extends.
+  `DESIGN-native-workflows-render` -- the initial render's companion docs, whose
+  foundation this feature extends.
 - `PRD-native-workflows-phase-detail` -- the requirements derived from this
   brief.
 - `DESIGN-native-workflows-phase-detail` -- the field mapping that satisfies

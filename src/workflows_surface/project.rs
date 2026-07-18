@@ -21,7 +21,7 @@ use super::contract::RenderStatus;
 
 const LABEL_SEP: &str = " \u{b7} "; // " · "
 
-/// The minimal per-session projection Feature 1 renders.
+/// The minimal per-session projection the initial render produces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Projection {
     /// The session's stable init-time UUID.
@@ -51,8 +51,8 @@ pub fn derive_minimal_projection(
 }
 
 /// The pure minimal-projection computation over an already-read log. Shared by
-/// [`derive_minimal_projection`] (Feature 1) and [`derive_enriched_projection`]
-/// (Feature 2) so both derive the base status identically from one read.
+/// [`derive_minimal_projection`] (the minimal shape) and [`derive_enriched_projection`]
+/// (the enriched shape) so both derive the base status identically from one read.
 fn project_from_log(
     header: &StateFileHeader,
     events: &[Event],
@@ -101,7 +101,7 @@ fn project_from_log(
 }
 
 // ---------------------------------------------------------------------------
-// Feature 2: enriched projection (ordered phases, per-phase outcomes, blocked)
+// Enriched projection (ordered phases, per-phase outcomes, blocked)
 // ---------------------------------------------------------------------------
 
 /// Where a phase sits relative to the session's current state.
@@ -148,11 +148,11 @@ pub struct PhaseEntry {
     pub outcome: StateOutcome,
 }
 
-/// The enriched projection Feature 2 renders: the Feature 1 base plus the
+/// The enriched projection: the minimal base plus the
 /// ordered phase list.
 #[derive(Debug, Clone)]
 pub struct EnrichedProjection {
-    /// The Feature 1 minimal projection (status already blocked-adjusted).
+    /// The minimal projection (status already blocked-adjusted).
     pub base: Projection,
     /// The session's phases in structural order.
     pub phases: Vec<PhaseEntry>,
@@ -160,7 +160,7 @@ pub struct EnrichedProjection {
 
 /// Derive the enriched projection for `session_id`, reading the log once.
 ///
-/// Reuses the read-seam derivations Feature 1 uses for the base fields and the
+/// Reuses the read-seam derivations the minimal projection uses for the base fields and the
 /// dashboard's blocked predicate ([`latest_epoch_gate_failed`]) for the
 /// `blocked` status, then adds the ordered phase list ([`ordered_phases`]) with
 /// per-phase status, directive, and outcome ([`per_state_outcomes`]). Returns
@@ -187,7 +187,7 @@ pub fn derive_enriched_projection(
     }
 
     // Load the compiled template (best-effort): no template -> no phase list,
-    // and the entry still renders the Feature 1 fields.
+    // and the entry still renders the minimal fields.
     let compiled = derive_machine_state(&header, &events, &session_dir).and_then(|ms| {
         std::fs::read(&ms.template_path)
             .ok()

@@ -9,17 +9,17 @@ problem: |
   Claude Code session publishes -- opt-in, atomic, directory-creating, and
   untouched when no location is published. The slice must also fix the shared
   foundation (file contract, hook seam, context-store publish/discover key) so
-  Features 2-5 extend it rather than reopen it.
+  later features extend it rather than reopen it.
 decision: |
   Materialize off the single trait-level commit funnel
   (`SessionBackend::append_event`), re-deriving a minimal projection from the
   existing dashboard read seam. Publish the target `/workflows` directory into
-  koto's per-session context store under the reserved, F3-ready key
+  koto's per-session context store under the reserved, hierarchy-ready key
   `workflows/publish-location`; resolve the target on commit by walking
   self-then-`parent_workflow`-ancestors and taking the nearest published
   location. Learn the directory from the hosting Claude Code session via a
   `SessionStart` hook that sets `KOTO_WORKFLOWS_DIR`; koto self-publishes that
-  into its own context store so descendants (F3) discover it by the same walk.
+  into its own context store so descendants (a future hierarchy) discover it by the same walk.
   Write `koto-<session-uuid>.json` atomically (temp-then-rename), creating the
   directory when absent. No published location resolvable -> no write.
 rationale: |
@@ -29,18 +29,18 @@ rationale: |
   instrumenting N commands. Reusing the read seam keeps koto's model the single
   source of truth. A namespaced context-store key plus an ancestor walk is the
   minimal shape that is already correct for one session (the walk degenerates to
-  self) and for Feature 3's tree (nearest published ancestor) with no key
+  self) and for a future hierarchy's tree (nearest published ancestor) with no key
   change. Opt-in by published-location presence, not config, is forced by koto
   config not being inherited by children.
 ---
 
-# DESIGN: koto sessions render natively in Claude Code's `/workflows` (walking skeleton)
+# DESIGN: koto sessions render natively in Claude Code's `/workflows` (initial single-session slice)
 
 ## Status
 
 Current
 
-Mechanism design for the walking-skeleton slice of koto's native Claude Code
+Mechanism design for the initial single-session slice of koto's native Claude Code
 `/workflows` rendering, settling the forks left open by the Accepted
 `PRD-native-workflows-render`. The surface decision (koto produces the native
 artifact; no skill or reader) is settled and is not reopened here. This design
@@ -65,7 +65,7 @@ UI-free per-session projection at read time (the dashboard's read seam, which
 `koto dashboard --once` consumes). The problem is to connect these: on each
 commit, re-derive the session's state and write it, in Claude Code's file
 shape, into the directory a hosting session published -- for one session now,
-extensibly enough that Features 2-5 (richer detail, hierarchies, hardening,
+extensibly enough that later features (richer detail, hierarchies, hardening,
 lifecycle) add to it rather than rework it.
 
 Concrete seams this design builds on (koto working tree):
@@ -95,8 +95,8 @@ Concrete seams this design builds on (koto working tree):
   commands (the explicit "hook the one funnel, not each command" rule).
 - **koto's model is the source of truth**: the projection is a derivation, not a
   second store; reuse the read seam rather than reimplement it.
-- **Do not box out Feature 3**: the context-store key and discovery walk must be
-  the shape F3's nearest-published-ancestor generalization needs, chosen now.
+- **Do not box out future hierarchies**: the context-store key and discovery walk must be
+  the shape a future hierarchy's nearest-published-ancestor generalization needs, chosen now.
 - **Opt-in, default path untouched**: no location published -> no write, no
   meaningful added cost, no behavior change.
 - **Never render a torn entry**: writes are atomic; the directory is created.
@@ -124,7 +124,7 @@ cloud backend inherits it through its inner `self.local.append_event(...)` call.
   cannot resolve a publish location or key a projection; and it is also called
   by internal coordinator writes (respawn/wake/claim) where a projection would
   be premature. Note those same internal sites bypass the trait, so they do not
-  trigger materialization -- correct for F1 (mid-coordination writes are not
+  trigger materialization -- correct for the initial slice (mid-coordination writes are not
   session-state commits an operator wants rendered).
 
 ### Fork B -- How to derive the projection
@@ -133,7 +133,7 @@ cloud backend inherits it through its inner `self.local.append_event(...)` call.
 minimal projection needs only the display name (from the header/intent), the
 current state (`derive_state_from_log`), and running/done/failed (`is_terminal_state`
 plus the failure-name heuristic `classify_status` uses). These are pure
-functions over header + events + template. The small subset F1 needs is factored
+functions over header + events + template. The small subset the initial slice needs is factored
 into a shared, UI-free helper the materializer and the dashboard both call, so
 this is a *reuse* (lifting pure helpers to where both callers see them), not an
 engine refactor and not a second derivation.
@@ -141,10 +141,10 @@ engine refactor and not a second derivation.
 - *Rejected: reimplement a bespoke state read in the materializer.* Duplicates
   logic that must stay in lockstep with koto's terminal/blocked semantics and
   invites drift -- the exact failure the "single source of truth" driver forbids.
-- *Rejected: call the full `read_detail` deep projection.* F1's minimal shape
+- *Rejected: call the full `read_detail` deep projection.* The initial minimal shape
   does not need evidence/gates/history/remaining; pulling the deep seam now
-  couples F1 to fields it does not render. F2 opts into `read_detail` when it
-  adds per-phase detail.
+  couples the initial slice to fields it does not render. The phase-detail enrichment
+  opts into `read_detail` when it adds per-phase detail.
 
 ### Fork C -- How the hosting directory reaches koto (the addressing problem)
 
@@ -163,9 +163,9 @@ its *own* context store (Fork D's key). Materialization then resolves the
 directory through the context-store walk (Fork D), which for the host finds its
 own freshly-published key. Self-publishing (rather than reading the env var
 directly at write time) is what makes the location durable and walkable by
-descendants: a Feature 3 child inherits no env var but discovers the location by
-walking to this ancestor's published key -- so the same mechanism serves F1's
-single session and F3's tree, and the opt-in stays "presence of a published
+descendants: a future hierarchy's child inherits no env var but discovers the location by
+walking to this ancestor's published key -- so the same mechanism serves the
+single session and a future hierarchy's tree, and the opt-in stays "presence of a published
 location," not config.
 
 - *Rejected: the hook shells out `koto context add <koto-session> ...`.* The
@@ -183,7 +183,7 @@ location," not config.
 An explicit `koto workflows publish --dir <dir> [--session <id>]` subcommand is
 *also* provided (Solution Architecture) for the case where a caller does know
 the target session and for scripted verification; it writes the same key without
-appending an event. The env-var handoff is the default F1 path; the subcommand is
+appending an event. The env-var handoff is the default initial path; the subcommand is
 the explicit escape hatch and publish surface.
 
 The `KOTO_WORKFLOWS_DIR` handoff is the one accepted point of coupling to Claude
@@ -192,7 +192,7 @@ Claude Code cannot make the variable visible to a koto process, the documented
 fallback is the explicit `koto workflows publish` call from the hook; either way
 the location ends up in the context store, and koto core reads only the store.
 
-### Fork D -- The context-store key schema and discovery walk (F3-ready)
+### Fork D -- The context-store key schema and discovery walk (hierarchy-ready)
 
 **Chosen: reserved namespaced key `workflows/publish-location`, content = the
 absolute directory path; discovery walks self-then-ancestors and takes the
@@ -203,13 +203,13 @@ the leading-`/` and `..` key restrictions do not bite). Discovery reuses the
 `measure_depth_from_parent` walk shape -- cycle guard, hop cap, missing-header-
 as-root, empty-parent-as-root -- probing each session's store with
 `ctx_exists(session, "workflows/publish-location")` and returning the nearest
-hit's content. For F1 the walk starts and ends at the session itself. Feature 3
+hit's content. For a single session the walk starts and ends at the session itself. A future hierarchy
 adds nothing to the key or the probe: it is already the nearest-published-
 ancestor walk, just exercised over a real tree.
 
 - *Rejected: an unprefixed key (`workflows-dir`).* Risks colliding with user
   context keys and does not group the reserved surface; harder to reason about
-  when F3/F4/F5 add sibling reserved keys.
+  when later features add sibling reserved keys.
 - *Rejected: publish only at the root and compose downward.* Root-only
   composition is already rejected (it leaves deep progress stale); the
   per-session-writes-to-nearest-published-ancestor model is the settled shape.
@@ -223,18 +223,18 @@ currentState, contractVersion }`) that identifies the file and versions the
 contract.** Claude Code applies defaults to every field and renders even `{}`,
 so a conservative minimal top-level set renders as an entry showing the name and
 status; the current state is surfaced both in the koto block and reflected into
-the rendered entry. The struct is serde-modeled with room to grow: Feature 2
-adds phase/agent detail as additional fields, Feature 4's guard pins the exact
-shape against a fixture, and the `contractVersion` gives that guard a stable
-anchor. The file is named `koto-<session-uuid>.json` (R2), non-colliding with
+the rendered entry. The struct is serde-modeled with room to grow: the
+phase-detail enrichment adds phase/agent detail as additional fields, the future
+drift-guard pins the exact shape against a fixture, and the `contractVersion`
+gives that guard a stable anchor. The file is named `koto-<session-uuid>.json` (R2), non-colliding with
 `wf_*.json`.
 
 - *Rejected: emit koto's internal detail struct verbatim.* Couples the on-disk
   contract to koto's internal field names and would churn every time the read
   seam changes; the projection is a deliberate, versioned mapping instead.
 - *Rejected: reverse-engineer and pin the full Claude Code `wf_*.json` schema
-  now.* That is Feature 4's guard/fixture work. F1 emits the minimal renderable
-  shape and documents the coupling; over-specifying now would front-load F4.
+  now.* That is the future drift-guard's guard/fixture work. The initial slice emits the minimal renderable
+  shape and documents the coupling; over-specifying now would front-load that hardening.
 
 ### Fork F -- Terminal / done inference
 
@@ -245,15 +245,15 @@ failure heuristic, or the template's `failure` flag) renders `failed`; anything
 else renders `running`. A session writes its terminal state on the terminal
 commit, before koto's cleanup deletes its state file, so the finished entry
 persists (R9). Three genuinely ambiguous cases (missing/changed template, an
-unnamed failure state, a cancelled session) are handled at F1 only to the
+unnamed failure state, a cancelled session) are handled in the initial slice only to the
 extent the common path requires -- a cancelled session (a `WorkflowCancelled`
 event) renders terminal rather than a stuck `running`; the finer inference is
 later-slice scope and is noted as a known limitation here, not silently assumed
 solved.
 
 - *Rejected: solve all three ambiguous cases now.* The finer inference belongs
-  to the later mapping and guard slices; pulling it into F1 widens the skeleton
-  past its purpose. F1 must only satisfy "graceful completion reads done," which
+  to the later mapping and guard slices; pulling it into the initial slice widens it
+  past its purpose. The initial slice must only satisfy "graceful completion reads done," which
   the common-path mapping does.
 
 ### Fork G -- Write atomicity and directory creation
@@ -267,7 +267,7 @@ rename is atomic on the local filesystem, so a concurrent `/workflows` reopen
 never sees a partial file.
 
 - *Rejected: write in place.* Risks a torn read if `/workflows` opens mid-write;
-  cheap to avoid, so avoided even though the broader hardening guard is F4.
+  cheap to avoid, so avoided even though the broader hardening guard is a later slice.
 
 ## Decision Outcome
 
@@ -413,16 +413,16 @@ three independent enough to land in any order behind the fourth.
   most, one `ctx_exists` probe; on the enabled path it is a read-seam
   re-derivation plus an atomic write per commit (the accepted per-advance cost).
 - The context-store key `workflows/publish-location` and the self-then-ancestor
-  walk are now a shipped contract Feature 3 extends without change -- the "don't
-  box out F3" obligation is discharged in F1.
+  walk are now a shipped contract a future hierarchy extends without change -- the "don't
+  box out the hierarchy work" obligation is discharged in the initial slice.
 - Internal coordinator writes that bypass the trait (respawn/wake/claim, via
-  `persistence::append_event` directly) do not materialize. Harmless for F1
+  `persistence::append_event` directly) do not materialize. Harmless for the initial slice
   (they are not operator-facing session commits); the hierarchy slice revisits
   whether any need to, when hierarchy rendering is in scope.
 - Known limitations carried forward (not regressions): the finer terminal
   inference for the three ambiguous cases, the version/fixture guard and
   rendered smoke check, and retention and crash-staleness are all later-slice
-  scope and out of F1.
+  scope and out of the initial slice.
 - If Claude Code cannot expose `KOTO_WORKFLOWS_DIR` to a koto process, the
   documented fallback (`koto workflows publish` from the hook) keeps the design
   intact, since koto core reads only the context store.

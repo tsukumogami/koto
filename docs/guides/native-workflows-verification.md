@@ -1,7 +1,7 @@
 # Verifying native `/workflows` rendering
 
-Feature 1 of the koto agent-surface work makes a koto session appear as a
-native entry in Claude Code's `/workflows` screen; Feature 2 enriches that entry
+The initial render makes a koto session appear as a
+native entry in Claude Code's `/workflows` screen; the phase-detail work enriches that entry
 from a bare status into the session's real structure (ordered phases with the
 active one marked, the active directive, per-phase evidence/gate outcomes, and a
 gate-blocked → `blocked` status). This guide covers both the automated check and
@@ -19,27 +19,27 @@ scripts/verify-native-workflows.sh
 ```
 
 Expected output ends with
-`ALL CHECKS PASSED: Feature 1 + Feature 2 verified end-to-end.` The script
+`ALL CHECKS PASSED: native /workflows rendering verified end-to-end.` The script
 exercises everything koto owns:
 
-- **Feature 1** — single-session render with the current state, update on
+- **The initial render** — single-session render with the current state, update on
   advance, done-on-completion, the opt-in no-write path (default path
   untouched), and the atomic `koto-<uuid>.json` filename.
-- **Feature 2** — the phases render in order with the active one marked, the
+- **The phase-detail enrichment** — the phases render in order with the active one marked, the
   active phase's directive is legible, a completed phase shows its gate outcome,
   and a session whose gate did not pass renders as `blocked` (not running, not
   done).
 
 The `hello-koto` template's `awakening` state carries a command gate that fails
 until a greeting file exists, so the first advance lands on a gate-blocked state
-(Feature 2's blocked case) and the second, after the greeting, completes —
+(the blocked case) and the second, after the greeting, completes —
 exercising both statuses on one run.
 
 The script does **not** confirm that Claude Code actually renders the file — CI
 cannot drive the TUI — which is what the manual check below adds. The exact
 enriched file shape is pinned by the golden fixture at
 `tests/fixtures/native-workflows/enriched-shape.json` and its guard test
-(`tests/native_workflows_shape.rs`); Feature 4 adopts that fixture as the anchor
+(`tests/native_workflows_shape.rs`); the future drift-guard adopts that fixture as the anchor
 for its version/fixture guard over the undocumented surface.
 
 ## Manual (live Claude Code TUI)
@@ -95,10 +95,10 @@ the emitted file.
 - The write is atomic (temp-then-rename), so a `/workflows` reopen never sees a
   half-written file.
 - The `/workflows` file format is an undocumented, version-coupled Claude Code
-  surface. Feature 2 pins the enriched shape with a committed golden fixture
+  surface. The phase-detail enrichment pins the enriched shape with a committed golden fixture
   (`tests/fixtures/native-workflows/enriched-shape.json`) and a guard test, so a
   koto-side change to the emitted shape fails loudly. The guard that catches a
   *Claude Code*-side change to the surface (a version/fixture check plus a
-  rendered smoke check) is scoped to Feature 4, which adopts this fixture as its
+  rendered smoke check) is scoped to a later slice, which adopts this fixture as its
   anchor; if the manual check stops rendering after a Claude Code update, that is
-  the expected signal for Feature 4's guard.
+  the expected signal for the future drift-guard.

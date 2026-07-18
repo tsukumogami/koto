@@ -1,11 +1,11 @@
-//! Golden-shape guard for the Feature 2 enriched `/workflows` file contract.
+//! Golden-shape guard for the enriched `/workflows` file contract.
 //!
 //! The committed fixture at `tests/fixtures/native-workflows/enriched-shape.json`
 //! pins the enriched `koto-<uuid>.json` shape (ordered `phases`, the
-//! `workflowProgress` tree, and the `blocked` status) that koto emits. Feature 4
-//! adopts this fixture as the anchor for its version/fixture guard over the
-//! undocumented Claude Code surface; this test is the Feature 2 discharge of the
-//! roadmap's F2/F4 shape-change obligation (whenever the emitted shape changes,
+//! `workflowProgress` tree, and the `blocked` status) that koto emits. The future
+//! drift-guard adopts this fixture as the anchor for its version/fixture guard over the
+//! undocumented Claude Code surface; this test is the discharge of the
+//! shape-change / drift-guard obligation (whenever the emitted shape changes,
 //! this fixture must change with it, deliberately).
 
 use koto::workflows_surface::{Phase, ProgressNode, RenderStatus, WorkflowFile, CONTRACT_VERSION};
@@ -92,7 +92,7 @@ fn canonical_enriched_file() -> WorkflowFile {
 
 /// The emitted enriched shape must match the committed golden fixture. Drift
 /// (a renamed field, a dropped node type, a changed status vocabulary) fails
-/// here so Feature 4's guard has a stable anchor and F1's readers are not
+/// here so the future drift-guard has a stable anchor and the initial readers are not
 /// silently broken.
 #[test]
 fn enriched_shape_matches_golden_fixture() {
@@ -106,14 +106,14 @@ fn enriched_shape_matches_golden_fixture() {
     assert_eq!(
         actual, expected,
         "the emitted enriched /workflows shape drifted from the golden fixture \
-         ({FIXTURE}). This fixture is Feature 4's guard anchor; if the contract \
+         ({FIXTURE}). This fixture is the drift-guard anchor; if the contract \
          change is intentional, regenerate it with \
          `cargo test --test native_workflows_shape -- --ignored --nocapture` and \
          commit the printed JSON."
     );
 }
 
-/// The fixture pins contract version 2 and the Feature 2 additive fields, so a
+/// The fixture pins contract version 2 and the enriched additive fields, so a
 /// future reader can assert the shape it targets.
 #[test]
 fn fixture_pins_contract_v2_and_new_fields() {
@@ -124,7 +124,7 @@ fn fixture_pins_contract_v2_and_new_fields() {
     assert_eq!(v["status"], "blocked");
     assert!(v["phases"].is_array());
     assert!(v["workflowProgress"].is_array());
-    // Feature 1's top-level fields survive unchanged.
+    // The initial top-level fields survive unchanged.
     assert!(v["id"].is_string());
     assert!(v["name"].is_string());
     assert!(v["startTime"].is_u64());

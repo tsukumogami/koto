@@ -6,27 +6,27 @@
 //! by `startTime`, and renders each as a run entry (established empirically
 //! against Claude Code v2.1.209; see
 //! `docs/designs/DESIGN-native-workflows-render.md`). The shape here is a
-//! minimal *valid* projection for Feature 1 (name, current state, running/done)
-//! that later features add fields to without breaking F1 readers. The
+//! minimal *valid* projection for the initial render (name, current state, running/done)
+//! that later features add fields to without breaking the initial readers. The
 //! koto-namespaced [`KotoBlock`] identifies the file as koto's and carries a
-//! [`CONTRACT_VERSION`] that Feature 4's guard/fixture anchors on.
+//! [`CONTRACT_VERSION`] that the future drift-guard/fixture anchors on.
 
 use serde::Serialize;
 
-/// Contract version of the koto-namespaced projection block. Feature 4's
-/// guard/fixture pins this; later features that add fields bump it.
+/// Contract version of the koto-namespaced projection block. The future
+/// drift-guard/fixture pins this; later features that add fields bump it.
 ///
-/// Version 2 (Feature 2) adds the additive `phases` and `workflowProgress`
+/// Version 2 adds the additive `phases` and `workflowProgress`
 /// fields and the `blocked` render status. Version 1's fields remain a valid
-/// subset, so a reader that ignores the new fields still renders Feature 1's
+/// subset, so a reader that ignores the new fields still renders the initial
 /// entry.
 pub const CONTRACT_VERSION: u32 = 2;
 
 /// Render status mapped onto the `/workflows` vocabulary.
 ///
-/// Feature 1 emitted `running`/`completed`/`failed`; Feature 2 adds `blocked`
+/// Version 1 emitted `running`/`completed`/`failed`; version 2 adds `blocked`
 /// (koto's blocked-in-current-epoch), distinct from running and done. Stalled/
-/// pending refinements remain Feature 5 scope.
+/// pending refinements remain later-slice scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RenderStatus {
@@ -61,7 +61,7 @@ pub struct Phase {
 /// single non-hierarchical koto session, a `workflow_agent` step represents the
 /// session working one phase (its directive as `promptPreview`, its
 /// evidence/gate outcome as `resultPreview`) -- not a delegate session, which
-/// Feature 3 renders as its own separate entry.
+/// a future hierarchy renders as its own separate entry.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProgressNode {
@@ -128,12 +128,11 @@ pub struct WorkflowFile {
     /// Start time in epoch milliseconds; Claude Code sorts entries by this.
     #[serde(rename = "startTime")]
     pub start_time: u64,
-    /// The session's phases in order (Feature 2). Empty on the Feature 1
-    /// minimal shape; omitted from serialization when empty so F1's render is
-    /// byte-preserved.
+    /// The session's phases in order. Empty on the minimal shape; omitted from
+    /// serialization when empty so the initial render is byte-preserved.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub phases: Vec<Phase>,
-    /// The progress tree (Feature 2): a `workflow_phase` marker per phase plus
+    /// The progress tree: a `workflow_phase` marker per phase plus
     /// a `workflow_agent` step per visited/active phase. Omitted when empty.
     #[serde(rename = "workflowProgress", skip_serializing_if = "Vec::is_empty")]
     pub workflow_progress: Vec<ProgressNode>,
@@ -170,11 +169,11 @@ impl WorkflowFile {
         }
     }
 
-    /// Attach the Feature 2 phase detail (ordered phases + progress tree).
+    /// Attach the enriched phase detail (ordered phases + progress tree).
     ///
-    /// Additive over [`WorkflowFile::new`]: the Feature 1 minimal shape leaves
+    /// Additive over [`WorkflowFile::new`]: the minimal shape leaves
     /// both empty, and empty vectors are omitted from serialization, so a file
-    /// built without this call is byte-identical to Feature 1's.
+    /// built without this call is byte-identical to the initial render's.
     pub fn with_detail(mut self, phases: Vec<Phase>, workflow_progress: Vec<ProgressNode>) -> Self {
         self.phases = phases;
         self.workflow_progress = workflow_progress;
@@ -254,14 +253,14 @@ mod tests {
 
     #[test]
     fn contract_version_is_two() {
-        // Feature 2 bumped the contract; the guard/fixture anchors on it.
+        // Version 2 bumped the contract; the guard/fixture anchors on it.
         assert_eq!(CONTRACT_VERSION, 2);
     }
 
     #[test]
-    fn f1_minimal_shape_omits_phase_fields() {
-        // A file built with `new` (Feature 1 path) carries neither `phases`
-        // nor `workflowProgress`, so it is byte-identical to Feature 1's shape
+    fn minimal_shape_omits_phase_fields() {
+        // A file built with `new` (the minimal path) carries neither `phases`
+        // nor `workflowProgress`, so it is byte-identical to the initial shape
         // and remains a valid subset for readers that ignore the new fields.
         let wf = WorkflowFile::new("s", "w", "n".to_string(), None, RenderStatus::Running, 0);
         let v: serde_json::Value = serde_json::from_slice(&wf.to_json_bytes().unwrap()).unwrap();
@@ -331,7 +330,7 @@ mod tests {
         );
         assert_eq!(v["workflowProgress"][2]["type"], "workflow_phase");
 
-        // Feature 1's fields are unchanged and present alongside the new ones.
+        // The initial fields are unchanged and present alongside the new ones.
         assert_eq!(v["id"], "koto-sid");
         assert_eq!(v["koto"]["contractVersion"], 2);
     }
