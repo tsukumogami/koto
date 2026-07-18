@@ -892,6 +892,47 @@ pub fn derive_visit_counts(events: &[Event]) -> HashMap<String, usize> {
     counts
 }
 
+/// Whether the most recent gate evaluation in `current_state`'s current epoch
+/// did not pass -- the epoch-scoped half of the dashboard's blocked
+/// classification.
+///
+/// The epoch is the slice of events after the last transition/directed/rewind
+/// into `current_state`; within it, the latest `GateEvaluated` decides. Returns
+/// `false` when the current epoch has no gate evaluation. Callers combine this
+/// with a non-terminal check to get "blocked": the dashboard read seam
+/// (`read_session`) and the `/workflows` projection writer both call this so
+/// they classify a blocked session identically (no drift).
+pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
+    let epoch_start = events.iter().enumerate().rev().find_map(|(idx, e)| {
+        let to = match &e.payload {
+            EventPayload::Transitioned { to, .. } => Some(to.as_str()),
+            EventPayload::DirectedTransition { to, .. } => Some(to.as_str()),
+            EventPayload::Rewound { to, .. } => Some(to.as_str()),
+            _ => None,
+        };
+        if to == Some(current_state) {
+            Some(idx)
+        } else {
+            None
+        }
+    });
+    let epoch_events: &[Event] = match epoch_start {
+        Some(idx) => &events[idx + 1..],
+        None => events,
+    };
+    epoch_events
+        .iter()
+        .rev()
+        .find_map(|e| {
+            if let EventPayload::GateEvaluated { outcome, .. } = &e.payload {
+                Some(outcome != "passed")
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

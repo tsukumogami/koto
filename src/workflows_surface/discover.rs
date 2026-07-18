@@ -8,8 +8,8 @@
 //!
 //! Discovery is the **nearest-published-ancestor walk**: a session resolves its
 //! target directory by walking from itself up its `parent_workflow` chain and
-//! taking the first ancestor that published a location. For Feature 1 (a single
-//! session) the walk starts and ends at the session itself; Feature 3 exercises
+//! taking the first ancestor that published a location. For a single
+//! session the walk starts and ends at the session itself; a future hierarchy exercises
 //! the same walk over a real tree with no change to this key or algorithm. The
 //! walk copies `crate::engine::caps::measure_depth_from_parent`'s robustness:
 //! a cycle guard, a hop cap, and treating a missing header or empty parent as

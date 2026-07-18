@@ -22,7 +22,7 @@ outcome: |
 
 Done
 
-Framing for the walking-skeleton slice of koto's native Claude Code
+Framing for the initial single-session slice of koto's native Claude Code
 `/workflows` rendering. The surface decision is settled: koto produces the
 artifacts Claude Code's `/workflows` renders natively -- there is no koto
 skill, reader, or parallel surface. This brief captures that framing so the
@@ -101,19 +101,18 @@ and any existing `/workflows` screen is untouched.
   `/workflows` file contract (a minimal valid shape later slices add fields
   to), the single commit-funnel hook point that materializes on every
   state-commit, and a context-store publish/discover mechanism whose key
-  schema already admits Feature 3's nearest-published-ancestor walk.
+  schema already admits a future hierarchy's nearest-published-ancestor walk.
 - Creating the target `/workflows` directory when it is absent.
 - Opt-in by the presence of a published location (koto's default path is
   untouched when no location is published).
 
 **Out:**
 
-- Richer per-phase / per-agent detail in the entry (Feature 2).
-- Hierarchies -- coordinator and delegates each rendering (Feature 3).
+- Richer per-phase / per-agent detail in the entry.
+- Hierarchies -- coordinator and delegates each rendering.
 - Hardening against the undocumented surface: the version/fixture guard, the
-  rendered smoke check, and atomic-write-as-hardening (Feature 4).
-- File lifecycle: retention/rotation and crash-staleness reconciliation
-  (Feature 5).
+  rendered smoke check, and atomic-write-as-hardening.
+- File lifecycle: retention/rotation and crash-staleness reconciliation.
 - Any koto skill, reader, MCP server, or parallel surface (settled out of
   scope).
 - Re-deciding the settled surface decision.

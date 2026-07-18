@@ -339,7 +339,7 @@ koto workspace prune --root <session-id> --dry-run
 
 ## Native Claude Code `/workflows` rendering
 
-When a koto session runs inside a Claude Code session, it can appear as a native entry in Claude Code's `/workflows` screen — no separate command or window. This is opt-in and rides the state-commit path: on each advance, koto writes its own `koto-<uuid>.json` (session name, current state, running/done) into the Claude Code session's workflows directory, and the operator sees it on the next `/workflows` reopen.
+When a koto session runs inside a Claude Code session, it can appear as a native entry in Claude Code's `/workflows` screen — no separate command or window. This is opt-in and rides the state-commit path: on each advance, koto writes its own `koto-<uuid>.json` into the Claude Code session's workflows directory, and the operator sees it on the next `/workflows` reopen. The entry shows the session's real structure — its phases in order with the active one marked, the active phase's directive, each completed phase's evidence/gate outcome, and a running / blocked / done status (a session blocked on a failed gate reads *blocked*). No agent action shapes this file; koto derives it from the session's own state.
 
 Enabling it takes one thing: koto must know the target directory. The koto-skills plugin ships a `SessionStart` hook that derives the directory (`<projectDir>/<sessionId>/workflows`) and announces it. koto sessions render into it when **`KOTO_WORKFLOWS_DIR`** is set in their environment:
 

@@ -6,30 +6,93 @@
 //! by `startTime`, and renders each as a run entry (established empirically
 //! against Claude Code v2.1.209; see
 //! `docs/designs/DESIGN-native-workflows-render.md`). The shape here is a
-//! minimal *valid* projection for Feature 1 (name, current state, running/done)
-//! that later features add fields to without breaking F1 readers. The
+//! minimal *valid* projection for the initial render (name, current state, running/done)
+//! that later features add fields to without breaking the initial readers. The
 //! koto-namespaced [`KotoBlock`] identifies the file as koto's and carries a
-//! [`CONTRACT_VERSION`] that Feature 4's guard/fixture anchors on.
+//! [`CONTRACT_VERSION`] that the future drift-guard/fixture anchors on.
 
 use serde::Serialize;
 
-/// Contract version of the koto-namespaced projection block. Feature 4's
-/// guard/fixture pins this; later features that add fields bump it.
-pub const CONTRACT_VERSION: u32 = 1;
+/// Contract version of the koto-namespaced projection block. The future
+/// drift-guard/fixture pins this; later features that add fields bump it.
+///
+/// Version 2 adds the additive `phases` and `workflowProgress`
+/// fields and the `blocked` render status. Version 1's fields remain a valid
+/// subset, so a reader that ignores the new fields still renders the initial
+/// entry.
+pub const CONTRACT_VERSION: u32 = 2;
 
 /// Render status mapped onto the `/workflows` vocabulary.
 ///
-/// Feature 1 emits only these three; blocked/stalled/pending refinements are
-/// Feature 2/5 scope.
+/// Version 1 emitted `running`/`completed`/`failed`; version 2 adds `blocked`
+/// (koto's blocked-in-current-epoch), distinct from running and done. Stalled/
+/// pending refinements remain later-slice scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RenderStatus {
     /// Non-terminal: the session is advancing.
     Running,
+    /// Non-terminal, but the most recent current-epoch gate did not pass:
+    /// the session is blocked waiting on the gate condition. Precedence is
+    /// terminal (completed/failed) > blocked > running.
+    Blocked,
     /// Terminal, not a failure.
     Completed,
     /// Terminal failure (state name matches the failure heuristic).
     Failed,
+}
+
+/// A single phase in the `/workflows` ordered phase list. Each koto template
+/// state maps to one phase; `title` is the human-readable label and `detail`
+/// is the subtitle line (for a completed phase, its evidence/gate outcome; for
+/// the active phase, its progress marker).
+#[derive(Debug, Clone, Serialize)]
+pub struct Phase {
+    /// Human-readable phase label (the humanized state name).
+    pub title: String,
+    /// Subtitle line: outcome for completed phases, progress marker otherwise.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+/// A node in the `/workflows` `workflowProgress` progress tree. The screen
+/// renders `workflow_phase` nodes as phase headers (positionally marking the
+/// ordered phases) and `workflow_agent` nodes as steps under a phase. For a
+/// single non-hierarchical koto session, a `workflow_agent` step represents the
+/// session working one phase (its directive as `promptPreview`, its
+/// evidence/gate outcome as `resultPreview`) -- not a delegate session, which
+/// a future hierarchy renders as its own separate entry.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProgressNode {
+    /// A phase header in the progress tree.
+    WorkflowPhase {
+        /// 1-based phase index.
+        index: u32,
+        /// Human-readable phase label.
+        title: String,
+    },
+    /// A step under a phase (the koto session working that phase).
+    WorkflowAgent {
+        /// 1-based step index.
+        index: u32,
+        /// Step label (the humanized state name).
+        label: String,
+        /// 1-based index of the phase this step belongs to.
+        #[serde(rename = "phaseIndex")]
+        phase_index: u32,
+        /// The phase's human-readable label.
+        #[serde(rename = "phaseTitle")]
+        phase_title: String,
+        /// Step state: `done` (completed phase) or `progress` (active phase).
+        state: String,
+        /// The phase's directive text (what the step asks for).
+        #[serde(rename = "promptPreview", skip_serializing_if = "String::is_empty")]
+        prompt_preview: String,
+        /// The phase's produced outcome: evidence and/or gate result.
+        #[serde(rename = "resultPreview", skip_serializing_if = "String::is_empty")]
+        result_preview: String,
+    },
 }
 
 /// koto-namespaced identification and extension block. Nested under the `koto`
@@ -65,6 +128,14 @@ pub struct WorkflowFile {
     /// Start time in epoch milliseconds; Claude Code sorts entries by this.
     #[serde(rename = "startTime")]
     pub start_time: u64,
+    /// The session's phases in order. Empty on the minimal shape; omitted from
+    /// serialization when empty so the initial render is byte-preserved.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<Phase>,
+    /// The progress tree: a `workflow_phase` marker per phase plus
+    /// a `workflow_agent` step per visited/active phase. Omitted when empty.
+    #[serde(rename = "workflowProgress", skip_serializing_if = "Vec::is_empty")]
+    pub workflow_progress: Vec<ProgressNode>,
     /// koto's namespaced identification + extension block.
     pub koto: KotoBlock,
 }
@@ -87,6 +158,8 @@ impl WorkflowFile {
             name,
             status,
             start_time,
+            phases: Vec::new(),
+            workflow_progress: Vec::new(),
             koto: KotoBlock {
                 session_id: session_id.to_string(),
                 workflow: workflow.to_string(),
@@ -94,6 +167,17 @@ impl WorkflowFile {
                 contract_version: CONTRACT_VERSION,
             },
         }
+    }
+
+    /// Attach the enriched phase detail (ordered phases + progress tree).
+    ///
+    /// Additive over [`WorkflowFile::new`]: the minimal shape leaves
+    /// both empty, and empty vectors are omitted from serialization, so a file
+    /// built without this call is byte-identical to the initial render's.
+    pub fn with_detail(mut self, phases: Vec<Phase>, workflow_progress: Vec<ProgressNode>) -> Self {
+        self.phases = phases;
+        self.workflow_progress = workflow_progress;
+        self
     }
 
     /// Serialize to pretty JSON bytes (the on-disk form).
@@ -156,6 +240,7 @@ mod tests {
     fn status_serializes_lowercase() {
         for (status, want) in [
             (RenderStatus::Running, "running"),
+            (RenderStatus::Blocked, "blocked"),
             (RenderStatus::Completed, "completed"),
             (RenderStatus::Failed, "failed"),
         ] {
@@ -164,6 +249,109 @@ mod tests {
                 serde_json::from_slice(&wf.to_json_bytes().unwrap()).unwrap();
             assert_eq!(v["status"], want);
         }
+    }
+
+    #[test]
+    fn contract_version_is_two() {
+        // Version 2 bumped the contract; the guard/fixture anchors on it.
+        assert_eq!(CONTRACT_VERSION, 2);
+    }
+
+    #[test]
+    fn minimal_shape_omits_phase_fields() {
+        // A file built with `new` (the minimal path) carries neither `phases`
+        // nor `workflowProgress`, so it is byte-identical to the initial shape
+        // and remains a valid subset for readers that ignore the new fields.
+        let wf = WorkflowFile::new("s", "w", "n".to_string(), None, RenderStatus::Running, 0);
+        let v: serde_json::Value = serde_json::from_slice(&wf.to_json_bytes().unwrap()).unwrap();
+        assert!(v.get("phases").is_none());
+        assert!(v.get("workflowProgress").is_none());
+    }
+
+    #[test]
+    fn with_detail_emits_phases_and_progress() {
+        let phases = vec![
+            Phase {
+                title: "Gather context".to_string(),
+                detail: "gate build: PASS".to_string(),
+            },
+            Phase {
+                title: "Implement".to_string(),
+                detail: String::new(),
+            },
+        ];
+        let progress = vec![
+            ProgressNode::WorkflowPhase {
+                index: 1,
+                title: "Gather context".to_string(),
+            },
+            ProgressNode::WorkflowAgent {
+                index: 1,
+                label: "Gather context".to_string(),
+                phase_index: 1,
+                phase_title: "Gather context".to_string(),
+                state: "done".to_string(),
+                prompt_preview: "read the issue".to_string(),
+                result_preview: "3 files identified".to_string(),
+            },
+            ProgressNode::WorkflowPhase {
+                index: 2,
+                title: "Implement".to_string(),
+            },
+        ];
+        let wf = WorkflowFile::new(
+            "sid",
+            "wf",
+            "wf".to_string(),
+            Some("implement".to_string()),
+            RenderStatus::Running,
+            0,
+        )
+        .with_detail(phases, progress);
+        let v: serde_json::Value = serde_json::from_slice(&wf.to_json_bytes().unwrap()).unwrap();
+
+        // Ordered phases with a completed phase's outcome as detail.
+        assert_eq!(v["phases"][0]["title"], "Gather context");
+        assert_eq!(v["phases"][0]["detail"], "gate build: PASS");
+        // Empty detail is omitted.
+        assert!(v["phases"][1].get("detail").is_none());
+
+        // Progress tree: both node types, tagged by `type`.
+        assert_eq!(v["workflowProgress"][0]["type"], "workflow_phase");
+        assert_eq!(v["workflowProgress"][0]["index"], 1);
+        assert_eq!(v["workflowProgress"][1]["type"], "workflow_agent");
+        assert_eq!(v["workflowProgress"][1]["phaseIndex"], 1);
+        assert_eq!(v["workflowProgress"][1]["phaseTitle"], "Gather context");
+        assert_eq!(v["workflowProgress"][1]["state"], "done");
+        assert_eq!(v["workflowProgress"][1]["promptPreview"], "read the issue");
+        assert_eq!(
+            v["workflowProgress"][1]["resultPreview"],
+            "3 files identified"
+        );
+        assert_eq!(v["workflowProgress"][2]["type"], "workflow_phase");
+
+        // The initial fields are unchanged and present alongside the new ones.
+        assert_eq!(v["id"], "koto-sid");
+        assert_eq!(v["koto"]["contractVersion"], 2);
+    }
+
+    #[test]
+    fn workflow_agent_omits_empty_previews() {
+        let progress = vec![ProgressNode::WorkflowAgent {
+            index: 1,
+            label: "Verify".to_string(),
+            phase_index: 3,
+            phase_title: "Verify".to_string(),
+            state: "progress".to_string(),
+            prompt_preview: String::new(),
+            result_preview: String::new(),
+        }];
+        let wf = WorkflowFile::new("s", "w", "n".to_string(), None, RenderStatus::Running, 0)
+            .with_detail(Vec::new(), progress);
+        let v: serde_json::Value = serde_json::from_slice(&wf.to_json_bytes().unwrap()).unwrap();
+        assert!(v["workflowProgress"][0].get("promptPreview").is_none());
+        assert!(v["workflowProgress"][0].get("resultPreview").is_none());
+        assert_eq!(v["workflowProgress"][0]["state"], "progress");
     }
 
     #[test]
