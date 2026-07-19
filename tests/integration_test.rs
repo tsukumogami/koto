@@ -3365,7 +3365,7 @@ fn init_var_forbidden_chars_fail() {
             "--template",
             src.to_str().unwrap(),
             "--var",
-            "OWNER=acme corp",
+            "OWNER=acme;rm -rf",
             "--var",
             "REPO=widgets",
         ])
@@ -3374,7 +3374,7 @@ fn init_var_forbidden_chars_fail() {
 
     assert!(
         !output.status.success(),
-        "forbidden characters in value should fail"
+        "shell metacharacters in value should fail"
     );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let err = json["error"].as_str().unwrap();
@@ -3383,6 +3383,47 @@ fn init_var_forbidden_chars_fail() {
         "error should mention not allowed, got: {}",
         err
     );
+}
+
+#[test]
+fn init_var_structured_data_values_accepted() {
+    // Issue #180: structured data values with `:`, `@`, and spaces are
+    // accepted through the CLI and stored verbatim in the init event, while
+    // the injection guard still rejects shell metacharacters (covered by
+    // init_var_forbidden_chars_fail).
+    let dir = TempDir::new().unwrap();
+    let src = write_var_template_source(dir.path());
+
+    let output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "var-wf",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "OWNER=from:delta@delta.com",
+            "--var",
+            "REPO=widgets",
+            "--var",
+            "BRANCH=Weekly Planning",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "init with structured data values should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state_path = session_state_path(dir.path(), "var-wf");
+    let content = std::fs::read_to_string(&state_path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    let init_event: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let vars = init_event["payload"]["variables"].as_object().unwrap();
+    assert_eq!(vars["OWNER"].as_str(), Some("from:delta@delta.com"));
+    assert_eq!(vars["BRANCH"].as_str(), Some("Weekly Planning"));
 }
 
 #[test]

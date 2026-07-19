@@ -731,7 +731,16 @@ For a template at `koto-templates/my-skill.md`, the preview goes at `koto-templa
 
 ## Security note
 
-Koto performs `{{VARIABLE}}` substitution in `command` gate strings before passing them to `sh -c`. If a variable contains user-supplied input, this creates a shell injection risk.
+Koto performs `{{VARIABLE}}` substitution in `command` gate strings before passing them to `sh -c`. Values supplied via `--var` are validated at init time against an allowlist (letters, digits, `. _ - /`, `:`, `@`, and spaces); shell metacharacters such as `;` `|` `&` `$` `(` `)` `<` `>` `*` `?`, quotes, backticks, and newlines are rejected, so a value cannot inject a command.
+
+The allowlist blocks command injection, not word splitting. A value may contain spaces (for structured names like a calendar title), and an unquoted interpolation splits it into multiple shell arguments. Quote the reference when a value must stay a single argument:
+
+```yaml
+# A value like "Weekly Planning" splits into two arguments here:
+command: mytool --calendar {{CALENDAR}}
+# Quote it to keep it one argument:
+command: mytool --calendar "{{CALENDAR}}"
+```
 
 Prefer `context-exists` gates over `command` gates when checking paths or files that come from variable interpolation. The `context-exists` and `context-matches` gate types don't invoke a shell and aren't vulnerable to injection.
 
