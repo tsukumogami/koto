@@ -599,8 +599,11 @@ koto config list --json
 | `session.cloud.region` | AWS region | -- | yes |
 | `session.cloud.access_key` | Access key ID | -- | no |
 | `session.cloud.secret_key` | Secret access key | -- | no |
+| `workflows.native` | `true`, `false` | `false` | yes |
 
 Credential keys (`access_key`, `secret_key`) can also be provided through environment variables `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Environment variables take precedence over config file values.
+
+`workflows.native` opts in to rendering koto sessions in Claude Code's `/workflows` screen (see [native-workflows-verification.md](native-workflows-verification.md)); a participating session self-discovers its target directory from `CLAUDE_CODE_SESSION_ID`.
 
 #### Example: local-only config (default)
 

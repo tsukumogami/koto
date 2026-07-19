@@ -30,6 +30,11 @@ const PREVIEW_MAX: usize = 240;
 /// `SessionStart` hook hands koto the session's `/workflows` directory.
 pub const WORKFLOWS_DIR_ENV: &str = "KOTO_WORKFLOWS_DIR";
 
+/// Environment variable Claude Code sets to the viewing session's id in every
+/// subprocess. Under the `workflows.native` opt-in, koto self-discovers the
+/// session's `/workflows` directory from it -- no `SessionStart` hook required.
+const CLAUDE_SESSION_ID_ENV: &str = "CLAUDE_CODE_SESSION_ID";
+
 /// Materialize `session_id`'s `/workflows` artifact after a state-commit.
 ///
 /// Best-effort: any failure is logged and swallowed so the commit itself never
@@ -186,26 +191,96 @@ fn preview(s: &str) -> String {
 
 /// Resolve the target `/workflows` directory, applying the opt-in gate.
 ///
-/// If `KOTO_WORKFLOWS_DIR` is set (the host handoff), self-publish it into this
-/// session's own context store -- so descendants discover it by the ancestor
-/// walk -- and use it. Otherwise resolve it by walking to the nearest published
-/// ancestor. `None` means no participation: write nothing.
+/// Resolution order:
+/// 1. `KOTO_WORKFLOWS_DIR` -- an explicit host handoff (e.g. a SessionStart
+///    hook). Self-published into this session's store so descendants discover
+///    it by the ancestor walk.
+/// 2. The nearest published ancestor (a location this session self-published on
+///    a prior commit, or an ancestor's). A cheap key probe; no config load.
+/// 3. The global opt-in `workflows.native`: self-discover the hosting Claude
+///    Code session's `/workflows` directory from the environment. Only reached
+///    on a participating session's first commit, before it self-publishes.
+///
+/// `None` means no participation: write nothing, default path untouched.
 fn resolve_target_dir(
     backend: &dyn SessionBackend,
     store: &dyn ContextStore,
     session_id: &str,
 ) -> Option<PathBuf> {
+    // 1. Explicit host handoff.
     if let Ok(env_dir) = std::env::var(WORKFLOWS_DIR_ENV) {
         let env_dir = env_dir.trim().to_string();
         if !env_dir.is_empty() {
-            if !discover::has_published_location(store, session_id) {
-                // Best-effort: self-publish so hierarchy descendants can discover it.
-                let _ = discover::publish_location(store, session_id, &env_dir);
-            }
+            self_publish_if_absent(store, session_id, &env_dir);
             return Some(PathBuf::from(env_dir));
         }
     }
-    discover::resolve_publish_location(backend, store, session_id)
+    // 2. Nearest published ancestor (self-published or hierarchy).
+    if let Some(dir) = discover::resolve_publish_location(backend, store, session_id) {
+        return Some(dir);
+    }
+    // 3. Config opt-in: self-discover from the Claude Code session environment.
+    if workflows_native_enabled() {
+        if let Some(dir) = resolve_from_claude_env() {
+            if let Some(s) = dir.to_str() {
+                self_publish_if_absent(store, session_id, s);
+            }
+            return Some(dir);
+        }
+    }
+    None
+}
+
+/// Publish `dir` as `session_id`'s location if it has not already published one
+/// (so descendants can discover it by the ancestor walk). Best-effort.
+fn self_publish_if_absent(store: &dyn ContextStore, session_id: &str, dir: &str) {
+    if !discover::has_published_location(store, session_id) {
+        let _ = discover::publish_location(store, session_id, dir);
+    }
+}
+
+/// Whether the `workflows.native` global opt-in is enabled. Best-effort: any
+/// config-load failure reads as disabled, so koto's default path is untouched.
+fn workflows_native_enabled() -> bool {
+    crate::config::resolve::load_config()
+        .map(|c| c.workflows.native)
+        .unwrap_or(false)
+}
+
+/// Derive the hosting Claude Code session's `/workflows` directory from the
+/// environment, with no SessionStart hook.
+///
+/// Claude Code exposes the viewing session's id to every subprocess as
+/// [`CLAUDE_SESSION_ID_ENV`] and renders `<projectDir>/<sessionId>/workflows/*.json`,
+/// where `<projectDir>` is the directory holding the session transcript
+/// `<sessionId>.jsonl` under `~/.claude/projects/`. Returns `None` when the env
+/// var is unset/empty or no matching transcript exists (e.g. a fully headless
+/// run) -- in which case nothing renders and the dashboard stays the surface.
+fn resolve_from_claude_env() -> Option<PathBuf> {
+    let session_id = std::env::var(CLAUDE_SESSION_ID_ENV).ok()?;
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    let home = std::env::var_os("HOME")?;
+    let projects = Path::new(&home).join(".claude").join("projects");
+    let project_dir = find_session_project_dir(&projects, session_id)?;
+    Some(project_dir.join(session_id).join("workflows"))
+}
+
+/// Find the project directory under `projects` that holds `<session_id>.jsonl`.
+/// The workflows directory is keyed to the session's project (where its
+/// transcript lives), not the koto process cwd, so the transcript's location is
+/// the authority. Returns the first match, or `None`.
+fn find_session_project_dir(projects: &Path, session_id: &str) -> Option<PathBuf> {
+    let transcript = format!("{session_id}.jsonl");
+    for entry in std::fs::read_dir(projects).ok()?.flatten() {
+        let dir = entry.path();
+        if dir.join(&transcript).is_file() {
+            return Some(dir);
+        }
+    }
+    None
 }
 
 /// A stable `startTime`: reuse the value already on disk (so the entry's start
@@ -605,5 +680,40 @@ mod tests {
         transition(&backend, "solo", "building");
 
         assert!(nested.join(workflow_filename("solo-uuid")).exists());
+    }
+
+    #[test]
+    fn find_session_project_dir_matches_transcript_owner() {
+        let projects = TempDir::new().unwrap();
+        let sid = "abc-123";
+        // Two encoded project dirs exist for the session id (e.g. cwd changed),
+        // but only one holds the `<sid>.jsonl` transcript.
+        let owner = projects.path().join("-home-user-proj");
+        let other = projects.path().join("-home-user-proj-sub");
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(owner.join(format!("{sid}.jsonl")), b"{}").unwrap();
+        // The `other` dir has a same-named directory but no transcript file.
+        std::fs::create_dir_all(other.join(sid)).unwrap();
+
+        let got = find_session_project_dir(projects.path(), sid);
+        assert_eq!(got, Some(owner));
+    }
+
+    #[test]
+    fn find_session_project_dir_none_without_transcript() {
+        let projects = TempDir::new().unwrap();
+        std::fs::create_dir_all(projects.path().join("-home-user-proj")).unwrap();
+        assert_eq!(
+            find_session_project_dir(projects.path(), "missing-sid"),
+            None
+        );
+    }
+
+    #[test]
+    fn find_session_project_dir_none_when_projects_absent() {
+        let tmp = TempDir::new().unwrap();
+        let absent = tmp.path().join("no-such-projects");
+        assert_eq!(find_session_project_dir(&absent, "any"), None);
     }
 }

@@ -10,6 +10,23 @@ pub struct KotoConfig {
     pub session: SessionConfig,
     #[serde(default)]
     pub request_store: RequestStoreConfig,
+    #[serde(default)]
+    pub workflows: WorkflowsConfig,
+}
+
+/// Native Claude Code `/workflows` rendering configuration.
+///
+/// `native` is the global opt-in for rendering koto sessions in Claude Code's
+/// `/workflows` screen. When true, a session driven inside a Claude Code
+/// session self-discovers that session's workflows directory from the
+/// `CLAUDE_CODE_SESSION_ID` environment variable and renders into it -- no
+/// SessionStart hook or plugin required. Defaults to false, so koto's default
+/// path is untouched until an operator opts in (`koto config set
+/// workflows.native true --user`).
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
+pub struct WorkflowsConfig {
+    #[serde(default)]
+    pub native: bool,
 }
 
 /// Request-store (coordinator/operator) configuration.
@@ -151,6 +168,7 @@ pub fn get_value(config: &KotoConfig, key: &str) -> Option<String> {
         "request_store.respawn_generation_cap" => {
             Some(config.request_store.respawn_generation_cap.to_string())
         }
+        "workflows.native" => Some(config.workflows.native.to_string()),
         _ => None,
     }
 }
@@ -239,6 +257,16 @@ pub fn set_value_in_toml(doc: &mut toml::Value, key: &str, value: &str) -> Resul
                 .ok_or("request_store.recursion is not a table")?;
             recursion_table.insert(field.to_string(), toml_value);
         }
+        "workflows.native" => {
+            let parsed: bool = value
+                .parse()
+                .map_err(|_| format!("value for {} must be true or false", key))?;
+            let workflows = table
+                .entry("workflows")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            let workflows_table = workflows.as_table_mut().ok_or("workflows is not a table")?;
+            workflows_table.insert("native".to_string(), toml::Value::Boolean(parsed));
+        }
         _ => return Err(format!("unknown config key: {}", key)),
     }
     Ok(())
@@ -307,6 +335,14 @@ pub fn unset_value_in_toml(doc: &mut toml::Value, key: &str) -> Result<bool, Str
             }
             Ok(false)
         }
+        "workflows.native" => {
+            if let Some(workflows) = table.get_mut("workflows") {
+                if let Some(t) = workflows.as_table_mut() {
+                    return Ok(t.remove("native").is_some());
+                }
+            }
+            Ok(false)
+        }
         _ => Err(format!("unknown config key: {}", key)),
     }
 }
@@ -327,6 +363,7 @@ pub const ALL_KEYS: &[&str] = &[
     "request_store.compact_lock_timeout_seconds",
     "request_store.directive_batch_size",
     "request_store.respawn_generation_cap",
+    "workflows.native",
 ];
 
 /// Produce a redacted copy of the config for display.
@@ -605,5 +642,60 @@ mod tests {
         set_value_in_toml(&mut doc, "request_store.recursion.max_depth", "10").unwrap();
         let removed = unset_value_in_toml(&mut doc, "request_store.recursion.max_depth").unwrap();
         assert!(removed);
+    }
+
+    // -----------------------------------------------------------------------
+    // workflows.native opt-in coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_workflows_native_defaults_false() {
+        let config = KotoConfig::default();
+        assert!(!config.workflows.native);
+        assert_eq!(
+            get_value(&config, "workflows.native"),
+            Some("false".to_string())
+        );
+    }
+
+    #[test]
+    fn test_set_and_get_workflows_native() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        set_value_in_toml(&mut doc, "workflows.native", "true").unwrap();
+        let cfg: KotoConfig = doc.try_into().unwrap();
+        assert!(cfg.workflows.native);
+        assert_eq!(
+            get_value(&cfg, "workflows.native"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn test_workflows_native_partial_toml_uses_defaults() {
+        // A config that only sets request_store leaves workflows.native false.
+        let toml_str = "[request_store]\nredelegation_cap = 5\n";
+        let cfg: KotoConfig = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.workflows.native);
+    }
+
+    #[test]
+    fn test_set_workflows_native_rejects_non_bool() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        let err = set_value_in_toml(&mut doc, "workflows.native", "yes")
+            .expect_err("non-bool must reject");
+        assert!(err.contains("must be true or false"));
+    }
+
+    #[test]
+    fn test_unset_workflows_native_round_trips() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        set_value_in_toml(&mut doc, "workflows.native", "true").unwrap();
+        assert!(unset_value_in_toml(&mut doc, "workflows.native").unwrap());
+        assert!(!unset_value_in_toml(&mut doc, "workflows.native").unwrap());
+    }
+
+    #[test]
+    fn test_workflows_native_in_all_keys() {
+        assert!(ALL_KEYS.contains(&"workflows.native"));
     }
 }

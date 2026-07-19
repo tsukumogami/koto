@@ -181,10 +181,17 @@ fn load_config_file(path: &Path) -> Result<LoadedConfig> {
         .and_then(|v| v.as_table())
         .and_then(|t| t.get("recursion"))
         .is_some();
+    let workflows_native_present = raw
+        .as_table()
+        .and_then(|t| t.get("workflows"))
+        .and_then(|v| v.as_table())
+        .map(|t| t.contains_key("native"))
+        .unwrap_or(false);
     Ok(LoadedConfig {
         config,
         request_store_keys,
         request_store_has_recursion,
+        workflows_native_present,
     })
 }
 
@@ -194,6 +201,7 @@ struct LoadedConfig {
     config: KotoConfig,
     request_store_keys: Vec<String>,
     request_store_has_recursion: bool,
+    workflows_native_present: bool,
 }
 
 /// Merge source config into target. Non-default/non-empty values in
@@ -259,6 +267,9 @@ fn merge_config(target: &mut KotoConfig, source: &LoadedConfig) {
     }
     if source.request_store_has_recursion {
         target.request_store.recursion = source.config.request_store.recursion.clone();
+    }
+    if source.workflows_native_present {
+        target.workflows.native = source.config.workflows.native;
     }
 }
 
@@ -377,9 +388,11 @@ mod tests {
                     },
                 },
                 request_store: RequestStoreConfig::default(),
+                workflows: Default::default(),
             },
             request_store_keys: vec![],
             request_store_has_recursion: false,
+            workflows_native_present: false,
         };
 
         merge_config(&mut base, &overlay);
@@ -397,6 +410,7 @@ mod tests {
             config: KotoConfig::default(),
             request_store_keys: vec![],
             request_store_has_recursion: false,
+            workflows_native_present: false,
         };
         merge_config(&mut base, &overlay);
 
@@ -405,6 +419,58 @@ mod tests {
         // The merge only overwrites if source backend is non-empty.
         assert_eq!(base.session.backend, "cloud");
         assert_eq!(base.session.cloud.bucket, Some("existing".to_string()));
+    }
+
+    #[test]
+    fn test_workflows_native_parsed_and_tracked_from_file() {
+        // Race-free: load_config_file reads a specific path, touching no
+        // process-global cwd/env.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[workflows]\nnative = true\n").unwrap();
+
+        let loaded = load_config_file(&path).unwrap();
+        assert!(loaded.config.workflows.native);
+        assert!(loaded.workflows_native_present);
+    }
+
+    #[test]
+    fn test_workflows_native_absent_not_tracked() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[session]\nbackend = \"local\"\n").unwrap();
+
+        let loaded = load_config_file(&path).unwrap();
+        assert!(!loaded.config.workflows.native);
+        assert!(!loaded.workflows_native_present);
+    }
+
+    #[test]
+    fn test_merge_applies_workflows_native_only_when_present() {
+        // present=true flips the base on.
+        let mut base = KotoConfig::default();
+        let mut on = KotoConfig::default();
+        on.workflows.native = true;
+        let overlay = LoadedConfig {
+            config: on.clone(),
+            request_store_keys: vec![],
+            request_store_has_recursion: false,
+            workflows_native_present: true,
+        };
+        merge_config(&mut base, &overlay);
+        assert!(base.workflows.native);
+
+        // present=false must NOT overwrite an already-on base.
+        let mut base_on = KotoConfig::default();
+        base_on.workflows.native = true;
+        let overlay_absent = LoadedConfig {
+            config: KotoConfig::default(),
+            request_store_keys: vec![],
+            request_store_has_recursion: false,
+            workflows_native_present: false,
+        };
+        merge_config(&mut base_on, &overlay_absent);
+        assert!(base_on.workflows.native, "absent key must not clobber");
     }
 
     #[test]
