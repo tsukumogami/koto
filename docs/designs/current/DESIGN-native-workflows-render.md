@@ -168,6 +168,21 @@ walking to this ancestor's published key -- so the same mechanism serves the
 single session and a future hierarchy's tree, and the opt-in stays "presence of a published
 location," not config.
 
+**Amended after ship.** Two follow-on changes evolved the enable model beyond this
+original design:
+
+- **Config-based enable + environment self-discovery.** koto can now resolve the target
+  directory itself from `CLAUDE_CODE_SESSION_ID` (which Claude Code sets in every
+  subprocess) by locating the session transcript under `~/.claude/projects/`, so native
+  rendering no longer requires the `koto-skills` SessionStart hook or plugin. The
+  `KOTO_WORKFLOWS_DIR` handoff and the published-location walk both remain, as the first
+  two steps of the resolution order.
+- **On by default.** A `workflows.native` config flag gates env self-discovery, and its
+  default is `true`. Rendering is therefore on by default for any koto session running
+  inside a Claude Code session; a fully headless run still renders nothing, and an
+  operator opts out with `workflows.native = false`. The original "opt-in is presence of a
+  published location, not config" framing is superseded by this default-on config gate.
+
 - *Rejected: the hook shells out `koto context add <koto-session> ...`.* The
   most direct "publish into the context store" phrasing, but it presumes the
   hook knows the koto session id, which does not exist at `SessionStart`. It also

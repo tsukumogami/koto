@@ -7,9 +7,12 @@
 //! individual commands. It is **best-effort**: it never fails the commit
 //! (mirroring the cloud backend's swallow-on-side-effect discipline).
 //!
-//! Opt-in is the presence of a published location (or the `KOTO_WORKFLOWS_DIR`
-//! host handoff). With neither, the function returns after a cheap probe,
-//! writing nothing -- koto's default path is untouched.
+//! Rendering is on by default (`workflows.native`, default true): a session
+//! writes when it can resolve a target directory -- a published location, the
+//! `KOTO_WORKFLOWS_DIR` host handoff, or self-discovery from the Claude Code
+//! session environment. When none resolves (fully headless) or the operator has
+//! opted out (`workflows.native = false`), the function returns after a cheap
+//! probe, writing nothing -- koto's default path is untouched there.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -31,7 +34,7 @@ const PREVIEW_MAX: usize = 240;
 pub const WORKFLOWS_DIR_ENV: &str = "KOTO_WORKFLOWS_DIR";
 
 /// Environment variable Claude Code sets to the viewing session's id in every
-/// subprocess. Under the `workflows.native` opt-in, koto self-discovers the
+/// subprocess. Under `workflows.native` (default on), koto self-discovers the
 /// session's `/workflows` directory from it -- no `SessionStart` hook required.
 const CLAUDE_SESSION_ID_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 
@@ -55,7 +58,7 @@ fn try_materialize(
     store: &dyn ContextStore,
     session_id: &str,
 ) -> anyhow::Result<()> {
-    // Opt-in gate: resolve the target directory, or return writing nothing.
+    // Render gate: resolve the target directory, or return writing nothing.
     let dir = match resolve_target_dir(backend, store, session_id) {
         Some(d) => d,
         None => return Ok(()),
@@ -189,7 +192,7 @@ fn preview(s: &str) -> String {
     out
 }
 
-/// Resolve the target `/workflows` directory, applying the opt-in gate.
+/// Resolve the target `/workflows` directory, applying the render gate.
 ///
 /// Resolution order:
 /// 1. `KOTO_WORKFLOWS_DIR` -- an explicit host handoff (e.g. a SessionStart
@@ -197,11 +200,13 @@ fn preview(s: &str) -> String {
 ///    it by the ancestor walk.
 /// 2. The nearest published ancestor (a location this session self-published on
 ///    a prior commit, or an ancestor's). A cheap key probe; no config load.
-/// 3. The global opt-in `workflows.native`: self-discover the hosting Claude
-///    Code session's `/workflows` directory from the environment. Only reached
-///    on a participating session's first commit, before it self-publishes.
+/// 3. `workflows.native` (default on): self-discover the hosting Claude Code
+///    session's `/workflows` directory from the environment. Only reached on a
+///    participating session's first commit, before it self-publishes; skipped
+///    when the operator has opted out (`workflows.native = false`).
 ///
-/// `None` means no participation: write nothing, default path untouched.
+/// `None` means no target resolved: write nothing, default path untouched
+/// (fully headless, or opted out).
 fn resolve_target_dir(
     backend: &dyn SessionBackend,
     store: &dyn ContextStore,
@@ -219,7 +224,8 @@ fn resolve_target_dir(
     if let Some(dir) = discover::resolve_publish_location(backend, store, session_id) {
         return Some(dir);
     }
-    // 3. Config opt-in: self-discover from the Claude Code session environment.
+    // 3. Config gate (on by default): self-discover from the Claude Code
+    //    session environment unless the operator opted out.
     if workflows_native_enabled() {
         if let Some(dir) = resolve_from_claude_env() {
             if let Some(s) = dir.to_str() {
@@ -239,8 +245,10 @@ fn self_publish_if_absent(store: &dyn ContextStore, session_id: &str, dir: &str)
     }
 }
 
-/// Whether the `workflows.native` global opt-in is enabled. Best-effort: any
-/// config-load failure reads as disabled, so koto's default path is untouched.
+/// Whether `workflows.native` is enabled (default true). Best-effort: a
+/// config-load failure (a malformed config file) reads as disabled -- the
+/// conservative side for a directory koto does not own. Absence of any config
+/// file is not a failure; it resolves to the default (on).
 fn workflows_native_enabled() -> bool {
     crate::config::resolve::load_config()
         .map(|c| c.workflows.native)
@@ -596,6 +604,31 @@ mod tests {
         serde_json::from_slice(&bytes).ok()
     }
 
+    /// RAII guard that overrides `$HOME` for the duration of a test and restores
+    /// it on drop, so the config load and env self-discovery resolve against a
+    /// controlled directory. Env mutation is process-global; CI runs
+    /// `--test-threads=1` (see `.github/workflows/validate.yml`).
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(path: &Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", path);
+            HomeGuard { prev }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
     #[test]
     fn ac1_file_appears_with_current_state() {
         let base = TempDir::new().unwrap();
@@ -634,19 +667,44 @@ mod tests {
     }
 
     #[test]
-    fn ac4_no_write_without_published_location() {
+    fn ac4_no_write_when_headless_and_unpublished() {
         let base = TempDir::new().unwrap();
         let wf = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        // Rendering is on by default, but point HOME at an empty directory so
+        // env self-discovery finds no session transcript. With no published
+        // location and no KOTO_WORKFLOWS_DIR either, the fully-headless case
+        // writes nothing -- koto's default path is untouched.
+        let _home = HomeGuard::set(home.path());
         let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
         init_session(&backend, "solo");
-        // No publish_location call, and KOTO_WORKFLOWS_DIR is unset in this test.
 
         transition(&backend, "solo", "building");
 
-        // Nothing materialized; the /workflows dir is untouched (empty).
         assert!(read_file(wf.path(), "solo-uuid").is_none());
         let entries: Vec<_> = std::fs::read_dir(wf.path()).unwrap().collect();
         assert!(entries.is_empty(), "no koto-*.json written");
+    }
+
+    #[test]
+    fn native_gate_default_on_and_respects_explicit_optout() {
+        let home = TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+        // No config file: the gate resolves to the default (on).
+        assert!(workflows_native_enabled(), "default is on");
+
+        // An explicit opt-out in user config turns the gate off.
+        let koto_dir = home.path().join(".koto");
+        std::fs::create_dir_all(&koto_dir).unwrap();
+        std::fs::write(
+            koto_dir.join("config.toml"),
+            "[workflows]\nnative = false\n",
+        )
+        .unwrap();
+        assert!(
+            !workflows_native_enabled(),
+            "explicit opt-out disables the gate"
+        );
     }
 
     #[test]
