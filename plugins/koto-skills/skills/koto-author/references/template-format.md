@@ -40,7 +40,9 @@ Optional fields: `description`, `variables`.
 
 ### Variables
 
-Variables are declared at the root level and interpolated into directive text using `{{VARIABLE_NAME}}` syntax. The agent supplies values at init time via `--var KEY=VALUE`. Each variable has a `description` and a `required` flag.
+Variables are declared at the root level and interpolated into directive text using `{{VARIABLE_NAME}}` syntax. The agent supplies values at init time via `--var KEY=VALUE`. Each variable has a `description`, a `required` flag, and an optional `default`.
+
+An optional variable (`required: false`) that the caller omits resolves to its `default`, or to an empty string when no default is declared. Every declared variable is always materialized, so a `{{VARIABLE_NAME}}` reference never fails to resolve. When such a reference lands unquoted in a gate or action command (`--flag {{VAR}}`) and the value is empty, koto renders it as an explicit empty argument (`--flag ''`) so the command stays well-formed instead of dropping the token.
 
 Koto also provides two built-in variables that don't need to be declared:
 

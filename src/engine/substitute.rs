@@ -76,10 +76,38 @@ impl Variables {
 
     /// Replace `{{KEY}}` patterns with variable values.
     ///
-    /// Panics on undefined references. Compile-time validation prevents this
-    /// from happening in practice, so a panic here indicates a bug in the
-    /// validation layer rather than user error.
+    /// An undefined reference is left intact rather than substituted, and never
+    /// panics. Compile-time validation (`src/template/types.rs`) rejects any
+    /// template that references an undeclared variable with an actionable error,
+    /// and `koto init` materializes every declared variable (including empty
+    /// defaults), so a `{{KEY}}` that reaches substitution always resolves in
+    /// practice. Passing an unresolved token through unchanged is defense in
+    /// depth: a missing variable is a user or template error, not an internal
+    /// invariant break that should crash with a backtrace (Issue #184).
     pub fn substitute(&self, input: &str) -> String {
+        self.substitute_inner(input, false)
+    }
+
+    /// Like [`substitute`](Self::substitute), but safe for values that land in a
+    /// `sh -c` command string.
+    ///
+    /// When a variable resolves to an empty string and its `{{KEY}}` reference
+    /// is not already wrapped in a shell quote, the token is rendered as an
+    /// explicit empty argument (`''`). Without this, an unquoted `--flag
+    /// {{VAR}}` with an empty `VAR` renders `--flag ` -- the argv splitter drops
+    /// the empty token and the next flag is consumed as the value, corrupting
+    /// the command (Issue #186). This pairs with Issue #184: once an optional
+    /// variable's empty default is materialized, safe interpolation is what
+    /// keeps the resulting command well-formed.
+    ///
+    /// Non-empty values are emitted verbatim, exactly as [`substitute`](Self::substitute)
+    /// does: quoting a value that may contain spaces stays the template author's
+    /// responsibility (Issue #180), so this method changes nothing for them.
+    pub fn substitute_command(&self, input: &str) -> String {
+        self.substitute_inner(input, true)
+    }
+
+    fn substitute_inner(&self, input: &str, shell_safe: bool) -> String {
         let re = Regex::new(VAR_REF_PATTERN).expect("VAR_REF_PATTERN is a valid regex");
         let mut result = String::with_capacity(input.len());
         let mut last_end = 0;
@@ -90,11 +118,28 @@ impl Variables {
 
             result.push_str(&input[last_end..whole_match.start()]);
 
-            let value = self
-                .vars
-                .get(key)
-                .unwrap_or_else(|| panic!("undefined variable reference: {{{{{}}}}}", key));
-            result.push_str(value);
+            match self.vars.get(key) {
+                Some(value) if shell_safe && value.is_empty() => {
+                    // Empty value in a shell command. Emit an explicit empty
+                    // argument so the token stays a distinct, empty word --
+                    // unless the author already wrapped the reference in a
+                    // quote, in which case injecting `''` would produce the
+                    // literal two-character string instead.
+                    let prev = input[..whole_match.start()].chars().next_back();
+                    let next = input[whole_match.end()..].chars().next();
+                    let author_quoted = matches!(prev, Some('\'') | Some('"'))
+                        || matches!(next, Some('\'') | Some('"'));
+                    if !author_quoted {
+                        result.push_str("''");
+                    }
+                }
+                Some(value) => result.push_str(value),
+                None => {
+                    // Undefined reference: pass the literal token through rather
+                    // than panic (Issue #184). See the method docs.
+                    result.push_str(whole_match.as_str());
+                }
+            }
 
             last_end = whole_match.end();
         }
@@ -286,12 +331,88 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "undefined variable reference")]
-    fn substitute_panics_on_undefined_ref() {
+    fn substitute_leaves_undefined_ref_intact() {
+        // A missing variable must never panic. Compile-time validation
+        // (src/template/types.rs) already rejects a template that references an
+        // undeclared variable with an actionable error, and `koto init`
+        // materializes every declared variable, so this path is defense in
+        // depth: if an undefined reference ever reaches substitution, leave the
+        // literal token in place rather than crash with a backtrace (Issue #184).
         let vars = Variables {
             vars: HashMap::new(),
         };
-        vars.substitute("{{UNDEFINED}}");
+        assert_eq!(vars.substitute("{{UNDEFINED}}"), "{{UNDEFINED}}");
+        assert_eq!(vars.substitute("a {{UNDEFINED}} b"), "a {{UNDEFINED}} b");
+    }
+
+    // -----------------------------------------------------------------------
+    // Variables::substitute_command (empty-value shell safety, Issue #186)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn substitute_command_quotes_empty_unquoted_token() {
+        // An unquoted `{{VAR}}` whose value is empty would otherwise vanish,
+        // letting the argv splitter consume the next flag as the value. Render
+        // it as an explicit empty shell argument instead (Issue #186).
+        let vars = Variables {
+            vars: HashMap::from([("START".to_string(), String::new())]),
+        };
+        assert_eq!(
+            vars.substitute_command("cmd --start {{START}} --dir d"),
+            "cmd --start '' --dir d"
+        );
+    }
+
+    #[test]
+    fn substitute_command_leaves_nonempty_value_unquoted() {
+        // Non-empty values are substituted verbatim, exactly as before. Word
+        // splitting on spaces stays the template author's responsibility to
+        // quote (Issue #180); command substitution must not change that.
+        let vars = Variables {
+            vars: HashMap::from([("START".to_string(), "2026-01".to_string())]),
+        };
+        assert_eq!(
+            vars.substitute_command("cmd --start {{START}}"),
+            "cmd --start 2026-01"
+        );
+    }
+
+    #[test]
+    fn substitute_command_preserves_author_double_quoted_empty() {
+        // When the author already wraps the reference in quotes, an empty value
+        // is well-formed on its own -- injecting `''` inside would produce the
+        // literal two-character string `''`. Detect the adjacent quote and
+        // leave the value empty.
+        let vars = Variables {
+            vars: HashMap::from([("CAL".to_string(), String::new())]),
+        };
+        assert_eq!(
+            vars.substitute_command("cmd --calendar \"{{CAL}}\""),
+            "cmd --calendar \"\""
+        );
+    }
+
+    #[test]
+    fn substitute_command_preserves_author_single_quoted_empty() {
+        let vars = Variables {
+            vars: HashMap::from([("CAL".to_string(), String::new())]),
+        };
+        assert_eq!(
+            vars.substitute_command("cmd --calendar '{{CAL}}'"),
+            "cmd --calendar ''"
+        );
+    }
+
+    #[test]
+    fn substitute_command_leaves_undefined_ref_intact() {
+        // Same defense-in-depth guarantee as substitute(): never panic.
+        let vars = Variables {
+            vars: HashMap::new(),
+        };
+        assert_eq!(
+            vars.substitute_command("cmd {{UNDEFINED}}"),
+            "cmd {{UNDEFINED}}"
+        );
     }
 
     // -----------------------------------------------------------------------
