@@ -572,7 +572,7 @@ koto config list                 # Print merged config as TOML
 koto config list --json          # Print merged config as JSON
 ```
 
-Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`.
+Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `workflows.native`.
 
 ---
 

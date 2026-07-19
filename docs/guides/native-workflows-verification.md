@@ -47,46 +47,51 @@ for its version/fixture guard over the undocumented surface.
 This confirms the one thing the automated check cannot: that Claude Code renders
 the emitted file.
 
-1. **Enable the hook.** Ensure the `koto-skills` plugin is installed so its
-   `SessionStart` hook runs. On session start it announces the workflows
-   directory for the current Claude Code session.
+1. **Enable rendering (once).** Opt in with a config flag:
 
-2. **Point koto at the directory.** Export the announced path so koto processes
-   inherit it:
+   ```bash
+   koto config set workflows.native true --user
+   ```
+
+   With this set, a koto session driven inside a Claude Code session
+   self-discovers that session's workflows directory from the
+   `CLAUDE_CODE_SESSION_ID` environment variable Claude Code sets in every
+   subprocess — no plugin, hook, or manual export required. It stays off by
+   default, so koto's normal path is untouched until you opt in.
+
+   *Alternative (explicit handoff):* instead of the config flag, export the
+   directory directly — useful for a headless host or a non-standard layout:
 
    ```bash
    export KOTO_WORKFLOWS_DIR="<projectDir>/<sessionId>/workflows"
    ```
 
-   (The hook prints the exact `export` line. `<projectDir>` is the directory of
-   the session's transcript; `<sessionId>` is the Claude Code session id.)
-
-3. **Drive a koto session.** In the same Claude Code session, run a workflow:
+2. **Drive a koto session.** In the same Claude Code session, run a workflow:
 
    ```bash
    koto init demo --template <template> --intent "demo"
    koto next demo
    ```
 
-4. **Open `/workflows`.** The koto session appears as an entry named for the
+3. **Open `/workflows`.** The koto session appears as an entry named for the
    session, showing its phases in order with the active one marked, the active
    phase's directive, and — for a multi-phase workflow — each completed phase's
    evidence or gate outcome.
 
-5. **Advance and reopen.** Run `koto next demo` again, then reopen
+4. **Advance and reopen.** Run `koto next demo` again, then reopen
    `/workflows` — the active-phase marker moves to the new phase, the previously
    active phase shows its outcome, and the directive updates (refresh-on-open).
 
-6. **Block on a gate and reopen.** Drive the session into a state whose gate
+5. **Block on a gate and reopen.** Drive the session into a state whose gate
    does not pass, then reopen `/workflows` — the entry reads *blocked*, not a
    spinning *running* and not *done*.
 
-7. **Complete and reopen.** Drive the session to its terminal state, then reopen
+6. **Complete and reopen.** Drive the session to its terminal state, then reopen
    `/workflows` — the entry reads *done* (completed), not a stuck *running*.
 
-8. **Negative check.** In a plain terminal (no `KOTO_WORKFLOWS_DIR`, no hook),
-   run a koto session and confirm `/workflows` is unaffected and no
-   `koto-*.json` is written.
+7. **Negative check.** With rendering disabled (`workflows.native` unset and no
+   `KOTO_WORKFLOWS_DIR`), run a koto session and confirm `/workflows` is
+   unaffected and no `koto-*.json` is written.
 
 ## Notes
 
