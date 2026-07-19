@@ -53,7 +53,7 @@ Initializes a new workflow. Provide the definition one of two ways:
 | `--template <path>` | One of `--template` / `--from-stdin` | Path to the template `.md` source file. Compiled automatically on first use. |
 | `--from-stdin` | One of `--template` / `--from-stdin` | Read the workflow definition from stdin, strict-compile it into the session directory, and start the session. **Mutually exclusive** with `--template`. **Rejects** `--allow-legacy-gates` (the inline path is strict-only). Does not support `--parent`. |
 | `--parent <parent-name>` | No | Link this workflow as a child of an existing parent workflow. Fails if the parent doesn't exist. Not available with `--from-stdin`. |
-| `--var KEY=VALUE` | No | Set a template variable. Repeatable. Required variables must be supplied; unknown keys are rejected. |
+| `--var KEY=VALUE` | No | Set a template variable. Repeatable. Required variables must be supplied; unknown keys are rejected. VALUE is checked against an allowlist (see Notes). |
 
 **Success output:**
 ```json
@@ -66,6 +66,7 @@ Initializes a new workflow. Provide the definition one of two ways:
 - Exit 1: a `--from-stdin` definition that fails strict validation. No session is created, the process exits non-zero, and the error **names the failing element** (state / transition / gate) — for example `state "start" references undefined transition target "nowhere"` — so you can correct the definition and re-pipe it.
 
 **Notes:**
+- `--var` values are validated against an allowlist because a substituted `{{KEY}}` can land in a gate command (run via `sh -c`) or an agent instruction. Allowed characters: letters, digits, `. _ - /`, `:`, `@`, and spaces. This covers structured data values such as Gmail filters (`newer_than:90d`, `from:user@example.com`) and names with spaces (a calendar title). Shell metacharacters -- `;` `|` `&` `$` `(` `)` `<` `>` `*` `?`, quotes, backticks, and newlines -- are **rejected** so a value cannot inject a command. A space is allowed but is not shell-quoted for you: when a value may contain spaces, quote the reference in the template (e.g. `--calendar "{{CALENDAR}}"`) so it stays a single argument.
 - Reserved variable names `SESSION_DIR` and `SESSION_NAME` cannot be declared in templates. They are injected automatically.
 - If a `--template` source uses legacy-mode gates (no `gates.*` when-clause routing), `koto init` emits a warning to **stderr** and still succeeds. The `--from-stdin` path is strict: a legacy gate is **rejected**, naming the offending state and gate.
 - `--from-stdin` writes both the compiled artifact and the human-readable source into the session directory (the source under a fixed filename), so the workflow survives global cache eviction and the authored definition stays recoverable for audit. Do not embed secrets in the definition; reference `$VAR` / files read at gate-evaluation time instead.

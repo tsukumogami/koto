@@ -5,9 +5,28 @@ use regex::Regex;
 use crate::engine::types::{Event, EventPayload};
 use crate::template::types::VAR_REF_PATTERN;
 
-/// Allowlist regex for variable values: alphanumeric, dots, underscores, hyphens, forward slashes.
+/// Allowlist regex for variable values.
+///
+/// A substituted `{{KEY}}` value can land in a `sh -c` gate command or an agent
+/// instruction, so the value set is an allowlist, not a denylist: every
+/// character that could execute a command, trigger an expansion, or redirect
+/// I/O stays out by default. The set is deliberately conservative -- widen it
+/// only with a per-character justification.
+///
+/// Allowed characters:
+/// - `a-z A-Z 0-9` and `. _ -` -- identifiers, versions, filenames.
+/// - `/` -- path separators (e.g. `org/repo`).
+/// - `:` `@` -- structured data values such as Gmail filters (`newer_than:90d`,
+///   `from:user@example.com`). Neither is a shell metacharacter, so both are
+///   literal inside a `sh -c` word (Issue #180).
+/// - space -- structured names such as a calendar title. A space is not a
+///   command-injection vector: it introduces no command, expansion, or
+///   redirection. Its only effect in an unquoted interpolation is word
+///   splitting, so template authors should quote `{{KEY}}` where a value must
+///   stay a single shell argument (Issue #180).
+///
 /// Empty strings are allowed for optional variables with no default (Issue #141).
-const VALUE_PATTERN: &str = r"^[a-zA-Z0-9._/\-]*$";
+const VALUE_PATTERN: &str = r"^[a-zA-Z0-9._/:@ \-]*$";
 
 /// Holds resolved variable bindings for substitution.
 #[derive(Debug)]
@@ -127,10 +146,21 @@ mod tests {
     }
 
     #[test]
-    fn validate_value_rejects_spaces() {
-        let err = validate_value("KEY", "hello world").unwrap_err();
-        assert_eq!(err.key, "KEY");
-        assert_eq!(err.value, "hello world");
+    fn validate_value_accepts_spaces() {
+        // Spaces are allowed for structured data values such as a calendar name
+        // (Issue #180). A space introduces no shell command, expansion, or
+        // redirection; its only effect in an unquoted interpolation is word
+        // splitting, which template authors control by quoting `{{KEY}}`.
+        validate_value("KEY", "Weekly Planning").unwrap();
+    }
+
+    #[test]
+    fn validate_value_accepts_colon_and_at() {
+        // Colon and at-sign are not shell metacharacters, so they are literal
+        // inside a `sh -c` word. They unblock structured values like Gmail
+        // search filters (Issue #180).
+        validate_value("SINCE", "newer_than:90d").unwrap();
+        validate_value("FROM", "from:delta@delta.com").unwrap();
     }
 
     #[test]
@@ -141,9 +171,22 @@ mod tests {
 
     #[test]
     fn validate_value_rejects_special_chars() {
-        validate_value("KEY", "value;rm -rf").unwrap_err();
-        validate_value("KEY", "$(evil)").unwrap_err();
-        validate_value("KEY", "a\nb").unwrap_err();
+        // The allowlist must keep out every character that can execute a
+        // command, trigger an expansion, or redirect I/O once the value lands
+        // in a `sh -c` gate command or an agent instruction (Issue #180 keeps
+        // this guarantee intact while widening the safe set).
+        validate_value("KEY", "value;rm -rf").unwrap_err(); // command separator
+        validate_value("KEY", "$(evil)").unwrap_err(); // command substitution
+        validate_value("KEY", "`evil`").unwrap_err(); // backtick substitution
+        validate_value("KEY", "a\nb").unwrap_err(); // newline
+        validate_value("KEY", "a|b").unwrap_err(); // pipe
+        validate_value("KEY", "a&b").unwrap_err(); // background / and-list
+        validate_value("KEY", "a>b").unwrap_err(); // redirection
+        validate_value("KEY", "a*b").unwrap_err(); // glob
+        validate_value("KEY", "${HOME}").unwrap_err(); // parameter expansion
+        validate_value("KEY", "a'b").unwrap_err(); // single quote
+        validate_value("KEY", "a\"b").unwrap_err(); // double quote
+        validate_value("KEY", "a\\b").unwrap_err(); // backslash
     }
 
     // -----------------------------------------------------------------------
@@ -291,7 +334,7 @@ mod tests {
             event_type: "workflow_initialized".to_string(),
             payload: EventPayload::WorkflowInitialized {
                 template_path: "/cache/abc.json".to_string(),
-                variables: HashMap::from([("BAD".to_string(), "has spaces".to_string())]),
+                variables: HashMap::from([("BAD".to_string(), "value;rm -rf".to_string())]),
                 spawn_entry: None,
             },
             idempotency_hash: None,
@@ -299,6 +342,32 @@ mod tests {
 
         let err = Variables::from_events(&events).unwrap_err();
         assert_eq!(err.key, "BAD");
+    }
+
+    #[test]
+    fn from_events_accepts_structured_data_values() {
+        // The motivating Issue #180 values: a Gmail window, a sender filter
+        // with a colon and `@`, and a calendar name with spaces.
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: HashMap::from([
+                    ("SINCE".to_string(), "newer_than:90d".to_string()),
+                    ("FROM".to_string(), "from:delta@delta.com".to_string()),
+                    ("CALENDAR".to_string(), "Weekly Planning".to_string()),
+                ]),
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+
+        let vars = Variables::from_events(&events).unwrap();
+        assert_eq!(vars.substitute("{{SINCE}}"), "newer_than:90d");
+        assert_eq!(vars.substitute("{{FROM}}"), "from:delta@delta.com");
+        assert_eq!(vars.substitute("{{CALENDAR}}"), "Weekly Planning");
     }
 
     #[test]
