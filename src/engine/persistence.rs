@@ -1042,6 +1042,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn header_missing_schema_version_defaults_to_1() {
+        // Older sessions were written before `schema_version` existed in
+        // the header. Such a header must parse (as version 1) rather than
+        // fail with "missing field schema_version", so discovery stops
+        // warning about it and the session stays readable.
+        let dir = TempDir::new().unwrap();
+        let header = make_header();
+        let mut header_json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&header).unwrap()).unwrap();
+        header_json
+            .as_object_mut()
+            .unwrap()
+            .remove("schema_version");
+        assert!(
+            header_json.get("schema_version").is_none(),
+            "test setup: schema_version should be absent"
+        );
+
+        let path = dir.path().join("koto-legacy.state.jsonl");
+        let mut content = serde_json::to_string(&header_json).unwrap();
+        content.push('\n');
+        content.push_str(
+            &serde_json::to_string(&make_event(
+                1,
+                EventPayload::WorkflowInitialized {
+                    template_path: "/cache/abc.json".to_string(),
+                    variables: HashMap::new(),
+                    spawn_entry: None,
+                },
+            ))
+            .unwrap(),
+        );
+        content.push('\n');
+        std::fs::write(&path, &content).unwrap();
+
+        let parsed = read_header(&path).expect("header missing schema_version must parse");
+        assert_eq!(parsed.schema_version, 1);
+
+        // The full read path recovers too, not just the header.
+        let (parsed_header, events) =
+            read_events(&path).expect("read_events must recover legacy header");
+        assert_eq!(parsed_header.schema_version, 1);
+        assert_eq!(events.len(), 1);
+    }
+
     // -----------------------------------------------------------------------
     // Header parsing
     // -----------------------------------------------------------------------

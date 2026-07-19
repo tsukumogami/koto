@@ -198,6 +198,23 @@ impl AsRef<str> for ValidatedCoordId {
 /// Additive optional fields do NOT require a bump.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
+/// Schema version assumed for a header line that omits `schema_version`.
+///
+/// The field has been written into every header since the event-log
+/// format was introduced (schema version 1), so a header lacking it was
+/// written before the field existed and is, by definition, version 1.
+///
+/// This is a fixed literal, deliberately NOT `CURRENT_SCHEMA_VERSION`:
+/// if the current version is later bumped, a header that omits the field
+/// must still read as 1 rather than silently adopting the newest
+/// version. Recovering the field on read (rather than rejecting the
+/// file) keeps sessions from older koto builds readable instead of
+/// surfacing them as `state file corrupted: missing field
+/// schema_version` during discovery.
+fn default_schema_version() -> u32 {
+    1
+}
+
 /// Header line written as the first line of a state file.
 ///
 /// Contains metadata about the workflow log. Has no `seq` field -- it is
@@ -205,6 +222,11 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StateFileHeader {
     /// Format version; currently `1`.
+    ///
+    /// Defaults to `1` when absent so state files written before the
+    /// field existed remain readable rather than failing to parse with
+    /// `missing field schema_version`. See `default_schema_version`.
+    #[serde(default = "default_schema_version")]
     pub schema_version: u32,
 
     /// Workflow name; must match the state filename.

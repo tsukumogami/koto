@@ -94,6 +94,22 @@ fn pre_request_store_fixture_header_deserializes_with_defaults() {
 }
 
 #[test]
+fn header_without_schema_version_defaults_to_1() {
+    // Sessions written before `schema_version` was added to the header
+    // omit the key entirely. Such a header must deserialize (as version
+    // 1) rather than failing with "missing field schema_version", so
+    // discovery stops warning about it and the session stays readable.
+    let legacy_json = r#"{
+        "workflow": "old-wf",
+        "template_hash": "abc",
+        "created_at": "2026-01-01T00:00:00Z"
+    }"#;
+    let parsed: StateFileHeader =
+        serde_json::from_str(legacy_json).expect("header missing schema_version must deserialize");
+    assert_eq!(parsed.schema_version, 1);
+}
+
+#[test]
 fn needs_agent_alone_deserializes() {
     // CLI-layer companion validation is owned by Issue 4; the type
     // layer must accept `needs_agent = true` even without role /

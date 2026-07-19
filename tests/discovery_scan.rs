@@ -685,6 +685,40 @@ fn scan_returns_empty_when_sessions_dir_missing() {
     assert!(out.is_empty());
 }
 
+// ----- Regression: legacy header missing schema_version -------------------
+
+/// Rewrite a state file's header line to drop the `schema_version` key,
+/// simulating a session written before the field existed.
+fn strip_schema_version(path: &Path) {
+    let content = fs::read_to_string(path).unwrap();
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let mut header: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    header.as_object_mut().unwrap().remove("schema_version");
+    assert!(header.get("schema_version").is_none());
+    lines[0] = serde_json::to_string(&header).unwrap();
+    fs::write(path, format!("{}\n", lines.join("\n"))).unwrap();
+}
+
+#[test]
+fn scan_discovers_child_whose_header_omits_schema_version() {
+    // Issue 185: a child session written before `schema_version` existed
+    // used to fail header parsing during discovery ("state file
+    // corrupted: missing field schema_version") and be skipped with a
+    // stderr warning. It must now be admitted as a normal candidate.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let path = write_session(
+        root,
+        &make_unassigned_child_header("legacy-child"),
+        now_micros() - 100,
+    );
+    strip_schema_version(&path);
+
+    let out = scan(root, &coord(), &RequestStoreConfig::default()).unwrap();
+    assert_eq!(out.len(), 1, "legacy-header child must be discovered");
+    assert_eq!(out[0].child_session_id, "legacy-child");
+}
+
 // Silence the UnassignedChild-rebind warning under -D warnings; this is
 // here so the type import is exercised even if future refactors stop
 // using it directly.
