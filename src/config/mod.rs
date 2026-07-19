@@ -16,17 +16,30 @@ pub struct KotoConfig {
 
 /// Native Claude Code `/workflows` rendering configuration.
 ///
-/// `native` is the global opt-in for rendering koto sessions in Claude Code's
-/// `/workflows` screen. When true, a session driven inside a Claude Code
-/// session self-discovers that session's workflows directory from the
+/// `native` controls whether koto sessions render in Claude Code's `/workflows`
+/// screen. When true, a session driven inside a Claude Code session
+/// self-discovers that session's workflows directory from the
 /// `CLAUDE_CODE_SESSION_ID` environment variable and renders into it -- no
-/// SessionStart hook or plugin required. Defaults to false, so koto's default
-/// path is untouched until an operator opts in (`koto config set
-/// workflows.native true --user`).
-#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
+/// SessionStart hook or plugin required. **Defaults to true (on).** A session
+/// with no discoverable Claude Code environment (fully headless) still renders
+/// nothing, so the default path is untouched there. To opt out, set
+/// `koto config set workflows.native false --user`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct WorkflowsConfig {
-    #[serde(default)]
+    #[serde(default = "default_native")]
     pub native: bool,
+}
+
+impl Default for WorkflowsConfig {
+    fn default() -> Self {
+        Self {
+            native: default_native(),
+        }
+    }
+}
+
+fn default_native() -> bool {
+    true
 }
 
 /// Request-store (coordinator/operator) configuration.
@@ -649,12 +662,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_workflows_native_defaults_false() {
+    fn test_workflows_native_defaults_true() {
         let config = KotoConfig::default();
-        assert!(!config.workflows.native);
+        assert!(config.workflows.native);
         assert_eq!(
             get_value(&config, "workflows.native"),
-            Some("false".to_string())
+            Some("true".to_string())
         );
     }
 
@@ -672,10 +685,23 @@ mod tests {
 
     #[test]
     fn test_workflows_native_partial_toml_uses_defaults() {
-        // A config that only sets request_store leaves workflows.native false.
+        // A config that only sets request_store leaves workflows.native at its
+        // default (on).
         let toml_str = "[request_store]\nredelegation_cap = 5\n";
         let cfg: KotoConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.workflows.native);
+    }
+
+    #[test]
+    fn test_workflows_native_explicit_optout_parses() {
+        // Opting out is an explicit `native = false`.
+        let toml_str = "[workflows]\nnative = false\n";
+        let cfg: KotoConfig = toml::from_str(toml_str).unwrap();
         assert!(!cfg.workflows.native);
+        assert_eq!(
+            get_value(&cfg, "workflows.native"),
+            Some("false".to_string())
+        );
     }
 
     #[test]

@@ -23,8 +23,8 @@ Expected output ends with
 exercises everything koto owns:
 
 - **The initial render** — single-session render with the current state, update on
-  advance, done-on-completion, the opt-in no-write path (default path
-  untouched), and the atomic `koto-<uuid>.json` filename.
+  advance, done-on-completion, the no-write path when no target resolves (default
+  path untouched), and the atomic `koto-<uuid>.json` filename.
 - **The phase-detail enrichment** — the phases render in order with the active one marked, the
   active phase's directive is legible, a completed phase shows its gate outcome,
   and a session whose gate did not pass renders as `blocked` (not running, not
@@ -47,20 +47,20 @@ for its version/fixture guard over the undocumented surface.
 This confirms the one thing the automated check cannot: that Claude Code renders
 the emitted file.
 
-1. **Enable rendering (once).** Opt in with a config flag:
+1. **Rendering is on by default.** A koto session driven inside a Claude Code
+   session self-discovers that session's workflows directory from the
+   `CLAUDE_CODE_SESSION_ID` environment variable Claude Code sets in every
+   subprocess — no plugin, hook, or manual export required. A fully headless run
+   (no Claude Code environment) still renders nothing.
+
+   To opt out, set the flag to false:
 
    ```bash
-   koto config set workflows.native true --user
+   koto config set workflows.native false --user
    ```
 
-   With this set, a koto session driven inside a Claude Code session
-   self-discovers that session's workflows directory from the
-   `CLAUDE_CODE_SESSION_ID` environment variable Claude Code sets in every
-   subprocess — no plugin, hook, or manual export required. It stays off by
-   default, so koto's normal path is untouched until you opt in.
-
-   *Alternative (explicit handoff):* instead of the config flag, export the
-   directory directly — useful for a headless host or a non-standard layout:
+   *Alternative (explicit handoff):* to point koto at a specific directory —
+   useful for a non-standard layout — export it directly:
 
    ```bash
    export KOTO_WORKFLOWS_DIR="<projectDir>/<sessionId>/workflows"
@@ -89,9 +89,9 @@ the emitted file.
 6. **Complete and reopen.** Drive the session to its terminal state, then reopen
    `/workflows` — the entry reads *done* (completed), not a stuck *running*.
 
-7. **Negative check.** With rendering disabled (`workflows.native` unset and no
-   `KOTO_WORKFLOWS_DIR`), run a koto session and confirm `/workflows` is
-   unaffected and no `koto-*.json` is written.
+7. **Negative check.** With rendering opted out (`koto config set
+   workflows.native false`) and no `KOTO_WORKFLOWS_DIR`, run a koto session and
+   confirm `/workflows` is unaffected and no `koto-*.json` is written.
 
 ## Notes
 

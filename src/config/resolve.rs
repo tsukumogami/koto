@@ -441,36 +441,52 @@ mod tests {
         fs::write(&path, "[session]\nbackend = \"local\"\n").unwrap();
 
         let loaded = load_config_file(&path).unwrap();
-        assert!(!loaded.config.workflows.native);
+        // Absent from the file: not tracked for merge, and left at the default (on).
         assert!(!loaded.workflows_native_present);
+        assert!(loaded.config.workflows.native);
+    }
+
+    #[test]
+    fn test_workflows_native_explicit_optout_tracked() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[workflows]\nnative = false\n").unwrap();
+
+        let loaded = load_config_file(&path).unwrap();
+        assert!(loaded.workflows_native_present);
+        assert!(!loaded.config.workflows.native);
     }
 
     #[test]
     fn test_merge_applies_workflows_native_only_when_present() {
-        // present=true flips the base on.
+        // An explicit opt-out (present, native=false) overrides the default-on base.
         let mut base = KotoConfig::default();
-        let mut on = KotoConfig::default();
-        on.workflows.native = true;
-        let overlay = LoadedConfig {
-            config: on.clone(),
+        assert!(base.workflows.native, "default is on");
+        let mut off = KotoConfig::default();
+        off.workflows.native = false;
+        let optout = LoadedConfig {
+            config: off,
             request_store_keys: vec![],
             request_store_has_recursion: false,
             workflows_native_present: true,
         };
-        merge_config(&mut base, &overlay);
-        assert!(base.workflows.native);
+        merge_config(&mut base, &optout);
+        assert!(
+            !base.workflows.native,
+            "explicit opt-out overrides the default"
+        );
 
-        // present=false must NOT overwrite an already-on base.
-        let mut base_on = KotoConfig::default();
-        base_on.workflows.native = true;
-        let overlay_absent = LoadedConfig {
+        // An absent key (not present in the layer) leaves the base untouched.
+        let mut base_off = KotoConfig::default();
+        base_off.workflows.native = false;
+        let absent = LoadedConfig {
             config: KotoConfig::default(),
             request_store_keys: vec![],
             request_store_has_recursion: false,
             workflows_native_present: false,
         };
-        merge_config(&mut base_on, &overlay_absent);
-        assert!(base_on.workflows.native, "absent key must not clobber");
+        merge_config(&mut base_off, &absent);
+        assert!(!base_off.workflows.native, "absent key must not clobber");
     }
 
     #[test]
