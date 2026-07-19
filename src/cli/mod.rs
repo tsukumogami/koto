@@ -790,8 +790,13 @@ pub(crate) fn resolve_variables(
                 key, key
             ));
         } else {
-            // Not required, no default, not provided -- skip.
-            continue;
+            // Optional, not provided, and either no default or an explicit empty
+            // default: materialize an empty binding rather than skipping the
+            // variable. Every declared variable then resolves at substitution
+            // time, so a `{{KEY}}` reference yields "" instead of an undefined
+            // reference (Issue #184). The empty value still passes through
+            // validate_value below, preserving the #180 allowlist guarantee.
+            String::new()
         };
 
         // 3. Validate the value against the allowlist.
@@ -3382,7 +3387,7 @@ fn handle_next(
                     .map(|(name, gate)| {
                         let mut g = gate.clone();
                         let cmd = crate::cli::vars::substitute_vars(&g.command, &vars_for_gates);
-                        g.command = variables.substitute(&cmd);
+                        g.command = variables.substitute_command(&cmd);
                         (name.clone(), g)
                     })
                     .collect();
@@ -3408,8 +3413,10 @@ fn handle_next(
             return ActionResult::Skipped;
         }
 
-        // Substitute variables in command and working_dir.
-        let command = variables.substitute(&action.command);
+        // Substitute variables in command and working_dir. The command goes to
+        // `sh -c`, so use the shell-safe form (Issue #186); working_dir is a
+        // path, not a shell word, so it keeps the plain substitution.
+        let command = variables.substitute_command(&action.command);
         let wd = if action.working_dir.is_empty() {
             current_dir.clone()
         } else {
@@ -3429,7 +3436,7 @@ fn handle_next(
                         .iter()
                         .map(|(name, gate)| {
                             let mut g = gate.clone();
-                            g.command = variables.substitute(&g.command);
+                            g.command = variables.substitute_command(&g.command);
                             (name.clone(), g)
                         })
                         .collect::<std::collections::BTreeMap<_, _>>()
@@ -3652,7 +3659,7 @@ fn handle_next(
                         command: final_template_state
                             .default_action
                             .as_ref()
-                            .map(|a| variables.substitute(&a.command))
+                            .map(|a| variables.substitute_command(&a.command))
                             .unwrap_or_default(),
                         exit_code,
                         stdout,
@@ -5471,6 +5478,128 @@ Done.
         assert_eq!(
             result.payload.expect("evidence fields ride the payload")["score"],
             7
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_variables (optional-var default materialization, Issue #184)
+    // -----------------------------------------------------------------------
+
+    fn var_decl(required: bool, default: &str) -> VariableDecl {
+        VariableDecl {
+            description: String::new(),
+            required,
+            default: default.to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_variables_materializes_optional_empty_default() {
+        // An optional variable with an empty (or omitted) default that the
+        // caller doesn't pass must still be materialized into the binding set,
+        // so a `{{START}}` reference resolves to "" instead of hitting an
+        // undefined reference at substitution time (Issue #184).
+        let mut decls = BTreeMap::new();
+        decls.insert("START".to_string(), var_decl(false, ""));
+
+        let resolved = resolve_variables(&[], &decls).unwrap();
+
+        assert_eq!(resolved.get("START"), Some(&String::new()));
+    }
+
+    #[test]
+    fn resolve_variables_optional_nonempty_default_used_when_unset() {
+        let mut decls = BTreeMap::new();
+        decls.insert("REGION".to_string(), var_decl(false, "us-east"));
+
+        let resolved = resolve_variables(&[], &decls).unwrap();
+
+        assert_eq!(resolved.get("REGION"), Some(&"us-east".to_string()));
+    }
+
+    #[test]
+    fn resolve_variables_provided_value_overrides_default() {
+        let mut decls = BTreeMap::new();
+        decls.insert("REGION".to_string(), var_decl(false, "us-east"));
+
+        let resolved = resolve_variables(&["REGION=eu-west".to_string()], &decls).unwrap();
+
+        assert_eq!(resolved.get("REGION"), Some(&"eu-west".to_string()));
+    }
+
+    #[test]
+    fn resolve_variables_required_with_default_uses_default_when_unset() {
+        // A required variable that also declares a default is satisfied by the
+        // default when unset -- this precedence must be preserved.
+        let mut decls = BTreeMap::new();
+        decls.insert("WEEKS".to_string(), var_decl(true, "12"));
+
+        let resolved = resolve_variables(&[], &decls).unwrap();
+
+        assert_eq!(resolved.get("WEEKS"), Some(&"12".to_string()));
+    }
+
+    #[test]
+    fn resolve_variables_required_no_default_errors_when_unset() {
+        let mut decls = BTreeMap::new();
+        decls.insert("WEEKS".to_string(), var_decl(true, ""));
+
+        let err = resolve_variables(&[], &decls).unwrap_err();
+
+        assert!(
+            err.contains("missing required variable"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_variables_materialized_empty_default_survives_validation() {
+        // The materialized empty value still goes through validate_value, so the
+        // #180 allowlist guarantee is preserved for defaulted/empty bindings.
+        let mut decls = BTreeMap::new();
+        decls.insert("START".to_string(), var_decl(false, ""));
+
+        // Resolution succeeds (empty passes the allowlist) and the binding is
+        // present, so downstream substitution never sees an undefined ref.
+        let resolved = resolve_variables(&[], &decls).unwrap();
+        assert!(resolved.contains_key("START"));
+    }
+
+    #[test]
+    fn optional_empty_default_renders_wellformed_command_end_to_end() {
+        // The combined #184 + #186 path, from the caller omitting an optional
+        // variable through to the rendered gate command:
+        //   1. #184: resolve_variables materializes the empty default.
+        //   2. #180: from_events re-validates the empty value (must pass).
+        //   3. #186: substitute_command renders the empty token as `''`, so the
+        //      command stays well-formed and the next flag isn't consumed.
+        use crate::engine::substitute::Variables;
+
+        let mut decls = BTreeMap::new();
+        decls.insert("START".to_string(), var_decl(false, ""));
+        decls.insert("DIR".to_string(), var_decl(false, ".sweep"));
+
+        // Caller passes neither --var; START falls back to its empty default.
+        let resolved = resolve_variables(&[], &decls).unwrap();
+
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: resolved,
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+
+        let variables = Variables::from_events(&events).unwrap();
+
+        assert_eq!(
+            variables.substitute_command("cmd init --start {{START}} --dir {{DIR}}"),
+            "cmd init --start '' --dir .sweep"
         );
     }
 }
