@@ -1,0 +1,19 @@
+{
+  "topic": "orphaned-session-detection",
+  "decisions": [
+    {
+      "id": 1,
+      "question": "What shape and home should the new orphan-detection signal take, and how should it wire into koto status's response, koto init's already-exists collision message, and koto session list's per-session output -- reusing vs. extending SchedulerWarning::StaleTemplateSourceDir, and what should it be named given koto workflows --orphaned already means something different?",
+      "status": "pending",
+      "complexity": "critical"
+    },
+    {
+      "id": 2,
+      "question": "Should orphan-detection behave differently across the local vs. cloud-sync (CloudBackend) session backends, given cloud-synced cross-machine resume is the primary source of legitimate false positives and CloudBackend's remote-only placeholder rows can't cheaply determine template_source_dir existence without an extra sync round-trip?",
+      "status": "pending",
+      "complexity": "standard"
+    }
+  ],
+  "cross_validation": "pending",
+  "round": 0
+}
