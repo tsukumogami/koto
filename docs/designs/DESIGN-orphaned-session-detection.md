@@ -29,14 +29,85 @@ Proposed
 
 ## Context and Problem Statement
 
-<From exploration findings. Cover what prompted the exploration, what was
-discovered, and what architectural or technical decisions remain open.>
+A koto session's state header records `template_source_dir` -- the
+directory a session was initialized from -- but three commands that should
+care whether that directory still exists never check it:
+
+- **`koto init`'s "already exists" collision path** (`src/cli/mod.rs:1682-1691`)
+  is a pure `backend.exists(name)` filesystem-presence test; it never opens
+  the colliding session's header, so it cannot tell a real concurrent
+  session apart from a dead one whose originating working tree was reaped.
+- **`koto status`** (`handle_status`, `src/cli/mod.rs:4387`) already reads
+  the full header but never inspects `template_source_dir`.
+- **`koto session list`** (`handle_list`, `src/cli/session.rs:504`) reads
+  each session's header via `persistence::read_header`, then discards
+  `template_source_dir` when projecting into `SessionInfo`
+  (`src/session/mod.rs:129-141`) -- the field is read off disk and thrown
+  away before it reaches the CLI.
+
+The practical consequence (tsukumogami/koto#189): a session created inside
+a working tree that later gets torn down (a reaped ephemeral sandbox, a
+removed git worktree, a container teardown) stays "live" from koto's
+perspective forever. A later `koto init <same-name>` from an unrelated
+environment collides with it and fails with a generic
+`"workflow '<name>' already exists"` error -- indistinguishable from a real
+concurrent session. The only way to tell the two apart today is to
+manually open the colliding session's raw state JSONL and check by hand
+whether `template_source_dir` still resolves.
+
+The codebase already solved a version of this problem once, just scoped
+narrowly. Decision 14 of `docs/designs/current/DESIGN-batch-child-spawning.md`
+added `SchedulerWarning::StaleTemplateSourceDir { path, machine_id,
+falling_back_to }` (`src/engine/scheduler_warning.rs`), emitted when the
+batch scheduler's per-tick child-template-path resolver
+(`src/engine/path_resolution.rs`) finds a recorded `template_source_dir`
+that `Path::exists()` reports as gone. That mechanism is invisible outside
+scheduler ticks -- it never fires for `init`, `status`, or `session list`,
+which is exactly where issue #189's repro lives.
+
+This design decides how to extend that existing, working pattern to the
+three call sites where it's missing: what shape the new signal takes and
+where it lives in the codebase, what it's named (given `koto workflows
+--orphaned` already means something structurally different -- a workflow
+whose *parent* no longer exists, not a session whose *originating
+directory* is gone), and how it should behave given that cross-machine
+session resumption via `CloudBackend`'s cloud sync is a shipped, documented
+feature (`docs/guides/cloud-sync-setup.md`) and the single largest source of
+legitimate false positives for this exact signal.
+
+Explicitly out of scope: any automatic sweep/gc/cleanup of orphaned
+sessions. See Decisions Already Made below.
 
 ## Decision Drivers
 
-<From exploration findings. List the factors that should influence the
-technical decision. Pull from tensions, constraints, and user priorities
-surfaced during exploration.>
+- **Reuse over reinvention.** The batch scheduler already solved "does
+  `template_source_dir` still exist" once; a second, differently-shaped
+  answer to the same question would leave the codebase with two
+  incompatible ways to describe the same fact.
+- **No new incorrect-by-default coupling.** Whatever shape is chosen must
+  not let scheduler-only concerns (like the scheduler's `submitter_cwd`
+  fallback decision) leak into `status`/`init`/`session list`, which have
+  nothing to fall back to.
+- **Read-only for this design; destructive action is out of scope.** A
+  bare `Path::exists()` check is accepted as sufficient because directions
+  1 and 2 (status/init messaging, list surfacing) are informational only.
+  A stronger, fingerprint-based check would only be needed for destructive
+  cleanup, which this design explicitly defers.
+- **Cross-machine resume must not be misreported as certain deletion.**
+  `CloudBackend` sessions resumed on a different machine legitimately have
+  a `template_source_dir` that only ever existed on the originating
+  machine. The signal's wording must not overclaim what a plain existence
+  check can prove.
+- **No new CLI surface where avoidable, and no name collisions.** The
+  existing `koto workflows --orphaned` flag and the batch scheduler's
+  separate `OrphanCandidate`/`orphan_candidates` concept already occupy the
+  word "orphan" for two different things; a third meaning would be a real
+  source of operator confusion.
+- **Additive, non-breaking wire changes.** New JSON fields on
+  `koto status`/`koto session list` output must be additive (present only
+  when relevant, or `Option`-typed), consistent with the project's existing
+  precedent for evolving CLI response shapes (e.g. CHANGELOG 0.10.0's
+  `unassigned_children` addition).
 
 ## Decisions Already Made
 
@@ -73,3 +144,276 @@ exploration this design was handed off from, including the six research
 leads' detailed findings on current plumbing, candidate-direction sizing,
 staleness-check robustness, opt-in posture, and prior art (koto's own docs
 and comparable tools).
+
+## Considered Options
+
+### Decision 1: Orphan-detection signal shape and wiring
+
+`template_source_dir` has exactly one consumer today: the batch
+scheduler's path resolver, which builds `SchedulerWarning::StaleTemplateSourceDir
+{ path: String, machine_id: Option<String>, falling_back_to: PathBuf }`
+(`#[serde(tag = "kind")]` -> `"kind": "stale_template_source_dir"`) when
+`Path::exists()` on the recorded directory returns false. `koto status`,
+`koto init`'s collision check, and `koto session list` never look at this
+field, and `SessionInfo` (`src/session/mod.rs:129-141`) has no
+orphan-flavored signal at all. "Orphan" is already a taken word in this
+codebase: `koto workflows --orphaned` means a workflow whose *parent* no
+longer exists, and the batch scheduler separately has an unrelated
+`OrphanCandidate`/`orphan_candidates` concept for task-name drift across
+submissions.
+
+Three alternatives were evaluated in depth, then cross-examined by
+independent validators who revised their positions after verifying each
+other's claims directly against the source. Two points survived that
+process undisputed: `falling_back_to` is a scheduler-only *decision*
+(what to fall back to when resolution fails) that has no meaning at the
+three new call sites, which have nothing to fall back to; and `machine_id`
+must travel with the existence check everywhere, not just the scheduler,
+because the cross-machine cloud-sync scenario it exists for applies to
+`koto status`/`koto session list` exactly as much as to a scheduler tick.
+
+**Key assumptions:**
+- No interactive user was available during this design (run in `--auto`
+  mode); this decision is recorded as "assumed," not "confirmed."
+- `Path::exists()` is accepted as sufficient (a prior, separate decision;
+  see Decisions Already Made).
+- The chosen shape must tolerate "no data available" as a state distinct
+  from "checked and fine," since `CloudBackend`'s remote-only placeholder
+  rows have no header to check at all (see Decision 2).
+- New, optional CLI-response JSON fields are treated as additive and
+  non-breaking, per the project's own precedent.
+
+#### Chosen: Shared-core extraction (refined)
+
+Extract the existence check into one shared, synchronous helper --
+`fn check_template_source_dir(header: &StateFileHeader) ->
+Option<TemplateSourceStatus>`, where `TemplateSourceStatus { path:
+PathBuf, exists: bool, machine_id: Option<String> }` -- placed alongside
+`persistence::parse_header`/`read_header` or in `path_resolution.rs`. The
+helper calls `Path::exists()` and the already-crate-visible
+`current_machine_id()` (`pub(crate)`, `src/engine/path_resolution.rs:66`)
+exactly once, so there is exactly one place in the codebase that computes
+"does this recorded directory exist, and on whose machine."
+
+`SchedulerWarning::StaleTemplateSourceDir`'s own construction
+(`path_resolution.rs`, `batch.rs:1789`) is refactored to build *from* this
+same helper's result -- converting `TemplateSourceStatus.path: PathBuf` to
+the enum's existing `path: String` only at that call site, and bolting
+`falling_back_to` on only there. The scheduler's public JSON wire format
+(`kind`, `path`, `machine_id`, `falling_back_to`, all currently required
+per an existing hard-coded serialization test) does not change at all.
+
+Wiring at the three new call sites:
+- **`SessionInfo`** (`src/session/mod.rs:129-141`) gains `pub
+  template_source_status: Option<TemplateSourceStatus>` (additive; `None`
+  when the header has no recorded `template_source_dir` *or* when no
+  header is available at all -- see Decision 2 for the `CloudBackend`
+  handling). `LocalBackend::list()` populates it from the header it
+  already has in memory, at zero extra I/O beyond the existence syscall.
+- **`koto status`** (`handle_status`, `src/cli/mod.rs:4387`) already has
+  the header in scope; it calls the shared helper and, only when `exists
+  == false`, adds a conditional top-level `stale_template_source_dir` JSON
+  key -- matching the existing convention of `batch`/`superseded_branches`
+  appearing only when relevant, rather than always-present-but-often-null.
+- **`koto init`'s collision pre-check** (`src/cli/mod.rs:1682-1691`, today
+  a pure `backend.exists(name)` call with no header read) opens the
+  colliding session's header -- new, but bounded, I/O -- runs the shared
+  helper, and when stale, appends a sibling field/clause to the message
+  rather than rewriting the existing `"already exists"` string (preserving
+  the documented guarantee that callers can rely on a stable
+  collision-error string).
+
+Naming keeps the existing `stale_template_source_dir` word family
+throughout (Rust field/type names, JSON keys) -- explicitly not "orphan"
+anything. No new CLI flag is introduced at any of the three sites (all
+three commands already run unconditionally), so there is no possibility of
+colliding with `koto workflows --orphaned` or the scheduler's
+`OrphanCandidate` concept -- avoided by construction, not by finding a
+clever alternate word.
+
+This closes the sharpest disagreement in the bakeoff: instead of two types
+that merely share field names by convention, there is one computation with
+two thin, purpose-specific projections -- the scheduler's existing enum
+variant on one side, the three new-surface consumers on the other -- which
+eliminates both "two types can silently drift" and "three independently
+hand-rolled copies" risk in the same move. It also directly answers the
+strongest argument for direct reuse (see Alternatives below): because the
+three new surfaces depend on the smaller, purpose-built
+`TemplateSourceStatus` rather than on `SchedulerWarning` itself, the
+scheduler's type remains free to grow scheduler-only fields without any
+risk of those fields leaking into non-scheduler output by default.
+
+#### Alternatives Considered
+
+**Direct reuse of `SchedulerWarning::StaleTemplateSourceDir` as-is across
+all four call sites**: cheapest to implement and gives perfect
+compiler-enforced type identity between the scheduler's existing warning
+and the three new surfaces. Rejected because reusing the enum wholesale
+means any future scheduler-only field added to it leaks into non-scheduler
+JSON output by default unless every future contributor remembers those
+three non-scheduler consumers exist -- a standing coupling risk with no
+mitigation but memory. It also forces `falling_back_to` to become
+`Option<PathBuf>` so non-scheduler emitters can omit it, which produces one
+`kind` tag that serializes as two observably different shapes depending on
+which command emitted it, undercutting the "one recognizable vocabulary"
+benefit reuse is supposed to provide.
+
+**Independent per-call-site `Path::exists()` booleans, no shared type**:
+initially attractive for matching the three call sites' genuinely
+different data-availability profiles (each already has different
+information in hand). Rejected because once corrected to include
+`machine_id` -- a required part of the constraint, and functionally free to
+call -- the alternative became structurally identical to the chosen shape,
+just hand-duplicated three times with no shared function or type to
+prevent the three copies from drifting apart over time. Strictly dominated
+by the chosen shared-core approach with no remaining simplicity advantage.
+
+### Decision 2: Backend differentiation for local vs. cloud-sync sessions
+
+`CloudBackend` makes cross-machine session resumption a shipped, documented
+workflow (`docs/guides/cloud-sync-setup.md`): a session created on machine
+A and resumed on machine B legitimately has a `template_source_dir` that
+only ever existed on A. This decision asks whether the new signal's
+computation, wording, or suppression should differ between `LocalBackend`
+and `CloudBackend` to avoid misreporting a healthy cross-machine resume as
+a dead session, without adding new S3 round trips to `koto session list`.
+
+Direct code research overturned part of the premise this decision started
+with: `StaleTemplateSourceDir`'s `machine_id` field, initially assumed to
+distinguish "deleted" from "cross-machine," does not actually perform that
+comparison today -- `current_machine_id()` is a cheap, ephemeral local read
+used purely as an observational label ("here's which machine noticed
+this"), not a stored value compared against anything. `StateFileHeader` has
+no creator-machine identifier at all. A second, unrelated `machine_id`
+concept (`get_or_create_machine_id()` / `version.json.machine_id`) records
+the *last machine to write a version bump*, not the machine that recorded
+`template_source_dir`, and is frequently absent for read-only sessions --
+not a reliable substitute. `CloudBackend::list()`'s remote-only placeholder
+rows also turned out not to be where the real false positive happens (they
+carry no header data to misfire on); the actual common case is a session
+whose header has already been pulled to a second machine via
+`sync_pull_state`, at which point the row is an indistinguishable,
+fully-populated local session whose `template_source_dir` happens to
+belong to another host.
+
+**Key assumptions:**
+- Decision 1's chosen `SessionInfo` field uses `Option` semantics
+  (matching `parent_workflow`), not the `String::new()` sentinel idiom
+  `created_at`/`template_hash` use elsewhere in the same struct -- Decision
+  1 confirms this holds. If it hadn't, every `CloudBackend` remote-only
+  placeholder row would misfire the check regardless of any wording layered
+  on top.
+- "No new round trips" is a hard constraint that also rules out inventing
+  new persisted state solely to serve this decision.
+
+#### Chosen: Backend-aware wording only, gated on a free discriminant
+
+Keep the check's computation identical across backends: evaluate
+`Path::exists()` only when `template_source_dir` is known (`Some`), never
+when absent/unknown, regardless of which backend produced the row. Do not
+suppress or skip the check for `CloudBackend` sessions specifically -- a
+fully-downloaded session with a genuinely stale `template_source_dir` is
+just as worth flagging as a local one.
+
+The one place backend matters is message text. When a session's backend is
+`Backend::Cloud(_)` (a static, zero-cost discriminant already in hand,
+`cloud.rs:559-561`, no I/O and no new field), soften the wording to
+acknowledge the ambiguity instead of asserting deletion -- e.g. "template
+source directory not found (if this session was synced from another
+machine, this may be expected)" -- rather than a flat "no longer exists."
+For `LocalBackend` sessions, where cross-machine resume isn't a possible
+explanation (a session can't be resumed on another machine without cloud
+sync), keep the more direct wording.
+
+This is a static, backend-type-level hedge applied uniformly to every
+`CloudBackend` session's warning -- not a per-session claim that the
+cross-machine explanation applies to this specific session. No cheap,
+reliable per-session signal exists to make that stronger claim honestly;
+the backend-type discriminant is the only thing that's genuinely free.
+
+#### Alternatives Considered
+
+**Uniform behavior (identical check, identical wording, no backend
+awareness)**: rejected because it discards a zero-cost signal already
+available on every session row, producing needlessly alarming wording for
+a common, shipped, healthy workflow (cross-machine resume) with no
+offsetting simplicity benefit -- the backend-aware branch is a single
+conditional at message-formatting time, not a structural complication.
+
+**Machine-id cross-reference via a new persisted creator-machine-id**:
+rejected because it requires inventing new persisted state and a new write
+path in `StateFileHeader`/`init` -- a materially larger, separately-scoped
+change than adjusting an existing signal's computation/wording/suppression
+-- and because the codebase's existing `version.json.machine_id` field
+demonstrates that machine-id fields drift (tracking "last touched by"
+rather than "created by") unless deliberately designed to be immutable
+post-init, a risk this decision doesn't need to take on to deliver most of
+the benefit via wording alone.
+
+## Decision Outcome
+
+**Chosen: Shared-core `TemplateSourceStatus` extraction (Decision 1) +
+backend-aware wording only (Decision 2)**
+
+### Summary
+
+A new, small type -- `TemplateSourceStatus { path: PathBuf, exists: bool,
+machine_id: Option<String> }` -- and one shared helper,
+`check_template_source_dir(header: &StateFileHeader) ->
+Option<TemplateSourceStatus>`, become the single place in the codebase that
+answers "does this session's recorded source directory still exist, and on
+whose machine." The batch scheduler's existing
+`SchedulerWarning::StaleTemplateSourceDir` is refactored to build from this
+same helper's result instead of computing the fact inline a second way;
+its own public JSON shape (`kind`, `path`, `machine_id`, `falling_back_to`)
+is untouched, and its existing hard-coded serialization test keeps passing
+unchanged.
+
+Three call sites wire into the shared helper. `SessionInfo` gains an
+additive `Option<TemplateSourceStatus>` field, populated by
+`LocalBackend::list()` from the header it already holds in memory (no new
+I/O) and left `None` by `CloudBackend::list()`'s remote-only placeholder
+rows (no new sync round-trip). `koto status` calls the helper and adds a
+conditional `stale_template_source_dir` JSON key only when the directory is
+confirmed missing. `koto init`'s "already exists" collision check gains new
+(bounded) I/O -- it now opens the colliding session's header, runs the
+helper, and appends a sibling clause to the existing, stable
+`"already exists"` error string rather than rewriting it.
+
+Message wording is the one place backend type matters: sessions on
+`Backend::Cloud(_)` get softened wording acknowledging that a missing
+directory may reflect a legitimate cross-machine resume, using a static,
+already-in-hand discriminant, while `Backend::Local` sessions -- for which
+cross-machine resume isn't possible -- keep more direct wording. The
+underlying `Path::exists()` computation never differs by backend; only the
+words describing the result do. No CLI flag is introduced anywhere, and the
+word "orphan" is never used in any new field, message, or flag name --
+the existing `stale_template_source_dir` vocabulary is reused throughout,
+avoiding the `koto workflows --orphaned` and scheduler `OrphanCandidate`
+collisions by construction.
+
+Direction 3 from the source issue (an automatic sweep/gc/cleanup command
+for orphaned sessions) remains explicitly out of scope; this design only
+covers read-only, informational surfacing.
+
+### Rationale
+
+The two decisions reinforce each other cleanly. Decision 1 settles what the
+signal *is* and where it lives; Decision 2 settles how its *words* should
+change by context, without touching the underlying check. Because Decision
+1 committed to `Option` semantics on the new `SessionInfo` field (mirroring
+the existing `parent_workflow` idiom, not the `String::new()` sentinel
+idiom used elsewhere in the same struct), Decision 2's central risk --
+`CloudBackend` placeholder rows misfiring the check universally -- doesn't
+materialize; cross-validation confirmed no conflict between the two
+decisions' assumptions.
+
+The combination accepts one real trade-off: `koto init`'s collision path
+gains I/O it doesn't have today (a header read on the colliding session).
+This is a deliberate, bounded cost, not an oversight -- it's the minimum
+required to turn a generic "already exists" error into a diagnosable one,
+which is the concrete bug this design exists to fix. The `CloudBackend`
+`None`-means-two-things ambiguity ("no `template_source_dir` recorded" vs.
+"no header available to check") is inherited and left unresolved by
+design; it should be documented as a known limitation via a doc comment on
+the field, not silently papered over.
