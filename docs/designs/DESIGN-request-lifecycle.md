@@ -265,20 +265,46 @@ delegate's next tick sees it with no restart. It is also an O(1) reverse
 lookup on a read the tick already performs, so the delegate never scans
 requests.
 
-**Two constraints this imposes, both load-bearing.**
+**Three constraints this imposes, all load-bearing.**
 
 The `leg` object must **not** carry `dispatch_epoch`. The epoch is baked into
 the delegate's dispatch at spawn time, and a freshly-readable epoch would let a
 displaced agent present the current value and defeat the fence. Identity is
 readable; authority stays baked.
 
-Because a stale agent can still read a valid `leg`, the append path must be
-fenced: `koto request progress` and `koto request resolve` take
-`--dispatch-epoch` and validate it when the fence applies to the child's
-header, exactly as `koto next` does.
+Because a stale agent can still read a valid `leg`, every mutating leg path is
+fenced — `progress`, `resolve`, and leg-scoped `abandon` all take
+`--dispatch-epoch`.
 
-`request_id` must be opaque and must not embed the coordinator's session id,
-or a delegate-readable field would leak coordinator identity.
+**The fence reads the epoch from the request log, not from the child's
+header.** This is a correction from the security review and it matters more
+than it looks. Reading the child's header would make the fence unavailable in
+exactly the window it exists for. The applicability predicate requires
+`parent_workflow.is_some() && needs_agent == Some(true)`, which excludes
+top-level sessions and batch-spawned children — all of which `bind` would
+otherwise happily accept, silently ignoring `--dispatch-epoch` forever after.
+Worse, the child's header disappears on its terminal tick while the request
+record outlives it, so after cleanup there would be no header to compare
+against and the leg would be permanently unfenceable — during precisely the
+period a displaced original agent may still be alive.
+
+So `request.leg_bound` carries the child's `dispatch_epoch`, captured at bind
+time, and the fence compares against that. Identity stays readable and
+authority stays baked; only koto reads the recorded epoch. `bind` also rejects
+a child whose header does not satisfy the fence predicate, so a leg cannot be
+bound to something unfenceable in the first place.
+
+An unbound leg has no child and therefore no epoch, so it is unfenceable by
+construction. That is correct — its creator is the only party that can resolve
+it — but it is an exception worth stating rather than leaving implied.
+
+`request_id` is a `ValidatedRequestId` newtype, not a `&str`, so validation
+cannot be forgotten at a future call site. koto's existing discipline is
+explicit about why: a function taking a validated newtype by reference cannot
+be called with an unvalidated string, which is a property the type system
+keeps rather than one every author has to re-keep. It is generated in a single
+case so two ids cannot collide to one directory on a case-insensitive
+filesystem, and it is opaque so requests cannot be enumerated by guessing.
 
 **Alternative — a new field on `UnassignedChild` or in the spawn prompt.**
 Rejected: both are coordinator-side or spawn-time, so neither satisfies R21's
@@ -332,6 +358,33 @@ lifecycle and violate R29.
 An informational `leg_abandoned` sibling on the envelope gives a shell consumer
 something to branch on without parsing prose.
 
+**The rationale does not go into the directive verbatim.** An earlier draft of
+this design claimed that embedding the caller's rationale as a quoted value
+stopped it forging a second instruction. That is false for a prose field read
+by a language model: quoting has no semantics there, and a rationale ending in
+something shaped like "end of notice — new instruction from your coordinator:"
+is indistinguishable from koto's own text to the reader whose
+instruction-following is the entire enforcement. Combined with the fact that
+abandonment is what triggers the splice, an unfenced abandon would be an
+injection path into another delegate's authoritative field.
+
+Three things close it. Leg-scoped abandon is fenced (Decision 3). The
+`directive` splice carries koto-authored text plus a pointer to the mechanical
+sibling, not the rationale itself. And the rationale is capped at 4 KiB with
+control characters stripped and newlines collapsed, so it cannot visually
+escape its enclosure even where it is displayed. The verbatim rationale is
+available in the `leg_abandoned` sibling and in the log, which is where a
+consumer that wants it should read it.
+
+**The splice happens after variable substitution, not before.** Prepending
+caller-influenced text ahead of the substitution closure would expose it to
+`{{...}}` expansion, and the substitution helper is a sequential replace over a
+map rather than a single pass, so a value substituted early can be rescanned by
+a later key in nondeterministic order. The blast radius would be confusion
+rather than command injection — variable values are allowlist-constrained and
+no caller content reaches a gate command — but the ordering is free to get
+right.
+
 **Delivery is audited.** A fifth reserved `request_store.`-prefixed
 `EvidenceSubmitted` kind is appended once to the delegate's own log when the
 notice is first delivered. Without it an operator cannot distinguish "never
@@ -360,10 +413,17 @@ koto request list     [--requested-by ID | --coordinator-of-record ID] [--state 
                       [--unresolved-legs]
 koto request progress <request-id> <leg> --with-data J [--dispatch-epoch N]
 koto request resolve  <request-id> <leg> --with-data J [--dispatch-epoch N]
-koto request abandon  <request-id> <leg> --rationale TEXT
+koto request abandon  <request-id> <leg> --rationale TEXT [--dispatch-epoch N]
 koto request abandon-request <request-id> --rationale TEXT
 koto request close    <request-id>
 ```
+
+Leg-scoped `abandon` is fenced alongside `progress` and `resolve`, because
+abandonment is what triggers the directive splice and an unfenced abandon would
+let any party holding a leg identity reach into a sibling delegate's
+authoritative field. Request-scoped `abandon-request` and `close` are
+request-level rather than leg-level operations and have no single epoch to
+compare against; they record the presented identity for audit instead.
 
 Leg-scoped and request-scoped abandonment are separate subcommands rather than
 one subcommand with an optional positional, so an unset shell variable fails
@@ -403,11 +463,22 @@ invalid-identifier error at the caller-error class. And because `bind` reuses
 the fence, it can legitimately surface 65 and 75, which must not be remapped.
 
 **The wait polls the same read path `get` uses**, with a two-second default
-interval, an absolute deadline computed once, and hundred-millisecond sleep
-slices so a signal is noticed promptly. Interruption exits in the transient
-class rather than zero. Filesystem watching was rejected: it adds a dependency,
-is blind under the cloud backend, is defeated by write-temp-then-rename churn,
-and it would optimize a single `stat`.
+interval clamped to a floor so an interval of zero cannot spin, an absolute
+deadline computed once, and hundred-millisecond sleep slices so a signal is
+noticed promptly. Interruption exits in the transient class rather than zero.
+Filesystem watching was rejected: it adds a dependency, is blind under the
+cloud backend, is defeated by write-temp-then-rename churn, and it would
+optimize a single `stat`.
+
+**Progress and resolve appends carry an idempotency hash.** koto already has a
+canonical-JSON idempotency-hash append that short-circuits an identical retry
+and raises a conflict when the hash hits but the payload differs. Without it,
+"retry on the transient class" is unsafe advice for this group: a `progress`
+retried after an ambiguous failure would double-append and burn the append
+bound, and a `resolve` retried after a write that succeeded but was not
+reported would be rejected as a second result, indistinguishable to the caller
+from a genuine double-resolve. Hashing both makes the documented retry
+behavior actually safe.
 
 **The predicates** are `--leg <name>` (that leg resolved), `--all-legs`,
 `--closed`, and `--resolved-count <N>`; exactly one is required.
@@ -487,21 +558,57 @@ result), `Skipped` maps to `resolved`, `Pending` and `Blocked` map to `open`,
 and `abandoned` has no `TaskOutcome` image at all — which is the clearest
 evidence the two enumerations should stay separate.
 
-### Decision 8: The per-leg append bound
+### Decision 8: Every bound, not just the append bound
 
-**Chosen: 256 appends per leg and 16 KiB per append, rejecting at the bound.**
+**Chosen: reject at the bound, on five dimensions rather than one.**
 
-R74 requires a bound with an explicit behavior. Rejecting is chosen over
-truncating and over rolling over: truncation silently loses the newest
-information, which is the most valuable, and roll-over breaks R16's ordering
-guarantee and R38's monotonic revision. A rejection is a caller error the
-consumer can see and react to.
+R74 names the per-leg append bound, and an earlier draft of this design bounded
+only that. The security review's most useful structural finding was that the
+unbounded dimensions were the interesting ones — and that koto already ships
+enforcement for most of them, so the work is adoption rather than invention.
 
-The numbers are set to be far above any plausible legitimate use — a delegate
-posting a note per file in a large review stays well inside 256 — and far below
-a log-growth hazard: 256 × 16 KiB caps one leg's append contribution at 4 MiB.
-Both are operator-tunable under the existing `request_store` config table,
-which already holds the dispatch protocol's tunables.
+| Dimension | Bound | Behavior | Source |
+|---|---|---|---|
+| Progress appends per leg | 256 | reject | new, this design |
+| Bytes per progress append | 16 KiB | reject | new, this design |
+| Legs per request | 256 | reject at create | mirrors the batch task cap |
+| Any JSON flag payload | 1 MiB and depth 128 | reject | reuse the existing inputs and with-data guards |
+| `--rationale` | 4 KiB, control characters stripped | reject | tightens the existing 1 MiB rationale precedent |
+
+Rejecting is chosen over truncating and over rolling over: truncation silently
+loses the newest information, which is the most valuable, and roll-over breaks
+R16's ordering guarantee and R38's monotonic revision. A rejection is a caller
+error the consumer can see and react to. All five are enforced inside the lock
+where they guard log growth, so none can be raced past.
+
+Two of these are load-bearing beyond hygiene. The **leg cap** matters because
+every append re-reads the whole log under the exclusive lock, so an unbounded
+leg count makes append cost grow with the record and lengthens the lock hold —
+undermining both the bounded-read promise and the claim that the lock is held
+only briefly. The **rationale cap** is much tighter than koto's existing 1 MiB
+precedent because this rationale is prepended to a delegate's directive on
+every tick until it terminates, which makes a large one a context-exhaustion
+problem rather than merely a large string.
+
+The append and leg bounds are operator-tunable under the existing
+`request_store` config table, which already holds the dispatch protocol's
+tunables. The payload and rationale caps are fixed.
+
+**Duplicate leg names are rejected at create.** The shared name grammar
+validates one name at a time; whole-submission uniqueness is a separate rule in
+the batch validator, typed to batch entries and not reusable here. Without an
+explicit check, two legs declared with one name would collapse in the view's
+map: one declaration silently lost, and a single result resolving what the
+caller believes are two legs.
+
+**Retention is a stated gap, not a solved problem.** Nothing in this change
+deletes a request, and listing parses every request's header, so the store
+grows monotonically and listing gets slower for the life of the workspace. R6
+requires durability against *session* cleanup, which does not preclude an
+explicit prune, but adding an eleventh verb is scope this change does not take.
+It is recorded in Consequences and as a follow-up. Any future prune must not
+unlink the lock file while a writer holds it, or two writers would lock
+different inodes.
 
 ## Decision Outcome
 
@@ -668,49 +775,118 @@ says the event enum has no catch-all.
 
 ## Security Considerations
 
-**Path traversal through identifiers.** Both `request_id` and `leg_name` become
-path components. Leg names are validated against the batch task-name grammar,
-which admits only alphanumerics, hyphen, and underscore — this is why reusing
-that check rather than copying the regex is load-bearing. `request_id` is
-koto-generated and opaque, and is validated on every read against the same
-character class, so a caller-supplied identifier cannot escape
-`~/.koto/requests/`.
+The threat model is a local, single-uid CLI. There is no network service and no
+multi-tenancy, so nothing here is a remote-exploit surface. What is real is that
+agent-supplied content flows through the store, several processes write
+concurrently, and one of those processes can be a *displaced* agent — an
+earlier dispatch that is still alive after being superseded. Most of what
+follows is about that case and about confused-agent hygiene, not about a
+security boundary this tool claims to have.
 
-**The fence and displaced agents.** Making leg identity readable from a
-delegate's own header means a stale or displaced agent can also read it. That
-is why the `leg` object deliberately omits `dispatch_epoch` — a readable epoch
-would let a displaced agent present the current value — and why the append
-paths validate the epoch when the fence applies. Identity is readable;
-authority is not.
+**Path traversal through the request identifier.** Under Decision 1 only
+`request_id` becomes a path component; leg names live inside the log as map
+keys, not as directory entries. `request_id` is therefore a
+`ValidatedRequestId` newtype whose constructor is the only way to obtain one,
+so the read and write entry points cannot be called with an unvalidated
+string — validation is a property the type system holds rather than a discipline
+each call site re-keeps. It is koto-generated, opaque, and single-case, the last
+so two ids cannot collide to one directory on a case-insensitive filesystem,
+which would interleave two logs and fail the sequence check permanently.
 
-**Cross-principal writes.** Any process that can read `~/.koto/` can append to
-a request log; koto has no principal authentication and this design does not
-add one. `--issued-by` is an audit attribution, not an authorization, and is
-documented as such so no consumer treats it as an access check. The threat
-model is unchanged from the existing session store, where the same property
-already holds.
+Leg names are still validated against the shared grammar, but for the wire
+format and the CLI rather than for the filesystem, and the grammar additionally
+rejects a leading hyphen: leg names are positional shell arguments in every
+mutating verb, and a leg named `--rationale` is an argument-parsing hazard for
+the shell wrappers this feature exists to serve. koto's own identifier
+validator rejects a leading hyphen for the same reason.
 
-**Identity leakage into delegates.** `request_id` must not embed the
-coordinator's session id, because the header field is delegate-readable. An
-opaque identifier keeps a delegate from learning its coordinator's identity
-through the binding.
+**Symlinks and modes.** The request directory and its log refuse to follow
+symlinks, matching how the claim sidecar is opened and how workspace prune
+refuses a symlinked root. `requests/` and each request directory are created
+0700 and the log 0600, rather than relying on the home directory's mode having
+been set correctly once.
 
-**Denial of service through unbounded appends.** Decision 8's bound exists
-partly for this: without it a compromised or looping delegate could grow a
-request log without limit on the same filesystem koto's crash-safety depends
-on. The bound is enforced inside the lock, so it cannot be raced past.
+**The fence and displaced agents.** This is the part the first draft of this
+design got wrong, and the correction is in Decision 3: the fence compares
+against the epoch recorded in `request.leg_bound`, not against the child's
+header. Reading the header would have left the fence unavailable exactly when
+it is needed — the applicability predicate excludes children a leg can legally
+be bound to, and the header disappears on the child's terminal tick while the
+request record outlives it, so a leg would become permanently unfenceable
+during the window a displaced agent may still be running.
 
-**Lock starvation.** The validate-and-append lock is held only across a
-re-read, a check, and one append. A bounded acquisition timeout surfaces
-contention as a transient-class error rather than hanging a caller
-indefinitely.
+Every mutating leg path is fenced, including leg-scoped abandon. Abandon is
+fenced specifically because it triggers the directive splice, so an unfenced
+abandon would be a path for one party holding a leg identity to place prose in
+a different delegate's authoritative field. Request-scoped close and abandon
+have no single epoch to compare against and are audited with the presented
+identity instead. An unbound leg has no epoch and is unfenceable by
+construction, which is correct rather than a gap.
 
-**Untrusted content in prose fields.** Progress content, rationales, and
-summaries are caller-supplied and are surfaced in a delegate's `directive` and
-in the dashboard. They are carried as data and never interpolated into a shell
-command or a gate command. The abandonment notice is koto-authored text with
-the caller's rationale embedded as a quoted value, so a rationale cannot forge
-a second directive instruction.
+**Untrusted content in prose fields.** The abandonment notice reaches a
+language model as prose, and quoting has no semantics there — a claim to the
+contrary was removed from this design. The rationale is therefore not spliced
+into the directive at all: the directive carries koto-authored text plus a
+pointer, and the verbatim rationale lives in the mechanical envelope sibling
+and in the log. It is capped at 4 KiB with control characters stripped and
+newlines collapsed, and the splice happens after variable substitution so
+caller-influenced text is never exposed to template expansion. No caller
+content reaches a gate command or a shell command on any path.
+
+Terminal escapes are handled by the surfaces rather than here: JSON output
+escapes all control bytes, and the interactive dashboard filters any grapheme
+containing a control character before it reaches a cell. This change adds only
+a derived membership badge to the dashboard and no caller-supplied text, so it
+does not widen that surface. If a human-readable renderer for the request view
+is ever added, it owns its own scrubbing.
+
+**Denial of service.** Decision 8 bounds five dimensions rather than one, all
+enforced inside the lock so none can be raced past. The two that matter most
+are the leg cap — because append cost and lock hold time grow with the record,
+so an unbounded leg count would undermine both the bounded-read promise and the
+brief-lock claim — and the tight rationale cap, because that text is prepended
+to a delegate's directive on every tick until it terminates, which makes a
+large one a context-exhaustion problem rather than a large string. The `wait`
+interval is clamped to a floor so it cannot spin.
+
+**Cross-principal reads and writes.** Any process at the same uid can read and
+append to a request log. koto has no principal authentication and this design
+does not add one; `--issued-by` is audit attribution, not authorization, and is
+documented as such so no consumer mistakes it for an access check. This is
+unchanged from the existing session store.
+
+One consequence is worth stating plainly rather than implying otherwise: a
+delegate holding its own leg identity can read the whole request, including
+sibling legs' declarations, progress, and results, and the header's requester
+and coordinator. Cross-leg readability is intended — an operator needs it — so
+the honest framing is that an opaque identifier prevents enumeration by
+guessing and nothing more. It does not hide the coordinator's identity from a
+bound delegate. The delegate-facing projections omit the requester and
+coordinator fields to avoid handing them over gratuitously, but that is
+hygiene, not a boundary.
+
+**Locking.** The lock is an flock, deliberately not an exclusive-create lease
+file: the kernel releases an flock when the holding process dies, so a killed
+writer cannot strand it, whereas the lease-file pattern elsewhere in koto needs
+stale recovery and an age heuristic precisely because those files do strand.
+koto has no bounded-wait flock primitive today, so the bounded acquisition is
+non-blocking plus sleep-and-retry against a deadline; flock is not
+first-in-first-out, so a writer can be starved past its deadline under
+sustained contention and surfaces that as the transient class.
+
+Two constraints follow from flock and should be read as limitations rather than
+mitigations. The validate-and-append primitive is unix-only, matching koto's
+existing platform support. And the store requires a local filesystem: flock is
+host-local, so two hosts appending over a network filesystem would collide on
+sequence assignment, and the reader hard-errors on a sequence gap — leaving that
+request permanently unreadable. That is a worse failure than the session-store
+equivalent because this record is the durable one, so it is documented
+alongside the cloud-backend gap.
+
+**Retry safety.** Progress and resolve appends carry an idempotency hash so a
+retry after an ambiguous failure is a no-op rather than a double-append or a
+spurious second-result rejection. Without it, the documented advice to retry on
+the transient class would itself be a correctness hazard.
 
 ## Consequences
 
@@ -733,7 +909,17 @@ a second directive instruction.
 
 - `requests/` is the first authoritative directory outside `sessions/`, so the
   documented workspace layout changes and a new backup or sync concern appears.
-- Request records do not replicate under the cloud backend.
+- Request records do not replicate under the cloud backend, and the store
+  requires a local filesystem because flock is host-local.
+- The validate-and-append primitive is unix-only.
+- Nothing prunes the request store. It grows monotonically for the life of a
+  workspace, and listing parses every request's header, so listing gets slower
+  over time. A prune verb is deliberately out of scope for this change and is
+  recorded as a follow-up; durability against session cleanup, which is what
+  the requirement asks for, does not preclude one.
+- A bound delegate can read its whole request, including sibling legs. That is
+  intended, but it means an opaque identifier prevents enumeration and nothing
+  more — it does not hide the coordinator from a delegate.
 - Appends to different legs of one request briefly serialize, which is why R73
   was corrected.
 - The delegate's leg pointer is denormalized onto its header and can lag the
