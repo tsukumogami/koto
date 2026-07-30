@@ -138,12 +138,11 @@ sessions. See Decisions Already Made below.
   "parent workflow no longer exists") in both CLI help text and wire
   format.
 
-See `wip/explore_orphaned-session-detection_findings.md` and
-`wip/research/explore_orphaned-session-detection_r1_lead-*.md` for the full
-exploration this design was handed off from, including the six research
-leads' detailed findings on current plumbing, candidate-direction sizing,
-staleness-check robustness, opt-in posture, and prior art (koto's own docs
-and comparable tools).
+These decisions were made during the `/explore` workflow that preceded this
+design (six research leads covering current plumbing, candidate-direction
+sizing, staleness-check robustness, opt-in posture, and prior art in koto's
+own docs and comparable tools); their findings are folded into the Context,
+Considered Options, and Solution Architecture sections below.
 
 ## Considered Options
 
