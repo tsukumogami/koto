@@ -4,8 +4,9 @@
     {
       "id": 1,
       "question": "What shape and home should the new orphan-detection signal take, and how should it wire into koto status's response, koto init's already-exists collision message, and koto session list's per-session output -- reusing vs. extending SchedulerWarning::StaleTemplateSourceDir, and what should it be named given koto workflows --orphaned already means something different?",
-      "status": "pending",
-      "complexity": "critical"
+      "status": "complete",
+      "complexity": "critical",
+      "report_file": "wip/design_orphaned-session-detection_decision_1_report.md"
     },
     {
       "id": 2,
