@@ -18,9 +18,10 @@ decision: |
   validate-and-append primitive that takes an exclusive lock for the whole
   check-then-write critical section. Six typed `EventPayload` variants land in
   a new `request.` wire namespace with no schema-version bump. A leg's
-  identifiers reach its delegate as additive header fields on the child's own
-  state file, surfaced as a `leg` object on the delegate's `koto next`
-  response. Abandonment reaches the delegate as a koto-authored notice
+  identifiers reach its delegate through a sidecar file in the child's own
+  session directory, surfaced as a `leg` object on the delegate's `koto next`
+  response, and the fence reads the bound epoch from the request log so it
+  survives the child's cleanup. Abandonment reaches the delegate as a koto-authored notice
   prepended to the authoritative `directive` field. Ten subcommands under
   `koto request` use koto's existing four exit classes, with readiness split
   into a separate polling `wait`. A bound leg's result is promoted on the
@@ -28,16 +29,16 @@ decision: |
   terminal-index write.
 rationale: |
   Putting the log at a workspace path rather than in a session resolves the
-  central tension without touching a single type: koto's append machinery is
-  already path-parameterized, so the event enum is the log format rather than
-  the session format. One log per request rather than one per leg keeps the
+  central tension cheaply: koto's append primitive is already
+  path-parameterized, so the event enum is the log format rather than the
+  session format, and only the header-typed read half needs generifying. One log per request rather than one per leg keeps the
   revision well-defined as the last event's sequence number and gives a real
   total order across legs, at the cost of a short-held lock on append —
   acceptable because that same lock is what makes at-most-one-result and
   idempotent rebinding enforceable at all, which per-leg files could not
-  provide. Every other decision follows koto's own precedent: additive
-  serde-optional header fields, the `directive` field the agent-facing skill
-  declares authoritative, and the exit-zero-with-discriminator contract
+  provide. Every other decision follows koto's own precedent: the claim
+  sidecar's temp-and-rename pointer, the `directive` field the agent-facing
+  skill declares authoritative, and the exit-zero-with-discriminator contract
   `koto next` already documents.
 ---
 
@@ -138,12 +139,26 @@ scheduler, which this design must sit beside without contradicting.
   request.lock      flock target for the validate-and-append critical section
 ```
 
-The central tension turns out to be dissolvable rather than tradeable. koto's
-append and read primitives in `src/engine/persistence.rs` are
-path-parameterized — they take a `&Path` and know nothing about sessions. Only
-`LocalBackend` makes a log session-shaped. So `EventPayload` is koto's
-*event-log* format, not its *session* format, and a second log family at a
-workspace path satisfies R53 literally with no type changes at all.
+The central tension turns out to be dissolvable rather than tradeable.
+`append_event` in `src/engine/persistence.rs` is genuinely path-parameterized —
+it takes a `&Path` and knows nothing about sessions — so `EventPayload` is
+koto's *event-log* format rather than its *session* format, and a second log
+family at a workspace path satisfies R53 without redefining the enum.
+
+**The read half, however, is not reusable as-is**, and an earlier draft of this
+design claimed it was. `parse_header` hard-deserializes `StateFileHeader` and
+gates on `CURRENT_SCHEMA_VERSION`; `read_header` and `read_events` both funnel
+through it and return `StateFileHeader`; `append_header` is typed to it. Since
+`StateFileHeader` requires `workflow` and `template_hash` with no serde
+default, a `RequestHeader` line would fail to parse and surface as a corrupted
+log.
+
+So two functions get generified rather than copied: a
+`read_log<H: DeserializeOwned>(path) -> (H, Vec<Event>)` and an
+`append_header_line<H: Serialize>`, with the existing session-typed pair
+becoming thin wrappers. Copying instead would duplicate the sequence-gap
+validation and the truncated-final-line recovery, which must live in exactly
+one place.
 
 R6 then becomes a property of the layout rather than a rule enforced at every
 deletion site. Sessions delete themselves on their terminal tick, and nothing
@@ -180,10 +195,48 @@ are atomic with respect to other writers, which needs a lock whether or not
 the files are split. Once a lock is on the table, splitting the files buys
 ordering weakness rather than concurrency.
 
+**Creation is one atomic write, not two.** A header write followed by an event
+append would be two fsyncs, and a crash between them would leave a request
+whose header parses and whose log is empty — listable, and projecting to a
+request with zero legs, because the leg declarations live in the creation
+event. That is a direct crash-safety violation, and the pattern that avoids it
+already exists in the tree: buffer the header and the first event, fsync a
+tempfile in the target directory, then atomically rename with
+no-replace semantics. The rename also gives exclusive creation against a
+colliding request id for free.
+
+**Three invariants the layout has to defend, because a request log is
+multi-writer and immortal where a session log is neither.**
+
+*Every writer must take the lock.* `append_event` derives its sequence number
+from an unlocked read of the last one, and the reader hard-errors on any
+non-consecutive sequence — which is not the recoverable final-line case. Two
+unlocked concurrent appends both computing the same next sequence would brick
+the request permanently, breaking R6's promise that the record stays readable.
+The structural defense is that the log path stays private to the module: no
+public accessor hands a caller a path it could append to directly, and creation
+goes through the same discipline.
+
+*A torn tail must be repaired before appending, not after.* An unbuffered
+`writeln!` can issue the payload and the newline as separate writes, so a crash
+can leave a line with no terminator. The reader recovers that only while it is
+the final line; the next append concatenates onto it, making it non-final and
+permanently fatal. Session logs mostly dodge this because they have one writer
+and are deleted at terminal — a request log has neither property, which is this
+design's own durability argument turned against it. Since the lock is already
+held, the fix is cheap: after acquiring, verify the file ends in a newline and
+the last line parses, and truncate a torn tail before writing.
+
+*Reads must be quiet.* The existing reader prints a warning to stderr on a
+truncated final line. A lock-free read racing a concurrent append will hit that
+legitimately, and `wait` polls every two seconds, so the request path needs a
+quiet variant rather than a stderr stream during normal operation.
+
 **What the per-request choice costs.** `requests/` is the first authoritative
 directory outside `sessions/`, so `docs/workspace-layout.md` needs amending.
-Request records do not replicate under the cloud backend; that is a documented
-limitation, not a silent gap.
+Request records do not replicate under the cloud backend, and because flock is
+host-local the store requires a local filesystem; both are documented
+limitations rather than silent gaps.
 
 ### Decision 2: The event family and its wire namespace
 
@@ -310,12 +363,35 @@ filesystem, and it is opaque so requests cannot be enumerated by guessing.
 Rejected: both are coordinator-side or spawn-time, so neither satisfies R21's
 "readable from its own session" test for a leg bound later.
 
-**Known denormalization.** The header pointer can lag or lose against the
-`request.leg_bound` event, mirroring how `assignment_claim` relates to the
-claim sidecar. A lost header write leaves a correctly-bound leg whose delegate
-reads `leg: null` — degraded capability, not corruption, and repairable from
-the event. The bind path treats the event as authoritative and the header write
-as best-effort-with-warning.
+**The pointer is a sidecar, not a header rewrite.** An earlier draft of this
+design had `bind` rewrite the child's state-file header in place. That is unsafe
+here, for a specific reason: the existing atomic header rewrite reads the whole
+file and then writes header-plus-tail to a temp and renames, with no lock. Its
+current callers all run when the child is not ticking — at claim time and during
+stale-sidecar recovery — but R18 explicitly allows binding a leg to a child that
+is already running, and a non-batch session holds no lock during `koto next`.
+Any event the child appended between that read and the rename would be lost,
+including a state transition, which would silently regress the delegate.
+
+So the leg pointer is written as its own temp-and-rename sidecar file in the
+child's session directory, following the claim sidecar's precedent, and is read
+alongside the header rather than out of it. The bind path never rewrites the
+child's own log.
+
+**A child fulfils at most one leg, and only the child side can enforce it.**
+The lock is per-request, so two binds in *different* requests targeting one
+child do not serialize at all, and the pointer is single-valued — the second
+bind would overwrite the first and the delegate would act on the wrong leg. The
+check therefore lives on the child side: refuse a bind when the child already
+carries a different request-and-leg pointer.
+
+**Known denormalization.** The sidecar can still lag or lose against the
+`request.leg_bound` event, mirroring how the claim record relates to the claim
+sidecar. A lost sidecar write leaves a correctly-bound leg whose delegate reads
+no leg — degraded capability, not corruption, and repairable from the event. The
+bind path treats the event as authoritative and the sidecar write as
+best-effort-with-warning, and releases the request lock before writing it so
+there is no lock-ordering cycle against the terminal tick.
 
 ### Decision 4: How an abandoned leg's delegate is told
 
@@ -346,8 +422,14 @@ the child's result, writes a terminal-index entry, emits `ChildCompleted`, and
 auto-cleans the session — a cascade in disguise, violating R29.
 
 So the notice goes in `directive`, the one field the skill declares
-authoritative and the only one present on every variant a running delegate can
-receive. It is applied at the two existing directive-substitution funnels,
+authoritative and the one present on every variant a running delegate can
+receive *and act on*. Two variants carry no directive at all — the terminal
+response and the error response — so a delegate that submits bad evidence gets
+an error and no notice, and learns of the abandonment on its next successful
+tick. That is a coverage gap, narrower than the blocking-condition option's but
+real, and it is the reason the mechanical envelope sibling exists rather than
+being a convenience. It is applied at the two existing directive-substitution
+funnels,
 after classification and before serialization, so the `action` table and the
 gate-derived blocking conditions are untouched. Discovery is one bounded read
 of the request record, gated on the child's header carrying a leg binding, and
@@ -392,11 +474,29 @@ told" from "told and ignored". This uses the reserved kind space for exactly
 what it was reserved for — an audit record — which is consistent with Decision
 2 declining to put *typed control-flow events* there.
 
-**Accepted weakness.** The mechanism is prose in a field, so instruction-
-following is the enforcement. The sibling field is what makes it mechanical for
-non-agent consumers. The notice is also absent on `koto next --to` responses,
-which print without the envelope splice; that path is documented as not
-carrying the notice rather than silently differing.
+**The delivery-audit event needs an explicit pseudo-state name.** Every
+existing reserved-kind audit record uses a synthetic state name rather than the
+session's real one, precisely so it can never be mistaken for template
+evidence. That convention is load-bearing here and not merely tidy: the result
+synthesizer lifts a summary and payload from the most recent evidence event
+whose state matches the final state, with no kind filter — so an audit record
+written against the delegate's *actual* state would, on a terminal tick, be
+promoted as the child's result. The delivery audit therefore writes against a
+synthetic `request_store.abandon_notice` state.
+
+**Accepted weakness.** The mechanism is prose in a field, so
+instruction-following is the enforcement, and two response variants carry no
+directive to splice into. The mechanical sibling is what covers both gaps for a
+non-agent consumer. On the directed-transition path the directive funnel does
+run, so the notice does appear there; what is missing on that path is the
+envelope sibling and the `leg` object, which is the opposite of what an earlier
+draft of this design claimed.
+
+**The per-tick read must be cheap.** Checking for abandonment on every tick of
+every bound delegate is a read of the request record, which The bounds decision sizes at
+up to four megabytes per leg. Reading tens of megabytes to learn one boolean is
+not acceptable per-tick cost, so the check short-circuits on the log's
+modification time and skips entirely once the delivery-audit marker is present.
 
 ### Decision 5: The CLI surface, the envelope, and the wait
 
@@ -449,11 +549,20 @@ left as a follow-up rather than done speculatively.
 
 **Exit statuses use only 0, 1, 2, 3.** Zero for every successful read —
 including a request with open legs — every successful write, and a satisfied
-wait. The transient class for wait timeout, an unsatisfiable predicate, an
-interrupted wait, and lock contention. The caller-error class for request or
-leg not found (matching where `workflow_not_initialized` already sits), a
-malformed identifier, an invalid submission, every rejection under R12, and a
-contract-version mismatch. The infrastructure class for persistence failures.
+wait. The transient class for wait timeout, an interrupted wait, and lock
+contention. The caller-error class for request or leg not found (matching where
+`workflow_not_initialized` already sits), a malformed identifier, an invalid
+submission, every rejection under R12, and a contract-version mismatch. The
+infrastructure class for persistence failures.
+
+**An unsatisfiable predicate is a caller error, not a transient one.** An
+earlier draft put it in the transient class, which would tell a shell loop to
+retry forever on a condition that can never become true — asking for five
+resolved legs on a three-leg request, for instance. A structurally impossible
+predicate is validated to the caller-error class before polling begins. A
+predicate that *became* impossible while waiting, because the legs it needed
+were abandoned or the request closed, gets its own caller-error code distinct
+from a timeout, so a consumer can tell "not yet" from "never".
 
 The sysexits values already in use across the crate are 64, 65, 66, and 75, so
 none of 0–3 collides. Two traps found and avoided: the existing invalid-session
@@ -503,12 +612,35 @@ permanently-skipped session with a forever-open leg. It sits before 5 because
 D11 makes the coordinator's own directive the canonical result read, so the
 request view must not lag it.
 
-**Two things the existing code forces.** All four existing terminal writes sit
-inside an `if !no_cleanup` guard, so a debugging flag would silently disable
-result promotion; steps 2–5 must be hoisted out of that guard. And the plain
-append assigns its sequence number by reading the last one with no lock, while
-the read path hard-errors on a non-consecutive sequence — so concurrent writers
-to one request log must go through the lock-guarded path.
+**There are two terminal write sites, not one.** The sequence above lives in
+the advance-loop completion path, but the identical sequence also exists on the
+`koto next --to <terminal>` directed-transition path. Adding promotion to only
+one of them would mean a directed transition to a terminal state writes the
+child's result, the index entry, and the parent event, then deletes the session
+while the leg stays open forever — exactly what ordering step 3 before step 4
+exists to prevent. That path also passes its pre-transition event list rather
+than re-reading, so a result synthesized there would be computed from a stale
+log.
+
+The fix is to extract the whole completion block into one function called from
+both sites. That also delivers the synthesize-once hoist, since the result
+synthesis is currently invoked separately on each path.
+
+**Only step 3 is hoisted out of the cleanup guard, and it is idempotent.** An
+earlier draft hoisted all four writes. That overreaches: an already-terminal
+session ticked again returns immediately from the advance loop, so under
+`--no-cleanup` the block runs on every tick — hoisting all four would append
+another child-log result, another index entry, and another parent event per
+tick, unbounded, on a deliberately parked session. It would also change what
+`--no-cleanup` means for a large number of existing tests, at least one of which
+is built specifically on a parked terminal child *not* emitting the parent
+event. So step 3 alone is hoisted, and it is gated on "this leg has no result
+yet" so a repeat tick is a silent no-op rather than a warning per tick.
+
+**Every writer takes the lock.** The plain append assigns its sequence number
+from an unlocked read of the last one, while the read path hard-errors on a
+non-consecutive sequence, so concurrent writers to one request log must go
+through the lock-guarded path — which is why the log path stays module-private.
 
 **The terminal tick never fails.** Structurally it cannot report one: the
 response envelope is printed before these writes and the block ends in a
@@ -532,6 +664,14 @@ ordering), R38 (no revision advance on the event that matters most), and R6
 
 **Chosen: keep the containers distinct, and enforce R66 by provenance rather
 than reconciliation.**
+
+**Correction on where membership comes from.** An earlier draft said both
+memberships derive from "the header the tree already holds". Leg membership does,
+via the new pointer, but batch membership does not — it lives on the
+initialization event's spawn entry, and the dashboard's cached session holds the
+header plus derived scalars, not events. Batch membership therefore needs a new
+cached field populated during the replay that already computes the current
+state, rather than being read off the header.
 
 Independent investigation confirmed the PRD's position and added three reasons
 beyond "who supplies the worker". A batch's task list is re-derived from the
@@ -558,7 +698,26 @@ result), `Skipped` maps to `resolved`, `Pending` and `Blocked` map to `open`,
 and `abandoned` has no `TaskOutcome` image at all — which is the clearest
 evidence the two enumerations should stay separate.
 
-### Decision 8: Every bound, not just the append bound
+### Decision 8: The relationship to `koto session start --needs-agent`
+
+**Chosen: the two are orthogonal and both stay supported.** R65 asks which is
+the forward path; the answer is that they do different things and neither
+replaces the other.
+
+`koto session start --needs-agent` creates a child session that wants an agent.
+That is unchanged, still supported, and still the only way a child session comes
+into existence — `koto request create` creates the request container and spawns
+nothing. `bind` is what connects an existing child to a leg.
+
+So the forward path for a fan-out is create-then-spawn-then-bind, and the
+forward path for a single delegation is exactly what it is today, with binding
+optional. A request identifier is discoverable from a child created the older
+way only once that child has been bound, through the leg-pointer sidecar; a
+child that is never bound has no request, which is precisely today's behavior.
+This is what makes R60 and R62 hold without a migration: the old path is not
+deprecated, it is just no longer the only shape.
+
+### Decision 9: Every bound, not just the append bound
 
 **Chosen: reject at the bound, on five dimensions rather than one.**
 
@@ -593,6 +752,17 @@ problem rather than merely a large string.
 The append and leg bounds are operator-tunable under the existing
 `request_store` config table, which already holds the dispatch protocol's
 tunables. The payload and rationale caps are fixed.
+
+**The name grammar is shared, not inherited from the batch validator.** It
+moves to a neutral engine module rather than being exposed from
+`batch_validation`. Exposing it there would propagate an existing dependency
+inversion — that module imports its error vocabulary from the CLI layer, so an
+engine-side request store consuming it would end up depending on CLI types —
+and would silently make the batch scheduler's reserved action words forbidden as
+leg names, which has no justification. The same applies to the temp-and-rename
+and root-creation helpers the atomic create needs: they are private to the
+session backend today, and the engine must not reach into the session layer, so
+they move to a neutral module too.
 
 **Duplicate leg names are rejected at create.** The shared name grammar
 validates one name at a time; whole-submission uniqueness is a separate rule in
@@ -644,7 +814,8 @@ that already exists rather than adding a step beside it.
 | Request store | `src/engine/request_store/mod.rs` | Layout, header type, validate-and-append primitive, read/projection |
 | Request view | `src/engine/request_store/view.rs` | Replay events into the view; derive disposition and revision |
 | Event variants | `src/engine/types.rs` | The six variants, their wire strings, `LegDeclaration`, `LegResultSource` |
-| Leg name validation | `src/engine/batch_validation.rs` | Existing name check, lifted to `pub` and reused |
+| Component-name grammar | `src/engine/name_grammar.rs` (new, neutral) | The shared 1..=64 / `[A-Za-z0-9_-]` / no-leading-hyphen check, consumed by both batch and request validation |
+| Atomic create helpers | `src/engine/atomic_fs.rs` (new, neutral) | Temp-and-rename-with-no-replace and root-directory creation, moved out of the session backend |
 | CLI noun group | `src/cli/request.rs` | The ten subcommands, envelope serialization, exit mapping |
 | Wait loop | `src/cli/request.rs` | Predicate evaluation, deadline, signal handling |
 | Promotion hook | `src/cli/mod.rs` terminal path | Step 3 of the terminal ordering |
@@ -683,12 +854,50 @@ pub struct LegView {
     pub progress: Vec<ProgressEntry>,
 }
 
+pub struct ProgressEntry {
+    pub seq: u64,                              // the event's own seq: ordering (R16)
+    pub timestamp: String,
+    pub content: BTreeMap<String, serde_json::Value>,
+    pub issued_by: Option<String>,
+}
+
 pub struct RequestView {
     pub header: RequestHeader,
     pub request_state: RequestState,           // Open | Closed
     pub close_disposition: Option<CloseDisposition>,
+    /// The request-level shared context recorded at creation (R3).
+    /// Without this the CLI would accept shared inputs and never be
+    /// able to read them back.
+    pub inputs: Option<serde_json::Value>,
     pub legs: BTreeMap<String, LegView>,       // canonical order (R75)
     pub revision: u64,                         // last event seq (R38)
+}
+
+/// One row of a listing. Field names deliberately mirror
+/// `UnassignedChild` for the concepts the two share — `requested_by`,
+/// `coordinator_of_record`, `created_at` — which is the whole of what
+/// R41's vocabulary-reuse clause asks for.
+pub struct RequestSummary {
+    pub request_id: String,
+    pub requested_by: String,
+    pub coordinator_of_record: String,
+    pub created_at: String,
+    pub request_state: RequestState,
+    pub leg_counts: LegCounts,
+}
+
+pub struct LegCounts {
+    pub total: usize,
+    pub open: usize,
+    pub resolved: usize,
+    pub abandoned: usize,
+}
+
+pub struct ListFilter {
+    pub requested_by: Option<String>,
+    pub coordinator_of_record: Option<String>,
+    pub state: Option<RequestState>,
+    pub unresolved_legs_only: bool,
 }
 
 /// The one write path. Acquires an exclusive lock on `request.lock`,
@@ -840,7 +1049,7 @@ a derived membership badge to the dashboard and no caller-supplied text, so it
 does not widen that surface. If a human-readable renderer for the request view
 is ever added, it owns its own scrubbing.
 
-**Denial of service.** Decision 8 bounds five dimensions rather than one, all
+**Denial of service.** The bounds decision covers five dimensions rather than one, all
 enforced inside the lock so none can be raced past. The two that matter most
 are the leg cap — because append cost and lock hold time grow with the record,
 so an unbounded leg count would undermine both the bounded-read promise and the

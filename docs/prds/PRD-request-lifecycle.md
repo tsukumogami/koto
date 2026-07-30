@@ -706,7 +706,7 @@ Naming what is already covered keeps the scope honest.
 | Await a delegation | Covered in part; completed here | The wake pass and `RequesterWoken` cover the single-delegation case. R36's wait operation adds a request-scoped predicate with an explicit timeout. |
 | Report a final answer | Already covered | `RequestStoreResult` carrying `WorkflowResult`, promoted on the completion tick. Newly recorded against a leg (R13, and the promotion rule in D10). |
 | Query one delegation | Partial — completed here | The discovery scan and `koto status` answer workflow-shaped questions. R33 adds the request-scoped read. |
-| List outstanding delegations | Partial — completed here | R39 and R40, as projections of the existing scan (R41). |
+| List outstanding delegations | Partial — completed here | R39 and R40, reusing the existing scan's per-entry vocabulary and adding no second cursor (R41). |
 | Post a mid-flight update | Missing — this PRD | Leg progress appends (R22–R24). |
 | Report incremental progress | Missing — this PRD | The same mechanism as a mid-flight update; no dedicated progress event (D6). |
 | Stop waiting on one delegation | Missing — this PRD | Leg-scoped and request-scoped abandonment (R26–R32). |

@@ -50,6 +50,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::engine::name_grammar::{name_regex, validate_member_name, MemberNameError};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -268,23 +269,26 @@ enum NameCheck {
     Reserved(String),
 }
 
-/// Build the R9 regex. Compiled once per call; the pattern is tiny
-/// and the submission volume (<=1000 tasks) makes caching moot.
-fn name_regex() -> Regex {
-    Regex::new(r"^[A-Za-z0-9_-]+$").expect("R9 regex is a constant and always parses")
-}
-
 /// Run the R9 checks against one name. Returns [`NameCheck::Valid`]
 /// when the name passes, or a typed rejection describing why it
 /// failed.
+///
+/// The grammar half delegates to
+/// [`crate::engine::name_grammar::validate_member_name`] so batch task
+/// names and request leg names cannot diverge; the reserved-name half is
+/// batch-specific and stays here.
 fn check_name(name: &str, name_re: &Regex) -> NameCheck {
-    // Length band is checked first so an empty string reports
-    // `LengthOutOfRange(0)` instead of `RegexMismatch`.
-    if name.is_empty() || name.len() > 64 {
-        return NameCheck::Invalid(InvalidNameDetail::LengthOutOfRange(name.len()));
-    }
-    if !name_re.is_match(name) {
-        return NameCheck::Invalid(InvalidNameDetail::RegexMismatch);
+    match validate_member_name(name, name_re) {
+        Err(MemberNameError::LengthOutOfRange(n)) => {
+            return NameCheck::Invalid(InvalidNameDetail::LengthOutOfRange(n));
+        }
+        // A leading hyphen is a pattern-level rejection from the batch's
+        // point of view: R9 has no separate detail for it, and the name
+        // is genuinely not one R9 admits.
+        Err(MemberNameError::RegexMismatch) | Err(MemberNameError::LeadingHyphen) => {
+            return NameCheck::Invalid(InvalidNameDetail::RegexMismatch);
+        }
+        Ok(()) => {}
     }
     if RESERVED_NAMES.contains(&name) {
         return NameCheck::Reserved(name.to_string());

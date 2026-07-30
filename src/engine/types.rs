@@ -699,10 +699,20 @@ pub enum EventPayload {
     /// This event is authoritative for the binding; the mirrored
     /// pointer on the child's own header is a best-effort denormalization
     /// and is repairable from here.
+    ///
+    /// `dispatch_epoch` is captured from the child's header at bind time
+    /// and is what the leg's mutating paths fence against. Recording it
+    /// here rather than re-reading the child's header is deliberate: the
+    /// child's session is deleted on its terminal tick while this record
+    /// outlives it, so a header-based fence would go blind during exactly
+    /// the window a displaced agent may still be running. `None` only for
+    /// a child whose header carries no epoch, which `bind` rejects.
     RequestLegBound {
         request_id: String,
         leg_name: String,
         child_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatch_epoch: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         issued_by: Option<String>,
     },
@@ -1257,6 +1267,7 @@ impl<'de> Deserialize<'de> for Event {
                     request_id: p.request_id,
                     leg_name: p.leg_name,
                     child_session_id: p.child_session_id,
+                    dispatch_epoch: p.dispatch_epoch,
                     issued_by: p.issued_by,
                 }
             }
@@ -1472,6 +1483,8 @@ struct RequestLegBoundPayload {
     request_id: String,
     leg_name: String,
     child_session_id: String,
+    #[serde(default)]
+    dispatch_epoch: Option<u32>,
     #[serde(default)]
     issued_by: Option<String>,
 }
@@ -3055,6 +3068,7 @@ mod tests {
                     request_id: "r1".to_string(),
                     leg_name: "reviewer-a".to_string(),
                     child_session_id: "child-1".to_string(),
+                    dispatch_epoch: Some(0),
                     issued_by: None,
                 },
                 "request.leg_bound",
@@ -3271,6 +3285,7 @@ mod tests {
                 request_id: "r1".to_string(),
                 leg_name: "reviewer-a".to_string(),
                 child_session_id: "parent.reviewer-a".to_string(),
+                dispatch_epoch: Some(2),
                 issued_by: Some("coord".to_string()),
             },
         );
@@ -3278,10 +3293,12 @@ mod tests {
         match back.payload {
             EventPayload::RequestLegBound {
                 child_session_id,
+                dispatch_epoch,
                 issued_by,
                 ..
             } => {
                 assert_eq!(child_session_id, "parent.reviewer-a");
+                assert_eq!(dispatch_epoch, Some(2));
                 assert_eq!(issued_by.as_deref(), Some("coord"));
             }
             other => panic!("expected RequestLegBound, got {:?}", other),

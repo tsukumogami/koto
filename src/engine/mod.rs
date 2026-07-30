@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod epoch;
 pub mod errors;
 pub mod evidence;
+pub mod name_grammar;
 pub mod path_resolution;
 pub mod persistence;
 #[cfg(unix)]
