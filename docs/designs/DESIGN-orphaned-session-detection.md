@@ -19,6 +19,51 @@ problem: |
   the new signal lives, what it's named (given `koto workflows --orphaned`
   already means something unrelated), and how it behaves across the
   already-shipped local vs. cloud-sync backends.
+decision: |
+  Extract the existence/staleness check into one shared core --
+  `TemplateSourceStatus { path, exists, machine_id }` plus
+  `check_template_source_path`/`check_template_source_dir` in a new
+  `src/engine/template_source_status.rs` -- and refactor both existing
+  `StaleTemplateSourceDir` construction sites (`path_resolution.rs`'s
+  per-task resolver and `batch.rs`'s per-tick warning emitter) to build
+  from it, alongside three new consumers: `SessionInfo` gains an additive
+  `Option<TemplateSourceStatus>` field populated by `LocalBackend::list()`
+  (left `None` for `CloudBackend`'s remote-only placeholder rows), `koto
+  status` adds a conditional `stale_template_source_dir` JSON key, and
+  `koto init`'s two "already exists" collision paths each open the
+  colliding session's header and append the same staleness clause.
+  Message wording branches on `Backend::is_cloud()` to soften language for
+  cloud-synced sessions without suppressing or altering the underlying
+  check. No new CLI flag is introduced anywhere, and the word "orphan" is
+  never used in any new field or flag name, avoiding collision with the
+  existing `koto workflows --orphaned` flag and the scheduler's unrelated
+  `OrphanCandidate` concept by construction. An automatic sweep/gc/cleanup
+  of orphaned sessions (the source issue's third candidate direction)
+  remains explicitly out of scope.
+rationale: |
+  A shared core beats both direct reuse of the scheduler's existing
+  `SchedulerWarning::StaleTemplateSourceDir` enum (which would let future
+  scheduler-only fields leak into non-scheduler output by default) and
+  independent per-call-site booleans (which collapsed into the same field
+  set once `machine_id` was correctly included, just hand-duplicated with
+  no drift protection) -- three independent validators converged on this
+  after cross-examining each other's claims against the actual source.
+  Backend-aware wording, not suppression, is the right posture for
+  cross-machine cloud-sync false positives because no cheap, reliable
+  per-session signal exists today to prove "deleted" versus "resumed
+  elsewhere" -- the scheduler's own `machine_id` field turned out to be an
+  observational label, not a stored comparison, once verified directly
+  against the code. A bare `Path::exists()` check is accepted as
+  sufficient because this design is read-only/informational throughout;
+  the failure modes a stronger check would catch (directory reuse,
+  transient remounts) only matter for destructive action, which stays out
+  of scope. Phase 6 review caught a second scheduler construction site
+  this design would otherwise have missed (`batch.rs`), a factual error in
+  an earlier draft's collision-message-identity claim, and a stat-latency
+  availability risk from computing the check on every `list()` call
+  rather than once per scheduler tick -- all three are corrected or
+  documented in the final design rather than left to surface during
+  implementation.
 ---
 
 # DESIGN: Orphaned Session Detection
@@ -657,8 +702,9 @@ Deliverables:
 
 Update both collision paths (pre-check and `SpawnErrorKind::Collision`
 handler) to open the colliding session's header, run the shared check, and
-append the staleness clause to both, preserving their existing
-byte-identical guarantee.
+append the same staleness clause to both -- see the Implicit Decision above
+for why both paths need it despite their base messages not being
+byte-identical today.
 
 Deliverables:
 - `src/cli/mod.rs` collision-path changes (both sites)
