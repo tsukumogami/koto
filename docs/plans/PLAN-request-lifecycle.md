@@ -1,6 +1,6 @@
 ---
 schema: plan/v1
-status: Draft
+status: Active
 execution_mode: single-pr
 upstream: docs/designs/DESIGN-request-lifecycle.md
 milestone: "Request leg-and-result lifecycle"
@@ -11,7 +11,7 @@ issue_count: 15
 
 ## Status
 
-Draft
+Active
 
 Decomposes `docs/designs/DESIGN-request-lifecycle.md` into fifteen atomic
 issues driven on one branch and shipped as one pull request alongside the
@@ -72,14 +72,14 @@ dependency order on one branch.
 moving the schema version.
 
 **Acceptance Criteria**:
-- [ ] Six variants exist with wire strings `request.created`, `request.leg_bound`, `request.leg_progress`, `request.leg_result`, `request.leg_abandoned`, `request.closed`.
-- [ ] Every variant carries `request_id`; the four leg variants also carry `leg_name`.
-- [ ] `RequestCreated` carries `legs: BTreeMap<String, LegDeclaration>` and optional shared `inputs`.
-- [ ] `RequestLegResult` carries a `WorkflowResult` and a `LegResultSource` recording whether it was promoted or explicit.
-- [ ] A round-trip test serializes and deserializes each variant unchanged.
-- [ ] A test asserts an unrecognized `request.*` type string deserializes to `Unknown` rather than erroring.
-- [ ] A test asserts `CURRENT_SCHEMA_VERSION` is still 1.
-- [ ] No existing variant's serialization changes; existing tests pass untouched.
+- [x] Six variants exist with wire strings `request.created`, `request.leg_bound`, `request.leg_progress`, `request.leg_result`, `request.leg_abandoned`, `request.closed`.
+- [x] Every variant carries `request_id`; the four leg variants also carry `leg_name`.
+- [x] `RequestCreated` carries `legs: BTreeMap<String, LegDeclaration>` and optional shared `inputs`.
+- [x] `RequestLegResult` carries a `WorkflowResult` and a `LegResultSource` recording whether it was promoted or explicit.
+- [x] A round-trip test serializes and deserializes each variant unchanged.
+- [x] A test asserts an unrecognized `request.*` type string deserializes to `Unknown` rather than erroring.
+- [x] A test asserts `CURRENT_SCHEMA_VERSION` is still 1.
+- [x] No existing variant's serialization changes; existing tests pass untouched.
 
 **Dependencies**: None
 **Complexity**: testable
@@ -93,12 +93,12 @@ task names and request leg names cannot diverge, without the request store
 inheriting batch semantics or CLI types.
 
 **Acceptance Criteria**:
-- [ ] A new `src/engine/name_grammar.rs` owns the length band, the character class, and a leading-hyphen rejection.
-- [ ] It depends on nothing but `regex` — in particular not on the CLI error vocabulary the batch validator imports, so an engine-side consumer does not acquire a dependency on CLI types.
-- [ ] The batch validator delegates its grammar half to it and keeps its own reserved-name rule, so leg names do not inherit the batch scheduler's reserved action words.
-- [ ] A doc comment states the grammar is security-relevant because a member name can become a path component.
-- [ ] Tests reject every traversal shape (`..`, `.`, `a/b`, absolute, backslash, NUL, dot, space, colon, non-ASCII, a bidi override) and every leading-hyphen shape.
-- [ ] No behavior change for batch; existing batch validation tests pass.
+- [x] A new `src/engine/name_grammar.rs` owns the length band, the character class, and a leading-hyphen rejection.
+- [x] It depends on nothing but `regex` — in particular not on the CLI error vocabulary the batch validator imports, so an engine-side consumer does not acquire a dependency on CLI types.
+- [x] The batch validator delegates its grammar half to it and keeps its own reserved-name rule, so leg names do not inherit the batch scheduler's reserved action words.
+- [x] A doc comment states the grammar is security-relevant because a member name can become a path component.
+- [x] Tests reject every traversal shape (`..`, `.`, `a/b`, absolute, backslash, NUL, dot, space, colon, non-ASCII, a bidi override) and every leading-hyphen shape.
+- [x] No behavior change for batch; existing batch validation tests pass.
 
 **Dependencies**: None
 **Complexity**: simple
