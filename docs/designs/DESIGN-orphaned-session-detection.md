@@ -683,7 +683,12 @@ directly opening the raw state JSONL, which is the documented status quo
 workaround this design replaces. Because the read is keyed to the single
 colliding name (not an enumeration), it is also not a viable
 denial-of-service amplification vector: cost is O(1) per `koto init` call,
-same class as existing header reads in `koto status`/`session list`.
+same class as existing header reads in `koto status`/`session list`. (The
+`0o700` permission on `~/.koto` is applied by `ensure_koto_root` only at
+first creation, not re-enforced on every call -- this trust-boundary claim
+is guaranteed for fresh installs and merely assumed, not verified, for
+directories that predate this behavior or were manually re-permissioned;
+not a risk this design introduces, but worth naming precisely.)
 
 **Surfaced values are not new disclosures.** Both `template_source_dir`
 (a local path) and `machine_id` (a non-secret value from `/etc/machine-id`
