@@ -2,9 +2,16 @@
 
 ## Chosen Type
 
-Design Doc (scoped as a small addendum extending the existing
-`docs/designs/current/DESIGN-batch-child-spawning.md`, not a freestanding
-new document -- see Rationale)
+Design Doc: a new, focused document at `docs/designs/DESIGN-orphaned-session-detection.md`
+(following koto's convention of `docs/designs/DESIGN-<topic>.md` for Proposed
+docs, promoted to `docs/designs/current/` once accepted) that explicitly
+cites Decision 14 of `docs/designs/current/DESIGN-batch-child-spawning.md`
+as prior art/dependency rather than re-deriving it. A standalone doc, not an
+addendum inside the existing 4400-line batch-spawning doc, because this
+fix's scope (`koto init`/`status`/`session list`) is a session-lifecycle
+concern, not a batch-scheduling concern, and a future reader looking for
+"why does `session list` show a staleness flag" would not think to look
+inside a doc titled batch child spawning.
 
 ## Rationale
 
@@ -41,15 +48,15 @@ shape/`machine_id` vocabulary, reject the `--orphaned` name for this signal)
 that need to be preserved somewhere durable -- `wip/` is cleaned before
 merge, so these choices are lost unless written into a committed doc.
 
-The doc should take the form of an addendum to the existing
-DESIGN-batch-child-spawning.md (a new Decision entry, following that doc's
-own pattern) rather than a new standalone design doc, because the
-load-bearing precedent -- `template_source_dir`, `StaleTemplateSourceDir`,
-`current_machine_id()` -- already lives there, and a fresh document would
-have to re-derive context that document already owns. This keeps the
-project's own convention (Decision 14 already anticipated exactly this kind
-of follow-on work in its Non-goals section) rather than fragmenting related
-decisions across multiple documents.
+The doc should be a new, focused document rather than an addendum folded
+into the existing DESIGN-batch-child-spawning.md: that doc's scope is batch
+child spawning specifically, while this fix touches session-lifecycle
+surfaces (`init`, `status`, `session list`) that have nothing to do with
+batch scheduling. The new doc should explicitly cite Decision 14's
+`template_source_dir`/`StaleTemplateSourceDir`/`current_machine_id()`
+vocabulary as prior art to build on -- Decision 14 already anticipated this
+kind of follow-on work in its Non-goals section -- without re-deriving that
+context or fragmenting it silently into an unrelated document.
 
 ## Signal Evidence
 
