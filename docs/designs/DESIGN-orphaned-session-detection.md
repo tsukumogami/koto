@@ -417,3 +417,246 @@ which is the concrete bug this design exists to fix. The `CloudBackend`
 "no header available to check") is inherited and left unresolved by
 design; it should be documented as a known limitation via a doc comment on
 the field, not silently papered over.
+
+## Solution Architecture
+
+### Overview
+
+One new, small module owns the fact this design is about: whether a
+session's recorded `template_source_dir` still resolves, and on whose
+machine. Everything else -- the batch scheduler's existing warning, and the
+three new call sites -- consumes that one computation rather than
+recomputing or reinventing it.
+
+### Components
+
+- **`src/engine/template_source_status.rs`** (new file): defines
+  `TemplateSourceStatus { path: PathBuf, exists: bool, machine_id:
+  Option<String> }` and `fn check_template_source_dir(header:
+  &StateFileHeader) -> Option<TemplateSourceStatus>`. Placed as its own
+  module rather than folded into `persistence.rs` (owns serialization, not
+  policy) or `path_resolution.rs` (owns the scheduler's fallback-resolution
+  policy specifically, which this check is not part of) -- both the
+  scheduler and the three new call sites depend on this module without
+  depending on each other.
+- **`src/engine/scheduler_warning.rs`** (existing, modified): `SchedulerWarning::StaleTemplateSourceDir`'s
+  constructor now calls `check_template_source_dir` internally rather than
+  computing `Path::exists()`/`current_machine_id()` inline, converting
+  `TemplateSourceStatus.path: PathBuf` to its own `path: String` field and
+  attaching `falling_back_to` at that single call site. The variant's
+  public shape and `#[serde(tag = "kind")]` output are unchanged.
+- **`src/engine/path_resolution.rs`** (existing, modified): the resolver
+  that currently computes staleness inline now calls the new module's
+  helper and passes the result to `scheduler_warning`'s constructor,
+  instead of computing `Path::exists()` itself.
+- **`src/session/mod.rs`** (existing, modified): `SessionInfo` gains `pub
+  template_source_status: Option<TemplateSourceStatus>`.
+- **`src/session/local.rs`** (existing, modified): `LocalBackend::list()`
+  populates the new field from the header it already holds in memory
+  (calls `check_template_source_dir` once per session, same cost class as
+  today's existing header read).
+- **`src/session/cloud.rs`** (existing, modified): `CloudBackend::list()`
+  leaves the new field `None` for remote-only placeholder rows (no header
+  available, no new sync round-trip); for rows whose header has already
+  been pulled locally via `sync_pull_state`, behaves like `LocalBackend`.
+  Message formatting (see below) additionally checks `Backend::is_cloud()`
+  to select wording.
+- **`src/cli/mod.rs`** (existing, modified): `handle_status` calls
+  `check_template_source_dir` on the header it already has and adds a
+  conditional `stale_template_source_dir` JSON key when `exists == false`.
+  `koto init`'s collision paths (both the pre-check at line ~1682 and the
+  `SpawnErrorKind::Collision` handler at line ~1707) each open the
+  colliding session's header and append the same staleness clause when
+  stale -- see Implicit Decision below for why both, not just one.
+- **`src/cli/session.rs`** (existing, modified): `handle_list` reads
+  `template_source_status` off each `SessionInfo` row (already populated by
+  the backend) and includes it in the JSON output; no new I/O at this
+  layer.
+
+### Key Interfaces
+
+```rust
+// src/engine/template_source_status.rs (new)
+pub struct TemplateSourceStatus {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub machine_id: Option<String>,
+}
+
+pub fn check_template_source_dir(
+    header: &StateFileHeader,
+) -> Option<TemplateSourceStatus> {
+    let path = header.template_source_dir.clone()?;
+    let exists = path.exists();
+    Some(TemplateSourceStatus { path, exists, machine_id: current_machine_id() })
+}
+```
+
+`SessionInfo` (`src/session/mod.rs`):
+```rust
+pub struct SessionInfo {
+    // existing fields: id, created_at, template_hash, parent_workflow
+    pub template_source_status: Option<TemplateSourceStatus>, // new, additive
+}
+```
+
+Wire shape addition on `koto status` (only present when stale):
+```json
+{
+  "stale_template_source_dir": {
+    "path": "/home/user/repo-that-was-deleted",
+    "machine_id": "host-a",
+    "note": "template source directory not found (if this session was synced from another machine, this may be expected)"
+  }
+}
+```
+The `note` field's wording branches on `Backend::is_cloud()` per Decision 2
+(softened for cloud-backed sessions, direct for local ones); the `kind`
+discriminator and other field names follow the existing
+`stale_template_source_dir` vocabulary from `scheduler_warning.rs` for
+cross-surface consistency.
+
+### Data Flow
+
+1. `koto init`/child-spawn writes `template_source_dir` into
+   `StateFileHeader` at session creation (unchanged, existing behavior).
+2. At read time (`koto status`, `koto init`'s collision check, `koto
+   session list`, and the batch scheduler's per-tick resolution), the
+   relevant header is loaded through the existing shared parser
+   (`persistence::parse_header`), then passed to
+   `check_template_source_dir`.
+3. The resulting `Option<TemplateSourceStatus>` is either projected
+   directly into a JSON response field (`status`, `list`) or converted into
+   the scheduler's existing `StaleTemplateSourceDir` variant (batch path
+   resolution only).
+4. Message wording for the three new surfaces branches on the session's
+   `Backend` variant at formatting time -- a pure function of already-known
+   data, no extra I/O.
+
+### Implicit Decision: both `koto init` collision paths get the staleness clause
+
+The existing code deliberately keeps the pre-check's error text
+(`src/cli/mod.rs:1682-1691`) and the atomic `SpawnErrorKind::Collision`
+handler's error text (`src/cli/mod.rs:1707-1716`) byte-identical -- the
+comment at the collision handler explicitly says this is "so callers can
+rely on a stable 'already exists' string regardless of which detector
+fired." Adding the staleness clause to only one of the two paths would
+silently break that invariant (a caller could get a diagnosable message or
+a generic one depending on race timing, for the same underlying
+condition). This design adds the same clause, built from the same shared
+helper call, to both paths -- preserving the existing byte-identical
+guarantee rather than introducing a new asymmetry. This is recorded here
+as an implicit decision (no viable alternative was seriously considered
+once the existing invariant was noticed) rather than a full Considered
+Options entry, per the design skill's guidance for architecture-stage
+decisions with an obvious, low-controversy answer; no interactive user was
+available to confirm it (`--auto` mode), so it's recorded as assumed.
+
+## Implementation Approach
+
+### Phase 1: Shared status module
+
+Add `src/engine/template_source_status.rs` with `TemplateSourceStatus` and
+`check_template_source_dir`. No behavior change yet -- this phase only
+introduces the type and function in isolation, unit-tested directly against
+constructed `StateFileHeader` values (present/absent `template_source_dir`,
+existing/missing directory).
+
+Deliverables:
+- `src/engine/template_source_status.rs` (new)
+- Unit tests for `check_template_source_dir`
+
+### Phase 2: Refactor the scheduler to consume the shared module
+
+Update `src/engine/path_resolution.rs` and `src/engine/scheduler_warning.rs`
+so `StaleTemplateSourceDir`'s construction routes through
+`check_template_source_dir` instead of computing `Path::exists()`/
+`current_machine_id()` inline. No wire-format change; existing tests
+(`stale_base_emits_warning_with_machine_id_and_fallback` and neighbors)
+must keep passing unchanged -- they are the regression guard for this
+refactor.
+
+Deliverables:
+- Refactored `path_resolution.rs` construction site
+- Existing scheduler tests passing unmodified
+
+### Phase 3: `SessionInfo` and both `list()` backends
+
+Add `template_source_status` to `SessionInfo`. Populate it in
+`LocalBackend::list()` from the in-memory header. Leave it `None` in
+`CloudBackend::list()`'s remote-only placeholder rows; populate it
+normally for rows whose header has already synced locally.
+
+Deliverables:
+- `src/session/mod.rs` struct change
+- `src/session/local.rs` populated field
+- `src/session/cloud.rs` placeholder-row handling
+- Doc comment on the new field noting the `CloudBackend` `None`-means-two-things
+  limitation (no recorded dir vs. no header available)
+
+### Phase 4: `koto status` and `koto session list` output
+
+Wire `handle_status` to add the conditional `stale_template_source_dir`
+JSON key. Wire `handle_list` to surface `template_source_status` from each
+`SessionInfo` row. Implement backend-aware wording (Decision 2) as a small
+formatting function consulted by both.
+
+Deliverables:
+- `handle_status` change (`src/cli/mod.rs`)
+- `handle_list` change (`src/cli/session.rs`)
+- Shared wording-formatting helper
+
+### Phase 5: `koto init` collision messaging
+
+Update both collision paths (pre-check and `SpawnErrorKind::Collision`
+handler) to open the colliding session's header, run the shared check, and
+append the staleness clause to both, preserving their existing
+byte-identical guarantee.
+
+Deliverables:
+- `src/cli/mod.rs` collision-path changes (both sites)
+- Test confirming both paths produce the same staleness clause for the
+  same underlying condition
+
+## Consequences
+
+### Positive
+- Fixes the concrete bug in tsukumogami/koto#189: a same-named `koto init`
+  colliding with a dead session now gets a diagnosable message instead of
+  a generic "already exists" error.
+- `koto session list` gains passive staleness visibility with no new
+  network cost, letting operators discover garbaged sessions without
+  hitting the collision case at all.
+- No new CLI flags, no new "orphan"-named surface -- avoids the
+  `koto workflows --orphaned` and scheduler `OrphanCandidate` naming
+  collisions by construction rather than by careful wording alone.
+- The batch scheduler's existing, tested behavior is preserved exactly
+  (same wire format, same test suite passing unmodified) while sharing its
+  core logic with the new surfaces -- one computation, not four.
+
+### Negative
+- `koto init`'s collision pre-check gains I/O it doesn't have today (a
+  header read on the colliding session), a real behavior change to a path
+  that was previously a zero-read filesystem check.
+- `CloudBackend`'s `None` on the new field is ambiguous between "no
+  `template_source_dir` was ever recorded" and "no header available to
+  check" -- a real limitation, not fully resolved by this design.
+- Backend-aware wording only *softens* language for cloud sessions; it
+  cannot actually distinguish a torn-down cloud-synced session from a
+  genuinely deleted local one, because no cheap, reliable per-session
+  signal for that distinction exists today.
+
+### Mitigations
+- The new I/O in `koto init`'s collision path is bounded (one header read,
+  only on the already-slow-path collision case, not the common
+  non-colliding case) and documented explicitly in this design rather than
+  discovered later as a surprise.
+- The `CloudBackend` ambiguity is documented via a doc comment on the new
+  field at implementation time, and flagged here as a known limitation for
+  a future design to resolve (e.g. distinguishing the two `None` cases with
+  a tri-state enum) rather than silently accepted.
+- The wording-only limitation is itself the reason Decision 2 rejected a
+  stronger, certainty-claiming alternative (a new persisted
+  creator-machine-id) as a separately-scoped, larger change -- this design
+  explicitly does not claim more confidence than the underlying check
+  supports.
