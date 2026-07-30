@@ -18,6 +18,14 @@ DESIGN-batch-child-spawning.md), scoped only to the batch scheduler.
 - Must account for the shipped `CloudBackend`/cloud-sync cross-machine
   resume workflow as the primary legitimate false-positive source.
 
+## Security Review (Phase 5)
+**Outcome:** Option 2 (document considerations)
+**Summary:** No security-relevant risk found that requires changing the
+design. The new I/O (`koto init` opening a colliding session's header) and
+new output fields (a local path, `machine_id`) stay within koto's existing
+single-user, local-filesystem trust boundary and existing disclosure
+precedent (`StaleTemplateSourceDir`).
+
 ## Current Status
-**Phase:** 0 - Setup (Explore Handoff)
+**Phase:** 5 - Security (complete)
 **Last Updated:** 2026-07-29

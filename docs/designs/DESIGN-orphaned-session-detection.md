@@ -618,6 +618,46 @@ Deliverables:
 - Test confirming both paths produce the same staleness clause for the
   same underlying condition
 
+## Security Considerations
+
+This design introduces no new external inputs, dependencies, or network
+surfaces -- it only reads local session state that koto itself already
+wrote, and formats already-stored values (a path, a machine identifier)
+into CLI/JSON output at three additional call sites.
+
+**New I/O is bounded and same-trust-boundary.** `koto init`'s collision
+path now opens the colliding session's header (previously a pure
+existence check). Both the checking process and the checked session live
+under the same OS user's `~/.koto/sessions/` tree, which is
+`0o700`/`0o600`-permissioned (`src/session/local.rs`); this read does not
+cross any privilege or user boundary that wasn't already crossable by
+directly opening the raw state JSONL, which is the documented status quo
+workaround this design replaces. Because the read is keyed to the single
+colliding name (not an enumeration), it is also not a viable
+denial-of-service amplification vector: cost is O(1) per `koto init` call,
+same class as existing header reads in `koto status`/`session list`.
+
+**Surfaced values are not new disclosures.** Both `template_source_dir`
+(a local path) and `machine_id` (a non-secret value from `/etc/machine-id`
+or the `HOSTNAME` env var, via the existing `current_machine_id()`) are
+already stored in the session header or already exposed via
+`SchedulerWarning::StaleTemplateSourceDir`. This design broadens *where*
+those values surface (three more CLI commands); it does not broaden *who*
+can see them, since koto is a single-user local tool with no cross-user or
+network session-store access. The doc comment already planned for the
+`SessionInfo.template_source_status` field's `CloudBackend`
+None-means-two-things ambiguity (see Consequences/Mitigations) is the
+right place to also note that this field surfaces a locally-recorded path
+and should not be treated as safe to forward verbatim into any future
+shared/multi-user or telemetry surface without re-evaluating this
+single-user assumption.
+
+**The `Path::exists()` check is read-only and gates messages, not
+actions,** so no TOCTOU mitigation is required for this design's scope; if
+a future Direction 3 (destructive sweep/gc) is built on top of this
+signal, that design will need to revisit staleness-check robustness
+(fingerprinting, not just existence) as it already anticipates.
+
 ## Consequences
 
 ### Positive
