@@ -432,23 +432,45 @@ recomputing or reinventing it.
 
 - **`src/engine/template_source_status.rs`** (new file): defines
   `TemplateSourceStatus { path: PathBuf, exists: bool, machine_id:
-  Option<String> }` and `fn check_template_source_dir(header:
-  &StateFileHeader) -> Option<TemplateSourceStatus>`. Placed as its own
-  module rather than folded into `persistence.rs` (owns serialization, not
-  policy) or `path_resolution.rs` (owns the scheduler's fallback-resolution
-  policy specifically, which this check is not part of) -- both the
-  scheduler and the three new call sites depend on this module without
-  depending on each other.
+  Option<String> }` plus two functions -- a core `fn
+  check_template_source_path(path: Option<&Path>) ->
+  Option<TemplateSourceStatus>` and a thin wrapper `fn
+  check_template_source_dir(header: &StateFileHeader) ->
+  Option<TemplateSourceStatus>` that extracts `header.template_source_dir`
+  and delegates to the core. The core takes `Option<&Path>`, not a header,
+  because **there are two existing scheduler call sites, not one** (see
+  below), and one of them has no header in scope at its call site --
+  discovered during Phase 6 architecture review, corrected here before this
+  was two functions maintained in parallel instead of one. Placed as its
+  own module rather than folded into `persistence.rs` (owns serialization,
+  not policy) or `path_resolution.rs` (owns the per-task resolver's
+  fallback policy specifically, which this check is not part of) -- all
+  consumers depend on this module without depending on each other.
 - **`src/engine/scheduler_warning.rs`** (existing, modified): `SchedulerWarning::StaleTemplateSourceDir`'s
-  constructor now calls `check_template_source_dir` internally rather than
-  computing `Path::exists()`/`current_machine_id()` inline, converting
-  `TemplateSourceStatus.path: PathBuf` to its own `path: String` field and
-  attaching `falling_back_to` at that single call site. The variant's
+  constructor now accepts a `TemplateSourceStatus` (or is built from one)
+  rather than computing `Path::exists()`/`current_machine_id()` inline,
+  converting `TemplateSourceStatus.path: PathBuf` to its own `path: String`
+  field and attaching `falling_back_to` at each call site. The variant's
   public shape and `#[serde(tag = "kind")]` output are unchanged.
-- **`src/engine/path_resolution.rs`** (existing, modified): the resolver
-  that currently computes staleness inline now calls the new module's
-  helper and passes the result to `scheduler_warning`'s constructor,
-  instead of computing `Path::exists()` itself.
+- **`src/engine/path_resolution.rs`** (existing, modified): the per-task
+  resolver that currently computes staleness inline now calls
+  `check_template_source_path` and passes the result to
+  `scheduler_warning`'s constructor, instead of computing `Path::exists()`
+  itself.
+- **`src/cli/batch.rs`** (existing, modified): `emit_template_source_dir_warnings`
+  (`~line 1774`), the *second* existing construction site for
+  `StaleTemplateSourceDir` -- called once per scheduler tick from `~line
+  882`, independently of `path_resolution.rs`'s per-task resolver -- today
+  computes its own `Path::exists()` at `~line 875-876`
+  (`template_source_dir_exists`) and calls `current_machine_id()` itself.
+  This site has `Option<&Path>` and a pre-computed bool in hand, not a
+  `StateFileHeader`, which is exactly why the shared core takes
+  `Option<&Path>` rather than a header: this call site switches to calling
+  `check_template_source_path` directly (skipping the header-accepting
+  wrapper), closing the gap the rest of this design would otherwise have
+  left open -- without this change, `batch.rs` would keep hand-rolling the
+  same fact after the refactor lands, undercutting the "one computation,
+  not four (now five)" goal.
 - **`src/session/mod.rs`** (existing, modified): `SessionInfo` gains `pub
   template_source_status: Option<TemplateSourceStatus>`.
 - **`src/session/local.rs`** (existing, modified): `LocalBackend::list()`
@@ -483,12 +505,21 @@ pub struct TemplateSourceStatus {
     pub machine_id: Option<String>,
 }
 
+// Core: used directly by src/cli/batch.rs (no header in scope there).
+pub fn check_template_source_path(
+    path: Option<&Path>,
+) -> Option<TemplateSourceStatus> {
+    let path = path?.to_path_buf();
+    let exists = path.exists();
+    Some(TemplateSourceStatus { path, exists, machine_id: current_machine_id() })
+}
+
+// Wrapper: used by path_resolution.rs and the three new call sites,
+// which have a StateFileHeader in hand.
 pub fn check_template_source_dir(
     header: &StateFileHeader,
 ) -> Option<TemplateSourceStatus> {
-    let path = header.template_source_dir.clone()?;
-    let exists = path.exists();
-    Some(TemplateSourceStatus { path, exists, machine_id: current_machine_id() })
+    check_template_source_path(header.template_source_dir.as_deref())
 }
 ```
 
@@ -535,22 +566,35 @@ cross-surface consistency.
 
 ### Implicit Decision: both `koto init` collision paths get the staleness clause
 
-The existing code deliberately keeps the pre-check's error text
-(`src/cli/mod.rs:1682-1691`) and the atomic `SpawnErrorKind::Collision`
-handler's error text (`src/cli/mod.rs:1707-1716`) byte-identical -- the
-comment at the collision handler explicitly says this is "so callers can
-rely on a stable 'already exists' string regardless of which detector
-fired." Adding the staleness clause to only one of the two paths would
-silently break that invariant (a caller could get a diagnosable message or
-a generic one depending on race timing, for the same underlying
-condition). This design adds the same clause, built from the same shared
-helper call, to both paths -- preserving the existing byte-identical
-guarantee rather than introducing a new asymmetry. This is recorded here
-as an implicit decision (no viable alternative was seriously considered
-once the existing invariant was noticed) rather than a full Considered
-Options entry, per the design skill's guidance for architecture-stage
-decisions with an obvious, low-controversy answer; no interactive user was
-available to confirm it (`--auto` mode), so it's recorded as assumed.
+**Correction from Phase 6 review:** an earlier draft of this section
+claimed the pre-check's error text (`src/cli/mod.rs:1682-1691`) and the
+atomic `SpawnErrorKind::Collision` handler's error text
+(`src/cli/mod.rs:1707-1716`) are byte-identical today. They are not: the
+pre-check's message includes cleanup guidance ("run `koto session cleanup
+{}` to reuse the name, or `koto cancel --cleanup {}` to stop a running
+workflow first") that the collision handler's shorter message
+(`"workflow '{}' already exists"`) lacks. The collision handler's own
+comment states the intent is to keep callers able to "rely on a stable
+'already exists' string regardless of which detector fired" -- that intent
+holds for the shared `"workflow '{}' already exists"` prefix both messages
+contain, but the full strings diverge today; this design's earlier framing
+overstated the existing guarantee.
+
+That correction doesn't change this design's conclusion, only its
+reasoning: both paths should still get the staleness clause, for the
+reason the original comment gives (this design should not introduce a
+*new* inconsistency where the same underlying condition is diagnosable via
+one detector but not the other, race-timing-dependent). Concretely: both
+messages append the same staleness clause, built from the same shared
+helper call, on top of whichever base message each path already emits --
+this design does not need to (and does not) unify the two base messages
+themselves, only ensure the new clause isn't selectively present on one. This
+is recorded here as an implicit decision (no viable alternative was
+seriously considered once the existing pattern was examined) rather than a
+full Considered Options entry, per the design skill's guidance for
+architecture-stage decisions with an obvious, low-controversy answer; no
+interactive user was available to confirm it (`--auto` mode), so it's
+recorded as assumed.
 
 ## Implementation Approach
 
@@ -566,19 +610,23 @@ Deliverables:
 - `src/engine/template_source_status.rs` (new)
 - Unit tests for `check_template_source_dir`
 
-### Phase 2: Refactor the scheduler to consume the shared module
+### Phase 2: Refactor both scheduler construction sites to consume the shared module
 
-Update `src/engine/path_resolution.rs` and `src/engine/scheduler_warning.rs`
-so `StaleTemplateSourceDir`'s construction routes through
-`check_template_source_dir` instead of computing `Path::exists()`/
-`current_machine_id()` inline. No wire-format change; existing tests
+There are two existing places that construct `StaleTemplateSourceDir`, and
+both must move to the shared core in this phase, not just one: the
+per-task resolver in `src/engine/path_resolution.rs` (uses the header-
+accepting wrapper), and the per-tick `emit_template_source_dir_warnings` in
+`src/cli/batch.rs` (~line 1774, called from ~line 882 -- uses the core
+`check_template_source_path` directly, since it only has `Option<&Path>` in
+scope, not a header). No wire-format change at either site; existing tests
 (`stale_base_emits_warning_with_machine_id_and_fallback` and neighbors)
 must keep passing unchanged -- they are the regression guard for this
 refactor.
 
 Deliverables:
 - Refactored `path_resolution.rs` construction site
-- Existing scheduler tests passing unmodified
+- Refactored `batch.rs::emit_template_source_dir_warnings` construction site
+- Existing scheduler tests passing unmodified (both sites)
 
 ### Phase 3: `SessionInfo` and both `list()` backends
 
@@ -658,6 +706,27 @@ a future Direction 3 (destructive sweep/gc) is built on top of this
 signal, that design will need to revisit staleness-check robustness
 (fingerprinting, not just existence) as it already anticipates.
 
+**Stat-latency / hung-mount availability risk (added at Phase 6 review).**
+`Path::exists()` is a `stat()` syscall, and `stat()` on an unreachable
+mount (a hung NFS/FUSE mount, a not-yet-remounted network path) can block
+indefinitely rather than fail fast -- exactly the class of torn-down
+environment this feature targets (reaped sandboxes, removed worktrees).
+This design multiplies exposure to that risk beyond the scheduler's
+existing once-per-tick probe: `SessionInfo.template_source_status` is
+computed for every session on every `LocalBackend::list()` call, and
+`list()` is invoked on every dashboard refresh (`src/cli/dashboard.rs`,
+`src/cli/dashboard_data.rs:290`, default 500ms poll interval). A single
+session with a hung-mount `template_source_dir` could stall the
+dashboard's synchronous refresh loop, not just delay one `koto` CLI
+invocation -- a materially larger availability surface than "one extra
+syscall per `koto init` collision" alone would suggest. This is a known,
+accepted limitation for this design, not a blocker: it's the same
+trade-off the batch scheduler already made when it shipped the original
+`Path::exists()` probe (Decision 14 explicitly called it a "cheap probe"
+assumption), now extended to more call sites. A bounded-timeout wrapper
+around the existence check is a reasonable follow-up if this proves real
+in practice, but is deferred rather than built speculatively here.
+
 ## Consequences
 
 ### Positive
@@ -685,6 +754,11 @@ signal, that design will need to revisit staleness-check robustness
   cannot actually distinguish a torn-down cloud-synced session from a
   genuinely deleted local one, because no cheap, reliable per-session
   signal for that distinction exists today.
+- `Path::exists()`'s underlying `stat()` syscall can block on a hung/
+  unreachable mount rather than fail fast, and this design pays that cost
+  once per session on every `LocalBackend::list()` call (including the
+  dashboard's ~500ms refresh poll), not just once per scheduler tick as
+  today -- see Security Considerations.
 
 ### Mitigations
 - The new I/O in `koto init`'s collision path is bounded (one header read,
