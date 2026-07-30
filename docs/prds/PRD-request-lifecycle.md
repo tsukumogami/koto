@@ -9,8 +9,7 @@ problem: |
   fan-out, no typed record of a delegation's creation, and no object that
   holds several answers together. Coordination verbs that used to live in an
   external MCP sidecar were removed, so koto is now the only place these
-  semantics can live, and there is nothing for a coordinator-side harness to
-  drive.
+  semantics can live, and no shell-out consumer can drive them today.
 goals: |
   Give koto a first-class request object with an ordered, repeatable
   leg-and-result lifecycle layered on the existing dispatch protocol, a CLI
@@ -84,13 +83,12 @@ children and correlating them by naming convention.
 workflow in." Neither answers "what is the state of the thing I asked for" —
 which legs are filled, which are still open, what came back so far.
 
-Two things make this urgent rather than merely desirable. The coordination
-verbs that covered some of this — delegate, await, report progress, update,
-cancel, finish, query, list — previously lived in an MCP sidecar in the niwa
-workspace manager, which removed them (niwa#151). koto is now the only place
-they can live. And an agent-facing coordinator harness cannot be written
-against a surface that does not exist: everything such a harness does, it does
-by shelling out to koto and parsing what comes back.
+The coordination verbs that covered some of this — delegate, await, report
+progress, update, cancel, finish, query, list — previously lived in an MCP
+sidecar in the niwa workspace manager, which removed them
+(tsukumogami/niwa#151). koto is now the only place they can live, and nothing
+can drive these semantics today: any shell-out consumer — a script, a CI job,
+an agent skill — has no surface to call.
 
 koto does already ship one container-with-members primitive — the batch
 scheduler's `materialize_children` state, its named task list, and the
@@ -150,9 +148,9 @@ close the request on four answers, so that the workflow makes progress and the
 log records that I chose to proceed short-handed rather than silently dropping
 a reviewer.
 
-### S4 — A coordinator harness drives the lifecycle from a shell
+### S4 — A shell-out consumer drives the lifecycle
 
-As an agent-facing harness running in a coordinator's context, I want every
+As an agent or script driving coordination from a shell, I want every
 operation reachable as a single CLI invocation that takes explicit request and
 leg identifiers and returns a versioned JSON envelope, so that I work
 correctly even though the coordinator and its delegates run in different
@@ -323,10 +321,12 @@ lost leg without having kept my own correlation table.
   open-versus-closed.
 - **R40.** A coordinator can list the requests it is accountable for servicing,
   filtered at least by "has unresolved legs."
-- **R41.** The listings of R39 and R40 are read-only projections of the same
-  discovery scan that populates `unassigned_children` on `koto next`
-  responses, and reuse its per-entry field names. They are not a second scan
-  and not a parallel vocabulary.
+- **R41.** The listings of R39 and R40 reuse the per-entry vocabulary of
+  `unassigned_children` on `koto next` responses — the same field names for the
+  same concepts — and introduce no second claim mechanism and no second
+  discovery cursor. They are read-only per R35, so they do not take the
+  cursor-advancing path the dispatch scan uses; a listing never mutates
+  coordinator state.
 
 ### CLI contract
 
@@ -469,9 +469,11 @@ lost leg without having kept my own correlation table.
 - **R72.** Every recorded step survives a crash at any point: a step is either
   durably recorded or not recorded, never half-recorded, and a reader after a
   crash sees a consistent view.
-- **R73.** Concurrent writers to different legs of the same request do not
-  block or corrupt each other. Concurrent attempts to resolve or bind the same
-  leg produce exactly one winner.
+- **R73.** Concurrent writers to different legs of the same request never
+  corrupt each other or each other's records, and any serialization between
+  them is bounded to the append critical section rather than held across a
+  leg's lifetime. Concurrent attempts to resolve or bind the same leg produce
+  exactly one winner.
 - **R74.** Progress appends are bounded in size and count per leg, with the
   bound recorded and an explicit behavior when it is hit. An unbounded append
   stream is a log-growth hazard on the substrate koto's crash-safety depends
@@ -680,8 +682,8 @@ lost leg without having kept my own correlation table.
   redesigning `materialize_children`, the `children-complete` gate, or
   `TaskOutcome` is not this feature's work.
 - **Forced termination of a delegate.** koto has no process control. R30 gives a
-  stop signal a delegate can act on; making a delegate stop is the harness's
-  job. A future compound operation that both abandons a leg and cancels the
+  stop signal a delegate can act on; making a delegate stop is the agent
+  runtime's job, not koto's. A future compound operation that both abandons a leg and cancels the
   bound workflow is a convenience, not a primitive.
 - **Dashboard panel design.** R66 constrains the request view and the batch's
   counters not to contradict each other, and D2 fixes the visual relationship.
@@ -800,8 +802,8 @@ event enum at no cost to older readers, because unrecognized type strings fall
 through `Unknown`. And layering keeps delegations already in flight working
 unmodified — the new events are additive, and a request with no leg events
 behaves like today's single-child request — while standing beside doubles every
-coordinator integration's code paths, so a harness would need two runbooks and
-a per-call decision about which model applies.
+coordinator integration's code paths, so every integration would need two code
+paths and a per-call decision about which model applies.
 
 **The counter-argument, stated fairly.** The granularity mismatch is real. The
 dispatch protocol models one child workflow per request and is terminal-only,
@@ -1064,9 +1066,9 @@ happened yet" by exiting zero with `action: "gate_blocked"`, and
 success shape is exit zero, and the only loop control a caller needs is whether
 `action` is `done`. There is a gate-blocked error code mapped to exit 1 in
 `NextErrorCode`, but it is dead — defined, mapped, and unit-tested, constructed
-nowhere in the crate. So the surface a harness already polls exits zero while
-waiting, and specifying the opposite here would hand one harness two
-incompatible polling idioms, one of which dies under `set -e`.
+nowhere in the crate. So the koto surface a shell consumer already polls exits
+zero while waiting, and specifying the opposite here would hand one consumer
+two incompatible polling idioms, one of which dies under `set -e`.
 
 The convention outside koto points the same way. kubectl, the AWS CLI, gh, and
 docker all keep readiness out of the read verb and put it in a dedicated wait or
