@@ -16,6 +16,6 @@
       "report_file": "wip/design_orphaned-session-detection_decision_2_report.md"
     }
   ],
-  "cross_validation": "pending",
+  "cross_validation": "passed",
   "round": 0
 }
