@@ -1,6 +1,6 @@
-//! Integration tests for Issue 4 of DESIGN-orphaned-session-detection.md:
-//! `koto status` and `koto session list` surfacing a stale
-//! `template_source_dir`.
+//! Integration tests for Issues 4 and 5 of DESIGN-orphaned-session-detection.md:
+//! `koto status`, `koto session list`, and `koto init`'s collision
+//! pre-check surfacing a stale `template_source_dir`.
 //!
 //! Exercises the real `koto` binary end to end (mirrors
 //! `tests/batch_rewind_test.rs`'s `run_koto` pattern) against a
@@ -14,6 +14,18 @@
 //! `read_header()` fall back to local-only behavior while `Backend::is_cloud()`
 //! still reports `true`, which is exactly the discriminant these two CLI
 //! surfaces gate wording on.
+//!
+//! The `koto init` tests at the bottom of this file
+//! (`init_collision_*`) are the repro for tsukumogami/koto#189: a
+//! same-named `koto init` after the recorded `template_source_dir` was
+//! deleted used to produce a generic, undiagnosable "already exists"
+//! error. They exercise the pre-check collision path (the one
+//! deterministically reachable from a single-process CLI invocation --
+//! the `SpawnErrorKind::Collision` handler only fires on a genuine
+//! atomic-rename race that this test harness cannot force
+//! in-process; it is covered instead by
+//! `src/cli/mod.rs`'s `stale_template_source_dir_clause` unit tests,
+//! since both collision paths call that exact same function).
 
 #![cfg(unix)]
 
@@ -281,4 +293,123 @@ fn list_surfaces_softened_wording_for_cloud_backend() {
         "cloud wording must be softened, got: {note}"
     );
     assert_ne!(note, DIRECT_NOTE);
+}
+
+// -----------------------------------------------------------------------
+// koto init collision (Issue 5 / tsukumogami/koto#189 repro)
+// -----------------------------------------------------------------------
+
+#[test]
+fn init_collision_omits_clause_when_template_source_dir_still_exists() {
+    let tmp = TempDir::new().unwrap();
+    let src = write_template_in_subdir(tmp.path(), "srctpl");
+
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &["init", "sess", "--template", src.to_str().unwrap()],
+    );
+    assert!(ok, "init failed: {stderr}");
+
+    // Re-init the same name while the template source directory still
+    // exists: the base "already exists" message must be unchanged, with
+    // no staleness clause appended.
+    let (ok, json, stderr) = run_koto(
+        tmp.path(),
+        &["init", "sess", "--template", src.to_str().unwrap()],
+    );
+    assert!(!ok, "second init on the same name must fail");
+    let msg = json["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error field should be a string, got: {json} ({stderr})"));
+    assert!(
+        msg.starts_with("workflow 'sess' already exists; run `koto session cleanup sess`"),
+        "base message must be unchanged: {msg}"
+    );
+    assert!(
+        !msg.contains(DIRECT_NOTE),
+        "no staleness clause should be present while the directory exists: {msg}"
+    );
+}
+
+/// Repro for tsukumogami/koto#189: a session whose `template_source_dir`
+/// working tree was torn down (a reaped ephemeral sandbox, a removed git
+/// worktree, a container teardown) used to be indistinguishable, from
+/// `koto init`'s perspective, from a real concurrent session collision --
+/// the error was a generic "already exists" with no way to tell the two
+/// apart. This test confirms the error now identifies the recorded,
+/// missing `template_source_dir` explicitly.
+#[test]
+fn init_collision_diagnoses_stale_template_source_dir() {
+    let tmp = TempDir::new().unwrap();
+    let src = write_template_in_subdir(tmp.path(), "srctpl");
+    let src_dir = src.parent().unwrap().to_path_buf();
+
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &["init", "sess", "--template", src.to_str().unwrap()],
+    );
+    assert!(ok, "init failed: {stderr}");
+
+    // Tear down the working tree the template was loaded from -- the
+    // exact condition tsukumogami/koto#189 reports.
+    std::fs::remove_dir_all(&src_dir).unwrap();
+
+    let (ok, json, stderr) = run_koto(
+        tmp.path(),
+        &["init", "sess", "--template", src.to_str().unwrap()],
+    );
+    assert!(!ok, "second init on the same name must fail");
+    let msg = json["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error field should be a string, got: {json} ({stderr})"));
+
+    // Base message (cleanup guidance) is untouched.
+    assert!(
+        msg.starts_with("workflow 'sess' already exists; run `koto session cleanup sess`"),
+        "base message must be unchanged: {msg}"
+    );
+    // The bug's fix: the error now names the staleness condition and the
+    // recorded (now-missing) path, rather than leaving it undiagnosable.
+    assert!(
+        msg.contains(DIRECT_NOTE),
+        "error must diagnose the stale template_source_dir, got: {msg}"
+    );
+    let expected_path = src_dir.canonicalize().unwrap_or(src_dir);
+    assert!(
+        msg.contains(&expected_path.display().to_string()),
+        "error must identify the missing recorded path {expected_path:?}, got: {msg}"
+    );
+}
+
+#[test]
+fn init_collision_softened_wording_for_cloud_backend() {
+    let tmp = TempDir::new().unwrap();
+    setup_unroutable_cloud_config(tmp.path());
+    let src = write_template_in_subdir(tmp.path(), "srctpl");
+    let src_dir = src.parent().unwrap().to_path_buf();
+
+    let (ok, _, stderr) = run_koto(
+        tmp.path(),
+        &["init", "sess", "--template", src.to_str().unwrap()],
+    );
+    assert!(ok, "init failed: {stderr}");
+
+    std::fs::remove_dir_all(&src_dir).unwrap();
+
+    let (ok, json, stderr) = run_koto(
+        tmp.path(),
+        &["init", "sess", "--template", src.to_str().unwrap()],
+    );
+    assert!(!ok, "second init on the same name must fail");
+    let msg = json["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error field should be a string, got: {json} ({stderr})"));
+    assert!(
+        msg.contains(CLOUD_NOTE_FRAGMENT),
+        "cloud wording must be softened, got: {msg}"
+    );
+    assert!(
+        !msg.contains(DIRECT_NOTE),
+        "direct (non-cloud) wording must not appear, got: {msg}"
+    );
 }
