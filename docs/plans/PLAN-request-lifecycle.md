@@ -111,22 +111,22 @@ inheriting batch semantics or CLI types.
 request log into a view.
 
 **Acceptance Criteria**:
-- [ ] `src/engine/request_store/` exists with `mod.rs` and `view.rs`.
-- [ ] `RequestHeader` carries its own `schema_version`, the request id, creation timestamp, requester, and coordinator of record.
-- [ ] The layout is `<root>/requests/<request_id>/request.jsonl` plus `request.lock`.
-- [ ] `read_view` replays the log into `RequestView`: legs in a `BTreeMap`, disposition derived rather than stored, bound child, result, progress entries, request state, close disposition, and revision.
-- [ ] Revision equals the sequence number of the last event on the log.
-- [ ] Both identifiers are validated against the shared name grammar before being used as path components; a traversal attempt is rejected.
-- [ ] Reading a request that does not exist returns a distinguishable not-found error.
-- [ ] `read_log` and the header write are generified over the header type, with the existing session-typed pair becoming thin wrappers, so the sequence-gap validation and truncated-final-line recovery live in one place rather than being copied.
-- [ ] The request path uses a quiet read variant: a lock-free read racing a concurrent append does not print to stderr.
-- [ ] Creation is a single atomic write — header and creation event buffered, fsynced in a tempfile, then renamed with no-replace semantics — so a crash cannot leave a header with an empty log, and a colliding request id is refused by the rename.
-- [ ] `request_id` is a validated newtype, not a string, so the read and write entry points cannot be called with an unvalidated identifier.
-- [ ] Identifiers are generated in a single case so two cannot collide to one directory on a case-insensitive filesystem.
-- [ ] `requests/` and each request directory are created 0700 and the log 0600; neither the log nor the lock follows a symlink.
-- [ ] The log path is module-private: no public accessor hands a caller a path it could append to outside the lock.
-- [ ] The view exposes the request-level shared inputs recorded at creation, so shared context is not write-only.
-- [ ] Tests cover an open request, a partially resolved request, an abandoned leg, a closed request, legs inserted out of order, and revision advance.
+- [x] `src/engine/request_store/` exists with `mod.rs` and `view.rs`.
+- [x] `RequestHeader` carries its own `schema_version`, the request id, creation timestamp, requester, and coordinator of record.
+- [x] The layout is `<root>/requests/<request_id>/request.jsonl` plus `request.lock`.
+- [x] `read_view` replays the log into `RequestView`: legs in a `BTreeMap`, disposition derived rather than stored, bound child, result, progress entries, request state, close disposition, and revision.
+- [x] Revision equals the sequence number of the last event on the log.
+- [x] Both identifiers are validated against the shared name grammar before being used as path components; a traversal attempt is rejected.
+- [x] Reading a request that does not exist returns a distinguishable not-found error.
+- [x] `read_log` and the header write are generified over the header type, with the existing session-typed pair becoming thin wrappers, so the sequence-gap validation and truncated-final-line recovery live in one place rather than being copied.
+- [x] The request path uses a quiet read variant: a lock-free read racing a concurrent append does not print to stderr.
+- [x] Creation is a single atomic write — header and creation event buffered, fsynced in a tempfile, then renamed with no-replace semantics — so a crash cannot leave a header with an empty log, and a colliding request id is refused by the rename.
+- [x] `request_id` is a validated newtype, not a string, so the read and write entry points cannot be called with an unvalidated identifier.
+- [x] Identifiers are generated in a single case so two cannot collide to one directory on a case-insensitive filesystem.
+- [x] `requests/` and each request directory are created 0700 and the log 0600; neither the log nor the lock follows a symlink.
+- [x] The log path is module-private: no public accessor hands a caller a path it could append to outside the lock.
+- [x] The view exposes the request-level shared inputs recorded at creation, so shared context is not write-only.
+- [x] Tests cover an open request, a partially resolved request, an abandoned leg, a closed request, legs inserted out of order, and revision advance.
 
 **Dependencies**: Issue 1, Issue 2
 **Complexity**: testable
@@ -139,19 +139,19 @@ request log into a view.
 concurrency guarantee.
 
 **Acceptance Criteria**:
-- [ ] `validate_and_append` acquires an exclusive lock, re-reads the view, runs a caller-supplied precondition, appends only on success, and releases.
-- [ ] Lock acquisition has a bounded timeout surfacing as a transient-class error.
-- [ ] A second result on a resolved leg is rejected with a distinct error.
-- [ ] A result on an abandoned leg is rejected with a distinct error.
-- [ ] Rebinding a leg to the same child succeeds; rebinding to a different child is rejected.
-- [ ] Closing an already-closed request is rejected.
-- [ ] All five bounds are enforced inside the lock: 256 progress appends per leg, 16 KiB per append, 256 legs per request, 1 MiB and depth 128 for any JSON flag payload (reusing the existing inputs guards), and 4 KiB for a rationale with control characters stripped.
-- [ ] Duplicate leg names are rejected at create, since the grammar validates one name at a time and two legs sharing a name would collapse in the view.
-- [ ] Lock acquisition is non-blocking plus deadline retry, not a blocking lock, and is an flock rather than an exclusive-create lease file so a killed writer cannot strand it.
-- [ ] A torn tail is repaired under the lock before appending: the writer verifies the file ends in a newline and the last line parses, and truncates a partial line first, so a crash mid-write cannot permanently poison the log once a later append concatenates onto it.
-- [ ] Progress and resolve appends carry an idempotency hash so a retry after an ambiguous failure is a no-op rather than a double-append or a spurious second-result rejection.
-- [ ] A concurrency test spawns two simultaneous resolves of one leg and asserts exactly one succeeds and the log stays readable.
-- [ ] A crash-safety test truncates a log mid-line and asserts the reader reports a clear error rather than silently losing events.
+- [x] `validate_and_append` acquires an exclusive lock, re-reads the view, runs a caller-supplied precondition, appends only on success, and releases.
+- [x] Lock acquisition has a bounded timeout surfacing as a transient-class error.
+- [x] A second result on a resolved leg is rejected with a distinct error.
+- [x] A result on an abandoned leg is rejected with a distinct error.
+- [x] Rebinding a leg to the same child succeeds; rebinding to a different child is rejected.
+- [x] Closing an already-closed request is rejected.
+- [x] All five bounds are enforced inside the lock: 256 progress appends per leg, 16 KiB per append, 256 legs per request, 1 MiB and depth 128 for any JSON flag payload (reusing the existing inputs guards), and 4 KiB for a rationale with control characters stripped.
+- [x] Duplicate leg names are rejected at create, since the grammar validates one name at a time and two legs sharing a name would collapse in the view.
+- [x] Lock acquisition is non-blocking plus deadline retry, not a blocking lock, and is an flock rather than an exclusive-create lease file so a killed writer cannot strand it.
+- [x] A torn tail is repaired under the lock before appending: the writer verifies the file ends in a newline and the last line parses, and truncates a partial line first, so a crash mid-write cannot permanently poison the log once a later append concatenates onto it.
+- [x] Progress and resolve appends carry an idempotency hash so a retry after an ambiguous failure is a no-op rather than a double-append or a spurious second-result rejection.
+- [x] A concurrency test spawns two simultaneous resolves of one leg and asserts exactly one succeeds and the log stays readable.
+- [x] Crash-safety tests cover both halves of the reader's contract: a truncated *final* line recovers with the earlier events intact, and a broken *non-final* line returns a corruption error rather than silently dropping what follows it.
 
 **Dependencies**: Issue 3
 **Complexity**: critical
@@ -164,11 +164,11 @@ concurrency guarantee.
 dispatch cursor.
 
 **Acceptance Criteria**:
-- [ ] `list_requests` walks the requests directory and parses only header lines.
-- [ ] Filters by requester, by coordinator of record, by open-or-closed, and by has-unresolved-legs.
-- [ ] Per-entry field names reuse the `unassigned_children` vocabulary for the same concepts.
-- [ ] A test asserts listing advances no coordinator cursor and writes nothing.
-- [ ] A test asserts listing skips a malformed request directory with a warning rather than failing the call.
+- [x] `list_requests` walks the requests directory and answers the identity filters (requester, coordinator) from header lines alone, replaying only the rows that survive — the state and unresolved-legs filters are derived from events and cannot be answered from a header.
+- [x] Filters by requester, by coordinator of record, by open-or-closed, and by has-unresolved-legs.
+- [x] Per-entry field names reuse the `unassigned_children` vocabulary for the same concepts.
+- [x] A test asserts listing advances no coordinator cursor and writes nothing.
+- [x] A test asserts listing skips a malformed request directory with a warning rather than failing the call.
 
 **Dependencies**: Issue 3
 **Complexity**: testable
@@ -181,17 +181,17 @@ dispatch cursor.
 three verbs that do not mutate a leg.
 
 **Acceptance Criteria**:
-- [ ] `koto request` exists as a subcommand group with `create`, `get`, and `list`.
-- [ ] `create` accepts either `--with-data` carrying legs and shared inputs, or the flat `--role` / `--template` / `--inputs` triple for the one-leg case, and requires `--requested-by` and `--coordinator-of-record`.
-- [ ] `create` prints the generated request id in its envelope.
-- [ ] The envelope carries `request_state`, `close_disposition`, `leg_counts`, `revision`, and `cli_contract` as two integers.
-- [ ] `--cli-contract MAJOR.MINOR` is accepted on every subcommand and validated before any IO; a mismatch exits in the caller-error class.
-- [ ] Output is JSON unconditionally with no format flag.
-- [ ] `get` exits zero for an open, a fully resolved, and a closed request alike.
-- [ ] Two consecutive `get` calls on an unchanged request produce byte-equal output.
-- [ ] Failures use the structured nested error envelope with codes from a closed set.
-- [ ] Exit statuses use only 0, 1, 2, 3 and collide with none of the sysexits values already returned elsewhere in the crate.
-- [ ] A request that does not exist exits in the caller-error class.
+- [x] `koto request` exists as a subcommand group with `create`, `get`, and `list`.
+- [x] `create` accepts either `--with-data` carrying legs and shared inputs, or the flat `--role` / `--template` / `--inputs` triple for the one-leg case, and requires `--requested-by` and `--coordinator-of-record`.
+- [x] `create` prints the generated request id in its envelope.
+- [x] The envelope carries `request_state`, `close_disposition`, `leg_counts`, `revision`, and `cli_contract` as two integers.
+- [x] `--cli-contract MAJOR.MINOR` is accepted on every subcommand and validated before any IO; a mismatch exits in the caller-error class.
+- [x] Output is JSON unconditionally with no format flag.
+- [x] `get` exits zero for an open, a fully resolved, and a closed request alike.
+- [x] Two consecutive `get` calls on an unchanged request produce byte-equal output.
+- [x] Failures use the structured nested error envelope with codes from a closed set.
+- [x] Exit statuses use only 0, 1, 2, 3 and collide with none of the sysexits values already returned elsewhere in the crate.
+- [x] A request that does not exist exits in the caller-error class.
 
 **Dependencies**: Issue 4, Issue 5
 **Complexity**: testable
@@ -203,12 +203,12 @@ three verbs that do not mutate a leg.
 **Goal**: The three verbs that mutate a leg.
 
 **Acceptance Criteria**:
-- [ ] `bind <request-id> <leg> --child <session-id>` binds and is idempotent for the same pair.
-- [ ] `progress <request-id> <leg> --with-data` appends, and is rejected once the leg resolves or is abandoned.
-- [ ] `resolve <request-id> <leg> --with-data` records a result on an unbound leg and is rejected on a bound leg with a distinct code.
-- [ ] Ten appends to one leg read back in the order they were made.
-- [ ] `--issued-by` is accepted on all three and recorded.
-- [ ] Exceeding the append bound returns the documented rejection.
+- [x] `bind <request-id> <leg> --child <session-id>` binds and is idempotent for the same pair.
+- [x] `progress <request-id> <leg> --with-data` appends, and is rejected once the leg resolves or is abandoned.
+- [x] `resolve <request-id> <leg> --with-data` records a result on an unbound leg and is rejected on a bound leg with a distinct code.
+- [x] Ten appends to one leg read back in the order they were made.
+- [x] `--issued-by` is accepted on all three and recorded.
+- [x] Exceeding the append bound returns the documented rejection.
 
 **Dependencies**: Issue 6
 **Complexity**: testable
@@ -221,13 +221,13 @@ three verbs that do not mutate a leg.
 cannot escalate.
 
 **Acceptance Criteria**:
-- [ ] `abandon <request-id> <leg> --rationale` abandons one leg and leaves the others open.
-- [ ] `abandon-request <request-id> --rationale` abandons every open leg and closes the request, as a separate subcommand so an empty leg argument cannot escalate a leg abandonment.
-- [ ] `close <request-id>` records a disposition distinguishing all-resolved, closed-with-abandoned-legs, and request-abandoned.
-- [ ] `--rationale` is required on both abandon forms.
-- [ ] Closing an already-closed request is rejected.
-- [ ] Every abandonment is readable from the log with its rationale and issuing principal.
-- [ ] `koto cancel` behavior is unchanged, and no request operation is reachable from it.
+- [x] `abandon <request-id> <leg> --rationale` abandons one leg and leaves the others open.
+- [x] `abandon-request <request-id> --rationale` abandons every open leg and closes the request, as a separate subcommand so an empty leg argument cannot escalate a leg abandonment.
+- [x] `close <request-id>` records a disposition distinguishing all-resolved, closed-with-abandoned-legs, and request-abandoned.
+- [x] `--rationale` is required on both abandon forms.
+- [x] Closing an already-closed request is rejected.
+- [x] Every abandonment is readable from the log with its rationale and issuing principal.
+- [x] `koto cancel` behavior is unchanged, and no request operation is reachable from it.
 
 **Dependencies**: Issue 6
 **Complexity**: testable
@@ -239,16 +239,16 @@ cannot escalate.
 **Goal**: Readiness as its own verb, so the read stays exit-zero.
 
 **Acceptance Criteria**:
-- [ ] `wait <request-id>` takes exactly one of `--leg <name>`, `--all-legs`, `--closed`, `--resolved-count <N>`.
-- [ ] `--timeout-secs` is required; `--interval-secs` defaults to 2.
-- [ ] A satisfied predicate exits zero; an unsatisfied one at deadline exits in the transient class.
-- [ ] A structurally impossible predicate — more resolved legs than the request has — is rejected in the caller-error class before polling begins, not left to time out in the retry class.
-- [ ] A predicate that became impossible while waiting, through abandonment or close, exits with a caller-error code distinct from a timeout.
-- [ ] `--interval-secs` is clamped to a floor so zero cannot spin.
-- [ ] The deadline is absolute, computed once, and the wait sleeps in slices so a signal is noticed promptly.
-- [ ] Interruption exits in the transient class with a distinct code.
-- [ ] The wait reads through the same path `get` uses and writes nothing, asserted by comparing log length and cursor state before and after.
-- [ ] A count predicate is satisfied by a partial fan-out without requiring all legs.
+- [x] `wait <request-id>` takes exactly one of `--leg <name>`, `--all-legs`, `--closed`, `--resolved-count <N>`.
+- [x] `--timeout-secs` is required; `--interval-secs` defaults to 2.
+- [x] A satisfied predicate exits zero; an unsatisfied one at deadline exits in the transient class.
+- [x] A structurally impossible predicate — more resolved legs than the request has — is rejected in the caller-error class before polling begins, not left to time out in the retry class.
+- [x] A predicate that became impossible while waiting, through abandonment or close, exits with a caller-error code distinct from a timeout.
+- [x] `--interval-secs` is clamped to a floor so zero cannot spin.
+- [x] The deadline is absolute, computed once, and the wait sleeps in slices so a signal is noticed promptly.
+- [x] Interruption exits in the transient class with a distinct code.
+- [x] The wait reads through the same path `get` uses and writes nothing, asserted by comparing log length and cursor state before and after.
+- [x] A count predicate is satisfied by a partial fan-out without requiring all legs.
 
 **Dependencies**: Issue 6
 **Complexity**: testable
@@ -261,17 +261,17 @@ cannot escalate.
 append paths against a displaced agent.
 
 **Acceptance Criteria**:
-- [ ] The leg pointer is a temp-and-rename sidecar in the child's session directory, following the claim sidecar's precedent — **not** an in-place header rewrite, which is unsafe against a running delegate because the existing atomic rewrite reads the whole file and rewrites it without a lock and would lose any event the child appended in between, including a state transition.
-- [ ] The pointer is written after the bind event is durable and after the request lock is released, so there is no lock-ordering cycle against the terminal tick; a failed write warns and does not fail the bind.
-- [ ] `bind` refuses a child that already carries a different request-and-leg pointer, which is the only place the one-leg-per-child half of the invariant can be enforced since the lock is per-request.
-- [ ] `bind` refuses a child whose header does not satisfy the dispatch-fence predicate, so a leg cannot be bound to something that can never be fenced.
-- [ ] The bound epoch is recorded in the bind event and the fence compares against that, not against the child's header, so the fence survives the child's session cleanup.
-- [ ] `koto next` on a bound child carries a `leg` object with the request id and leg name, and deliberately without the dispatch epoch.
-- [ ] `koto status` mirrors the `leg` object read-only.
-- [ ] `progress`, `resolve`, and leg-scoped `abandon` all accept `--dispatch-epoch` and validate it against the epoch recorded in the bind event.
-- [ ] A test asserts a stale epoch is rejected on the append path.
-- [ ] A test asserts the `leg` object omits the epoch.
-- [ ] A test asserts a leg bound after child creation is visible to the child's next tick with no restart.
+- [x] The leg pointer is a temp-and-rename sidecar in the child's session directory, following the claim sidecar's precedent — **not** an in-place header rewrite, which is unsafe against a running delegate because the existing atomic rewrite reads the whole file and rewrites it without a lock and would lose any event the child appended in between, including a state transition.
+- [x] The pointer is written after the bind event is durable and after the request lock is released, so there is no lock-ordering cycle against the terminal tick; a failed write warns and does not fail the bind.
+- [x] `bind` refuses a child that already carries a different request-and-leg pointer, which is the only place the one-leg-per-child half of the invariant can be enforced since the lock is per-request.
+- [x] `bind` refuses a child whose header does not satisfy the dispatch-fence predicate, so a leg cannot be bound to something that can never be fenced.
+- [x] The bound epoch is recorded in the bind event and the fence compares against that, not against the child's header, so the fence survives the child's session cleanup.
+- [x] `koto next` on a bound child carries a `leg` object with the request id and leg name, and deliberately without the dispatch epoch.
+- [x] `koto status` mirrors the `leg` object read-only.
+- [x] `progress`, `resolve`, and leg-scoped `abandon` all accept `--dispatch-epoch` and validate it against the epoch recorded in the bind event.
+- [x] A test asserts a stale epoch is rejected on the append path.
+- [x] A test asserts the `leg` object omits the epoch.
+- [x] A test asserts a leg bound after child creation is visible to the child's next tick with no restart.
 
 **Dependencies**: Issue 4, Issue 7
 **Complexity**: critical
@@ -284,16 +284,16 @@ append paths against a displaced agent.
 action from either side.
 
 **Acceptance Criteria**:
-- [ ] The result envelope is synthesized once and shared by the child-log append and the promotion.
-- [ ] The completion block is extracted into one function called from **both** terminal write sites — the advance-loop path and the directed-transition path — so a directed transition to a terminal state cannot delete a session while its leg stays open forever.
-- [ ] The extracted function re-reads rather than using a caller's pre-transition event list, so the synthesized result is not computed from a stale log.
-- [ ] `request.leg_result` with a promoted source is appended to the request log between the child-log result append and the terminal-index write.
-- [ ] Only the promotion step is hoisted out of the cleanup guard, and it is gated on the leg having no result yet, so a repeatedly-ticked parked session is a silent no-op rather than an unbounded append per tick. Hoisting the other three writes is explicitly not done, because a parked terminal session would then emit a duplicate child-log result, index entry, and parent event on every tick, and existing tests depend on a parked child not emitting the parent event.
-- [ ] A closed request, an abandoned leg, or an unreachable record warns on stderr and does not fail the terminal tick.
-- [ ] A retryable IO failure defers cleanup using the existing append-failure lever.
-- [ ] Promotion does not require the child's session directory to survive.
-- [ ] A test walks a bound child to terminal and asserts its leg is resolved with the same status, summary, and payload the child produced.
-- [ ] A test asserts a child bound to an abandoned leg still completes normally.
+- [x] The result envelope is synthesized once and shared by the child-log append and the promotion.
+- [x] The completion block is extracted into one function called from **both** terminal write sites — the advance-loop path and the directed-transition path — so a directed transition to a terminal state cannot delete a session while its leg stays open forever.
+- [x] The extracted function re-reads rather than using a caller's pre-transition event list, so the synthesized result is not computed from a stale log.
+- [x] `request.leg_result` with a promoted source is appended to the request log between the child-log result append and the terminal-index write.
+- [x] Only the promotion step is hoisted out of the cleanup guard, and it is gated on the leg having no result yet, so a repeatedly-ticked parked session is a silent no-op rather than an unbounded append per tick. Hoisting the other three writes is explicitly not done, because a parked terminal session would then emit a duplicate child-log result, index entry, and parent event on every tick, and existing tests depend on a parked child not emitting the parent event.
+- [x] A closed request, an abandoned leg, or an unreachable record warns on stderr and does not fail the terminal tick.
+- [x] A retryable IO failure defers cleanup using the existing append-failure lever.
+- [x] Promotion does not require the child's session directory to survive.
+- [x] A test walks a bound child to terminal and asserts its leg is resolved with the same status, summary, and payload the child produced.
+- [x] A test asserts a child bound to an abandoned leg still completes normally.
 
 **Dependencies**: Issue 10
 **Complexity**: critical
@@ -306,18 +306,18 @@ action from either side.
 to obey.
 
 **Acceptance Criteria**:
-- [ ] A koto-authored stop notice is prepended to `directive` at both existing substitution funnels, after classification and before serialization.
-- [ ] The caller's rationale is embedded as a quoted value so it cannot forge a second instruction.
-- [ ] An informational abandoned-leg sibling is attached to the envelope for non-agent consumers.
-- [ ] Discovery is one bounded read gated on the child's header carrying a leg pointer, and a read failure is non-fatal.
-- [ ] The `action` enumeration gains no value, and gate-derived blocking conditions are unchanged, both asserted by test.
-- [ ] The delegate's workflow state is unchanged by the notice; the advance loop is not gated on abandonment.
-- [ ] A delivery-audit evidence kind under the reserved prefix is appended once to the delegate's own log on first delivery, written against a synthetic pseudo-state name rather than the delegate's real state — otherwise the result synthesizer, which lifts a summary from the latest evidence matching the final state with no kind filter, would promote the audit record as the child's result.
-- [ ] The rationale is not spliced into `directive`: the directive carries koto-authored text plus a pointer, and the verbatim rationale lives in the envelope sibling and the log.
-- [ ] The splice happens after variable substitution, so caller-influenced text is never exposed to template expansion.
-- [ ] The per-tick check short-circuits on the log's modification time and skips once the delivery marker is present, so a tick does not read megabytes to learn one boolean.
-- [ ] The two response variants that carry no directive are documented as not carrying the notice, with the envelope sibling covering them.
-- [ ] The directed-transition path is documented as not carrying the notice.
+- [x] A koto-authored stop notice is prepended to `directive` at both existing substitution funnels, after classification and before serialization.
+- [x] The caller's rationale is embedded as a quoted value so it cannot forge a second instruction.
+- [x] An informational abandoned-leg sibling is attached to the envelope for non-agent consumers.
+- [x] Discovery is one bounded read gated on the child's header carrying a leg pointer, and a read failure is non-fatal.
+- [x] The `action` enumeration gains no value, and gate-derived blocking conditions are unchanged, both asserted by test.
+- [x] The delegate's workflow state is unchanged by the notice; the advance loop is not gated on abandonment.
+- [x] A delivery-audit evidence kind under the reserved prefix is appended once to the delegate's own log on first delivery, written against a synthetic pseudo-state name rather than the delegate's real state — otherwise the result synthesizer, which lifts a summary from the latest evidence matching the final state with no kind filter, would promote the audit record as the child's result.
+- [x] The rationale is not spliced into `directive`: the directive carries koto-authored text plus a pointer, and the verbatim rationale lives in the envelope sibling and the log.
+- [x] The splice happens after variable substitution, so caller-influenced text is never exposed to template expansion.
+- [x] The per-tick check short-circuits on the log's modification time and skips once the delivery marker is present, so a tick does not read megabytes to learn one boolean.
+- [x] The two response variants that carry no directive are documented as not carrying the notice, with the envelope sibling covering them.
+- [x] The directed-transition path is documented as not carrying the notice.
 
 **Dependencies**: Issue 10
 **Complexity**: critical
@@ -330,11 +330,11 @@ to obey.
 implied by a count.
 
 **Acceptance Criteria**:
-- [ ] A membership attribute with values none, batch, leg, and both on the row descriptor. Leg membership comes from the new pointer, but batch membership comes from the initialization event's spawn entry, so it needs a new cached-session field populated during the replay that already computes the current state — it is not readable off the header.
-- [ ] Rendered as a badge on the member's row.
-- [ ] The `Tasks` column is renamed `Children`; the count logic is unchanged.
-- [ ] Request data does not appear in `koto status`'s batch section.
-- [ ] A test asserts a session that is both a batch task and a request leg renders one count and a both badge.
+- [x] A membership attribute with values none, batch, leg, and both on the row descriptor. Leg membership comes from the new pointer, but batch membership comes from the initialization event's spawn entry, so it needs a new cached-session field populated during the replay that already computes the current state — it is not readable off the header.
+- [x] Rendered as a badge on the member's row.
+- [x] The `Tasks` column is renamed `Children`; the count logic is unchanged.
+- [x] Request data does not appear in `koto status`'s batch section.
+- [x] A test asserts a session that is both a batch task and a request leg renders one count and a both badge.
 
 **Dependencies**: Issue 3
 **Complexity**: simple
@@ -346,11 +346,11 @@ implied by a count.
 **Goal**: Bring the reference documentation in line with what shipped.
 
 **Acceptance Criteria**:
-- [ ] `docs/reference/error-codes.md` gains a section for the request commands with every code and its class.
-- [ ] `docs/workspace-layout.md` documents `requests/` and states the cloud-backend replication gap.
-- [ ] `STABILITY.md`'s claim that the schema constant rises on additive change is corrected to match practice and the forward-compatibility contract.
-- [ ] `docs/designs/current/DESIGN-session-schema-hygiene.md`'s claim that the event enum has no catch-all is corrected.
-- [ ] Doc validation passes for every changed file.
+- [x] `docs/reference/error-codes.md` gains a section for the request commands with every code and its class.
+- [x] `docs/workspace-layout.md` documents `requests/` and states the cloud-backend replication gap.
+- [x] `STABILITY.md`'s claim that the schema constant rises on additive change is corrected to match practice and the forward-compatibility contract.
+- [x] `docs/designs/current/DESIGN-session-schema-hygiene.md`'s claim that the event enum has no catch-all is corrected.
+- [x] Doc validation passes for every changed file.
 
 **Dependencies**: Issue 9
 **Complexity**: simple

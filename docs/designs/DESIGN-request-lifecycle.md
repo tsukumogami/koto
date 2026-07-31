@@ -688,7 +688,9 @@ provenance, not reconciliation: one count per surface, always over the session
 set, with membership as a per-row attribute. Concretely — leave the count logic
 untouched, rename the column from `Tasks` to `Children` so it stops implying
 batch semantics, add a `membership` attribute (`None`, `Batch`, `Leg`, `Both`)
-to the row descriptor derived from the header the tree already holds, render it
+to the row descriptor — leg membership from the pointer sidecar, batch
+membership from the spawn entry, since the header's `parent_workflow` is set for
+any `--parent` child and cannot identify a batch task, render it
 as a badge on the member's row, and keep request data out of `koto status`'s
 batch section.
 
