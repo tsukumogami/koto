@@ -10,6 +10,7 @@ pub mod init_child;
 pub mod next;
 pub mod next_types;
 pub mod overrides;
+pub mod request;
 pub mod retry;
 pub mod session;
 pub mod task_spawn_error;
@@ -255,6 +256,18 @@ pub enum Command {
     Workspace {
         #[command(subcommand)]
         subcommand: WorkspaceCommand,
+    },
+
+    /// Request lifecycle verbs (create, bind, resolve, abandon, close)
+    ///
+    /// `--cli-contract` is declared here and marked global so it is
+    /// accepted on every subcommand in the group from one definition.
+    Request {
+        #[command(flatten)]
+        args: request::RequestGroupArgs,
+
+        #[command(subcommand)]
+        subcommand: request::RequestCommand,
     },
 
     /// Live terminal dashboard showing session hierarchy and state
@@ -1271,6 +1284,10 @@ pub fn run(app: App) -> Result<()> {
                 }
             }
         }
+        // `handle` never returns: it prints an envelope and exits, so
+        // the exit mapping for the whole noun group lives in one place
+        // rather than at ten call sites.
+        Command::Request { args, subcommand } => request::handle(args, subcommand),
         Command::Context { subcommand } => {
             let backend = build_backend()?;
             let store: &dyn ContextStore = &backend;

@@ -214,6 +214,20 @@ pub enum RequestStoreError {
         leg_name: String,
     },
 
+    /// An explicit resolve on a leg that has a child working it.
+    ///
+    /// A bound leg resolves by promotion from its child's terminal tick;
+    /// accepting an explicit result here would block the real one.
+    #[error(
+        "leg {leg_name} of request {request_id} is bound to child {child_session_id} \
+         and resolves when that child completes"
+    )]
+    LegBoundToChild {
+        request_id: String,
+        leg_name: String,
+        child_session_id: String,
+    },
+
     /// A mutation on a leg the requester stopped waiting on.
     #[error("leg {leg_name} of request {request_id} was abandoned")]
     LegAbandoned {
@@ -1478,6 +1492,27 @@ pub fn record_result(
                 })
             }
             LegDisposition::Open => {}
+        }
+        // An explicit resolve is for legs nobody else is working on. A
+        // bound leg resolves by promotion from its child's terminal
+        // tick, so accepting one here would let a coordinator record an
+        // answer on a delegate's behalf and permanently block the real
+        // one — the promotion would then hit a leg that already has a
+        // result and be dropped.
+        //
+        // This check lives inside the lock rather than as a pre-read in
+        // the caller because the discriminator is a leg's binding, and a
+        // bind landing between an unlocked read and this append would
+        // slip through.
+        if result.source == LegResultSource::Explicit && leg.bound_child.is_some() {
+            return Err(RequestStoreError::LegBoundToChild {
+                request_id: view.header.request_id.clone(),
+                leg_name: result.leg_name.clone(),
+                child_session_id: leg
+                    .bound_child
+                    .clone()
+                    .expect("bound_child is Some in this arm"),
+            });
         }
         Ok(Some(PendingAppend {
             payload,
