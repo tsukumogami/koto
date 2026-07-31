@@ -484,12 +484,21 @@ recomputing or reinventing it.
 
 - **`src/engine/template_source_status.rs`** (new file): defines
   `TemplateSourceStatus { path: PathBuf, exists: bool, machine_id:
-  Option<String> }` plus two functions -- a core `fn
+  Option<String> }`, two functions -- a core `fn
   check_template_source_path(path: Option<&Path>) ->
   Option<TemplateSourceStatus>` and a thin wrapper `fn
   check_template_source_dir(header: &StateFileHeader) ->
   Option<TemplateSourceStatus>` that extracts `header.template_source_dir`
-  and delegates to the core. The core takes `Option<&Path>`, not a header,
+  and delegates to the core -- plus `fn
+  format_stale_template_source_note(is_cloud: bool) -> &'static str`, the
+  shared wording helper both `koto status`/`koto session list` (below) and
+  `koto init`'s collision messages consume. Placing the wording helper
+  here too (rather than in `src/cli/mod.rs`, where an earlier draft put
+  it) is itself a plan-review correction (Category D): `koto init`'s
+  messaging depends only on this module, not on the `koto status`/`session
+  list` work, so a helper defined alongside the accessor it takes as input
+  is reachable from both without a cross-issue ordering hazard. The core
+  takes `Option<&Path>`, not a header,
   because **there are two existing scheduler call sites, not one** (see
   below), and one of them has no header in scope at its call site --
   discovered during Phase 6 architecture review, corrected here before this
@@ -716,15 +725,16 @@ status module itself. No behavior change yet -- this phase only introduces
 the type, functions, and accessor in isolation, unit-tested directly
 against constructed `StateFileHeader` values covering present-and-existing,
 present-and-missing, and absent `template_source_dir`, plus at least one
-boundary case beyond plain existence (e.g. a `template_source_dir` that
-resolves to a regular file rather than a directory, or a dangling
-symlink) -- not just the three happy-path cases.
+edge case (a dangling symlink) and one error/invalid-input case (a
+`template_source_dir` that resolves to a regular file rather than a
+directory) -- not just the three happy-path cases.
 
 Deliverables:
 - `src/engine/template_source_status.rs` (new)
 - `Backend::is_cloud()` accessor (`src/session/mod.rs`)
 - Unit tests for `check_template_source_path`/`check_template_source_dir`,
-  including a non-happy-path boundary case
+  including edge-case and error/invalid-input coverage, not just
+  happy-path cases
 
 ### Phase 2: Route the scheduler's per-tick probe and warning through the shared module
 
@@ -782,14 +792,17 @@ Deliverables:
 
 Wire `handle_status` to add the conditional `stale_template_source_dir`
 JSON key. Wire `handle_list` to surface `template_source_status` from each
-`SessionInfo` row. Implement backend-aware wording (Decision 2) as a small
-formatting function consulted by both, gated on the `Backend::is_cloud()`
-accessor added in Phase 1.
+`SessionInfo` row. Both call Phase 1's `format_stale_template_source_note`,
+gated on Phase 1's `Backend::is_cloud()` accessor -- this phase does not
+define a new formatting helper (an earlier draft placed the helper here;
+plan-review Category D found that left Phase 5's consumer hedging on
+whether this phase had landed first, since Phase 5 depends only on Phase
+1 -- moving the helper itself into Phase 1 alongside the accessor closes
+that gap for both).
 
 Deliverables:
 - `handle_status` change (`src/cli/mod.rs`)
 - `handle_list` change (`src/cli/session.rs`)
-- Shared wording-formatting helper
 
 ### Phase 5: `koto init` collision messaging
 

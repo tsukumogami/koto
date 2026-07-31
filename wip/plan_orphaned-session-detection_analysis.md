@@ -1,6 +1,6 @@
 # Plan Analysis: DESIGN-orphaned-session-detection
 
-review_rounds: 1
+review_rounds: 2
 
 ## Source Document
 Path: docs/designs/DESIGN-orphaned-session-detection.md

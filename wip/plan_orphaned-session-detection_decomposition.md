@@ -39,9 +39,11 @@ alongside the issue that introduces it.
 - **Goal**: Introduce `TemplateSourceStatus` and
   `check_template_source_path`/`check_template_source_dir` in a new
   `src/engine/template_source_status.rs`, plus a `Backend::is_cloud()`
-  accessor (moved here from Issue 4/5 per plan-review Category D, since
-  both depend on Issue 1 and neither otherwise forced ordering), all
-  unit-tested in isolation with no wiring into any existing call site yet.
+  accessor and a `format_stale_template_source_note` wording helper (both
+  moved here from Issue 4/5 per plan-review Category D rounds 1 and 2,
+  since Issues 4 and 5 both depend on Issue 1 and neither otherwise forced
+  ordering between each other), all unit-tested in isolation with no
+  wiring into any existing call site yet.
 - **Section**: Solution Architecture / Implementation Approach Phase 1
 - **Milestone**: Orphaned Session Detection
 - **Dependencies**: None
@@ -81,10 +83,10 @@ alongside the issue that introduces it.
 - **Complexity**: testable
 - **Goal**: Add a conditional `stale_template_source_dir` JSON key to
   `handle_status`'s response and surface `template_source_status` from
-  each row in `handle_list`'s output, via a shared backend-aware wording
-  helper (gated on Issue 1's `Backend::is_cloud()`, per Decision 2) that
-  softens language for cloud-synced sessions. Document the new field in
-  `docs/guides/cli-usage.md` (docs-coverage emit, step 3.1a).
+  each row in `handle_list`'s output, calling Issue 1's shared
+  `format_stale_template_source_note`/`Backend::is_cloud()` (per Decision
+  2) rather than defining a new wording helper here. Document the new
+  field in `docs/guides/cli-usage.md` (docs-coverage emit, step 3.1a).
 - **Section**: Implementation Approach Phase 4
 - **Milestone**: Orphaned Session Detection
 - **Dependencies**: Issue 1, Issue 3

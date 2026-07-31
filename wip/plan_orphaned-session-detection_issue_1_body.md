@@ -45,7 +45,8 @@ Design: `docs/designs/DESIGN-orphaned-session-detection.md`
   - [ ] Present path that does not exist on disk: returns `Some` with `exists: false` and the correct `path`.
   - [ ] Absent path (`None` input to `check_template_source_path`, or a `StateFileHeader` with `template_source_dir: None` for `check_template_source_dir`): returns `None`.
   - [ ] `check_template_source_dir` correctly extracts and delegates using a constructed `StateFileHeader` (existing test helpers/fixtures in `src/engine/types.rs`'s own test module construct `StateFileHeader` values already -- follow that pattern, e.g. `template_source_dir: None` at `src/engine/types.rs:1362`/`1392`/`1502`).
-  - [ ] At least one boundary case beyond plain existence/absence -- e.g. `template_source_dir` pointing at a regular file instead of a directory, or a dangling symlink -- asserting the function's actual documented behavior for that case (`Path::exists()` follows symlinks and returns `false` for a broken one; a path pointing at a file rather than a directory still reports `exists: true` since this function checks path existence, not "is a directory" -- assert whichever behavior is actually correct per this function's contract, don't assume).
+  - [ ] At least one edge case beyond plain existence/absence -- a dangling (broken) symlink at the recorded path -- asserting the function's actual, documented behavior: `Path::exists()` follows symlinks and reports `false` for a broken one, so this must return `Some(TemplateSourceStatus { exists: false, .. })`, not `None` and not `exists: true`.
+  - [ ] At least one genuine error/invalid-input case: a `template_source_dir` that resolves to a regular file rather than a directory (not missing, not a valid directory) -- assert the function does not error/panic and reports whatever its documented contract says for this case (this function checks path existence only, not "is a directory," so `exists: true` is the correct, asserted outcome here -- the test's job is to confirm the function doesn't silently misreport or fail on a malformed, non-directory `template_source_dir`).
 - [ ] `Backend` (`src/session/mod.rs`, `pub enum Backend { Local(LocalBackend), Cloud(CloudBackend) }`) gains:
   ```rust
   pub fn is_cloud(&self) -> bool {
@@ -53,8 +54,19 @@ Design: `docs/designs/DESIGN-orphaned-session-detection.md`
   }
   ```
   (or an equivalent form delegating to the existing `CloudBackend::is_cloud()` at `cloud.rs:559-561` for the `Cloud` arm). No such method exists on the enum today -- only on the concrete `CloudBackend` struct. Unit test: a `Backend::Local(_)` value returns `false`; a `Backend::Cloud(_)` value returns `true`.
-- [ ] `cargo build` and `cargo test` pass with the new module and accessor compiled in; no existing test anywhere is modified (neither is yet called from any existing code path).
-- [ ] No other file in the repo calls `check_template_source_path`, `check_template_source_dir`, or `Backend::is_cloud()` yet -- wiring is explicitly out of scope for this issue (see Downstream Dependencies).
+- [ ] `src/engine/template_source_status.rs` also defines the shared wording-formatting helper both later CLI surfaces need:
+  ```rust
+  pub fn format_stale_template_source_note(is_cloud: bool) -> &'static str {
+      if is_cloud {
+          "template source directory not found (if this session was synced from another machine, this may be expected)"
+      } else {
+          "template source directory no longer exists"
+      }
+  }
+  ```
+  (exact wording may differ slightly; the shape -- one function, one `bool` parameter, two static strings -- is what matters). Placed here rather than in <<ISSUE:4>> because <<ISSUE:5>> also needs it and depends only on this issue, not on <<ISSUE:4>>: defining it once, here, means neither downstream issue has to hedge on implementation order or risk two independently-written wording strings drifting apart. Unit test: `true` returns the softened/cloud wording, `false` returns the direct/local wording.
+- [ ] `cargo build` and `cargo test` pass with the new module, accessor, and helper compiled in; no existing test anywhere is modified (none of the three is yet called from any existing code path).
+- [ ] No other file in the repo calls `check_template_source_path`, `check_template_source_dir`, `Backend::is_cloud()`, or `format_stale_template_source_note` yet -- wiring is explicitly out of scope for this issue (see Downstream Dependencies).
 
 ## Dependencies
 
@@ -64,5 +76,5 @@ None
 
 - <<ISSUE:2>> (`refactor(engine): route stale-template-source-dir warnings through the shared module`) needs the core `check_template_source_path` (`Option<&Path>` signature) to exist and be importable from `src/cli/batch.rs`, so `batch.rs`'s per-tick probe and `emit_template_source_dir_warnings` can build from this shared core instead of computing `Path::exists()`/`current_machine_id()` inline. (`path_resolution.rs` is out of scope for Issue 2 -- it never independently computed existence, only consumed a pre-computed boolean from its caller; see Issue 2's own Context for the corrected scope.)
 - <<ISSUE:3>> (`feat(session): thread template-source-status through SessionInfo and both list() backends`) needs the `TemplateSourceStatus` struct and `check_template_source_dir` wrapper to be usable from `src/session/local.rs`/`src/session/cloud.rs`, so `LocalBackend::list()` can populate a new `SessionInfo.template_source_status` field from the header it already holds in memory.
-- <<ISSUE:4>> (`feat(cli): surface stale template_source_dir on koto status and koto session list`) needs `TemplateSourceStatus`'s fields (`path`, `exists`, `machine_id`) to be `pub` and stable, AND `Backend::is_cloud()` to already exist so its shared wording helper can gate on it without adding its own accessor.
-- <<ISSUE:5>> (`fix(cli): diagnose stale template_source_dir in koto init's already-exists error`) needs `check_template_source_dir` to be callable from `src/cli/mod.rs` on a freshly-read `StateFileHeader`, AND `Backend::is_cloud()` to already exist -- Issue 5 depends only on <<ISSUE:1>>, not <<ISSUE:4>>, so the accessor must live here to avoid a missing-dependency risk if Issue 5 lands before Issue 4.
+- <<ISSUE:4>> (`feat(cli): surface stale template_source_dir on koto status and koto session list`) needs `TemplateSourceStatus`'s fields (`path`, `exists`, `machine_id`) to be `pub` and stable, AND `Backend::is_cloud()` and `format_stale_template_source_note` to already exist so it consumes them rather than defining its own.
+- <<ISSUE:5>> (`fix(cli): diagnose stale template_source_dir in koto init's already-exists error`) needs `check_template_source_dir`, `Backend::is_cloud()`, AND `format_stale_template_source_note` to already exist -- Issue 5 depends only on <<ISSUE:1>>, not <<ISSUE:4>>, so both the accessor and the wording helper must live here (not in Issue 4) to avoid a missing-dependency risk if Issue 5 lands before Issue 4.

@@ -52,3 +52,29 @@ corrected directly rather than regenerated from scratch via fresh Phase 4
 agents, since the root causes were narrow and precisely understood after
 verifying each claim against the actual source. `review_rounds`
 incremented to 1 in the analysis artifact.
+
+## Round 2: re-review findings and resolution
+
+A full re-run of all four categories against the round-1 fixes found
+Categories A and B clean, but two residual findings:
+
+- **Category D**: round 1 only moved `Backend::is_cloud()` into Issue 1;
+  Issue 5's AC still hedged on reusing Issue 4's *wording-formatting
+  helper* ("if it has already landed... or an equivalent local check
+  otherwise") with no dependency edge forcing order. Same class of gap as
+  round 1, one layer up. **Fixed** by moving
+  `format_stale_template_source_note` itself into Issue 1 (and the design
+  doc's Solution Architecture / Phase 4) alongside the accessor -- Issue 4
+  now only consumes it, matching Issue 5.
+- **Category C**: Issue 1's round-1 "boundary case" AC didn't trip the
+  taxonomy's Pattern-3 detector because it used "boundary case" instead of
+  the taxonomy's literal trigger phrase "edge case" -- a wording miss, not
+  a substance gap. **Fixed** by renaming to "edge case" and splitting into
+  two explicit ACs: a genuine edge case (dangling symlink) and a genuine
+  error/invalid-input case (path resolves to a regular file, not a
+  directory), both asserting specific, checkable behavior rather than a
+  generic label.
+
+`status="assumed"` for both fixes (no interactive user available). A
+third re-review pass was launched to confirm both are resolved before
+finalizing.
