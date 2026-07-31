@@ -25,19 +25,23 @@ no automatic cleanup/gc (explicitly deferred).
   construction built from `TemplateSourceStatus` instead of computing
   `Path::exists()`/`current_machine_id()` inline; public JSON shape
   (`kind`, `path`, `machine_id`, `falling_back_to`) unchanged.
-- **`src/engine/path_resolution.rs`** (modified): per-task resolver calls
-  `check_template_source_path` instead of computing existence itself.
-- **`src/cli/batch.rs`** (modified): `emit_template_source_dir_warnings`
-  (~line 1774, called from ~line 882) -- the second, independent existing
-  construction site -- switches to the same core function.
+- **`src/cli/batch.rs`** (modified): the per-tick existence probe and
+  `emit_template_source_dir_warnings` (~line 1774, called from ~line 882)
+  switch to the shared core. `src/engine/path_resolution.rs`'s per-task
+  resolver is explicitly **not modified** (plan-review correction,
+  Category B) -- it only ever consumed a pre-computed boolean, never
+  independently checked existence.
 - **`src/session/mod.rs`** (modified): `SessionInfo` gains an additive
   `pub template_source_status: Option<TemplateSourceStatus>` field.
+  `Backend` also gains `pub fn is_cloud(&self) -> bool` (defined once, in
+  Issue 1 -- plan-review correction, Category D).
 - **`src/session/local.rs`** (modified): `LocalBackend::list()` populates
   the new field from the in-memory header (no new I/O).
 - **`src/session/cloud.rs`** (modified): `CloudBackend::list()` leaves the
   field `None` for remote-only placeholder rows; populates normally for
-  rows already synced locally. Backend-aware message wording (checks
-  `Backend::is_cloud()`) lives here or in the formatting helper it feeds.
+  rows already synced locally. Backend-aware message wording calls
+  `format_stale_template_source_note` (also defined once, in Issue 1
+  alongside `is_cloud()` -- plan-review correction, Category D round 2).
 - **`src/cli/mod.rs`** (modified): `handle_status` adds a conditional
   `stale_template_source_dir` JSON key; both `koto init` collision paths
   (pre-check ~line 1682, `SpawnErrorKind::Collision` handler ~line 1707)
@@ -49,17 +53,20 @@ no automatic cleanup/gc (explicitly deferred).
 ## Implementation Phases (from design)
 
 ### Phase 1: Shared status module
-Add `src/engine/template_source_status.rs` with `TemplateSourceStatus` and
-`check_template_source_path`/`check_template_source_dir`. No behavior
-change yet -- unit-tested in isolation against constructed
-`StateFileHeader`/path values (present/absent, existing/missing directory).
+Add `src/engine/template_source_status.rs` with `TemplateSourceStatus`,
+`check_template_source_path`/`check_template_source_dir`, plus
+`Backend::is_cloud()` and `format_stale_template_source_note` (both
+foundational shared infrastructure, added here rather than in later
+issues per plan-review Category D). No behavior change yet -- unit-tested
+in isolation against constructed `StateFileHeader`/path values
+(present/absent, existing/missing directory, plus edge-case and
+error/invalid-input coverage).
 
-### Phase 2: Refactor both scheduler construction sites to consume the shared module
-Both existing places that construct `StaleTemplateSourceDir` move to the
-shared core: `path_resolution.rs`'s per-task resolver (header-accepting
-wrapper) and `batch.rs`'s `emit_template_source_dir_warnings` (core
-function directly, since it only has `Option<&Path>` in scope). No
-wire-format change; existing tests
+### Phase 2: Route the scheduler's per-tick probe and warning through the shared module
+Only `batch.rs`'s existence probe and `emit_template_source_dir_warnings`
+move to the shared core. `path_resolution.rs`'s per-task resolver is
+explicitly out of scope (plan-review correction, Category B) -- it never
+independently checked existence. No wire-format change; existing tests
 (`stale_base_emits_warning_with_machine_id_and_fallback` and neighbors)
 must keep passing unchanged as the regression guard.
 
@@ -72,9 +79,9 @@ the `CloudBackend` None-means-two-things limitation.
 
 ### Phase 4: `koto status` and `koto session list` output
 Wire `handle_status` to add the conditional `stale_template_source_dir`
-JSON key. Wire `handle_list` to surface `template_source_status`.
-Implement backend-aware wording (Decision 2) as a small shared formatting
-function consulted by both.
+JSON key. Wire `handle_list` to surface `template_source_status`. Both
+call Phase 1's `format_stale_template_source_note`/`Backend::is_cloud()`
+(Decision 2) -- this phase does not define its own wording helper.
 
 ### Phase 5: `koto init` collision messaging
 Update both collision paths to open the colliding session's header, run
