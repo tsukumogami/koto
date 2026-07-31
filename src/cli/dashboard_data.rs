@@ -203,6 +203,21 @@ pub struct CachedSession {
     /// state file). Such sessions are surfaced in the `unreadable` tally rather
     /// than silently dropped.
     pub is_unreadable: bool,
+    /// True when the session was spawned as a batch task, i.e. its
+    /// `WorkflowInitialized` event carries a `spawn_entry`.
+    ///
+    /// Batch membership is not readable off the header, so it is derived
+    /// during the same replay that computes `current_state` rather than by
+    /// re-reading the log (DESIGN-request-lifecycle.md Decision 7).
+    pub is_batch_task: bool,
+    /// True when a leg pointer sits in the session directory, i.e. the
+    /// session is bound to a request leg.
+    ///
+    /// Cached alongside the rest of the session because `visible_rows` runs
+    /// on every tick and every keystroke. A bind writes only the sidecar and
+    /// never the child's own log, so this flag can lag by one refresh of the
+    /// state file — the same denormalization the pointer itself documents.
+    pub is_request_leg: bool,
 }
 
 /// Hierarchical view of all sessions visible to the dashboard.
@@ -366,6 +381,17 @@ pub fn read_session(path: &Path) -> CachedSession {
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
+    // Leg membership: the pointer sidecar in the session's own directory
+    // is the child-side record of a bind. Read here, alongside the state
+    // file, so the row builder stays free of IO. Unlike the CLI read paths
+    // this one swallows a malformed pointer silently: the dashboard owns
+    // the terminal, and a warning line would corrupt the frame.
+    let session_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let is_request_leg = crate::engine::leg_pointer::read_pointer(session_dir)
+        .ok()
+        .flatten()
+        .is_some();
+
     // Try to read the header alone for the fallback case.
     let fallback_header = match read_header(path) {
         Ok(h) => h,
@@ -381,6 +407,8 @@ pub fn read_session(path: &Path) -> CachedSession {
                 last_event_at: None,
                 salient_var: None,
                 is_unreadable: true,
+                is_batch_task: false,
+                is_request_leg,
             };
         }
     };
@@ -401,6 +429,8 @@ pub fn read_session(path: &Path) -> CachedSession {
                 last_event_at: None,
                 salient_var: None,
                 is_unreadable: false,
+                is_batch_task: false,
+                is_request_leg,
             };
         }
     };
@@ -411,7 +441,6 @@ pub fn read_session(path: &Path) -> CachedSession {
     // Derive machine state to get the template path for terminal detection.
     // The state file lives inside the session directory, so its parent is
     // the resolution base for a session-relative template_path.
-    let session_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let is_terminal = match derive_machine_state(&header, &events, session_dir) {
         Some(machine_state) => {
             is_terminal_state(&machine_state.template_path, &machine_state.current_state)
@@ -446,6 +475,19 @@ pub fn read_session(path: &Path) -> CachedSession {
         _ => None,
     });
 
+    // Batch membership: a spawn entry on the initialization event is what a
+    // batch scheduler leaves behind, and the only record of it. Taken from
+    // the events already in hand — this is the replay, not a second one.
+    let is_batch_task = events.iter().any(|e| {
+        matches!(
+            &e.payload,
+            crate::engine::types::EventPayload::WorkflowInitialized {
+                spawn_entry: Some(_),
+                ..
+            }
+        )
+    });
+
     CachedSession {
         header,
         current_state,
@@ -457,6 +499,8 @@ pub fn read_session(path: &Path) -> CachedSession {
         last_event_at,
         salient_var,
         is_unreadable: false,
+        is_batch_task,
+        is_request_leg,
     }
 }
 
@@ -1069,6 +1113,8 @@ mod tests {
                 last_event_at: None,
                 salient_var: None,
                 is_unreadable: false,
+                is_batch_task: false,
+                is_request_leg: false,
             },
         );
 
@@ -1103,6 +1149,8 @@ mod tests {
                 last_event_at: None,
                 salient_var: None,
                 is_unreadable: false,
+                is_batch_task: false,
+                is_request_leg: false,
             },
         );
 
@@ -1137,6 +1185,8 @@ mod tests {
                 last_event_at: None,
                 salient_var: None,
                 is_unreadable: false,
+                is_batch_task: false,
+                is_request_leg: false,
             },
         );
 
@@ -1280,6 +1330,123 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // read_session: where the two memberships come from (I13)
+    // -----------------------------------------------------------------------
+
+    /// A state file whose init event carries a spawn entry, i.e. one a
+    /// batch scheduler materialized.
+    fn write_spawned_state_file(dir: &std::path::Path, name: &str) -> PathBuf {
+        let path = dir.join(format!("koto-{}.state.jsonl", name));
+        append_header(&path, &make_header(name, Some("coord"))).unwrap();
+        append_event(
+            &path,
+            &EventPayload::WorkflowInitialized {
+                template_path: "/cache/test.json".to_string(),
+                variables: HashMap::new(),
+                spawn_entry: Some(crate::engine::types::SpawnEntrySnapshot::new(
+                    "child.md".to_string(),
+                    Default::default(),
+                    vec![],
+                )),
+            },
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        path
+    }
+
+    fn write_leg_pointer(dir: &std::path::Path) {
+        crate::engine::leg_pointer::write_pointer(
+            dir,
+            &crate::engine::leg_pointer::LegPointer {
+                request_id: "req-abcdef".to_string(),
+                leg_name: "reviewer-a".to_string(),
+                bound_at: "2026-01-01T00:00:00.000Z".to_string(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn batch_membership_comes_from_the_init_events_spawn_entry() {
+        let dir = TempDir::new().unwrap();
+        let path = write_spawned_state_file(dir.path(), "spawned");
+
+        let cached = read_session(&path);
+
+        assert!(
+            cached.is_batch_task,
+            "a spawn entry on the init event is what marks a batch task"
+        );
+        assert!(
+            !cached.is_request_leg,
+            "a batch task is not a request leg by itself"
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_spawn_entry_is_not_a_batch_task() {
+        let dir = TempDir::new().unwrap();
+        let path = write_minimal_state_file(dir.path(), "top-level");
+
+        let cached = read_session(&path);
+
+        assert!(!cached.is_batch_task);
+        // The header carries the parentage a spawn entry would too, which
+        // is exactly why membership cannot be read off it.
+        assert!(!cached.is_request_leg);
+    }
+
+    #[test]
+    fn leg_membership_comes_from_the_pointer_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let path = write_minimal_state_file(dir.path(), "bound");
+        write_leg_pointer(dir.path());
+
+        let cached = read_session(&path);
+
+        assert!(
+            cached.is_request_leg,
+            "the pointer in the session directory is the child-side record of a bind"
+        );
+        assert!(!cached.is_batch_task);
+    }
+
+    #[test]
+    fn a_batch_task_bound_to_a_leg_reads_as_both() {
+        let dir = TempDir::new().unwrap();
+        let path = write_spawned_state_file(dir.path(), "dual");
+        write_leg_pointer(dir.path());
+
+        let cached = read_session(&path);
+
+        assert!(cached.is_batch_task);
+        assert!(cached.is_request_leg);
+    }
+
+    #[test]
+    fn an_unreadable_pointer_leaves_the_session_readable() {
+        let dir = TempDir::new().unwrap();
+        let path = write_minimal_state_file(dir.path(), "garbled-pointer");
+        std::fs::write(
+            crate::engine::leg_pointer::pointer_path(dir.path()),
+            "this is not toml = = =",
+        )
+        .unwrap();
+
+        let cached = read_session(&path);
+
+        assert!(
+            !cached.is_request_leg,
+            "a malformed pointer degrades to no membership"
+        );
+        assert!(
+            !cached.is_unreadable,
+            "and never makes the session itself unreadable"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // refresh: orchestration
     // -----------------------------------------------------------------------
 
@@ -1318,6 +1485,8 @@ mod tests {
                 last_event_at: None,
                 salient_var: None,
                 is_unreadable: false,
+                is_batch_task: false,
+                is_request_leg: false,
             },
         );
 
@@ -1408,6 +1577,8 @@ mod tests {
                 last_event_at: None,
                 salient_var: None,
                 is_unreadable: false,
+                is_batch_task: false,
+                is_request_leg: false,
             },
         );
         sessions.insert(
@@ -1423,6 +1594,8 @@ mod tests {
                 last_event_at: None,
                 salient_var: None,
                 is_unreadable: false,
+                is_batch_task: false,
+                is_request_leg: false,
             },
         );
 
@@ -1448,6 +1621,8 @@ mod tests {
                 last_event_at: None,
                 salient_var: None,
                 is_unreadable: false,
+                is_batch_task: false,
+                is_request_leg: false,
             },
         );
         sessions.insert(
@@ -1463,6 +1638,8 @@ mod tests {
                 last_event_at: None,
                 salient_var: None,
                 is_unreadable: false,
+                is_batch_task: false,
+                is_request_leg: false,
             },
         );
 
@@ -1489,6 +1666,8 @@ mod tests {
                 last_event_at: None,
                 salient_var: None,
                 is_unreadable: false,
+                is_batch_task: false,
+                is_request_leg: false,
             },
         );
 
@@ -1583,6 +1762,8 @@ mod tests {
             last_event_at,
             salient_var: None,
             is_unreadable: false,
+            is_batch_task: false,
+            is_request_leg: false,
         }
     }
 
@@ -1768,6 +1949,8 @@ mod tests {
             last_event_at: None,
             salient_var: salient_var.map(|s| s.to_string()),
             is_unreadable: false,
+            is_batch_task: false,
+            is_request_leg: false,
         }
     }
 

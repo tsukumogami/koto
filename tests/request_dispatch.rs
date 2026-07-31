@@ -926,3 +926,136 @@ fn a_bound_but_unabandoned_leg_carries_no_notice() {
     assert!(envelope.get("leg_abandoned").is_none());
     assert_eq!(delivery_records(tmp.path(), "child-1"), 0);
 }
+
+// ===== Issue 13: the batch boundary on `koto status` =====
+
+/// A batch-scoped parent: `materialize_children` on `plan`, so `koto
+/// status` derives a `batch` section for it.
+const BATCH_PARENT_TEMPLATE: &str = r#"---
+name: batch-coordinator
+version: "1.0"
+initial_state: plan
+states:
+  plan:
+    accepts:
+      tasks:
+        type: tasks
+        required: true
+      finalize:
+        type: enum
+        required: false
+        values: [yes]
+    gates:
+      done:
+        type: children-complete
+    materialize_children:
+      from_field: tasks
+      default_template: child.md
+    transitions:
+      - target: summarize
+        when:
+          finalize: yes
+  summarize:
+    terminal: true
+---
+
+## plan
+
+Plan the batch.
+
+## summarize
+
+Summarize.
+"#;
+
+/// Spawn one batch child off a batch-scoped parent and bind it to a
+/// leg. Returns the request id and the child's session name.
+fn batch_child_bound_to_a_leg(dir: &Path) -> (String, String) {
+    std::fs::write(dir.join("batch-parent.md"), BATCH_PARENT_TEMPLATE).unwrap();
+    std::fs::write(dir.join("child.md"), CHILD_TEMPLATE).unwrap();
+    let parent_tmpl = dir.join("batch-parent.md");
+
+    run_ok(
+        dir,
+        &[
+            "init",
+            "batch-coord",
+            "--template",
+            parent_tmpl.to_str().unwrap(),
+        ],
+    );
+    run_ok(
+        dir,
+        &[
+            "next",
+            "batch-coord",
+            "--with-data",
+            r#"{"tasks":[{"name":"A","waits_on":[],"vars":{}}]}"#,
+        ],
+    );
+
+    let child = "batch-coord.A".to_string();
+    koto::engine::claim::rewrite_header_atomically(&state_path(dir, &child), |mut h| {
+        h.needs_agent = Some(true);
+        h.role = Some("scrutineer".into());
+        h.coordinator_of_record = Some("batch-coord".into());
+        h
+    })
+    .unwrap();
+
+    let envelope = run_ok(
+        dir,
+        &[
+            "request",
+            "create",
+            "--with-data",
+            ONE_LEG,
+            "--requested-by",
+            "batch-coord",
+            "--coordinator-of-record",
+            "batch-coord",
+        ],
+    );
+    let id = envelope["request_id"].as_str().unwrap().to_string();
+    run_ok(
+        dir,
+        &["request", "bind", &id, "reviewer-a", "--child", &child],
+    );
+
+    (id, child)
+}
+
+#[test]
+fn a_bound_batch_child_keeps_its_request_out_of_the_batch_section() {
+    let tmp = TempDir::new().unwrap();
+    let (id, child) = batch_child_bound_to_a_leg(tmp.path());
+
+    // The parent is batch-scoped, so it has a batch section — and the
+    // batch is a container of tasks, not of legs.
+    let parent = run_ok(tmp.path(), &["status", "batch-coord"]);
+    let batch = parent
+        .get("batch")
+        .unwrap_or_else(|| panic!("a batch-scoped parent has a batch section: {parent}"));
+    let rendered = serde_json::to_string(batch).unwrap();
+    assert!(
+        rendered.contains("batch-coord.A"),
+        "the batch section must actually describe the task, or the absence \
+         assertions below prove nothing: {rendered}"
+    );
+    for needle in [id.as_str(), "request", "leg", "reviewer-a"] {
+        assert!(
+            !rendered.contains(needle),
+            "the batch section is a batch's own membership and nothing else, but it \
+             carried '{needle}': {rendered}"
+        );
+    }
+
+    // The child's own status carries the request, in its own section.
+    let child_status = run_ok(tmp.path(), &["status", &child]);
+    assert_eq!(child_status["leg"]["request_id"], serde_json::json!(id));
+    assert_eq!(child_status["leg"]["leg_name"], "reviewer-a");
+    assert!(
+        child_status.get("batch").is_none(),
+        "a batch task is not itself a batch: {child_status}"
+    );
+}
