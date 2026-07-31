@@ -32,7 +32,8 @@ decision: |
   status` adds a conditional `stale_template_source_dir` JSON key, and
   `koto init`'s two "already exists" collision paths each open the
   colliding session's header and append the same staleness clause.
-  Message wording branches on `Backend::is_cloud()` to soften language for
+  Message wording branches on whether the session's backend matches
+  `Backend::Cloud(_)` to soften language for
   cloud-synced sessions without suppressing or altering the underlying
   check. No new CLI flag is introduced anywhere, and the word "orphan" is
   never used in any new field or flag name, avoiding collision with the
@@ -525,8 +526,15 @@ recomputing or reinventing it.
   leaves the new field `None` for remote-only placeholder rows (no header
   available, no new sync round-trip); for rows whose header has already
   been pulled locally via `sync_pull_state`, behaves like `LocalBackend`.
-  Message formatting (see below) additionally checks `Backend::is_cloud()`
-  to select wording.
+  Message formatting (see below) additionally matches on `Backend::Cloud(_)`
+  vs. `Backend::Local(_)` to select wording. (Correction from Phase 4 plan
+  generation: `CloudBackend::is_cloud()` at `cloud.rs:559-561` is an
+  inherent method on the concrete `CloudBackend` struct, not on the
+  `Backend` enum that `handle_status`/`handle_list` actually hold --
+  callers there match the enum variant directly, e.g. `matches!(backend,
+  Backend::Cloud(_))`, rather than calling a method through the enum. Same
+  zero-cost discriminant, no new accessor needed; only the earlier
+  method-call phrasing was inaccurate.)
 - **`src/cli/mod.rs`** (existing, modified): `handle_status` calls
   `check_template_source_dir` on the header it already has and adds a
   conditional `stale_template_source_dir` JSON key when `exists == false`.
@@ -585,8 +593,8 @@ Wire shape addition on `koto status` (only present when stale):
   }
 }
 ```
-The `note` field's wording branches on `Backend::is_cloud()` per Decision 2
-(softened for cloud-backed sessions, direct for local ones); the `kind`
+The `note` field's wording branches on matching `Backend::Cloud(_)` per
+Decision 2 (softened for cloud-backed sessions, direct for local ones); the `kind`
 discriminator and other field names follow the existing
 `stale_template_source_dir` vocabulary from `scheduler_warning.rs` for
 cross-surface consistency.
