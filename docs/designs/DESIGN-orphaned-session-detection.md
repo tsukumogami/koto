@@ -23,17 +23,19 @@ decision: |
   Extract the existence/staleness check into one shared core --
   `TemplateSourceStatus { path, exists, machine_id }` plus
   `check_template_source_path`/`check_template_source_dir` in a new
-  `src/engine/template_source_status.rs` -- and refactor both existing
-  `StaleTemplateSourceDir` construction sites (`path_resolution.rs`'s
-  per-task resolver and `batch.rs`'s per-tick warning emitter) to build
-  from it, alongside three new consumers: `SessionInfo` gains an additive
+  `src/engine/template_source_status.rs`, plus a thin `Backend::is_cloud()`
+  accessor -- and route the scheduler's existing per-tick existence probe
+  and its `StaleTemplateSourceDir` warning construction (`batch.rs`) through
+  the shared core (the per-task resolver in `path_resolution.rs` is
+  explicitly not touched -- it only ever received a pre-computed boolean,
+  never an independent existence check to consolidate), alongside three
+  new consumers: `SessionInfo` gains an additive
   `Option<TemplateSourceStatus>` field populated by `LocalBackend::list()`
   (left `None` for `CloudBackend`'s remote-only placeholder rows), `koto
   status` adds a conditional `stale_template_source_dir` JSON key, and
   `koto init`'s two "already exists" collision paths each open the
   colliding session's header and append the same staleness clause.
-  Message wording branches on whether the session's backend matches
-  `Backend::Cloud(_)` to soften language for
+  Message wording branches on `Backend::is_cloud()` to soften language for
   cloud-synced sessions without suppressing or altering the underlying
   check. No new CLI flag is introduced anywhere, and the word "orphan" is
   never used in any new field or flag name, avoiding collision with the
@@ -240,11 +242,14 @@ helper calls `Path::exists()` and the already-crate-visible
 exactly once, so there is exactly one place in the codebase that computes
 "does this recorded directory exist, and on whose machine."
 
-`SchedulerWarning::StaleTemplateSourceDir`'s own construction
-(`path_resolution.rs`, `batch.rs:1789`) is refactored to build *from* this
-same helper's result -- converting `TemplateSourceStatus.path: PathBuf` to
-the enum's existing `path: String` only at that call site, and bolting
-`falling_back_to` on only there. The scheduler's public JSON wire format
+`SchedulerWarning::StaleTemplateSourceDir`'s construction in
+`batch.rs::emit_template_source_dir_warnings` (`~line 1789`) is refactored
+to build *from* this same helper's result -- converting
+`TemplateSourceStatus.path: PathBuf` to the enum's existing `path: String`
+at that call site, and bolting `falling_back_to` on there. (The *other*
+existing construction site, `path_resolution.rs`'s per-task resolver, is
+not refactored by this design -- see Solution Architecture's correction.)
+The scheduler's public JSON wire format
 (`kind`, `path`, `machine_id`, `falling_back_to`, all currently required
 per an existing hard-coded serialization test) does not change at all.
 
@@ -360,9 +365,11 @@ suppress or skip the check for `CloudBackend` sessions specifically -- a
 fully-downloaded session with a genuinely stale `template_source_dir` is
 just as worth flagging as a local one.
 
-The one place backend matters is message text. When a session's backend is
-`Backend::Cloud(_)` (a static, zero-cost discriminant already in hand,
-`cloud.rs:559-561`, no I/O and no new field), soften the wording to
+The one place backend matters is message text. When `Backend::is_cloud()`
+is true (a thin, zero-cost accessor added to the `Backend` enum -- see
+Solution Architecture's correction on this point -- delegating to
+`CloudBackend::is_cloud()` at `cloud.rs:559-561`, no I/O and no persisted
+new field), soften the wording to
 acknowledge the ambiguity instead of asserting deletion -- e.g. "template
 source directory not found (if this session was synced from another
 machine, this may be expected)" -- rather than a flat "no longer exists."
@@ -425,8 +432,8 @@ confirmed missing. `koto init`'s "already exists" collision check gains new
 helper, and appends a sibling clause to the existing, stable
 `"already exists"` error string rather than rewriting it.
 
-Message wording is the one place backend type matters: sessions on
-`Backend::Cloud(_)` get softened wording acknowledging that a missing
+Message wording is the one place backend type matters: sessions where
+`Backend::is_cloud()` is true get softened wording acknowledging that a missing
 directory may reflect a legitimate cross-machine resume, using a static,
 already-in-hand discriminant, while `Backend::Local` sessions -- for which
 cross-machine resume isn't possible -- keep more direct wording. The
@@ -497,27 +504,55 @@ recomputing or reinventing it.
   converting `TemplateSourceStatus.path: PathBuf` to its own `path: String`
   field and attaching `falling_back_to` at each call site. The variant's
   public shape and `#[serde(tag = "kind")]` output are unchanged.
-- **`src/engine/path_resolution.rs`** (existing, modified): the per-task
-  resolver that currently computes staleness inline now calls
-  `check_template_source_path` and passes the result to
-  `scheduler_warning`'s constructor, instead of computing `Path::exists()`
-  itself.
-- **`src/cli/batch.rs`** (existing, modified): `emit_template_source_dir_warnings`
-  (`~line 1774`), the *second* existing construction site for
-  `StaleTemplateSourceDir` -- called once per scheduler tick from `~line
-  882`, independently of `path_resolution.rs`'s per-task resolver -- today
-  computes its own `Path::exists()` at `~line 875-876`
-  (`template_source_dir_exists`) and calls `current_machine_id()` itself.
-  This site has `Option<&Path>` and a pre-computed bool in hand, not a
-  `StateFileHeader`, which is exactly why the shared core takes
-  `Option<&Path>` rather than a header: this call site switches to calling
-  `check_template_source_path` directly (skipping the header-accepting
-  wrapper), closing the gap the rest of this design would otherwise have
-  left open -- without this change, `batch.rs` would keep hand-rolling the
-  same fact after the refactor lands, undercutting the "one computation,
-  not four (now five)" goal.
+- **`src/engine/path_resolution.rs`** (existing, **not modified** by this
+  design -- see the correction below). `current_machine_id()` (line 66)
+  stays exactly where it is; the shared module's core function calls it,
+  not the other way around.
+- **`src/cli/batch.rs`** (existing, modified, narrower scope than an
+  earlier draft claimed): the scheduler's *single* existing existence
+  probe (`~line 875-876`, `template_source_dir_exists =
+  template_source_dir.as_deref().map(|p| p.exists())`, run once per tick)
+  switches to `check_template_source_path(template_source_dir.as_deref())`,
+  then derives the boolean for existing downstream consumers via
+  `.map(|s| s.exists)` -- so the one real filesystem probe in this whole
+  path now goes through the shared core. `emit_template_source_dir_warnings`
+  (`~line 1774`, called once per tick from `~line 882`) is updated to take
+  the resulting `Option<TemplateSourceStatus>` directly and build its
+  `StaleTemplateSourceDir` warning from it, rather than taking a bare
+  `base_exists: Option<bool>` and calling `current_machine_id()` itself.
+  This is the one and only construction-site change on the scheduler side.
+
+  **Correction from Phase 6 plan review**: an earlier draft of this design
+  additionally claimed `path_resolution.rs`'s per-task resolver
+  (`resolve_template_path_with_base_status`) is a *second* independent
+  `StaleTemplateSourceDir` construction site that this design refactors.
+  That claim doesn't survive contact with the actual call graph:
+  `resolve_template_path_with_base_status` takes `base_exists:
+  Option<bool>` as a parameter from its callers (`spawn_ready_task`,
+  `spawn_skip_marker_task` in `batch.rs`) -- it never had a path or header
+  in its own scope to call the shared module with, because the one real
+  existence check already happens upstream, once per tick, at the
+  `batch.rs` probe corrected above. Its own inline warning construction
+  (lines 175-179) is left as-is in this design: it keeps consuming the
+  existing `base_exists: Option<bool>` parameter and keeps calling
+  `current_machine_id()` itself. Threading a full `TemplateSourceStatus`
+  down through `resolve_template_path_with_base_status`'s multiple call
+  sites, purely to avoid one extra cheap, non-filesystem `current_machine_id()`
+  read per task, is not worth the touched-surface-area increase across
+  `spawn_ready_task`/`spawn_skip_marker_task`/`canonical_paths_tried` --
+  this is a deliberate scope boundary, not an oversight. "One computation,
+  not four" refers to the filesystem existence check (now genuinely
+  singular, at the `batch.rs` probe); a second, cheap, side-effect-free
+  `current_machine_id()` call at `path_resolution.rs`'s existing
+  warning-construction site is an accepted, harmless duplication, not a
+  second instance of the risk Decision 1 was scoped to eliminate.
 - **`src/session/mod.rs`** (existing, modified): `SessionInfo` gains `pub
-  template_source_status: Option<TemplateSourceStatus>`.
+  template_source_status: Option<TemplateSourceStatus>`. `Backend` also
+  gains `pub fn is_cloud(&self) -> bool` (`Backend::Local(_) => false`,
+  `Backend::Cloud(b) => b.is_cloud()` or equivalent `matches!` form) --
+  see the `is_cloud()` correction under `src/session/cloud.rs` below for
+  why this method needs to exist on the enum, not just the concrete
+  `CloudBackend` struct.
 - **`src/session/local.rs`** (existing, modified): `LocalBackend::list()`
   populates the new field from the header it already holds in memory
   (calls `check_template_source_dir` once per session, same cost class as
@@ -526,15 +561,28 @@ recomputing or reinventing it.
   leaves the new field `None` for remote-only placeholder rows (no header
   available, no new sync round-trip); for rows whose header has already
   been pulled locally via `sync_pull_state`, behaves like `LocalBackend`.
-  Message formatting (see below) additionally matches on `Backend::Cloud(_)`
-  vs. `Backend::Local(_)` to select wording. (Correction from Phase 4 plan
-  generation: `CloudBackend::is_cloud()` at `cloud.rs:559-561` is an
-  inherent method on the concrete `CloudBackend` struct, not on the
-  `Backend` enum that `handle_status`/`handle_list` actually hold --
-  callers there match the enum variant directly, e.g. `matches!(backend,
-  Backend::Cloud(_))`, rather than calling a method through the enum. Same
-  zero-cost discriminant, no new accessor needed; only the earlier
-  method-call phrasing was inaccurate.)
+  Message formatting (see below) additionally calls `Backend::is_cloud()`
+  to select wording.
+
+  **Correction, twice-revised.** A Phase 6 design-review pass first
+  observed that `is_cloud()` at `cloud.rs:559-561` is an inherent method
+  on the concrete `CloudBackend` struct, not on the `Backend` enum that
+  `handle_status`/`handle_list` actually hold, and suggested inline
+  `matches!(backend, Backend::Cloud(_))` at each call site instead. A
+  later plan-review pass (Category B/C, `/plan` Phase 6) caught that this
+  second fix created a *new* contradiction: three independently-generated
+  plan issues (status/list, `koto init` messaging) had already, correctly,
+  concluded a real `Backend::is_cloud()` accessor was needed and written
+  acceptance criteria to add one -- multiple call sites across two
+  commands all need this same discriminant, and a one-line delegating
+  method on the enum (`pub fn is_cloud(&self) -> bool { matches!(self,
+  Backend::Cloud(_)) }`) is the more maintainable answer than repeating
+  the `matches!` pattern at every call site. This design now settles on
+  that accessor as the final answer: `Backend::is_cloud()` is added once,
+  as part of this design's foundational shared-infrastructure work (see
+  `src/session/mod.rs` above), and every later call site (here, `koto
+  status`, `koto session list`, `koto init`'s collision messages) calls
+  it rather than re-deriving the same `matches!` inline.
 - **`src/cli/mod.rs`** (existing, modified): `handle_status` calls
   `check_template_source_dir` on the header it already has and adds a
   conditional `stale_template_source_dir` JSON key when `exists == false`.
@@ -566,8 +614,8 @@ pub fn check_template_source_path(
     Some(TemplateSourceStatus { path, exists, machine_id: current_machine_id() })
 }
 
-// Wrapper: used by path_resolution.rs and the three new call sites,
-// which have a StateFileHeader in hand.
+// Wrapper: used by the three new call sites (status, init, session
+// list), which have a StateFileHeader in hand.
 pub fn check_template_source_dir(
     header: &StateFileHeader,
 ) -> Option<TemplateSourceStatus> {
@@ -593,7 +641,7 @@ Wire shape addition on `koto status` (only present when stale):
   }
 }
 ```
-The `note` field's wording branches on matching `Backend::Cloud(_)` per
+The `note` field's wording branches on `Backend::is_cloud()` per
 Decision 2 (softened for cloud-backed sessions, direct for local ones); the `kind`
 discriminator and other field names follow the existing
 `stale_template_source_dir` vocabulary from `scheduler_warning.rs` for
@@ -603,18 +651,24 @@ cross-surface consistency.
 
 1. `koto init`/child-spawn writes `template_source_dir` into
    `StateFileHeader` at session creation (unchanged, existing behavior).
-2. At read time (`koto status`, `koto init`'s collision check, `koto
-   session list`, and the batch scheduler's per-tick resolution), the
-   relevant header is loaded through the existing shared parser
-   (`persistence::parse_header`), then passed to
-   `check_template_source_dir`.
-3. The resulting `Option<TemplateSourceStatus>` is either projected
-   directly into a JSON response field (`status`, `list`) or converted into
-   the scheduler's existing `StaleTemplateSourceDir` variant (batch path
-   resolution only).
-4. Message wording for the three new surfaces branches on the session's
-   `Backend` variant at formatting time -- a pure function of already-known
-   data, no extra I/O.
+2. At read time, the three new surfaces (`koto status`, `koto init`'s
+   collision check, `koto session list`) each load the relevant header
+   through the existing shared parser (`persistence::parse_header`), then
+   pass it to `check_template_source_dir` (the header-accepting wrapper).
+3. Separately, the batch scheduler's per-tick probe (`batch.rs`, ~line
+   875) already holds a raw `Option<&Path>`, not a header, so it calls
+   `check_template_source_path` (the core function) directly once per
+   tick; the resulting `Option<TemplateSourceStatus>` is converted into
+   the scheduler's existing `StaleTemplateSourceDir` variant by
+   `emit_template_source_dir_warnings`. The per-task resolver
+   (`path_resolution.rs`) is not touched by this design -- see Solution
+   Architecture's correction for why.
+4. In both flows, the resulting `Option<TemplateSourceStatus>` is either
+   projected directly into a JSON response field (`status`, `list`) or
+   converted into the scheduler's `StaleTemplateSourceDir` variant.
+5. Message wording for the three new surfaces branches on
+   `Backend::is_cloud()` at formatting time -- a pure function of
+   already-known data, no extra I/O.
 
 ### Implicit Decision: both `koto init` collision paths get the staleness clause
 
@@ -652,33 +706,63 @@ recorded as assumed.
 
 ### Phase 1: Shared status module
 
-Add `src/engine/template_source_status.rs` with `TemplateSourceStatus` and
-`check_template_source_dir`. No behavior change yet -- this phase only
-introduces the type and function in isolation, unit-tested directly against
-constructed `StateFileHeader` values (present/absent `template_source_dir`,
-existing/missing directory).
+Add `src/engine/template_source_status.rs` with `TemplateSourceStatus`,
+`check_template_source_path`, and `check_template_source_dir`. Also add
+the thin `Backend::is_cloud()` accessor to `src/session/mod.rs` (`pub fn
+is_cloud(&self) -> bool`, delegating to `CloudBackend::is_cloud()` for the
+`Cloud` variant) -- grouped into this phase because it is foundational,
+zero-risk shared infrastructure that Phases 4 and 5 both need, same as the
+status module itself. No behavior change yet -- this phase only introduces
+the type, functions, and accessor in isolation, unit-tested directly
+against constructed `StateFileHeader` values covering present-and-existing,
+present-and-missing, and absent `template_source_dir`, plus at least one
+boundary case beyond plain existence (e.g. a `template_source_dir` that
+resolves to a regular file rather than a directory, or a dangling
+symlink) -- not just the three happy-path cases.
 
 Deliverables:
 - `src/engine/template_source_status.rs` (new)
-- Unit tests for `check_template_source_dir`
+- `Backend::is_cloud()` accessor (`src/session/mod.rs`)
+- Unit tests for `check_template_source_path`/`check_template_source_dir`,
+  including a non-happy-path boundary case
 
-### Phase 2: Refactor both scheduler construction sites to consume the shared module
+### Phase 2: Route the scheduler's per-tick probe and warning through the shared module
 
-There are two existing places that construct `StaleTemplateSourceDir`, and
-both must move to the shared core in this phase, not just one: the
-per-task resolver in `src/engine/path_resolution.rs` (uses the header-
-accepting wrapper), and the per-tick `emit_template_source_dir_warnings` in
-`src/cli/batch.rs` (~line 1774, called from ~line 882 -- uses the core
-`check_template_source_path` directly, since it only has `Option<&Path>` in
-scope, not a header). No wire-format change at either site; existing tests
+`batch.rs`'s existing per-tick existence probe (`~line 875-876`, currently
+`template_source_dir.as_deref().map(|p| p.exists())`) switches to calling
+`check_template_source_path`, deriving the same `Option<bool>` its existing
+downstream consumers (`spawn_ready_task`, `spawn_skip_marker_task`,
+`canonical_paths_tried`, `resolve_template_path_with_base_status`) already
+expect via `.map(|s| s.exists)` -- their signatures do not change.
+`emit_template_source_dir_warnings` (`~line 1774`, called once per tick
+from `~line 882`) is updated to accept the resulting
+`Option<TemplateSourceStatus>` directly and build its
+`StaleTemplateSourceDir` warning from it, instead of taking a bare
+`base_exists: Option<bool>` and calling `current_machine_id()` itself.
+
+`path_resolution.rs`'s per-task resolver (`resolve_template_path_with_base_status`)
+is explicitly **not** touched in this phase: it only ever receives a
+pre-computed `base_exists: Option<bool>` from its callers and has no path
+or header of its own to check, so there is nothing here for it to route
+through the shared module. It keeps its existing inline warning
+construction and its own `current_machine_id()` call -- seeing this design
+doesn't remove that field's now-redundant-sounding "one computation, not
+four" framing; the framing is about the filesystem existence check
+(genuinely singular after this phase), not about a second,
+side-effect-free `current_machine_id()` read, which is an accepted,
+harmless duplication.
+
+No wire-format change. Existing tests
 (`stale_base_emits_warning_with_machine_id_and_fallback` and neighbors)
 must keep passing unchanged -- they are the regression guard for this
 refactor.
 
 Deliverables:
-- Refactored `path_resolution.rs` construction site
+- Refactored `batch.rs` per-tick probe (calls `check_template_source_path`)
 - Refactored `batch.rs::emit_template_source_dir_warnings` construction site
-- Existing scheduler tests passing unmodified (both sites)
+- Existing scheduler tests passing unmodified
+- `path_resolution.rs` left unmodified (explicitly out of scope, per the
+  correction above)
 
 ### Phase 3: `SessionInfo` and both `list()` backends
 
@@ -699,7 +783,8 @@ Deliverables:
 Wire `handle_status` to add the conditional `stale_template_source_dir`
 JSON key. Wire `handle_list` to surface `template_source_status` from each
 `SessionInfo` row. Implement backend-aware wording (Decision 2) as a small
-formatting function consulted by both.
+formatting function consulted by both, gated on the `Backend::is_cloud()`
+accessor added in Phase 1.
 
 Deliverables:
 - `handle_status` change (`src/cli/mod.rs`)
@@ -710,8 +795,9 @@ Deliverables:
 
 Update both collision paths (pre-check and `SpawnErrorKind::Collision`
 handler) to open the colliding session's header, run the shared check, and
-append the same staleness clause to both -- see the Implicit Decision above
-for why both paths need it despite their base messages not being
+append the same staleness clause to both (wording gated on the same
+`Backend::is_cloud()` accessor from Phase 1) -- see the Implicit Decision
+above for why both paths need it despite their base messages not being
 byte-identical today.
 
 Deliverables:
