@@ -45,9 +45,11 @@ fn default_native() -> bool {
 /// Request-store (coordinator/operator) configuration.
 ///
 /// Carries the eight operator-tunable dimensions from Decision 4 of
-/// DESIGN-koto-request-store. Each field has a built-in default and
-/// is independently overridable via TOML, env-var, or (for
-/// `redelegation_cap`) a per-tick CLI flag on `koto next`.
+/// DESIGN-koto-request-store, plus the two request-lifecycle bounds
+/// from Decision 9 of DESIGN-request-lifecycle. Each field has a
+/// built-in default and is independently overridable via TOML,
+/// env-var, or (for `redelegation_cap`) a per-tick CLI flag on
+/// `koto next`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct RequestStoreConfig {
     #[serde(default = "default_stale_claim_timeout_seconds")]
@@ -66,6 +68,24 @@ pub struct RequestStoreConfig {
     pub directive_batch_size: u32,
     #[serde(default = "default_respawn_generation_cap")]
     pub respawn_generation_cap: u32,
+    /// Progress appends accepted on a single request leg before the
+    /// store rejects further ones
+    /// (DESIGN-request-lifecycle.md Decision 9).
+    ///
+    /// Operator-tunable because the right ceiling depends on how
+    /// chatty an operator's delegates are; rejecting rather than
+    /// truncating keeps the ordering guarantee intact.
+    #[serde(default = "default_request_leg_append_cap")]
+    pub request_leg_append_cap: u32,
+    /// Legs a single request may declare at creation
+    /// (DESIGN-request-lifecycle.md Decision 9).
+    ///
+    /// Load-bearing rather than hygiene: every append re-reads the
+    /// whole request log under the exclusive lock, so an unbounded leg
+    /// count would make append cost — and lock hold time — grow with
+    /// the record.
+    #[serde(default = "default_request_leg_cap")]
+    pub request_leg_cap: u32,
     /// Reserved-but-ignored namespace for V1.1 recursion-cap promotion.
     /// V1 runtime caps are hard-coded in `src/engine/caps.rs`; values
     /// supplied under `[request_store.recursion]` are accepted by the
@@ -87,6 +107,8 @@ impl Default for RequestStoreConfig {
             compact_lock_timeout_seconds: default_compact_lock_timeout_seconds(),
             directive_batch_size: default_directive_batch_size(),
             respawn_generation_cap: default_respawn_generation_cap(),
+            request_leg_append_cap: default_request_leg_append_cap(),
+            request_leg_cap: default_request_leg_cap(),
             recursion: None,
         }
     }
@@ -115,6 +137,12 @@ fn default_directive_batch_size() -> u32 {
 }
 fn default_respawn_generation_cap() -> u32 {
     2
+}
+fn default_request_leg_append_cap() -> u32 {
+    256
+}
+fn default_request_leg_cap() -> u32 {
+    256
 }
 
 /// Session-related configuration.
@@ -181,6 +209,10 @@ pub fn get_value(config: &KotoConfig, key: &str) -> Option<String> {
         "request_store.respawn_generation_cap" => {
             Some(config.request_store.respawn_generation_cap.to_string())
         }
+        "request_store.request_leg_append_cap" => {
+            Some(config.request_store.request_leg_append_cap.to_string())
+        }
+        "request_store.request_leg_cap" => Some(config.request_store.request_leg_cap.to_string()),
         "workflows.native" => Some(config.workflows.native.to_string()),
         _ => None,
     }
@@ -225,6 +257,8 @@ pub fn set_value_in_toml(doc: &mut toml::Value, key: &str, value: &str) -> Resul
         | "request_store.compact_lock_timeout_seconds"
         | "request_store.directive_batch_size"
         | "request_store.respawn_generation_cap"
+        | "request_store.request_leg_append_cap"
+        | "request_store.request_leg_cap"
         | "request_store.redelegation_cap" => {
             let field = key.strip_prefix("request_store.").unwrap();
             let parsed: i64 = value
@@ -323,6 +357,8 @@ pub fn unset_value_in_toml(doc: &mut toml::Value, key: &str) -> Result<bool, Str
         | "request_store.compact_lock_timeout_seconds"
         | "request_store.directive_batch_size"
         | "request_store.respawn_generation_cap"
+        | "request_store.request_leg_append_cap"
+        | "request_store.request_leg_cap"
         | "request_store.redelegation_cap" => {
             let field = key.strip_prefix("request_store.").unwrap();
             if let Some(rs) = table.get_mut("request_store") {
@@ -376,6 +412,8 @@ pub const ALL_KEYS: &[&str] = &[
     "request_store.compact_lock_timeout_seconds",
     "request_store.directive_batch_size",
     "request_store.respawn_generation_cap",
+    "request_store.request_leg_append_cap",
+    "request_store.request_leg_cap",
     "workflows.native",
 ];
 
@@ -429,6 +467,8 @@ mod tests {
         assert_eq!(rs.compact_lock_timeout_seconds, 3600);
         assert_eq!(rs.directive_batch_size, 50);
         assert_eq!(rs.respawn_generation_cap, 2);
+        assert_eq!(rs.request_leg_append_cap, 256);
+        assert_eq!(rs.request_leg_cap, 256);
         assert!(rs.recursion.is_none());
     }
 
@@ -566,6 +606,34 @@ mod tests {
         assert_eq!(cfg.request_store.compact_lock_timeout_seconds, 7200);
         assert_eq!(cfg.request_store.directive_batch_size, 100);
         assert_eq!(cfg.request_store.respawn_generation_cap, 3);
+    }
+
+    #[test]
+    fn test_set_value_request_store_request_lifecycle_bounds() {
+        // The two DESIGN-request-lifecycle Decision 9 bounds ride the
+        // existing `[request_store]` table rather than a new one.
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        set_value_in_toml(&mut doc, "request_store.request_leg_append_cap", "64").unwrap();
+        set_value_in_toml(&mut doc, "request_store.request_leg_cap", "8").unwrap();
+        let cfg: KotoConfig = doc.clone().try_into().unwrap();
+        assert_eq!(cfg.request_store.request_leg_append_cap, 64);
+        assert_eq!(cfg.request_store.request_leg_cap, 8);
+
+        assert_eq!(
+            get_value(&cfg, "request_store.request_leg_append_cap"),
+            Some("64".to_string())
+        );
+        assert_eq!(
+            get_value(&cfg, "request_store.request_leg_cap"),
+            Some("8".to_string())
+        );
+
+        assert!(unset_value_in_toml(&mut doc, "request_store.request_leg_cap").unwrap());
+        let cfg: KotoConfig = doc.try_into().unwrap();
+        assert_eq!(
+            cfg.request_store.request_leg_cap, 256,
+            "back to the default"
+        );
     }
 
     #[test]

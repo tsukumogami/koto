@@ -150,6 +150,12 @@ fn apply_request_store_env_overrides(rs: &mut RequestStoreConfig) {
     if let Some(v) = env_parse::<u32>("KOTO_REQUEST_STORE_RESPAWN_GENERATION_CAP") {
         rs.respawn_generation_cap = v;
     }
+    if let Some(v) = env_parse::<u32>("KOTO_REQUEST_STORE_REQUEST_LEG_APPEND_CAP") {
+        rs.request_leg_append_cap = v;
+    }
+    if let Some(v) = env_parse::<u32>("KOTO_REQUEST_STORE_REQUEST_LEG_CAP") {
+        rs.request_leg_cap = v;
+    }
 }
 
 fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
@@ -261,6 +267,13 @@ fn merge_config(target: &mut KotoConfig, source: &LoadedConfig) {
             "respawn_generation_cap" => {
                 target.request_store.respawn_generation_cap =
                     source.config.request_store.respawn_generation_cap;
+            }
+            "request_leg_append_cap" => {
+                target.request_store.request_leg_append_cap =
+                    source.config.request_store.request_leg_append_cap;
+            }
+            "request_leg_cap" => {
+                target.request_store.request_leg_cap = source.config.request_store.request_leg_cap;
             }
             _ => {}
         }

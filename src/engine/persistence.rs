@@ -16,12 +16,54 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::engine::errors::EngineError;
 use crate::engine::types::{
     Event, EventPayload, MachineState, StateFileHeader, CURRENT_SCHEMA_VERSION,
 };
+
+/// What a log's first line must be able to tell the reader.
+///
+/// koto now has two log families — the session state file and the
+/// request record under `~/.koto/requests/` — that share the JSONL
+/// envelope, the sequence discipline, and the truncated-final-line
+/// recovery but NOT the header type. Generifying the reader over this
+/// trait rather than copying it keeps the sequence-gap validation and
+/// the tail recovery in exactly one place
+/// (DESIGN-request-lifecycle.md Decision 1).
+///
+/// The version gate is part of the trait rather than left to the
+/// caller because it has to run *before* the events are parsed: a log
+/// written by a newer koto must fail at line one with a version error
+/// rather than at line forty with a mystery.
+pub trait LogHeader: DeserializeOwned {
+    /// The `schema_version` recorded on this header line.
+    fn schema_version(&self) -> u32;
+    /// The highest `schema_version` this build can read for this log
+    /// family. Each family versions independently.
+    fn max_supported_schema_version() -> u32;
+}
+
+impl LogHeader for StateFileHeader {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+    fn max_supported_schema_version() -> u32 {
+        CURRENT_SCHEMA_VERSION
+    }
+}
+
+/// Serialize one header line (no trailing newline).
+///
+/// The single definition of "what a header line looks like on disk",
+/// shared by the append path and by callers that buffer a header plus
+/// their first events into one atomic write.
+pub fn serialize_header_line<H: Serialize>(header: &H) -> anyhow::Result<String> {
+    serde_json::to_string(header).map_err(|e| anyhow::anyhow!("failed to serialize header: {}", e))
+}
 
 /// Write the header line to a new state file.
 ///
@@ -36,6 +78,13 @@ use crate::engine::types::{
 /// fsync with `EINVAL`; we tolerate that for parity with the existing
 /// pattern in `discovery.rs`.
 pub fn append_header(path: &Path, header: &StateFileHeader) -> anyhow::Result<()> {
+    append_header_line(path, header)
+}
+
+/// Header-type-generic form of [`append_header`].
+///
+/// Same durability discipline; see that function's doc comment.
+pub fn append_header_line<H: Serialize>(path: &Path, header: &H) -> anyhow::Result<()> {
     let is_first_write = !path.exists();
 
     let mut opts = OpenOptions::new();
@@ -51,8 +100,7 @@ pub fn append_header(path: &Path, header: &StateFileHeader) -> anyhow::Result<()
         .open(path)
         .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
 
-    let line = serde_json::to_string(header)
-        .map_err(|e| anyhow::anyhow!("failed to serialize header: {}", e))?;
+    let line = serialize_header_line(header)?;
 
     writeln!(file, "{}", line)
         .map_err(|e| anyhow::anyhow!("failed to write header to {}: {}", path.display(), e))?;
@@ -485,6 +533,15 @@ fn read_last_seq(path: &Path) -> anyhow::Result<u64> {
 /// Parses the first line as a `StateFileHeader`. If it doesn't parse,
 /// the file is treated as corrupted.
 pub fn read_header(path: &Path) -> anyhow::Result<StateFileHeader> {
+    read_header_only(path)
+}
+
+/// Header-type-generic form of [`read_header`]: parse the first line
+/// and stop.
+///
+/// Used by the request store's listing walk, which must not pay for a
+/// full replay of every request just to answer an identity filter.
+pub fn read_header_only<H: LogHeader>(path: &Path) -> anyhow::Result<H> {
     let file = std::fs::File::open(path)
         .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
 
@@ -505,14 +562,18 @@ pub fn read_header(path: &Path) -> anyhow::Result<StateFileHeader> {
     parse_header(trimmed)
 }
 
-/// Parse a header line as a `StateFileHeader`.
-fn parse_header(first_line: &str) -> anyhow::Result<StateFileHeader> {
-    let header = serde_json::from_str::<StateFileHeader>(first_line)
+/// Parse a header line, rejecting a log written by a newer koto.
+///
+/// The version gate runs here — before any event is looked at — so a
+/// forward-incompatible log fails at line one rather than partway
+/// through a replay.
+fn parse_header<H: LogHeader>(first_line: &str) -> anyhow::Result<H> {
+    let header = serde_json::from_str::<H>(first_line)
         .map_err(|e| EngineError::StateFileCorrupted(format!("failed to parse header: {}", e)))?;
-    if header.schema_version > CURRENT_SCHEMA_VERSION {
+    if header.schema_version() > H::max_supported_schema_version() {
         return Err(EngineError::IncompatibleSchemaVersion {
-            found: header.schema_version,
-            max_supported: CURRENT_SCHEMA_VERSION,
+            found: header.schema_version(),
+            max_supported: H::max_supported_schema_version(),
         }
         .into());
     }
@@ -530,6 +591,44 @@ fn parse_header(first_line: &str) -> anyhow::Result<StateFileHeader> {
 /// - A malformed final line is recovered: events up to last valid are returned
 ///   with a warning to stderr
 pub fn read_events(path: &Path) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
+    read_log(path)
+}
+
+/// Whether a recovered truncated final line is announced on stderr.
+///
+/// A session log has one writer, so a truncated tail there means a
+/// crash and is worth a warning. A request log is multi-writer and is
+/// read lock-free on a two-second poll, so a reader racing a
+/// concurrent append hits the same condition legitimately — warning
+/// would turn normal operation into a stderr stream
+/// (DESIGN-request-lifecycle.md Decision 1, "reads must be quiet").
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TailReport {
+    Warn,
+    Quiet,
+}
+
+/// Header-type-generic form of [`read_events`].
+///
+/// This is the one implementation of the sequence-gap validation and
+/// the truncated-final-line recovery; both log families funnel through
+/// it (DESIGN-request-lifecycle.md Decision 1).
+pub fn read_log<H: LogHeader>(path: &Path) -> anyhow::Result<(H, Vec<Event>)> {
+    read_log_inner(path, TailReport::Warn)
+}
+
+/// [`read_log`] with the truncated-final-line warning suppressed.
+///
+/// For lock-free readers of a multi-writer log, where a torn tail is an
+/// expected race rather than evidence of a crash.
+pub fn read_log_quiet<H: LogHeader>(path: &Path) -> anyhow::Result<(H, Vec<Event>)> {
+    read_log_inner(path, TailReport::Quiet)
+}
+
+fn read_log_inner<H: LogHeader>(
+    path: &Path,
+    report: TailReport,
+) -> anyhow::Result<(H, Vec<Event>)> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
 
@@ -575,12 +674,15 @@ pub fn read_events(path: &Path) -> anyhow::Result<(StateFileHeader, Vec<Event>)>
             }
             Err(e) => {
                 if is_last_line {
-                    // Truncated final line: recoverable. Warn and return what we have.
-                    eprintln!(
-                        "warning: truncated final line in {}, recovering: {}",
-                        path.display(),
-                        e
-                    );
+                    // Truncated final line: recoverable. Return what we
+                    // have, announcing it only when the caller asked.
+                    if report == TailReport::Warn {
+                        eprintln!(
+                            "warning: truncated final line in {}, recovering: {}",
+                            path.display(),
+                            e
+                        );
+                    }
                     break;
                 } else {
                     // Non-final malformed line: corruption.
