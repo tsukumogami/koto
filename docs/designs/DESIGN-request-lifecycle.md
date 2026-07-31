@@ -1131,6 +1131,19 @@ the transient class would itself be a correctness hazard.
 - A bound delegate can read its whole request, including sibling legs. That is
   intended, but it means an opaque identifier prevents enumeration and nothing
   more — it does not hide the coordinator from a delegate.
+- **Request-scoped abandon is not fenced, while leg-scoped abandon is.** The
+  leg-scoped verb is fenced because it triggers the directive splice; the
+  request-scoped verb triggers the same splice for every open leg and has no
+  single epoch to compare against. A delegate that knows its own request id can
+  therefore abandon the whole request. Closing this needs an authorization
+  notion — issued-by matching the coordinator of record — which is a semantic
+  addition this change does not make, so it is recorded rather than papered
+  over.
+- **A deferred cleanup after a failed promotion has no retry.** On a retryable
+  IO or lock failure the terminal tick skips cleanup so a later tick can finish
+  the job, but nothing re-ticks a completed child, so the session directory
+  leaks. The parent event has already landed by then, so the leak is the whole
+  cost; a workspace prune reclaims it.
 - Appends to different legs of one request briefly serialize, which is why R73
   was corrected.
 - The delegate's leg pointer is denormalized onto its header and can lag the
