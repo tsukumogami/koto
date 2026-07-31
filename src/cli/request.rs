@@ -804,6 +804,21 @@ fn parse_object_flag(
 /// a future epoch rejects alongside a stale one, which catches a
 /// spawner that bakes the wrong value.
 fn fence(leg: &LegView, presented: Option<u32>) -> Result<(), RequestError> {
+    // Key on the binding, not on the epoch's presence. A bound leg with
+    // no recorded epoch would otherwise be silently unfenced — the
+    // engine's `BindLeg::dispatch_epoch` is an `Option` and nothing in
+    // the type ties it to `child_session_id`, so reject the combination
+    // loudly rather than letting a writer through.
+    if leg.bound_child.is_some() && leg.bound_epoch.is_none() {
+        return Err(RequestError::new(
+            RequestErrorCode::EpochFenceViolation,
+            format!(
+                "leg '{}' is bound but carries no dispatch epoch, so it cannot be fenced",
+                leg.name
+            ),
+        )
+        .with_detail(&leg.name, "bound without a recorded epoch"));
+    }
     let Some(expected) = leg.bound_epoch else {
         return Ok(());
     };

@@ -1355,7 +1355,31 @@ pub fn bind_leg(
         reject_closed_leg(view, leg)?;
         if let Some(bound) = &leg.bound_child {
             if bound == &bind.child_session_id {
-                return Ok(None);
+                // Same child, same epoch: the caller asked for a state
+                // that already holds.
+                if leg.bound_epoch == bind.dispatch_epoch {
+                    return Ok(None);
+                }
+                // Same child, DIFFERENT epoch: a redelegation bumped the
+                // child's epoch in place on the same session id, so the
+                // recorded epoch is now stale. Re-record it.
+                //
+                // Treating this as a no-op would invert the fence: the
+                // freshly-dispatched agent presents the new epoch and is
+                // rejected forever, while the displaced agent still
+                // holding the old one is admitted — the exact reversal
+                // the fence exists to prevent, with no recovery path.
+                return Ok(Some(PendingAppend {
+                    payload: EventPayload::RequestLegBound {
+                        request_id: view.header.request_id.clone(),
+                        leg_name: bind.leg_name.clone(),
+                        child_session_id: bind.child_session_id.clone(),
+                        dispatch_epoch: bind.dispatch_epoch,
+                        issued_by: bind.issued_by.clone(),
+                    },
+                    timestamp: bind.timestamp.clone(),
+                    hash: None,
+                }));
             }
             return Err(RequestStoreError::LegBoundToDifferentChild {
                 request_id: view.header.request_id.clone(),

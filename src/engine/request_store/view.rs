@@ -47,6 +47,15 @@ pub struct LegView {
     /// mutating paths fence against this rather than against the
     /// child's header, which disappears on the child's terminal tick
     /// while this record outlives it.
+    ///
+    /// Never serialized. koto compares against it; nobody is handed it.
+    /// The leg pointer a delegate reads deliberately omits the epoch so
+    /// a displaced agent cannot present the current value — and emitting
+    /// it in `koto request get` would hand back exactly what the pointer
+    /// withholds, one command later. Same-uid readers can still open the
+    /// log, so this is confused-agent hygiene rather than a boundary,
+    /// but koto should not do the work for them.
+    #[serde(skip_serializing)]
     pub bound_epoch: Option<u32>,
     pub result: Option<WorkflowResult>,
     /// Whether the result was promoted from a bound child's terminal

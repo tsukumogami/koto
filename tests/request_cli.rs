@@ -259,6 +259,16 @@ fn fenceable_child(dir: &Path, parent: &str, child: &str, dispatch_epoch: u32) {
     .unwrap();
 }
 
+/// Advance an existing child's dispatch epoch in place, the way a
+/// redelegation does: same session id, bumped epoch.
+fn redelegate(dir: &Path, child: &str, new_epoch: u32) {
+    koto::engine::claim::rewrite_header_atomically(&child_state_path(dir, child), |mut h| {
+        h.dispatch_epoch = new_epoch;
+        h
+    })
+    .unwrap();
+}
+
 /// The common shape: one parent and one child at the given epoch.
 fn bindable(dir: &Path, child: &str, dispatch_epoch: u32) {
     init_parent(dir, "coord-a");
@@ -801,6 +811,101 @@ fn every_failure_exit_status_is_zero_one_two_or_three() {
 // ===== Issue 7: bind, progress, resolve =====
 
 #[test]
+fn rebinding_the_same_child_at_a_new_epoch_refreshes_the_fence() {
+    // A redelegation bumps the child's epoch in place on the same
+    // session id. If rebinding were a flat no-op, the recorded epoch
+    // would go stale and the fence would invert: the freshly-dispatched
+    // agent presenting the new epoch is rejected forever while the
+    // displaced agent still holding the old one is admitted. There is
+    // no recovery path from that, so the rebind has to re-record.
+    let tmp = TempDir::new().unwrap();
+    let id = create(tmp.path(), TWO_LEGS);
+    bindable(tmp.path(), "child-a", 0);
+    let child = "child-a";
+
+    run_ok(
+        tmp.path(),
+        &[
+            "request",
+            "bind",
+            &id,
+            "reviewer-a",
+            "--child",
+            child,
+            "--dispatch-epoch",
+            "0",
+        ],
+    );
+
+    // The original agent, at epoch 0, is inside the fence.
+    run_ok(
+        tmp.path(),
+        &[
+            "request",
+            "progress",
+            &id,
+            "reviewer-a",
+            "--with-data",
+            r#"{"step":"before"}"#,
+            "--dispatch-epoch",
+            "0",
+        ],
+    );
+
+    // Redelegation: the child's epoch advances in place.
+    redelegate(tmp.path(), child, 1);
+    let rebind = run_ok(
+        tmp.path(),
+        &[
+            "request",
+            "bind",
+            &id,
+            "reviewer-a",
+            "--child",
+            child,
+            "--dispatch-epoch",
+            "1",
+        ],
+    );
+    assert_eq!(
+        rebind["written"], true,
+        "a rebind at a new epoch must append, not no-op"
+    );
+
+    // The live agent is now inside the fence...
+    run_ok(
+        tmp.path(),
+        &[
+            "request",
+            "progress",
+            &id,
+            "reviewer-a",
+            "--with-data",
+            r#"{"step":"after"}"#,
+            "--dispatch-epoch",
+            "1",
+        ],
+    );
+
+    // ...and the displaced one is locked out.
+    let (code, error) = run_err(
+        tmp.path(),
+        &[
+            "request",
+            "progress",
+            &id,
+            "reviewer-a",
+            "--with-data",
+            r#"{"step":"stale"}"#,
+            "--dispatch-epoch",
+            "0",
+        ],
+    );
+    assert_eq!(code, 2);
+    assert_eq!(error, "epoch_fence_violation");
+}
+
+#[test]
 fn bind_binds_and_is_idempotent_for_the_same_pair() {
     let tmp = TempDir::new().unwrap();
     let id = create(tmp.path(), TWO_LEGS);
@@ -824,7 +929,15 @@ fn bind_binds_and_is_idempotent_for_the_same_pair() {
     );
     assert_eq!(first["written"], true);
     assert_eq!(first["legs"]["reviewer-a"]["bound_child"], "child-1");
-    assert_eq!(first["legs"]["reviewer-a"]["bound_epoch"], 3);
+    // The recorded epoch is deliberately withheld from the envelope:
+    // emitting it here would hand back exactly what the leg pointer
+    // omits, one command later, and let a displaced agent present the
+    // current value. Its presence is proved by the fence accepting it
+    // below, not by reading it out.
+    assert!(
+        first["legs"]["reviewer-a"].get("bound_epoch").is_none(),
+        "the envelope must not publish the fenced epoch"
+    );
     let revision = first["revision"].as_u64().unwrap();
 
     let second = run_ok(
@@ -994,7 +1107,41 @@ fn bind_records_the_childs_own_epoch_and_refuses_a_disagreeing_one() {
         tmp.path(),
         &["request", "bind", &id, "reviewer-a", "--child", "child-1"],
     );
-    assert_eq!(envelope["legs"]["reviewer-a"]["bound_epoch"], 7);
+    assert!(
+        envelope["legs"]["reviewer-a"].get("bound_epoch").is_none(),
+        "the envelope must not publish the fenced epoch"
+    );
+
+    // The header's epoch (7) is what got recorded — proved by the fence,
+    // which is the only thing that reads it.
+    let (code, error) = run_err(
+        tmp.path(),
+        &[
+            "request",
+            "progress",
+            &id,
+            "reviewer-a",
+            "--with-data",
+            r#"{"step":"one"}"#,
+            "--dispatch-epoch",
+            "0",
+        ],
+    );
+    assert_eq!(code, 2);
+    assert_eq!(error, "epoch_fence_violation");
+    run_ok(
+        tmp.path(),
+        &[
+            "request",
+            "progress",
+            &id,
+            "reviewer-a",
+            "--with-data",
+            r#"{"step":"one"}"#,
+            "--dispatch-epoch",
+            "7",
+        ],
+    );
 }
 
 #[test]
