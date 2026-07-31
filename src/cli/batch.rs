@@ -49,6 +49,7 @@ use crate::cli::task_spawn_error::TaskSpawnError;
 use crate::engine::batch_validation::TaskEntry;
 use crate::engine::persistence::derive_state_from_log;
 use crate::engine::scheduler_warning::SchedulerWarning;
+use crate::engine::template_source_status::{check_template_source_path, TemplateSourceStatus};
 use crate::engine::types::{
     ChildSnapshot, Event, EventPayload, SpawnEntrySnapshot, TerminalOutcome, WorkflowResult,
 };
@@ -869,19 +870,24 @@ pub(crate) fn run_batch_scheduler(
     // Resolve the parent's template source dir + submitter cwd once.
     let (template_source_dir, submitter_cwd) = resolution_context(backend, parent_name, events);
 
-    // Probe `template_source_dir.exists()` once per tick (AC5). The
-    // result is threaded through every per-task resolver call so the
-    // filesystem syscall is amortized across the whole submission.
+    // Probe `template_source_dir.exists()` once per tick (AC5), via the
+    // shared core check (`check_template_source_path`) so this call
+    // site and the other `template_source_dir` consumers agree on a
+    // single definition of "does this recorded directory exist, and on
+    // whose machine". The result is threaded through every per-task
+    // resolver call so the filesystem syscall is amortized across the
+    // whole submission.
+    let template_source_status: Option<TemplateSourceStatus> =
+        check_template_source_path(template_source_dir.as_deref());
     let template_source_dir_exists: Option<bool> =
-        template_source_dir.as_deref().map(|p| p.exists());
+        template_source_status.as_ref().map(|s| s.exists);
 
     // Emit per-tick warnings (MissingTemplateSourceDir /
     // StaleTemplateSourceDir) exactly once, here at the top of the
     // tick, rather than letting the per-task resolver accumulate
     // duplicates. This is the second half of AC5 + AC3.
     emit_template_source_dir_warnings(
-        template_source_dir.as_deref(),
-        template_source_dir_exists,
+        template_source_status.as_ref(),
         submitter_cwd.as_deref(),
         &mut warnings,
     );
@@ -1755,40 +1761,41 @@ fn accumulate_resolution_warnings(
 }
 
 /// Emit per-tick path-resolution warnings based on the single
-/// `template_source_dir.exists()` probe performed at the top of the
-/// tick. Issue #21 AC3 + AC5.
+/// `template_source_dir` status computed at the top of the tick via
+/// [`check_template_source_path`]. Issue #21 AC3 + AC5.
 ///
-/// - `template_source_dir == None` →
+/// - `template_source_status == None` →
 ///   [`SchedulerWarning::MissingTemplateSourceDir`]. Pre-feature
 ///   state files carry no base directory; the resolver silently falls
 ///   through to `submitter_cwd`, and agents see one warning per tick
-///   telling them why.
-/// - `template_source_dir == Some(p)` but `base_exists == Some(false)`
-///   → [`SchedulerWarning::StaleTemplateSourceDir`]. Cross-machine
+///   telling them why. `check_template_source_path` only returns
+///   `None` when it was given no path to check, so this arm fires
+///   exactly when `template_source_dir` itself is `None`.
+/// - `template_source_status == Some(status)` but `!status.exists` →
+///   [`SchedulerWarning::StaleTemplateSourceDir`]. Cross-machine
 ///   migration left the path behind; emit once with the recorded
-///   base, the current machine identifier, and the directory the
-///   scheduler is actually using (typically `submitter_cwd`, or the
-///   recorded base as a best-effort when `submitter_cwd` is absent).
-/// - Otherwise (base is live or was never configured beyond the
-///   `None` case above) no warning is emitted here.
+///   base, the machine identifier the shared check attached, and the
+///   directory the scheduler is actually using (typically
+///   `submitter_cwd`, or the recorded base as a best-effort when
+///   `submitter_cwd` is absent).
+/// - Otherwise (base is live) no warning is emitted here.
 fn emit_template_source_dir_warnings(
-    template_source_dir: Option<&std::path::Path>,
-    base_exists: Option<bool>,
+    template_source_status: Option<&TemplateSourceStatus>,
     submitter_cwd: Option<&std::path::Path>,
     warnings: &mut Vec<SchedulerWarning>,
 ) {
-    match template_source_dir {
+    match template_source_status {
         None => {
             warnings.push(SchedulerWarning::MissingTemplateSourceDir);
         }
-        Some(base) => {
-            if base_exists == Some(false) {
+        Some(status) => {
+            if !status.exists {
                 let fallback = submitter_cwd
                     .map(std::path::Path::to_path_buf)
-                    .unwrap_or_else(|| base.to_path_buf());
+                    .unwrap_or_else(|| status.path.clone());
                 warnings.push(SchedulerWarning::StaleTemplateSourceDir {
-                    path: base.to_string_lossy().into_owned(),
-                    machine_id: crate::engine::path_resolution::current_machine_id(),
+                    path: status.path.to_string_lossy().into_owned(),
+                    machine_id: status.machine_id.clone(),
                     falling_back_to: fallback,
                 });
             }
