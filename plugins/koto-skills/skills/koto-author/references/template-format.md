@@ -177,6 +177,17 @@ A few `--with-data` field values are reserved by koto and rejected at parse time
 
 Both rejections surface as `invalid_submission` with a `reserved`-flavored message before any disk write.
 
+### Reserved event-type namespaces
+
+Two prefixes in koto's wire namespace are koto-owned. They're separate namespaces, and confusing them is easy:
+
+- **`request_store.`** — the evidence-`kind` family described just above, plus the `request_store.result` event. This one the CLI actively rejects on submission.
+- **`request.`** — the event types the request store writes on a request's own log: `request.created`, `request.leg_bound`, `request.leg_progress`, `request.leg_result`, `request.leg_abandoned`, `request.closed`. koto owns the whole prefix, not just those six.
+
+Templates don't write event types, so there's nothing to reject at compile time — which is exactly why it's worth saying. Don't author a template, a tool, or a downstream consumer that emits or expects a `request.*` event of its own invention: the six variants are a closed enumeration, koto adds to it as the request lifecycle grows, and a name you pick today can collide with one koto ships tomorrow. A reader on an older koto build deserializes an unrecognized `request.*` type to `Unknown` and keeps going rather than erroring, so a collision degrades silently instead of failing loudly.
+
+If your workflow needs to record something about a request, record it through `koto request progress` (an ordered append that belongs to the leg) or as ordinary evidence on your own session — not as a new event type.
+
 ### Field types
 
 | Type | Requires | Notes |

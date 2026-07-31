@@ -24,8 +24,44 @@ the durable record of what they can rely on.
 The constant lives at `koto::engine::types::CURRENT_SCHEMA_VERSION`.
 It encodes the maximum wire-format version koto knows how to read; a
 state file whose `schema_version` exceeds the constant rejects with
-`EngineError::IncompatibleSchemaVersion`. The constant's value is
-bumped under one of three rules:
+`EngineError::IncompatibleSchemaVersion`. That check runs in
+`parse_header`, on line one, before any event is looked at.
+
+The constant is still 1, and has been since the event-log format was
+introduced. Its value moves under one of three rules.
+
+### The rule: additive change does NOT bump the constant
+
+An earlier version of this document said an additive change raises the
+constant by 1. That was wrong in both directions — it contradicts what
+the crate has actually done, and following it would break the very
+consumers this contract protects.
+
+Practice first: several additive `EventPayload` variants and several
+additive `StateFileHeader` fields have shipped with the constant
+unmoved. The worked examples further down this page say so themselves.
+
+The reason is where the version gate sits. Because it fires at the
+header line, a bumped constant makes an entire log unreadable to any
+older build — including the events it could have read perfectly well,
+and including the header fields it would have quietly defaulted to
+`None`. So bumping on an additive change would convert the graceful
+degradation the additive rules are designed around into a hard error:
+instead of an old reader parsing a new log and landing unrecognized
+events in `Unknown { type_name, raw_payload }`, it would refuse the
+file outright with `IncompatibleSchemaVersion`. The additive rules and
+a bump are alternatives, not companions.
+
+The operative test is therefore not "did the wire format change" but
+"can a reader that predates the change still make sense of the file":
+
+- **Bump** when it cannot — a new *required* event type the reader must
+  dispatch on, a required field removed from an existing event type, or
+  a change to the event envelope keys (`seq`, `timestamp`, `type`,
+  `payload`).
+- **Leave it alone** when it can — any new `EventPayload` variant, any
+  new `Option<T>` header field carrying `#[serde(default)]`, any change
+  that an older reader either skips or degrades on.
 
 ### Patch releases — `CURRENT_SCHEMA_VERSION` rises by **0**
 
@@ -33,16 +69,15 @@ The vast majority of patch-level changes do NOT alter the wire format:
 bugfixes, performance improvements, internal refactors, dependency
 bumps, and additive doc updates all leave the constant untouched.
 
-### Minor releases — `CURRENT_SCHEMA_VERSION` rises by **0 or 1**
+### Minor releases — `CURRENT_SCHEMA_VERSION` rises by **0**
 
 Minor releases are permitted to introduce additive evolution to the
 wire format under the rules in
 [`StateFileHeader` additive evolution](#statefileheader-additive-evolution)
 and [`EventPayload` additive variants](#eventpayload-additive-variants).
-When an additive change ships, the constant rises by 1; when no
-wire-format change ships, the constant stays put. Additive changes
-that ship in the same release MAY be batched under a single version
-bump.
+None of that evolution moves the constant, by the rule above. A minor
+release that needed to move it would be carrying a change that isn't
+additive, which belongs in a major release instead.
 
 ### Major releases — `CURRENT_SCHEMA_VERSION` rises by **1+**, with a 6-week deprecation window
 
@@ -192,6 +227,23 @@ Round-trip is byte-identical: `Event::Serialize` writes back the
 original `type_name` and `raw_payload`. A koto 1.5 reader can parse a
 koto 1.6 event log without losing data — the new variants survive
 in the `Unknown` form and a future upgrade re-decodes them losslessly.
+
+The `Unknown` arm has existed since v0.9.0. A build at v0.8.4 or
+earlier has no catch-all and hard-errors on an unrecognized event
+type, so that release is the back-compat floor for this guarantee.
+
+### Worked example: the `request.` family
+
+The six `request.`-prefixed variants shipped as an additive change
+with `CURRENT_SCHEMA_VERSION` left at 1, and a test asserts it. An
+older build reading a request-lifecycle log lands those events in
+`Unknown` and keeps going; had the constant moved, the same build
+would have rejected the file at its header line instead.
+
+Request logs carry their own version constant,
+`request_store::REQUEST_SCHEMA_VERSION`, deliberately independent of
+this one. Coupling them would mean a session-format change made every
+request log unreadable to the older build.
 
 ---
 

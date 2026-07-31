@@ -322,6 +322,8 @@ mod tests {
             last_event_at: None,
             salient_var: None,
             is_unreadable: false,
+            is_batch_task: false,
+            is_request_leg: false,
         }
     }
 

@@ -716,100 +716,22 @@ fn migrate_if_needed(base: &Path) {
 }
 
 /// Atomically move `src` to `dst` with "fail if destination exists"
-/// semantics. On Linux this uses `renameat2(RENAME_NOREPLACE)`; on
-/// other Unixes it uses POSIX `link()` followed by `unlink()`, falling
-/// back to plain `rename()` on `EXDEV`. On non-Unix platforms it falls
-/// back to a best-effort check-then-rename (not strictly atomic).
+/// semantics.
 ///
-/// When the destination already exists, returns `SessionError::Collision`
-/// so callers can distinguish races from other I/O failures without
-/// inspecting the underlying `io::Error`.
-#[cfg(target_os = "linux")]
+/// The platform code lives in [`crate::engine::atomic_fs`] because the
+/// request store needs the identical primitive and the engine must not
+/// reach into the session layer. This wrapper only maps the neutral
+/// error into the session vocabulary: a pre-existing destination
+/// becomes `SessionError::Collision` so callers can distinguish races
+/// from other I/O failures without inspecting the underlying
+/// `io::Error`.
 fn atomic_create_rename(src: &Path, dst: &Path) -> Result<(), SessionError> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
+    use crate::engine::atomic_fs::AtomicCreateError;
 
-    let src_c = CString::new(src.as_os_str().as_bytes()).map_err(|e| {
-        SessionError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("src path contains NUL: {}", e),
-        ))
-    })?;
-    let dst_c = CString::new(dst.as_os_str().as_bytes()).map_err(|e| {
-        SessionError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("dst path contains NUL: {}", e),
-        ))
-    })?;
-
-    // SAFETY: We pass valid C strings and AT_FDCWD semantics on both
-    // ends. `syscall` returns -1 on error and sets errno.
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            src_c.as_ptr(),
-            libc::AT_FDCWD,
-            dst_c.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if ret == 0 {
-        return Ok(());
-    }
-
-    // `From<io::Error> for SessionError` routes AlreadyExists to the
-    // Collision variant; every other errno becomes SessionError::Io.
-    Err(SessionError::from(std::io::Error::last_os_error()))
-}
-
-/// Non-Linux Unix fallback: POSIX `link()` + `unlink()`.
-///
-/// `link()` fails with `EEXIST` when the destination already exists,
-/// which gives us the same fail-if-exists semantics as
-/// `RENAME_NOREPLACE`. On `EXDEV` (cross-device — shouldn't happen
-/// because the tempfile is created in the session dir) we fall back to
-/// plain `rename()`, accepting a non-atomic window in that extreme case.
-#[cfg(all(unix, not(target_os = "linux")))]
-fn atomic_create_rename(src: &Path, dst: &Path) -> Result<(), SessionError> {
-    match fs::hard_link(src, dst) {
-        Ok(()) => {
-            // Link succeeded; drop the original name.
-            fs::remove_file(src).map_err(SessionError::Io)?;
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(SessionError::Collision),
-        Err(e) => {
-            // EXDEV (cross-device) is reported as Other/Uncategorized on
-            // most Rust versions. Retry with plain rename, which
-            // tolerates EXDEV. Rename replaces the destination if it
-            // exists, so we check first; a racing writer could still
-            // slip in, but this branch only triggers in pathological
-            // cross-filesystem setups.
-            let is_exdev = e
-                .raw_os_error()
-                .map(|code| code == libc::EXDEV)
-                .unwrap_or(false);
-            if is_exdev {
-                if dst.exists() {
-                    return Err(SessionError::Collision);
-                }
-                fs::rename(src, dst).map_err(SessionError::Io)
-            } else {
-                Err(SessionError::Io(e))
-            }
-        }
-    }
-}
-
-/// Non-Unix fallback (e.g., Windows test builds). Best-effort
-/// check-then-rename with a non-atomic window.
-#[cfg(not(unix))]
-fn atomic_create_rename(src: &Path, dst: &Path) -> Result<(), SessionError> {
-    if dst.exists() {
-        return Err(SessionError::Collision);
-    }
-    fs::rename(src, dst).map_err(SessionError::Io)
+    crate::engine::atomic_fs::atomic_create_rename(src, dst).map_err(|e| match e {
+        AtomicCreateError::Collision => SessionError::Collision,
+        AtomicCreateError::Io(e) => SessionError::from(e),
+    })
 }
 
 /// Ensure the `.koto` ancestor directory exists with mode 0700.

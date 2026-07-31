@@ -378,10 +378,21 @@ tamper evidence.
 
 ### Negative
 
-- Old koto binaries cannot read JSONL logs that contain `context_added` events. The
-  `EventPayload` untagged enum has no catch-all variant, so deserialization of an
-  unknown variant fails. This is forward-compatibility breakage (old reader + new log),
-  not backward-compatibility breakage, and is outside the PRD's compatibility scope.
+- koto binaries at v0.8.4 and earlier cannot read JSONL logs that contain
+  `context_added` events. Those builds hard-error on an unrecognized event type.
+  This is forward-compatibility breakage (old reader + new log), not
+  backward-compatibility breakage, and is outside the PRD's compatibility scope.
+
+  A previous revision of this document generalized that to "the `EventPayload` enum
+  has no catch-all variant." It does have one, and has since v0.9.0:
+  `EventPayload::Unknown { type_name, raw_payload }`, reached by the total final arm
+  of `Event`'s hand-written `Deserialize` impl. That impl reads the `type` field
+  first and matches it against the known variant names; anything unmatched becomes
+  `Unknown`, preserving the original type string and raw payload verbatim so a later
+  build with the variant defined re-decodes the same file losslessly. So from v0.9.0
+  onward an unrecognized event degrades gracefully instead of failing the read, and
+  v0.8.4 is the back-compat floor for this consequence rather than "old koto" in
+  general.
 - `handle_add`'s signature grows by one parameter. Any future call sites for
   `handle_add` must supply `&dyn SessionBackend`. Currently there is exactly one call
   site; adding a second requires the same plumbing.
@@ -394,6 +405,9 @@ tamper evidence.
 - The `ContextAdded` forward-compatibility break is mitigated by the single-PR delivery
   requirement: all four fields ship together. Consumers who upgrade get the full schema
   at once; there is no intermediate state where some fields exist and others don't.
+  From v0.9.0 the `Unknown` arm mitigates it further: a reader that predates the
+  variant degrades rather than failing, so only the v0.8.4-and-earlier floor is
+  actually broken.
 - A unit test for `generate_session_id()` verifies the version nibble, variant bits,
   and hyphenated format, catching RFC 4122 implementation errors before they reach
   production logs.

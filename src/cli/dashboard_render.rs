@@ -19,7 +19,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::cli::dashboard_data::{DetailData, Liveness, SessionTree};
-use crate::cli::dashboard_state::{DashboardAppState, DashboardTab, TaskCounts};
+use crate::cli::dashboard_state::{DashboardAppState, DashboardTab, Membership, TaskCounts};
 
 /// Maximum number of evidence entries rendered in the detail pane.
 const EVIDENCE_DISPLAY_CAP: usize = 3;
@@ -94,7 +94,7 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
     let rows_data = state.visible_rows();
 
     // Reserve 1 column for border and 1 for scrollbar on the right (2 total overhead).
-    // Column widths: State=12, Idle=9, Tasks=10, plus separators.
+    // Column widths: State=12, Idle=9, Children=10, plus separators.
     // Name fills the remaining space via Constraint::Min(0).
     let widths: Vec<Constraint> = vec![
         Constraint::Min(0),
@@ -121,7 +121,12 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
     }
 
     for row in &rows_data {
-        let name_cell = format!("{}{}", row.connector, row.display_name);
+        let name_cell = format!(
+            "{}{}{}",
+            row.connector,
+            row.display_name,
+            membership_badge(row.membership)
+        );
 
         let state_cell = row.state.as_deref().unwrap_or("-").to_string();
         let elapsed_cell = format!(
@@ -167,7 +172,11 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
         Cell::from("Name").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("State").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Idle").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Tasks").style(Style::default().add_modifier(Modifier::BOLD)),
+        // `Children`, not `Tasks`: the count below it is derived from
+        // parent-workflow parentage and never from the batch view, so the
+        // old name implied batch semantics it never had
+        // (DESIGN-request-lifecycle.md Decision 7).
+        Cell::from("Children").style(Style::default().add_modifier(Modifier::BOLD)),
     ]);
 
     let table = Table::new(rows, widths)
@@ -382,6 +391,22 @@ fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
+/// The badge suffix for a row's membership, or an empty string when the
+/// session belongs to no container.
+///
+/// A badge and a count answer different questions: the count says how many
+/// children a session has, the badge says which containers the session itself
+/// belongs to. A session that is both a batch task and a request leg gets one
+/// badge reading `both`, never two counts.
+fn membership_badge(membership: Membership) -> &'static str {
+    match membership {
+        Membership::None => "",
+        Membership::Batch => " [batch]",
+        Membership::Leg => " [leg]",
+        Membership::Both => " [both]",
+    }
+}
+
 /// Format `TaskCounts` into a compact string, or return an empty string for leaf sessions.
 fn format_task_counts(counts: Option<&TaskCounts>) -> String {
     match counts {
@@ -446,7 +471,7 @@ mod tests {
     fn render_frame_list_mode_header_row_present() {
         let state = empty_state();
         // Use width=100 so the horizontal split gives the list pane ~40 columns,
-        // enough to show all four header columns (Name, State, Elapsed, Tasks).
+        // enough to show all four header columns (Name, State, Elapsed, Children).
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render_frame(f, &state)).unwrap();
@@ -536,6 +561,8 @@ mod tests {
                 last_event_at: None,
                 salient_var: None,
                 is_unreadable: false,
+                is_batch_task: false,
+                is_request_leg: false,
             },
         );
 
@@ -816,6 +843,8 @@ mod tests {
                 last_event_at: Some(SystemTime::now()),
                 salient_var: None,
                 is_unreadable: false,
+                is_batch_task: false,
+                is_request_leg: false,
             },
         );
         state.tree.roots = vec!["my-workflow".to_string()];
@@ -1092,6 +1121,8 @@ mod tests {
             last_event_at,
             salient_var: None,
             is_unreadable: false,
+            is_batch_task: false,
+            is_request_leg: false,
         }
     }
 
@@ -1213,6 +1244,177 @@ mod tests {
             list.contains("Nothing needs you"),
             "all-clear row must render when needs-you band is empty; got: {:?}",
             &list[..list.len().min(400)]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // I13: membership badges and the Children column
+    // -----------------------------------------------------------------------
+
+    /// An active session with the given parentage and memberships.
+    fn membership_session(
+        parent: Option<&str>,
+        is_batch_task: bool,
+        is_request_leg: bool,
+    ) -> crate::cli::dashboard_data::CachedSession {
+        let mut session = render_session(
+            Some("work-on"),
+            Some("implement"),
+            None,
+            false,
+            false,
+            Some(std::time::SystemTime::now()),
+        );
+        session.header.parent_workflow = parent.map(|p| p.to_string());
+        session.is_batch_task = is_batch_task;
+        session.is_request_leg = is_request_leg;
+        session
+    }
+
+    /// Render a one-root tree at list-only width and return the whole pane.
+    fn render_tree_to_string(state: &DashboardAppState) -> String {
+        let backend = TestBackend::new(78, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        region_to_string(&buffer, 0..24, 0..78)
+    }
+
+    #[test]
+    fn the_child_count_column_is_headed_children() {
+        let state = empty_state();
+        let backend = TestBackend::new(78, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let header = region_to_string(&buffer, 1..2, 0..78);
+        assert!(
+            header.contains("Children"),
+            "the count column header should read 'Children'; got: {header:?}"
+        );
+        assert!(
+            !header.contains("Tasks"),
+            "'Tasks' implied batch semantics the count never had; got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn a_batch_task_renders_a_batch_badge() {
+        let mut state = DashboardAppState::new(500);
+        state
+            .tree
+            .sessions
+            .insert("task".to_string(), membership_session(None, true, false));
+        state.tree.roots = vec!["task".to_string()];
+
+        let list = render_tree_to_string(&state);
+        assert!(
+            list.contains("[batch]") && !list.contains("[leg]") && !list.contains("[both]"),
+            "a batch task's row carries the batch badge alone; got: {:?}",
+            &list[..list.len().min(400)]
+        );
+    }
+
+    #[test]
+    fn a_bound_leg_renders_a_leg_badge() {
+        let mut state = DashboardAppState::new(500);
+        state
+            .tree
+            .sessions
+            .insert("leg".to_string(), membership_session(None, false, true));
+        state.tree.roots = vec!["leg".to_string()];
+
+        let list = render_tree_to_string(&state);
+        assert!(
+            list.contains("[leg]") && !list.contains("[batch]") && !list.contains("[both]"),
+            "a bound leg's row carries the leg badge alone; got: {:?}",
+            &list[..list.len().min(400)]
+        );
+    }
+
+    #[test]
+    fn a_session_in_no_container_renders_no_badge() {
+        let mut state = DashboardAppState::new(500);
+        state
+            .tree
+            .sessions
+            .insert("plain".to_string(), membership_session(None, false, false));
+        state.tree.roots = vec!["plain".to_string()];
+
+        let list = render_tree_to_string(&state);
+        assert!(
+            !list.contains('['),
+            "an unaffiliated session gets no badge at all; got: {:?}",
+            &list[..list.len().min(400)]
+        );
+    }
+
+    #[test]
+    fn a_batch_task_that_is_also_a_leg_renders_one_count_and_a_both_badge() {
+        // The R66 case: dual membership must be stated on one row rather
+        // than implied by a second count. The count itself stays what it
+        // has always been -- the number of child sessions.
+        let mut state = DashboardAppState::new(500);
+        state
+            .tree
+            .sessions
+            .insert("coord".to_string(), membership_session(None, true, true));
+        state.tree.sessions.insert(
+            "child".to_string(),
+            membership_session(Some("coord"), false, false),
+        );
+        state.tree.roots = vec!["coord".to_string()];
+
+        let list = render_tree_to_string(&state);
+        assert!(
+            list.contains("[both]"),
+            "dual membership renders one 'both' badge; got: {:?}",
+            &list[..list.len().min(400)]
+        );
+        assert!(
+            !list.contains("[batch]") && !list.contains("[leg]"),
+            "the 'both' badge replaces the single-container badges; got: {:?}",
+            &list[..list.len().min(400)]
+        );
+        assert_eq!(
+            list.matches("0/1 done").count(),
+            1,
+            "one count per surface, over the session set only; got: {:?}",
+            &list[..list.len().min(400)]
+        );
+    }
+
+    #[test]
+    fn the_badge_does_not_disturb_the_count() {
+        // The badge is an attribute of the row, not an input to the count:
+        // the same tree renders the same count with and without membership.
+        let mut plain = DashboardAppState::new(500);
+        plain
+            .tree
+            .sessions
+            .insert("coord".to_string(), membership_session(None, false, false));
+        plain.tree.sessions.insert(
+            "child".to_string(),
+            membership_session(Some("coord"), false, false),
+        );
+        plain.tree.roots = vec!["coord".to_string()];
+
+        let mut member = DashboardAppState::new(500);
+        member
+            .tree
+            .sessions
+            .insert("coord".to_string(), membership_session(None, true, true));
+        member.tree.sessions.insert(
+            "child".to_string(),
+            membership_session(Some("coord"), false, false),
+        );
+        member.tree.roots = vec!["coord".to_string()];
+
+        let plain_rows = plain.visible_rows();
+        let member_rows = member.visible_rows();
+        assert_eq!(
+            plain_rows[0].task_counts, member_rows[0].task_counts,
+            "membership must not change how children are counted"
         );
     }
 }

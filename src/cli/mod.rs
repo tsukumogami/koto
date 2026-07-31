@@ -10,6 +10,7 @@ pub mod init_child;
 pub mod next;
 pub mod next_types;
 pub mod overrides;
+pub mod request;
 pub mod retry;
 pub mod session;
 pub mod task_spawn_error;
@@ -255,6 +256,18 @@ pub enum Command {
     Workspace {
         #[command(subcommand)]
         subcommand: WorkspaceCommand,
+    },
+
+    /// Request lifecycle verbs (create, bind, resolve, abandon, close)
+    ///
+    /// `--cli-contract` is declared here and marked global so it is
+    /// accepted on every subcommand in the group from one definition.
+    Request {
+        #[command(flatten)]
+        args: request::RequestGroupArgs,
+
+        #[command(subcommand)]
+        subcommand: request::RequestCommand,
     },
 
     /// Live terminal dashboard showing session hierarchy and state
@@ -730,7 +743,7 @@ fn handle_workflows_action(action: WorkflowsAction) -> Result<()> {
 }
 
 /// Build the local backend, honoring `KOTO_SESSIONS_BASE` for testing.
-fn build_local_backend() -> Result<LocalBackend> {
+pub(crate) fn build_local_backend() -> Result<LocalBackend> {
     if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
         Ok(LocalBackend::with_base_dir(PathBuf::from(base)))
     } else {
@@ -1271,6 +1284,10 @@ pub fn run(app: App) -> Result<()> {
                 }
             }
         }
+        // `handle` never returns: it prints an envelope and exits, so
+        // the exit mapping for the whole noun group lives in one place
+        // rather than at ten call sites.
+        Command::Request { args, subcommand } => request::handle(args, subcommand),
         Command::Context { subcommand } => {
             let backend = build_backend()?;
             let store: &dyn ContextStore = &backend;
@@ -2184,8 +2201,10 @@ fn project_terminal_outcome(compiled: &CompiledTemplate, final_state: &str) -> T
 /// terminal tick — and the same atomic `O_APPEND` discipline
 /// ([`SessionBackend::append_event`]) — that the terminal evidence and
 /// the `ChildCompleted` notification already use. The result is
-/// synthesized from data the completion path already holds via
-/// [`synthesize_workflow_result`], so no extra agent step is required.
+/// synthesized once by [`finish_terminal_tick`] via
+/// [`synthesize_workflow_result`] and passed by reference here, so the
+/// child's log, the request leg's promotion, and the parent's
+/// `ChildCompleted` all carry the same envelope.
 ///
 /// Returns `true` when the event was durably appended, which is exactly
 /// the condition under which the terminal-index entry may set
@@ -2197,13 +2216,11 @@ fn project_terminal_outcome(compiled: &CompiledTemplate, final_state: &str) -> T
 fn append_request_store_result_to_child(
     backend: &dyn SessionBackend,
     child_name: &str,
-    compiled: &CompiledTemplate,
-    final_state: &str,
-    child_events: &[Event],
+    result: &WorkflowResult,
 ) -> bool {
-    let outcome = project_terminal_outcome(compiled, final_state);
-    let result = synthesize_workflow_result(outcome, final_state, child_events);
-    let payload = EventPayload::RequestStoreResult { result };
+    let payload = EventPayload::RequestStoreResult {
+        result: result.clone(),
+    };
     match backend.append_event(child_name, &payload, &now_iso8601()) {
         Ok(_) => true,
         Err(e) => {
@@ -2295,7 +2312,7 @@ fn append_child_completed_to_parent(
     child_header: &crate::engine::types::StateFileHeader,
     compiled: &CompiledTemplate,
     final_state: &str,
-    child_events: &[Event],
+    result: &WorkflowResult,
 ) -> ChildCompletedAppend {
     let parent_name = match child_header.parent_workflow.as_deref() {
         Some(p) => p,
@@ -2321,19 +2338,17 @@ fn append_child_completed_to_parent(
         child_name.to_string()
     };
 
-    // Auto-promote the child's result from the same terminal evidence
-    // and outcome projection the completion path already holds, and
-    // carry a copy on the parent's log so the converge gate can read it
-    // after the child session is auto-cleaned
-    // (DESIGN-request-store-converge.md Decision 3).
-    let result = synthesize_workflow_result(outcome, final_state, child_events);
-
+    // Carry a copy of the auto-promoted result on the parent's log so
+    // the converge gate can read it after the child session is
+    // auto-cleaned (DESIGN-request-store-converge.md Decision 3). The
+    // envelope is synthesized once by [`finish_terminal_tick`] and
+    // shared with the child-log append and the leg promotion.
     let payload = EventPayload::ChildCompleted {
         child_name: child_name.to_string(),
         task_name,
         outcome,
         final_state: final_state.to_string(),
-        result: Some(result),
+        result: Some(result.clone()),
     };
     match backend.append_event(parent_name, &payload, &now_iso8601()) {
         Ok(_) => ChildCompletedAppend::Notified,
@@ -2396,6 +2411,386 @@ fn append_terminal_index_for_session(
             "warning: terminal-index append failed for {}: {}",
             session_id, e
         );
+    }
+}
+
+// ===========================================================
+// The terminal tick: one completion block, two call sites
+// ===========================================================
+
+/// Everything a session does on the tick that lands it in a terminal
+/// state, in the order DESIGN-request-lifecycle.md Decision 6 fixes:
+///
+/// 1. Synthesize the [`WorkflowResult`] envelope once, so the three
+///    writes below cannot disagree about what the child answered.
+/// 2. Append `request_store.result` to the child's own log.
+/// 3. **Promote** the envelope onto the bound leg's request log.
+/// 4. Write the terminal-index entry carrying the done-bit from 2.
+/// 5. Append `ChildCompleted` to the parent's log.
+/// 6. Auto-clean the child session.
+///
+/// Step 3 sits before 4 because a crash after the index write would
+/// leave a permanently-skipped session with a forever-open leg, and
+/// before 5 because the coordinator's own directive is the canonical
+/// result read, so the request view must not lag it.
+///
+/// **Why this is a function and not two copies.** There are two terminal
+/// write sites in [`handle_next`] — the advance-loop completion path and
+/// the `koto next --to <terminal>` directed-transition path — and the
+/// sequence is identical on both. Adding promotion to only one of them
+/// would mean a directed transition to a terminal state writes the
+/// child's result, the index entry and the parent event, then deletes
+/// the session while the leg stays open forever.
+///
+/// **Why it re-reads.** The directed path's caller holds a
+/// pre-transition event list. Synthesizing a result from it would
+/// compute the child's answer from a stale log, so the re-read happens
+/// here rather than at either call site.
+///
+/// **Why only step 3 is hoisted out of the cleanup guard.** An
+/// already-terminal session ticked again returns immediately from the
+/// advance loop, so under `--no-cleanup` this block runs on every tick.
+/// Hoisting all four writes would append another child-log result,
+/// another index entry and another parent event per tick, unbounded, on
+/// a deliberately parked session — and existing tests are built on a
+/// parked terminal child *not* emitting the parent event. So promotion
+/// alone is hoisted, gated on the leg having no result yet, which makes
+/// a repeat tick a silent no-op rather than a warning per tick.
+#[cfg(unix)]
+fn finish_terminal_tick(
+    backend: &dyn SessionBackend,
+    name: &str,
+    header: &crate::engine::types::StateFileHeader,
+    compiled: &CompiledTemplate,
+    final_state: &str,
+    no_cleanup: bool,
+) {
+    // One `open` on a path almost no session has. Reading it before the
+    // events keeps a parked `--no-cleanup` tick on an unbound session
+    // from paying for a log re-read it has no use for.
+    let pointer = crate::engine::leg_pointer::read_pointer_best_effort(&backend.session_dir(name));
+    if no_cleanup && pointer.is_none() {
+        return;
+    }
+
+    // Re-read so the synthesized result reflects everything this tick
+    // appended, and so the index classifier sees a mid-tick
+    // `WorkflowCancelled`.
+    let post_events = backend
+        .read_events(name)
+        .map(|(_, ev)| ev)
+        .unwrap_or_default();
+    let outcome = project_terminal_outcome(compiled, final_state);
+    let result = synthesize_workflow_result(outcome, final_state, &post_events);
+
+    // Step 3, the child's own log. Stays under the cleanup guard: a
+    // parked session ticked repeatedly would otherwise append one of
+    // these per tick, unbounded.
+    let has_result = if no_cleanup {
+        false
+    } else {
+        append_request_store_result_to_child(backend, name, &result)
+    };
+
+    // Step 2 of the promotion ordering, and the one step hoisted out of
+    // the cleanup guard: a parked terminal session still resolves its
+    // leg, because the requester waiting on it has no way to know the
+    // session was parked. It sits after the child-log append so the
+    // result is already durable somewhere the child owns, and before the
+    // index write so a crash between them cannot leave a permanently
+    // skipped session with a forever-open leg.
+    let defer_for_promotion = match &pointer {
+        Some(pointer) => promote_leg_result(pointer, &result),
+        None => false,
+    };
+
+    if no_cleanup {
+        return;
+    }
+
+    append_terminal_index_for_session(backend, name, &post_events, has_result);
+    let append_result =
+        append_child_completed_to_parent(backend, name, header, compiled, final_state, &result);
+    let defer_for_parent = matches!(append_result, ChildCompletedAppend::AppendFailed);
+    if !defer_for_parent && !defer_for_promotion {
+        if let Err(e) = backend.cleanup(name) {
+            eprintln!("warning: session cleanup failed: {}", e);
+        }
+    }
+}
+
+/// Promote a bound leg's result onto its request log.
+///
+/// Returns `true` when cleanup must be deferred — a retryable failure,
+/// where leaving the session on disk gives the next tick something to
+/// retry from. This reuses the same lever the parent-notification
+/// append-failure path already pulls.
+///
+/// **The terminal tick can never fail here.** Structurally it cannot
+/// report one: the response envelope was printed before this ran and the
+/// block ends in a zero exit. So a closed request, an abandoned leg, and
+/// an unreachable record all warn on stderr and let the tick finish. An
+/// abandoned leg's late result is discoverable from the child's own log,
+/// where the `request_store.result` append already put it.
+///
+/// **No surviving session directory is required.** The envelope rides by
+/// value and the leg identity came off a pointer already read, so
+/// promotion is unaffected by the cleanup that follows it.
+#[cfg(unix)]
+fn promote_leg_result(
+    pointer: &crate::engine::leg_pointer::LegPointer,
+    result: &crate::engine::types::WorkflowResult,
+) -> bool {
+    use crate::engine::request_store::{self, RequestStoreError};
+
+    let Some(home) = dirs::home_dir() else {
+        eprintln!("warning: leg result promotion skipped: no home directory");
+        return false;
+    };
+    let root = home.join(".koto");
+    let request_id = match request_store::ValidatedRequestId::new(&pointer.request_id) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("warning: leg result promotion skipped: {e}");
+            return false;
+        }
+    };
+
+    // The "no result yet" gate. An unlocked read is enough: the store
+    // re-checks under the lock, and this read exists so a repeatedly
+    // ticked parked session is silent rather than warning once per tick.
+    match request_store::read_view(&root, &request_id) {
+        Ok(view) => match view.leg(&pointer.leg_name) {
+            Ok(leg) if leg.result.is_some() => return false,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("warning: leg result promotion skipped: {e}");
+                return false;
+            }
+        },
+        Err(e) => {
+            let retryable = matches!(e, RequestStoreError::Io { .. });
+            eprintln!("warning: leg result promotion skipped: {e}");
+            return retryable;
+        }
+    }
+
+    let promotion = request_store::record_result(
+        &root,
+        &request_id,
+        &request_store::LegResult {
+            leg_name: pointer.leg_name.clone(),
+            result: result.clone(),
+            source: crate::engine::types::LegResultSource::Promoted,
+            issued_by: None,
+            timestamp: now_iso8601(),
+        },
+    );
+    match promotion {
+        Ok(_) => false,
+        // Two writers reaching the same conclusion is not news.
+        Err(RequestStoreError::LegAlreadyResolved { .. }) => false,
+        Err(e) => {
+            let retryable = matches!(
+                e,
+                RequestStoreError::Io { .. } | RequestStoreError::LockContention { .. }
+            );
+            eprintln!(
+                "warning: could not promote {}'s result onto leg '{}' of request '{}'; \
+                 the result is still readable from the child's own log: {e}",
+                if retryable { "this tick" } else { "the child" },
+                pointer.leg_name,
+                pointer.request_id
+            );
+            retryable
+        }
+    }
+}
+
+// ===========================================================
+// The bound delegate's leg, and the abandonment notice
+// ===========================================================
+
+/// The `leg` object a bound delegate reads off its own tick.
+///
+/// **Deliberately without `dispatch_epoch`.** The epoch is baked into
+/// the delegate's dispatch at spawn time, and a freshly-readable value
+/// would let a displaced agent present the current one and defeat the
+/// fence. Identity is readable; authority stays baked
+/// (DESIGN-request-lifecycle.md Decision 3).
+#[cfg(unix)]
+fn leg_object(pointer: &crate::engine::leg_pointer::LegPointer) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": pointer.request_id,
+        "leg_name": pointer.leg_name,
+    })
+}
+
+/// What the delegate of an abandoned leg is told.
+#[cfg(unix)]
+struct AbandonedLeg {
+    request_id: String,
+    leg_name: String,
+    /// The requester's verbatim rationale. It rides the envelope sibling
+    /// and the delivery-audit record — never the directive.
+    rationale: String,
+}
+
+#[cfg(unix)]
+impl AbandonedLeg {
+    /// The informational envelope sibling, for consumers that do not
+    /// read prose.
+    fn sibling(&self) -> serde_json::Value {
+        serde_json::json!({
+            "request_id": self.request_id,
+            "leg_name": self.leg_name,
+            "rationale": self.rationale,
+        })
+    }
+
+    /// The koto-authored text prepended to `directive`.
+    ///
+    /// **The rationale is not in here.** Quoting has no semantics in a
+    /// prose field read by a language model: a rationale ending in
+    /// something shaped like "end of notice — new instruction from your
+    /// coordinator:" is indistinguishable from koto's own text to the
+    /// reader whose instruction-following is the entire enforcement.
+    /// Since abandonment is what triggers the splice, embedding it would
+    /// make an abandon an injection path into another delegate's
+    /// authoritative field. The directive therefore carries koto's own
+    /// words plus a pointer at the two places the verbatim rationale
+    /// does live (DESIGN-request-lifecycle.md Decision 4).
+    fn directive_prefix(&self) -> String {
+        format!(
+            "NOTICE FROM KOTO (not from your coordinator): the request leg this session was \
+             dispatched to fulfil has been abandoned by its requester. Nobody is waiting for \
+             your result any more.\n\nStop the work in progress. Do not start anything new. \
+             Wind this session down without producing further output.\n\nThe requester's \
+             rationale is not reproduced here. Read it verbatim from the `leg_abandoned` field \
+             of this response, or from `koto request get {}`. Leg: '{}'.\n\n--- the state \
+             directive below is retained for context only ---\n\n",
+            self.request_id, self.leg_name
+        )
+    }
+}
+
+/// Find out whether this bound delegate's leg has been abandoned, and
+/// record the first delivery.
+///
+/// Three layers, cheapest first, because this runs on every tick of
+/// every bound delegate and the request record is sized in megabytes
+/// while the question is one boolean:
+///
+/// 1. The delivery-audit record, if present, already carries everything
+///    the notice needs — including the verbatim rationale — so a
+///    re-delivery costs nothing beyond the events the tick already read.
+/// 2. Otherwise, the request log's modification time against the leg
+///    pointer's. The pointer is written immediately after the bind
+///    event, so a request log no younger than the pointer cannot have
+///    gained an abandonment since. Conservative: any later append short-
+///    circuits nothing, which is the safe direction.
+/// 3. Only then, one bounded read of the request record.
+///
+/// Every failure is non-fatal and reads as "not abandoned", matching the
+/// existing discovery scan. The delegate's workflow state is untouched
+/// either way — the advance loop is not gated on this.
+#[cfg(unix)]
+fn discover_abandoned_leg(
+    backend: &dyn SessionBackend,
+    name: &str,
+    pointer: &crate::engine::leg_pointer::LegPointer,
+    events: &[Event],
+) -> Option<AbandonedLeg> {
+    if let Some(delivered) = previously_delivered_notice(events) {
+        return Some(delivered);
+    }
+
+    let home = dirs::home_dir()?;
+    let root = home.join(".koto");
+    let request_id = crate::engine::request_store::ValidatedRequestId::new(&pointer.request_id)
+        .map_err(|e| eprintln!("warning: ignoring a leg pointer with an unusable id: {e}"))
+        .ok()?;
+
+    if let (Some(log_mtime), Some(pointer_mtime)) = (
+        crate::engine::request_store::log_mtime(&root, &request_id),
+        crate::engine::leg_pointer::pointer_mtime(&backend.session_dir(name)),
+    ) {
+        if log_mtime < pointer_mtime {
+            return None;
+        }
+    }
+
+    let view = match crate::engine::request_store::read_view(&root, &request_id) {
+        Ok(view) => view,
+        Err(e) => {
+            eprintln!("warning: could not check whether this session's leg was abandoned: {e}");
+            return None;
+        }
+    };
+    let leg = view.leg(&pointer.leg_name).ok()?;
+    if leg.disposition != crate::engine::types::LegDisposition::Abandoned {
+        return None;
+    }
+    let abandoned = AbandonedLeg {
+        request_id: pointer.request_id.clone(),
+        leg_name: pointer.leg_name.clone(),
+        rationale: leg.abandoned_rationale.clone().unwrap_or_default(),
+    };
+    record_notice_delivery(backend, name, &abandoned);
+    Some(abandoned)
+}
+
+/// Rebuild the notice from the delivery-audit record, if one is already
+/// on the delegate's log.
+#[cfg(unix)]
+fn previously_delivered_notice(events: &[Event]) -> Option<AbandonedLeg> {
+    events.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::EvidenceSubmitted { state, fields, .. }
+            if state == crate::engine::audit::ABANDON_NOTICE_STATE =>
+        {
+            let field = |key: &str| {
+                fields
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            Some(AbandonedLeg {
+                request_id: field("request_id"),
+                leg_name: field("leg_name"),
+                rationale: field("rationale"),
+            })
+        }
+        _ => None,
+    })
+}
+
+/// Append the delivery-audit record to the delegate's own log, once.
+///
+/// Written against the synthetic [`crate::engine::audit::ABANDON_NOTICE_STATE`]
+/// rather than the delegate's real state. That is load-bearing:
+/// [`synthesize_workflow_result`] lifts a summary and payload from the
+/// most recent evidence event whose state matches the final state, with
+/// no kind filter, so an audit record written against the real state
+/// would be promoted as the child's result on a terminal tick.
+#[cfg(unix)]
+fn record_notice_delivery(backend: &dyn SessionBackend, name: &str, abandoned: &AbandonedLeg) {
+    let timestamp = now_iso8601();
+    let payload = EventPayload::EvidenceSubmitted {
+        state: crate::engine::audit::ABANDON_NOTICE_STATE.to_string(),
+        fields: crate::engine::audit::abandon_notice_fields(
+            &abandoned.request_id,
+            &abandoned.leg_name,
+            &abandoned.rationale,
+            &timestamp,
+        ),
+        submitter_cwd: None,
+    };
+    if let Err(e) = backend.append_event(name, &payload, &timestamp) {
+        // Losing the audit costs an operator the ability to tell "never
+        // told" from "told and ignored". It does not cost the delegate
+        // the notice, which is already on its way out in the directive.
+        eprintln!("warning: could not record the abandonment-notice delivery: {e}");
     }
 }
 
@@ -2805,6 +3200,19 @@ fn handle_next(
     );
     runtime_vars.insert("SESSION_NAME".to_string(), name.clone());
 
+    // The leg pointer, read once for the whole tick: it gates the `leg`
+    // object, the abandonment notice, and the terminal tick's promotion.
+    // Almost no session carries one, and the read is a single `open` on
+    // a path that is not there (DESIGN-request-lifecycle.md Decision 3).
+    //
+    // The abandonment check is deliberately NOT hoisted alongside it:
+    // its first delivery appends a record to the child's log, and the
+    // epoch fence below must reject a displaced writer before any
+    // persistence call. Each directive funnel runs the check for itself,
+    // past the fence.
+    let leg_pointer =
+        crate::engine::leg_pointer::read_pointer_best_effort(&backend.session_dir(&name));
+
     // 4. Handle --to (directed transition) -- single-shot, no advancement loop
     if let Some(ref target) = to {
         let current_state = &machine_state.current_state;
@@ -2880,56 +3288,40 @@ fn handle_next(
                     let d = crate::cli::vars::substitute_vars(d, &runtime_vars);
                     variables.substitute(&d)
                 });
+                // The abandonment notice, spliced after classification
+                // and after variable substitution. Prepending
+                // caller-influenced text ahead of the substitution
+                // closure would expose it to `{{...}}` expansion, and
+                // the substitution helper is a sequential replace over a
+                // map rather than a single pass — so a value substituted
+                // early can be rescanned by a later key
+                // (DESIGN-request-lifecycle.md Decision 4).
+                //
+                // This path carries the notice but not the envelope
+                // sibling and not the `leg` object: it prints the
+                // response directly rather than through the advance
+                // loop's envelope map.
+                let abandoned_leg = leg_pointer
+                    .as_ref()
+                    .and_then(|p| discover_abandoned_leg(backend, &name, p, &events));
+                let resp = match &abandoned_leg {
+                    Some(a) => resp.with_directive_prefix(&a.directive_prefix()),
+                    None => resp,
+                };
                 println!("{}", serde_json::to_string(&resp)?);
                 // Auto-cleanup after output when reaching a terminal state.
                 if let next_types::NextResponse::Terminal {
                     state: final_state, ..
                 } = &resp
                 {
-                    if !no_cleanup {
-                        // Issue 3: append the durable `request_store.result`
-                        // event to the CHILD's OWN log BEFORE cleanup, on
-                        // the same terminal tick and under the same atomic
-                        // append discipline as the terminal evidence
-                        // (DESIGN-request-store-converge.md Decision 3,
-                        // AC1). The boolean it returns is the done-bit the
-                        // index entry records, preserving the "has_result
-                        // implies a durable result is readable" invariant.
-                        let has_result = append_request_store_result_to_child(
-                            backend,
-                            &name,
-                            &compiled,
-                            final_state,
-                            &events,
-                        );
-                        // Issue 8: append the terminal-index entry BEFORE
-                        // session cleanup so the workspace skip-list
-                        // observes the terminal transition. Best-effort
-                        // — a write failure here logs a warning and
-                        // falls through to cleanup; the next discovery
-                        // scan will read the header directly per the
-                        // header-is-truth rule.
-                        append_terminal_index_for_session(backend, &name, &events, has_result);
-                        // Issue #134: emit ChildCompleted to parent BEFORE
-                        // cleanup so the batch gate can observe outcomes
-                        // for children that auto-clean on terminal. When
-                        // the append fails we must leave the child on
-                        // disk so the parent's next tick can classify
-                        // it from the state file instead of losing it.
-                        let append_result = append_child_completed_to_parent(
-                            backend,
-                            &name,
-                            &header,
-                            &compiled,
-                            final_state,
-                            &events,
-                        );
-                        if !matches!(append_result, ChildCompletedAppend::AppendFailed) {
-                            if let Err(e) = backend.cleanup(&name) {
-                                eprintln!("warning: session cleanup failed: {}", e);
-                            }
-                        }
-                    }
+                    finish_terminal_tick(
+                        backend,
+                        &name,
+                        &header,
+                        &compiled,
+                        final_state,
+                        no_cleanup,
+                    );
                 }
                 std::process::exit(0);
             }
@@ -3015,6 +3407,12 @@ fn handle_next(
             );
         }
     }
+
+    // Past the fence, so a displaced writer is rejected before the
+    // notice's first delivery appends anything to the child's log.
+    let abandoned_leg = leg_pointer
+        .as_ref()
+        .and_then(|p| discover_abandoned_leg(backend, &name, p, &events));
 
     // 5. Handle --with-data (evidence submission)
     if let Some(ref data_str) = with_data {
@@ -3731,6 +4129,17 @@ fn handle_next(
                 let d = crate::cli::vars::substitute_vars(d, &runtime_vars);
                 variables.substitute(&d)
             });
+            // The abandonment notice, spliced after classification and
+            // after variable substitution so caller-influenced text is
+            // never exposed to `{{...}}` expansion. The `action` table
+            // and the gate-derived blocking conditions are untouched:
+            // this only prepends to `directive`, the one field the
+            // agent-facing skill declares authoritative
+            // (DESIGN-request-lifecycle.md Decision 4).
+            let resp = match &abandoned_leg {
+                Some(a) => resp.with_directive_prefix(&a.directive_prefix()),
+                None => resp,
+            };
 
             // Run the batch scheduler when the final state carries a
             // `materialize_children` hook. Fresh events reflect any
@@ -3984,6 +4393,17 @@ fn handle_next(
                 }
             }
 
+            // The bound delegate's own leg, and — when the requester
+            // stopped waiting — the mechanical sibling that covers the
+            // two response variants carrying no directive to splice
+            // into (DESIGN-request-lifecycle.md Decisions 3 and 4).
+            if let Some(pointer) = &leg_pointer {
+                envelope.insert("leg".to_string(), leg_object(pointer));
+            }
+            if let Some(abandoned) = &abandoned_leg {
+                envelope.insert("leg_abandoned".to_string(), abandoned.sibling());
+            }
+
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::Value::Object(envelope))?
@@ -3993,55 +4413,7 @@ fn handle_next(
                 state: final_state, ..
             } = &resp
             {
-                if !no_cleanup {
-                    // Issue 8: append terminal-index entry BEFORE cleanup
-                    // so the workspace skip-list observes the terminal
-                    // transition. Re-read the events so a mid-tick
-                    // WorkflowCancelled is reflected in the classifier.
-                    // Best-effort: a failure logs a warning, doesn't
-                    // block cleanup.
-                    // Re-read once and reuse: the terminal-index append
-                    // needs a WorkflowCancelled-aware classifier, and the
-                    // child-completed result synthesis reads the terminal
-                    // evidence from the same events.
-                    let post_events = backend
-                        .read_events(&name)
-                        .map(|(_, ev)| ev)
-                        .unwrap_or_default();
-                    // Issue 3: durable result on the child's OWN log,
-                    // appended BEFORE cleanup on the same terminal tick
-                    // (DESIGN-request-store-converge.md Decision 3, AC1).
-                    // The boolean is the index done-bit, preserving the
-                    // "has_result implies a durable result is readable"
-                    // invariant.
-                    let has_result = append_request_store_result_to_child(
-                        backend,
-                        &name,
-                        &compiled,
-                        final_state,
-                        &post_events,
-                    );
-                    append_terminal_index_for_session(backend, &name, &post_events, has_result);
-                    // Issue #134: emit ChildCompleted to parent BEFORE
-                    // cleanup so the batch gate can observe outcomes for
-                    // children that auto-clean on terminal. When the
-                    // append fails we must leave the child on disk so
-                    // the parent's next tick can classify it from the
-                    // state file instead of losing it.
-                    let append_result = append_child_completed_to_parent(
-                        backend,
-                        &name,
-                        &header,
-                        &compiled,
-                        final_state,
-                        &post_events,
-                    );
-                    if !matches!(append_result, ChildCompletedAppend::AppendFailed) {
-                        if let Err(e) = backend.cleanup(&name) {
-                            eprintln!("warning: session cleanup failed: {}", e);
-                        }
-                    }
-                }
+                finish_terminal_tick(backend, &name, &header, &compiled, final_state, no_cleanup);
             }
             std::process::exit(0);
         }
@@ -4475,6 +4847,21 @@ fn handle_status(backend: &dyn SessionBackend, name: &str) -> Result<()> {
     ) {
         let batch_json = crate::cli::batch_view::batch_view_to_json(&batch_view);
         response["batch"] = batch_json;
+    }
+
+    // Optional `leg` section — present when this session was bound to a
+    // request leg. Read-only mirror of what the session's own `koto
+    // next` carries, and without `dispatch_epoch` for the same reason:
+    // a readable epoch would let a displaced agent present the current
+    // value and defeat the fence
+    // (DESIGN-request-lifecycle.md Decision 3).
+    if let Some(pointer) =
+        crate::engine::leg_pointer::read_pointer_best_effort(&backend.session_dir(name))
+    {
+        response["leg"] = serde_json::json!({
+            "request_id": pointer.request_id,
+            "leg_name": pointer.leg_name,
+        });
     }
 
     // Superseded branches: list sessions whose name starts with
@@ -5455,8 +5842,16 @@ Done.
             states,
         };
 
-        let has_result =
-            append_request_store_result_to_child(&backend, "child", &compiled, "done", &events);
+        // The completion path synthesizes the envelope once and shares
+        // it with the leg promotion and the parent notification; this
+        // helper now takes the synthesized value rather than re-deriving
+        // it.
+        let synthesized = synthesize_workflow_result(
+            project_terminal_outcome(&compiled, "done"),
+            "done",
+            &events,
+        );
+        let has_result = append_request_store_result_to_child(&backend, "child", &synthesized);
         assert!(
             has_result,
             "a successful child-log append is the has_result done-bit"

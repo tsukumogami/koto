@@ -668,6 +668,104 @@ pub enum EventPayload {
     RequestStoreResult {
         result: WorkflowResult,
     },
+    /// Emitted on a request's own log when the request is created
+    /// (wire `type: "request.created"`).
+    ///
+    /// The `request.*` namespace is deliberately distinct from
+    /// `request_store.*`: the latter is also reserved as an
+    /// [`EvidenceSubmitted`](EventPayload::EvidenceSubmitted)
+    /// `fields.kind` prefix (see [`crate::engine::audit`]), and one
+    /// prefix must not denote two layers of the log format. The two
+    /// strings diverge at byte 7 (`.` vs `_`), so neither is a prefix
+    /// of the other under the audit module's `starts_with` check.
+    ///
+    /// `legs` is a [`BTreeMap`] rather than a `HashMap` so the
+    /// serialized form is byte-stable, which is what makes two reads of
+    /// an unchanged request compare equal.
+    RequestCreated {
+        request_id: String,
+        requested_by: String,
+        coordinator_of_record: String,
+        legs: BTreeMap<String, LegDeclaration>,
+        /// Shared context inputs for the whole request. Per-leg inputs
+        /// live on each [`LegDeclaration`]; this is the common context,
+        /// not the individual ask.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inputs: Option<serde_json::Value>,
+    },
+    /// Emitted when a leg is bound to a child session
+    /// (wire `type: "request.leg_bound"`).
+    ///
+    /// This event is authoritative for the binding; the mirrored
+    /// pointer on the child's own header is a best-effort denormalization
+    /// and is repairable from here.
+    ///
+    /// `dispatch_epoch` is captured from the child's header at bind time
+    /// and is what the leg's mutating paths fence against. Recording it
+    /// here rather than re-reading the child's header is deliberate: the
+    /// child's session is deleted on its terminal tick while this record
+    /// outlives it, so a header-based fence would go blind during exactly
+    /// the window a displaced agent may still be running. `None` only for
+    /// a child whose header carries no epoch, which `bind` rejects.
+    RequestLegBound {
+        request_id: String,
+        leg_name: String,
+        child_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatch_epoch: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issued_by: Option<String>,
+    },
+    /// A mid-flight progress append on a leg
+    /// (wire `type: "request.leg_progress"`).
+    ///
+    /// Repeatable and append-only: an append never overwrites a prior
+    /// one. `content` is a [`BTreeMap`] for the same byte-stability
+    /// reason as [`RequestCreated::legs`].
+    RequestLegProgress {
+        request_id: String,
+        leg_name: String,
+        content: BTreeMap<String, serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issued_by: Option<String>,
+    },
+    /// A leg's terminal answer (wire `type: "request.leg_result"`).
+    ///
+    /// Reuses [`WorkflowResult`] verbatim so a coordinator reads every
+    /// leg uniformly and a child-fulfilled leg needs no translation.
+    /// `source` records whether the result was promoted from a bound
+    /// child's terminal tick or recorded explicitly; it is recorded
+    /// rather than derived, so a later change to which paths may
+    /// resolve a leg cannot make old events retroactively ambiguous.
+    RequestLegResult {
+        request_id: String,
+        leg_name: String,
+        result: WorkflowResult,
+        source: LegResultSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issued_by: Option<String>,
+    },
+    /// A leg the requester stopped waiting on
+    /// (wire `type: "request.leg_abandoned"`).
+    ///
+    /// Abandonment has its own variant because it can ride neither
+    /// [`RequestLegResult`] (a [`WorkflowResult`] has no abandoned
+    /// status, and an abandoned leg rejects results) nor
+    /// [`RequestClosed`] (abandoning one leg leaves the rest open).
+    RequestLegAbandoned {
+        request_id: String,
+        leg_name: String,
+        rationale: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issued_by: Option<String>,
+    },
+    /// The request's terminal event (wire `type: "request.closed"`).
+    RequestClosed {
+        request_id: String,
+        disposition: CloseDisposition,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issued_by: Option<String>,
+    },
     /// Catch-all for event type strings not recognized by this koto version.
     ///
     /// Enables graceful degradation when reading logs produced by a newer
@@ -729,6 +827,81 @@ pub struct WorkflowResult {
     /// Optional structured detail. Omitted from the wire when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
+}
+
+/// What one leg of a request asks for.
+///
+/// Carries the fields the dispatch protocol requires of a child session
+/// that may be bound to this leg, supplied **per leg** rather than per
+/// request — a five-reviewer panel gives five roles and five briefs in
+/// one creation call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LegDeclaration {
+    /// Role identifier an assigning coordinator matches against.
+    pub role: String,
+    /// Template the bound child is materialized from.
+    pub template: String,
+    /// The individual ask for this leg.
+    pub inputs: serde_json::Value,
+}
+
+/// Which path recorded a leg's result.
+///
+/// Serialized as snake_case (`"promoted"`, `"explicit"`). `Promoted`
+/// means a bound child's terminal tick carried its own
+/// [`WorkflowResult`] onto the leg with no extra action; `Explicit`
+/// means the leg had no bound child and its creator recorded the result
+/// directly. The distinction is recorded rather than derived so a later
+/// change to which paths may resolve a leg cannot make existing events
+/// retroactively ambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegResultSource {
+    Promoted,
+    Explicit,
+}
+
+/// How a request ended.
+///
+/// Serialized as snake_case. Distinguishing these is what lets a
+/// coordinator close on partial results and have the log say so:
+/// `AllResolved` means every leg produced an answer,
+/// `ClosedWithAbandonedLegs` means the requester proceeded
+/// short-handed, and `RequestAbandoned` means the whole request was
+/// given up on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseDisposition {
+    AllResolved,
+    ClosedWithAbandonedLegs,
+    RequestAbandoned,
+}
+
+/// Where a leg stands, derived at replay time.
+///
+/// This is a **projection type**: it is never serialized into an event
+/// payload. Deriving it rather than storing it is what makes "the view
+/// cannot disagree with the log" structural rather than a discipline.
+///
+/// It is orthogonal to [`TerminalOutcome`], which lives *inside* a
+/// resolved leg's [`WorkflowResult`] — a leg that is `Resolved` with a
+/// `Failure` outcome is normal, not contradictory. It is deliberately
+/// not the batch scheduler's task outcome, whose pending, blocked, and
+/// spawn-failed values have no leg analogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegDisposition {
+    Open,
+    Resolved,
+    Abandoned,
+}
+
+/// Whether a request is still accepting leg activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestState {
+    Open,
+    Closed,
 }
 
 /// Reference to the event that superseded a stale `BatchFinalized`.
@@ -814,6 +987,12 @@ impl EventPayload {
             EventPayload::ChildCompleted { .. } => "child_completed",
             EventPayload::IntentUpdated { .. } => "intent_updated",
             EventPayload::RequestStoreResult { .. } => "request_store.result",
+            EventPayload::RequestCreated { .. } => "request.created",
+            EventPayload::RequestLegBound { .. } => "request.leg_bound",
+            EventPayload::RequestLegProgress { .. } => "request.leg_progress",
+            EventPayload::RequestLegResult { .. } => "request.leg_result",
+            EventPayload::RequestLegAbandoned { .. } => "request.leg_abandoned",
+            EventPayload::RequestClosed { .. } => "request.closed",
             EventPayload::Unknown { .. } => "unknown",
         }
     }
@@ -1070,6 +1249,68 @@ impl<'de> Deserialize<'de> for Event {
                     .map_err(serde::de::Error::custom)?;
                 EventPayload::RequestStoreResult { result: p.result }
             }
+            "request.created" => {
+                let p: RequestCreatedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::RequestCreated {
+                    request_id: p.request_id,
+                    requested_by: p.requested_by,
+                    coordinator_of_record: p.coordinator_of_record,
+                    legs: p.legs,
+                    inputs: p.inputs,
+                }
+            }
+            "request.leg_bound" => {
+                let p: RequestLegBoundPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::RequestLegBound {
+                    request_id: p.request_id,
+                    leg_name: p.leg_name,
+                    child_session_id: p.child_session_id,
+                    dispatch_epoch: p.dispatch_epoch,
+                    issued_by: p.issued_by,
+                }
+            }
+            "request.leg_progress" => {
+                let p: RequestLegProgressPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::RequestLegProgress {
+                    request_id: p.request_id,
+                    leg_name: p.leg_name,
+                    content: p.content,
+                    issued_by: p.issued_by,
+                }
+            }
+            "request.leg_result" => {
+                let p: RequestLegResultPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::RequestLegResult {
+                    request_id: p.request_id,
+                    leg_name: p.leg_name,
+                    result: p.result,
+                    source: p.source,
+                    issued_by: p.issued_by,
+                }
+            }
+            "request.leg_abandoned" => {
+                let p: RequestLegAbandonedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::RequestLegAbandoned {
+                    request_id: p.request_id,
+                    leg_name: p.leg_name,
+                    rationale: p.rationale,
+                    issued_by: p.issued_by,
+                }
+            }
+            "request.closed" => {
+                let p: RequestClosedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::RequestClosed {
+                    request_id: p.request_id,
+                    disposition: p.disposition,
+                    issued_by: p.issued_by,
+                }
+            }
             other => EventPayload::Unknown {
                 type_name: other.to_string(),
                 raw_payload: payload_val.clone(),
@@ -1225,6 +1466,63 @@ struct IntentUpdatedPayload {
 #[derive(Deserialize)]
 struct RequestStoreResultPayload {
     result: WorkflowResult,
+}
+
+#[derive(Deserialize)]
+struct RequestCreatedPayload {
+    request_id: String,
+    requested_by: String,
+    coordinator_of_record: String,
+    legs: BTreeMap<String, LegDeclaration>,
+    #[serde(default)]
+    inputs: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct RequestLegBoundPayload {
+    request_id: String,
+    leg_name: String,
+    child_session_id: String,
+    #[serde(default)]
+    dispatch_epoch: Option<u32>,
+    #[serde(default)]
+    issued_by: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RequestLegProgressPayload {
+    request_id: String,
+    leg_name: String,
+    content: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    issued_by: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RequestLegResultPayload {
+    request_id: String,
+    leg_name: String,
+    result: WorkflowResult,
+    source: LegResultSource,
+    #[serde(default)]
+    issued_by: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RequestLegAbandonedPayload {
+    request_id: String,
+    leg_name: String,
+    rationale: String,
+    #[serde(default)]
+    issued_by: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RequestClosedPayload {
+    request_id: String,
+    disposition: CloseDisposition,
+    #[serde(default)]
+    issued_by: Option<String>,
 }
 
 /// Metadata about a workflow, derived from the state file header.
@@ -2716,6 +3014,346 @@ mod tests {
             }
             other => panic!("expected RequestStoreResult, got {:?}", other),
         }
+    }
+
+    /// Build an `Event` around a request-family payload, using the
+    /// payload's own `type_name()` so the test cannot drift from the
+    /// wire-string mapping it is asserting against.
+    fn request_event(seq: u64, payload: EventPayload) -> Event {
+        Event {
+            seq,
+            timestamp: "2026-07-30T00:00:00Z".to_string(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        }
+    }
+
+    fn sample_legs() -> BTreeMap<String, LegDeclaration> {
+        let mut legs = BTreeMap::new();
+        legs.insert(
+            "reviewer-b".to_string(),
+            LegDeclaration {
+                role: "security".to_string(),
+                template: "review.md".to_string(),
+                inputs: serde_json::json!({"focus": "authz"}),
+            },
+        );
+        legs.insert(
+            "reviewer-a".to_string(),
+            LegDeclaration {
+                role: "correctness".to_string(),
+                template: "review.md".to_string(),
+                inputs: serde_json::json!({"focus": "logic"}),
+            },
+        );
+        legs
+    }
+
+    #[test]
+    fn request_family_wire_strings_are_in_the_request_namespace() {
+        let cases = [
+            (
+                EventPayload::RequestCreated {
+                    request_id: "r1".to_string(),
+                    requested_by: "coord".to_string(),
+                    coordinator_of_record: "coord".to_string(),
+                    legs: sample_legs(),
+                    inputs: None,
+                },
+                "request.created",
+            ),
+            (
+                EventPayload::RequestLegBound {
+                    request_id: "r1".to_string(),
+                    leg_name: "reviewer-a".to_string(),
+                    child_session_id: "child-1".to_string(),
+                    dispatch_epoch: Some(0),
+                    issued_by: None,
+                },
+                "request.leg_bound",
+            ),
+            (
+                EventPayload::RequestLegProgress {
+                    request_id: "r1".to_string(),
+                    leg_name: "reviewer-a".to_string(),
+                    content: BTreeMap::new(),
+                    issued_by: None,
+                },
+                "request.leg_progress",
+            ),
+            (
+                EventPayload::RequestLegResult {
+                    request_id: "r1".to_string(),
+                    leg_name: "reviewer-a".to_string(),
+                    result: WorkflowResult {
+                        status: TerminalOutcome::Success,
+                        summary: "done".to_string(),
+                        payload: None,
+                    },
+                    source: LegResultSource::Promoted,
+                    issued_by: None,
+                },
+                "request.leg_result",
+            ),
+            (
+                EventPayload::RequestLegAbandoned {
+                    request_id: "r1".to_string(),
+                    leg_name: "reviewer-a".to_string(),
+                    rationale: "stalled".to_string(),
+                    issued_by: None,
+                },
+                "request.leg_abandoned",
+            ),
+            (
+                EventPayload::RequestClosed {
+                    request_id: "r1".to_string(),
+                    disposition: CloseDisposition::AllResolved,
+                    issued_by: None,
+                },
+                "request.closed",
+            ),
+        ];
+
+        for (payload, expected) in cases {
+            assert_eq!(payload.type_name(), expected);
+            // The whole point of the separate namespace: no request-family
+            // wire string may collide with the reserved evidence-kind
+            // prefix, in either direction.
+            assert!(
+                !expected.starts_with("request_store."),
+                "{expected} must not sit under the reserved request_store. prefix"
+            );
+            assert!(
+                !"request_store.result"
+                    .starts_with(expected.split_once('.').expect("dotted wire string").0)
+                    || expected.starts_with("request."),
+                "namespace check is only meaningful for the request. family"
+            );
+        }
+    }
+
+    #[test]
+    fn request_created_round_trips_with_canonical_leg_order() {
+        let e = request_event(
+            1,
+            EventPayload::RequestCreated {
+                request_id: "r1".to_string(),
+                requested_by: "coord".to_string(),
+                coordinator_of_record: "coord".to_string(),
+                legs: sample_legs(),
+                inputs: Some(serde_json::json!({"pr": 42})),
+            },
+        );
+        let json = serde_json::to_string(&e).unwrap();
+        // Legs must serialize in canonical (sorted) order regardless of
+        // insertion order -- this is what makes two reads of an
+        // unchanged request byte-comparable.
+        let a_at = json.find("reviewer-a").expect("leg a present");
+        let b_at = json.find("reviewer-b").expect("leg b present");
+        assert!(a_at < b_at, "legs must serialize in sorted order");
+
+        let back: Event = serde_json::from_str(&json).unwrap();
+        match back.payload {
+            EventPayload::RequestCreated { legs, inputs, .. } => {
+                assert_eq!(legs.len(), 2);
+                assert_eq!(legs["reviewer-a"].role, "correctness");
+                assert_eq!(inputs.unwrap()["pr"], 42);
+            }
+            other => panic!("expected RequestCreated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn request_created_omits_absent_inputs() {
+        let e = request_event(
+            1,
+            EventPayload::RequestCreated {
+                request_id: "r1".to_string(),
+                requested_by: "coord".to_string(),
+                coordinator_of_record: "coord".to_string(),
+                legs: BTreeMap::new(),
+                inputs: None,
+            },
+        );
+        let val: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert!(
+            val["payload"].get("inputs").is_none(),
+            "absent shared inputs must be omitted so pre-feature logs round-trip"
+        );
+    }
+
+    #[test]
+    fn request_leg_result_records_its_source() {
+        for (source, wire) in [
+            (LegResultSource::Promoted, "promoted"),
+            (LegResultSource::Explicit, "explicit"),
+        ] {
+            let e = request_event(
+                2,
+                EventPayload::RequestLegResult {
+                    request_id: "r1".to_string(),
+                    leg_name: "reviewer-a".to_string(),
+                    result: WorkflowResult {
+                        status: TerminalOutcome::Failure,
+                        summary: "found a bug".to_string(),
+                        payload: Some(serde_json::json!({"count": 1})),
+                    },
+                    source,
+                    issued_by: Some("child-1".to_string()),
+                },
+            );
+            let json = serde_json::to_string(&e).unwrap();
+            let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(val["payload"]["source"], wire);
+            // A resolved leg carrying a failure outcome is normal: the
+            // outcome lives inside the result, not in the disposition.
+            assert_eq!(val["payload"]["result"]["status"], "failure");
+
+            let back: Event = serde_json::from_str(&json).unwrap();
+            match back.payload {
+                EventPayload::RequestLegResult { source: s, .. } => assert_eq!(s, source),
+                other => panic!("expected RequestLegResult, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn request_leg_progress_round_trips_ordered_content() {
+        let mut content = BTreeMap::new();
+        content.insert("step".to_string(), serde_json::json!("parsed"));
+        content.insert("files".to_string(), serde_json::json!(3));
+        let e = request_event(
+            3,
+            EventPayload::RequestLegProgress {
+                request_id: "r1".to_string(),
+                leg_name: "reviewer-a".to_string(),
+                content,
+                issued_by: None,
+            },
+        );
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(
+            json.find("files").unwrap() < json.find("step").unwrap(),
+            "progress content must serialize in sorted key order"
+        );
+        let back: Event = serde_json::from_str(&json).unwrap();
+        match back.payload {
+            EventPayload::RequestLegProgress { content, .. } => {
+                assert_eq!(content["files"], 3);
+                assert_eq!(content["step"], "parsed");
+            }
+            other => panic!("expected RequestLegProgress, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn request_closed_round_trips_every_disposition() {
+        for (disposition, wire) in [
+            (CloseDisposition::AllResolved, "all_resolved"),
+            (
+                CloseDisposition::ClosedWithAbandonedLegs,
+                "closed_with_abandoned_legs",
+            ),
+            (CloseDisposition::RequestAbandoned, "request_abandoned"),
+        ] {
+            let e = request_event(
+                4,
+                EventPayload::RequestClosed {
+                    request_id: "r1".to_string(),
+                    disposition,
+                    issued_by: None,
+                },
+            );
+            let json = serde_json::to_string(&e).unwrap();
+            let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(val["payload"]["disposition"], wire);
+            let back: Event = serde_json::from_str(&json).unwrap();
+            match back.payload {
+                EventPayload::RequestClosed { disposition: d, .. } => assert_eq!(d, disposition),
+                other => panic!("expected RequestClosed, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn request_leg_bound_and_abandoned_round_trip() {
+        let bound = request_event(
+            5,
+            EventPayload::RequestLegBound {
+                request_id: "r1".to_string(),
+                leg_name: "reviewer-a".to_string(),
+                child_session_id: "parent.reviewer-a".to_string(),
+                dispatch_epoch: Some(2),
+                issued_by: Some("coord".to_string()),
+            },
+        );
+        let back: Event = serde_json::from_str(&serde_json::to_string(&bound).unwrap()).unwrap();
+        match back.payload {
+            EventPayload::RequestLegBound {
+                child_session_id,
+                dispatch_epoch,
+                issued_by,
+                ..
+            } => {
+                assert_eq!(child_session_id, "parent.reviewer-a");
+                assert_eq!(dispatch_epoch, Some(2));
+                assert_eq!(issued_by.as_deref(), Some("coord"));
+            }
+            other => panic!("expected RequestLegBound, got {:?}", other),
+        }
+
+        let abandoned = request_event(
+            6,
+            EventPayload::RequestLegAbandoned {
+                request_id: "r1".to_string(),
+                leg_name: "reviewer-a".to_string(),
+                rationale: "no movement in an hour".to_string(),
+                issued_by: Some("coord".to_string()),
+            },
+        );
+        let back: Event =
+            serde_json::from_str(&serde_json::to_string(&abandoned).unwrap()).unwrap();
+        match back.payload {
+            EventPayload::RequestLegAbandoned { rationale, .. } => {
+                assert_eq!(rationale, "no movement in an hour");
+            }
+            other => panic!("expected RequestLegAbandoned, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unrecognized_request_namespace_type_falls_through_to_unknown() {
+        // Forward compatibility: a future koto may add
+        // `request.leg_reassigned`. This build must degrade to Unknown
+        // rather than failing the whole log read, which is what keeps
+        // an older build able to read a newer log.
+        let raw = r#"{"seq":7,"timestamp":"2026-07-30T00:00:00Z","type":"request.leg_reassigned","payload":{"request_id":"r1","leg_name":"a"}}"#;
+        let e: Event = serde_json::from_str(raw).unwrap();
+        match &e.payload {
+            EventPayload::Unknown {
+                type_name,
+                raw_payload,
+            } => {
+                assert_eq!(type_name, "request.leg_reassigned");
+                assert_eq!(raw_payload["leg_name"], "a");
+            }
+            other => panic!("expected Unknown, got {:?}", other),
+        }
+        // And the original type string survives re-serialization.
+        let json = serde_json::to_string(&e).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(val["type"], "request.leg_reassigned");
+    }
+
+    #[test]
+    fn adding_the_request_family_does_not_move_the_schema_version() {
+        // Bumping the constant would make every new log unreadable to an
+        // older koto at the header line, converting graceful degradation
+        // into a hard error. The request family is additive and rides the
+        // Unknown fallthrough instead.
+        assert_eq!(CURRENT_SCHEMA_VERSION, 1);
     }
 
     #[test]

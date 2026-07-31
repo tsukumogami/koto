@@ -102,6 +102,32 @@
         "Response reads the result inline from the gate output's `children[]` array (the `result` object), not from a separate command",
         "Response does NOT suggest running `koto status coord.task-1`, `koto next coord.task-1`, or `koto query coord.task-1` to obtain the result"
       ]
+    },
+    {
+      "id": 9,
+      "name": "request-leg-result-read-precedence",
+      "prompt": "I'm coordinating a koto workflow called 'plan-exec'. I created a koto request with three legs and bound each one to a child session that an agent is working on. Right now `koto next plan-exec` returns:\n```json\n{\"action\":\"gate_blocked\",\"state\":\"await_children\",\"directive\":\"Waiting on the three implementation children.\",\"blocking_conditions\":[{\"name\":\"children-done\",\"type\":\"children-complete\",\"status\":\"failed\",\"category\":\"temporal\",\"agent_actionable\":true,\"output\":{\"total\":3,\"completed\":1,\"pending\":2,\"all_complete\":false,\"results_in\":false,\"outstanding\":[\"plan-exec.b\",\"plan-exec.c\"],\"error\":\"\"}}],\"advanced\":false}\n```\nI want each child's status, summary, and payload. Should I loop on `koto request get <request-id>` until all three legs resolve and read the results from the request view?",
+      "expected_output": "Agent says no: for a bound leg the coordinator reads each child's result from its own `koto next` directive -- the `children-complete` gate output's `children[*].result` array once `results_in` is true -- and re-ticks `koto next plan-exec` rather than polling the request view for the final results. It explains the request view is for mid-flight progress, partial fan-out state, cross-session reads, and restart recovery.",
+      "files": [],
+      "assertions": [
+        "Response tells the agent to read each child's result from its own `koto next` output (the `children-complete` gate output / `blocking_conditions[0].output.children[*].result`), not from the request view",
+        "Response advises against polling `koto request get` in a loop to obtain the final results",
+        "Response explains what the request view IS for -- at least one of: mid-flight progress, partial fan-out state, cross-session reads, restart recovery",
+        "Response does NOT suggest running `koto next` or `koto query` against the child sessions to learn what they produced"
+      ]
+    },
+    {
+      "id": 10,
+      "name": "bound-leg-resolves-by-promotion",
+      "prompt": "I'm a dispatched subagent driving the koto session 'review-443'. `koto next review-443` returned:\n```json\n{\"action\":\"evidence_required\",\"state\":\"review\",\"directive\":\"Review the PR and record your verdict.\",\"expects\":{\"fields\":{\"verdict\":{\"type\":\"enum\",\"required\":true,\"values\":[\"approve\",\"reject\"]}}},\"blocking_conditions\":[],\"leg\":{\"request_id\":\"req-9f1c2b7a-4d3e-4c5f-8a1b-2c3d4e5f6071\",\"leg_name\":\"review\"},\"advanced\":true}\n```\nI've finished the review and I'm approving. Should I run `koto request resolve req-9f1c2b7a-4d3e-4c5f-8a1b-2c3d4e5f6071 review --with-data '{\"status\":\"success\",\"summary\":\"approved\"}'` to report my verdict on the leg, and then finish my workflow?",
+      "expected_output": "Agent says no: the leg is bound to this session, so its result is promoted automatically from the session's terminal tick. The agent submits its evidence with `koto next review-443 --with-data '{\"verdict\": \"approve\"}'` and drives the workflow to terminal; koto writes the result onto the leg. An explicit resolve on a bound leg is rejected (`explicit_resolve_on_bound_leg`) and would block the real result.",
+      "files": [],
+      "assertions": [
+        "Response tells the agent NOT to call `koto request resolve` on its own bound leg",
+        "Response explains that a bound leg's result is promoted automatically when the child session reaches a terminal state",
+        "Response mentions that koto rejects an explicit resolve on a bound leg (`explicit_resolve_on_bound_leg`), or that it would block the real result",
+        "Response directs the agent to submit its verdict through `koto next review-443 --with-data` and complete the workflow normally"
+      ]
     }
   ]
 }

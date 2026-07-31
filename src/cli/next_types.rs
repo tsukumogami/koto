@@ -249,6 +249,112 @@ impl NextResponse {
             },
         }
     }
+
+    /// Return a new `NextResponse` with `prefix` prepended to the
+    /// `directive`, leaving every other field — `details` included —
+    /// untouched.
+    ///
+    /// Distinct from [`NextResponse::with_substituted_directive`], which
+    /// maps `details` as well. The abandonment notice belongs in
+    /// `directive` and nowhere else: `directive` is the one field the
+    /// agent-facing skill declares authoritative, and duplicating the
+    /// notice into `details` would put the same instruction in a field
+    /// the skill demotes to informational.
+    ///
+    /// The two variants that carry no directive — `Terminal` and `Error`
+    /// — are returned unchanged. That coverage gap is why the notice
+    /// also rides an envelope sibling
+    /// (DESIGN-request-lifecycle.md Decision 4).
+    pub fn with_directive_prefix(self, prefix: &str) -> Self {
+        let prepend = |directive: &str| format!("{prefix}{directive}");
+        match self {
+            NextResponse::EvidenceRequired {
+                state,
+                directive,
+                details,
+                advanced,
+                expects,
+                blocking_conditions,
+                unassigned_children,
+            } => NextResponse::EvidenceRequired {
+                state,
+                directive: prepend(&directive),
+                details,
+                advanced,
+                expects,
+                blocking_conditions,
+                unassigned_children,
+            },
+            NextResponse::GateBlocked {
+                state,
+                directive,
+                details,
+                advanced,
+                blocking_conditions,
+                unassigned_children,
+            } => NextResponse::GateBlocked {
+                state,
+                directive: prepend(&directive),
+                details,
+                advanced,
+                blocking_conditions,
+                unassigned_children,
+            },
+            NextResponse::Integration {
+                state,
+                directive,
+                details,
+                advanced,
+                expects,
+                integration,
+                unassigned_children,
+            } => NextResponse::Integration {
+                state,
+                directive: prepend(&directive),
+                details,
+                advanced,
+                expects,
+                integration,
+                unassigned_children,
+            },
+            NextResponse::IntegrationUnavailable {
+                state,
+                directive,
+                details,
+                advanced,
+                expects,
+                integration,
+                unassigned_children,
+            } => NextResponse::IntegrationUnavailable {
+                state,
+                directive: prepend(&directive),
+                details,
+                advanced,
+                expects,
+                integration,
+                unassigned_children,
+            },
+            NextResponse::ActionRequiresConfirmation {
+                state,
+                directive,
+                details,
+                advanced,
+                action_output,
+                expects,
+                unassigned_children,
+            } => NextResponse::ActionRequiresConfirmation {
+                state,
+                directive: prepend(&directive),
+                details,
+                advanced,
+                action_output,
+                expects,
+                unassigned_children,
+            },
+            terminal @ NextResponse::Terminal { .. } => terminal,
+            err @ NextResponse::Error { .. } => err,
+        }
+    }
 }
 
 impl Serialize for NextResponse {

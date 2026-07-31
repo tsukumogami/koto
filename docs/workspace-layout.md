@@ -1,10 +1,15 @@
 # Workspace Layout
 
-This document catalogs the files the request-store introduces under `~/.koto/` and
-their derivability / safe-deletion semantics. Operators reading this
-can confidently prune any of the listed files when troubleshooting
-without risk of data loss — every entry is rebuildable from the
-authoritative session state (headers + event logs).
+This document catalogs what koto writes under `~/.koto/` and the
+derivability / safe-deletion semantics of each entry. Most of it is
+derived: operators can prune any file in the "Derived files" section
+below when troubleshooting without risk of data loss, because every
+one of those entries is rebuildable from the authoritative session
+state (headers + event logs).
+
+Two trees are authoritative and rebuild from nothing:
+`~/.koto/sessions/` and `~/.koto/requests/`. Deleting either destroys
+history.
 
 Cross-references: `docs/STABILITY.md` for the public crate stability
 contract; `docs/designs/DESIGN-koto-request-store.md` for the full
@@ -19,6 +24,10 @@ of authority for this document).
 │   └── <session-id>/
 │       ├── koto-<session-id>.state.jsonl      # header + event log
 │       └── claim.lock                         # derived (request-store sidecar)
+├── requests/                                  # AUTHORITATIVE state
+│   └── <request_id>/
+│       ├── request.jsonl                      # header + event log
+│       └── request.lock                       # flock target for the write path
 ├── coordinators/                              # derived (request-store cursor state)
 │   └── <coord_id>/
 │       └── scan_cursor.toml
@@ -27,8 +36,91 @@ of authority for this document).
 ```
 
 Sessions under `~/.koto/sessions/` ARE the authoritative state and
-must not be deleted manually except via `koto session cleanup`. The
-four derived files below are safe to delete.
+must not be deleted manually except via `koto session cleanup`.
+Request records under `~/.koto/requests/` are authoritative too and
+have no cleanup verb at all. The four derived files below are safe to
+delete.
+
+## Authoritative state: `~/.koto/requests/`
+
+`koto request create` mints an opaque lowercase identifier and writes
+one directory per request:
+
+```
+~/.koto/requests/<request_id>/
+├── request.jsonl     header line + every event for this request
+└── request.lock      flock target for the validate-and-append critical section
+```
+
+`request.jsonl` is the whole record. The header line carries the
+request's own `schema_version`, its id, creation timestamp,
+`requested_by`, and `coordinator_of_record`; every line after it is an
+event in the `request.` family — creation, leg binds, progress
+appends, results, abandonments, and the close. A request's current
+shape is a projection of that log, not a stored snapshot, and the
+`revision` on every CLI response is the sequence number of the last
+line.
+
+Creation is a single atomic write. The header and the creation event
+are buffered together, fsynced into a tempfile in the target
+directory, then renamed into place with no-replace semantics — so a
+crash can never leave a request whose header parses and whose log is
+empty, and a colliding identifier is refused by the rename rather than
+by a check that could race.
+
+`request.lock` is a separate file from the log so acquiring the lock
+never truncates or extends it. Every write takes it. That is not
+politeness: the log's sequence numbers are derived from a read of the
+last one, and the reader hard-errors on a gap, so two unlocked
+concurrent appends computing the same next sequence would make the
+request permanently unreadable. Acquisition is non-blocking plus retry
+against a five-second deadline; a writer that loses the race that long
+gets `lock_contention`, which is transient and retryable. Reads take
+no lock at all and write nothing, so `get`, `list`, and `wait` never
+contend with a writer.
+
+**Permissions.** `requests/` and each `<request_id>/` directory are
+created mode 0700, and both `request.jsonl` and `request.lock` are
+opened mode 0600, rather than relying on the home directory's mode
+having been set correctly once. Both paths refuse to follow a symlink
+— the log through an explicit check before it is opened, the lock
+through `O_NOFOLLOW` — so a planted link can't redirect an append into
+a file the operator never meant to write.
+
+### Why this outlives the sessions it references
+
+A request names the child sessions bound to its legs, and those
+sessions are deleted on their terminal tick. The request record
+survives that by construction, not by every deletion site remembering
+to spare it: nothing in koto walks `~/.koto/` outside `sessions/` and
+`coordinators/`, so neither `koto session cleanup` nor `koto workspace
+prune` touches `requests/`. A coordinator that restarts after its
+children are gone still reads the full history — which legs resolved,
+with what result, which were abandoned and why.
+
+The flip side is that nothing deletes a request either. The store
+grows monotonically for the life of the workspace, and `koto request
+list` parses every record's header, so listing gets slower as records
+accumulate. There is no prune verb for it yet. Operators who need the
+space back can remove a `<request_id>/` directory by hand, accepting
+that the history goes with it; do it only when no writer holds the
+lock, since unlinking a lock file out from under a writer would leave
+two writers locking different inodes.
+
+### Two limitations
+
+**Request records do not replicate under the cloud backend.** They
+live on the local filesystem only. A workspace whose sessions
+replicate will still have request records visible on one host.
+
+**The store requires a local filesystem.** The write path's mutual
+exclusion is flock, which is host-local. Two hosts appending to the
+same record over a network filesystem would not see each other's lock,
+would compute the same next sequence number, and would leave a log
+whose sequence gap the reader refuses — the record becomes unreadable
+rather than merely stale. Point `~/.koto/` at local storage.
+
+Both are documented limitations rather than silent gaps.
 
 ## Derived files introduced by the request-store
 
@@ -236,9 +328,10 @@ e.g., a coordinator stuck behind a stale lock that the prune verb
 should but hasn't cleared. The four derivability rules above keep
 manual deletion safe: every file rebuilds on the next tick.
 
-The exception is `~/.koto/sessions/<session-id>/`: those directories
-are NOT derived and contain the authoritative state. Deleting a
-session directory permanently destroys the session's history.
+The exceptions are `~/.koto/sessions/<session-id>/` and
+`~/.koto/requests/<request_id>/`: those directories are NOT derived
+and contain the authoritative state. Deleting either permanently
+destroys the history it holds.
 
 ## Cross-references
 
@@ -247,4 +340,8 @@ session directory permanently destroys the session's history.
 - `docs/designs/DESIGN-koto-request-store.md` — full request-store design.
   Consequences > Mitigations (line 2223) is the source of
   authority for this document.
+- `docs/designs/current/DESIGN-request-lifecycle.md` — Decision 1, the source
+  of authority for the `~/.koto/requests/` layout.
+- `docs/reference/error-codes.md` — the `koto request` code set,
+  including the bounds and their config keys.
 - `koto workspace prune --help` — the operator-driven cleanup verb.

@@ -31,7 +31,42 @@ pub enum ViewMode {
     Detail,
 }
 
-/// Aggregate task counts for a coordinator row.
+/// Which containers a session belongs to, rendered as a per-row badge.
+///
+/// The dashboard's count is derived from parent-workflow parentage alone and
+/// is not a batch count, so a batch or a request cannot be inferred from it.
+/// Membership is carried as its own attribute instead: one count per surface,
+/// with dual membership stated rather than implied
+/// (DESIGN-request-lifecycle.md Decision 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Membership {
+    /// Neither a batch task nor a request leg.
+    None,
+    /// Spawned by a batch scheduler (its init event carries a spawn entry).
+    Batch,
+    /// Bound to a request leg (its session directory carries a leg pointer).
+    Leg,
+    /// Both: a batch task that was later bound to a leg.
+    Both,
+}
+
+impl Membership {
+    /// Combine the two independent memberships a session can hold.
+    pub fn from_flags(is_batch_task: bool, is_request_leg: bool) -> Self {
+        match (is_batch_task, is_request_leg) {
+            (true, true) => Membership::Both,
+            (true, false) => Membership::Batch,
+            (false, true) => Membership::Leg,
+            (false, false) => Membership::None,
+        }
+    }
+}
+
+/// Aggregate child counts for a coordinator row.
+///
+/// Every field counts child *sessions* — those whose header names this row as
+/// their `parent_workflow`. Nothing here consults the batch view, which is why
+/// the column is `Children` and not `Tasks`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCounts {
     /// Total number of child sessions.
@@ -68,6 +103,8 @@ pub struct RowDescriptor {
     pub liveness: Liveness,
     /// Aggregate child counts for coordinator rows; `None` for leaf sessions.
     pub task_counts: Option<TaskCounts>,
+    /// Which containers this session belongs to, independent of the count.
+    pub membership: Membership,
 }
 
 /// All mutable state owned by the dashboard event loop.
@@ -501,6 +538,13 @@ impl DashboardAppState {
             None
         };
 
+        // Membership is orthogonal to the count above: a session can be a
+        // batch task, a request leg, both, or neither, and none of those
+        // change how many children it has.
+        let membership = session
+            .map(|s| Membership::from_flags(s.is_batch_task, s.is_request_leg))
+            .unwrap_or(Membership::None);
+
         rows.push(RowDescriptor {
             indent_depth: depth,
             connector,
@@ -510,6 +554,7 @@ impl DashboardAppState {
             elapsed,
             liveness,
             task_counts,
+            membership,
         });
 
         // Recurse into children if this session is expanded.
@@ -657,6 +702,8 @@ mod tests {
             last_event_at: Some(SystemTime::now()),
             salient_var: None,
             is_unreadable: false,
+            is_batch_task: false,
+            is_request_leg: false,
         }
     }
 
@@ -1272,5 +1319,116 @@ mod tests {
             child_row.display_name.contains("work-on"),
             "child label must include its own leaf label"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // membership (I13)
+    // -----------------------------------------------------------------------
+
+    /// A session with the given batch / leg memberships.
+    fn member_session(
+        name: &str,
+        parent: Option<&str>,
+        is_batch_task: bool,
+        is_request_leg: bool,
+    ) -> CachedSession {
+        let mut session = make_session(name, parent, Some("working"), false);
+        session.is_batch_task = is_batch_task;
+        session.is_request_leg = is_request_leg;
+        session
+    }
+
+    #[test]
+    fn membership_combines_two_independent_flags() {
+        assert_eq!(Membership::from_flags(false, false), Membership::None);
+        assert_eq!(Membership::from_flags(true, false), Membership::Batch);
+        assert_eq!(Membership::from_flags(false, true), Membership::Leg);
+        assert_eq!(Membership::from_flags(true, true), Membership::Both);
+    }
+
+    #[test]
+    fn each_row_carries_its_own_membership() {
+        let mut state = DashboardAppState::new(500);
+        for (name, batch, leg) in [
+            ("plain", false, false),
+            ("task", true, false),
+            ("leg", false, true),
+            ("dual", true, true),
+        ] {
+            state
+                .tree
+                .sessions
+                .insert(name.to_string(), member_session(name, None, batch, leg));
+        }
+        state.tree.roots = vec![
+            "plain".to_string(),
+            "task".to_string(),
+            "leg".to_string(),
+            "dual".to_string(),
+        ];
+
+        let rows = state.visible_rows();
+        let membership_of = |id: &str| {
+            rows.iter()
+                .find(|r| r.session_id == id)
+                .unwrap_or_else(|| panic!("no row for {id}"))
+                .membership
+        };
+        assert_eq!(membership_of("plain"), Membership::None);
+        assert_eq!(membership_of("task"), Membership::Batch);
+        assert_eq!(membership_of("leg"), Membership::Leg);
+        assert_eq!(membership_of("dual"), Membership::Both);
+    }
+
+    #[test]
+    fn a_dual_member_row_carries_both_and_a_single_child_count() {
+        let mut state = DashboardAppState::new(500);
+        state.tree.sessions.insert(
+            "coord".to_string(),
+            member_session("coord", None, true, true),
+        );
+        state.tree.sessions.insert(
+            "child".to_string(),
+            member_session("child", Some("coord"), false, false),
+        );
+        state.tree.roots = vec!["coord".to_string()];
+
+        let rows = state.visible_rows();
+        let coord = rows.iter().find(|r| r.session_id == "coord").unwrap();
+        assert_eq!(coord.membership, Membership::Both);
+        let counts = coord
+            .task_counts
+            .as_ref()
+            .expect("a coordinator row carries child counts");
+        assert_eq!(
+            counts.total, 1,
+            "the count is over child sessions and nothing else"
+        );
+        assert_eq!(counts.running, 1);
+    }
+
+    #[test]
+    fn membership_does_not_reach_the_child_count() {
+        // Batch membership on the children must not change the parent's
+        // count: the count is parentage, not batch task list.
+        let mut state = DashboardAppState::new(500);
+        state.tree.sessions.insert(
+            "coord".to_string(),
+            member_session("coord", None, false, false),
+        );
+        state.tree.sessions.insert(
+            "a".to_string(),
+            member_session("a", Some("coord"), true, true),
+        );
+        state.tree.sessions.insert(
+            "b".to_string(),
+            member_session("b", Some("coord"), false, false),
+        );
+        state.tree.roots = vec!["coord".to_string()];
+
+        let rows = state.visible_rows();
+        let counts = rows[0].task_counts.as_ref().unwrap();
+        assert_eq!(counts.total, 2);
+        assert_eq!(counts.running, 2);
     }
 }

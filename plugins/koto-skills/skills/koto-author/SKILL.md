@@ -111,6 +111,15 @@ Additional guides are available at https://github.com/tsukumogami/koto/tree/main
 gh api repos/tsukumogami/koto/contents/docs/guides --jq '.[].name'
 ```
 
+## Namespaces koto reserves
+
+Two wire prefixes belong to koto, and a template must not borrow either:
+
+- `request_store.` -- the reserved evidence-`kind` family. A `--with-data` payload whose `fields.kind` starts with it is rejected at parse time, so don't declare an `accepts` enum that can produce one.
+- `request.` -- the event types the request store writes on a request's own log (`request.created`, `request.leg_bound`, `request.leg_progress`, `request.leg_result`, `request.leg_abandoned`, `request.closed`). koto owns the whole prefix. Nothing rejects a homemade `request.*` event type at compile time, because templates don't write event types at all -- which is exactly why an authored tool or consumer that invents one can collide with a variant koto ships later, and degrade silently rather than fail.
+
+The template format guide carries the longer version.
+
 ## Resuming interrupted sessions
 
 koto preserves state across interruptions. Call `koto next <session-name>` to see where you left off and pick up where you stopped. If you don't remember the session name, `koto workflows` lists active sessions.
