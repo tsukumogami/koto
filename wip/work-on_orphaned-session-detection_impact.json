@@ -1,0 +1,6 @@
+{
+  "impact": "none",
+  "rationale": "origin/main has not advanced since this branch was created (git merge-base HEAD origin/main equals origin/main's current head, and rebase reported 'up to date'). No upstream drift to assess.",
+  "rebase_head": "cdcfd9cb06cda8545dedcda31d9013d83db24b41",
+  "main_head": "00be93d059974f279cc4a192b4263e24143cbd4c"
+}
