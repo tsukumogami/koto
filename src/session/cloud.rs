@@ -650,6 +650,22 @@ impl CloudBackend {
     }
 }
 
+/// Build a placeholder `SessionInfo` for a session that exists only in S3
+/// and has no local copy to read full metadata from.
+///
+/// `template_source_status` is unconditionally `None` here: there is no
+/// header in scope to check, so this can never be inferred from -- or
+/// overridden by -- any other session's recorded status for the same id.
+fn placeholder_session_info(id: String) -> SessionInfo {
+    SessionInfo {
+        id,
+        created_at: String::new(),
+        template_hash: String::new(),
+        parent_workflow: None,
+        template_source_status: None,
+    }
+}
+
 impl SessionBackend for CloudBackend {
     fn create(&self, id: &str) -> anyhow::Result<PathBuf> {
         let path = self.local.create(id)?;
@@ -685,12 +701,7 @@ impl SessionBackend for CloudBackend {
             if !local_ids.contains(&remote_id) {
                 // We can't extract full metadata without downloading the
                 // state file, so provide placeholder values.
-                local_sessions.push(SessionInfo {
-                    id: remote_id,
-                    created_at: String::new(),
-                    template_hash: String::new(),
-                    parent_workflow: None,
-                });
+                local_sessions.push(placeholder_session_info(remote_id));
             }
         }
 
@@ -1280,6 +1291,24 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].id, "alpha");
         assert_eq!(sessions[1].id, "beta");
+    }
+
+    // -- SessionBackend: remote-only placeholder rows never carry a
+    // template_source_status --
+    //
+    // `test_cloud_backend` points S3 at an unroutable address, so
+    // `s3_list_sessions()` always returns empty in this test suite and the
+    // remote-only merge branch in `list()` can't be exercised end-to-end.
+    // Test the extracted `placeholder_session_info` helper directly instead.
+    #[test]
+    fn placeholder_session_info_has_no_template_source_status() {
+        let info = placeholder_session_info("remote-only".to_string());
+        assert_eq!(info.id, "remote-only");
+        assert_eq!(
+            info.template_source_status, None,
+            "remote-only placeholder rows must always report None, regardless \
+             of what a real session with this id might have recorded"
+        );
     }
 
     // -- ContextStore: add writes locally then attempts sync --

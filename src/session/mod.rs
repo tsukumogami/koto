@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use self::context::ContextStore;
 use self::local::LocalBackend;
 
+use crate::engine::template_source_status::TemplateSourceStatus;
 use crate::engine::types::{Event, EventPayload, StateFileHeader};
 
 /// Typed error for session-scoped operations.
@@ -138,6 +139,28 @@ pub struct SessionInfo {
 
     /// Name of the parent workflow, if this workflow was created as a child.
     pub parent_workflow: Option<String>,
+
+    /// Whether the session's recorded `template_source_dir` (if any) still
+    /// resolves on this machine, and on whose.
+    ///
+    /// Populated from the state file header already read into memory while
+    /// building this `SessionInfo` -- backends never perform extra I/O just
+    /// to fill this field.
+    ///
+    /// `None` is ambiguous by design and conflates two distinct cases that
+    /// this field does not (and is not required to) distinguish between:
+    ///
+    /// - The session's header never recorded a `template_source_dir` --
+    ///   there is nothing to check.
+    /// - No header was available to check at all. This is the case for
+    ///   `CloudBackend`'s remote-only placeholder rows (a session that
+    ///   exists in S3 but has not been synced locally): there is no header
+    ///   in scope, so the field is unconditionally `None` there regardless
+    ///   of what the session's real (remote) header might say once synced.
+    ///
+    /// This ambiguity is a known, accepted limitation -- not a bug to fix
+    /// here. See DESIGN-orphaned-session-detection.md for the rationale.
+    pub template_source_status: Option<TemplateSourceStatus>,
 }
 
 /// Return the state file name for a given session ID.

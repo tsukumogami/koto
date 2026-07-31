@@ -44,7 +44,7 @@ use crate::engine::types::StateFileHeader;
 /// [`current_machine_id`]) identifying which machine performed the
 /// check -- it is not compared against any stored "creator machine"
 /// value, since none exists in [`StateFileHeader`] today.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TemplateSourceStatus {
     /// The recorded `template_source_dir` path, unchanged from the
     /// header (or from whatever `Option<&Path>` the caller supplied).

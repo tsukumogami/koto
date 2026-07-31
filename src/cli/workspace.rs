@@ -437,30 +437,35 @@ mod tests {
                 created_at: "t0".to_string(),
                 template_hash: "h0".to_string(),
                 parent_workflow: None,
+                template_source_status: None,
             },
             SessionInfo {
                 id: "child-a".to_string(),
                 created_at: "t1".to_string(),
                 template_hash: "h0".to_string(),
                 parent_workflow: Some("root".to_string()),
+                template_source_status: None,
             },
             SessionInfo {
                 id: "child-b".to_string(),
                 created_at: "t1".to_string(),
                 template_hash: "h0".to_string(),
                 parent_workflow: Some("root".to_string()),
+                template_source_status: None,
             },
             SessionInfo {
                 id: "grandchild".to_string(),
                 created_at: "t2".to_string(),
                 template_hash: "h0".to_string(),
                 parent_workflow: Some("child-a".to_string()),
+                template_source_status: None,
             },
             SessionInfo {
                 id: "unrelated".to_string(),
                 created_at: "t0".to_string(),
                 template_hash: "h0".to_string(),
                 parent_workflow: None,
+                template_source_status: None,
             },
         ];
 
@@ -480,6 +485,7 @@ mod tests {
             created_at: "t0".to_string(),
             template_hash: "h0".to_string(),
             parent_workflow: None,
+            template_source_status: None,
         }];
         let descendants = collect_descendants("lonely", &sessions);
         assert!(descendants.is_empty());
