@@ -296,7 +296,9 @@ Multiple surfaces expose batch state. Use the right one for the question you're 
 | "Did this task's spawn fail, and why?" | `scheduler.errored[]` (typed per-task errors) and `materialized_children[*].outcome == "spawn_failed"`. |
 | "Did the gate pass / should the parent advance?" | `blocking_conditions[0].output.all_complete` (and aggregate booleans for routing). |
 | "Are every child's results in yet, and which children am I waiting on?" | `blocking_conditions[0].output.results_in` / `converge_blocked` / `outstanding`. |
-| "What did each child produce (status / summary / payload)?" | `blocking_conditions[0].output.children[*].result` — read inline once `results_in` is `true`; never tick or query the child. |
+| "What did each child produce (status / summary / payload)?" | `blocking_conditions[0].output.children[*].result` — read inline once `results_in` is `true`; never tick or query the child, and never poll `koto request get` for it. |
+| "How is a bound leg going before it finishes?" | `koto request get <request-id>` — `legs[*].progress` and `legs[*].disposition`. This is the only place mid-flight progress exists. |
+| "I restarted, or I'm not the session holding the gate — where's the result?" | `koto request get <request-id>` — `legs[*].result`. Same envelope the directive carried, promoted from the child's terminal tick. |
 | "What reason should I render for a failed child?" | `blocking_conditions[0].output.children[*].reason` with `reason_source` as the provenance tag. |
 | "Which children are eligible for retry, and how do I invoke it?" | `reserved_actions[0].applies_to` and `reserved_actions[0].invocation`. |
 | "Is this the final batch outcome?" | `batch_final_view.summary` on the terminal `done` response. |

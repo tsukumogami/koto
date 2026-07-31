@@ -23,6 +23,9 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session cleanup` | Runner — primary |
 | `koto session resolve` | Runner — cloud backend only |
 | `koto status` | Runner — primary |
+| `koto request create/bind/get/wait/list` | Runner — coordinator |
+| `koto request progress/resolve/abandon` | Runner — coordinator and delegate |
+| `koto request abandon-request/close` | Runner — coordinator |
 | `koto context add` | Runner — primary |
 | `koto context get` | Runner — primary |
 | `koto context exists` | Runner — primary |
@@ -90,6 +93,7 @@ Gets the current state directive. Submits evidence when `--with-data` is provide
 | `--to <state>` | Force a directed transition to a named state. Must be a valid transition target from the current state. Mutually exclusive with `--with-data`. |
 | `--no-cleanup` | Skip automatic session cleanup when the workflow reaches a terminal state. Useful for debugging artifacts after a workflow ends. |
 | `--full` | Always include the `details` field, even on repeat visits to a state. By default `details` is omitted after the first visit. |
+| `--dispatch-epoch <n>` | The epoch this writer was dispatched with. Required for `--with-data` writes against a child workflow's log; validated before any persistence call and rejected with `epoch_fence_violation` (exit 65) on a mismatch. Parent-workflow ticks don't need it. The same value goes on `koto request progress` / `resolve` / `abandon` for a bound leg. |
 
 **Output shapes** are determined by the `action` field. See `response-shapes.md` for all nine annotated scenarios.
 
@@ -159,6 +163,24 @@ recorded none.
 A child that is itself a coordinator converges its own children through this
 same gate and then carries its own result up to its parent identically — the
 read is uniform at every depth.
+
+**This stays true when the child also fills a request leg.** The leg records the
+same result — koto promotes it from the child's terminal tick — but that record
+exists for progress, partial fan-out state, cross-session reads, and restart
+recovery. The coordinator holding the gate reads the answer from its own
+directive as it always has. Polling `koto request get` for a result your own
+gate is about to hand you means never advancing.
+
+### Fields a request leg adds
+
+| Field | When it appears |
+|---|---|
+| `leg` | On every advance-loop response for a session bound to a leg, `done` included. Carries `request_id` and `leg_name`, never `dispatch_epoch`. Absent on the `koto next --to <state>` directed-transition path. |
+| `leg_abandoned` | On the same responses, once the requester abandoned the leg. Carries `request_id`, `leg_name`, and the verbatim `rationale`. Also absent on the `--to` path. |
+
+When a leg is abandoned, koto also prepends a stop notice to `directive` — see
+the skill's "When the requester stops waiting". The notice adds no `action`
+value and changes no `blocking_conditions`.
 
 ---
 
@@ -268,8 +290,132 @@ Returns read-only state metadata for a workflow. No gates are evaluated, no acti
 }
 ```
 
+A session bound to a request leg also carries a read-only `leg` section mirroring what the session's own `koto next` returns:
+
+```json
+{
+  "name": "review-443",
+  "current_state": "review",
+  "is_terminal": false,
+  "leg": {"request_id": "req-9f1c2b7a-4d3e-4c5f-8a1b-2c3d4e5f6071", "leg_name": "review"}
+}
+```
+
+The key is absent when the session isn't bound to a leg. It never carries `dispatch_epoch` — a readable epoch would let a displaced agent present the current value and defeat the fence.
+
 **Error cases:**
 - Exit 2: workflow not found
+
+---
+
+## koto request
+
+Ten subcommands over the request store — the durable record of what a coordinator asked for and what came back. See the skill's "Requests and legs" section for when to use it; this section is the flag surface.
+
+```
+koto request create   [--with-data '{"legs":[…],"inputs":{…}}' | --role R --template T --inputs J]
+                      --requested-by ID --coordinator-of-record ID
+koto request bind     <request-id> <leg> --child SESSION_ID [--dispatch-epoch N] [--issued-by ID]
+koto request get      <request-id>
+koto request wait     <request-id> (--leg NAME | --all-legs | --closed | --resolved-count N)
+                      --timeout-secs N [--interval-secs N]
+koto request list     [--requested-by ID | --coordinator-of-record ID] [--state open|closed] [--unresolved-legs]
+koto request progress <request-id> <leg> --with-data J [--dispatch-epoch N] [--issued-by ID]
+koto request resolve  <request-id> <leg> --with-data J [--dispatch-epoch N] [--issued-by ID]
+koto request abandon  <request-id> <leg> --rationale TEXT [--dispatch-epoch N] [--issued-by ID]
+koto request abandon-request <request-id> --rationale TEXT [--issued-by ID]
+koto request close    <request-id> [--issued-by ID]
+```
+
+`--cli-contract MAJOR.MINOR` is accepted on every subcommand and validated before any I/O, so a mismatch has no side effect. This build serves `1.0`; an older minor is served, a newer minor or a different major is refused.
+
+Output is JSON on stdout unconditionally — there is no format flag.
+
+### The response envelope
+
+Every subcommand except `list` prints the same object:
+
+```json
+{
+  "request_id": "req-9f1c2b7a-4d3e-4c5f-8a1b-2c3d4e5f6071",
+  "request_state": "open",
+  "close_disposition": null,
+  "leg_counts": {"total": 2, "open": 1, "resolved": 1, "abandoned": 0},
+  "revision": 7,
+  "requested_by": "coord-root",
+  "coordinator_of_record": "coord-root",
+  "created_at": "2026-07-14T09:12:04.318Z",
+  "inputs": {"repo": "koto"},
+  "legs": {
+    "review": {
+      "name": "review",
+      "declaration": {"role": "reviewer", "template": "review.md", "inputs": {"pr": 443}},
+      "disposition": "resolved",
+      "bound_child": "review-443",
+      "bound_epoch": 0,
+      "result": {"status": "success", "summary": "no blocking findings", "payload": {}},
+      "result_source": "promoted",
+      "abandoned_rationale": null,
+      "progress": [
+        {"seq": 5, "timestamp": "2026-07-14T09:20:00Z", "content": {"note": "parser rewritten"}, "issued_by": "review-443"}
+      ]
+    }
+  },
+  "written": true,
+  "cli_contract": {"major": 1, "minor": 0}
+}
+```
+
+| Field | Notes |
+|---|---|
+| `request_state` | `open` or `closed`. |
+| `close_disposition` | `all_resolved`, `closed_with_abandoned_legs`, or `request_abandoned`. Always present; `null` while open, so you never distinguish "absent" from "not yet closed". |
+| `leg_counts` | `total`, `open`, `resolved`, `abandoned`. Derived, not stored. |
+| `revision` | Sequence number of the last event on the log. After a write, this is how you tell your own append from a concurrent one. |
+| `inputs` | The request-level shared context recorded at `create`. Omitted when none was supplied. |
+| `legs` | Keyed by leg name, in name order — that ordering is what makes two `get` calls byte-equal. |
+| `legs[*].disposition` | `open`, `resolved`, or `abandoned`. |
+| `legs[*].result_source` | `promoted` (from the bound child's terminal tick) or `explicit` (recorded through `resolve`). |
+| `written` | Present on mutating verbs only, so you can tell a real append from a no-op success — a rebind to the child the leg already has, a re-abandon, or a retry the idempotency hash recognized. Absent on reads, which keeps `get` byte-stable. |
+| `cli_contract` | Two integers, never a string — `"1.10"` sorts below `"1.9"` as a string, and that mistake is unavailable here. |
+
+`list` prints `{"requests": [...], "cli_contract": {...}}`, where each row carries `request_id`, `requested_by`, `coordinator_of_record`, `created_at`, `request_state`, and `leg_counts`. It advances no coordinator cursor and writes nothing.
+
+### create
+
+`--with-data` takes `{"legs":[{"name","role","template","inputs"}],"inputs":{...}}`; the per-leg `inputs` is that leg's own ask, the top-level `inputs` is context shared by the whole request. Unknown keys are rejected. The flat `--role` / `--template` / `--inputs` triple is the one-leg shorthand and names the leg after the role; it is mutually exclusive with `--with-data`, and all three are required together.
+
+`--requested-by` and `--coordinator-of-record` are both required. Attribution, not authorization — anything running as the same user can read any request it can name.
+
+The generated id is `req-` plus a v4 UUID, printed in the envelope. Creation is a single atomic write, so a crash never leaves a request with a header and no log.
+
+### bind
+
+Three checks run against the child before the append: the child's session must be readable (`child_not_found`), its header must satisfy the dispatch fence — a `--parent` child started with `--needs-agent` (`child_not_fenceable`) — and it must not already point at a different request-and-leg pair (`child_bound_to_different_leg`). Rebinding the same leg to the same child succeeds and reports `written: false`.
+
+The epoch recorded on the bind event is read from the child's header, not from your flag; passing `--dispatch-epoch` here asserts a value and is rejected if it disagrees. After the bind is durable, koto writes a pointer into the child's session directory so the child can read its own leg back. A failed pointer write warns and does not fail the bind — re-run `bind` to repair it.
+
+### wait
+
+Exactly one predicate is required, enforced at parse time. `--timeout-secs` is required; a wait with no deadline is a hang. `--interval-secs` defaults to 2 and is clamped to a floor of 1 so zero cannot spin. The deadline is absolute and computed once, and the sleep runs in 100 ms slices so a signal is noticed promptly.
+
+The wait reads through the same path `get` uses and writes nothing. A count predicate is satisfied by a partial fan-out — it does not require every leg.
+
+### progress, resolve, abandon
+
+All three take `--dispatch-epoch`, validated against the epoch recorded on the leg's bind event rather than against the child's header, so the fence still works after the child's session is cleaned up. Equality is strict: a future epoch is rejected alongside a stale one. On an unbound leg the flag is accepted and ignored, so a wrapper that always passes it keeps working.
+
+`progress` and `resolve` carry an idempotency hash derived from the payload, so retrying either after an ambiguous failure short-circuits instead of double-appending. A retry whose payload differs from one already on the log surfaces as `idempotency_conflict`.
+
+`resolve` takes a result envelope: `{"status":"success|failure|skipped","summary":"...","payload":{...}}`. It applies only to a leg with no bound child — see the skill's "Recording a result explicitly".
+
+### abandon-request and close
+
+`abandon-request` abandons every open leg and then closes the request with the `request_abandoned` disposition. It is a separate subcommand rather than `abandon` with an optional leg argument, so an unset shell variable fails argument parsing instead of escalating. `--rationale` is required on both abandon forms, capped at 4 KiB, with control characters replaced and whitespace runs collapsed — this text reaches a delegate's response.
+
+`close` derives its disposition inside the lock from the legs' state, distinguishing all-resolved from closed-with-abandoned-legs. Closing an already-closed request is rejected.
+
+`koto cancel` is unrelated and unchanged: no request operation is reachable from it.
 
 ---
 

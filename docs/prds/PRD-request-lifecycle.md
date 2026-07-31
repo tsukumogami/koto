@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 problem: |
   koto's dispatch protocol carries one delegation from creation to a single
   terminal answer. A coordinator running a fan-out — a review panel, a
@@ -24,7 +24,7 @@ goals: |
 
 ## Status
 
-In Progress
+Done
 
 koto v0.10.0 shipped a child-session dispatch protocol, and v0.11.x added its
 converge half (`docs/prds/PRD-request-store-converge.md`). Together those take

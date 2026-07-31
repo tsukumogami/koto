@@ -340,7 +340,7 @@ destroys the history it holds.
 - `docs/designs/DESIGN-koto-request-store.md` — full request-store design.
   Consequences > Mitigations (line 2223) is the source of
   authority for this document.
-- `docs/designs/DESIGN-request-lifecycle.md` — Decision 1, the source
+- `docs/designs/current/DESIGN-request-lifecycle.md` — Decision 1, the source
   of authority for the `~/.koto/requests/` layout.
 - `docs/reference/error-codes.md` — the `koto request` code set,
   including the bounds and their config keys.

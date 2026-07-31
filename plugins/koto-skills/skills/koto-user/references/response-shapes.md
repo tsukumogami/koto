@@ -20,6 +20,16 @@ agent will encounter, including which fields are absent and why.
 | `integration` | **absent** | **absent** | always | always | **absent** | **absent** |
 | `action_output` | **absent** | **absent** | **absent** | **absent** | **absent** | always |
 | `error` | `null` | `null` | `null` | `null` | `null` | `null` |
+| `leg` | conditional | conditional | conditional | conditional | conditional | conditional |
+| `leg_abandoned` | conditional | conditional | conditional | conditional | conditional | conditional |
+
+`leg` is present on every response — `done` included — for a session bound to a request
+leg, and absent otherwise. It carries `request_id` and `leg_name` and never
+`dispatch_epoch`. `leg_abandoned` joins it once the requester abandoned the leg, carrying
+`request_id`, `leg_name`, and the verbatim `rationale`. Both are absent on the
+`koto next --to <state>` directed-transition path, which prints its response without the
+envelope these ride on. An abandoned leg also prepends a koto-authored stop notice to
+`directive`; `action` gains no value for it.
 
 `directive` is never present when `action` is `"done"`. The `done` variant has no
 `directive` field in its struct — the key is not written at all, not written as `null`.
@@ -500,7 +510,9 @@ finished yet. This is a temporal condition — it resolves on its own as childre
 - Once `results_in` is `true` the gate passes, the parent advances, and each
   `children[]` entry carries a `result` object (`status` / `summary` / optional
   `payload`). Read each child's result straight from that array — do not tick or query
-  the child to learn what it produced.
+  the child to learn what it produced, and don't wait on `koto request get` for it
+  either when the child also fills a request leg. The leg holds the same result for
+  progress, cross-session, and restart reads; this array is what advances you.
 
 ---
 
@@ -517,6 +529,9 @@ Several fields are conditionally absent rather than `null`. When writing code to
 - `expects` is always written but may be `null` — this is not the same as absent.
 - `options` inside an `expects` object is omitted (not written) when empty, not written
   as `[]`.
+- `leg` and `leg_abandoned` are absent unless the session is bound to a request leg (and,
+  for the second, unless that leg was abandoned). Check for `leg` before reading it — its
+  absence means this session has no leg, not that the request is unreachable.
 - In the JSONL event log, `skip_if_matched` is absent on `Transitioned` events whose
   `condition_type` is not `"skip_if"`. Don't assume this field is present — check
   `condition_type` first.

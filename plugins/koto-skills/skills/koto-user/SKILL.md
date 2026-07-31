@@ -73,6 +73,8 @@ Every `koto next` response includes an `action` field. Dispatch on this field on
 
 Note: `directive` is absent on `done` responses. Don't expect it.
 
+A session bound to a request leg also carries a top-level `leg` object on every `koto next` response, and a `leg_abandoned` sibling once the requester stops waiting — see [Requests and legs](#requests-and-legs). Both are informational. The abandonment signal that matters rides `directive`; `action` gains no value for it, so nothing in the table above changes.
+
 Directive-bearing responses also include a top-level `unassigned_children` array. It lists child workflows that name this coordinator as their `coordinator_of_record` and need agent dispatch; each element carries `child_session_id`, `role`, `template`, optional `inputs`, `requested_by`, `created_at`, and `dispatch_epoch`. The array stays empty unless the workspace contains unassigned children for this coordinator. Treat the field as informational alongside the directive — the current state's directive is still authoritative for what to do next.
 
 ## Handling `evidence_required`
@@ -105,7 +107,7 @@ koto next <name> --with-data @evidence.json
 
 The file must contain the JSON payload directly (no shell quoting needed) and must be at most 1 MB.
 
-**Dispatched-agent writes (`SubagentStop` hooks):** if you are a dispatched subagent writing back to a request-store child workflow, you MUST pass `--dispatch-epoch <n>` with the epoch baked into your spawn. Example: `koto next <child> --dispatch-epoch 0 --with-data '{"status":"completed"}'`. The koto CLI validates `presented == header.dispatch_epoch` before any persistence call and rejects mismatches with `EpochFenceViolation` (exit code 65). Operator-driven `koto next <coord_workflow>` calls on the parent workflow do NOT require the flag.
+**Dispatched-agent writes (`SubagentStop` hooks):** if you are a dispatched subagent writing back to a child workflow you were spawned to fulfil (one started with `--needs-agent`), you MUST pass `--dispatch-epoch <n>` with the epoch baked into your spawn. Example: `koto next <child> --dispatch-epoch 0 --with-data '{"status":"completed"}'`. The koto CLI validates `presented == header.dispatch_epoch` before any persistence call and rejects mismatches with `epoch_fence_violation` (exit code 65). Operator-driven `koto next <coord_workflow>` calls on the parent workflow do NOT require the flag. The same epoch goes on `koto request progress` / `resolve` / `abandon` when your session is bound to a request leg — there it's checked against the epoch recorded when the leg was bound, and the failure exits 2, not 65.
 
 ### Sub-case B: Gates failed, evidence fallback available
 
@@ -190,7 +192,7 @@ The `--parent` flag validates that the parent workflow exists and records the li
 
 ### Requesting agent dispatch on a new child
 
-When the child you're spawning needs a separate agent to pick it up later (the "request store" pattern), use `koto session start` instead of `koto init`. It writes a request-store header on the child so a coordinator can later dispatch the right agent:
+When the child you're spawning needs a separate agent to pick it up later, use `koto session start` instead of `koto init`. It marks the child as awaiting dispatch so a coordinator can later dispatch the right agent:
 
 ```bash
 koto session start <child-name> \
@@ -207,6 +209,8 @@ koto session start <child-name> \
 - Omit all four to start a plain child session without a dispatch marker — useful when the child is launched in-process by the same agent.
 
 The session id (`--parent`) and coordinator id (`--coordinator-of-record`) are validated against `^[a-zA-Z0-9][a-zA-Z0-9._-]*$` (max 255 chars) before any path operation, so paths like `../etc/passwd` or shell-metacharacter ids are rejected up front.
+
+`--needs-agent` and the `koto request` noun group below are orthogonal, and both are supported. `--needs-agent` is how a child session that wants an agent comes into existence; it's still the only way. A request is a separate object that records what you asked for and holds the answer — `koto request create` spawns nothing. Starting a child without ever binding it to a leg is exactly today's behavior and stays fine.
 
 ### Checking children
 
@@ -231,7 +235,7 @@ Check where a child is without side effects:
 koto status <child-name>
 ```
 
-Returns `name`, `current_state`, `template_path`, `template_hash`, and `is_terminal`. No gates are evaluated, no state changes happen.
+Returns `name`, `current_state`, `template_path`, `template_hash`, and `is_terminal`, plus a `leg` object when the session is bound to a request leg. No gates are evaluated, no state changes happen.
 
 Read a child's stored results:
 
@@ -283,6 +287,105 @@ Temporal blocks with `needs_attention: false` resolve on their own — poll `kot
 
 When you cancel, clean up, or rewind a parent, the response includes a `children` array listing affected child workflows. koto doesn't cascade these operations — it tells you which children exist so you can decide what to do with them.
 
+## Requests and legs
+
+A request is a durable answer slot. `koto request create` records what you're asking for as one or more named **legs**; each leg is later bound to the child session that fulfils it, and the leg keeps that child's result after the child is gone. The record lives at `~/.koto/requests/<request-id>/`, outside every session, so it outlives the child's cleanup and your own restart.
+
+A request is a container, not a spawner — `koto request create` starts no sessions. A fan-out is three steps:
+
+```bash
+# 1. Declare what you're asking for. Prints the generated request id.
+koto request create \
+  --with-data '{"legs":[{"name":"review","role":"reviewer","template":"review.md","inputs":{"pr":443}}],"inputs":{"repo":"koto"}}' \
+  --requested-by <your-session-id> \
+  --coordinator-of-record <coordinator-id>
+
+# 2. Start the child the usual way (see "Requesting agent dispatch on a new child").
+koto session start review-443 --parent <your-session-id> --needs-agent \
+  --role reviewer --template review.md --inputs '{"pr":443}'
+
+# 3. Connect the two.
+koto request bind <request-id> review --child review-443
+```
+
+For a single leg there's a shorthand: `koto request create --role reviewer --template review.md --inputs '<json>' --requested-by ID --coordinator-of-record ID`. The leg is named after the role, so the role has to satisfy the leg-name grammar. `--with-data` and the `--role` / `--template` / `--inputs` triple are mutually exclusive.
+
+`bind` only accepts a child started with `--needs-agent` under a parent — that's what makes the dispatch fence meaningful — and a child fulfils at most one leg. Rebinding the same leg to the same child is a no-op success; rebinding it elsewhere is rejected.
+
+Output is JSON on stdout, always, with no format flag. Every verb prints the same envelope: `request_id`, `request_state`, `close_disposition`, `leg_counts`, `revision`, `legs`, and `cli_contract`. Full flags and the response shape are in the [command reference](references/command-reference.md#koto-request); the closed error-code set and its exit statuses are in [error handling](references/error-handling.md#request-command-errors).
+
+### Where you read a leg's result
+
+**For a bound leg, read the result from your own `koto next` directive, exactly as you always have.** Don't tick the child, don't query it, and don't poll `koto request get` waiting for the answer — your own gate is what advances your workflow, so watching the request view leaves you sitting still while the gate that would have moved you has already cleared.
+
+The request view is for the four things your own directive can't give you:
+
+- mid-flight progress on a leg that hasn't finished,
+- partial state across a fan-out — which legs are in, which are still open,
+- a read from some session other than the coordinator holding the gate,
+- recovery after a restart, when the directive that carried the result is gone.
+
+### Reporting progress on a leg you're filling
+
+```bash
+koto request progress <request-id> <leg> --with-data '{"note":"parser rewritten, tests next"}' --dispatch-epoch <n>
+```
+
+`koto session update --intent` is one sentence about what your whole workflow is for and each write replaces the last; a leg progress append is one entry about what you just finished for the request someone asked you to fill, and every entry is kept in order.
+
+Progress goes on the request, not on your own session log, and it never advances your workflow. `--dispatch-epoch` is required once the leg is bound: present the epoch baked into your spawn, the same value `koto next` wants. Up to 256 appends per leg, 16 KiB each.
+
+### Recording a result explicitly
+
+`koto request resolve` applies **only to a leg with no bound child.** A bound leg resolves by promotion: when its child reaches a terminal state, koto writes that child's result onto the leg on the same tick, with no extra action from either side. Resolving a bound leg explicitly is rejected (`explicit_resolve_on_bound_leg`) — and if it weren't, your explicit answer would permanently block the real one, since a leg accepts at most one result.
+
+One sentence to hold: if something else is doing the work, let it report; if nothing is, report it yourself.
+
+```bash
+koto request resolve <request-id> <leg> --with-data '{"status":"success","summary":"...","payload":{}}'
+```
+
+`status` is `success`, `failure`, or `skipped` — the same envelope a child's terminal tick produces.
+
+### Reading, waiting, and closing
+
+| Command | What it does |
+|---|---|
+| `koto request get <request-id>` | Read one request. Exits 0 for open, partially resolved, and closed alike — an unfinished request is a successful read, not an error. Two reads of an unchanged request are byte-equal. |
+| `koto request list [--requested-by ID \| --coordinator-of-record ID] [--state open\|closed] [--unresolved-legs]` | Summaries only. Advances no cursor and writes nothing. |
+| `koto request wait <request-id> <predicate> --timeout-secs N [--interval-secs N]` | Poll the same read path until a predicate holds. Exactly one predicate: `--leg <name>`, `--all-legs`, `--closed`, or `--resolved-count <N>`. |
+| `koto request abandon <request-id> <leg> --rationale TEXT` | Stop waiting on one leg. The others stay open. |
+| `koto request abandon-request <request-id> --rationale TEXT` | Abandon every open leg and close the request. A separate verb, so an unset shell variable can't escalate a leg abandonment into the whole request's. |
+| `koto request close <request-id>` | Close, recording a disposition derived from the legs. Closing twice is rejected. |
+
+`wait` is where readiness lives, so `get` can stay exit-zero. A satisfied predicate exits 0; a deadline with the predicate still unsatisfied exits 1 (transient, retry); a predicate that could never hold — five resolved legs on a three-leg request — exits 2 before polling starts; one that stopped being reachable while you waited exits 2 with a distinct code. `--timeout-secs` is required, and `--interval-secs` defaults to 2 with a floor of 1.
+
+`--issued-by ID` is accepted on the six mutating verbs — `bind`, `progress`, `resolve`, `abandon`, `abandon-request`, `close` — and recorded for audit; `create` carries the same attribution as `--requested-by`. `--cli-contract MAJOR.MINOR` is accepted on every subcommand and checked before any read or write; this build serves `1.0`.
+
+### Learning your own leg
+
+If your session was bound to a leg, every `koto next` response carries a top-level `leg` object:
+
+```json
+{"leg": {"request_id": "req-9f1c2b7a-4d3e-4c5f-8a1b-2c3d4e5f6071", "leg_name": "review"}}
+```
+
+You read it off your own tick — it is never passed in your prompt. `koto status <name>` mirrors it read-only. It deliberately carries no `dispatch_epoch`: the epoch you present on writes is the one baked into your spawn, not something you can look up. A leg bound after your session started shows up on your next tick with no restart.
+
+If there's no `leg` object, your session isn't bound to one. Don't guess a request id and don't call `koto request` verbs against a request you can't see.
+
+### When the requester stops waiting
+
+If your leg is abandoned, your next `koto next` tells you twice.
+
+`directive` opens with a notice from koto — explicitly not from your coordinator — saying the leg was abandoned and nobody is waiting for your result. The state's own directive is still underneath it, retained for context only. The response also carries a top-level `leg_abandoned` object with `request_id`, `leg_name`, and the requester's verbatim `rationale`; the rationale is never spliced into `directive`, so read it from that sibling or from `koto request get <request-id>`.
+
+**What to do:** stop the work in progress, start nothing new, and wind the session down without producing further output. Report what happened to whoever spawned you.
+
+**What doesn't change:** the notice adds no `action` value — keep dispatching on `action` exactly as the table above says — and it doesn't touch `blocking_conditions` or your workflow state. koto isn't cancelling you; the advance loop still works, which is why the wind-down is yours to do.
+
+Two response variants carry no `directive` to splice into: `done` and an error response. So a tick that fails validation gets no notice and you'll see it on the next successful tick. A `koto next --to <state>` directed transition carries the notice in `directive` but no `leg_abandoned` sibling and no `leg` object.
+
 ## Batch workflows
 
 A batch workflow is a hierarchy variant where the parent submits a structured task list once, and koto's scheduler materializes and tracks per-task children automatically. The parent declares a `materialize_children` hook plus a `children-complete` gate; each `koto next <parent>` tick runs the scheduler, reports per-task feedback, and aggregates child outcomes for the gate.
@@ -323,9 +426,11 @@ koto session update <name> --intent "investigate the flaky CI failure in the aut
 
 Intent strings over 1024 characters are rejected. The command exits non-zero if the session doesn't exist.
 
+Don't reach for this to report progress on a request leg. `--intent` is one sentence about what your whole workflow is for and each write replaces the last; a leg progress append is one entry about what you just finished for the request someone asked you to fill, and every entry is kept in order. See [Requests and legs](#requests-and-legs).
+
 ## Periodic maintenance: koto workspace prune
 
-`koto workspace prune` reclaims the derived files the request-store substrate accumulates over time — stale scan cursors (`~/.koto/coordinators/<id>/scan_cursor.toml`), stale compaction locks, and stale claim sidecars (`claim.lock`). It does NOT reclaim session bodies under `~/.koto/sessions/`; per-session cleanup still routes through `koto session cleanup <session-id>`.
+`koto workspace prune` reclaims the derived files the dispatch substrate accumulates over time — stale scan cursors (`~/.koto/coordinators/<id>/scan_cursor.toml`), stale compaction locks, and stale claim sidecars (`claim.lock`). It does NOT reclaim session bodies under `~/.koto/sessions/`; per-session cleanup still routes through `koto session cleanup <session-id>`. It also leaves request records under `~/.koto/requests/` alone — a closed request stays readable, which is what makes it an audit trail.
 
 Suggest the verb when the user reports growing `~/.koto/` disk usage, when the discovery scan starts noticeably slowing at year-2 scale, or when stale-claim recovery events show up in the audit log.
 
@@ -363,9 +468,9 @@ To verify the path end-to-end without a live Claude Code TUI, run `scripts/verif
 
 Read these on demand, not upfront. The sections above cover the common path. Consult a reference file only when you hit the specific situation it describes.
 
-- [**Command reference**](references/command-reference.md) — full CLI syntax, flags, and output shapes for all subcommands. Follow this when you need exact flag names or want to check an unfamiliar command.
+- [**Command reference**](references/command-reference.md) — full CLI syntax, flags, and output shapes for all subcommands, including the whole `koto request` group. Follow this when you need exact flag names or want to check an unfamiliar command.
 - [**Response shapes**](references/response-shapes.md) — annotated JSON examples for every `action` value, sub-object schemas for `expects` and `blocking_conditions`, and field-level annotations. Follow this when a field's presence or shape is unclear.
-- [**Error handling**](references/error-handling.md) — exit code table, error code meanings, and agent actions for each error type. Follow this when a command fails or returns a non-zero exit code.
+- [**Error handling**](references/error-handling.md) — exit code table, error code meanings (including the closed `koto request` code set), and agent actions for each error type. Follow this when a command fails or returns a non-zero exit code.
 - [**Batch workflows**](references/batch-workflows.md) — coordinator/worker partition, `materialized_children` dispatch, `retry_failed` mechanics, `reserved_actions`, `batch_final_view`, cloud `sync_status`, and skip-marker `synthetic: true`. Follow this when the workflow uses `materialize_children` or the response carries a `scheduler` field.
 
 ## Troubleshooting
@@ -381,5 +486,11 @@ Read these on demand, not upfront. The sections above cover the common path. Con
 **Evidence rejected (`invalid_submission`)** — one or more fields didn't pass validation. The error includes a `details` array with per-field reasons. Fix the field values and resubmit. Call `koto next <name>` without `--with-data` to re-read the `expects` schema if needed.
 
 **"reserved audit-event kind"** — your `--with-data` payload included a `fields.kind` value that collides with the request-store audit family. Four literal kinds (`ChildDispatched`, `ChildRedelegated`, `RequesterWoken`, `RequesterRespawn`) and anything starting with the `request_store.` prefix are reserved for the engine — template authors can't use them. Rename the field value to something workflow-specific (e.g., `"verdict"`, `"scrutineer"`) and resubmit.
+
+**"explicit_resolve_on_bound_leg"** — you called `koto request resolve` on a leg that already has a bound child. Let the child's terminal tick promote its result instead; if you *are* that child, just finish your workflow normally and the leg resolves itself.
+
+**"epoch_fence_violation" from a `koto request` write** — the leg is bound and you either omitted `--dispatch-epoch` or presented something other than the epoch recorded when the leg was bound. Present the epoch baked into your spawn. It's deliberately not readable from the `leg` object, so don't go looking for it there.
+
+**"request_not_found" or "leg_not_found"** — check the id and leg name against your own `leg` object, or run `koto request list --coordinator-of-record <id>`. Both are caller errors (exit 2); retrying unchanged won't help.
 
 **`koto next` returns the same state repeatedly** — check `advanced` in the response. If it's `false`, the engine stopped where it already was (gates still blocking, or evidence still missing). Re-read `blocking_conditions` and `directive`.

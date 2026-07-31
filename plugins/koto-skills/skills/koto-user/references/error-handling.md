@@ -13,15 +13,17 @@ This file covers exit codes, error shapes, and how to respond to each category o
 | 2 | Caller error — the agent must change behavior | Fix the request; do not retry without changing input |
 | 3 | Infrastructure error — corrupted or misconfigured | Report to user; do not retry automatically |
 
+Some subcommands also return sysexits values (64, 65, 66, 75) — see the `NextErrorCode` table below. The `koto request` group never does: it uses 0, 1, 2, and 3 and nothing else, so a wrapper can treat any status above 3 from a request command as coming from somewhere other than koto.
+
 ---
 
 ## Two distinct error shapes
 
 koto uses different JSON shapes depending on which command failed.
 
-### Shape 1: koto next domain errors (structured)
+### Shape 1: structured, nested (`koto next` and `koto request`)
 
-`koto next` writes structured error JSON to **stdout** when a domain error occurs:
+`koto next` writes structured error JSON to **stdout** when a domain error occurs. The whole `koto request` group uses the same shape, on stdout, for every rejection:
 
 ```json
 {
@@ -38,12 +40,15 @@ koto uses different JSON shapes depending on which command failed.
 Fields:
 - `error.code` — snake_case error code string (see table below)
 - `error.message` — human-readable explanation
-- `error.details` — array of per-field errors; always present but may be empty `[]`;
-  populated only for `invalid_submission`
+- `error.details` — array of per-field errors; always present but may be empty `[]`. On
+  `koto next` it is populated only for `invalid_submission`; on `koto request` it names
+  the flag or the bound whenever the rejection is tied to one.
 
-### Shape 2: all other subcommands (flat)
+Batch-scoped ticks add a typed `error.batch` sibling to this shape (see below). `koto request` envelopes carry no `command` field — the code identifies the condition, so there's nothing to string-match.
 
-Every command other than `koto next` writes a flat error JSON to **stderr** on failure:
+### Shape 2: the remaining subcommands (flat)
+
+Every command other than `koto next` and `koto request` writes a flat error JSON to **stderr** on failure:
 
 ```json
 {"error": "workflow 'my-workflow' already exists", "command": "init"}
@@ -94,6 +99,68 @@ them via config. The reserved `[request_store.recursion]` namespace
 exists for a future V1.1 promotion to operator-configurable caps, but
 at V1 the fix is always structural: restructure the workflow rather
 than chase a config override.
+
+---
+
+## Request command errors
+
+Every subcommand under `koto request` reports failure through the nested envelope, with a code from a closed set. Each code binds to exactly one exit class, so you never have to read `message` to decide what to do.
+
+```json
+{
+  "error": {
+    "code": "epoch_fence_violation",
+    "message": "leg 'review' was bound at dispatch epoch 3; this writer presented 2",
+    "details": [{"field": "--dispatch-epoch", "reason": "expected 3, got 2"}]
+  }
+}
+```
+
+`details` is empty when the rejection isn't tied to a specific flag or bound.
+
+| `error.code` | Exit | Meaning | Agent action |
+|---|---|---|---|
+| `wait_timeout` | 1 | `wait` hit `--timeout-secs` with the predicate still unsatisfied | Retry the wait, or go do something else and come back |
+| `wait_interrupted` | 1 | A signal arrived while polling | Retry if you still want the answer |
+| `lock_contention` | 1 | The per-request write lock wasn't acquired within five seconds | Back off and retry the same call |
+| `request_not_found` | 2 | No request record at that identifier | Check the id; `koto request list` if you've lost it |
+| `leg_not_found` | 2 | The request has no leg by that name | Read the leg names from `koto request get` |
+| `invalid_identifier` | 2 | A request id, leg name, session id, or coordinator id failed its grammar | Fix the identifier; never worth retrying |
+| `invalid_submission` | 2 | A flag payload was malformed, or the combination was — `--with-data` together with the flat triple, a creation payload with no legs, a duplicate leg name, a value that isn't a JSON object | Fix the payload |
+| `contract_mismatch` | 2 | `--cli-contract` named a contract this build doesn't serve | Drop the pin or match the build. Checked before any I/O, so nothing happened |
+| `request_closed` | 2 | A leg mutation, or a second `close`, on a closed request | Stop writing to it |
+| `leg_already_resolved` | 2 | A second result, or any mutation, on a leg that already answered | Read the existing result instead |
+| `leg_abandoned` | 2 | A mutation on a leg the requester stopped waiting on | Wind down; see the abandonment notice |
+| `leg_bound_to_different_child` | 2 | A rebind that would point an already-bound leg at a different child | Rebinding to the *same* child is an idempotent success, not this |
+| `child_not_found` | 2 | `bind` named a child whose session couldn't be read | Start the child first, or fix the session id |
+| `child_not_fenceable` | 2 | `bind` named a child that isn't a `--needs-agent` child of a parent | Start it with `koto session start --parent <parent> --needs-agent ...` |
+| `child_bound_to_different_leg` | 2 | That child already fulfils another leg | A child fulfils at most one leg. Start another child |
+| `explicit_resolve_on_bound_leg` | 2 | `resolve` on a bound leg | Don't. The child's terminal tick promotes the result |
+| `request_id_collision` | 2 | The generated id already had a record on disk | Retry `create`; a fresh id is minted |
+| `idempotency_conflict` | 2 | A retry presented a known hash with a different payload | Decide which write you meant; this isn't the same logical write |
+| `bound_exceeded` | 2 | One of the bounds below rejected the call; `details` names the dimension | Send less |
+| `epoch_fence_violation` | 2 | The presented `--dispatch-epoch` isn't the epoch recorded on the leg's bind event, or was omitted on a bound leg | Present the epoch baked into your spawn. Equality is strict, so a future epoch fails alongside a stale one |
+| `predicate_impossible` | 2 | The `wait` predicate could never hold, caught before polling | Ask for something reachable |
+| `predicate_became_impossible` | 2 | The predicate stopped being reachable while waiting, through abandonment or close | Distinct from a timeout on purpose: this is "never", not "not yet" |
+| `persistence_error` | 3 | The filesystem refused, or the log disagrees with itself | Report to the user; retrying won't help |
+
+An unsatisfiable predicate is a caller error rather than a transient one on purpose — telling a shell loop to retry forever on a condition that can never become true is worse than failing it.
+
+### Bounds behind `bound_exceeded`
+
+Rejecting is chosen over truncating, since truncation silently drops the newest information.
+
+| Dimension | Limit | Reported in `details` as |
+|---|---|---|
+| Progress appends per leg | 256 (operator-tunable) | `progress_appends_per_leg` |
+| Bytes per progress append | 16 KiB | `append_bytes` |
+| Legs per request, at `create` | 256 (operator-tunable) | `legs_per_request` |
+| Bytes in any JSON flag value | 1 MiB | the flag name, e.g. `--with-data` |
+| Nesting depth in any JSON flag value | 128 | the flag name, or `json_depth` |
+| Bytes in a stored leg or request `inputs` | 1 MiB | `leg_inputs_bytes`, `request_inputs_bytes` |
+| Bytes in `--rationale` | 4 KiB | `rationale_bytes` |
+
+The rationale cap is much tighter than koto's 1 MiB rationale precedent elsewhere because that text reaches a delegate's response on every tick until it terminates. Every bound is checked inside the per-request lock, so none can be raced past, and a rejected `create` leaves no directory behind.
 
 ---
 

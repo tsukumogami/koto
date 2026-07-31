@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 upstream: docs/prds/PRD-request-lifecycle.md
 problem: |
   The accepted PRD specifies a request object holding several legs, each
@@ -46,7 +46,7 @@ rationale: |
 
 ## Status
 
-Planned
+Current
 
 ## Upstream Design Reference
 

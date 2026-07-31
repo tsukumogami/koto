@@ -266,6 +266,9 @@ The code set is closed. A consumer that had to match on `message` to tell "this 
 | `leg_abandoned` | 2 | A mutation on a leg the requester stopped waiting on. |
 | `leg_bound_to_different_child` | 2 | A rebind that would point an already-bound leg at a different child. Rebinding to the same child is an idempotent success, not this. |
 | `explicit_resolve_on_bound_leg` | 2 | `resolve` on a bound leg. A bound leg's result is promoted from its child's terminal tick; accepting an explicit one here would block the real one. |
+| `child_not_found` | 2 | `bind` named a child whose session could not be read. |
+| `child_not_fenceable` | 2 | `bind` named a child whose header does not satisfy the dispatch-fence predicate. Binding it would produce a leg that could never be fenced, so the bind is refused instead. |
+| `child_bound_to_different_leg` | 2 | `bind` named a child that already points at a different request-and-leg pair. A child fulfils at most one leg, and this is the only place that can be checked — the lock is per-request, so two binds in different requests never serialize against each other. |
 | `request_id_collision` | 2 | The generated identifier already had a record on disk. |
 | `idempotency_conflict` | 2 | A retry presented a known idempotency hash with a different payload, so it isn't the same logical write. |
 | `bound_exceeded` | 2 | One of the bounds below rejected the call. `details` names the dimension. |
