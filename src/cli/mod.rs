@@ -4756,7 +4756,12 @@ fn handle_decisions_list(backend: &dyn SessionBackend, name: String) -> Result<(
 /// Returns a JSON object with the workflow's current state, template info,
 /// and terminal status. Read-only: does not evaluate gates, run actions,
 /// or modify the state file.
-fn handle_status(backend: &dyn SessionBackend, name: &str) -> Result<()> {
+///
+/// Takes `&Backend` (the concrete enum) rather than `&dyn SessionBackend`
+/// so it can call the inherent `Backend::is_cloud()` accessor to gate
+/// `stale_template_source_dir` wording -- mirrors `handle_resolve`'s
+/// existing `&Backend` parameter for the same reason.
+fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     if !backend.exists(name) {
         exit_with_error_code(
             serde_json::json!({
@@ -4872,8 +4877,47 @@ fn handle_status(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         response["superseded_branches"] = serde_json::json!(superseded);
     }
 
+    // Optional `stale_template_source_dir` key — populated only when the
+    // session's recorded `template_source_dir` no longer resolves on this
+    // machine. Absent (not `null`) when there is nothing to report, per
+    // the same present-only-when-relevant convention as `batch` and
+    // `superseded_branches` above.
+    if let Some(stale) = derive_stale_template_source_dir(&header, backend.is_cloud()) {
+        response["stale_template_source_dir"] = stale;
+    }
+
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
+}
+
+/// Derive the `stale_template_source_dir` JSON value for `koto status`.
+///
+/// Returns `None` when the session's header has no `template_source_dir`
+/// recorded, or when the recorded directory still exists -- callers
+/// should omit the response key entirely in either case, never serialize
+/// `null`. Returns `Some` only when
+/// [`crate::engine::template_source_status::check_template_source_dir`]
+/// reports `exists: false`, with wording from
+/// [`crate::engine::template_source_status::format_stale_template_source_note`]
+/// gated on `is_cloud` (softened for `CloudBackend` sessions, direct for
+/// `LocalBackend`).
+fn derive_stale_template_source_dir(
+    header: &crate::engine::types::StateFileHeader,
+    is_cloud: bool,
+) -> Option<serde_json::Value> {
+    use crate::engine::template_source_status::{
+        check_template_source_dir, format_stale_template_source_note,
+    };
+
+    let status = check_template_source_dir(header)?;
+    if status.exists {
+        return None;
+    }
+    Some(serde_json::json!({
+        "path": status.path,
+        "machine_id": status.machine_id,
+        "note": format_stale_template_source_note(is_cloud),
+    }))
 }
 
 /// Discover superseded branches by scanning for sessions whose name
@@ -5332,6 +5376,80 @@ mod tests {
         assert_eq!(
             derive_default_intent(&t),
             Some("Real description".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 4: derive_stale_template_source_dir (koto status)
+    // -----------------------------------------------------------------------
+
+    fn header_with_template_source_dir(
+        dir: Option<std::path::PathBuf>,
+    ) -> crate::engine::types::StateFileHeader {
+        crate::engine::types::StateFileHeader {
+            schema_version: 1,
+            workflow: "test-workflow".to_string(),
+            template_hash: "testhash".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: None,
+            template_source_dir: dir,
+            session_id: String::new(),
+            intent: None,
+            template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
+        }
+    }
+
+    #[test]
+    fn derive_stale_template_source_dir_omitted_when_absent() {
+        let header = header_with_template_source_dir(None);
+        assert_eq!(derive_stale_template_source_dir(&header, false), None);
+    }
+
+    #[test]
+    fn derive_stale_template_source_dir_omitted_when_existing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let header = header_with_template_source_dir(Some(dir.path().to_path_buf()));
+        assert_eq!(derive_stale_template_source_dir(&header, false), None);
+    }
+
+    #[test]
+    fn derive_stale_template_source_dir_direct_wording_for_local() {
+        let missing = std::path::PathBuf::from("/definitely/does/not/exist/koto-status-test");
+        assert!(!missing.exists(), "test precondition violated");
+        let header = header_with_template_source_dir(Some(missing.clone()));
+
+        let value = derive_stale_template_source_dir(&header, false)
+            .expect("stale template_source_dir must be Some when the directory is missing");
+        assert_eq!(value["path"], serde_json::json!(missing));
+        assert_eq!(
+            value["note"],
+            serde_json::json!("template source directory no longer exists")
+        );
+    }
+
+    #[test]
+    fn derive_stale_template_source_dir_softened_wording_for_cloud() {
+        let missing = std::path::PathBuf::from("/definitely/does/not/exist/koto-status-test-2");
+        let header = header_with_template_source_dir(Some(missing));
+
+        let value = derive_stale_template_source_dir(&header, true)
+            .expect("stale template_source_dir must be Some when the directory is missing");
+        let note = value["note"].as_str().unwrap();
+        assert!(
+            note.contains("synced from another machine"),
+            "cloud wording must be softened, got: {note}"
         );
     }
 
