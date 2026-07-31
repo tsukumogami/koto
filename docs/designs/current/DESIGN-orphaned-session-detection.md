@@ -1,5 +1,5 @@
 ---
-status: Planned
+status: Current
 problem: |
   A koto session's state header already records the `template_source_dir`
   it was initialized from, but nothing reads that field back to check
@@ -73,7 +73,7 @@ rationale: |
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 
