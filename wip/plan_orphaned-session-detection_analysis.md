@@ -1,5 +1,7 @@
 # Plan Analysis: DESIGN-orphaned-session-detection
 
+review_rounds: 1
+
 ## Source Document
 Path: docs/designs/DESIGN-orphaned-session-detection.md
 Status: Accepted

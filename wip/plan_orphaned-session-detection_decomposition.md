@@ -38,8 +38,10 @@ alongside the issue that introduces it.
 - **Complexity**: simple
 - **Goal**: Introduce `TemplateSourceStatus` and
   `check_template_source_path`/`check_template_source_dir` in a new
-  `src/engine/template_source_status.rs`, unit-tested in isolation, with
-  no wiring into any existing call site yet.
+  `src/engine/template_source_status.rs`, plus a `Backend::is_cloud()`
+  accessor (moved here from Issue 4/5 per plan-review Category D, since
+  both depend on Issue 1 and neither otherwise forced ordering), all
+  unit-tested in isolation with no wiring into any existing call site yet.
 - **Section**: Solution Architecture / Implementation Approach Phase 1
 - **Milestone**: Orphaned Session Detection
 - **Dependencies**: None
@@ -47,12 +49,15 @@ alongside the issue that introduces it.
 ### Issue 2: refactor(engine): route stale-template-source-dir warnings through the shared module
 - **Type**: standard
 - **Complexity**: testable
-- **Goal**: Refactor both existing `SchedulerWarning::StaleTemplateSourceDir`
-  construction sites (`path_resolution.rs`'s per-task resolver and
-  `batch.rs::emit_template_source_dir_warnings`) to build from the Issue 1
-  module instead of computing `Path::exists()`/`current_machine_id()`
-  inline, with no wire-format change. Existing tests
-  (`stale_base_emits_warning_with_machine_id_and_fallback` and neighbors)
+- **Goal**: Refactor `batch.rs`'s per-tick existence probe and its
+  `SchedulerWarning::StaleTemplateSourceDir` construction
+  (`emit_template_source_dir_warnings`) to build from the Issue 1 module
+  instead of computing `Path::exists()`/`current_machine_id()` inline.
+  `path_resolution.rs`'s per-task resolver is explicitly **not** touched
+  (plan-review correction, Category B) -- it only consumes a pre-computed
+  boolean from its caller and never independently checked existence, so
+  there is nothing there to consolidate. No wire-format change. Existing
+  tests (`stale_base_emits_warning_with_machine_id_and_fallback` and neighbors)
   must keep passing unmodified as the regression guard.
 - **Section**: Implementation Approach Phase 2
 - **Milestone**: Orphaned Session Detection
@@ -77,8 +82,8 @@ alongside the issue that introduces it.
 - **Goal**: Add a conditional `stale_template_source_dir` JSON key to
   `handle_status`'s response and surface `template_source_status` from
   each row in `handle_list`'s output, via a shared backend-aware wording
-  helper (`Backend::is_cloud()`-gated, per Decision 2) that softens
-  language for cloud-synced sessions. Document the new field in
+  helper (gated on Issue 1's `Backend::is_cloud()`, per Decision 2) that
+  softens language for cloud-synced sessions. Document the new field in
   `docs/guides/cli-usage.md` (docs-coverage emit, step 3.1a).
 - **Section**: Implementation Approach Phase 4
 - **Milestone**: Orphaned Session Detection
@@ -90,7 +95,8 @@ alongside the issue that introduces it.
 - **Goal**: Update both `koto init` collision paths (the pre-check and the
   `SpawnErrorKind::Collision` handler) to open the colliding session's
   header, run the Issue 1 check, and append the same staleness clause to
-  both -- this is the design's Implicit Decision: the two base messages are
+  both (wording gated on Issue 1's `Backend::is_cloud()`) -- this is the
+  design's Implicit Decision: the two base messages are
   not byte-identical today and this issue does not unify them, only
   ensures the new clause is present on both. This is the fix for the
   originally reported bug (tsukumogami/koto#189).
