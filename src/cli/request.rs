@@ -147,6 +147,14 @@ pub enum RequestErrorCode {
     LegAbandoned,
     /// A rebind that would point an already-bound leg somewhere else.
     LegBoundToDifferentChild,
+    /// `bind` named a child whose session could not be read.
+    ChildNotFound,
+    /// `bind` named a child whose header does not satisfy the
+    /// dispatch-fence predicate, so the leg could never be fenced.
+    ChildNotFenceable,
+    /// `bind` named a child that already carries a pointer at a
+    /// different request-and-leg pair.
+    ChildBoundToDifferentLeg,
     /// An explicit `resolve` on a leg whose result will be promoted
     /// from its bound child's terminal tick.
     ExplicitResolveOnBoundLeg,
@@ -201,6 +209,9 @@ impl RequestErrorCode {
             | RequestErrorCode::LegAlreadyResolved
             | RequestErrorCode::LegAbandoned
             | RequestErrorCode::LegBoundToDifferentChild
+            | RequestErrorCode::ChildNotFound
+            | RequestErrorCode::ChildNotFenceable
+            | RequestErrorCode::ChildBoundToDifferentLeg
             | RequestErrorCode::ExplicitResolveOnBoundLeg
             | RequestErrorCode::RequestIdCollision
             | RequestErrorCode::IdempotencyConflict
@@ -1129,6 +1140,31 @@ fn list(
 
 // ===== leg mutations =====
 
+/// Bind a leg to the child session that will fulfil it.
+///
+/// Three checks run against the child's own session before the append,
+/// and the pointer that lets the child read its leg back is written
+/// after it (DESIGN-request-lifecycle.md Decision 3):
+///
+/// 1. The child's session must be readable. Binding a leg to a session
+///    that does not exist would produce a leg nobody can fulfil and a
+///    pointer nobody can read.
+/// 2. The child's header must satisfy the dispatch-fence predicate, so
+///    a leg cannot be bound to something that can never be fenced. The
+///    predicate excludes top-level sessions and batch-spawned children,
+///    both of which would otherwise bind happily and then ignore
+///    `--dispatch-epoch` forever after.
+/// 3. The child must not already carry a pointer at a *different*
+///    request-and-leg pair. The store's lock is per-request, so two
+///    binds in different requests targeting one child do not serialize
+///    at all — this is the only place the one-leg-per-child half of the
+///    invariant can be enforced.
+///
+/// The epoch recorded on the event is read from the child's header
+/// rather than taken from the flag, so the value the fence later
+/// compares against cannot be a caller's guess. A presented
+/// `--dispatch-epoch` that disagrees with the header is rejected rather
+/// than silently overridden.
 fn bind(
     id: &str,
     leg: &str,
@@ -1141,21 +1177,124 @@ fn bind(
     let issued_by = optional_identifier("--issued-by", issued_by)?;
     let root = koto_root()?;
 
+    let session_dir = child_session_dir(&child)?;
+    let header = read_child_header(&child, &session_dir)?;
+
+    if !crate::engine::epoch::fence_applies_to(&header) {
+        return Err(RequestError::new(
+            RequestErrorCode::ChildNotFenceable,
+            format!(
+                "child '{child}' is not a dispatched request-store child, so a leg bound to it \
+                 could never be fenced"
+            ),
+        )
+        .with_detail(
+            "--child",
+            "the header needs a parent workflow and needs_agent: true",
+        ));
+    }
+
+    // Presented before the header is read, so the comparison is against
+    // the value the fence will actually use.
+    if let Some(presented) = dispatch_epoch {
+        if presented != header.dispatch_epoch {
+            return Err(RequestError::new(
+                RequestErrorCode::EpochFenceViolation,
+                format!(
+                    "child '{child}' is at dispatch epoch {}; this caller presented {presented}",
+                    header.dispatch_epoch
+                ),
+            )
+            .with_detail(
+                "--dispatch-epoch",
+                format!("expected {}, got {presented}", header.dispatch_epoch),
+            ));
+        }
+    }
+
+    let existing = crate::engine::leg_pointer::read_pointer(&session_dir).map_err(|e| {
+        RequestError::new(
+            RequestErrorCode::PersistenceError,
+            format!("could not read child '{child}'s leg pointer: {e}"),
+        )
+    })?;
+    if let Some(existing) = &existing {
+        if existing.names_a_different_leg(id.as_str(), leg) {
+            return Err(RequestError::new(
+                RequestErrorCode::ChildBoundToDifferentLeg,
+                format!(
+                    "child '{child}' already fulfils leg '{}' of request '{}'; a child fulfils at \
+                     most one leg",
+                    existing.leg_name, existing.request_id
+                ),
+            )
+            .with_detail("--child", "already bound elsewhere"));
+        }
+    }
+
+    let timestamp = now_iso8601();
     let outcome = request_store::bind_leg(
         &root,
         &id,
         &BindLeg {
             leg_name: leg.to_string(),
-            child_session_id: child,
-            dispatch_epoch,
+            child_session_id: child.clone(),
+            dispatch_epoch: Some(header.dispatch_epoch),
             issued_by,
-            timestamp: now_iso8601(),
+            timestamp: timestamp.clone(),
         },
     )
     .map_err(map_store_error)?;
 
+    // After the event is durable and after the store released the
+    // request lock, so there is no lock-ordering cycle against the
+    // terminal tick's promotion. The event is authoritative; a lost
+    // pointer leaves a correctly-bound leg whose delegate reads no leg,
+    // which is degraded capability rather than corruption.
+    if let Err(e) = crate::engine::leg_pointer::write_pointer(
+        &session_dir,
+        &crate::engine::leg_pointer::LegPointer {
+            request_id: id.as_str().to_string(),
+            leg_name: leg.to_string(),
+            bound_at: timestamp,
+        },
+    ) {
+        eprintln!(
+            "warning: the leg is bound but child '{child}' could not be told which leg it \
+             fulfils; re-run bind to repair: {e}"
+        );
+    }
+
     let view = request_store::read_view(&root, &id).map_err(map_store_error)?;
     render(&view, Some(outcome.written))
+}
+
+/// Locate a child's session directory, honoring the same backend
+/// resolution `koto next` uses so a test workspace and a real one agree.
+fn child_session_dir(child: &str) -> Result<PathBuf, RequestError> {
+    let backend = crate::cli::build_local_backend().map_err(|e| {
+        RequestError::new(
+            RequestErrorCode::PersistenceError,
+            format!("could not resolve the session store: {e}"),
+        )
+    })?;
+    use crate::session::SessionBackend;
+    Ok(backend.session_dir(child))
+}
+
+/// Read a child's state-file header, or report the child unreachable.
+fn read_child_header(
+    child: &str,
+    session_dir: &std::path::Path,
+) -> Result<crate::engine::types::StateFileHeader, RequestError> {
+    let state_path = session_dir.join(crate::session::state_file_name(child));
+    crate::engine::persistence::read_header(&state_path).map_err(|e| {
+        RequestError::new(
+            RequestErrorCode::ChildNotFound,
+            format!("could not read child '{child}'s session: {e}"),
+        )
+        .with_detail("--child", "no readable session at this identifier")
+    })
 }
 
 fn progress(
@@ -1653,6 +1792,9 @@ mod tests {
             RequestErrorCode::LegAlreadyResolved,
             RequestErrorCode::LegAbandoned,
             RequestErrorCode::LegBoundToDifferentChild,
+            RequestErrorCode::ChildNotFound,
+            RequestErrorCode::ChildNotFenceable,
+            RequestErrorCode::ChildBoundToDifferentLeg,
             RequestErrorCode::ExplicitResolveOnBoundLeg,
             RequestErrorCode::RequestIdCollision,
             RequestErrorCode::IdempotencyConflict,

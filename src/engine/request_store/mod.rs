@@ -776,6 +776,20 @@ pub fn read_view(
     read_view_at(&path, request_id)
 }
 
+/// The request log's modification time, if the record is there.
+///
+/// Exposed so a caller can cheaply decide whether reading the whole
+/// record is worth it — the abandonment check on a bound delegate's tick
+/// is the one that needs this, since the record is sized in megabytes
+/// and the question it asks is one boolean. The log path itself stays
+/// module-private, because every writer has to go through the
+/// lock-guarded append.
+pub fn log_mtime(root: &Path, request_id: &ValidatedRequestId) -> Option<std::time::SystemTime> {
+    std::fs::metadata(log_path(root, request_id))
+        .ok()
+        .and_then(|md| md.modified().ok())
+}
+
 fn read_view_at(
     path: &Path,
     request_id: &ValidatedRequestId,

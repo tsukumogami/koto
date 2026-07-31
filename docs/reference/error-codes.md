@@ -6,7 +6,9 @@ Every error from the koto CLI is a JSON object with an `error` field and a `comm
 {"error":"workflow 'my-workflow' not found","command":"next"}
 ```
 
-The `error` field is a human-readable message. The `command` field identifies which subcommand produced the error. Both fields are always present.
+The `error` field is a human-readable message. The `command` field identifies which subcommand produced the error. Both fields are always present in this flat shape.
+
+Three surfaces use a structured envelope instead, where `error` is an object carrying a machine-readable `code`: `koto next`'s domain errors, the batch-scoped errors, and the whole `koto request` noun group. Those envelopes carry no `command` field — the code identifies the condition, so there's nothing to string-match.
 
 ## Error conditions by command
 
@@ -228,3 +230,83 @@ Example envelope:
 ```
 
 All batch validation runs pre-append — rejected submissions leave no events on the parent's state file.
+
+---
+
+## Request errors
+
+Every subcommand under `koto request` — `create`, `bind`, `get`, `wait`, `list`, `progress`, `resolve`, `abandon`, `abandon-request`, and `close` — reports failure through one nested envelope, the same shape `koto next`'s domain errors use:
+
+```json
+{
+  "error": {
+    "code": "epoch_fence_violation",
+    "message": "leg 'review' was bound at dispatch epoch 3; this writer presented 2",
+    "details": [
+      {"field": "--dispatch-epoch", "reason": "expected 3, got 2"}
+    ]
+  }
+}
+```
+
+The code set is closed. A consumer that had to match on `message` to tell "this leg already has a result" from "this request is closed" would have no contract at all, so each condition gets its own code and each code binds to exactly one exit class. `details` is empty when the rejection isn't tied to a specific flag or bound.
+
+| Code | Exit | Meaning |
+|------|:----:|---------|
+| `wait_timeout` | 1 | `wait` hit its `--timeout-secs` deadline with the predicate still unsatisfied. |
+| `wait_interrupted` | 1 | A signal arrived while `wait` was polling. |
+| `lock_contention` | 1 | The per-request write lock wasn't acquired within its five-second deadline. Retryable after backoff. |
+| `request_not_found` | 2 | No request record exists at that identifier. |
+| `leg_not_found` | 2 | The request has no leg by that name. |
+| `invalid_identifier` | 2 | A request id, leg name, session id, or coordinator id failed its grammar. Never worth retrying. |
+| `invalid_submission` | 2 | A flag payload was malformed, or the flag combination was — `--with-data` together with the `--role`/`--template`/`--inputs` triple, a creation payload with no legs, a duplicate leg name, a value that isn't a JSON object. |
+| `contract_mismatch` | 2 | `--cli-contract` named a contract this build doesn't serve. Checked before any read or write, so a mismatch has no side effect. |
+| `request_closed` | 2 | A leg mutation, or a second `close`, on a closed request. |
+| `leg_already_resolved` | 2 | A second result, or any mutation, on a leg that already answered. |
+| `leg_abandoned` | 2 | A mutation on a leg the requester stopped waiting on. |
+| `leg_bound_to_different_child` | 2 | A rebind that would point an already-bound leg at a different child. Rebinding to the same child is an idempotent success, not this. |
+| `explicit_resolve_on_bound_leg` | 2 | `resolve` on a bound leg. A bound leg's result is promoted from its child's terminal tick; accepting an explicit one here would block the real one. |
+| `request_id_collision` | 2 | The generated identifier already had a record on disk. |
+| `idempotency_conflict` | 2 | A retry presented a known idempotency hash with a different payload, so it isn't the same logical write. |
+| `bound_exceeded` | 2 | One of the bounds below rejected the call. `details` names the dimension. |
+| `epoch_fence_violation` | 2 | The presented `--dispatch-epoch` doesn't match the epoch recorded on the leg's bind event, or was omitted on a leg that is bound. Equality is strict, so a future epoch rejects alongside a stale one. |
+| `predicate_impossible` | 2 | The `wait` predicate could never hold, caught before polling began — asking for five resolved legs on a three-leg request, for instance. |
+| `predicate_became_impossible` | 2 | The predicate stopped being reachable while the wait was running, through abandonment or close. Distinct from a timeout so a caller can tell "not yet" from "never". |
+| `persistence_error` | 3 | The filesystem refused, or the log disagrees with itself. |
+
+An unsatisfiable predicate is a caller error rather than a transient one on purpose: telling a shell loop to retry forever on a condition that can never become true is worse than failing it.
+
+`progress` and `resolve` appends carry an idempotency hash derived from the payload, so retrying either after an ambiguous failure is safe — an identical retry short-circuits instead of double-appending, and a payload that differs under a hash already on the log surfaces as `idempotency_conflict` rather than as a phantom second result.
+
+### Bounds behind `bound_exceeded`
+
+Rejecting is chosen over truncating: truncation silently drops the newest information, which is the most valuable, and rolling over would break the log's ordering guarantee.
+
+| Dimension | Limit | Reported in `details` as | Tunable |
+|-----------|-------|--------------------------|---------|
+| Progress appends per leg | 256 | `progress_appends_per_leg` | `request_store.request_leg_append_cap` |
+| Bytes per progress append | 16 KiB | `append_bytes` | fixed |
+| Legs per request, at `create` | 256 | `legs_per_request` | `request_store.request_leg_cap` |
+| Bytes in any JSON flag value | 1 MiB | the flag name, e.g. `--with-data` | fixed |
+| Nesting depth in any JSON flag value | 128 | the flag name, or `json_depth` | fixed |
+| Bytes in a stored leg or request `inputs` | 1 MiB | `leg_inputs_bytes`, `request_inputs_bytes` | fixed |
+| Bytes in `--rationale` | 4 KiB | `rationale_bytes` | fixed |
+
+The rationale cap is much tighter than koto's 1 MiB rationale precedent elsewhere because this text is prepended to a delegate's directive on every tick until it terminates. A large one is a context-exhaustion problem, not merely a large string. Control characters in an accepted rationale are replaced with spaces and runs of whitespace collapse, so the notice stays one line.
+
+Every bound is checked inside the per-request lock, so none can be raced past, and a rejected `create` leaves no directory behind.
+
+---
+
+## Exit classes
+
+The four classes are the same everywhere koto reports an error, whatever the envelope shape:
+
+| Exit code | Class | What the caller should do |
+|:---------:|-------|---------------------------|
+| 0 | Success | Nothing. A read that succeeded is a success even when it reports an unfinished request. |
+| 1 | Transient | Retry without changing anything, after a backoff. |
+| 2 | Caller error | Change something — fix the payload, pick a different target, stop asking for a condition that can't hold. |
+| 3 | Infrastructure | Inspect the workspace. Retrying the same call won't help. |
+
+`koto request` uses only these four. The sysexits values that appear elsewhere in the CLI (64, 65, 66, 75) never surface from that group, so a wrapper can treat any status above 3 as coming from somewhere else.

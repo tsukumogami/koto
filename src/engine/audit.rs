@@ -52,6 +52,27 @@ pub const REQUESTER_WOKEN: &str = "RequesterWoken";
 /// terminal child failure (PRD R31 respawn).
 pub const REQUESTER_RESPAWN: &str = "RequesterRespawn";
 
+/// `fields.kind` for the audit record appended to a delegate's own log
+/// the first time an abandoned leg's stop notice is delivered to it.
+///
+/// Prefixed rather than bare, so [`is_reserved_kind`] covers it without
+/// growing [`RESERVED_KINDS`]. Without this record an operator cannot
+/// distinguish "never told" from "told and ignored"
+/// (DESIGN-request-lifecycle.md Decision 4).
+pub const ABANDON_NOTICE_DELIVERED: &str = "request_store.abandon_notice_delivered";
+
+/// Synthetic state name the abandon-notice audit record is written
+/// against.
+///
+/// **This is load-bearing, not tidiness.** The result synthesizer lifts
+/// a summary and payload from the most recent evidence event whose
+/// state matches the child's final state, with no kind filter — so an
+/// audit record written against the delegate's *actual* state would, on
+/// a terminal tick, be promoted as the child's result. Every reserved
+/// audit record uses a synthetic state for exactly this reason
+/// (`request_store.dispatch`, `request_store.wake`).
+pub const ABANDON_NOTICE_STATE: &str = "request_store.abandon_notice";
+
 /// Prefix reserved for request-store audit-event kinds.
 ///
 /// Template authors cannot submit a `fields.kind` whose value starts
@@ -255,6 +276,42 @@ pub fn requester_respawn_fields(
     fields
 }
 
+/// Build the `fields` map for an abandon-notice delivery record.
+///
+/// Wire shape:
+/// ```json
+/// {
+///   "kind": "request_store.abandon_notice_delivered",
+///   "request_id": "<request>",
+///   "leg_name": "<leg>",
+///   "rationale": "<verbatim requester rationale>",
+///   "delivered_at": "<rfc3339>"
+/// }
+/// ```
+///
+/// The rationale rides here verbatim because this is one of the two
+/// places a consumer is *supposed* to read it — the other being the
+/// envelope's `leg_abandoned` sibling. It is deliberately not what gets
+/// spliced into the delegate's `directive`, which carries koto-authored
+/// text plus a pointer at these two.
+///
+/// Carrying it here is also what lets a later tick re-deliver the notice
+/// without re-reading the request record at all.
+pub fn abandon_notice_fields(
+    request_id: &str,
+    leg_name: &str,
+    rationale: &str,
+    delivered_at: &str,
+) -> HashMap<String, Value> {
+    let mut fields = HashMap::with_capacity(5);
+    fields.insert("kind".to_string(), json!(ABANDON_NOTICE_DELIVERED));
+    fields.insert("request_id".to_string(), json!(request_id));
+    fields.insert("leg_name".to_string(), json!(leg_name));
+    fields.insert("rationale".to_string(), json!(rationale));
+    fields.insert("delivered_at".to_string(), json!(delivered_at));
+    fields
+}
+
 /// Build the human-readable `summary` string carried on a
 /// `RequesterWoken` audit event.
 ///
@@ -304,6 +361,48 @@ mod tests {
         assert!(is_reserved_kind("request_store.foo"));
         assert!(is_reserved_kind("request_store."));
         assert!(is_reserved_kind("request_store.anything.with.dots"));
+    }
+
+    #[test]
+    fn the_abandon_notice_kind_and_state_are_both_reserved() {
+        assert!(
+            is_reserved_kind(ABANDON_NOTICE_DELIVERED),
+            "the delivery record must be unforgeable by a template author"
+        );
+        assert!(ABANDON_NOTICE_STATE.starts_with(REQUEST_STORE_PREFIX));
+    }
+
+    #[test]
+    fn the_abandon_notice_state_is_not_a_real_state_name() {
+        // The result synthesizer matches evidence on `state == final_state`
+        // with no kind filter. A pseudo-state carrying a dot cannot be a
+        // template state name, so the audit record can never be promoted
+        // as the child's result.
+        assert!(ABANDON_NOTICE_STATE.contains('.'));
+    }
+
+    #[test]
+    fn abandon_notice_fields_carry_the_verbatim_rationale() {
+        let fields = abandon_notice_fields(
+            "req-abcdef",
+            "reviewer-a",
+            "the PR was closed",
+            "2026-07-29T00:00:00.000Z",
+        );
+        assert_eq!(fields["kind"], json!(ABANDON_NOTICE_DELIVERED));
+        assert_eq!(fields["request_id"], json!("req-abcdef"));
+        assert_eq!(fields["leg_name"], json!("reviewer-a"));
+        assert_eq!(fields["rationale"], json!("the PR was closed"));
+        assert_eq!(fields["delivered_at"], json!("2026-07-29T00:00:00.000Z"));
+
+        let payload = EventPayload::EvidenceSubmitted {
+            state: ABANDON_NOTICE_STATE.to_string(),
+            fields,
+            submitter_cwd: None,
+        };
+        let s = serde_json::to_string(&payload).unwrap();
+        let parsed: EventPayload = serde_json::from_str(&s).unwrap();
+        assert_eq!(payload, parsed);
     }
 
     #[test]
