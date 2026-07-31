@@ -20,6 +20,7 @@ pub mod request_store;
 pub mod respawn;
 pub mod scheduler_warning;
 pub mod substitute;
+pub mod template_source_status;
 pub mod terminal_index;
 pub mod types;
 #[cfg(unix)]

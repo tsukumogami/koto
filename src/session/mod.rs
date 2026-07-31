@@ -393,6 +393,22 @@ pub enum Backend {
     Cloud(cloud::CloudBackend),
 }
 
+impl Backend {
+    /// Whether this backend supports cross-machine cloud sync.
+    ///
+    /// Delegates to `CloudBackend::is_cloud()` for the `Cloud` variant;
+    /// always `false` for `Local`. Used to gate wording on new
+    /// `template_source_dir` staleness surfaces (`koto status`, `koto
+    /// init`'s collision path, `koto session list`) since a
+    /// cloud-synced session can legitimately be resumed on a different
+    /// machine than the one that recorded its `template_source_dir` --
+    /// see `format_stale_template_source_note` in
+    /// `crate::engine::template_source_status`.
+    pub fn is_cloud(&self) -> bool {
+        matches!(self, Backend::Cloud(_))
+    }
+}
+
 impl SessionBackend for Backend {
     fn create(&self, id: &str) -> anyhow::Result<PathBuf> {
         match self {
@@ -537,5 +553,37 @@ impl ContextStore for Backend {
             Backend::Local(b) => b.list_keys(session, prefix),
             Backend::Cloud(b) => b.list_keys(session, prefix),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_backend_is_not_cloud() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = Backend::Local(LocalBackend::with_base_dir(tmp.path().to_path_buf()));
+        assert!(!backend.is_cloud());
+    }
+
+    #[test]
+    fn cloud_backend_is_cloud() {
+        // A dummy bucket pointing at a non-routable endpoint is enough
+        // to exercise the discriminant -- no S3 call happens here.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let local = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        let region = s3::Region::Custom {
+            region: "us-east-1".to_string(),
+            endpoint: "http://192.0.2.1:19000".to_string(), // RFC 5737 TEST-NET
+        };
+        let credentials =
+            s3::creds::Credentials::new(Some("test-key"), Some("test-secret"), None, None, None)
+                .unwrap();
+        let bucket = s3::Bucket::new("test-bucket", region, credentials).unwrap();
+        let cloud_backend =
+            cloud::CloudBackend::with_parts(local, bucket, "test-prefix".to_string());
+        let backend = Backend::Cloud(cloud_backend);
+        assert!(backend.is_cloud());
     }
 }
