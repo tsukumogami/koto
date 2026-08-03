@@ -3,7 +3,7 @@ status: Current
 spawned_from:
   issue: 67
   repo: tsukumogami/koto
-  parent_design: docs/designs/DESIGN-shirabe-work-on-template.md
+  parent_design: docs/designs/current/DESIGN-shirabe-work-on-template.md
 problem: |
   koto's template engine declares variables (VariableDecl in src/template/types.rs)
   and carries a variables field in the WorkflowInitialized event, but neither is wired

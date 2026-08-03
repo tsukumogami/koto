@@ -1,5 +1,5 @@
 ---
-status: Planned
+status: Current
 problem: |
   shirabe's /work-on workflow exists and works, but it runs entirely through agent
   instructions. koto's template engine can't yet express it as a template because the
@@ -37,7 +37,7 @@ rationale: |
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 

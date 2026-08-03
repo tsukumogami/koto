@@ -3,7 +3,7 @@ status: Current
 spawned_from:
   issue: 71
   repo: tsukumogami/koto
-  parent_design: docs/designs/DESIGN-shirabe-work-on-template.md
+  parent_design: docs/designs/current/DESIGN-shirabe-work-on-template.md
 problem: |
   koto's engine can verify outcomes via gates but can't execute deterministic work
   itself. Five states in the work-on template need default actions (run a script,

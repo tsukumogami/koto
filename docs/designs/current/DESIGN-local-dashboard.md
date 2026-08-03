@@ -1,5 +1,5 @@
 ---
-status: Implemented
+status: Current
 upstream: docs/prds/PRD-local-dashboard.md
 problem: |
   koto had no live visibility surface. The engine writes session state to JSONL
@@ -59,7 +59,7 @@ rationale: |
 
 ## Status
 
-Implemented
+Current
 
 > **Note:** Superseded in part by DESIGN-session-legibility (PR #166): the `--once` output now has 8 columns (adds `idle`, `liveness`) and the list is attention-ordered, not health-severity sorted.
 
