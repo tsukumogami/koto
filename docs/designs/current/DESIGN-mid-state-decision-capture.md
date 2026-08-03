@@ -3,7 +3,7 @@ status: Current
 spawned_from:
   issue: 68
   repo: tsukumogami/koto
-  parent_design: docs/designs/DESIGN-shirabe-work-on-template.md
+  parent_design: docs/designs/current/DESIGN-shirabe-work-on-template.md
 problem: |
   During long-running judgment states like implementation and analysis, agents make
   non-obvious choices — assumptions about API behavior, tradeoff decisions, approach
