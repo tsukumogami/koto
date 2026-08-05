@@ -6,6 +6,7 @@ use anyhow::Context;
 
 use crate::cache::sha256_hex;
 use crate::engine::persistence;
+use crate::engine::template_source_status::check_template_source_dir;
 use crate::engine::types::{now_iso8601, Event, EventPayload, StateFileHeader};
 use crate::session::context::{ContextStore, KeyMeta, Manifest};
 use crate::session::validate::{validate_context_key, validate_session_id};
@@ -114,11 +115,14 @@ impl SessionBackend for LocalBackend {
 
             match persistence::read_header(&state_path) {
                 Ok(header) => {
+                    // Compute from the header already in memory -- no new I/O.
+                    let template_source_status = check_template_source_dir(&header);
                     results.push(SessionInfo {
                         id: dir_name,
                         created_at: header.created_at,
                         template_hash: header.template_hash,
                         parent_workflow: header.parent_workflow,
+                        template_source_status,
                     });
                 }
                 Err(_) => {
@@ -810,6 +814,42 @@ mod tests {
         persistence::append_header(&state_path, &header).unwrap();
     }
 
+    /// Helper: write a state file header with an explicit
+    /// `template_source_dir`, for `template_source_status` tests.
+    fn write_state_file_with_template_source_dir(
+        base_dir: &Path,
+        id: &str,
+        template_source_dir: Option<PathBuf>,
+    ) {
+        let session_dir = base_dir.join(id);
+        fs::create_dir_all(&session_dir).unwrap();
+        let state_path = session_dir.join(state_file_name(id));
+        let header = StateFileHeader {
+            schema_version: 1,
+            workflow: id.to_string(),
+            template_hash: "testhash".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: None,
+            template_source_dir,
+            session_id: String::new(),
+            intent: None,
+            template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
+        };
+        persistence::append_header(&state_path, &header).unwrap();
+    }
+
     // -- scenario 1: create session directory --
 
     #[test]
@@ -982,6 +1022,67 @@ mod tests {
         assert_eq!(sessions[0].created_at, "2026-01-01T00:00:00Z");
         assert_eq!(sessions[1].id, "beta");
         assert_eq!(sessions[1].created_at, "2026-02-01T00:00:00Z");
+    }
+
+    #[test]
+    fn list_reports_none_when_no_template_source_dir_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+
+        write_state_file_with_template_source_dir(tmp.path(), "no-source", None);
+
+        let sessions = backend.list().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].template_source_status, None);
+    }
+
+    #[test]
+    fn list_reports_existing_template_source_status() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+
+        // Use the temp dir itself as an existing "source" directory.
+        let source_dir = tmp.path().join("template-source");
+        fs::create_dir_all(&source_dir).unwrap();
+        write_state_file_with_template_source_dir(
+            tmp.path(),
+            "has-source",
+            Some(source_dir.clone()),
+        );
+
+        let sessions = backend.list().unwrap();
+        assert_eq!(sessions.len(), 1);
+        let status = sessions[0]
+            .template_source_status
+            .as_ref()
+            .expect("template_source_status must be Some when template_source_dir is recorded");
+        assert!(status.exists, "existing directory must report exists: true");
+        assert_eq!(status.path, source_dir);
+    }
+
+    #[test]
+    fn list_reports_missing_template_source_status() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+
+        let missing_dir = tmp.path().join("does-not-exist");
+        write_state_file_with_template_source_dir(
+            tmp.path(),
+            "missing-source",
+            Some(missing_dir.clone()),
+        );
+
+        let sessions = backend.list().unwrap();
+        assert_eq!(sessions.len(), 1);
+        let status = sessions[0]
+            .template_source_status
+            .as_ref()
+            .expect("template_source_status must be Some when template_source_dir is recorded");
+        assert!(
+            !status.exists,
+            "missing directory must report exists: false"
+        );
+        assert_eq!(status.path, missing_dir);
     }
 
     // -- scenario 9: list skips directories without state files --

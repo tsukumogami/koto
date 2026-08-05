@@ -501,9 +501,36 @@ pub fn handle_dir(backend: &dyn SessionBackend, name: &str) -> Result<()> {
 }
 
 /// Print all sessions as a JSON array.
-pub fn handle_list(backend: &dyn SessionBackend) -> Result<()> {
+///
+/// Each row's `template_source_status` (already populated by the backend's
+/// `list()`, no new I/O here) gains a `note` field when its `exists` is
+/// `false`, worded via `format_stale_template_source_note` and gated on
+/// `backend.is_cloud()` -- softened for `CloudBackend` sessions, direct for
+/// `LocalBackend`. Takes `&Backend` (the concrete enum) rather than `&dyn
+/// SessionBackend` so it can call that inherent accessor, mirroring
+/// `handle_resolve`'s existing `&Backend` parameter.
+pub fn handle_list(backend: &Backend) -> Result<()> {
     let sessions = backend.list()?;
-    println!("{}", serde_json::to_string_pretty(&sessions)?);
+    let mut rows = serde_json::to_value(&sessions)?;
+    if let serde_json::Value::Array(rows) = &mut rows {
+        let is_cloud = backend.is_cloud();
+        for row in rows.iter_mut() {
+            let exists_false = row
+                .get("template_source_status")
+                .and_then(|s| s.get("exists"))
+                == Some(&serde_json::Value::Bool(false));
+            if exists_false {
+                if let Some(status) = row.get_mut("template_source_status") {
+                    status["note"] = serde_json::json!(
+                        crate::engine::template_source_status::format_stale_template_source_note(
+                            is_cloud
+                        )
+                    );
+                }
+            }
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&rows)?);
     Ok(())
 }
 

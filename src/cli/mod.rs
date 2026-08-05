@@ -1660,8 +1660,46 @@ fn record_default_intent(backend: &dyn SessionBackend, name: &str) {
     }
 }
 
+/// Best-effort staleness clause for `koto init`'s two collision paths
+/// (the pre-check and the `SpawnErrorKind::Collision` handler in
+/// [`handle_init`]).
+///
+/// Reads the colliding session's header via `backend.read_header`,
+/// runs it through [`crate::engine::template_source_status::check_template_source_dir`],
+/// and when the recorded `template_source_dir` is confirmed stale
+/// (`exists: false`), returns `Some` clause built from
+/// [`crate::engine::template_source_status::format_stale_template_source_note`]
+/// (gated on `backend.is_cloud()`) plus the recorded path. Both callers
+/// append this to whichever base "already exists" message they already
+/// emit -- this single shared function is what guarantees the appended
+/// clause is identical between the two paths for the same underlying
+/// condition, per the design's Implicit Decision (the two base messages
+/// themselves are intentionally *not* unified).
+///
+/// Returns `None` -- leaving the caller's base message unmodified -- in
+/// every other case: the header can't be read (e.g. a corrupt state
+/// file; this must never crash or replace the existing "already exists"
+/// error with a different one), there is no recorded
+/// `template_source_dir`, or the recorded directory still exists.
+fn stale_template_source_dir_clause(backend: &Backend, name: &str) -> Option<String> {
+    use crate::engine::template_source_status::{
+        check_template_source_dir, format_stale_template_source_note,
+    };
+
+    let header = backend.read_header(name).ok()?;
+    let status = check_template_source_dir(&header)?;
+    if status.exists {
+        return None;
+    }
+    Some(format!(
+        " ({}: {})",
+        format_stale_template_source_note(backend.is_cloud()),
+        status.path.display()
+    ))
+}
+
 fn handle_init(
-    backend: &dyn SessionBackend,
+    backend: &Backend,
     name: &str,
     template: &str,
     vars: &[String],
@@ -1697,12 +1735,17 @@ fn handle_init(
     // common path and avoids paying compile cost when we already know
     // the session exists.
     if backend.exists(name) {
+        let base = format!(
+            "workflow '{}' already exists; run `koto session cleanup {}` to reuse the name, \
+             or `koto cancel --cleanup {}` to stop a running workflow first",
+            name, name, name
+        );
+        let error = match stale_template_source_dir_clause(backend, name) {
+            Some(clause) => format!("{}{}", base, clause),
+            None => base,
+        };
         exit_with_error(serde_json::json!({
-            "error": format!(
-                "workflow '{}' already exists; run `koto session cleanup {}` to reuse the name, \
-                 or `koto cancel --cleanup {}` to stop a running workflow first",
-                name, name, name
-            ),
+            "error": error,
             "command": "init"
         }));
     }
@@ -1725,9 +1768,17 @@ fn handle_init(
             SpawnErrorKind::Collision => {
                 // Match the pre-check's error text so callers can rely
                 // on a stable "already exists" string regardless of
-                // which detector fired.
+                // which detector fired. The staleness clause (if any)
+                // is appended via the same shared helper the pre-check
+                // uses, so the clause itself is identical between the
+                // two paths even though their base messages differ.
+                let base = format!("workflow '{}' already exists", name);
+                let error = match stale_template_source_dir_clause(backend, name) {
+                    Some(clause) => format!("{}{}", base, clause),
+                    None => base,
+                };
                 exit_with_error(serde_json::json!({
-                    "error": format!("workflow '{}' already exists", name),
+                    "error": error,
                     "command": "init"
                 }));
             }
@@ -4756,7 +4807,12 @@ fn handle_decisions_list(backend: &dyn SessionBackend, name: String) -> Result<(
 /// Returns a JSON object with the workflow's current state, template info,
 /// and terminal status. Read-only: does not evaluate gates, run actions,
 /// or modify the state file.
-fn handle_status(backend: &dyn SessionBackend, name: &str) -> Result<()> {
+///
+/// Takes `&Backend` (the concrete enum) rather than `&dyn SessionBackend`
+/// so it can call the inherent `Backend::is_cloud()` accessor to gate
+/// `stale_template_source_dir` wording -- mirrors `handle_resolve`'s
+/// existing `&Backend` parameter for the same reason.
+fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     if !backend.exists(name) {
         exit_with_error_code(
             serde_json::json!({
@@ -4872,8 +4928,47 @@ fn handle_status(backend: &dyn SessionBackend, name: &str) -> Result<()> {
         response["superseded_branches"] = serde_json::json!(superseded);
     }
 
+    // Optional `stale_template_source_dir` key — populated only when the
+    // session's recorded `template_source_dir` no longer resolves on this
+    // machine. Absent (not `null`) when there is nothing to report, per
+    // the same present-only-when-relevant convention as `batch` and
+    // `superseded_branches` above.
+    if let Some(stale) = derive_stale_template_source_dir(&header, backend.is_cloud()) {
+        response["stale_template_source_dir"] = stale;
+    }
+
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
+}
+
+/// Derive the `stale_template_source_dir` JSON value for `koto status`.
+///
+/// Returns `None` when the session's header has no `template_source_dir`
+/// recorded, or when the recorded directory still exists -- callers
+/// should omit the response key entirely in either case, never serialize
+/// `null`. Returns `Some` only when
+/// [`crate::engine::template_source_status::check_template_source_dir`]
+/// reports `exists: false`, with wording from
+/// [`crate::engine::template_source_status::format_stale_template_source_note`]
+/// gated on `is_cloud` (softened for `CloudBackend` sessions, direct for
+/// `LocalBackend`).
+fn derive_stale_template_source_dir(
+    header: &crate::engine::types::StateFileHeader,
+    is_cloud: bool,
+) -> Option<serde_json::Value> {
+    use crate::engine::template_source_status::{
+        check_template_source_dir, format_stale_template_source_note,
+    };
+
+    let status = check_template_source_dir(header)?;
+    if status.exists {
+        return None;
+    }
+    Some(serde_json::json!({
+        "path": status.path,
+        "machine_id": status.machine_id,
+        "note": format_stale_template_source_note(is_cloud),
+    }))
 }
 
 /// Discover superseded branches by scanning for sessions whose name
@@ -5335,6 +5430,80 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Issue 4: derive_stale_template_source_dir (koto status)
+    // -----------------------------------------------------------------------
+
+    fn header_with_template_source_dir(
+        dir: Option<std::path::PathBuf>,
+    ) -> crate::engine::types::StateFileHeader {
+        crate::engine::types::StateFileHeader {
+            schema_version: 1,
+            workflow: "test-workflow".to_string(),
+            template_hash: "testhash".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: None,
+            template_source_dir: dir,
+            session_id: String::new(),
+            intent: None,
+            template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
+        }
+    }
+
+    #[test]
+    fn derive_stale_template_source_dir_omitted_when_absent() {
+        let header = header_with_template_source_dir(None);
+        assert_eq!(derive_stale_template_source_dir(&header, false), None);
+    }
+
+    #[test]
+    fn derive_stale_template_source_dir_omitted_when_existing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let header = header_with_template_source_dir(Some(dir.path().to_path_buf()));
+        assert_eq!(derive_stale_template_source_dir(&header, false), None);
+    }
+
+    #[test]
+    fn derive_stale_template_source_dir_direct_wording_for_local() {
+        let missing = std::path::PathBuf::from("/definitely/does/not/exist/koto-status-test");
+        assert!(!missing.exists(), "test precondition violated");
+        let header = header_with_template_source_dir(Some(missing.clone()));
+
+        let value = derive_stale_template_source_dir(&header, false)
+            .expect("stale template_source_dir must be Some when the directory is missing");
+        assert_eq!(value["path"], serde_json::json!(missing));
+        assert_eq!(
+            value["note"],
+            serde_json::json!("template source directory no longer exists")
+        );
+    }
+
+    #[test]
+    fn derive_stale_template_source_dir_softened_wording_for_cloud() {
+        let missing = std::path::PathBuf::from("/definitely/does/not/exist/koto-status-test-2");
+        let header = header_with_template_source_dir(Some(missing));
+
+        let value = derive_stale_template_source_dir(&header, true)
+            .expect("stale template_source_dir must be Some when the directory is missing");
+        let note = value["note"].as_str().unwrap();
+        assert!(
+            note.contains("synced from another machine"),
+            "cloud wording must be softened, got: {note}"
+        );
+    }
+
     /// RAII guard pointing XDG_CACHE_HOME at a temp dir for init tests.
     struct CacheGuard {
         _tmp: tempfile::TempDir,
@@ -5422,6 +5591,147 @@ Done.
             Some("My explicit intent".to_string()),
             "explicit --intent must win over the template default"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 5: stale_template_source_dir_clause (koto init collision paths)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stale_template_source_dir_clause_none_when_directory_exists() {
+        let _cache = CacheGuard::new();
+        let sessions = tempfile::TempDir::new().expect("sessions dir");
+        let backend = Backend::Local(LocalBackend::with_base_dir(sessions.path().to_path_buf()));
+
+        let tpl_dir = tempfile::TempDir::new().expect("template dir");
+        let tpl_path = tpl_dir.path().join("simple.md");
+        std::fs::write(&tpl_path, INTENT_TEMPLATE).unwrap();
+
+        handle_init(
+            &backend,
+            "clause-wf-exists",
+            tpl_path.to_str().unwrap(),
+            &[],
+            None,
+            None,
+        )
+        .expect("init should succeed");
+
+        assert_eq!(
+            stale_template_source_dir_clause(&backend, "clause-wf-exists"),
+            None,
+            "clause must be None while the template source directory still exists"
+        );
+    }
+
+    #[test]
+    fn stale_template_source_dir_clause_some_when_directory_missing() {
+        let _cache = CacheGuard::new();
+        let sessions = tempfile::TempDir::new().expect("sessions dir");
+        let backend = Backend::Local(LocalBackend::with_base_dir(sessions.path().to_path_buf()));
+
+        let tpl_dir = tempfile::TempDir::new().expect("template dir");
+        let tpl_subdir = tpl_dir.path().to_path_buf();
+        let tpl_path = tpl_subdir.join("simple.md");
+        std::fs::write(&tpl_path, INTENT_TEMPLATE).unwrap();
+
+        handle_init(
+            &backend,
+            "clause-wf-missing",
+            tpl_path.to_str().unwrap(),
+            &[],
+            None,
+            None,
+        )
+        .expect("init should succeed");
+
+        // Tear down the working tree the template was loaded from, the same
+        // condition tsukumogami/koto#189 reports.
+        std::fs::remove_dir_all(&tpl_subdir).unwrap();
+
+        let clause = stale_template_source_dir_clause(&backend, "clause-wf-missing")
+            .expect("clause must be Some when the recorded directory is gone");
+        assert!(
+            clause.contains("template source directory no longer exists"),
+            "clause should carry the direct (non-cloud) wording, got: {clause}"
+        );
+        assert!(
+            clause.contains(&tpl_subdir.display().to_string()),
+            "clause should identify the missing recorded path, got: {clause}"
+        );
+    }
+
+    #[test]
+    fn stale_template_source_dir_clause_none_when_no_recorded_dir() {
+        let _cache = CacheGuard::new();
+        let sessions = tempfile::TempDir::new().expect("sessions dir");
+        let backend = Backend::Local(LocalBackend::with_base_dir(sessions.path().to_path_buf()));
+
+        // The --from-stdin path never records a template_source_dir.
+        handle_init_inline(
+            &backend,
+            "clause-wf-no-dir",
+            INTENT_TEMPLATE.as_bytes(),
+            &[],
+            None,
+        )
+        .expect("inline init should succeed");
+
+        assert_eq!(
+            stale_template_source_dir_clause(&backend, "clause-wf-no-dir"),
+            None,
+            "clause must be None when the header has no recorded template_source_dir"
+        );
+    }
+
+    #[test]
+    fn stale_template_source_dir_clause_none_when_header_unreadable() {
+        let sessions = tempfile::TempDir::new().expect("sessions dir");
+        let backend = Backend::Local(LocalBackend::with_base_dir(sessions.path().to_path_buf()));
+
+        // No session named this exists at all, so read_header fails.
+        // A best-effort failure must yield None, not a panic or a
+        // different error, so the caller's existing "already exists"
+        // message stays intact.
+        assert_eq!(
+            stale_template_source_dir_clause(&backend, "does-not-exist"),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_template_source_dir_clause_identical_across_both_collision_paths() {
+        // Both handle_init collision paths (the pre-check and the
+        // SpawnErrorKind::Collision handler) call this exact function
+        // with the same (backend, name) pair, so calling it twice for
+        // the same underlying condition must produce byte-identical
+        // output -- this is the AC's "verified identical between the
+        // two" requirement, proven at the single shared call site both
+        // paths route through.
+        let _cache = CacheGuard::new();
+        let sessions = tempfile::TempDir::new().expect("sessions dir");
+        let backend = Backend::Local(LocalBackend::with_base_dir(sessions.path().to_path_buf()));
+
+        let tpl_dir = tempfile::TempDir::new().expect("template dir");
+        let tpl_subdir = tpl_dir.path().to_path_buf();
+        let tpl_path = tpl_subdir.join("simple.md");
+        std::fs::write(&tpl_path, INTENT_TEMPLATE).unwrap();
+
+        handle_init(
+            &backend,
+            "clause-wf-dup-calls",
+            tpl_path.to_str().unwrap(),
+            &[],
+            None,
+            None,
+        )
+        .expect("init should succeed");
+        std::fs::remove_dir_all(&tpl_subdir).unwrap();
+
+        let first = stale_template_source_dir_clause(&backend, "clause-wf-dup-calls");
+        let second = stale_template_source_dir_clause(&backend, "clause-wf-dup-calls");
+        assert_eq!(first, second);
+        assert!(first.is_some());
     }
 
     #[test]

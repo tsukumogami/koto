@@ -332,6 +332,8 @@ koto session list
 
 Each object contains the session id (same as the workflow name), creation timestamp, and template hash read from the state file header. Returns an empty array `[]` when no sessions exist. Directories without a valid state file are skipped.
 
+Each row also carries `template_source_status`, describing whether the directory the session's template was loaded from (at `koto init` time) still resolves on this machine: `{"path": "...", "exists": true|false, "machine_id": "..."}`, or `null` when the session recorded no `template_source_dir` (or, under a cloud backend, when the row is a remote-only placeholder that has not been synced locally yet). When `exists` is `false`, the object gains a `note` field explaining the staleness. The wording is backend-aware: a local session gets a direct note ("template source directory no longer exists"), while a cloud-synced session gets a softened note acknowledging the directory may simply be missing because the session was resumed on another machine (see `docs/guides/cloud-sync-setup.md`).
+
 #### session cleanup
 
 Removes a session directory and all its contents. Idempotent -- succeeds even if the session doesn't exist.
@@ -898,7 +900,7 @@ A batch workflow has one coordinator (parent) that submits a task list, and many
 
 - **`koto next <parent> --with-data @tasks.json`** — submit the task list. Responses from a batch-scoped parent carry a `scheduler` object with `materialized_children`, `spawned_this_tick`, and per-task `feedback.entries`. Dispatch workers based on `materialized_children`, not `spawned_this_tick`.
 - **`koto workflows --children <parent>`** — list every child for a parent, with per-row batch metadata (short task name, outcome, waits-on dependencies).
-- **`koto status <parent>`** — read-only view of the parent's current state. For batch parents, the response includes the materialized-children ledger so you can check progress without advancing state.
+- **`koto status <parent>`** — read-only view of the parent's current state. For batch parents, the response includes the materialized-children ledger so you can check progress without advancing state. When the session recorded a `template_source_dir` at `koto init` time and that directory no longer exists, the response also gains a `stale_template_source_dir` key (`{"path": "...", "machine_id": "...", "note": "..."}`); it's absent (not `null`) whenever there's nothing stale to report. The `note` wording is backend-aware -- direct for local sessions, softened for cloud-synced sessions since a missing directory there may just mean the session was resumed on another machine (see `docs/guides/cloud-sync-setup.md`).
 
 ### Worked example: 3-task linear batch
 
