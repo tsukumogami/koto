@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 problem: |
   shirabe's /work-on workflow exists and works, but it runs entirely through agent

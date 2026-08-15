@@ -1,4 +1,5 @@
 ---
+schema: prd/v1
 status: Done
 upstream: docs/briefs/BRIEF-request-store-converge.md
 problem: |

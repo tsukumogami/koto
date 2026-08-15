@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 upstream: docs/prds/PRD-gate-transition-contract.md
 problem: |
@@ -37,8 +38,7 @@ This is Feature 4 of the gate-transition contract. Feature 1 design:
 Feature 2 design: [DESIGN-gate-override-mechanism](current/DESIGN-gate-override-mechanism.md).
 Feature 3 design: [DESIGN-gate-contract-compiler-validation](current/DESIGN-gate-contract-compiler-validation.md).
 
-## Context and problem statement
-
+## Context and Problem Statement
 Features 1–3 of the gate-transition contract introduced structured gate output,
 the override mechanism, and compiler validation. Feature 1 preserved the old
 gate behavior implicitly: when no `when` clause in a state references `gates.*`
@@ -69,8 +69,7 @@ It needs to keep working until migrated to structured routing, and it must do
 so without source changes — agents starting workflows from this template can't
 patch the template themselves.
 
-## Decision drivers
-
+## Decision Drivers
 - Template authors must not accidentally opt into legacy mode. New templates
   using gates without `gates.*` routing should fail `koto template compile` by
   default.
@@ -88,8 +87,7 @@ patch the template themselves.
 - The legacy code path must be self-contained and deletable. When the flag is
   removed, deleting the compat code should be a contained change.
 
-## Considered options
-
+## Considered Options
 ### Decision 1: How legacy mode is declared and enforced
 
 Template authors using gates without `gates.*` routing need a way to signal
@@ -197,8 +195,7 @@ response all use `gate_results` directly and are unaffected. Rejected because
 it contradicts the PRD R10 acceptance criterion and leaves a misleading
 invariant in the codebase with no offsetting benefit.
 
-## Decision outcome
-
+## Decision Outcome
 **Chosen: D1 context-sensitive validation flag + D2 evidence exclusion**
 
 ### Summary
@@ -252,8 +249,7 @@ template author adds `--allow-legacy-gates` to their CI at their own pace.
 The flag's transitory nature is intentional and explicit. It is not a permanent
 feature; it is a migration scaffold with a named exit condition.
 
-## Solution architecture
-
+## Solution Architecture
 ### Overview
 
 Two isolated changes in two different layers. The compiler change adds a
@@ -390,8 +386,7 @@ advance loop
   └─► evidence merge: insert "gates" only if has_gates_routing
 ```
 
-## Implementation approach
-
+## Implementation Approach
 ### Phase 1: Context-sensitive validation
 
 Add `strict: bool` to `validate()` and `compile()`. Add the D5 check — error
@@ -429,8 +424,7 @@ Deliverables:
 - Unit tests: legacy state does not expose `gates.*` keys in merged evidence;
   structured-mode state does
 
-## Security considerations
-
+## Security Considerations
 This design adds a CLI flag that conditions compiler behavior and a conditional
 in the engine. Neither introduces new attack surface.
 

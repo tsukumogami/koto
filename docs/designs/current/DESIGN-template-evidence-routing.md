@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 problem: |
   koto's template format currently uses flat transition lists (transitions: [target1,

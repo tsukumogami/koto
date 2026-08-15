@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 upstream: docs/prds/PRD-gate-transition-contract.md
 problem: |
@@ -26,8 +27,7 @@ rationale: |
 
 Current
 
-## Context and problem statement
-
+## Context and Problem Statement
 Three components need to change to make gate output available for transition
 routing:
 
@@ -62,8 +62,7 @@ roadmap. It covers R1 (gate type schemas), R2 (structured evaluation), R3
 Override mechanism (Feature 2), compiler validation (Feature 3), and backward
 compatibility details (Feature 4) are separate designs.
 
-## Decision drivers
-
+## Decision Drivers
 - **Minimal resolver changes**: dot-path traversal is the biggest code change.
   Prefer an approach that minimizes changes to `resolve_transition` while
   supporting nested gate data.
@@ -83,8 +82,7 @@ compatibility details (Feature 4) are separate designs.
 - **Event ordering**: gate output events (if needed) must have deterministic
   sequence numbers relative to other events in the same invocation.
 
-## Considered options
-
+## Considered Options
 ### Decision 1: How gate evaluation produces structured data
 
 The `GateResult` enum in `src/gate.rs` has four variants that carry minimal
@@ -227,8 +225,7 @@ it limits pass conditions to exact equality (can't express `status_code >=
 200 && < 300` for future HTTP gates). Function-level logic in the evaluator
 is more flexible.
 
-## Decision outcome
-
+## Decision Outcome
 ### Summary
 
 Gate evaluation functions return a `StructuredGateResult` carrying both a
@@ -270,8 +267,7 @@ for `when` clause matching without changing the resolver's core logic
 (it still does exact JSON equality per field). Flat keys pass through it
 transparently, so backward compatibility is automatic.
 
-## Solution architecture
-
+## Solution Architecture
 ### Overview
 
 The change touches three layers: gate evaluation (`src/gate.rs`), the
@@ -365,8 +361,7 @@ resolve_transition(merged_evidence, ...)
 TransitionResolution::Resolved(target) | NeedsEvidence | ...
 ```
 
-## Implementation approach
-
+## Implementation Approach
 ### Phase 1: StructuredGateResult and evaluator changes
 
 Replace `GateResult` with `StructuredGateResult` in `src/gate.rs`. Update
@@ -403,8 +398,7 @@ Deliverables:
 - Functional tests for gate-blocked responses with structured data
 - `koto next` response shape matches R4a
 
-## Security considerations
-
+## Security Considerations
 This change modifies how gate data flows through the engine but doesn't
 introduce new attack surface. Gate output is produced by the engine itself
 (from commands it runs or context it reads), not from external input. The

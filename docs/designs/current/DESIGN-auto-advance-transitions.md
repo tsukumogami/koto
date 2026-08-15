@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 problem: |
   Plan-backed orchestrator workflows contain states whose evidence submissions are

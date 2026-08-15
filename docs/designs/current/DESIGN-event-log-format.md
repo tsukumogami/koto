@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 problem: |
   koto's state model (from issue #45) uses a minimal JSONL format with no sequence

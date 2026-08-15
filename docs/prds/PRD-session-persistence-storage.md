@@ -1,4 +1,5 @@
 ---
+schema: prd/v1
 status: Done
 problem: |
   koto stores workflow session state (engine state files, research artifacts, plans,
@@ -22,8 +23,7 @@ goals: |
 
 Done
 
-## Problem statement
-
+## Problem Statement
 koto's workflow engine and the skills that run on it (shirabe, tsukumogami) produce
 temporary artifacts during workflow execution: engine state files, exploration scope
 documents, research outputs, implementation plans, decision reports, test plans, and
@@ -65,8 +65,7 @@ content exists.
 5. A git backend preserves the current behavior as an opt-in mode
 6. koto can validate content format and enforce immutability on submitted context
 
-## User stories
-
+## User Stories
 **As a developer using koto on a team**, I want workflow artifacts to stay out of
 git branches, so that my PRs only contain real code changes and my teammates don't
 see temporary exploration/implementation state.
@@ -233,8 +232,7 @@ immediately.
 local workflow execution. The local copy is always the source of truth. koto retries
 the upload on the next state-mutating command automatically.
 
-## Acceptance criteria
-
+## Acceptance Criteria
 - [x] `koto init <name>` creates a session alongside the workflow state
 - [x] `koto context add <name> --key X` accepts content via stdin or `--from-file` and stores it
 - [x] `koto context get <name> --key X` outputs stored content to stdout or to `--to-file`
@@ -261,8 +259,7 @@ the upload on the next state-mutating command automatically.
 - [x] Templates using `{{SESSION_DIR}}` resolve to the session path
 - [ ] Content-aware gates work with all backends (local, cloud, git)
 
-## Out of scope
-
+## Out of Scope
 - **Partial patches or structured updates.** Context submission is replace-only.
   Agents that need to accumulate content read the current value, modify it, and
   submit the replacement. Structured append or field-level update operations are

@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 problem: |
   koto can only run a workflow from a pre-authored, compiled template, so an

@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 problem: |
   There's no guided way to create a koto-backed skill. Template authoring requires
@@ -28,8 +29,7 @@ rationale: |
 
 Current
 
-## Context and problem statement
-
+## Context and Problem Statement
 Koto is a workflow orchestration engine that uses markdown templates with YAML
 frontmatter to define state machines. Skills are Claude Code's mechanism for
 packaging reusable agent behaviors. Several skills already use koto templates as
@@ -56,8 +56,7 @@ workflow boilerplate (resume logic, phase ordering, gate checks), and that this
 duplication causes real failures: phase skipping, lost decisions, brittle resume.
 These 7 conversions are the immediate use case for this skill.
 
-## Decision drivers
-
+## Decision Drivers
 - The skill must teach agents how to write valid koto templates, not just generate them blindly
 - Template validation should use `koto template compile` as a mechanical check
 - The output must follow the established coupling convention (koto-templates/ directory)
@@ -423,37 +422,6 @@ skill.
 Deliverables:
 - Verified working skill for both input modes
 
-## Consequences
-
-### Positive
-
-- Agents get a structured, repeatable path to authoring koto-backed skills instead
-  of manual template writing
-- The compile validation self-loop catches structural errors mechanically, reducing
-  the chance of broken templates reaching production
-- The skill's own template serves as a mid-complexity reference (8 states), filling
-  the gap between hello-koto (trivial) and work-on (15+ states)
-- The 7 shirabe skill conversions from the adoption PRD have a guided workflow
-
-### Negative
-
-- v1 must be hand-written (bootstrapping cost), can't use the skill to build itself
-- The condensed format guide needs maintenance alongside the template format design
-  docs -- when the format evolves, two sources need updates (partially mitigated by
-  dynamic repo discovery, which surfaces new guides without skill updates)
-- Mode-conditional directives put prose quality burden on the template author -- if
-  mode-specific instructions are unclear, agents may do the wrong thing for their mode
-- The skill can't catch runtime behavior issues -- templates that compile but produce
-  poor workflows won't be flagged until someone actually runs them
-
-### Mitigations
-
-- Bootstrapping is a one-time cost; v2+ can be self-authored
-- The format guide is ~200-250 lines, small enough that maintenance is manageable
-- Graded examples complement the guide, reducing dependence on directive prose quality
-- The compiler catches the most common and most dangerous errors (structural issues,
-  evidence routing conflicts); runtime quality improves as agents gain experience
-
 ## Security Considerations
 
 This design has a minimal attack surface. The skill reads and writes local markdown
@@ -489,3 +457,34 @@ gates when checking for user-supplied paths.
 Produced templates should be reviewed by a human before deployment. The compiler
 validates structure but not intent -- a structurally valid template with a
 malicious command gate passes compilation.
+## Consequences
+
+### Positive
+
+- Agents get a structured, repeatable path to authoring koto-backed skills instead
+  of manual template writing
+- The compile validation self-loop catches structural errors mechanically, reducing
+  the chance of broken templates reaching production
+- The skill's own template serves as a mid-complexity reference (8 states), filling
+  the gap between hello-koto (trivial) and work-on (15+ states)
+- The 7 shirabe skill conversions from the adoption PRD have a guided workflow
+
+### Negative
+
+- v1 must be hand-written (bootstrapping cost), can't use the skill to build itself
+- The condensed format guide needs maintenance alongside the template format design
+  docs -- when the format evolves, two sources need updates (partially mitigated by
+  dynamic repo discovery, which surfaces new guides without skill updates)
+- Mode-conditional directives put prose quality burden on the template author -- if
+  mode-specific instructions are unclear, agents may do the wrong thing for their mode
+- The skill can't catch runtime behavior issues -- templates that compile but produce
+  poor workflows won't be flagged until someone actually runs them
+
+### Mitigations
+
+- Bootstrapping is a one-time cost; v2+ can be self-authored
+- The format guide is ~200-250 lines, small enough that maintenance is manageable
+- Graded examples complement the guide, reducing dependence on directive prose quality
+- The compiler catches the most common and most dangerous errors (structural issues,
+  evidence routing conflicts); runtime quality improves as agents gain experience
+

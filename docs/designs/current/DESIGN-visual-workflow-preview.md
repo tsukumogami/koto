@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 upstream: docs/prds/PRD-template-visual-tooling.md
 problem: |
@@ -525,36 +526,6 @@ Deliverables:
 - Caller example in documentation or README
 - Test by adding a freshness check job to `validate-plugins.yml`
 
-## Consequences
-
-### Positive
-
-- Single `export` command covers all visual output (mermaid, html, future formats)
-- `--check` enables CI freshness enforcement without git-level glue
-- Reusable GHA workflow gives consumers 5-line CI setup
-- HTML files work as both local debugging tools and deployed documentation
-- Mermaid renders natively on GitHub for source-browsing readers
-- No heavy new dependencies (only `opener` crate added)
-
-### Negative
-
-- CDN dependency: HTML doesn't work offline
-- Pinned CDN versions require manual updates via PRs
-- Dark mode relies on system preference only (no manual toggle)
-- Mermaid export omits evidence schemas and default actions
-- `--open` is format-conditional (only valid with `--format html`), adding a
-  flag interaction rule
-
-### Mitigations
-
-- Offline use: a future `--inline` flag could bundle JS. Not needed for v1.
-- CDN staleness: only Cytoscape.js is actively maintained (dagre frozen since
-  2016). Low maintenance burden.
-- Mermaid completeness: HTML covers detailed inspection. Mermaid is intentionally
-  a structural overview.
-- Flag interactions: `validate_export_flags()` catches all invalid combinations
-  with clear error messages.
-
 ## Security Considerations
 
 ### CDN script integrity
@@ -604,3 +575,33 @@ to stdout. This prevents accidental file writes to unexpected locations.
 The reusable workflow needs only `contents: read` to check out the repo and
 download a public release. It doesn't need write permissions, secrets, or
 token elevation. The `github.token` default is sufficient.
+## Consequences
+
+### Positive
+
+- Single `export` command covers all visual output (mermaid, html, future formats)
+- `--check` enables CI freshness enforcement without git-level glue
+- Reusable GHA workflow gives consumers 5-line CI setup
+- HTML files work as both local debugging tools and deployed documentation
+- Mermaid renders natively on GitHub for source-browsing readers
+- No heavy new dependencies (only `opener` crate added)
+
+### Negative
+
+- CDN dependency: HTML doesn't work offline
+- Pinned CDN versions require manual updates via PRs
+- Dark mode relies on system preference only (no manual toggle)
+- Mermaid export omits evidence schemas and default actions
+- `--open` is format-conditional (only valid with `--format html`), adding a
+  flag interaction rule
+
+### Mitigations
+
+- Offline use: a future `--inline` flag could bundle JS. Not needed for v1.
+- CDN staleness: only Cytoscape.js is actively maintained (dagre frozen since
+  2016). Low maintenance burden.
+- Mermaid completeness: HTML covers detailed inspection. Mermaid is intentionally
+  a structural overview.
+- Flag interactions: `validate_export_flags()` catches all invalid combinations
+  with clear error messages.
+

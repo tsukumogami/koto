@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 problem: |
   koto sessions produce JSONL event logs read by multiple planned consumers — a local

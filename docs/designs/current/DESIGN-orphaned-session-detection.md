@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 problem: |
   A koto session's state header already records the `template_source_dir`
