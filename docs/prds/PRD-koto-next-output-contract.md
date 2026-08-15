@@ -1,4 +1,5 @@
 ---
+schema: prd/v1
 status: Done
 problem: |
   The koto auto-advancement engine's caller-facing behavioral contract was never specified.
@@ -20,8 +21,7 @@ source_issue: 102
 
 Done
 
-## Problem statement
-
+## Problem Statement
 koto's auto-advancement engine was built across three design efforts: the CLI output contract (#37), the unified koto next command (#43), and the auto-advancement engine (#49). Each design specified its piece of the system. Nobody specified the whole from the caller's perspective.
 
 The result: AI agents calling `koto next` encounter response shapes, field values, and error codes that no single document explains. The `advanced` field -- present in every response -- has three different meanings depending on the code path. The `precondition_failed` error code covers six structurally different failures that require different caller responses. The `action: "confirm"` response variant isn't mentioned in the main CLI guide. Gate-with-evidence-fallback (where `EvidenceRequired` is returned instead of `GateBlocked`) is completely undocumented.
@@ -38,8 +38,7 @@ This isn't a naming problem. It's an absent contract. The engine's behavior is c
 - Error codes distinguish failure categories that require different caller responses
 - The contract is testable: acceptance criteria define binary pass/fail conditions
 
-## User stories
-
+## User Stories
 **As an AI agent running a koto workflow**, I want a decision tree that tells me what to do for every possible `koto next` response, so that I don't need to understand engine internals to use the CLI correctly.
 
 **As an AI agent encountering an error**, I want error codes that distinguish "fix my input" from "report a template bug" from "retry later," so that I can take the right corrective action.
@@ -153,8 +152,7 @@ How template authors specify the summary/details split (markdown separator, YAML
 - **The koto-author template itself** should dogfood the `details` split on its longer states (state_design, template_drafting, compile_validation have multi-paragraph directives that are candidates for the split).
 - **Example templates** should demonstrate the `details` convention so authors can see the pattern in context.
 
-## Acceptance criteria
-
+## Acceptance Criteria
 - [ ] Every `NextResponse` variant's JSON shape is documented with field names, types, and presence rules
 - [ ] The `advanced` field definition ("at least one state transition during this invocation") appears in user-facing documentation
 - [ ] Documentation explicitly states that callers dispatch on `action`, not on `advanced` or field presence
@@ -190,8 +188,7 @@ How template authors specify the summary/details split (markdown separator, YAML
 - [ ] A force-full mechanism (flag or command) returns `details` even on subsequent visits
 - [ ] States without `details` defined behave identically to current behavior (`details` field absent)
 
-## Out of scope
-
+## Out of Scope
 - **Engine refactoring.** The auto-advancement loop, gate evaluation, and transition resolution logic are correct and not changing. This PRD specifies the output contract, not the engine internals.
 - **Template authoring guide.** How to write templates that produce good caller experiences is a separate concern.
 - **Stale documentation cleanup.** The 12+ files referencing `koto transition` (a removed command) need cleanup but aren't part of this contract specification.

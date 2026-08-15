@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 upstream: docs/prds/PRD-session-persistence-storage.md
 problem: |
@@ -30,8 +31,7 @@ Current
 
 > **Note:** The `~/.koto/sessions/{repo-id}/{name}/` layout (Decisions 2/5) was later flattened to `~/.koto/sessions/<id>/`; repo-id scoping was removed by the dashboard/session-legibility work (see `LocalBackend::new` + `migrate_if_needed`).
 
-## Context and problem statement
-
+## Context and Problem Statement
 koto's workflow engine produces temporary artifacts during execution: engine state
 files, exploration scopes, research outputs, implementation plans, decision reports,
 test plans, and review results. These live in `wip/` committed to git feature
@@ -49,8 +49,7 @@ branches. This creates four problems:
    depends on shell commands checking the filesystem, not on koto's knowledge of
    what content exists.
 
-## Decision drivers
-
+## Decision Drivers
 - Zero configuration for local use (no database, no service, no cloud account)
 - Agents must not hardcode storage paths
 - koto must be able to validate and control content writes
@@ -59,8 +58,7 @@ branches. This creates four problems:
 - Existing shell gates must continue to work (non-breaking migration)
 - Content must be inspectable for debugging (`cat`, `ls`, not opaque binary formats)
 
-## Considered options
-
+## Considered Options
 ### Decision 1: Trait shape for session lifecycle
 
 **Context**: koto needs an abstraction over session storage that can support local
@@ -230,8 +228,7 @@ name. What remains is the artifact's structural role.
 **Rejected**: Flat strings — retains redundant naming noise, no prefix-based listing.
 Structured metadata — over-engineers querying for patterns prefix matching handles.
 
-## Decision outcome
-
+## Decision Outcome
 The design splits into two phases that build on each other.
 
 **Phase A (implemented)**: `SessionBackend` trait with `LocalBackend` storing
@@ -249,8 +246,7 @@ Together, koto owns both the location and content of workflow artifacts. The
 `SessionBackend` trait manages session lifecycle. The `ContextStore` trait manages
 what's inside sessions. `LocalBackend` implements both.
 
-## Solution architecture
-
+## Solution Architecture
 ### Overview
 
 Content ownership adds three components to the existing session model:
@@ -417,8 +413,7 @@ Gate evaluation during koto next:
     -> return GateResult::Passed or GateResult::Failed
 ```
 
-## Implementation approach
-
+## Implementation Approach
 ### Phase A: Session module and CLI refactoring (implemented)
 
 Session directories at `~/.koto/sessions/{repo-id}/{name}/`. `SessionBackend`
@@ -472,8 +467,7 @@ Deliverables:
 - Updated templates and documentation
 - Updated CLI usage guide
 
-## Security considerations
-
+## Security Considerations
 **Session ID and key validation.** Session IDs use allowlist
 `^[a-zA-Z][a-zA-Z0-9._-]*$`. Content keys use `[a-zA-Z0-9._-/]` with per-component
 rejection of `.` and `..` (each path segment between slashes is validated

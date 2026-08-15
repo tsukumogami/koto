@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 upstream: docs/prds/PRD-session-persistence-storage.md
 problem: |
@@ -26,8 +27,7 @@ rationale: |
 
 Current
 
-## Context and problem statement
-
+## Context and Problem Statement
 koto's `LocalBackend` is the only storage backend. It's hardcoded in `build_backend()`
 with no way to select an alternative. Sessions live at `~/.koto/sessions/<repo-id>/<name>/`
 on one machine. To resume a workflow elsewhere, you'd need to copy that directory
@@ -42,8 +42,7 @@ and cloud sync has no value without config to enable it.
 Feature 1 (local storage + content ownership) shipped in PR #84. The `SessionBackend`
 and `ContextStore` traits are implemented. `CloudBackend` needs to implement both.
 
-## Decision drivers
-
+## Decision Drivers
 - Cloud sync must be invisible to agents — zero new commands, zero token cost
 - Credentials must never live in project config (committed to git = supply chain risk)
 - Config system is general-purpose, not session-specific
@@ -51,8 +50,7 @@ and `ContextStore` traits are implemented. `CloudBackend` needs to implement bot
 - Local backend must remain the zero-config default
 - koto must remain a synchronous CLI (no tokio runtime)
 
-## Considered options
-
+## Considered Options
 ### Decision 1: Config file format and locations
 
 **Context**: koto needs persistent configuration for backend selection, cloud
@@ -208,8 +206,7 @@ latency per call). Async background sync (CLI process exits before sync complete
 aws-sdk-s3 (requires tokio, 30+ transitive deps). Manual S3 signing (reimplements
 SigV4, error-prone).
 
-## Decision outcome
-
+## Decision Outcome
 The config system and cloud sync compose as two layers over the existing session
 model.
 
@@ -223,8 +220,7 @@ first (fast, works offline), then syncs per-key to S3. Monotonic version counter
 detects conflicts. `rust-s3` keeps koto synchronous and is a regular dependency
 included in all builds.
 
-## Solution architecture
-
+## Solution Architecture
 ### Components
 
 ```
@@ -412,8 +408,7 @@ koto session resolve --keep local
   -> force-upload entire session to S3
 ```
 
-## Implementation approach
-
+## Implementation Approach
 ### Phase 1: Config module and CLI
 
 Create `src/config/` module. Implement `KotoConfig` struct, TOML loading from two
@@ -456,8 +451,7 @@ Update CLI usage docs with `koto config` commands. Document cloud setup guide
 Deliverables:
 - Updated docs
 
-## Security considerations
-
+## Security Considerations
 **Credential storage.** Project config uses an allowlist of safe keys (`endpoint`,
 `bucket`, `region`). Any key NOT on the allowlist is rejected for `--project` writes.
 This is safer than a blocklist because new credential-like keys are blocked by

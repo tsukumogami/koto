@@ -1,4 +1,5 @@
 ---
+schema: prd/v1
 status: Done
 problem: |
   Koto workflow templates compile to JSON state graphs that are hard to review
@@ -19,8 +20,7 @@ source_issue: 86
 
 Done
 
-## Problem statement
-
+## Problem Statement
 Koto workflow templates are markdown files with YAML front-matter that compile
 to directed state graphs. As templates grow past 5-10 states with branching
 transitions, gate conditions, and evidence schemas, reviewing the structure
@@ -70,8 +70,7 @@ so stale diagrams become misleading rather than helpful.
 - The visual tooling fits into existing workflows (compile -> inspect -> commit -> review)
   without requiring extra manual steps that people forget
 
-## User stories
-
+## User Stories
 **As a template author debugging a stuck workflow**, I want to open an
 interactive diagram of the compiled template in my browser, so that I can
 visually trace transition paths, inspect gate conditions via tooltips, and
@@ -191,8 +190,7 @@ requires CDN at view time, not generation time).
 | `--open` with `--check` | Error |
 | `--check` without `--output` | Error |
 
-## Acceptance criteria
-
+## Acceptance Criteria
 ### Export command
 - [ ] `koto template export` with no `--format` defaults to mermaid
 - [ ] `koto template export workflow.md` prints Mermaid to stdout
@@ -257,8 +255,7 @@ requires CDN at view time, not generation time).
 - [ ] HTML export succeeds without network access (CDN needed at view time
   only)
 
-## Out of scope
-
+## Out of Scope
 - **Watch mode / live reload.** Compile + export is under 100ms. Re-running
   the command is fast enough for v1. Watch mode can be added later if users
   request it.

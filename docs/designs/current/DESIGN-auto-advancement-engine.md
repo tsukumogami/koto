@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 problem: |
   koto next evaluates one state and returns. States with no accepts block, passing
@@ -547,48 +548,6 @@ Deliverables:
 - `dispatch_next` / engine recognizes cancelled state as terminal
 - Integration tests for cancel behavior
 
-## Consequences
-
-### Positive
-
-- Auto-advancement removes the tedious agent back-and-forth for intermediate
-  states. A 5-state workflow with 3 auto-advance states goes from 7 CLI calls
-  to 1.
-- The engine is unit-testable without filesystem or process spawning, catching
-  loop logic bugs before they reach integration tests.
-- Advisory flock prevents a class of corruption bugs that would be painful to
-  debug in production.
-- The closure interface means the integration runner can be built independently
-  without modifying the engine.
-
-### Negative
-
-- `handle_next` refactor is nontrivial. The 340-line function needs restructuring
-  to set up closures and call the engine, which touches the most complex code path
-  in the CLI.
-- Two classification systems coexist: `dispatch_next` returns `NextResponse`,
-  the engine returns `StopReason`. The mapping between them is straightforward
-  but adds a translation layer.
-- Gate evaluation can delay signal-based shutdown by up to 30 seconds (the default
-  gate timeout). Fast shutdown would require killing the child process group from
-  the signal handler.
-- `append_event` re-reads the entire file on every call to determine the next
-  sequence number. The advancement loop calls it multiple times per invocation,
-  making this progressively slower for long workflows.
-
-### Mitigations
-
-- The `handle_next` refactor is isolated to one function. The engine is new code
-  with clean interfaces. Risk is contained.
-- The `StopReason` → `NextResponse` mapping is a single match expression. The
-  types are aligned by design.
-- Gate timeout delay is acceptable per the upstream design ("complete the
-  in-progress atomic append before exiting"). Workflows sensitive to shutdown
-  latency can use shorter gate timeouts.
-- The `append_event` performance concern can be addressed by passing the expected
-  next sequence number as a parameter, avoiding the file read. This is a targeted
-  optimization for a later issue.
-
 ## Security Considerations
 
 ### Gate evaluation amplification
@@ -636,3 +595,45 @@ The existing `append_event` function applies 0600 file permissions on creation,
 limiting access to the file owner. The auto-advancement engine uses the same
 persistence path via injected closures and does not introduce new file access
 patterns.
+## Consequences
+
+### Positive
+
+- Auto-advancement removes the tedious agent back-and-forth for intermediate
+  states. A 5-state workflow with 3 auto-advance states goes from 7 CLI calls
+  to 1.
+- The engine is unit-testable without filesystem or process spawning, catching
+  loop logic bugs before they reach integration tests.
+- Advisory flock prevents a class of corruption bugs that would be painful to
+  debug in production.
+- The closure interface means the integration runner can be built independently
+  without modifying the engine.
+
+### Negative
+
+- `handle_next` refactor is nontrivial. The 340-line function needs restructuring
+  to set up closures and call the engine, which touches the most complex code path
+  in the CLI.
+- Two classification systems coexist: `dispatch_next` returns `NextResponse`,
+  the engine returns `StopReason`. The mapping between them is straightforward
+  but adds a translation layer.
+- Gate evaluation can delay signal-based shutdown by up to 30 seconds (the default
+  gate timeout). Fast shutdown would require killing the child process group from
+  the signal handler.
+- `append_event` re-reads the entire file on every call to determine the next
+  sequence number. The advancement loop calls it multiple times per invocation,
+  making this progressively slower for long workflows.
+
+### Mitigations
+
+- The `handle_next` refactor is isolated to one function. The engine is new code
+  with clean interfaces. Risk is contained.
+- The `StopReason` → `NextResponse` mapping is a single match expression. The
+  types are aligned by design.
+- Gate timeout delay is acceptable per the upstream design ("complete the
+  in-progress atomic append before exiting"). Workflows sensitive to shutdown
+  latency can use shorter gate timeouts.
+- The `append_event` performance concern can be addressed by passing the expected
+  next sequence number as a parameter, avoiding the file read. This is a targeted
+  optimization for a later issue.
+

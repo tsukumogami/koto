@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 spawned_from:
   issue: 67
@@ -37,8 +38,7 @@ rationale: |
 
 Current
 
-## Context and problem statement
-
+## Context and Problem Statement
 Issue #67 requires `--var KEY=VALUE` support on `koto init` so templates can reference
 runtime values like issue numbers and artifact path prefixes in gate commands and
 directive text. The parent design (DESIGN-shirabe-work-on-template.md) identifies this
@@ -61,8 +61,7 @@ the `done_blocked` state's directive references issue-specific recovery paths, a
 override/failure directives on deterministic states reference issue-specific artifacts.
 These aren't hypothetical, they're concrete requirements from the 17-state template.
 
-## Decision drivers
-
+## Decision Drivers
 - **Security**: variable values are interpolated into shell commands (`sh -c`). Command
   injection is the primary risk. The sanitization approach must eliminate it.
 - **Reusability**: #71 (default action execution) needs the same substitution for
@@ -104,8 +103,7 @@ Note: the parent design also suggests `TEST_COMMAND` as a template variable with
 default of `go test ./...`, confirming that the default-value path on `VariableDecl`
 is a first-class use case, not just required variables with explicit `--var` flags.
 
-## Considered options
-
+## Considered Options
 ### Decision 1: advance loop integration
 
 Variable substitution needs to reach two code paths: gate commands (before shell
@@ -203,8 +201,7 @@ deserialize identically for both types under serde.
 - **Custom deserializer**: solves a problem (gracefully handling non-string values)
   that can't occur. Overengineered for a field that's never been populated.
 
-## Decision outcome
-
+## Decision Outcome
 The three decisions compose cleanly. Compile-time validation (Decision 2) guarantees
 all variable references are valid, which makes runtime substitution infallible — this
 validates Decision 1's assumption that `substitute()` can be a pure string
@@ -218,8 +215,7 @@ defaults, sanitizes, stores `HashMap<String, String>` in the event → `koto nex
 constructs `Variables` from the event log, substitutes gate commands in the closure
 and directive text after advance returns.
 
-## Solution architecture
-
+## Solution Architecture
 ### Overview
 
 The feature adds variable substitution at three points in koto's pipeline: compile-time
@@ -362,8 +358,7 @@ Template authoring          Compilation              Init                    Run
                                                    store in event
 ```
 
-## Implementation approach
-
+## Implementation Approach
 ### Phase 1: type changes and substitution module
 
 Change the event type from `Value` to `String`. Create `src/engine/substitute.rs` with
@@ -403,8 +398,7 @@ Deliverables:
 - `src/cli/next.rs` — integration in `handle_next`
 - End-to-end tests
 
-## Security considerations
-
+## Security Considerations
 Variable values are interpolated into shell commands passed to `sh -c` in gate
 evaluation. Without sanitization, a value like `; rm -rf /` injected into
 `test -f wip/issue_{{ISSUE_NUMBER}}_context.md` would execute arbitrary commands.

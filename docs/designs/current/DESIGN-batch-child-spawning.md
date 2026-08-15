@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 problem: |
   Koto v0.7.0 lets a parent workflow spawn and wait for children, but the
@@ -4001,184 +4002,6 @@ These items are explicitly deferred:
   Cross-machine portability is documented with a runtime warning;
   the mechanism fix is future work.
 
-## Consequences
-
-### Positive
-
-- **Eliminates prose spawn loops in SKILL.md consumers.** Shirabe
-  PR #67 can replace its `spawn_and_execute` state's prose
-  orchestration with a declarative `materialize_children` hook.
-  Future consumers (including the koto-user skill's own
-  documentation) get a reliable, testable primitive.
-- **Free idempotency on resume.** The disk-derivation storage
-  strategy plus deterministic `<parent>.<task>` naming means the
-  scheduler is idempotent by construction. No persisted cursor, no
-  "replay protection" bookkeeping, no race conditions on retry.
-- **First-class failure semantics.** The new `failure: bool` field
-  on terminal states unblocks not just batch scheduling but any
-  future feature that needs to distinguish success from failure at
-  the protocol level (exit codes for `koto status`, CI gate
-  decisions, downstream automation).
-- **Atomic `init_state_file` fixes a pre-existing correctness bug.**
-  Phase 1 lands a fix that's valuable even if batch spawning never
-  shipped: v0.7.0's existing `koto init` path gets safer on crash.
-- **Extended `children-complete` gate output is backward compatible.**
-  Existing consumers that ignore unknown JSON fields continue to
-  work. New consumers get richer information.
-- **Shared `derive_batch_view` keeps `status` and `workflows --children`
-  in lockstep.** One helper, two read-only call sites, no
-  computation drift.
-- **Retry, mutation, and concurrency hazards are closed.** The retry
-  path is reachable out of the box (Decision 9): `analyze_failures`
-  intermediate state, W4 compile warning, template-declared
-  transition, `reserved_actions` discovery surface. Mutation
-  semantics are well-defined (Decision 10): R8 locks spawned task
-  entries, union-by-name is precise, per-entry feedback removes
-  silent drops. Rejected submissions carry typed discriminators
-  through a unified `action: "error"` envelope and validation runs
-  pre-append (Decision 11). Concurrency TOCTOU is closed at the
-  kernel level via `renameat2(RENAME_NOREPLACE)` / POSIX `link()`
-  fallback plus an advisory flock (Decision 12). Batch views survive
-  terminal transitions via `BatchFinalized` events and
-  `batch_final_view` fields (Decision 13). Path-resolution
-  contradictions are resolved: per-task failures, absent-source-dir
-  fallback, split variant, node-count depth (Decision 14).
-- **Path-resolution diagnostics.** New `SchedulerWarning::
-  MissingTemplateSourceDir` and `SchedulerWarning::
-  StaleTemplateSourceDir` variants surface cross-machine
-  portability issues at run time through `SchedulerOutcome.warnings`,
-  so agents see the root cause instead of a generic
-  `TemplateNotFound` per task.
-
-### Negative
-
-- **Schema PR is large.** Decision 2's atomicity fix is clean, but
-  Phase 2 bundles six decisions' worth of schema changes into one
-  PR: three new `TemplateState` fields, a new accepts field type,
-  `deny_unknown_fields`, a new header field, a new event field.
-  Reviewers have a lot to track.
-- **`deny_unknown_fields` is a one-time migration risk.** Any
-  template source file that has ever relied on unknown fields as
-  free-form annotations breaks with a clear error, but still
-  breaks. The pre-merge audit must be thorough. Scoped to
-  `SourceState` only, so the compile cache is unaffected.
-- **Batch observability has a read-time cost.** `koto status`
-  with a batch section calls `backend.list()` plus per-child reads.
-  For large batches (50+ children) on cloud sync, the per-call
-  cost is non-trivial. Not a regression for existing users (who
-  don't run batch templates), but a new cost class worth
-  monitoring.
-- **Retry semantics require template authors to understand rewind.**
-  `retry_failed` re-runs rewound children via the existing epoch
-  mechanism. Authors writing recovery transitions need to know
-  that `retry_failed` does not clear completed children from the
-  gate's count.
-- **Single-batch-per-template in v1 is a real constraint.** Some
-  use cases (e.g., parallel independent fanouts in different parent
-  states) are expressible under Reading B (nested `koto init
-  --parent`) but not under the flat batch model's single-hook
-  restriction. Users who hit this can fall back to Reading B
-  manually until multi-batch support ships.
-- **`template_source_dir` assumes the parent's template file
-  location is stable.** If a user moves the parent template
-  between submission and scheduler tick, relative resolution
-  fails. The `submitter_cwd` fallback covers the common case but
-  not all cases.
-- **When-clause engine extension is a prerequisite** for retry
-  routing. Decision 9 Part 2 relies on an
-  `evidence.<field>: present` matcher. Phase 3's first PR adds
-  this to the when-clause evaluator; if it slips, retry-routing
-  templates cannot fire their transitions.
-- **F5 puts authoring burden on child templates.** Any template
-  that participates in a batch must declare a reachable
-  `skipped_marker: true` terminal state. The F5 warning is advisory
-  because batch-eligibility isn't statically knowable at child-
-  compile time, but authors who ignore it hit a scheduler error at
-  first skip.
-- **Linux kernel 3.15+ requirement.** `renameat2` (Decision 12 Q2)
-  needs a 2014-era kernel. Non-Linux Unixes (macOS, BSD, illumos)
-  use a POSIX `link()` + `unlink()` fallback. Release notes must
-  pin the minimum.
-- **Response envelope surface grows.** New top-level fields
-  (`reserved_actions`, `batch_final_view`, `sync_status`,
-  `machine_id`) plus new scheduler-object fields
-  (`materialized_children`, `feedback`, `errored`, `warnings`,
-  `spawned_this_tick` rename) expand the envelope. Consumers that
-  pattern-match by field name are unaffected; consumers that
-  compare whole-response shapes would need to tolerate additions.
-- **`cancel_tasks` deferral.** Operators who mis-submit a task name
-  have no v1 recovery path other than manual state-file deletion.
-  v1.1 closes this gap.
-- **Retry-induced respawns serialize within a single tick.** The
-  `ready_to_drive` flag on `MaterializedChild` is required reading
-  for workers: a retry tick can insert newly-respawned dependents
-  into the ledger before their `waits_on` ancestors have finished
-  running. Agents that dispatch on bare ledger presence (without the
-  flag) risk starting a dependent against stale upstream state. This
-  is a contract workers must honor; the typed field makes it
-  enforceable rather than discoverable-by-feedback-only.
-- **`orphan_candidates` detection is advisory and post-spawn.** The
-  scheduler flags signature-matching entries by comparing the new
-  task's canonical-form `vars` + `waits_on` signature against
-  already-spawned children. The detection runs before the new child
-  is spawned in the current tick: when the match fires pre-spawn,
-  the scheduler PAUSES the new spawn and emits the warning with
-  `outcome: "errored", kind: "orphan_candidate_pending"` on the
-  feedback entry so the agent can investigate before duplicate work
-  lands. Agents resolve by resubmitting with the duplicate removed
-  (or by explicitly acknowledging the match in a future v1.1
-  primitive). Post-spawn detection remains advisory when a
-  previously-unseen match surfaces after both children exist.
-- **Cross-level retry is unsupported in v1.** `retry_failed` on a
-  child that is itself a batch parent rejects with
-  `InvalidRetryReason::ChildIsBatchParent`. Users of nested batches
-  retry at the inner level first, then bubble up. v1.1 may relax
-  this with cascading retry.
-
-### Mitigations
-
-- **Split Phase 2 if review velocity stalls.** The Decision 3
-  `deny_unknown_fields` attribute and Decision 4's header/event
-  fields can ship as separate small PRs before the main
-  `materialize_children` PR if reviewers prefer smaller chunks.
-- **Audit tooling for pre-merge check.** Add a grep-based
-  pre-merge check (or a one-time audit script committed to
-  `scripts/audit-unknown-fields.sh`) that scans all template
-  fixtures for the fields covered by `deny_unknown_fields`. Run it
-  once before merging Phase 2.
-- **Benchmark batch observability.** Phase 3 integration tests
-  should include a 50-task batch scenario to catch pathological
-  `backend.list()` + per-child-read costs. If the cost is
-  unacceptable, cache the classification within a single
-  `koto status` call.
-- **Document `retry_failed` + rewind interaction.** koto-user skill
-  updates in Phase 3 include a worked example showing how
-  `retry_failed` interacts with the `children-complete` gate
-  output, so consumer agents build the right mental model.
-- **Document the single-batch restriction.** koto-author skill
-  updates note the E8 compile-time check and explain when to use
-  nested batches (Reading B) instead.
-- **Provide a clear error for missing child templates.** The
-  scheduler's resolution fallback (parent template dir →
-  submitter cwd → error) produces an error message listing both
-  attempted paths, so users immediately see what was tried.
-- **Surface common authoring mistakes at compile time.** W4
-  (`materialize_children` states that route only on
-  `all_complete`) and W5 (`failure: true` states with no
-  `failure_reason` writer) catch two frequent authoring mistakes
-  before templates ship. F5 warns on batch-eligible child
-  templates that lack a scheduler-reachable `skipped_marker`
-  state.
-- **Per-task accumulation recovers from spawn failures.** A
-  submission with 10 valid tasks and 1 bad template resolves: the
-  10 spawn; the 1 surfaces as `BatchTaskView.outcome:
-  spawn_failed` with a `spawn_error` payload. The agent fixes the
-  single entry and resubmits.
-- **Reference template demonstrates retry-reachable routing.**
-  The shipped `coord.md` uses `analyze_failures` + `any_failed`
-  guards so authors who copy it get the retry path for free. Both
-  skills carry matching worked examples.
-
 ## Security Considerations
 
 Koto is a local-user tool for personal or small-team use. Agents
@@ -4397,3 +4220,181 @@ directory, which grants full control over workflow state regardless
 of any lock. The lock's purpose is to serialize concurrent `koto
 next` invocations by well-behaved callers, not to defend against
 local-root or same-UID attackers.
+## Consequences
+
+### Positive
+
+- **Eliminates prose spawn loops in SKILL.md consumers.** Shirabe
+  PR #67 can replace its `spawn_and_execute` state's prose
+  orchestration with a declarative `materialize_children` hook.
+  Future consumers (including the koto-user skill's own
+  documentation) get a reliable, testable primitive.
+- **Free idempotency on resume.** The disk-derivation storage
+  strategy plus deterministic `<parent>.<task>` naming means the
+  scheduler is idempotent by construction. No persisted cursor, no
+  "replay protection" bookkeeping, no race conditions on retry.
+- **First-class failure semantics.** The new `failure: bool` field
+  on terminal states unblocks not just batch scheduling but any
+  future feature that needs to distinguish success from failure at
+  the protocol level (exit codes for `koto status`, CI gate
+  decisions, downstream automation).
+- **Atomic `init_state_file` fixes a pre-existing correctness bug.**
+  Phase 1 lands a fix that's valuable even if batch spawning never
+  shipped: v0.7.0's existing `koto init` path gets safer on crash.
+- **Extended `children-complete` gate output is backward compatible.**
+  Existing consumers that ignore unknown JSON fields continue to
+  work. New consumers get richer information.
+- **Shared `derive_batch_view` keeps `status` and `workflows --children`
+  in lockstep.** One helper, two read-only call sites, no
+  computation drift.
+- **Retry, mutation, and concurrency hazards are closed.** The retry
+  path is reachable out of the box (Decision 9): `analyze_failures`
+  intermediate state, W4 compile warning, template-declared
+  transition, `reserved_actions` discovery surface. Mutation
+  semantics are well-defined (Decision 10): R8 locks spawned task
+  entries, union-by-name is precise, per-entry feedback removes
+  silent drops. Rejected submissions carry typed discriminators
+  through a unified `action: "error"` envelope and validation runs
+  pre-append (Decision 11). Concurrency TOCTOU is closed at the
+  kernel level via `renameat2(RENAME_NOREPLACE)` / POSIX `link()`
+  fallback plus an advisory flock (Decision 12). Batch views survive
+  terminal transitions via `BatchFinalized` events and
+  `batch_final_view` fields (Decision 13). Path-resolution
+  contradictions are resolved: per-task failures, absent-source-dir
+  fallback, split variant, node-count depth (Decision 14).
+- **Path-resolution diagnostics.** New `SchedulerWarning::
+  MissingTemplateSourceDir` and `SchedulerWarning::
+  StaleTemplateSourceDir` variants surface cross-machine
+  portability issues at run time through `SchedulerOutcome.warnings`,
+  so agents see the root cause instead of a generic
+  `TemplateNotFound` per task.
+
+### Negative
+
+- **Schema PR is large.** Decision 2's atomicity fix is clean, but
+  Phase 2 bundles six decisions' worth of schema changes into one
+  PR: three new `TemplateState` fields, a new accepts field type,
+  `deny_unknown_fields`, a new header field, a new event field.
+  Reviewers have a lot to track.
+- **`deny_unknown_fields` is a one-time migration risk.** Any
+  template source file that has ever relied on unknown fields as
+  free-form annotations breaks with a clear error, but still
+  breaks. The pre-merge audit must be thorough. Scoped to
+  `SourceState` only, so the compile cache is unaffected.
+- **Batch observability has a read-time cost.** `koto status`
+  with a batch section calls `backend.list()` plus per-child reads.
+  For large batches (50+ children) on cloud sync, the per-call
+  cost is non-trivial. Not a regression for existing users (who
+  don't run batch templates), but a new cost class worth
+  monitoring.
+- **Retry semantics require template authors to understand rewind.**
+  `retry_failed` re-runs rewound children via the existing epoch
+  mechanism. Authors writing recovery transitions need to know
+  that `retry_failed` does not clear completed children from the
+  gate's count.
+- **Single-batch-per-template in v1 is a real constraint.** Some
+  use cases (e.g., parallel independent fanouts in different parent
+  states) are expressible under Reading B (nested `koto init
+  --parent`) but not under the flat batch model's single-hook
+  restriction. Users who hit this can fall back to Reading B
+  manually until multi-batch support ships.
+- **`template_source_dir` assumes the parent's template file
+  location is stable.** If a user moves the parent template
+  between submission and scheduler tick, relative resolution
+  fails. The `submitter_cwd` fallback covers the common case but
+  not all cases.
+- **When-clause engine extension is a prerequisite** for retry
+  routing. Decision 9 Part 2 relies on an
+  `evidence.<field>: present` matcher. Phase 3's first PR adds
+  this to the when-clause evaluator; if it slips, retry-routing
+  templates cannot fire their transitions.
+- **F5 puts authoring burden on child templates.** Any template
+  that participates in a batch must declare a reachable
+  `skipped_marker: true` terminal state. The F5 warning is advisory
+  because batch-eligibility isn't statically knowable at child-
+  compile time, but authors who ignore it hit a scheduler error at
+  first skip.
+- **Linux kernel 3.15+ requirement.** `renameat2` (Decision 12 Q2)
+  needs a 2014-era kernel. Non-Linux Unixes (macOS, BSD, illumos)
+  use a POSIX `link()` + `unlink()` fallback. Release notes must
+  pin the minimum.
+- **Response envelope surface grows.** New top-level fields
+  (`reserved_actions`, `batch_final_view`, `sync_status`,
+  `machine_id`) plus new scheduler-object fields
+  (`materialized_children`, `feedback`, `errored`, `warnings`,
+  `spawned_this_tick` rename) expand the envelope. Consumers that
+  pattern-match by field name are unaffected; consumers that
+  compare whole-response shapes would need to tolerate additions.
+- **`cancel_tasks` deferral.** Operators who mis-submit a task name
+  have no v1 recovery path other than manual state-file deletion.
+  v1.1 closes this gap.
+- **Retry-induced respawns serialize within a single tick.** The
+  `ready_to_drive` flag on `MaterializedChild` is required reading
+  for workers: a retry tick can insert newly-respawned dependents
+  into the ledger before their `waits_on` ancestors have finished
+  running. Agents that dispatch on bare ledger presence (without the
+  flag) risk starting a dependent against stale upstream state. This
+  is a contract workers must honor; the typed field makes it
+  enforceable rather than discoverable-by-feedback-only.
+- **`orphan_candidates` detection is advisory and post-spawn.** The
+  scheduler flags signature-matching entries by comparing the new
+  task's canonical-form `vars` + `waits_on` signature against
+  already-spawned children. The detection runs before the new child
+  is spawned in the current tick: when the match fires pre-spawn,
+  the scheduler PAUSES the new spawn and emits the warning with
+  `outcome: "errored", kind: "orphan_candidate_pending"` on the
+  feedback entry so the agent can investigate before duplicate work
+  lands. Agents resolve by resubmitting with the duplicate removed
+  (or by explicitly acknowledging the match in a future v1.1
+  primitive). Post-spawn detection remains advisory when a
+  previously-unseen match surfaces after both children exist.
+- **Cross-level retry is unsupported in v1.** `retry_failed` on a
+  child that is itself a batch parent rejects with
+  `InvalidRetryReason::ChildIsBatchParent`. Users of nested batches
+  retry at the inner level first, then bubble up. v1.1 may relax
+  this with cascading retry.
+
+### Mitigations
+
+- **Split Phase 2 if review velocity stalls.** The Decision 3
+  `deny_unknown_fields` attribute and Decision 4's header/event
+  fields can ship as separate small PRs before the main
+  `materialize_children` PR if reviewers prefer smaller chunks.
+- **Audit tooling for pre-merge check.** Add a grep-based
+  pre-merge check (or a one-time audit script committed to
+  `scripts/audit-unknown-fields.sh`) that scans all template
+  fixtures for the fields covered by `deny_unknown_fields`. Run it
+  once before merging Phase 2.
+- **Benchmark batch observability.** Phase 3 integration tests
+  should include a 50-task batch scenario to catch pathological
+  `backend.list()` + per-child-read costs. If the cost is
+  unacceptable, cache the classification within a single
+  `koto status` call.
+- **Document `retry_failed` + rewind interaction.** koto-user skill
+  updates in Phase 3 include a worked example showing how
+  `retry_failed` interacts with the `children-complete` gate
+  output, so consumer agents build the right mental model.
+- **Document the single-batch restriction.** koto-author skill
+  updates note the E8 compile-time check and explain when to use
+  nested batches (Reading B) instead.
+- **Provide a clear error for missing child templates.** The
+  scheduler's resolution fallback (parent template dir →
+  submitter cwd → error) produces an error message listing both
+  attempted paths, so users immediately see what was tried.
+- **Surface common authoring mistakes at compile time.** W4
+  (`materialize_children` states that route only on
+  `all_complete`) and W5 (`failure: true` states with no
+  `failure_reason` writer) catch two frequent authoring mistakes
+  before templates ship. F5 warns on batch-eligible child
+  templates that lack a scheduler-reachable `skipped_marker`
+  state.
+- **Per-task accumulation recovers from spawn failures.** A
+  submission with 10 valid tasks and 1 bad template resolves: the
+  10 spawn; the 1 surfaces as `BatchTaskView.outcome:
+  spawn_failed` with a `spawn_error` payload. The agent fixes the
+  single entry and resubmits.
+- **Reference template demonstrates retry-reachable routing.**
+  The shipped `coord.md` uses `analyze_failures` + `any_failed`
+  guards so authors who copy it get the retry path for free. Both
+  skills carry matching worked examples.
+

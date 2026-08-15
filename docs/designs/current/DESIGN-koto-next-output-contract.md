@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 upstream: docs/prds/PRD-koto-next-output-contract.md
 problem: |
@@ -31,8 +32,7 @@ rationale: |
 
 Current
 
-## Context and problem statement
-
+## Context and Problem Statement
 The `koto next` command's output layer was built incrementally across three design efforts. The CLI output contract (#37) defined the `NextResponse` enum and custom serialization. The unified koto next design (#43) added auto-advancement. The auto-advancement engine (#49) added the advancement loop with `StopReason` -> `NextResponse` mapping. Each effort extended the output without reconciling the caller-facing contract.
 
 The technical problems are concrete:
@@ -49,8 +49,7 @@ The technical problems are concrete:
 
 The engine logic is correct. The changes are to the serialization layer, error classification, and response field population -- not to state machine semantics.
 
-## Decision drivers
-
+## Decision Drivers
 - **Minimize engine changes.** The advancement loop and transition resolution work correctly. Changes should be in the serialization and classification layers, not the core state machine.
 - **Ship as one contract version.** Callers shouldn't face partial upgrades where some action values changed but error codes didn't. All contract changes land together.
 - **Backward compatibility where possible.** `"done"` and `"confirm"` action values stay. New fields (`blocking_conditions` on EvidenceRequired, `details`) are additive. The `advanced` field stays.
@@ -58,8 +57,7 @@ The engine logic is correct. The changes are to the serialization layer, error c
 - **Template format for details is a design decision.** The PRD specifies the output contract (details field behavior). This design must choose the template source format.
 - **Documentation is part of the deliverable.** AGENTS.md, koto.mdc, koto-author skill materials, and template-format.md must be updated in the same release.
 
-## Considered options
-
+## Considered Options
 ### Decision 1: Template source format for the directive/details split
 
 Templates need a way for authors to separate short summary text (returned every time) from extended instructions (returned only on first visit). The compiled format is settled: `TemplateState` gets `directive: String` + `details: String`. But the source format -- how authors express the split in their markdown template -- has three viable options.
@@ -154,8 +152,7 @@ First visit = count of 1 (the transition event for the current state is already 
 
 **Persist visit count alongside events**: Add a running counter to derived state or a separate tracking file. Rejected because it violates PRD R9 ("no new state files or schema changes").
 
-## Decision outcome
-
+## Decision Outcome
 ### Summary
 
 The output contract changes span four code layers, all shipping together. At the serialization layer, the custom `Serialize` impl on `NextResponse` changes the `action` strings from `"execute"` to descriptive names (`"evidence_required"`, `"gate_blocked"`, `"integration"`, `"integration_unavailable"`) while keeping `"done"` and `"confirm"` unchanged. Rust enum variant names stay the same -- only the wire format changes.
@@ -174,8 +171,7 @@ The decisions reinforce each other through a clean layering: the template format
 
 The breaking change to `action` values is the right trade-off: koto is pre-1.0, callers are internal skill plugins in the same repo, and the gain (callers dispatch on `action` alone, no field-presence reconstruction) is permanent. The `advanced` field stays unchanged because the breaking change budget is better spent on `action`, and the PRD formally defines `advanced` as informational-only.
 
-## Solution architecture
-
+## Solution Architecture
 ### Overview
 
 The changes touch four code layers that converge at the CLI handler. Each layer is modified independently, and the handler orchestrates the data flow from template -> engine -> persistence -> serialization.
@@ -277,8 +273,7 @@ Events .jsonl --[read]--> [Event] --[derive_visit_counts]--> HashMap -------+
                               JSON serialization --> stdout
 ```
 
-## Implementation approach
-
+## Implementation Approach
 ### Phase 1: Engine and type changes
 
 Core Rust changes that don't affect the wire format yet.
@@ -317,6 +312,8 @@ Deliverables:
 - Example template with `<!-- details -->`
 - koto-author template dogfooding
 
+## Security Considerations
+No security dimensions apply to this design. It restructures how `koto next` serializes responses and classifies errors, operating entirely on data already loaded in memory from local files with owner-only permissions. The new `blocking_conditions` and `details` fields expose template-authored content and gate evaluation results that were previously computed but discarded -- this is the design's intended behavior, not an unintended leak. No new external inputs, dependencies, network access, or privilege changes are introduced.
 ## Consequences
 
 ### Positive
@@ -341,6 +338,3 @@ Deliverables:
 - Typical workflows have tens to low hundreds of events; the full scan is sub-millisecond
 - The koto-author skill teaches the marker during the template_drafting phase, and template-format.md documents it as a Layer 1 concept
 
-## Security considerations
-
-No security dimensions apply to this design. It restructures how `koto next` serializes responses and classifies errors, operating entirely on data already loaded in memory from local files with owner-only permissions. The new `blocking_conditions` and `details` fields expose template-authored content and gate evaluation results that were previously computed but discarded -- this is the design's intended behavior, not an unintended leak. No new external inputs, dependencies, network access, or privilege changes are introduced.

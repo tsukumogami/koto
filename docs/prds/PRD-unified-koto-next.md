@@ -1,4 +1,5 @@
 ---
+schema: prd/v1
 status: Done
 problem: |
   koto's state evolution requires multiple CLI commands: koto next to read the current
