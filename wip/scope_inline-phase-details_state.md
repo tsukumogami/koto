@@ -18,15 +18,21 @@ chain_ran:
     started_at: 2026-08-16T19:08:30Z
   - name: prd
     started_at: 2026-08-16T19:13:00Z
+  - name: design
+    started_at: 2026-08-16T21:50:00Z
 child_snapshots:
   brief:
     status: Accepted
     content_hash: f51a048de4c85c2021069a01f35870f461f5a4d4
     captured_at: 2026-08-16T19:12:15Z
   prd:
-    status: Accepted
+    status: In Progress
     content_hash: aa7659b85169eb971963d76d07c30a270ba525c7
     captured_at: 2026-08-16T21:45:00Z
+  design:
+    status: Accepted
+    content_hash: 428bfe098ae6ce923d98d06a157300f8eb186983
+    captured_at: 2026-08-16T22:30:00Z
 consolidation_judgments:
   - hop: brief->prd
     stage: judgment
@@ -43,8 +49,22 @@ consolidation_judgments:
       is already in the PRD at equal or greater fidelity: the Problem Statement
       is a superset, Goals cover the User Outcome, and the User Stories cover
       all four User Journeys plus two more.
+  - hop: prd->design
+    stage: judgment
+    verdict: keep
+    finding: >-
+      The PRD holds twenty-five numbered requirements and roughly forty
+      acceptance criteria. The DESIGN cites them by number throughout -- R4, R6,
+      R11, R16, R18 and others appear in its Decision Drivers and its Decision
+      Outcome -- but never states them, which is the citation-not-restatement
+      rule working as intended. An absorb composes the contribution section from
+      the survivor's own body, and the survivor's body does not contain the
+      requirement text or any acceptance criterion, so the carry check for the
+      ancestor's Requirements and Acceptance Criteria sections would fail.
+      Downstream needs them intact as well: the PLAN decomposes against the
+      acceptance criteria, and the implementation is verified against them.
 parent_orchestration:
-  invoking_child: design
+  invoking_child: plan
   suppress_status_aware_prompt: true
   rationale: fresh-chain
 ```
