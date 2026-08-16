@@ -1,7 +1,7 @@
 ```yaml
 topic: inline-phase-details
 chain_started: 2026-08-16T19:06:07Z
-last_updated: 2026-08-16T19:08:00Z
+last_updated: 2026-08-16T19:12:15Z
 phase_pointer: phase-2
 exit: UNSET
 exit_artifacts: []
@@ -13,7 +13,18 @@ planned_chain:
   - design
   - plan
 chain_skipped: []
-chain_ran: []
+chain_ran:
+  - name: brief
+    started_at: 2026-08-16T19:08:30Z
+child_snapshots:
+  brief:
+    status: Accepted
+    content_hash: f51a048de4c85c2021069a01f35870f461f5a4d4
+    captured_at: 2026-08-16T19:12:15Z
+parent_orchestration:
+  invoking_child: prd
+  suppress_status_aware_prompt: true
+  rationale: fresh-chain
 ```
 
 ## Phase 0 notes
