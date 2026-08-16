@@ -318,11 +318,12 @@ occurred.
 
 - [ ] Every non-terminal `koto next` response shape carries a pointer naming the
       retrieval when the current phase declares instructions. The shapes are
-      enumerated by the response type's own non-terminal variants — at time of
-      writing: gate-blocked, evidence-required, integration,
-      integration-unavailable, action-requires-confirmation, and
-      signal-received — and the criterion is met only when every variant that
-      exists at implementation time is covered.
+      enumerated by the response type's own variants that can carry
+      instructions — at time of writing: evidence-required, gate-blocked,
+      integration, integration-unavailable, and action-requires-confirmation.
+      The type's other two variants, terminal and error, carry no instructions
+      field and are excluded. The criterion is met only when every
+      instructions-carrying variant existing at implementation time is covered.
 - [ ] A response for a phase that declares no instructions carries no pointer.
 - [ ] The phase's own directive text is present and unaltered in a response that
       also carries the pointer.
