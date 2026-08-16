@@ -5,7 +5,7 @@
 //! PRD-inline-phase-details R6 says a phase declaring no instructions must keep
 //! producing exactly the response koto produces today. That is only checkable
 //! against a record of what "today" was, and the record has to be taken before
-//! the first behaviour change lands -- a baseline captured alongside the change
+//! the first behavior change lands -- a baseline captured alongside the change
 //! would already carry it.
 //!
 //! So this file exists ahead of its purpose. It is committed with the inert
@@ -19,15 +19,18 @@
 //! golden test (`tests/native_workflows_shape.rs`). The criterion is byte
 //! identity, and a `Value` comparison would pass through key reordering and
 //! whitespace drift -- both of which are real for these responses, since the
-//! natural-advancement path serialises through a key-sorted `serde_json::Map`
+//! natural-advancement path serializes through a key-sorted `serde_json::Map`
 //! and the directed path through a struct's declared field order.
 //!
-//! Regenerate with:
-//!   cargo test --test next_response_baseline -- --ignored --nocapture
+//! Regenerating is not the fix for a failure here while this feature is being
+//! built: the baseline's whole value is that it predates the change, and
+//! recapturing would overwrite it with whatever the code now does. The
+//! regeneration helper at the bottom of this file spells out the one case that
+//! does call for it.
 
 use assert_cmd::Command;
 use assert_fs::TempDir;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const FIXTURE: &str = "tests/fixtures/next-response-baseline/instruction-free.json";
 
@@ -36,7 +39,6 @@ const FIXTURE: &str = "tests/fixtures/next-response-baseline/instruction-free.js
 const TEMPLATE_TOKEN: &str = "<TEMPLATE>";
 const PARENT_TEMPLATE_TOKEN: &str = "<PARENT_TEMPLATE>";
 const GATE_BLOCKED_TEMPLATE_TOKEN: &str = "<GATE_BLOCKED_TEMPLATE>";
-const TERMINAL_TEMPLATE_TOKEN: &str = "<TERMINAL_TEMPLATE>";
 const CONFIRM_TEMPLATE_TOKEN: &str = "<CONFIRM_TEMPLATE>";
 const INTEGRATION_TEMPLATE_TOKEN: &str = "<INTEGRATION_TEMPLATE>";
 
@@ -167,27 +169,6 @@ Wait for the approval note.
 All done.
 "#;
 
-const TERMINAL_TEMPLATE: &str = r#"---
-name: baseline-terminal
-version: "1.0"
-initial_state: wrap_up
-states:
-  wrap_up:
-    transitions:
-      - target: done
-  done:
-    terminal: true
----
-
-## wrap_up
-
-Wrap the work up.
-
-## done
-
-All done.
-"#;
-
 /// `echo ready` rather than anything path-bearing: the command string is
 /// substituted into `action_output.command` verbatim, so an absolute path here
 /// would put the machine into the fixture.
@@ -278,7 +259,7 @@ Skipped.
 /// Prose recorded into the fixture alongside the bodies, so a reader who opens
 /// it later knows what it is and what it deliberately leaves out.
 const NOTES: &[&str] = &[
-    "Baseline of full `koto next` response bodies for a template whose phases declare no instructions (no `<!-- details -->` marker anywhere). Captured from the binary as it stood before any behaviour change in the inline-phase-details feature.",
+    "Baseline of full `koto next` response bodies for a template whose phases declare no instructions (no `<!-- details -->` marker anywhere). Captured from the binary as it stood before any behavior change in the inline-phase-details feature.",
     "Every sequence runs in its own temporary HOME and KOTO_SESSIONS_BASE, so no session state carries between them and the real session store is never touched.",
     "`stdout` holds the response bytes verbatim, including the trailing newline the CLI writes. Steps that only set a sequence up are run but not recorded -- `koto init`, `koto rewind`, and the ticks that get a workflow to the phase whose response is the point.",
     "One step is unrecorded for a harder reason than that: the parent tick that spawns a batch child. Its body embeds an `unassigned_children` entry carrying a wall-clock `created_at`, so it cannot be compared byte for byte at all. The child's own first tick, which is what the sequence is for, is recorded.",
@@ -286,26 +267,21 @@ const NOTES: &[&str] = &[
     "Beyond those, the fixture records every response shape `koto next` can produce for a phase that declares no instructions: gate-blocked (with its non-advancing repeat, the scenario the feature exists for), terminal, action-requires-confirmation, and integration-unavailable. A later issue splices a discoverability pointer through all of them, and each needs something to be compared against.",
     "The bodies were also confirmed identical between the debug binary this harness runs and a `cargo build --release` binary, so the baseline is a property of the source rather than of the profile.",
     "Several recorded bodies are identical to each other -- init and rewind arrivals, the conditional and unconditional and self-transition arrivals, the non-advancing repeat and its `--full` counterpart. That is not redundancy to be tidied away. The equality across paths is exactly what a delivery rule applied to one construction site and not the other would break.",
-    "One sequence needs comment: two consecutive directed transitions into the same phase are only reachable because `implement` declares itself as a transition target -- the `--to` handler validates the target against the current phase's declared transitions. That is why the template has a self-transition it would not otherwise need.",
 ];
 
 // ---------------------------------------------------------------------------
 //  Harness
 // ---------------------------------------------------------------------------
 
-fn sessions_base(dir: &Path) -> PathBuf {
-    let base = dir.join("sessions");
-    std::fs::create_dir_all(&base).unwrap();
-    base
-}
-
 /// Return a `koto` command with `KOTO_SESSIONS_BASE` set to the sessions
 /// subdirectory of `dir`, and `HOME` overridden so nothing reads or writes the
 /// real `~/.koto/`.
 fn koto_cmd(dir: &Path) -> Command {
+    let sessions = dir.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
     let mut cmd = Command::cargo_bin("koto").unwrap();
     cmd.current_dir(dir);
-    cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
+    cmd.env("KOTO_SESSIONS_BASE", sessions);
     cmd.env("HOME", dir);
     cmd
 }
@@ -426,8 +402,10 @@ const SEQUENCES: &[Sequence] = &[
         label: "terminal",
         description: "The tick that reaches a terminal phase. `done` responses omit instructions regardless of the rule, so this pins the shape that must not acquire them.",
         steps: &[
-            setup(&["init", "wf", "--template", TERMINAL_TEMPLATE_TOKEN]),
-            record(&["next", "wf"]),
+            setup(&["init", "wf", "--template", TEMPLATE_TOKEN]),
+            setup(&["next", "wf"]),
+            setup(&["next", "wf", "--with-data", r#"{"route":"direct"}"#]),
+            record(&["next", "wf", "--with-data", r#"{"loop_again":"no"}"#]),
         ],
     },
     Sequence {
@@ -473,7 +451,7 @@ fn capture() -> String {
         // cursor.
         let dir = TempDir::new().unwrap();
         let root = dir.path();
-        let templates: [(&str, &str, &str); 6] = [
+        let templates: [(&str, &str, &str); 5] = [
             (TEMPLATE_TOKEN, "baseline.md", BASELINE_TEMPLATE),
             (PARENT_TEMPLATE_TOKEN, "parent.md", PARENT_TEMPLATE),
             (
@@ -481,7 +459,6 @@ fn capture() -> String {
                 "gate-blocked.md",
                 GATE_BLOCKED_TEMPLATE,
             ),
-            (TERMINAL_TEMPLATE_TOKEN, "terminal.md", TERMINAL_TEMPLATE),
             (CONFIRM_TEMPLATE_TOKEN, "confirm.md", CONFIRM_TEMPLATE),
             (
                 INTEGRATION_TEMPLATE_TOKEN,
@@ -567,12 +544,22 @@ fn instruction_free_responses_are_byte_identical_to_the_baseline() {
             .position(|(a, b)| a != b)
             .map(|n| n + 1);
         panic!(
-            "a `koto next` response body for an instruction-free template drifted \
-             from the baseline in {FIXTURE}{}.\n\nPRD-inline-phase-details R6 requires \
-             these bodies to stay byte-identical: a phase that declares no \
-             instructions must produce exactly what koto produced before this \
-             feature. If the drift is intended, regenerate with:\n  \
+            "the captured document drifted from the baseline in {FIXTURE}{}.\n\n\
+             READ THIS BEFORE REGENERATING. If the drift is in a response body, \
+             it is almost certainly the bug this fixture exists to catch: \
+             PRD-inline-phase-details R6 requires a phase that declares no \
+             instructions to produce exactly the bytes koto produced before the \
+             feature, and the baseline was captured from a binary that predates \
+             it. Regenerating would recapture from the changed binary and destroy \
+             the only record of what the responses used to be. Fix the code \
+             instead.\n\n\
+             Regeneration is legitimate in one case only: a deliberate change to \
+             the `koto next` response format that has nothing to do with this \
+             feature, made after it has shipped. Then run:\n  \
              cargo test --test next_response_baseline -- --ignored --nocapture\n\n\
+             Note that the document also embeds this file's `NOTES` and the \
+             per-sequence `description` strings, so editing that prose trips this \
+             test too. A diff confined to those lines is the harmless case.\n\n\
              --- actual ---\n{actual}\n--- expected ---\n{expected}",
             match first_diff {
                 Some(line) => format!(" (first difference at line {line})"),
@@ -651,10 +638,14 @@ fn baseline_fixture_covers_every_required_sequence_and_stays_instruction_free() 
         "the baseline no longer covers every response shape"
     );
 
-    let mut recorded = 0;
     for seq in sequences {
-        for response in seq["responses"].as_array().expect("responses array") {
-            recorded += 1;
+        let responses = seq["responses"].as_array().expect("responses array");
+        assert!(
+            !responses.is_empty(),
+            "sequence {} records no response at all",
+            seq["label"]
+        );
+        for response in responses {
             let stdout = response["stdout"].as_str().expect("stdout string");
             let body: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
                 panic!(
@@ -673,16 +664,20 @@ fn baseline_fixture_covers_every_required_sequence_and_stays_instruction_free() 
             );
         }
     }
-    assert!(
-        recorded >= SEQUENCES.len(),
-        "expected at least one recorded response per sequence, got {recorded}"
-    );
 }
 
-/// Regeneration helper. Writes the fixture rather than printing it: the
-/// document embeds response bodies as escaped strings, and round-tripping that
-/// through a terminal is how a stray byte gets in. `#[ignore]` keeps it out of
-/// every ordinary run, so it only fires when someone asks for it by name.
+/// Regeneration helper.
+///
+/// Reach for this only for a deliberate change to the `koto next` response
+/// format that has nothing to do with inline phase details, made after that
+/// feature has shipped. While the feature is being built, a failing baseline is
+/// the finding, and rewriting the fixture destroys the pre-change record the
+/// comparison depends on.
+///
+/// Writes the fixture rather than printing it: the document embeds response
+/// bodies as escaped strings, and round-tripping that through a terminal is how
+/// a stray byte gets in. `#[ignore]` keeps it out of every ordinary run, so it
+/// only fires when someone asks for it by name.
 #[test]
 #[ignore = "regeneration helper; rewrites the baseline fixture"]
 fn regenerate_baseline_fixture() {

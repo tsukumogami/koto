@@ -1,14 +1,13 @@
 {
   "notes": [
-    "Baseline of full `koto next` response bodies for a template whose phases declare no instructions (no `<!-- details -->` marker anywhere). Captured from the binary as it stood before any behaviour change in the inline-phase-details feature.",
+    "Baseline of full `koto next` response bodies for a template whose phases declare no instructions (no `<!-- details -->` marker anywhere). Captured from the binary as it stood before any behavior change in the inline-phase-details feature.",
     "Every sequence runs in its own temporary HOME and KOTO_SESSIONS_BASE, so no session state carries between them and the real session store is never touched.",
     "`stdout` holds the response bytes verbatim, including the trailing newline the CLI writes. Steps that only set a sequence up are run but not recorded -- `koto init`, `koto rewind`, and the ticks that get a workflow to the phase whose response is the point.",
     "One step is unrecorded for a harder reason than that: the parent tick that spawns a batch child. Its body embeds an `unassigned_children` entry carrying a wall-clock `created_at`, so it cannot be compared byte for byte at all. The child's own first tick, which is what the sequence is for, is recorded.",
     "Every call sequence the plan enumerates -- conditional-transition arrival, unconditional-transition arrival, directed transition, self-transition, rewind, the `--full` override, `koto init` plus the first tick, and a batch child's first tick -- is expressible in the template grammar and is recorded here. Nothing was omitted.",
     "Beyond those, the fixture records every response shape `koto next` can produce for a phase that declares no instructions: gate-blocked (with its non-advancing repeat, the scenario the feature exists for), terminal, action-requires-confirmation, and integration-unavailable. A later issue splices a discoverability pointer through all of them, and each needs something to be compared against.",
     "The bodies were also confirmed identical between the debug binary this harness runs and a `cargo build --release` binary, so the baseline is a property of the source rather than of the profile.",
-    "Several recorded bodies are identical to each other -- init and rewind arrivals, the conditional and unconditional and self-transition arrivals, the non-advancing repeat and its `--full` counterpart. That is not redundancy to be tidied away. The equality across paths is exactly what a delivery rule applied to one construction site and not the other would break.",
-    "One sequence needs comment: two consecutive directed transitions into the same phase are only reachable because `implement` declares itself as a transition target -- the `--to` handler validates the target against the current phase's declared transitions. That is why the template has a self-transition it would not otherwise need."
+    "Several recorded bodies are identical to each other -- init and rewind arrivals, the conditional and unconditional and self-transition arrivals, the non-advancing repeat and its `--full` counterpart. That is not redundancy to be tidied away. The equality across paths is exactly what a delivery rule applied to one construction site and not the other would break."
   ],
   "sequences": [
     {
@@ -168,7 +167,9 @@
         {
           "argv": [
             "next",
-            "wf"
+            "wf",
+            "--with-data",
+            "{\"loop_again\":\"no\"}"
           ],
           "stdout": "{\"action\":\"done\",\"advanced\":true,\"error\":null,\"expects\":null,\"state\":\"done\",\"unassigned_children\":[]}\n"
         }

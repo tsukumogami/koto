@@ -777,7 +777,12 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         issued_by: Option<String>,
     },
-    /// Emitted when a response carried a phase's instructions to a caller.
+    /// Records that a response carried a phase's instructions to a caller.
+    ///
+    /// **Nothing appends this yet.** The variant lands ahead of the code that
+    /// writes it so the log format and the predicate reading it can be settled
+    /// and tested before any response changes. Until that wiring exists, a
+    /// session log will never contain one.
     ///
     /// Records only the phase the delivery applies to. Whether the caller has
     /// already been given a phase's instructions cannot be derived from the
@@ -3443,7 +3448,7 @@ mod tests {
     }
 
     #[test]
-    fn instructions_delivered_round_trips_and_degrades_on_an_older_build() {
+    fn instructions_delivered_round_trips_and_its_envelope_falls_through_to_unknown() {
         let e = Event {
             seq: 9,
             timestamp: "2026-08-16T00:00:00Z".to_string(),

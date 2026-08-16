@@ -1003,6 +1003,13 @@ pub fn derive_visit_counts(events: &[Event]) -> HashMap<String, usize> {
 /// a rewind into the phase: both append an entry event naming it. State-entry
 /// events are `Transitioned`, `DirectedTransition`, and `Rewound`.
 ///
+/// **`current_state` must be the phase the workflow currently occupies.** The
+/// returned slice runs from the last entry event naming that phase to the end
+/// of the log, and nothing truncates it at the departure -- there is nothing to
+/// truncate when the phase is the current one. Ask about a phase the workflow
+/// has since left and the slice will span everything that happened after it,
+/// which answers a different question than the caller meant.
+///
 /// With no entry event naming the phase, every event is in scope. The only
 /// phase that can be in that position is the initial one, which the workflow
 /// occupies before it has transitioned anywhere.
@@ -1057,18 +1064,24 @@ pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
 /// Whether `current_state`'s instructions have already been delivered to a
 /// caller during the phase's current occupancy.
 ///
+/// **Nothing calls this yet, because nothing appends the record it reads.** It
+/// lands ahead of the response-path wiring so the rule can be settled and
+/// tested on its own.
+///
 /// The occupancy is [`occupancy_slice`]'s, so self-transition, rewind, and
 /// arrival at the initial state all fall out of one definition shared with
-/// [`latest_epoch_gate_failed`].
+/// [`latest_epoch_gate_failed`], and the same precondition applies:
+/// `current_state` is the phase the workflow currently occupies.
 ///
 /// The record is matched on the phase it names as well as on its position in
-/// the slice, and the name check carries real weight in one case: when no entry
-/// event names the phase, the slice is the whole log, and without the name
-/// check any delivery anywhere in it would answer for the phase being asked
-/// about. It is also the safe direction to err in. A record naming the wrong
-/// phase reads as "not delivered" and koto delivers again, which is the same
-/// direction the design already accepts for a crash between printing a response
-/// and appending its record.
+/// the slice. Position alone would be enough for the ordinary case, where the
+/// only records after the entry event belong to the phase just entered. The
+/// name check answers the cases where that does not hold: a record for another
+/// phase landing inside this occupancy, and the fallback where no entry event
+/// names the phase and the slice is the whole log. It also errs in the safe
+/// direction -- a record naming the wrong phase reads as "not delivered" and
+/// koto delivers again, the same direction the design accepts for a crash
+/// between printing a response and appending its record.
 ///
 /// Takes a plain event slice and touches no backend, so a caller that has the
 /// events in memory does not pay a read to ask.

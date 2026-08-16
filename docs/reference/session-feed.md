@@ -682,8 +682,14 @@ recover it.
 Records that a `koto next` response carried a phase's instructions to whoever
 called it. A phase's occupancy runs from the state-entry event naming it to the
 next state-entry event naming any phase; a delivery recorded inside that window
-is why a later non-advancing response for the same phase leaves the
+is what will let a later non-advancing response for the same phase leave the
 instructions out.
+
+**Not emitted yet.** The event type is reserved and its shape is fixed, but no
+koto build appends one: instruction suppression is still keyed on visit count.
+A reader will not find this event in any session log written today. It is
+documented here because the type is part of the feed contract from the moment
+it exists, and a reader of a future log needs to know what it means.
 
 Nothing else in the feed can stand in for it. A non-advancing tick on a phase
 that is only waiting for evidence appends nothing at all, so two sessions
