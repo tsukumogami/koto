@@ -10,6 +10,9 @@ recommendation and records `status` rather than asking.
 | D2 | this file | 2 | confirmed | Whose statement of remaining scope governs? |
 | D3 | this file | 2 | confirmed | Does the exploration continue, or close as already-done? |
 | D4 | this file | 2 | assumed | Does the exploration need a round 2? |
+| D5 | this file | 2 | confirmed | Do the five defects belong in one piece of work? |
+| D6 | this file | 2 | confirmed | Do the three incidental bugs belong to this work? |
+| D7 | this file | 2 | confirmed | Is the exploration ready to crystallize? |
 
 ## Round 1
 
@@ -99,3 +102,69 @@ concrete surface and diff footprint.
 evidence favours the round because the count of real defects is not yet known
 and it directly determines the size of the work, but a reasonable author who
 trusts the code reading could skip it.
+
+**Outcome.** The round paid for itself. All five suspected defects reproduced,
+one round-1 claim was narrowed (batch-child retry does not break; only F1
+respawn does), one was overturned (`koto next --full` is not a safe read, which
+round 1 had left as an unresolved tension), and three unrelated bugs surfaced.
+
+## Round 2
+
+### D5 -- Do the five defects belong in one piece of work, or several?
+
+**Question.** Five reproductions could be five issues, one issue, or something in
+between. Which framing does the evidence support?
+
+**Evidence.** The empirical lead decomposed them into three root causes plus one
+inherited limitation. The blocked-re-tick defect and the rewind defect are the
+same wrong predicate producing opposite symptoms -- the counter measures entries
+into a state rather than deliveries of its instructions -- so fixing one without
+the other means keeping `derive_visit_counts` as the input and keeping both. The
+`--to` defect is a missing call site on a second code path, not a tuning problem.
+The `--full` finding is what makes the recovery path necessary rather than
+optional. Auto-advance discarding crossed states is different in kind: it drops
+the `directive` too, predates the details feature entirely, and is not a details
+regression.
+
+**Decision.** One coherent feature covering the first three plus the recovery
+path. Auto-advance's discarding of crossed states is named as pre-existing and
+carried as a scope question for the design hop, not folded in silently.
+
+**Consequence.** The work is a single feature with sequenced parts, not a
+scattering of independent bug fixes -- which is what a chain entering at `/scope`
+is shaped to handle.
+
+### D6 -- Do the three incidental bugs belong to this work?
+
+**Question.** The empirical lead surfaced a `koto rewind` ping-pong correctness
+bug, an `accepts:`-does-not-gate-advancement authoring trap, and a migration-scan
+stderr flood. Do they ride along?
+
+**Evidence.** None of the three touches `details`. The rewind ping-pong is a
+correctness bug in `handle_rewind`'s target selection. The `accepts:` trap is a
+template-grammar and documentation problem. The stderr flood is very likely the
+same defect as open issue #193, which already describes migration failing to
+converge and reprinting skip lines on every invocation.
+
+**Decision.** Out of scope. They are filed separately and referenced, not folded
+in.
+
+**Consequence.** Keeps the feature's boundary clean. The rewind ping-pong is
+worth flagging as adjacent, since a rewind fix in this work touches the same
+function.
+
+### D7 -- Is the exploration ready to crystallize?
+
+**Question.** Explore further, or decide?
+
+**Evidence.** Round 2 closed every gap round 1 named. What remains open is of a
+different kind: whether the `--to` carve-out is deliberate needs the author, not
+research; whether auto-advance belongs in scope is a design judgment; what to
+record and where is a trade-off with three costed candidates already on the
+table; and the naming question has evidence on both sides and needs a decision,
+not more evidence. Those are design-hop questions, and running a third
+discover-converge round would gather evidence nobody is missing.
+
+**Decision.** Ready. Proceed to crystallize.
+
+**Status: confirmed.** The remaining questions are decisions, not unknowns.

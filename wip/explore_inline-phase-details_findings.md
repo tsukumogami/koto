@@ -181,37 +181,217 @@ and AC4 is the higher-value half because it is what makes AC3 safe on loops
 whose iterations outlive the agent's context. This exploration treats that
 comment as the authoritative statement of what matters.
 
+## Round 2
+
+Round 2 ran three leads against the gaps round 1 left: an empirical build-and-run
+verification, the emission-counting constraint, and the escape hatch's cost. Two
+round-1 leads also revised their own conclusions after being told the feature had
+shipped.
+
+### Key Insights
+
+- **All five suspected defects reproduce on current source.** The empirical lead
+  built `cargo build --release` at `1e3a515` (source-identical to HEAD `1b35372`;
+  `git diff --stat` over `src/`, `Cargo.toml`, `Cargo.lock` is empty) and ran each
+  case with real templates and real transcripts. Nothing was left as inference.
+  *(lead: r2-repro)*
+
+- **The five defects are three root causes plus one inherited limitation.**
+  *(lead: r2-repro)*
+  1. *The counter measures the wrong thing.* It counts entries into a state, not
+     responses sent about a state. A blocked tick enters nothing, so it increments
+     nothing and re-sends forever; a rewind is an entry, so redoing a step
+     suppresses. This one root cause produces both the author's measured AC3 gap
+     and the rewind defect. Any fix that keeps `derive_visit_counts` as its input
+     keeps both symptoms.
+  2. *The rule lives on one of two code paths.* `handle_next`'s advance path has
+     the check; `dispatch_next` (the `--to` path) has none. That is a missing call
+     site, not a tuning problem.
+  3. *`--full` is not a read.* Measured: it advanced the test workflow.
+  4. *Auto-advance discards crossed states* -- and drops their `directive` too, not
+     just `details`. This predates the details feature and is different in kind
+     from the other four; it should be named as pre-existing rather than counted
+     as a details regression.
+
+- **The behavior is close to exactly backwards from the intent.** The mechanism
+  exists to spare an agent from re-reading long guidance on repeat visits.
+  Empirically it never suppresses on the repeat case that actually matters
+  (blocked retries) and always suppresses on the case where the guidance is wanted
+  most (a rewind telling the agent to redo a step). *(lead: r2-repro)*
+
+- **`koto next --full` is definitively unsafe as a recovery call.** Three
+  independent mutation paths fire regardless of the flag: a pure-routing state
+  auto-advances on empty evidence (`resolve_transition`'s guard,
+  `src/engine/advance.rs:759`); any state with a `default_action` re-executes its
+  shell command and appends `DefaultActionExecuted` on every call
+  (`src/engine/advance.rs:286-314`, confirmed intentional by
+  `DESIGN-default-action-execution.md:301-302`); and reaching a terminal state
+  triggers session cleanup. `--full` only gates whether `details` appears in the
+  final response; it never touches `advance_until_stop`. This resolves round 1's
+  open tension in the author's favour. *(leads: alternatives, phase-info, r2-repro)*
+
+- **`koto status` is the only true read seam, and it carries neither field.**
+  `dashboard --once`'s eight-column contract carries neither; the dashboard's
+  `read_detail`/`DetailData` carries `directive` but not `details` and is not
+  scriptable. So no existing command is read-only *and* keyed by workflow name
+  *and* returns the text. The recovery path is genuinely greenfield.
+  *(lead: phase-info, revised)*
+
+- **R9 forbids new state files and schema-version bumps -- not new events.** The
+  emission lead read the requirement verbatim and found three R9-compliant ways to
+  record a delivery: a new `EventPayload` variant, an `EvidenceSubmitted` riding
+  `audit.rs`'s existing reserved-kind convention, or a new additive
+  `StateFileHeader` field. All three are precedented: six `request.`-family
+  variants and header fields such as `respawn_generation` were added without ever
+  moving `CURRENT_SCHEMA_VERSION`, and the header is rewritable in place rather
+  than append-only. *(lead: r2-emission)*
+
+- **Two tempting shortcuts are both wrong.** Counting existing `GateEvaluated`
+  events is free but incomplete: an ordinary `accepts`-only state awaiting evidence
+  writes nothing on a blocked re-tick, which is likely the more common blocked
+  shape. Suppressing on the `advanced` flag alone is cheapest but breaks the core
+  scenario, because a true first visit via `koto init` and a blocked retry both
+  report `advanced == false`. *(lead: r2-emission)*
+
+- **Extending `koto status` is the cheapest recovery path by a wide margin.**
+  `handle_status` already reads the events, loads and parses the compiled template,
+  and looks up the current state; the read path exists end to end and its only real
+  open question is naming (a flag versus unconditional fields). A `phase-info`
+  subcommand has a comparable mechanical footprint but adds genuinely new doc and
+  skill sections plus the vocabulary cost. `next --dry-run` is the outlier: its
+  cost is not documentation but proving that every side channel inside a large,
+  side-effect-heavy `handle_next` can be safely skipped. *(lead: r2-hatch)*
+
+- **Discoverability already has a mechanism.** koto already injects
+  koto-authored text into `directive` unconditionally -- the leg-abandonment stop
+  notice does exactly this. Since `directive` is the one field guaranteed to reach
+  an agent on every tick, it is where a pointer to the recovery command can live
+  and survive the context loss it is meant to recover from. *(lead: r2-hatch)*
+
+- **Batch-child retry does not reproduce the stale-count problem.**
+  `respawn_skipped_child` and `respawn_failed_child` (`src/cli/retry.rs:571-660`)
+  both call `backend.cleanup()` to delete the child's log before reinit, so a
+  retried child always starts at count 0. Only F1 cold-restart respawn breaks it,
+  because `emit_respawn_event` appends to the same requester state file. This
+  narrows round 1's claim. *(lead: alternatives, revised)*
+
+- **The rewind fix should live at the call site, not in `derive_visit_counts`.**
+  That function is shared with `src/workflows_surface/project.rs:284-286` for an
+  unrelated visited-set purpose, so changing its semantics would ripple. The
+  boundary-aware checks -- was the most recent entry event a `Rewound`, and have
+  we crossed a respawn marker -- belong at `src/cli/mod.rs:4008-4013`.
+  *(lead: alternatives, revised)*
+
+### Three findings nobody asked for
+
+Surfaced by the empirical lead while building repro cases. None belongs to #90;
+all three are worth filing separately.
+
+- **`koto rewind` ping-pong.** Two consecutive rewinds move you *forward*. Once you
+  are past `s1`, `s1` is unreachable by rewinding. A plain correctness bug in
+  `handle_rewind`, independent of details. Its interaction with the
+  `materialize_children` epoch-branch relocation that `handle_rewind` also drives
+  is untested.
+- **`accepts:` does not gate advancement.** A transition without a `when:` clause
+  fires unconditionally regardless of any `accepts` block. A linear chain of four
+  evidence states ran to terminal and self-cleaned in a single `koto next`. This is
+  an authoring trap, and it means templates may be auto-advancing through states
+  their authors believe are interactive.
+- **Migration-scan stderr flood.** Every koto invocation against a real `~/.koto`
+  re-runs a migration scan emitting one `migration skipped` line per legacy
+  session -- roughly 20 KB of stderr per command on the user's machine. It broke
+  two measurement runs. This is likely the same defect as open issue #193.
+
+### Tensions
+
+- **Is the `--to` carve-out deliberate?** No code comment or design doc says. If
+  a directed transition is meant to be explicit operator intent that always
+  deserves full context, Claim 3 is not a defect and the count is four, not five.
+  This needs an author or design answer, not more measurement. It is the one open
+  question the research cannot close.
+- **Does auto-advance's discarding of crossed states belong in this scope?** It
+  drops the directive too, predates the details feature, and is arguably its own
+  issue. Naming it as pre-existing keeps a fix from being mis-scoped as "make
+  details work on crossed states" when the honest framing is that auto-advance has
+  never surfaced intermediate instructions at all.
+
+### Gaps
+
+- Details behavior under `koto next --with-data` combined with gate failure -- the
+  accepts-fallthrough path at `src/cli/next.rs:56-69` -- was not measured. It also
+  carries `details.clone()` and may have its own visit-count interaction.
+- Whether `koto status`'s JSON output has any stability expectation that would make
+  unconditional new fields a breaking change. Nothing documents one the way
+  `docs/STABILITY.md` documents the Rust surface.
+
+### Decisions
+
+D5 and D6 in `wip/explore_inline-phase-details_decisions.md`.
+
+### User Focus
+
+Still `--auto`. Round 2 confirmed the issue author's 2026-08-16 audit on every
+point it overlapped and extended it: the author measured one defect, and the same
+root cause produces a second (rewind) that the author had not tested.
+
 ## Accumulated Understanding
 
 koto#90 is not a feature request any more. It is a correction to a feature that
 shipped underneath it. The template marker, the response field, the visit-count
-derivation, and the `--full` override all exist and are documented in a Done PRD;
-the issue simply was never closed, and its body still describes a YAML template
-format koto never had.
+derivation, and the `--full` override all exist and are documented in a Done PRD
+(R9 of `PRD-koto-next-output-contract.md`, delivered by PR #109 on 2026-03-30,
+four days after #90 was filed and without ever citing it). The issue was simply
+never closed, and its body still describes a YAML template format koto never had.
 
-What remains is one coherent piece of work with two halves that share a root
-cause. koto counts *state entries* when the quantity that matters is
-*deliveries*. Because entries and deliveries diverge, the suppression is wrong
-in both directions: it re-sends details to an agent that already has them (the
-gate-blocked re-tick the author measured, and every `--to` transition), and it
-withholds details from an agent that does not (a rewind target, a respawned or
-retried agent on the same log, and any state crossed mid-auto-advance). Neither
-direction can be fixed by tuning the predicate, because the log records no
-notion of who is attached to the session.
+What the two rounds established is that the shipped mechanism does close to the
+opposite of what it was built for, and that this is one defect wearing several
+faces. koto counts *entries into* a state when the quantity that matters is
+*deliveries of its instructions*. Those two diverge in both directions and the
+divergence is measured, not argued. A blocked tick enters nothing, so the count
+never moves and the details are re-sent on every retry -- forever, on exactly the
+repeat case the feature exists to suppress. A rewind *is* an entry, so redoing a
+step suppresses the instructions the agent was just told to redo. One wrong
+predicate, two opposite symptoms. Alongside it sits a missing call site: the
+`--to` path runs through `dispatch_next`, which has no visit check at all, so the
+contract is not "first visit only" but "first visit only, except under `--to`,
+where it is always on."
 
-That is the argument for the second half. Since koto cannot reliably know
-whether the caller still holds the instructions, the omission has to be treated
-as an optimization with an explicit, cheap, non-mutating recovery path rather
-than as a correctness guarantee -- which is exactly what the external evidence
-says every comparable system concluded, and what Anthropic's own compaction
-documentation forces. Today there is no such path: `koto status` is read-only
-but does not carry the text, and `koto next --full` carries the text but can
-advance the machine. Closing that gap is a small change against a function that
-already loads the compiled template and already writes nothing.
+The second half of the work follows from something koto cannot fix by tuning the
+predicate. The log records no notion of who is attached to the session, so no
+log-derived rule can distinguish an agent that still holds the instructions from
+one that does not. F1 cold-restart respawn makes that concrete: a brand-new
+zero-context subagent continues on the predecessor's log and inherits its visit
+count. Silent context compaction is worse, because it leaves no event at all.
+Every comparable system checked -- Agent Skills, MCP, LangGraph, Temporal,
+AutoGen, CrewAI -- declined to gate instruction delivery on visit history, and
+Anthropic's own documentation states that tool-result content is
+compaction-eligible and not guaranteed to survive a turn. So the omission has to
+be treated as an optimization whose safety comes from a cheap, non-mutating
+recovery path, not as a correctness guarantee.
 
-The work is bounded, single-repo, and single-feature, but it is not a one-liner:
-it carries a real design decision about what to count and where to record it
-(constrained by R9's "no new state files"), a naming decision that the codebase
-has an opinion about, a set of edge cases that need reproducing before they are
-believed, and downstream skill and documentation updates that koto's own
-CLAUDE.md makes mandatory for any change to `src/cli/` or `src/engine/`.
+That path does not exist today, and round 2 killed the hope that it already did.
+`koto next --full` was the candidate; it is measurably not a read, because it
+evaluates gates, can auto-advance a routing state, re-executes any
+`default_action` shell command, and can trigger terminal session cleanup -- none
+of which the flag suppresses. `koto status` is the only genuine read seam and it
+returns neither the directive nor the details. The good news is that closing the
+gap is cheap: `handle_status` already reads the events, already parses the
+compiled template, and already looks up the current state, so the text is one
+field away from a function that writes nothing. R9 turns out to forbid new state
+*files* and schema-version bumps, not new events, and three precedented
+R9-compliant ways to record a delivery exist.
+
+So the work is bounded, single-repo, and one coherent feature -- but it is not a
+one-liner, and it is not four independent fixes either. It carries a real design
+decision about what to record and where (constrained by R9, with two tempting
+shortcuts already ruled out on evidence), a naming decision the codebase has a
+strong opinion about (`state` outnumbers `phase` 953 to 36 in the CLI, and
+`phase` is a deliberate UI-only translation), an open question about whether the
+`--to` carve-out is intentional that only the author can answer, a scope
+judgment about whether auto-advance's pre-existing habit of discarding crossed
+states belongs here at all, and mandatory downstream skill, eval, and
+documentation work that koto's own CLAUDE.md requires for any change under
+`src/cli/` or `src/engine/`. Three unrelated bugs surfaced along the way and
+belong in their own issues.
+
+## Decision: Crystallize
