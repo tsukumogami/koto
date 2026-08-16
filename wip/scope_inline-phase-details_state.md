@@ -16,13 +16,35 @@ chain_skipped: []
 chain_ran:
   - name: brief
     started_at: 2026-08-16T19:08:30Z
+  - name: prd
+    started_at: 2026-08-16T19:13:00Z
 child_snapshots:
   brief:
     status: Accepted
     content_hash: f51a048de4c85c2021069a01f35870f461f5a4d4
     captured_at: 2026-08-16T19:12:15Z
+  prd:
+    status: Accepted
+    content_hash: aa7659b85169eb971963d76d07c30a270ba525c7
+    captured_at: 2026-08-16T21:45:00Z
+consolidation_judgments:
+  - hop: brief->prd
+    stage: judgment
+    verdict: keep
+    finding: >-
+      The BRIEF holds the per-exclusion reasoning behind its Scope Boundary,
+      and the PRD deliberately does not. The PRD's Out of Scope section cites
+      the BRIEF for that reasoning rather than restating it, which the Phase 4
+      clarity reviewer required so the two documents would not carry two copies
+      that drift apart. The absorb procedure composes a contribution section
+      from the survivor's own body, and the survivor's body does not contain
+      that reasoning, so it could not be composed and the carry check for the
+      ancestor's Scope Boundary would fail. Everything else the BRIEF carries
+      is already in the PRD at equal or greater fidelity: the Problem Statement
+      is a superset, Goals cover the User Outcome, and the User Stories cover
+      all four User Journeys plus two more.
 parent_orchestration:
-  invoking_child: prd
+  invoking_child: design
   suppress_status_aware_prompt: true
   rationale: fresh-chain
 ```
