@@ -957,4 +957,4 @@ koto next coord
 # => action: "evidence_required" or "done" (depending on post-batch template states)
 ```
 
-Each coordinator tick re-derives the ledger from disk, so resume after a crash just means running `koto next coord` again. For the full runner surface (failure routing, `retry_failed`, typed error envelopes), see `docs/designs/DESIGN-batch-child-spawning.md` and the `koto-user` skill's batch references.
+Each coordinator tick re-derives the ledger from disk, so resume after a crash just means running `koto next coord` again. For the full runner surface (failure routing, `retry_failed`, typed error envelopes), see `docs/designs/current/DESIGN-batch-child-spawning.md` and the `koto-user` skill's batch references.
