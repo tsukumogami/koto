@@ -2789,6 +2789,114 @@ fn context_exists_returns_exit_1_when_missing() {
 }
 
 #[test]
+fn context_remove_deletes_a_present_key() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "scope.md"])
+        .write_stdin("data")
+        .assert()
+        .success();
+
+    koto_cmd(dir.path())
+        .args(["context", "exists", "ctx-wf", "scope.md"])
+        .assert()
+        .success();
+
+    koto_cmd(dir.path())
+        .args(["context", "remove", "ctx-wf", "scope.md"])
+        .assert()
+        .success();
+
+    // The gate surface `context-exists` reads must now report absent.
+    let output = koto_cmd(dir.path())
+        .args(["context", "exists", "ctx-wf", "scope.md"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "context exists should exit 1 after the key was removed"
+    );
+}
+
+#[test]
+fn context_remove_drops_the_key_from_list() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    for key in ["a.md", "b.md"] {
+        koto_cmd(dir.path())
+            .args(["context", "add", "ctx-wf", key])
+            .write_stdin("data")
+            .assert()
+            .success();
+    }
+
+    koto_cmd(dir.path())
+        .args(["context", "remove", "ctx-wf", "a.md"])
+        .assert()
+        .success();
+
+    let output = koto_cmd(dir.path())
+        .args(["context", "list", "ctx-wf"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let keys: Vec<String> = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        keys,
+        vec!["b.md".to_string()],
+        "remove should drop the key from the manifest, not just the content file"
+    );
+}
+
+#[test]
+fn context_remove_is_idempotent_on_a_missing_key() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    // No add first. A delete verb that fails on an absent key would make every
+    // caller probe before removing, and the probe cannot distinguish "absent"
+    // from "unreadable" -- so the idempotent shape is the useful one.
+    koto_cmd(dir.path())
+        .args(["context", "remove", "ctx-wf", "never-written.md"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn context_remove_appends_a_context_removed_event() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "scope.md"])
+        .write_stdin("data")
+        .assert()
+        .success();
+    koto_cmd(dir.path())
+        .args(["context", "remove", "ctx-wf", "scope.md"])
+        .assert()
+        .success();
+
+    // The event log is the authoritative record of what happened to a session.
+    // `add` writes one; without this the log would assert a key was added and
+    // never say it went away.
+    let log = std::fs::read_to_string(session_state_path(dir.path(), "ctx-wf"))
+        .expect("session state log should exist");
+    assert!(
+        log.contains("\"context_removed\""),
+        "removal should append a context_removed event; log was:\n{log}"
+    );
+    assert!(
+        log.contains("\"context_added\""),
+        "the add event should still be present alongside it"
+    );
+}
+
+#[test]
 fn context_list_returns_json_array() {
     let dir = TempDir::new().unwrap();
     create_session_dir(dir.path(), "ctx-wf");

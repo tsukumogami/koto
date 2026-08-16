@@ -177,6 +177,13 @@ events:
         type: integer
         required: true
 
+  context_removed:
+    tier: 2
+    fields:
+      key:
+        type: string
+        required: true
+
   default_action_executed:
     tier: 2
     fields:
@@ -629,6 +636,37 @@ events with `seq < transition.seq` were available before that transition.
 | `key` | string | Yes | Context key (e.g., `scope.md`, `research/r1/lead-foo.md`). |
 | `hash` | string | Yes | SHA-256 hex digest of the artifact content. 64 hex characters. |
 | `size` | integer | Yes | Byte length of the artifact content. |
+
+---
+
+#### `context_removed`
+
+Emitted by `koto context remove` after a context key is removed. A key with a
+`context_added` event and no later `context_removed` is still present; the pair
+is what lets a reader of the feed alone tell the two apart.
+
+Emitted on the idempotent no-op too — removing a key that was never written
+still appends one. The event records that the removal was requested and
+completed, which is what a reader is reconstructing; suppressing it would make
+the feed's silence ambiguous between "not asked for" and "asked for, nothing to
+do".
+
+```json
+{
+  "type": "context_removed",
+  "payload": {
+    "key": "research/r1/lead-foo.md"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `key` | string | Yes | Context key that was removed. |
+
+No `hash` or `size`: there is no content left to describe, and carrying the
+departed artifact's digest would invite a reader to treat the feed as a way to
+recover it.
 
 ---
 

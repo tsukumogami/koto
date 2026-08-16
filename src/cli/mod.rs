@@ -530,6 +530,13 @@ pub enum ContextCommand {
         /// Context key
         key: String,
     },
+    /// Remove a key and its content (idempotent: succeeds if already absent)
+    Remove {
+        /// Session name
+        session: String,
+        /// Context key
+        key: String,
+    },
     /// List all keys as a JSON array
     List {
         /// Session name
@@ -1332,6 +1339,18 @@ pub fn run(app: App) -> Result<()> {
                     } else {
                         std::process::exit(1);
                     }
+                }
+                ContextCommand::Remove { session, key } => {
+                    if let Err(e) = context::handle_remove(store, &backend, &session, &key) {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": e.to_string(),
+                                "command": "context remove"
+                            }),
+                            EXIT_INFRASTRUCTURE,
+                        );
+                    }
+                    Ok(())
                 }
                 ContextCommand::List { session, prefix } => {
                     if let Err(e) = context::handle_list(store, &session, prefix.as_deref()) {

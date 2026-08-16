@@ -88,6 +88,35 @@ pub fn handle_exists(store: &dyn ContextStore, session: &str, key: &str) -> bool
     store.ctx_exists(session, key)
 }
 
+/// Remove a key and its content from the store, then emit a `context_removed`
+/// event to the session log.
+///
+/// Idempotent: removing a key that is not there succeeds, matching
+/// `ContextStore::remove`'s own contract and the usual shape of a delete verb.
+/// A caller that needs to distinguish the two cases probes with
+/// `context exists` first.
+///
+/// The event is emitted unconditionally, including on the idempotent no-op.
+/// The log is the authoritative record of what happened to a session, and
+/// `add` already writes one; a removal that left no trace would leave a log
+/// asserting a key was added and never saying it went away, which is worse than
+/// an occasional event for a key that was already absent.
+pub fn handle_remove(
+    store: &dyn ContextStore,
+    backend: &dyn SessionBackend,
+    session: &str,
+    key: &str,
+) -> Result<()> {
+    store.remove(session, key)?;
+
+    let event = EventPayload::ContextRemoved {
+        key: key.to_string(),
+    };
+    backend.append_event(session, &event, &now_iso8601())?;
+
+    Ok(())
+}
+
 /// List all keys as a JSON array, optionally filtered by prefix.
 pub fn handle_list(store: &dyn ContextStore, session: &str, prefix: Option<&str>) -> Result<()> {
     let keys = store.list_keys(session, prefix)?;
