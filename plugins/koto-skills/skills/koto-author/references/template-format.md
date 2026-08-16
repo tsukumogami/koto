@@ -403,6 +403,35 @@ states:
           gates.doc_check.exists: false
 ```
 
+**When presence gating is the wrong gate.** A `context-exists` gate answers "is
+this key here", never "is what is here current". That is sound only when the key
+cannot survive from one evaluation of the gate into another, by any path.
+
+The example above is sound: the key does not exist yet, and the state waits for
+it to appear. It stops being sound as soon as the state can be re-entered after
+the key was written — a review phase that loops back to `implementation` on a
+failure and then walks forward into itself again, say. On re-entry the gate finds
+the *previous* round's artifact, reports `exists: true`, and the state advances on
+work that predates the fix.
+
+Note "by any path" is doing real work in that sentence. It is a property of the
+key, not the state: a state entered exactly once can still read a stale key, if
+an upstream state that wrote it sits on a cycle.
+
+Two ways out, and the choice matters:
+
+- **`koto context remove <session> <key>` on the loop-back edge.** The key goes
+  away, so the gate reports absent and the state cannot advance until something
+  writes a fresh one. This is the direct answer, and it is content-agnostic —
+  it works whatever the artifact looks like, including markdown.
+- **Gate on content with `context-matches` instead**, and overwrite the key with
+  a value the pattern rejects. Works when the artifact has a shape you can write
+  a pattern against, and couples the gate to that shape.
+
+What does **not** work is overwriting the key while keeping `context-exists`.
+`context add` replaces content but leaves the key present, so the gate is
+satisfied by the replacement and the state advances against whatever you wrote.
+
 **Path format rules:**
 
 - Exactly three dot-separated segments: `gates.<gate_name>.<field>`.
