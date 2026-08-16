@@ -114,3 +114,32 @@ Facts established before dispatching research:
    Progressive disclosure is a known pattern in agent skill systems and MCP.
    Knowing what shape others landed on, and what failed, informs both the
    conditioning rule and the escape hatch.
+
+## Research Leads -- Round 2
+
+Round 1 established that the feature shipped in PR #109 and that the live
+surface is two halves of one defect. Round 2 closes the gaps that decide how
+big the work is. See `wip/explore_inline-phase-details_findings.md` for the
+round 1 synthesis and `wip/explore_inline-phase-details_decisions.md` (D4) for
+why this round runs.
+
+8. **Which of the five suspected defects actually reproduce on current `main`?**
+   Four of them -- rewind suppression, respawn and batch-retry inheriting a
+   stale visit count, `--to` bypassing the visit check, and auto-advance
+   intermediates never surfacing details -- are code-reading inferences. The
+   author measured only the gate-blocked re-tick, and on 0.11.4. The count of
+   real defects decides whether this is one fix or four.
+
+9. **Can emission counting be recorded without violating R9's "no new state files"?**
+   The fix the author suggests turns a delivery into something koto must
+   remember. `DESIGN-koto-next-output-contract.md` already rejected a persisted
+   counter file on exactly that constraint. Whether an event in the existing log
+   satisfies R9, what it costs in schema version, and what the alternatives are
+   is the central constraint on the fix.
+
+10. **What does the read-only recovery path actually cost, in each candidate shape?**
+    `koto status --details` against a function already holding the compiled
+    template, versus a new `phase-info` subcommand, versus a `next --dry-run`.
+    Concrete diff footprint, plus the mandatory downstream work koto's CLAUDE.md
+    requires: `koto-author`, `koto-user`, their evals, `cli-usage.md`, and the
+    error-code envelope enumeration.
