@@ -29,6 +29,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto context add` | Runner — primary |
 | `koto context get` | Runner — primary |
 | `koto context exists` | Runner — primary |
+| `koto context remove` | Runner — primary |
 | `koto context list` | Runner — primary |
 | `koto config get/set/unset/list` | Runner — setup only |
 | `koto template compile` | Author (brief mention) |
@@ -685,6 +686,43 @@ fi
 ```
 
 This command is also usable directly in `gates: command:` entries in templates.
+
+**Exit 1 means "not present" and nothing more precise.** The check cannot
+distinguish a key that was never written from a store it could not read. Do not
+build a guard that treats exit 1 as "safe to skip" — on a transient read failure
+that guard skips a key that is really there.
+
+---
+
+## koto context remove
+
+```
+koto context remove <session> <key>
+```
+
+Removes a key and its content from the session's context store, and appends a
+`context_removed` event to the session log.
+
+**Idempotent.** Removing a key that is not there succeeds. That is what lets you
+call it unconditionally, which is the correct usage — see the `exists` caveat
+above for why probing first is worse than not probing.
+
+**This is the verb that makes a `context-exists` gate fail again.** Overwriting a
+key with `context add` leaves it present, so a state gated on `context-exists`
+still advances; only removal makes the gate report absent. If a workflow needs a
+phase to demand a *fresh* artifact after re-entering — a review panel that must
+re-run after a retry, say — removing the key is the step that forces it, and the
+gate is what enforces it.
+
+```sh
+# Force the next entry to scrutiny to require a new results artifact.
+koto context remove my-workflow scrutiny_results.json
+```
+
+Errors (an unwritable store) exit 3 with a JSON error on **stdout**, matching
+`add` and `get`. Note this means a failed removal is visible even with stderr
+redirected, which matters because koto's migration notices make `2>/dev/null` a
+common reflex.
 
 ---
 

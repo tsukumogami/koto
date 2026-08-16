@@ -408,6 +408,32 @@ koto context exists <name> <key>
 
 Exits 0 if the key exists, 1 if it doesn't. This is the CLI equivalent of the `context-exists` gate type in templates.
 
+Note that a `1` means "not present" and nothing more precise: the check cannot
+distinguish a key that was never written from a store it could not read. Callers
+that need to act on the difference should not infer it from this exit code.
+
+#### context remove
+
+Removes a content key and its stored content from a session.
+
+```bash
+koto context remove <name> <key>
+```
+
+**Positional arguments:**
+- `<name>` -- Workflow/session name.
+- `<key>` -- Content key.
+
+**Idempotent:** removing a key that is not there succeeds. That shape is
+deliberate — the alternative would push every caller to probe with `context
+exists` first, and per the note above that probe cannot tell "absent" from
+"unreadable", so the guard would silently skip keys it should have removed.
+
+The removal appends a `context_removed` event to the session's event log,
+mirroring the `context_added` event that `context add` writes. A workflow whose
+gate is `context-exists` over the removed key will report it absent on the next
+evaluation, so this is the verb that makes such a gate fail on purpose.
+
 #### context list
 
 Lists all content keys for a session as a JSON array.
@@ -931,4 +957,4 @@ koto next coord
 # => action: "evidence_required" or "done" (depending on post-batch template states)
 ```
 
-Each coordinator tick re-derives the ledger from disk, so resume after a crash just means running `koto next coord` again. For the full runner surface (failure routing, `retry_failed`, typed error envelopes), see `docs/designs/DESIGN-batch-child-spawning.md` and the `koto-user` skill's batch references.
+Each coordinator tick re-derives the ledger from disk, so resume after a crash just means running `koto next coord` again. For the full runner surface (failure routing, `retry_failed`, typed error envelopes), see `docs/designs/current/DESIGN-batch-child-spawning.md` and the `koto-user` skill's batch references.

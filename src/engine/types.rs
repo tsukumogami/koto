@@ -526,6 +526,17 @@ pub enum EventPayload {
         /// Size of the artifact content in bytes.
         size: u64,
     },
+    /// Emitted when a context key is removed via `koto context remove`.
+    ///
+    /// Carries the key alone: there is no content left to hash or measure, and
+    /// recording the departed artifact's digest would invite a reader to treat
+    /// the log as a way to recover it. Additive per `docs/STABILITY.md`, so it
+    /// does not move `CURRENT_SCHEMA_VERSION` -- an older build lands it in
+    /// `Unknown` and reads the rest of the log unharmed.
+    ContextRemoved {
+        /// The context key that was removed.
+        key: String,
+    },
     WorkflowCancelled {
         state: String,
         reason: String,
@@ -977,6 +988,7 @@ impl EventPayload {
             EventPayload::IntegrationInvoked { .. } => "integration_invoked",
             EventPayload::Rewound { .. } => "rewound",
             EventPayload::ContextAdded { .. } => "context_added",
+            EventPayload::ContextRemoved { .. } => "context_removed",
             EventPayload::WorkflowCancelled { .. } => "workflow_cancelled",
             EventPayload::DefaultActionExecuted { .. } => "default_action_executed",
             EventPayload::DecisionRecorded { .. } => "decision_recorded",
@@ -1158,6 +1170,11 @@ impl<'de> Deserialize<'de> for Event {
                     hash: p.hash,
                     size: p.size,
                 }
+            }
+            "context_removed" => {
+                let p: ContextRemovedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::ContextRemoved { key: p.key }
             }
             "workflow_cancelled" => {
                 let p: WorkflowCancelledPayload = serde_json::from_value(payload_val.clone())
@@ -1390,6 +1407,11 @@ struct ContextAddedPayload {
     key: String,
     hash: String,
     size: u64,
+}
+
+#[derive(Deserialize)]
+struct ContextRemovedPayload {
+    key: String,
 }
 
 #[derive(Deserialize)]
