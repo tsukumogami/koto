@@ -95,7 +95,8 @@ the procedure suppressed throughout.
 - An agent that no longer holds the instructions can retrieve them with a call
   that provably changes nothing about the workflow.
 - An agent that has lost its context still learns that the retrieval exists,
-  through a channel that reaches it on every response.
+  through a channel that reaches it on every response for a phase that has
+  instructions to recover.
 - Templates that attach no instructions behave exactly as they do today.
 - The change lands without a new state file, without a state-schema version
   bump, and without touching the frozen wire-format surface.
@@ -130,6 +131,28 @@ coverage today beyond its counting primitive.
 
 ## Requirements
 
+### Definitions
+
+Two terms carry weight across the requirements below, and both are defined here
+rather than left to implication.
+
+**Occupancy.** A phase's occupancy begins when a state-entry event names that
+phase as its target, and ends when the next state-entry event names any phase,
+including the same one. A self-transition therefore ends one occupancy and
+begins another, which makes it behave exactly like a loop-back through other
+phases: the instructions are delivered again on arrival. This is the same answer
+the criteria already require for a loop-back, and treating a self-transition
+differently would make the rule depend on the shape of the loop rather than on
+whether the workflow re-entered the phase.
+
+**Transition paths.** koto moves a workflow along two distinct code paths, and
+the requirements name them separately: the **natural-advancement path**, which
+covers conditional and unconditional transitions reached by evaluating the
+template, and the **directed-transition path**, which covers an explicitly
+targeted transition. Both advance the workflow. Where a requirement says a
+response "does not advance the workflow", it means no transition of either kind
+occurred.
+
 ### Functional — the delivery rule
 
 - **R1.** The decision to include a phase's instructions in a response is keyed
@@ -139,17 +162,18 @@ coverage today beyond its counting primitive.
 - **R2.** A response that does not advance the workflow, and that follows a
   response which already carried the current phase's instructions, omits them.
   This covers the gate-blocked re-tick and any other non-advancing repeat.
-- **R3.** The first response after arriving at a phase carries that phase's
-  instructions, for every way of arriving: a conditional transition, an
-  unconditional transition, a directed transition, a rewind, and workflow
-  initialization at the initial state.
-- **R4.** R1 through R3 hold identically on the directed-transition path and on
-  the advance path. There is one rule, not two.
+- **R3.** The first response of a phase's occupancy carries that phase's
+  instructions, however the occupancy began: a conditional transition, an
+  unconditional transition, a directed transition, a self-transition, a rewind,
+  or workflow initialization at the initial state.
+- **R4.** R1 through R3 hold identically on the natural-advancement path and on
+  the directed-transition path. There is one rule, not two.
 - **R5.** An explicit override remains available that includes the instructions
   regardless of the rule, preserving the behavior of the existing `--full` flag
   for callers that already depend on it.
 - **R6.** A phase that declares no instructions produces responses byte-identical
-  to those koto produces today.
+  to those koto produces today. The discoverability pointer of R14 does not
+  appear on such a response, so this requirement and R14 do not compete.
 
 ### Functional — the read-only retrieval
 
@@ -173,16 +197,19 @@ coverage today beyond its counting primitive.
 - **R12.** The retrieval does not block on a lock held by another process. A
   respawned agent must be able to retrieve instructions while its predecessor is
   still running.
-- **R13.** The retrieval's error behavior — for an unknown workflow, an
-  unreadable or corrupt session, and a phase that declares no instructions —
-  follows koto's existing structured error conventions, and a phase with no
-  instructions is not an error.
+- **R13.** The retrieval's error behavior follows koto's existing structured
+  error conventions for an unknown workflow and for an unreadable or corrupt
+  session. Two cases are explicitly not errors and return a normal success
+  response: a phase that declares no instructions, and a workflow sitting at a
+  terminal phase.
 
 ### Functional — discoverability
 
-- **R14.** A pointer to the retrieval reaches the agent on a channel that is
-  present in every non-terminal response, so an agent that has lost its context
-  learns the retrieval exists without having retained anything.
+- **R14.** A pointer to the retrieval reaches the agent on a channel present in
+  every non-terminal response for a phase that declares instructions, so an
+  agent that has lost its context learns the retrieval exists without having
+  retained anything. A phase declaring no instructions carries no pointer, which
+  is what keeps R6 intact.
 - **R15.** The pointer does not displace or truncate the phase's own directive
   text.
 
@@ -193,9 +220,9 @@ coverage today beyond its counting primitive.
   already imposes, carried forward unchanged.
 - **R17.** The frozen wire-format surface that `koto-stability-tests` pins is
   unchanged.
-- **R18.** Per-call cost stays within the same order as today's derivation: one
-  additional pass over an already-read event list, with no new file reads on the
-  `koto next` path.
+- **R18.** The `koto next` path performs no file read it does not perform today,
+  and any added per-call work stays proportional to the session data koto
+  already reads on that call. How that is achieved is the DESIGN's to decide.
 - **R19.** The behavior is covered by tests at the level it lives. The response
   construction and the delivery rule are exercised directly, not only through
   the counting primitive underneath them, which is where today's coverage stops.
@@ -214,6 +241,10 @@ coverage today beyond its counting primitive.
   delivery contract assert the changed behavior rather than the old one.
 - **R24.** `CHANGELOG.md` records the fix and any added surface under the
   repository's existing convention.
+- **R25.** Because R20 through R23 require changes under `plugins/koto-skills/`,
+  the shipped templates under that tree still compile. This is a merge gate, not
+  a convention: the plugin-validation workflow compiles every shipped template on
+  any pull request touching that tree.
 
 ## Acceptance Criteria
 
@@ -225,6 +256,12 @@ coverage today beyond its counting primitive.
       instructions field.
 - [ ] The same workflow, after the gate passes and the workflow later loops back
       to that phase, carries the instructions again on the arrival response.
+- [ ] A phase whose transition targets itself: the arrival response after the
+      self-transition carries the instructions, matching the loop-back case
+      above and the occupancy definition.
+- [ ] A phase reached by an unconditional transition carries the instructions on
+      arrival, verified separately from the conditional case even though both
+      run through the natural-advancement path.
 - [ ] A workflow is advanced past a phase and then rewound into it. The next
       response carries that phase's instructions.
 - [ ] Two consecutive directed transitions into the same phase: the first
@@ -237,8 +274,10 @@ coverage today beyond its counting primitive.
       instructions.
 - [ ] The existing override flag returns the instructions on a response where the
       rule would otherwise have omitted them.
-- [ ] A template whose phases declare no instructions produces responses with no
-      instructions field, on every path above.
+- [ ] For a template whose phases declare no instructions, the full response body
+      is byte-identical to the response the pre-change binary produces for the
+      same template and the same sequence of calls, on every path above. The
+      baseline is captured before the change lands — see the Decisions section.
 
 ### The read-only retrieval
 
@@ -258,9 +297,16 @@ coverage today beyond its counting primitive.
 - [ ] A retrieval against a phase carrying a default action does not execute it,
       verified the same way.
 - [ ] A retrieval against a workflow at a terminal phase does not clean up the
-      session; the session directory still exists afterwards.
-- [ ] A retrieval succeeds while a second process holds the session, without
-      blocking.
+      session, the session directory still exists afterwards, and the response
+      is a normal success envelope rather than an error.
+- [ ] A retrieval against a batch-scoped parent succeeds while another process
+      holds that session's advisory lock for the duration of a tick, and returns
+      without waiting for the lock to be released.
+- [ ] A retrieval against an ordinary, non-batch session succeeds and returns
+      immediately while a first process is mid-tick on that same session —
+      constructed with a phase whose gate or default action runs a deliberately
+      slow command. This is the respawn race the problem statement leads with,
+      and it is distinct from the batch-lock case above.
 - [ ] A retrieval against an unknown workflow name returns a structured error and
       a non-zero exit code consistent with koto's existing conventions.
 - [ ] A retrieval against a phase that declares no instructions succeeds and
@@ -270,8 +316,14 @@ coverage today beyond its counting primitive.
 
 ### Discoverability
 
-- [ ] Every non-terminal `koto next` response carries a pointer naming the
-      retrieval, on a field present in all such responses.
+- [ ] Every non-terminal `koto next` response shape carries a pointer naming the
+      retrieval when the current phase declares instructions. The shapes are
+      enumerated by the response type's own non-terminal variants — at time of
+      writing: gate-blocked, evidence-required, integration,
+      integration-unavailable, action-requires-confirmation, and
+      signal-received — and the criterion is met only when every variant that
+      exists at implementation time is covered.
+- [ ] A response for a phase that declares no instructions carries no pointer.
 - [ ] The phase's own directive text is present and unaltered in a response that
       also carries the pointer.
 
@@ -279,7 +331,13 @@ coverage today beyond its counting primitive.
 
 - [ ] No file is added under the session directory beyond those koto writes
       today, and the state-file schema version is unchanged.
+- [ ] A `koto next` call opens no file the pre-change binary did not open for the
+      same workflow and the same call, verified by comparing the two binaries'
+      file-open syscalls under `strace` or an equivalent.
 - [ ] `koto-stability-tests` passes unmodified.
+- [ ] `koto template compile` succeeds against every template shipped under
+      `plugins/`, which is what the plugin-validation workflow runs on any pull
+      request touching that tree.
 - [ ] Tests exercise the response construction and the delivery rule directly,
       covering at minimum: the non-advancing repeat, the rewind arrival, and both
       directed-transition cases.
@@ -348,6 +406,24 @@ anything. It would also be stale by construction, and a recovering agent could
 read it as live. R9 requires the evidence schema and stops there; the DESIGN
 decides whether a stale-labelled gate outcome earns its place.
 
+**The discoverability pointer is scoped to phases that declare instructions.**
+An unconditional pointer on every non-terminal response would contradict R6's
+promise that a template attaching no instructions behaves exactly as it does
+today — the two cannot both hold. Scoping the pointer resolves it in R6's
+favour, and the reasoning is more than expedience: a phase with no instructions
+has nothing for the retrieval to return, so advertising it there would point an
+agent at an empty answer. The cost is that an agent on an instruction-free
+workflow never learns the retrieval exists. That is acceptable because such an
+agent has nothing to recover; the directive it needs is on every response
+already.
+
+**The byte-identity baseline does not exist yet and must be captured first.**
+No current test compares whole response bodies against a fixed reference, so the
+R6 criterion is not satisfiable by running the suite as it stands. Capturing the
+baseline — a frozen fixture of responses from the pre-change binary, or a
+recorded diff against it — is work the implementation has to do before it can
+claim the criterion, not something a later reader can reconstruct.
+
 **Where the retrieval lives and what it is called are DESIGN questions.** The
 requirements above name a capability and its contract, not a surface. The
 exploration costed three candidates and found a strong vocabulary signal against
@@ -356,26 +432,23 @@ decision, not to this document.
 
 ## Out of Scope
 
-- **Auto-advance discarding the phases it crosses.** A `koto next` that advances
-  through an intermediate phase surfaces neither that phase's instructions nor
-  its directive. It predates this mechanism, is broader than it, and would
-  mis-frame as a delivery regression. Filed separately.
-- **Two consecutive rewinds moving a session forward.** A defect in how the
-  rewind target is selected, which makes an early phase unreachable once the
-  workflow has passed it. Adjacent — a rewind-aware change here touches the same
-  function — but unrelated to instruction delivery. Filed separately.
-- **`accepts:` not gating advancement.** A transition with no condition fires
-  regardless of any `accepts` block, so a chain of phases an author believes are
-  interactive can run to completion in one call. Filed separately.
-- **The migration scan's output on every invocation.** It obstructed measurement
-  during the exploration and is very likely the already-open issue #193.
-- **Retrofitting existing templates onto the mechanism.** Adoption work in other
-  repositories, downstream of anything koto changes here.
-- **Requiring the directed-transition path to evaluate gates.** A larger behavior
-  change than this problem statement supports; see Decisions.
-- **Changing the shared visit-count derivation's own semantics.** It has a second
-  consumer unrelated to instruction delivery, so it is a constraint on the
-  solution rather than a target of it.
+The upstream `BRIEF-inline-phase-details` sets this boundary and states the
+reasoning behind each exclusion in its Scope Boundary section. The list is
+carried here so a reader knows what this PRD does not require, without the
+justifications being written twice:
+
+- Auto-advance discarding the phases it crosses.
+- Two consecutive rewinds moving a session forward.
+- `accepts:` not gating advancement.
+- The migration scan's output on every invocation.
+- Retrofitting existing templates onto the mechanism.
+- Changing the shared visit-count derivation's own semantics.
+
+One exclusion is this PRD's own rather than the brief's:
+
+- **Requiring the directed-transition path to evaluate gates.** Reaching the
+  gate-fail-with-accepts branch would need it, and it is a materially larger
+  behavior change than this problem statement supports. See Decisions.
 
 ## Known Limitations
 
