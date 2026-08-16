@@ -1,6 +1,6 @@
 ---
 schema: plan/v1
-status: Draft
+status: Active
 execution_mode: single-pr
 upstream: docs/designs/DESIGN-inline-phase-details.md
 milestone: "inline-phase-details"
@@ -11,7 +11,7 @@ issue_count: 5
 
 ## Status
 
-Draft
+Active
 
 Authored from `DESIGN-inline-phase-details` under `/scope`'s tactical chain.
 Tracking level is `none`, so no GitHub issues or milestone are created and the
@@ -64,8 +64,19 @@ back, without wiring either into a response path.
       occupancy; a delivery recorded before the most recent entry event; arrival
       by rewind; arrival by self-transition; and a multi-hop advance where a
       delivery belongs to an intermediate phase.
-- [ ] No observable behavior changes. The full suite passes and no response
-      differs from before this issue.
+- [ ] The predicate has no call site and the new event is appended nowhere,
+      verified by searching the tree for both names and finding only their
+      definitions and their tests. This is what "inert" means here, and it is
+      checkable, where "no response differs" would not be until the fixture below
+      exists.
+- [ ] The full existing suite passes unchanged.
+- [ ] **The byte-identity baseline is captured and committed in this issue**, from
+      a binary built before any behavior change. It is a fixture of full response
+      bodies for an instruction-free template, covering the same call sequences
+      issue 2's byte-identity criterion enumerates. Capturing it here rather than
+      in issue 2 is deliberate: issue 2 is the first issue that changes behavior,
+      so a baseline captured inside it would already be contaminated, and the
+      pre-change binary would have to be recovered by checkout and rebuild.
 
 **Dependencies**: None
 
@@ -102,11 +113,18 @@ delivery as it happens.
 - [ ] Two consecutive directed transitions into the same phase, which requires a
       template declaring a self-transition, both carry them.
 - [ ] The existing override flag returns them on a response the rule would
-      otherwise have suppressed, and recording that delivery changes nothing
-      observable for existing override callers.
-- [ ] For a template whose phases declare no instructions, responses are
-      byte-identical to the pre-change binary's for the same template and call
-      sequence. The baseline is captured before this issue lands.
+      otherwise have suppressed.
+- [ ] An override call records a delivery like any other: an override call
+      followed by a plain non-advancing `koto next` on the same occupancy returns
+      a response with no instructions. Without this, an implementation that
+      simply never records on the override path passes the criterion above
+      vacuously, and the plain call that follows wrongly re-delivers.
+- [ ] For a template whose phases declare no instructions, full response bodies
+      are byte-identical to the baseline fixture captured in issue 1, across every
+      call sequence the criteria above exercise: conditional-transition arrival,
+      unconditional-transition arrival, directed transition, self-transition,
+      rewind, override, `koto init` plus first tick, and batch-child init. A diff
+      against only the simplest sequence does not satisfy this.
 - [ ] `derive_visit_counts` still exists and its consumer in the workflows
       surface is untouched.
 - [ ] `koto-stability-tests` passes unmodified.
@@ -139,15 +157,25 @@ directive, instructions, and evidence schema without moving the workflow.
       `details` absent rather than erroring.
 - [ ] A retrieval against a batch-scoped parent succeeds while another process
       holds that session's advisory lock for a tick, returning without waiting.
+      This is the only scenario in which real lock contention exists, because the
+      advisory lock is taken only for batch-scoped phases.
+- [ ] The retrieval attempts no lock on the session state file at all, verified
+      by the absence of a lock syscall under `strace` on a non-batch session. The
+      non-batch mid-tick scenario alone would not discriminate: no lock exists
+      there under either a correct implementation or one that wrongly tries to
+      take a non-blocking lock, so both would return immediately.
 - [ ] A retrieval against an ordinary non-batch session returns immediately while
       a first process is mid-tick, constructed with a deliberately slow gate or
-      default action.
+      default action. This covers the respawn race the problem statement leads
+      with; the syscall criterion above is what makes it discriminating.
 - [ ] A retrieval against an unknown workflow returns a structured error and a
       non-zero exit code consistent with the handler's existing conventions.
 - [ ] The handler verifies the compiled template's hash against the session
-      header and, on mismatch, adds a conditionally-present key naming the
-      divergence rather than failing. The pre-existing unverified read that
-      `is_terminal` depended on is closed by the same check.
+      header and, on mismatch, reports rather than fails: it adds a
+      conditionally-present key carrying **both** the hash recorded in the session
+      header and the hash of the template as read, so a caller can tell what
+      diverged. A bare boolean does not satisfy this. The pre-existing unverified
+      read that `is_terminal` depended on is closed by the same check.
 
 **Dependencies**: Blocked by <<ISSUE:2>>
 
@@ -162,10 +190,14 @@ exists.
       action-requires-confirmation — carries a pointer naming the retrieval when
       the current phase declares instructions.
 - [ ] The pointer's presence keys on whether the phase declares instructions, not
-      on whether this response carries them, so it appears on exactly the
-      responses where they were suppressed.
+      on whether this response carries them. It therefore appears on responses
+      that carry the instructions *and* on the suppressed ones — not only the
+      suppressed ones. An implementation that shows the pointer only when the
+      instructions were withheld does not satisfy this.
 - [ ] A response for a phase declaring no instructions carries no pointer, and
-      such responses stay byte-identical to the pre-change binary's.
+      such responses stay byte-identical to the issue 1 baseline fixture.
+- [ ] Terminal and error responses carry no pointer, since neither carries a
+      directive for it to ride.
 - [ ] The phase's own directive text is present and unaltered in a response that
       also carries the pointer.
 - [ ] The pointer is spliced after variable substitution, so it is never itself
@@ -191,8 +223,12 @@ what ships, which koto's contributor guide makes mandatory for changes under
       author can now rely on over a loop.
 - [ ] `docs/guides/cli-usage.md` and the Cursor rules file under the plugin match
       the shipped behavior.
-- [ ] Every skill under the plugin tree still has at least one eval, and any eval
-      asserting the old delivery behavior is updated to assert the new one.
+- [ ] Every skill under the plugin tree still has at least one eval, and every
+      eval that asserted the old visit-count behavior asserts the new rule
+      instead. "Updated" is not satisfied by a wording change: at least one eval
+      must assert that a second non-advancing tick omits the instructions, and at
+      least one must assert that a rewind arrival delivers them. Deleting an
+      assertion rather than replacing it fails this criterion.
 - [ ] `koto template compile` succeeds against every template shipped under the
       plugin tree, which the plugin-validation workflow runs on any pull request
       touching it.
@@ -212,26 +248,10 @@ Outlines above are the decomposition `/work-on` consumes.
 
 ## Dependency Graph
 
-```mermaid
-graph TD
-    I1["Issue 1: record the delivery"]
-    I2["Issue 2: one rule, both sites"]
-    I3["Issue 3: retrieval via koto status"]
-    I4["Issue 4: recovery pointer"]
-    I5["Issue 5: skills, evals, docs"]
-
-    I1 --> I2
-    I2 --> I3
-    I3 --> I4
-    I4 --> I5
-
-    class I1,I2,I3,I4,I5 pending
-    classDef pending fill:#f5f5f5,stroke:#9e9e9e,color:#212121
-    classDef inProgress fill:#fff3e0,stroke:#ff9800,color:#212121
-    classDef done fill:#e8f5e9,stroke:#4caf50,color:#212121
-```
-
-Legend: grey is pending, orange is in progress, green is done.
+Empty by design. Execution mode is `single-pr`, so there are no GitHub issues for
+a diagram to link and the dependency structure is a strict chain rather than a
+graph. Each issue's own `Dependencies` line above carries its one edge, and the
+Implementation Sequence below explains why each edge is real.
 
 ## Implementation Sequence
 
@@ -247,9 +267,17 @@ natural-advancement path and the directed-transition path — must land in the s
 commit set, because shipping one without the other leaves the two paths
 disagreeing, which is the defect this work exists to close.
 
-One preparatory step belongs before issue 2 rather than inside it. The
-byte-identity baseline that issue 2's acceptance criteria compare against does
-not exist today: no current test compares whole response bodies to a fixed
-reference. Capture it from the pre-change binary — a frozen fixture of responses
-for an instruction-free template — before the first behavior-changing commit, or
-the criterion cannot be evaluated afterwards.
+The byte-identity baseline that issue 2 compares against does not exist today —
+no current test compares whole response bodies to a fixed reference — so issue 1
+owns capturing it. That placement is load-bearing rather than tidy: issue 2 is
+the first issue that changes behavior, so a baseline captured inside it would
+already be contaminated, and recovering the pre-change binary afterwards means a
+checkout and a rebuild. Issue 1 is the last point at which the working tree still
+produces pre-change responses, which is why the fixture is one of its acceptance
+criteria rather than a note here.
+
+Verification is not deferred to the end. Issue 5 carries the repository-wide
+gates — formatting, lints, the full suite, template compilation, and the
+wip-hygiene check — because those are the things that must hold of the finished
+branch, not because earlier issues may leave them broken. Each issue's own
+criteria are verified as that issue lands.

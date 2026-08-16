@@ -1,10 +1,15 @@
 ```yaml
 topic: inline-phase-details
 chain_started: 2026-08-16T19:06:07Z
-last_updated: 2026-08-16T19:12:15Z
-phase_pointer: phase-2
-exit: UNSET
-exit_artifacts: []
+chain_completed: 2026-08-16T22:16:29Z
+last_updated: 2026-08-16T22:16:29Z
+phase_pointer: phase-3
+exit: full-run
+exit_artifacts:
+  - docs/plans/PLAN-inline-phase-details.md
+  - docs/designs/DESIGN-inline-phase-details.md
+  - docs/prds/PRD-inline-phase-details.md
+  - docs/briefs/BRIEF-inline-phase-details.md
 visibility: Public
 consumed_handoff: wip/scope_inline-phase-details_handoff.md
 planned_chain:
@@ -20,6 +25,8 @@ chain_ran:
     started_at: 2026-08-16T19:13:00Z
   - name: design
     started_at: 2026-08-16T21:50:00Z
+  - name: plan
+    started_at: 2026-08-16T22:00:00Z
 child_snapshots:
   brief:
     status: Accepted
@@ -30,9 +37,13 @@ child_snapshots:
     content_hash: aa7659b85169eb971963d76d07c30a270ba525c7
     captured_at: 2026-08-16T21:45:00Z
   design:
-    status: Accepted
-    content_hash: 428bfe098ae6ce923d98d06a157300f8eb186983
-    captured_at: 2026-08-16T22:30:00Z
+    status: Planned
+    content_hash: 0a2a9ab1b898312d9250938349501b844f5ff13b
+    captured_at: 2026-08-16T22:16:29Z
+  plan:
+    status: Active
+    content_hash: 3bd6fd3f48ed5ba11da38cf7bf38bc7c45cc277b
+    captured_at: 2026-08-16T22:16:29Z
 consolidation_judgments:
   - hop: brief->prd
     stage: judgment
@@ -63,10 +74,22 @@ consolidation_judgments:
       ancestor's Requirements and Acceptance Criteria sections would fail.
       Downstream needs them intact as well: the PLAN decomposes against the
       acceptance criteria, and the implementation is verified against them.
-parent_orchestration:
-  invoking_child: plan
-  suppress_status_aware_prompt: true
-  rationale: fresh-chain
+  - hop: design->plan
+    stage: judgment
+    verdict: keep
+    finding: >-
+      The DESIGN holds four decisions with their considered options and the
+      reasoning that rejected each alternative, the security review's ruling on
+      template-hash verification, and the solution architecture. The PLAN holds
+      acceptance criteria and a sequence, and cites none of that reasoning. The
+      lifetime rule settles it independently and decisively: the PLAN is a
+      working artifact the implementation cascade deletes, while the DESIGN
+      becomes Current and stays as the durable record of how the approach was
+      chosen. Absorbing the DESIGN into the PLAN would destroy that record the
+      moment the cascade ran, which is the exact failure the lifetime rule
+      exists to prevent -- a link, or in this case a whole body, running from
+      the longer-lived document into the shorter-lived one.
+plan_execution_mode: single-pr
 ```
 
 ## Phase 0 notes

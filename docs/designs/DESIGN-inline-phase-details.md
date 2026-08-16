@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-inline-phase-details.md
 problem: |
   koto decides whether a phase's long-form instructions ride in a `koto next`
@@ -42,7 +42,7 @@ rationale: |
 
 ## Status
 
-Accepted
+Planned
 
 Authored under `/scope`'s tactical chain from `PRD-inline-phase-details`. Four
 decisions were evaluated independently and cross-validated; the cross-validation
