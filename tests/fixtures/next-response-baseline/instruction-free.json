@@ -1,0 +1,147 @@
+{
+  "notes": [
+    "Baseline of full `koto next` response bodies for a template whose phases declare no instructions (no `<!-- details -->` marker anywhere). Captured from the binary as it stood before any behaviour change in the inline-phase-details feature.",
+    "Every sequence runs in its own temporary HOME and KOTO_SESSIONS_BASE, so no session state carries between them and the real session store is never touched.",
+    "`stdout` holds the response bytes verbatim, including the trailing newline the CLI writes. Steps whose stdout is not part of the contract under test (`koto init`, `koto rewind`, and the parent tick that spawns a batch child) are run but not recorded; the response they set up is.",
+    "Every call sequence the plan enumerates -- conditional-transition arrival, unconditional-transition arrival, directed transition, self-transition, rewind, the `--full` override, `koto init` plus the first tick, and a batch child's first tick -- is expressible in the template grammar and is recorded here. Nothing was omitted. The non-advancing repeat is recorded too, on its own, because it is the response the delivery rule will change and the one the `--full` entry is the counterpart of.",
+    "The bodies were also confirmed identical between the debug binary this harness runs and a `cargo build --release` binary, so the baseline is a property of the source rather than of the profile.",
+    "One sequence needs comment: two consecutive directed transitions into the same phase are only reachable because `implement` declares itself as a transition target -- the `--to` handler validates the target against the current phase's declared transitions. That is why the template has a self-transition it would not otherwise need."
+  ],
+  "sequences": [
+    {
+      "description": "`koto init` followed by the first `koto next`: the arrival response for the initial phase.",
+      "label": "init-then-first-tick",
+      "responses": [
+        {
+          "argv": [
+            "next",
+            "wf"
+          ],
+          "stdout": "{\"action\":\"evidence_required\",\"advanced\":false,\"blocking_conditions\":[],\"directive\":\"Collect the inputs.\",\"error\":null,\"expects\":{\"event_type\":\"evidence_submitted\",\"fields\":{\"route\":{\"required\":true,\"type\":\"enum\",\"values\":[\"direct\",\"indirect\"]}},\"options\":[{\"target\":\"implement\",\"when\":{\"route\":\"direct\"}},{\"target\":\"relay\",\"when\":{\"route\":\"indirect\"}}]},\"state\":\"gather\",\"unassigned_children\":[]}\n"
+        }
+      ]
+    },
+    {
+      "description": "Evidence routes `gather` to `implement` through a `when` clause.",
+      "label": "conditional-transition-arrival",
+      "responses": [
+        {
+          "argv": [
+            "next",
+            "wf",
+            "--with-data",
+            "{\"route\":\"direct\"}"
+          ],
+          "stdout": "{\"action\":\"evidence_required\",\"advanced\":true,\"blocking_conditions\":[],\"directive\":\"Make the change.\",\"error\":null,\"expects\":{\"event_type\":\"evidence_submitted\",\"fields\":{\"loop_again\":{\"required\":true,\"type\":\"enum\",\"values\":[\"yes\",\"no\"]}},\"options\":[{\"target\":\"implement\",\"when\":{\"loop_again\":\"yes\"}},{\"target\":\"done\",\"when\":{\"loop_again\":\"no\"}}]},\"state\":\"implement\",\"unassigned_children\":[]}\n"
+        }
+      ]
+    },
+    {
+      "description": "Evidence routes `gather` to `relay`, whose sole transition is unconditional, so the tick chains on and the arrival at `implement` is reached unconditionally.",
+      "label": "unconditional-transition-arrival",
+      "responses": [
+        {
+          "argv": [
+            "next",
+            "wf",
+            "--with-data",
+            "{\"route\":\"indirect\"}"
+          ],
+          "stdout": "{\"action\":\"evidence_required\",\"advanced\":true,\"blocking_conditions\":[],\"directive\":\"Make the change.\",\"error\":null,\"expects\":{\"event_type\":\"evidence_submitted\",\"fields\":{\"loop_again\":{\"required\":true,\"type\":\"enum\",\"values\":[\"yes\",\"no\"]}},\"options\":[{\"target\":\"implement\",\"when\":{\"loop_again\":\"yes\"}},{\"target\":\"done\",\"when\":{\"loop_again\":\"no\"}}]},\"state\":\"implement\",\"unassigned_children\":[]}\n"
+        }
+      ]
+    },
+    {
+      "description": "A second `koto next` on a phase awaiting evidence, which does not advance. This is the response the delivery rule will later change.",
+      "label": "non-advancing-repeat",
+      "responses": [
+        {
+          "argv": [
+            "next",
+            "wf"
+          ],
+          "stdout": "{\"action\":\"evidence_required\",\"advanced\":false,\"blocking_conditions\":[],\"directive\":\"Make the change.\",\"error\":null,\"expects\":{\"event_type\":\"evidence_submitted\",\"fields\":{\"loop_again\":{\"required\":true,\"type\":\"enum\",\"values\":[\"yes\",\"no\"]}},\"options\":[{\"target\":\"implement\",\"when\":{\"loop_again\":\"yes\"}},{\"target\":\"done\",\"when\":{\"loop_again\":\"no\"}}]},\"state\":\"implement\",\"unassigned_children\":[]}\n"
+        }
+      ]
+    },
+    {
+      "description": "The same non-advancing tick under `--full`.",
+      "label": "full-override",
+      "responses": [
+        {
+          "argv": [
+            "next",
+            "wf",
+            "--full"
+          ],
+          "stdout": "{\"action\":\"evidence_required\",\"advanced\":false,\"blocking_conditions\":[],\"directive\":\"Make the change.\",\"error\":null,\"expects\":{\"event_type\":\"evidence_submitted\",\"fields\":{\"loop_again\":{\"required\":true,\"type\":\"enum\",\"values\":[\"yes\",\"no\"]}},\"options\":[{\"target\":\"implement\",\"when\":{\"loop_again\":\"yes\"}},{\"target\":\"done\",\"when\":{\"loop_again\":\"no\"}}]},\"state\":\"implement\",\"unassigned_children\":[]}\n"
+        }
+      ]
+    },
+    {
+      "description": "`implement` transitions to itself, ending one occupancy and beginning another.",
+      "label": "self-transition-arrival",
+      "responses": [
+        {
+          "argv": [
+            "next",
+            "wf",
+            "--with-data",
+            "{\"loop_again\":\"yes\"}"
+          ],
+          "stdout": "{\"action\":\"evidence_required\",\"advanced\":true,\"blocking_conditions\":[],\"directive\":\"Make the change.\",\"error\":null,\"expects\":{\"event_type\":\"evidence_submitted\",\"fields\":{\"loop_again\":{\"required\":true,\"type\":\"enum\",\"values\":[\"yes\",\"no\"]}},\"options\":[{\"target\":\"implement\",\"when\":{\"loop_again\":\"yes\"}},{\"target\":\"done\",\"when\":{\"loop_again\":\"no\"}}]},\"state\":\"implement\",\"unassigned_children\":[]}\n"
+        }
+      ]
+    },
+    {
+      "description": "Two consecutive `--to` transitions into `implement`. The second is reachable only because `implement` declares itself as a target. Note the key order differs from the natural-advancement path.",
+      "label": "directed-transition",
+      "responses": [
+        {
+          "argv": [
+            "next",
+            "wf",
+            "--to",
+            "implement"
+          ],
+          "stdout": "{\"action\":\"evidence_required\",\"state\":\"implement\",\"directive\":\"Make the change.\",\"advanced\":true,\"expects\":{\"event_type\":\"evidence_submitted\",\"fields\":{\"loop_again\":{\"type\":\"enum\",\"required\":true,\"values\":[\"yes\",\"no\"]}},\"options\":[{\"target\":\"implement\",\"when\":{\"loop_again\":\"yes\"}},{\"target\":\"done\",\"when\":{\"loop_again\":\"no\"}}]},\"blocking_conditions\":[],\"unassigned_children\":[],\"error\":null}\n"
+        },
+        {
+          "argv": [
+            "next",
+            "wf",
+            "--to",
+            "implement"
+          ],
+          "stdout": "{\"action\":\"evidence_required\",\"state\":\"implement\",\"directive\":\"Make the change.\",\"advanced\":true,\"expects\":{\"event_type\":\"evidence_submitted\",\"fields\":{\"loop_again\":{\"type\":\"enum\",\"required\":true,\"values\":[\"yes\",\"no\"]}},\"options\":[{\"target\":\"implement\",\"when\":{\"loop_again\":\"yes\"}},{\"target\":\"done\",\"when\":{\"loop_again\":\"no\"}}]},\"blocking_conditions\":[],\"unassigned_children\":[],\"error\":null}\n"
+        }
+      ]
+    },
+    {
+      "description": "The workflow is advanced past `gather` and then rewound into it; the next response is the arrival.",
+      "label": "rewind-arrival",
+      "responses": [
+        {
+          "argv": [
+            "next",
+            "wf"
+          ],
+          "stdout": "{\"action\":\"evidence_required\",\"advanced\":false,\"blocking_conditions\":[],\"directive\":\"Collect the inputs.\",\"error\":null,\"expects\":{\"event_type\":\"evidence_submitted\",\"fields\":{\"route\":{\"required\":true,\"type\":\"enum\",\"values\":[\"direct\",\"indirect\"]}},\"options\":[{\"target\":\"implement\",\"when\":{\"route\":\"direct\"}},{\"target\":\"relay\",\"when\":{\"route\":\"indirect\"}}]},\"state\":\"gather\",\"unassigned_children\":[]}\n"
+        }
+      ]
+    },
+    {
+      "description": "A batch-spawned child's first `koto next`. The parent tick that spawns it is setup; the child's arrival response is the record.",
+      "label": "batch-child-first-tick",
+      "responses": [
+        {
+          "argv": [
+            "next",
+            "par.a"
+          ],
+          "stdout": "{\"action\":\"evidence_required\",\"advanced\":false,\"blocking_conditions\":[],\"directive\":\"Do the work.\",\"error\":null,\"expects\":{\"event_type\":\"evidence_submitted\",\"fields\":{\"marker\":{\"required\":true,\"type\":\"enum\",\"values\":[\"done\",\"skip\"]}},\"options\":[{\"target\":\"finished\",\"when\":{\"marker\":\"done\"}},{\"target\":\"skipped\",\"when\":{\"marker\":\"skip\"}}]},\"state\":\"work\",\"unassigned_children\":[]}\n"
+        }
+      ]
+    }
+  ]
+}

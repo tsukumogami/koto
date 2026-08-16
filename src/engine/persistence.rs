@@ -1035,6 +1035,50 @@ pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `current_state`'s instructions have already been delivered to a
+/// caller during the phase's current occupancy.
+///
+/// An occupancy begins when a state-entry event names the phase as its target
+/// and ends when the next state-entry event names any phase, including the same
+/// one -- so a self-transition ends one occupancy and begins another, and a
+/// rewind into the phase begins a fresh one. State-entry events are
+/// `Transitioned`, `DirectedTransition`, and `Rewound`; the slice they define is
+/// the same one [`latest_epoch_gate_failed`] reads, and the two share the idiom
+/// so the two predicates cannot drift on what "this occupancy" means.
+///
+/// The record is matched on the phase it names as well as on its position in
+/// the slice. The two are not redundant: a multi-hop advance leaves deliveries
+/// for the phases it passed through, and an intermediate phase's record must
+/// not read as the phase the workflow now occupies.
+///
+/// Takes a plain event slice and touches no backend, so a caller that has the
+/// events in memory does not pay a read to ask.
+pub fn instructions_delivered_this_occupancy(events: &[Event], current_state: &str) -> bool {
+    let occupancy_start = events.iter().enumerate().rev().find_map(|(idx, e)| {
+        let to = match &e.payload {
+            EventPayload::Transitioned { to, .. } => Some(to.as_str()),
+            EventPayload::DirectedTransition { to, .. } => Some(to.as_str()),
+            EventPayload::Rewound { to, .. } => Some(to.as_str()),
+            _ => None,
+        };
+        if to == Some(current_state) {
+            Some(idx)
+        } else {
+            None
+        }
+    });
+    let occupancy_events: &[Event] = match occupancy_start {
+        Some(idx) => &events[idx + 1..],
+        None => events,
+    };
+    occupancy_events.iter().any(|e| {
+        matches!(
+            &e.payload,
+            EventPayload::InstructionsDelivered { state } if state == current_state
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2424,6 +2468,131 @@ mod tests {
         ];
         let counts = derive_visit_counts(&events);
         assert!(counts.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // instructions_delivered_this_occupancy
+    // -----------------------------------------------------------------------
+
+    fn transitioned(seq: u64, from: Option<&str>, to: &str) -> Event {
+        make_event(
+            seq,
+            EventPayload::Transitioned {
+                from: from.map(str::to_string),
+                to: to.to_string(),
+                condition_type: "auto".to_string(),
+                skip_if_matched: None,
+            },
+        )
+    }
+
+    fn rewound(seq: u64, from: &str, to: &str) -> Event {
+        make_event(
+            seq,
+            EventPayload::Rewound {
+                from: from.to_string(),
+                to: to.to_string(),
+                rationale: None,
+            },
+        )
+    }
+
+    fn delivered(seq: u64, state: &str) -> Event {
+        make_event(
+            seq,
+            EventPayload::InstructionsDelivered {
+                state: state.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn instructions_delivered_false_when_nothing_was_delivered() {
+        let events = vec![transitioned(1, None, "gather")];
+        assert!(!instructions_delivered_this_occupancy(&events, "gather"));
+    }
+
+    #[test]
+    fn instructions_delivered_true_within_the_current_occupancy() {
+        let events = vec![
+            transitioned(1, None, "gather"),
+            delivered(2, "gather"),
+            make_event(
+                3,
+                EventPayload::EvidenceSubmitted {
+                    state: "gather".to_string(),
+                    fields: HashMap::new(),
+                    submitter_cwd: None,
+                },
+            ),
+        ];
+        assert!(instructions_delivered_this_occupancy(&events, "gather"));
+    }
+
+    #[test]
+    fn instructions_delivered_false_when_the_record_predates_the_entry_event() {
+        // gather -> implement -> gather: the first occupancy's delivery does
+        // not carry over into the second.
+        let events = vec![
+            transitioned(1, None, "gather"),
+            delivered(2, "gather"),
+            transitioned(3, Some("gather"), "implement"),
+            transitioned(4, Some("implement"), "gather"),
+        ];
+        assert!(!instructions_delivered_this_occupancy(&events, "gather"));
+    }
+
+    #[test]
+    fn instructions_delivered_resets_on_arrival_by_rewind() {
+        let events = vec![
+            transitioned(1, None, "gather"),
+            delivered(2, "gather"),
+            transitioned(3, Some("gather"), "implement"),
+            delivered(4, "implement"),
+            rewound(5, "implement", "gather"),
+        ];
+        assert!(!instructions_delivered_this_occupancy(&events, "gather"));
+    }
+
+    #[test]
+    fn instructions_delivered_resets_on_a_self_transition() {
+        // A self-transition ends one occupancy and begins another, so the
+        // delivery recorded before it does not answer for the new one.
+        let events = vec![
+            transitioned(1, None, "review"),
+            delivered(2, "review"),
+            transitioned(3, Some("review"), "review"),
+        ];
+        assert!(!instructions_delivered_this_occupancy(&events, "review"));
+
+        // ...and a delivery after the self-transition does.
+        let mut events = events;
+        events.push(delivered(4, "review"));
+        assert!(instructions_delivered_this_occupancy(&events, "review"));
+    }
+
+    #[test]
+    fn instructions_delivered_ignores_an_intermediate_phases_record() {
+        // A multi-hop advance leaves a delivery for each phase it passed
+        // through. Asking about the phase the workflow now occupies must not
+        // be answered by the record an intermediate phase left behind.
+        let events = vec![
+            transitioned(1, None, "gather"),
+            delivered(2, "gather"),
+            transitioned(3, Some("gather"), "implement"),
+            delivered(4, "implement"),
+            transitioned(5, Some("implement"), "verify"),
+        ];
+        assert!(!instructions_delivered_this_occupancy(&events, "verify"));
+    }
+
+    #[test]
+    fn instructions_delivered_reads_the_whole_log_when_no_entry_event_names_the_state() {
+        // Same fallback as `latest_epoch_gate_failed`: with no entry event for
+        // the state, every event is in scope.
+        let events = vec![delivered(1, "gather")];
+        assert!(instructions_delivered_this_occupancy(&events, "gather"));
+        assert!(!instructions_delivered_this_occupancy(&events, "implement"));
     }
 
     // -----------------------------------------------------------------------
