@@ -265,10 +265,14 @@ occurred.
       run through the natural-advancement path.
 - [ ] A workflow is advanced past a phase and then rewound into it. The next
       response carries that phase's instructions.
-- [ ] Two consecutive directed transitions into the same phase: the first
-      carries the instructions, the second does not.
+- [ ] A directed transition into a phase, followed by a non-advancing `koto next`
+      on that phase: the first carries the instructions, the second does not.
 - [ ] A directed transition into a phase the workflow has never occupied carries
       the instructions.
+- [ ] Two consecutive directed transitions into the same phase — reachable only
+      when the template declares a self-transition, since the directed handler
+      validates the target against the current phase's declared transitions —
+      both carry the instructions, because each begins a new occupancy.
 - [ ] `koto init` followed by a first `koto next` carries the initial phase's
       instructions.
 - [ ] A batch-spawned child's first `koto next` carries its initial phase's
@@ -333,9 +337,12 @@ occurred.
 
 - [ ] No file is added under the session directory beyond those koto writes
       today, and the state-file schema version is unchanged.
-- [ ] A `koto next` call opens no file the pre-change binary did not open for the
-      same workflow and the same call, verified by comparing the two binaries'
-      file-open syscalls under `strace` or an equivalent.
+- [ ] A `koto next` call performs no file *read* the pre-change binary did not
+      perform for the same workflow and the same call, verified by comparing the
+      two binaries' syscalls under `strace` or an equivalent. Writes are excluded
+      from this comparison: R1 may require koto to append a record when it
+      delivers instructions, which is an additional write to a file the call
+      already touches, not a new file and not a new read.
 - [ ] `koto-stability-tests` passes unmodified.
 - [ ] `koto template compile` succeeds against every template shipped under
       `plugins/`, which is what the plugin-validation workflow runs on any pull
