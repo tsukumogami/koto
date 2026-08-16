@@ -35,6 +35,10 @@ const FIXTURE: &str = "tests/fixtures/next-response-baseline/instruction-free.js
 /// argv, so the fixture holds no machine-specific path.
 const TEMPLATE_TOKEN: &str = "<TEMPLATE>";
 const PARENT_TEMPLATE_TOKEN: &str = "<PARENT_TEMPLATE>";
+const GATE_BLOCKED_TEMPLATE_TOKEN: &str = "<GATE_BLOCKED_TEMPLATE>";
+const TERMINAL_TEMPLATE_TOKEN: &str = "<TERMINAL_TEMPLATE>";
+const CONFIRM_TEMPLATE_TOKEN: &str = "<CONFIRM_TEMPLATE>";
+const INTEGRATION_TEMPLATE_TOKEN: &str = "<INTEGRATION_TEMPLATE>";
 
 // ---------------------------------------------------------------------------
 //  Templates -- instruction-free by construction
@@ -134,6 +138,105 @@ Fan the work out.
 All done.
 "#;
 
+/// A gate that can never pass without a `koto context add`, so the tick blocks
+/// deterministically: no shell, no children, no clock. The state declares no
+/// `accepts` and no `gates.*` when-clause, which is what keeps the engine from
+/// falling through to an evidence-required response.
+const GATE_BLOCKED_TEMPLATE: &str = r#"---
+name: baseline-gate-blocked
+version: "1.0"
+initial_state: guarded
+states:
+  guarded:
+    gates:
+      approval:
+        type: context-exists
+        key: approval_note
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## guarded
+
+Wait for the approval note.
+
+## done
+
+All done.
+"#;
+
+const TERMINAL_TEMPLATE: &str = r#"---
+name: baseline-terminal
+version: "1.0"
+initial_state: wrap_up
+states:
+  wrap_up:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## wrap_up
+
+Wrap the work up.
+
+## done
+
+All done.
+"#;
+
+/// `echo ready` rather than anything path-bearing: the command string is
+/// substituted into `action_output.command` verbatim, so an absolute path here
+/// would put the machine into the fixture.
+const CONFIRM_TEMPLATE: &str = r#"---
+name: baseline-confirm
+version: "1.0"
+initial_state: apply
+states:
+  apply:
+    default_action:
+      command: "echo ready"
+      requires_confirmation: true
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## apply
+
+Apply the change.
+
+## done
+
+All done.
+"#;
+
+const INTEGRATION_TEMPLATE: &str = r#"---
+name: baseline-integration
+version: "1.0"
+initial_state: delegate
+states:
+  delegate:
+    integration: code_review
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## delegate
+
+Delegate the review.
+
+## done
+
+All done.
+"#;
+
 const CHILD_TEMPLATE: &str = r#"---
 name: baseline-child
 version: "1.0"
@@ -177,9 +280,12 @@ Skipped.
 const NOTES: &[&str] = &[
     "Baseline of full `koto next` response bodies for a template whose phases declare no instructions (no `<!-- details -->` marker anywhere). Captured from the binary as it stood before any behaviour change in the inline-phase-details feature.",
     "Every sequence runs in its own temporary HOME and KOTO_SESSIONS_BASE, so no session state carries between them and the real session store is never touched.",
-    "`stdout` holds the response bytes verbatim, including the trailing newline the CLI writes. Steps whose stdout is not part of the contract under test (`koto init`, `koto rewind`, and the parent tick that spawns a batch child) are run but not recorded; the response they set up is.",
-    "Every call sequence the plan enumerates -- conditional-transition arrival, unconditional-transition arrival, directed transition, self-transition, rewind, the `--full` override, `koto init` plus the first tick, and a batch child's first tick -- is expressible in the template grammar and is recorded here. Nothing was omitted. The non-advancing repeat is recorded too, on its own, because it is the response the delivery rule will change and the one the `--full` entry is the counterpart of.",
+    "`stdout` holds the response bytes verbatim, including the trailing newline the CLI writes. Steps that only set a sequence up are run but not recorded -- `koto init`, `koto rewind`, and the ticks that get a workflow to the phase whose response is the point.",
+    "One step is unrecorded for a harder reason than that: the parent tick that spawns a batch child. Its body embeds an `unassigned_children` entry carrying a wall-clock `created_at`, so it cannot be compared byte for byte at all. The child's own first tick, which is what the sequence is for, is recorded.",
+    "Every call sequence the plan enumerates -- conditional-transition arrival, unconditional-transition arrival, directed transition, self-transition, rewind, the `--full` override, `koto init` plus the first tick, and a batch child's first tick -- is expressible in the template grammar and is recorded here. Nothing was omitted.",
+    "Beyond those, the fixture records every response shape `koto next` can produce for a phase that declares no instructions: gate-blocked (with its non-advancing repeat, the scenario the feature exists for), terminal, action-requires-confirmation, and integration-unavailable. A later issue splices a discoverability pointer through all of them, and each needs something to be compared against.",
     "The bodies were also confirmed identical between the debug binary this harness runs and a `cargo build --release` binary, so the baseline is a property of the source rather than of the profile.",
+    "Several recorded bodies are identical to each other -- init and rewind arrivals, the conditional and unconditional and self-transition arrivals, the non-advancing repeat and its `--full` counterpart. That is not redundancy to be tidied away. The equality across paths is exactly what a delivery rule applied to one construction site and not the other would break.",
     "One sequence needs comment: two consecutive directed transitions into the same phase are only reachable because `implement` declares itself as a transition target -- the `--to` handler validates the target against the current phase's declared transitions. That is why the template has a self-transition it would not otherwise need.",
 ];
 
@@ -307,6 +413,40 @@ const SEQUENCES: &[Sequence] = &[
         ],
     },
     Sequence {
+        label: "gate-blocked-then-repeat",
+        description: "A phase whose gate fails, then a second `koto next` that evaluates the same failing gate and does not transition. This is the scenario the feature exists for, and the only recorded pair on the `gate_blocked` response shape.",
+        steps: &[
+            setup(&["init", "wf", "--template", GATE_BLOCKED_TEMPLATE_TOKEN]),
+            record(&["next", "wf"]),
+            record(&["next", "wf"]),
+            record(&["next", "wf", "--full"]),
+        ],
+    },
+    Sequence {
+        label: "terminal",
+        description: "The tick that reaches a terminal phase. `done` responses omit instructions regardless of the rule, so this pins the shape that must not acquire them.",
+        steps: &[
+            setup(&["init", "wf", "--template", TERMINAL_TEMPLATE_TOKEN]),
+            record(&["next", "wf"]),
+        ],
+    },
+    Sequence {
+        label: "action-requires-confirmation",
+        description: "A phase whose default action requires confirmation, which is a fourth response shape the pointer of a later issue also passes through.",
+        steps: &[
+            setup(&["init", "wf", "--template", CONFIRM_TEMPLATE_TOKEN]),
+            record(&["next", "wf"]),
+        ],
+    },
+    Sequence {
+        label: "integration-unavailable",
+        description: "A phase declaring an integration, which is unconditionally unavailable in this build.",
+        steps: &[
+            setup(&["init", "wf", "--template", INTEGRATION_TEMPLATE_TOKEN]),
+            record(&["next", "wf"]),
+        ],
+    },
+    Sequence {
         label: "batch-child-first-tick",
         description: "A batch-spawned child's first `koto next`. The parent tick that spawns it is setup; the child's arrival response is the record.",
         steps: &[
@@ -333,11 +473,27 @@ fn capture() -> String {
         // cursor.
         let dir = TempDir::new().unwrap();
         let root = dir.path();
-        let template = root.join("baseline.md");
-        std::fs::write(&template, BASELINE_TEMPLATE).unwrap();
-        let parent = root.join("parent.md");
-        std::fs::write(&parent, PARENT_TEMPLATE).unwrap();
-        // Resolved relative to the parent template's directory.
+        let templates: [(&str, &str, &str); 6] = [
+            (TEMPLATE_TOKEN, "baseline.md", BASELINE_TEMPLATE),
+            (PARENT_TEMPLATE_TOKEN, "parent.md", PARENT_TEMPLATE),
+            (
+                GATE_BLOCKED_TEMPLATE_TOKEN,
+                "gate-blocked.md",
+                GATE_BLOCKED_TEMPLATE,
+            ),
+            (TERMINAL_TEMPLATE_TOKEN, "terminal.md", TERMINAL_TEMPLATE),
+            (CONFIRM_TEMPLATE_TOKEN, "confirm.md", CONFIRM_TEMPLATE),
+            (
+                INTEGRATION_TEMPLATE_TOKEN,
+                "integration.md",
+                INTEGRATION_TEMPLATE,
+            ),
+        ];
+        for (_, filename, body) in templates {
+            std::fs::write(root.join(filename), body).unwrap();
+        }
+        // Not tokenised: the parent template names it by relative path, and it
+        // is resolved against the parent template's own directory.
         std::fs::write(root.join("child.md"), CHILD_TEMPLATE).unwrap();
 
         let mut responses = Vec::new();
@@ -345,11 +501,12 @@ fn capture() -> String {
             let argv: Vec<String> = step
                 .argv
                 .iter()
-                .map(|a| match *a {
-                    TEMPLATE_TOKEN => template.to_str().unwrap().to_string(),
-                    PARENT_TEMPLATE_TOKEN => parent.to_str().unwrap().to_string(),
-                    other => other.to_string(),
-                })
+                .map(
+                    |a| match templates.iter().find(|(token, _, _)| token == a) {
+                        Some((_, filename, _)) => root.join(filename).to_str().unwrap().to_string(),
+                        None => a.to_string(),
+                    },
+                )
                 .collect();
 
             let output = koto_cmd(root).args(&argv).output().unwrap();
@@ -449,6 +606,10 @@ fn baseline_fixture_covers_every_required_sequence_and_stays_instruction_free() 
         "self-transition-arrival",
         "directed-transition",
         "rewind-arrival",
+        "gate-blocked-then-repeat",
+        "terminal",
+        "action-requires-confirmation",
+        "integration-unavailable",
         "batch-child-first-tick",
     ] {
         assert!(
@@ -456,6 +617,39 @@ fn baseline_fixture_covers_every_required_sequence_and_stays_instruction_free() 
             "baseline fixture is missing the `{required}` sequence"
         );
     }
+
+    // Every response shape `koto next` can produce for an instruction-free
+    // phase must have a baseline, or a later issue's pointer splice lands on a
+    // shape with nothing to be compared against.
+    let mut actions: Vec<&str> = sequences
+        .iter()
+        .flat_map(|s| s["responses"].as_array().unwrap())
+        .map(|r| {
+            let body: serde_json::Value =
+                serde_json::from_str(r["stdout"].as_str().unwrap().trim()).unwrap();
+            match body["action"].as_str().unwrap() {
+                "evidence_required" => "evidence_required",
+                "gate_blocked" => "gate_blocked",
+                "done" => "done",
+                "confirm" => "confirm",
+                "integration_unavailable" => "integration_unavailable",
+                other => panic!("unrecognised action `{other}` in the fixture"),
+            }
+        })
+        .collect();
+    actions.sort_unstable();
+    actions.dedup();
+    assert_eq!(
+        actions,
+        vec![
+            "confirm",
+            "done",
+            "evidence_required",
+            "gate_blocked",
+            "integration_unavailable",
+        ],
+        "the baseline no longer covers every response shape"
+    );
 
     let mut recorded = 0;
     for seq in sequences {

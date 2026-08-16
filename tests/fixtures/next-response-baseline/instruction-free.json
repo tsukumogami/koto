@@ -2,9 +2,12 @@
   "notes": [
     "Baseline of full `koto next` response bodies for a template whose phases declare no instructions (no `<!-- details -->` marker anywhere). Captured from the binary as it stood before any behaviour change in the inline-phase-details feature.",
     "Every sequence runs in its own temporary HOME and KOTO_SESSIONS_BASE, so no session state carries between them and the real session store is never touched.",
-    "`stdout` holds the response bytes verbatim, including the trailing newline the CLI writes. Steps whose stdout is not part of the contract under test (`koto init`, `koto rewind`, and the parent tick that spawns a batch child) are run but not recorded; the response they set up is.",
-    "Every call sequence the plan enumerates -- conditional-transition arrival, unconditional-transition arrival, directed transition, self-transition, rewind, the `--full` override, `koto init` plus the first tick, and a batch child's first tick -- is expressible in the template grammar and is recorded here. Nothing was omitted. The non-advancing repeat is recorded too, on its own, because it is the response the delivery rule will change and the one the `--full` entry is the counterpart of.",
+    "`stdout` holds the response bytes verbatim, including the trailing newline the CLI writes. Steps that only set a sequence up are run but not recorded -- `koto init`, `koto rewind`, and the ticks that get a workflow to the phase whose response is the point.",
+    "One step is unrecorded for a harder reason than that: the parent tick that spawns a batch child. Its body embeds an `unassigned_children` entry carrying a wall-clock `created_at`, so it cannot be compared byte for byte at all. The child's own first tick, which is what the sequence is for, is recorded.",
+    "Every call sequence the plan enumerates -- conditional-transition arrival, unconditional-transition arrival, directed transition, self-transition, rewind, the `--full` override, `koto init` plus the first tick, and a batch child's first tick -- is expressible in the template grammar and is recorded here. Nothing was omitted.",
+    "Beyond those, the fixture records every response shape `koto next` can produce for a phase that declares no instructions: gate-blocked (with its non-advancing repeat, the scenario the feature exists for), terminal, action-requires-confirmation, and integration-unavailable. A later issue splices a discoverability pointer through all of them, and each needs something to be compared against.",
     "The bodies were also confirmed identical between the debug binary this harness runs and a `cargo build --release` binary, so the baseline is a property of the source rather than of the profile.",
+    "Several recorded bodies are identical to each other -- init and rewind arrivals, the conditional and unconditional and self-transition arrivals, the non-advancing repeat and its `--full` counterpart. That is not redundancy to be tidied away. The equality across paths is exactly what a delivery rule applied to one construction site and not the other would break.",
     "One sequence needs comment: two consecutive directed transitions into the same phase are only reachable because `implement` declares itself as a transition target -- the `--to` handler validates the target against the current phase's declared transitions. That is why the template has a self-transition it would not otherwise need."
   ],
   "sequences": [
@@ -127,6 +130,73 @@
             "wf"
           ],
           "stdout": "{\"action\":\"evidence_required\",\"advanced\":false,\"blocking_conditions\":[],\"directive\":\"Collect the inputs.\",\"error\":null,\"expects\":{\"event_type\":\"evidence_submitted\",\"fields\":{\"route\":{\"required\":true,\"type\":\"enum\",\"values\":[\"direct\",\"indirect\"]}},\"options\":[{\"target\":\"implement\",\"when\":{\"route\":\"direct\"}},{\"target\":\"relay\",\"when\":{\"route\":\"indirect\"}}]},\"state\":\"gather\",\"unassigned_children\":[]}\n"
+        }
+      ]
+    },
+    {
+      "description": "A phase whose gate fails, then a second `koto next` that evaluates the same failing gate and does not transition. This is the scenario the feature exists for, and the only recorded pair on the `gate_blocked` response shape.",
+      "label": "gate-blocked-then-repeat",
+      "responses": [
+        {
+          "argv": [
+            "next",
+            "wf"
+          ],
+          "stdout": "{\"action\":\"gate_blocked\",\"advanced\":false,\"blocking_conditions\":[{\"agent_actionable\":true,\"category\":\"corrective\",\"name\":\"approval\",\"output\":{\"error\":\"\",\"exists\":false},\"status\":\"failed\",\"type\":\"context-exists\"}],\"directive\":\"Wait for the approval note.\",\"error\":null,\"expects\":null,\"state\":\"guarded\",\"unassigned_children\":[]}\n"
+        },
+        {
+          "argv": [
+            "next",
+            "wf"
+          ],
+          "stdout": "{\"action\":\"gate_blocked\",\"advanced\":false,\"blocking_conditions\":[{\"agent_actionable\":true,\"category\":\"corrective\",\"name\":\"approval\",\"output\":{\"error\":\"\",\"exists\":false},\"status\":\"failed\",\"type\":\"context-exists\"}],\"directive\":\"Wait for the approval note.\",\"error\":null,\"expects\":null,\"state\":\"guarded\",\"unassigned_children\":[]}\n"
+        },
+        {
+          "argv": [
+            "next",
+            "wf",
+            "--full"
+          ],
+          "stdout": "{\"action\":\"gate_blocked\",\"advanced\":false,\"blocking_conditions\":[{\"agent_actionable\":true,\"category\":\"corrective\",\"name\":\"approval\",\"output\":{\"error\":\"\",\"exists\":false},\"status\":\"failed\",\"type\":\"context-exists\"}],\"directive\":\"Wait for the approval note.\",\"error\":null,\"expects\":null,\"state\":\"guarded\",\"unassigned_children\":[]}\n"
+        }
+      ]
+    },
+    {
+      "description": "The tick that reaches a terminal phase. `done` responses omit instructions regardless of the rule, so this pins the shape that must not acquire them.",
+      "label": "terminal",
+      "responses": [
+        {
+          "argv": [
+            "next",
+            "wf"
+          ],
+          "stdout": "{\"action\":\"done\",\"advanced\":true,\"error\":null,\"expects\":null,\"state\":\"done\",\"unassigned_children\":[]}\n"
+        }
+      ]
+    },
+    {
+      "description": "A phase whose default action requires confirmation, which is a fourth response shape the pointer of a later issue also passes through.",
+      "label": "action-requires-confirmation",
+      "responses": [
+        {
+          "argv": [
+            "next",
+            "wf"
+          ],
+          "stdout": "{\"action\":\"confirm\",\"action_output\":{\"command\":\"echo ready\",\"exit_code\":0,\"stderr\":\"\",\"stdout\":\"ready\\n\"},\"advanced\":false,\"directive\":\"Apply the change.\",\"error\":null,\"expects\":null,\"state\":\"apply\",\"unassigned_children\":[]}\n"
+        }
+      ]
+    },
+    {
+      "description": "A phase declaring an integration, which is unconditionally unavailable in this build.",
+      "label": "integration-unavailable",
+      "responses": [
+        {
+          "argv": [
+            "next",
+            "wf"
+          ],
+          "stdout": "{\"action\":\"integration_unavailable\",\"advanced\":false,\"directive\":\"Delegate the review.\",\"error\":null,\"expects\":null,\"integration\":{\"available\":false,\"name\":\"code_review\"},\"state\":\"delegate\",\"unassigned_children\":[]}\n"
         }
       ]
     },

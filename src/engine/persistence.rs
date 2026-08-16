@@ -994,18 +994,24 @@ pub fn derive_visit_counts(events: &[Event]) -> HashMap<String, usize> {
     counts
 }
 
-/// Whether the most recent gate evaluation in `current_state`'s current epoch
-/// did not pass -- the epoch-scoped half of the dashboard's blocked
-/// classification.
+/// The events since the workflow last entered `current_state` -- the phase's
+/// current occupancy.
 ///
-/// The epoch is the slice of events after the last transition/directed/rewind
-/// into `current_state`; within it, the latest `GateEvaluated` decides. Returns
-/// `false` when the current epoch has no gate evaluation. Callers combine this
-/// with a non-terminal check to get "blocked": the dashboard read seam
-/// (`read_session`) and the `/workflows` projection writer both call this so
-/// they classify a blocked session identically (no drift).
-pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
-    let epoch_start = events.iter().enumerate().rev().find_map(|(idx, e)| {
+/// An occupancy begins when a state-entry event names the phase as its target
+/// and ends when the next state-entry event names any phase, including the same
+/// one. So a self-transition ends one occupancy and begins another, and so does
+/// a rewind into the phase: both append an entry event naming it. State-entry
+/// events are `Transitioned`, `DirectedTransition`, and `Rewound`.
+///
+/// With no entry event naming the phase, every event is in scope. The only
+/// phase that can be in that position is the initial one, which the workflow
+/// occupies before it has transitioned anywhere.
+///
+/// Shared rather than copied so the predicates built on it -- the epoch-scoped
+/// gate classification and the delivery check -- cannot come to disagree about
+/// where an occupancy starts.
+fn occupancy_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
+    let start = events.iter().enumerate().rev().find_map(|(idx, e)| {
         let to = match &e.payload {
             EventPayload::Transitioned { to, .. } => Some(to.as_str()),
             EventPayload::DirectedTransition { to, .. } => Some(to.as_str()),
@@ -1018,11 +1024,24 @@ pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
             None
         }
     });
-    let epoch_events: &[Event] = match epoch_start {
+    match start {
         Some(idx) => &events[idx + 1..],
         None => events,
-    };
-    epoch_events
+    }
+}
+
+/// Whether the most recent gate evaluation in `current_state`'s current epoch
+/// did not pass -- the epoch-scoped half of the dashboard's blocked
+/// classification.
+///
+/// The epoch is the slice of events after the last transition/directed/rewind
+/// into `current_state`; within it, the latest `GateEvaluated` decides. Returns
+/// `false` when the current epoch has no gate evaluation. Callers combine this
+/// with a non-terminal check to get "blocked": the dashboard read seam
+/// (`read_session`) and the `/workflows` projection writer both call this so
+/// they classify a blocked session identically (no drift).
+pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
+    occupancy_slice(events, current_state)
         .iter()
         .rev()
         .find_map(|e| {
@@ -1038,40 +1057,23 @@ pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
 /// Whether `current_state`'s instructions have already been delivered to a
 /// caller during the phase's current occupancy.
 ///
-/// An occupancy begins when a state-entry event names the phase as its target
-/// and ends when the next state-entry event names any phase, including the same
-/// one -- so a self-transition ends one occupancy and begins another, and a
-/// rewind into the phase begins a fresh one. State-entry events are
-/// `Transitioned`, `DirectedTransition`, and `Rewound`; the slice they define is
-/// the same one [`latest_epoch_gate_failed`] reads, and the two share the idiom
-/// so the two predicates cannot drift on what "this occupancy" means.
+/// The occupancy is [`occupancy_slice`]'s, so self-transition, rewind, and
+/// arrival at the initial state all fall out of one definition shared with
+/// [`latest_epoch_gate_failed`].
 ///
 /// The record is matched on the phase it names as well as on its position in
-/// the slice. The two are not redundant: a multi-hop advance leaves deliveries
-/// for the phases it passed through, and an intermediate phase's record must
-/// not read as the phase the workflow now occupies.
+/// the slice, and the name check carries real weight in one case: when no entry
+/// event names the phase, the slice is the whole log, and without the name
+/// check any delivery anywhere in it would answer for the phase being asked
+/// about. It is also the safe direction to err in. A record naming the wrong
+/// phase reads as "not delivered" and koto delivers again, which is the same
+/// direction the design already accepts for a crash between printing a response
+/// and appending its record.
 ///
 /// Takes a plain event slice and touches no backend, so a caller that has the
 /// events in memory does not pay a read to ask.
 pub fn instructions_delivered_this_occupancy(events: &[Event], current_state: &str) -> bool {
-    let occupancy_start = events.iter().enumerate().rev().find_map(|(idx, e)| {
-        let to = match &e.payload {
-            EventPayload::Transitioned { to, .. } => Some(to.as_str()),
-            EventPayload::DirectedTransition { to, .. } => Some(to.as_str()),
-            EventPayload::Rewound { to, .. } => Some(to.as_str()),
-            _ => None,
-        };
-        if to == Some(current_state) {
-            Some(idx)
-        } else {
-            None
-        }
-    });
-    let occupancy_events: &[Event] = match occupancy_start {
-        Some(idx) => &events[idx + 1..],
-        None => events,
-    };
-    occupancy_events.iter().any(|e| {
+    occupancy_slice(events, current_state).iter().any(|e| {
         matches!(
             &e.payload,
             EventPayload::InstructionsDelivered { state } if state == current_state
@@ -2497,6 +2499,17 @@ mod tests {
         )
     }
 
+    fn directed(seq: u64, from: &str, to: &str) -> Event {
+        make_event(
+            seq,
+            EventPayload::DirectedTransition {
+                from: from.to_string(),
+                to: to.to_string(),
+                rationale: None,
+            },
+        )
+    }
+
     fn delivered(seq: u64, state: &str) -> Event {
         make_event(
             seq,
@@ -2584,6 +2597,31 @@ mod tests {
             transitioned(5, Some("implement"), "verify"),
         ];
         assert!(!instructions_delivered_this_occupancy(&events, "verify"));
+
+        // The slicing alone carries the case above, because the entry into
+        // `verify` is the last event. Put an intermediate phase's record
+        // *inside* the current occupancy and the name check is the only thing
+        // left holding the answer.
+        let mut events = events;
+        events.push(delivered(6, "implement"));
+        assert!(!instructions_delivered_this_occupancy(&events, "verify"));
+    }
+
+    #[test]
+    fn instructions_delivered_resets_on_arrival_by_directed_transition() {
+        // `DirectedTransition` is the third state-entry kind, and the one the
+        // `--to` handler appends. Two consecutive directed transitions into the
+        // same phase are two occupancies, exactly as two self-transitions are.
+        let events = vec![
+            transitioned(1, None, "gather"),
+            directed(2, "gather", "implement"),
+            delivered(3, "implement"),
+        ];
+        assert!(instructions_delivered_this_occupancy(&events, "implement"));
+
+        let mut events = events;
+        events.push(directed(4, "implement", "implement"));
+        assert!(!instructions_delivered_this_occupancy(&events, "implement"));
     }
 
     #[test]

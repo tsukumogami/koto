@@ -537,24 +537,6 @@ pub enum EventPayload {
         /// The context key that was removed.
         key: String,
     },
-    /// Emitted when a response carried a phase's instructions to a caller.
-    ///
-    /// Records only the phase the delivery applies to. Whether the caller has
-    /// already been given a phase's instructions cannot be derived from the
-    /// events that already exist: a non-advancing tick on an `accepts`-only
-    /// phase appends nothing at all, so two sessions differing only in whether
-    /// instructions were delivered would produce byte-identical logs. See
-    /// DESIGN-inline-phase-details.md Decision 1.
-    ///
-    /// The phase is named rather than left implicit so a reader can tell a
-    /// delivery belonging to an intermediate phase of a multi-hop advance from
-    /// one belonging to the phase the workflow now occupies. Additive per
-    /// `docs/STABILITY.md`, so it does not move `CURRENT_SCHEMA_VERSION` -- an
-    /// older build lands it in `Unknown` and reads the rest of the log unharmed.
-    InstructionsDelivered {
-        /// The phase whose instructions the response carried.
-        state: String,
-    },
     WorkflowCancelled {
         state: String,
         reason: String,
@@ -795,6 +777,33 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         issued_by: Option<String>,
     },
+    /// Emitted when a response carried a phase's instructions to a caller.
+    ///
+    /// Records only the phase the delivery applies to. Whether the caller has
+    /// already been given a phase's instructions cannot be derived from the
+    /// events that already exist: a non-advancing tick on an `accepts`-only
+    /// phase appends nothing at all, so two sessions differing only in whether
+    /// instructions were delivered would produce byte-identical logs. See
+    /// DESIGN-inline-phase-details.md Decision 1.
+    ///
+    /// The phase is named rather than left implicit so a reader can tell a
+    /// delivery belonging to an intermediate phase of a multi-hop advance from
+    /// one belonging to the phase the workflow now occupies. Additive per
+    /// `docs/STABILITY.md`, so it does not move `CURRENT_SCHEMA_VERSION` -- an
+    /// older build lands it in `Unknown` and reads the rest of the log unharmed.
+    ///
+    /// Declared last among the real variants on purpose. The enum is
+    /// `#[serde(untagged)]`, and untagged struct variants ignore fields they do
+    /// not declare, so a variant requiring only `state` matches any payload
+    /// carrying a `state` -- including `WorkflowCancelled`'s and
+    /// `DecisionRecorded`'s. Production reads never see that, because they
+    /// dispatch on `Event`'s `type` string rather than through the derived
+    /// impl, but keeping this variant behind the more specific ones costs
+    /// nothing and removes the trap for anyone who does reach for it.
+    InstructionsDelivered {
+        /// The phase whose instructions the response carried.
+        state: String,
+    },
     /// Catch-all for event type strings not recognized by this koto version.
     ///
     /// Enables graceful degradation when reading logs produced by a newer
@@ -1007,7 +1016,6 @@ impl EventPayload {
             EventPayload::Rewound { .. } => "rewound",
             EventPayload::ContextAdded { .. } => "context_added",
             EventPayload::ContextRemoved { .. } => "context_removed",
-            EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
             EventPayload::WorkflowCancelled { .. } => "workflow_cancelled",
             EventPayload::DefaultActionExecuted { .. } => "default_action_executed",
             EventPayload::DecisionRecorded { .. } => "decision_recorded",
@@ -1024,6 +1032,7 @@ impl EventPayload {
             EventPayload::RequestLegResult { .. } => "request.leg_result",
             EventPayload::RequestLegAbandoned { .. } => "request.leg_abandoned",
             EventPayload::RequestClosed { .. } => "request.closed",
+            EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
             EventPayload::Unknown { .. } => "unknown",
         }
     }
@@ -1195,11 +1204,6 @@ impl<'de> Deserialize<'de> for Event {
                     .map_err(serde::de::Error::custom)?;
                 EventPayload::ContextRemoved { key: p.key }
             }
-            "instructions_delivered" => {
-                let p: InstructionsDeliveredPayload = serde_json::from_value(payload_val.clone())
-                    .map_err(serde::de::Error::custom)?;
-                EventPayload::InstructionsDelivered { state: p.state }
-            }
             "workflow_cancelled" => {
                 let p: WorkflowCancelledPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
@@ -1351,6 +1355,11 @@ impl<'de> Deserialize<'de> for Event {
                     disposition: p.disposition,
                     issued_by: p.issued_by,
                 }
+            }
+            "instructions_delivered" => {
+                let p: InstructionsDeliveredPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::InstructionsDelivered { state: p.state }
             }
             other => EventPayload::Unknown {
                 type_name: other.to_string(),

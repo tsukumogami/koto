@@ -184,6 +184,13 @@ events:
         type: string
         required: true
 
+  instructions_delivered:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+
   default_action_executed:
     tier: 2
     fields:
@@ -667,6 +674,38 @@ do".
 No `hash` or `size`: there is no content left to describe, and carrying the
 departed artifact's digest would invite a reader to treat the feed as a way to
 recover it.
+
+---
+
+#### `instructions_delivered`
+
+Records that a `koto next` response carried a phase's instructions to whoever
+called it. A phase's occupancy runs from the state-entry event naming it to the
+next state-entry event naming any phase; a delivery recorded inside that window
+is why a later non-advancing response for the same phase leaves the
+instructions out.
+
+Nothing else in the feed can stand in for it. A non-advancing tick on a phase
+that is only waiting for evidence appends nothing at all, so two sessions
+differing only in whether the instructions went out produce identical feeds.
+
+```json
+{
+  "type": "instructions_delivered",
+  "payload": {
+    "state": "implement"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `state` | string | Yes | The phase whose instructions the response carried. |
+
+The phase is named rather than left implicit because a tick can advance through
+several phases at once, and a reader has to be able to tell a record left by a
+phase the workflow passed through from one belonging to the phase it now
+occupies.
 
 ---
 
