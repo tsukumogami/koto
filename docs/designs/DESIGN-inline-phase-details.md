@@ -330,7 +330,24 @@ than by a new guarantee.
 The pointer's presence condition is "this phase declares instructions", not
 "instructions are in this response". Those differ on exactly the responses where
 the rule suppressed the instructions, which are the responses a recovering agent
-most needs the pointer on. D4 must not reuse D1's predicate for this.
+most needs the pointer on. The pointer must not reuse the delivery predicate for
+this.
+
+### Splice ordering when both notices apply
+
+`directive` already carries one koto-authored splice: the leg-abandonment stop
+notice. Both it and the recovery pointer can apply to the same response — an
+abandoned leg on a phase that declares instructions — so their order has to be
+stated rather than discovered.
+
+**The recovery pointer is spliced first, the abandonment notice second, so the
+abandonment notice ends up closest to the front of `directive`.** The reason is
+that the two say different kinds of thing. The abandonment notice tells an agent
+to stop; the pointer tells it where to look something up. Burying a stop
+instruction underneath routine navigational text would defeat the notice, and the
+notice exists precisely because the agent must act on it before anything else.
+Ordering them the other way costs nothing when only one applies and protects the
+more urgent one when both do.
 
 ## Implementation Approach
 
@@ -358,10 +375,13 @@ the retrieval's exact invocation to name, so it follows phase 3. The skill,
 guide, Cursor-rule and eval updates that PRD R20 through R25 require land with
 it.
 
-Phases 1 and 2 cannot be separated across pull requests without leaving the
-directed path and the natural path disagreeing, which is the defect R4 exists to
-close. Phases 3 and 4 could be separated, but phase 4 without phase 3 points at
-nothing.
+The coupling that matters is inside phase 2, not between phases 1 and 2. Phase 1
+is inert by construction — it adds a variant and a predicate that nothing calls —
+so it can land on its own. But phase 2's two halves, wiring the natural path and
+wiring the directed path, must land together: shipping one without the other
+leaves the two paths disagreeing, which is the defect R4 exists to close, and
+would replace one inconsistency with a different one. Phases 3 and 4 could be
+separated, but phase 4 without phase 3 points at nothing.
 
 ## Security Considerations
 
