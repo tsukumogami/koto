@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Accepted
+status: Done
 problem: |
   koto decides whether to send a phase's long-form instructions by counting
   entries into a state rather than deliveries of its instructions, so it
@@ -26,7 +26,7 @@ motivating_context: |
 
 ## Status
 
-Accepted
+Done
 
 Authored under `/scope`'s chain for koto#90. The framing here stops at the
 problem, the outcome, the journeys, and the boundary; the downstream PRD owns

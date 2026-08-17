@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 problem: |
   koto decides whether a phase's long-form instructions ride in a `koto next`
   response by counting entries into a state rather than deliveries of that
@@ -34,7 +34,7 @@ motivating_context: |
 
 ## Status
 
-In Progress
+Done
 
 Authored under `/scope`'s tactical chain from `BRIEF-inline-phase-details`. The
 requirements here are deliberately silent on where the read-only retrieval lives
