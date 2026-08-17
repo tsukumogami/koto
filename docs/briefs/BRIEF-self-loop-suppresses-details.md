@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Accepted
+status: Done
 problem: |
   koto sends a phase's long-form instructions once per occupancy, and it counts
   a phase transitioning to itself as ending one occupancy and beginning another.
@@ -25,7 +25,7 @@ motivating_context: |
 
 ## Status
 
-Accepted
+Done
 
 Authored under `/scope`'s chain for koto#90. The framing stops at the problem,
 the outcome, the journeys, and the boundary. Which arrivals deliver is settled

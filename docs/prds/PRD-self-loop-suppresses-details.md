@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 upstream: docs/briefs/BRIEF-self-loop-suppresses-details.md
 source_issue: 90
 problem: |
@@ -30,7 +30,7 @@ motivating_context: |
 
 ## Status
 
-In Progress
+Done
 
 ## Problem Statement
 
