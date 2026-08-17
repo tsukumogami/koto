@@ -1042,7 +1042,7 @@ fn both_the_pointer_and_the_notice_apply_the_notice_ends_up_closest_to_the_front
     );
     let notice_pos = directive.find("NOTICE FROM KOTO").unwrap();
     let pointer_pos = directive
-        .find("[koto] Lost context?")
+        .find(koto::cli::next_types::RECOVERY_POINTER)
         .unwrap_or_else(|| panic!("the recovery pointer must also be present: {directive}"));
     assert!(
         notice_pos < pointer_pos,
@@ -1065,7 +1065,7 @@ fn the_pointer_appears_on_a_plain_response_for_a_phase_that_declares_instruction
     let envelope = run_ok(tmp.path(), &["next", "child-1"]);
     let directive = envelope["directive"].as_str().expect("a directive");
     assert!(
-        directive.starts_with("[koto] Lost context?"),
+        directive.starts_with(koto::cli::next_types::RECOVERY_POINTER),
         "the pointer precedes the phase's own directive when nothing else splices in: \
          {directive}"
     );
@@ -1083,7 +1083,7 @@ fn the_pointer_appears_on_a_plain_response_for_a_phase_that_declares_instruction
         repeat["directive"]
             .as_str()
             .unwrap()
-            .starts_with("[koto] Lost context?"),
+            .starts_with(koto::cli::next_types::RECOVERY_POINTER),
         "the pointer still appears on the suppressed response: {repeat}"
     );
 }
