@@ -494,9 +494,11 @@ fn status_appends_nothing_and_leaves_the_next_delivery_decision_unaffected() {
     let root = dir.path();
     init_workflow_with_vars(root, "wf", PHASES_TEMPLATE, &["ORG=acme"]);
 
-    // First occupancy of `implement`: carries details.
-    run_koto(root, &["next", "wf", "--with-data", r#"{"route":"go"}"#]);
-    let first_implement = run_koto(root, &["next", "wf", "--to", "implement"]);
+    // Arrival at `implement` from `gather`: carries details. The arrival is the
+    // `route: go` tick itself. An earlier version of this setup followed it with
+    // a `--to implement` issued while already standing there, which is now a lap
+    // rather than an arrival and suppresses.
+    let first_implement = run_koto(root, &["next", "wf", "--with-data", r#"{"route":"go"}"#]);
     assert!(
         first_implement.get("details").is_some(),
         "first arrival at implement should carry details: {first_implement}"
@@ -523,6 +525,54 @@ fn status_appends_nothing_and_leaves_the_next_delivery_decision_unaffected() {
     assert!(
         repeat.get("details").is_none(),
         "an intervening retrieval must not change what the next `koto next` returns: {repeat}"
+    );
+}
+
+/// The retrieval is what makes suppressing on a self-loop safe: once a loop
+/// suppresses, no lap brings the procedure back, so `koto status` is the only
+/// route to it that does not move the workflow. This is the case that matters
+/// and the one the delivery rule created.
+#[test]
+fn status_returns_details_after_a_self_transition_suppressed_them() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    init_workflow_with_vars(root, "wf", PHASES_TEMPLATE, &["ORG=acme"]);
+
+    let arrival = run_koto(root, &["next", "wf", "--with-data", r#"{"route":"go"}"#]);
+    assert!(
+        arrival.get("details").is_some(),
+        "arrival at implement should carry details: {arrival}"
+    );
+
+    let lap = run_koto(
+        root,
+        &["next", "wf", "--with-data", r#"{"loop_again":"yes"}"#],
+    );
+    assert_eq!(lap["state"].as_str(), Some("implement"));
+    assert!(
+        lap.get("details").is_none(),
+        "a self-transition is a lap, not an arrival, and must suppress: {lap}"
+    );
+
+    let before = std::fs::read(session_state_path(root, "wf")).unwrap();
+
+    let status = run_koto(root, &["status", "wf"]);
+    assert!(
+        status.get("details").is_some(),
+        "the retrieval must return the procedure a lap withheld: {status}"
+    );
+
+    let after = std::fs::read(session_state_path(root, "wf")).unwrap();
+    assert_eq!(
+        before, after,
+        "the session state file must be byte-identical before and after a retrieval"
+    );
+
+    // And the retrieval changed nothing about the next tick.
+    let repeat = run_koto(root, &["next", "wf"]);
+    assert!(
+        repeat.get("details").is_none(),
+        "the tick after a retrieval must still suppress: {repeat}"
     );
 }
 

@@ -266,7 +266,7 @@ const NOTES: &[&str] = &[
     "Every call sequence the plan enumerates -- conditional-transition arrival, unconditional-transition arrival, directed transition, self-transition, rewind, the `--full` override, `koto init` plus the first tick, and a batch child's first tick -- is expressible in the template grammar and is recorded here. Nothing was omitted.",
     "Beyond those, the fixture records every response shape `koto next` can produce for a phase that declares no instructions: gate-blocked (with its non-advancing repeat, the scenario the feature exists for), terminal, action-requires-confirmation, and integration-unavailable. A later issue splices a discoverability pointer through all of them, and each needs something to be compared against.",
     "The bodies were also confirmed identical between the debug binary this harness runs and a `cargo build --release` binary, so the baseline is a property of the source rather than of the profile.",
-    "Several recorded bodies are identical to each other -- init and rewind arrivals, the conditional and unconditional and self-transition arrivals, the non-advancing repeat and its `--full` counterpart. That is not redundancy to be tidied away. The equality across paths is exactly what a delivery rule applied to one construction site and not the other would break.",
+    "Several recorded bodies are identical to each other -- init and rewind arrivals, the conditional and unconditional arrivals and the self-transition, the non-advancing repeat and its `--full` counterpart. That is not redundancy to be tidied away. The equality across paths is exactly what a delivery rule applied to one construction site and not the other would break.",
 ];
 
 // ---------------------------------------------------------------------------
@@ -359,7 +359,7 @@ const SEQUENCES: &[Sequence] = &[
     },
     Sequence {
         label: "self-transition-arrival",
-        description: "`implement` transitions to itself, ending one occupancy and beginning another.",
+        description: "`implement` transitions to itself, so the tick begins and ends in the same state.",
         steps: &[
             setup(&["init", "wf", "--template", TEMPLATE_TOKEN]),
             setup(&["next", "wf"]),

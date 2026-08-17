@@ -68,6 +68,22 @@ fn assert_omits(resp: &serde_json::Value, context: &str) {
     );
 }
 
+/// The recovery pointer is gated on the *phase* declaring instructions, not on
+/// this response carrying them, so it must survive suppression. It is the only
+/// route back to a procedure lost inside a loop, which is what makes suppressing
+/// there safe.
+fn assert_pointer(resp: &serde_json::Value, context: &str) {
+    let directive = resp
+        .get("directive")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        directive.starts_with("[koto] Lost context?"),
+        "{context}: a suppressed response must still name the retrieval, got directive {:?}",
+        directive
+    );
+}
+
 // ---------------------------------------------------------------------------
 //  Templates
 // ---------------------------------------------------------------------------
@@ -250,10 +266,87 @@ All done.
 Skipped.
 "#;
 
+/// `implement` declares instructions and routes through `bounce`, whose sole
+/// transition is unconditional, so a single tick can leave `implement`, pass
+/// through another phase, and arrive back at `implement`. That round trip is the
+/// case a paraphrase of the delivery rule most often gets wrong: the tick begins
+/// and ends in the same phase and is nonetheless a genuine arrival, because the
+/// entry event that lands it records a different source.
+///
+/// `DELIVERY_TEMPLATE` cannot express it -- `implement`'s only non-self targets
+/// are `gather`, which has required `accepts` and stops the chain, and the
+/// terminal `done`.
+const ROUND_TRIP_TEMPLATE: &str = r#"---
+name: round-trip
+version: "1.0"
+initial_state: gather
+states:
+  gather:
+    accepts:
+      route:
+        type: enum
+        required: true
+        values: [direct]
+    transitions:
+      - target: implement
+        when:
+          route: direct
+  implement:
+    accepts:
+      loop_again:
+        type: enum
+        required: true
+        values: [hop, no]
+    transitions:
+      - target: bounce
+        when:
+          loop_again: hop
+      - target: done
+        when:
+          loop_again: no
+  bounce:
+    transitions:
+      - target: implement
+  done:
+    terminal: true
+---
+
+## gather
+
+Collect the inputs.
+
+<!-- details -->
+
+Gather instructions.
+
+## implement
+
+Make the change.
+
+<!-- details -->
+
+Implement instructions.
+
+## bounce
+
+Pass straight through.
+
+## done
+
+All done.
+"#;
+
 /// Write `DELIVERY_TEMPLATE` into `dir` and return its path.
 fn write_delivery_template(dir: &Path) -> PathBuf {
     let path = dir.join("delivery.md");
     std::fs::write(&path, DELIVERY_TEMPLATE).unwrap();
+    path
+}
+
+/// Write `ROUND_TRIP_TEMPLATE` into `dir` and return its path.
+fn write_round_trip_template(dir: &Path) -> PathBuf {
+    let path = dir.join("round-trip.md");
+    std::fs::write(&path, ROUND_TRIP_TEMPLATE).unwrap();
     path
 }
 
@@ -356,7 +449,7 @@ fn unconditional_transition_arrival_carries_details_separately_from_conditional(
 }
 
 #[test]
-fn self_transition_arrival_carries_details_again() {
+fn self_transition_omits_details_and_keeps_the_pointer() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     let template = write_delivery_template(root);
@@ -370,14 +463,26 @@ fn self_transition_arrival_carries_details_again() {
         .args(["next", "wf", "--with-data", r#"{"route":"direct"}"#])
         .assert()
         .success();
-    // First occupancy of `implement` has already delivered. A self-transition
-    // starts a fresh occupancy, so delivery happens again.
-    let resp = run_koto(
+    // The arrival at `implement` already delivered. A self-transition is a lap
+    // around a loop the agent is already in rather than an arrival, so it opens
+    // no delivery window and the instructions are not re-sent.
+    let first = run_koto(
         root,
         &["next", "wf", "--with-data", r#"{"loop_again":"yes"}"#],
     );
-    assert_eq!(resp["state"], "implement");
-    assert_carries(&resp, "Implement instructions.", "self-transition arrival");
+    assert_eq!(first["state"], "implement");
+    assert_eq!(first["advanced"], true);
+    assert_omits(&first, "self-transition");
+    assert_pointer(&first, "self-transition");
+
+    // ...and it stays omitted however many laps follow.
+    let second = run_koto(
+        root,
+        &["next", "wf", "--with-data", r#"{"loop_again":"yes"}"#],
+    );
+    assert_eq!(second["state"], "implement");
+    assert_eq!(second["advanced"], true);
+    assert_omits(&second, "second consecutive self-transition");
 }
 
 #[test]
@@ -396,9 +501,10 @@ fn loop_back_arrival_at_previously_occupied_phase_carries_details_again() {
         .assert()
         .success();
     // `gather` was already occupied (and delivered) at the start of this
-    // sequence. Looping back into it via `implement` starts a fresh
-    // occupancy, so delivery happens again -- this is the case a
-    // visit-count predicate gets backwards.
+    // sequence. Looping back into it from `implement` is an arrival from a
+    // different phase, so it opens a fresh delivery window and delivery happens
+    // again -- this is the case a visit-count predicate gets backwards, and the
+    // one a rule keyed on "did the state change" would get backwards too.
     let resp = run_koto(
         root,
         &["next", "wf", "--with-data", r#"{"loop_again":"redo"}"#],
@@ -447,8 +553,8 @@ fn gate_blocked_first_tick_carries_and_repeat_omits() {
     assert_eq!(first["action"], "gate_blocked");
     assert_carries(&first, "Guarded instructions.", "gate-blocked first tick");
 
-    // Same failing gate, no transition: the occupancy has not moved, and
-    // it already delivered.
+    // Same failing gate, no transition: no entry event was appended, so the
+    // delivery window has not moved and it already delivered.
     let second = run_koto(root, &["next", "wf"]);
     assert_eq!(second["action"], "gate_blocked");
     assert_omits(&second, "gate-blocked repeat tick");
@@ -477,14 +583,14 @@ fn directed_transition_carries_then_nonadvancing_tick_omits() {
         "directed transition arrival",
     );
 
-    // No evidence submitted: does not advance, same occupancy as the
-    // directed arrival just delivered.
+    // No evidence submitted: does not advance, so it stays inside the delivery
+    // window the directed arrival opened and already delivered for.
     let repeat = run_koto(root, &["next", "wf"]);
     assert_omits(&repeat, "non-advancing tick after directed transition");
 }
 
 #[test]
-fn two_consecutive_directed_transitions_into_same_phase_both_carry() {
+fn a_second_directed_transition_into_the_occupied_phase_omits() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     let template = write_delivery_template(root);
@@ -504,13 +610,11 @@ fn two_consecutive_directed_transitions_into_same_phase_both_carry() {
 
     // `implement` declares itself as a transition target (the self-
     // transition `when: loop_again: yes`), so a second directed transition
-    // into it is valid and is a fresh occupancy.
+    // into it is valid -- and it is a hand-driven lap of that loop rather
+    // than an arrival, so it opens no delivery window and repeats nothing.
     let second = run_koto(root, &["next", "wf", "--to", "implement"]);
-    assert_carries(
-        &second,
-        "Implement instructions.",
-        "second directed transition (self-transition)",
-    );
+    assert_omits(&second, "directed transition into the occupied phase");
+    assert_pointer(&second, "directed transition into the occupied phase");
 }
 
 // ---------------------------------------------------------------------------
@@ -547,8 +651,8 @@ fn full_override_returns_details_on_a_response_that_would_otherwise_be_suppresse
 }
 
 /// The override call must record its own delivery, not merely surface
-/// details already recorded by an earlier response in the same occupancy.
-/// `--full` is applied to the *first* tick of the occupancy -- the only
+/// details already recorded by an earlier response in the same delivery window.
+/// `--full` is applied to the *first* tick of the window -- the only
 /// possible source of a delivery record for it -- so an implementation
 /// that gates the append on `!full` would fail the assertion below: the
 /// following plain tick would wrongly carry the instructions again.
@@ -564,7 +668,7 @@ fn override_call_records_a_delivery_so_the_next_plain_call_omits_instructions() 
         .success();
     koto_cmd(root).args(["next", "wf"]).assert().success();
 
-    // First tick of `implement`'s occupancy, requested with --full.
+    // First tick of `implement`'s delivery window, requested with --full.
     // already_delivered is false here regardless of the flag, so this
     // assertion alone would pass even if --full's own append were
     // skipped -- the point is the *next* assertion.
@@ -581,7 +685,7 @@ fn override_call_records_a_delivery_so_the_next_plain_call_omits_instructions() 
     assert_carries(
         &arrival,
         "Implement instructions.",
-        "override on first tick of occupancy",
+        "override on first tick of the delivery window",
     );
 
     let repeat = run_koto(root, &["next", "wf"]);
@@ -589,4 +693,164 @@ fn override_call_records_a_delivery_so_the_next_plain_call_omits_instructions() 
         &repeat,
         "plain non-advancing tick after an override-only delivery",
     );
+}
+
+// ---------------------------------------------------------------------------
+//  Same-tick round trip, same-phase rewind, and the non-entry event
+// ---------------------------------------------------------------------------
+
+/// A tick that leaves `implement`, passes through `bounce`, and arrives back at
+/// `implement` is an arrival, not a lap. The tick begins and ends in the same
+/// phase, so a rule paraphrased as "did the state change" gets it backwards; the
+/// entry event that lands the tick records `bounce` as its source, which is what
+/// decides it.
+#[test]
+fn same_tick_round_trip_back_to_a_phase_carries_details_again() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let template = write_round_trip_template(root);
+
+    koto_cmd(root)
+        .args(["init", "wf", "--template", template.to_str().unwrap()])
+        .assert()
+        .success();
+    koto_cmd(root).args(["next", "wf"]).assert().success();
+
+    let arrival = run_koto(
+        root,
+        &["next", "wf", "--with-data", r#"{"route":"direct"}"#],
+    );
+    assert_carries(&arrival, "Implement instructions.", "arrival at implement");
+
+    let round_trip = run_koto(
+        root,
+        &["next", "wf", "--with-data", r#"{"loop_again":"hop"}"#],
+    );
+    assert_eq!(round_trip["state"], "implement");
+    assert_carries(
+        &round_trip,
+        "Implement instructions.",
+        "implement -> bounce -> implement within one tick",
+    );
+}
+
+/// `koto rewind` right after a self-transition records the same phase as both
+/// source and target -- its destination is the second-to-last state-changing
+/// event's target, which the self-transition made `implement` twice over. A
+/// rewind means redo this rather than continue, so it delivers whatever phases
+/// it records; the rule reads the event's variant rather than its `from` field,
+/// so this answer cannot drift with a change to how rewind picks a destination.
+#[test]
+fn a_rewind_recording_the_same_phase_twice_carries_details_again() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let template = write_delivery_template(root);
+
+    koto_cmd(root)
+        .args(["init", "wf", "--template", template.to_str().unwrap()])
+        .assert()
+        .success();
+    koto_cmd(root).args(["next", "wf"]).assert().success();
+    koto_cmd(root)
+        .args(["next", "wf", "--with-data", r#"{"route":"direct"}"#])
+        .assert()
+        .success();
+    let lap = run_koto(
+        root,
+        &["next", "wf", "--with-data", r#"{"loop_again":"yes"}"#],
+    );
+    assert_omits(&lap, "self-transition before the rewind");
+
+    koto_cmd(root).args(["rewind", "wf"]).assert().success();
+
+    let after = run_koto(root, &["next", "wf"]);
+    assert_eq!(after["state"], "implement");
+    assert_carries(
+        &after,
+        "Implement instructions.",
+        "tick after a rewind recording implement as both source and target",
+    );
+}
+
+/// The override forces the instructions through on a response the rule would
+/// otherwise suppress. This is a regression check on `--full`, not a test of its
+/// recording clause: inside a self-entry window the arrival already recorded a
+/// delivery, so the override's own record can never be the load-bearing one
+/// there. The recording is covered by
+/// `override_call_records_a_delivery_so_the_next_plain_call_omits_instructions`,
+/// which applies `--full` to a window's first response.
+#[test]
+fn override_forces_details_through_on_a_suppressed_self_transition() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let template = write_delivery_template(root);
+
+    koto_cmd(root)
+        .args(["init", "wf", "--template", template.to_str().unwrap()])
+        .assert()
+        .success();
+    koto_cmd(root).args(["next", "wf"]).assert().success();
+    koto_cmd(root)
+        .args(["next", "wf", "--with-data", r#"{"route":"direct"}"#])
+        .assert()
+        .success();
+
+    let forced = run_koto(
+        root,
+        &[
+            "next",
+            "wf",
+            "--with-data",
+            r#"{"loop_again":"yes"}"#,
+            "--full",
+        ],
+    );
+    assert_carries(
+        &forced,
+        "Implement instructions.",
+        "--full on a self-transition the rule would suppress",
+    );
+
+    let plain = run_koto(root, &["next", "wf"]);
+    assert_omits(&plain, "non-advancing tick after the forced delivery");
+}
+
+/// An event that is not a state entry neither opens a delivery window nor closes
+/// one. Recording a decision is the instrument here rather than a gate override:
+/// an override unblocks the phase, so the next response would belong to a
+/// different phase -- and on this file's gated template, to a terminal one with
+/// no `details` field to assert against at all.
+#[test]
+fn a_recorded_decision_does_not_reopen_the_delivery_window() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let template = write_delivery_template(root);
+
+    koto_cmd(root)
+        .args(["init", "wf", "--template", template.to_str().unwrap()])
+        .assert()
+        .success();
+    koto_cmd(root).args(["next", "wf"]).assert().success();
+    koto_cmd(root)
+        .args(["next", "wf", "--with-data", r#"{"route":"direct"}"#])
+        .assert()
+        .success();
+
+    let before = run_koto(root, &["next", "wf"]);
+    assert_omits(&before, "non-advancing tick before the decision");
+
+    koto_cmd(root)
+        .args([
+            "decisions",
+            "record",
+            "wf",
+            "--with-data",
+            r#"{"choice":"keep the current approach","rationale":"nothing about the phase changed"}"#,
+        ])
+        .assert()
+        .success();
+
+    let after = run_koto(root, &["next", "wf"]);
+    assert_omits(&after, "non-advancing tick after a recorded decision");
+    assert_pointer(&after, "non-advancing tick after a recorded decision");
 }
