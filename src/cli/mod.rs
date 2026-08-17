@@ -5003,10 +5003,8 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
         }
     };
 
-    let is_terminal = compiled
-        .states
-        .get(&machine_state.current_state)
-        .is_some_and(|s| s.terminal);
+    let current_template_state = compiled.states.get(&machine_state.current_state);
+    let is_terminal = current_template_state.is_some_and(|s| s.terminal);
 
     let mut response = serde_json::json!({
         "name": name,
@@ -5015,6 +5013,76 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
         "template_hash": machine_state.template_hash,
         "is_terminal": is_terminal,
     });
+
+    // Verify the compiled template read above against the hash recorded
+    // in the session header -- the same check `koto next` performs
+    // before trusting `compiled` (src/cli/mod.rs:3220). `koto next` fails
+    // closed on a mismatch; `handle_status` cannot do the same without
+    // denying an agent its only recovery path at exactly the moment it
+    // has nothing else, so it reports instead of failing. This closes
+    // the pre-existing gap where `is_terminal` above was computed from
+    // an unverified read (DESIGN-inline-phase-details.md Security
+    // Considerations).
+    let actual_template_hash = sha256_hex(&template_bytes);
+    if actual_template_hash != machine_state.template_hash {
+        response["template_hash_mismatch"] = serde_json::json!({
+            "recorded": machine_state.template_hash,
+            "actual": actual_template_hash,
+        });
+    }
+
+    // Optional `directive`/`details`/`expects` — the current phase's
+    // instructions, retrievable without moving the workflow (Issue 3 of
+    // PLAN-inline-phase-details.md). Absent together when the phase is
+    // terminal, matching the terminal response variant's existing
+    // behaviour of carrying no directive (PRD R13). `details` is
+    // additionally absent when the phase declares none. Neither absence
+    // is an error.
+    //
+    // This retrieval always returns the full instructions regardless of
+    // the delivery rule `koto next` applies (PRD R10), and it appends
+    // nothing: no delivery record, no other event, and no lock is taken
+    // anywhere in this function.
+    if let Some(state) = current_template_state {
+        if !state.terminal {
+            let mut runtime_vars = std::collections::HashMap::new();
+            runtime_vars.insert(
+                "SESSION_DIR".to_string(),
+                backend.session_dir(name).to_string_lossy().to_string(),
+            );
+            runtime_vars.insert("SESSION_NAME".to_string(), name.to_string());
+
+            // Re-validates values as defense in depth, mirroring
+            // `handle_next`'s construction of the same type -- this is
+            // the "same two-layer pipeline" `koto next` substitutes
+            // through, so recovered text matches byte-for-byte
+            // (DESIGN-inline-phase-details.md "koto status output").
+            let variables = match crate::engine::substitute::Variables::from_events(&events) {
+                Ok(v) => v,
+                Err(e) => {
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": format!("variable re-validation failed: {}", e),
+                            "command": "status"
+                        }),
+                        EXIT_INFRASTRUCTURE,
+                    );
+                }
+            };
+            let substitute = |raw: &str| -> String {
+                let d = crate::cli::vars::substitute_vars(raw, &runtime_vars);
+                variables.substitute(&d)
+            };
+
+            response["directive"] = serde_json::json!(substitute(&state.directive));
+            if !state.details.is_empty() {
+                response["details"] = serde_json::json!(substitute(&state.details));
+            }
+            if let Some(expects) = crate::cli::next_types::derive_expects(state) {
+                response["expects"] = serde_json::to_value(&expects)?;
+            }
+        }
+    }
 
     // Optional `batch` section — populated when the parent is
     // batch-scoped (current state has a `materialize_children` hook)
