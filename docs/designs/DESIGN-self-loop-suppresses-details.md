@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-self-loop-suppresses-details.md
 problem: |
   koto decides whether a response carries a phase's instructions by asking
@@ -36,7 +36,7 @@ rationale: |
 
 ## Status
 
-Accepted
+Planned
 
 Authored under `/scope`'s tactical chain from
 `PRD-self-loop-suppresses-details`. Three decisions were evaluated

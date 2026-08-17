@@ -1,10 +1,14 @@
 ---
 topic: self-loop-suppresses-details
 chain_started: 2026-08-17T08:20:00Z
-last_updated: 2026-08-17T08:25:00Z
-phase_pointer: phase-2
-exit: UNSET
-exit_artifacts: []
+last_updated: 2026-08-17T10:30:00Z
+phase_pointer: phase-3
+exit: full-run
+exit_artifacts:
+  - docs/plans/PLAN-self-loop-suppresses-details.md
+  - docs/designs/DESIGN-self-loop-suppresses-details.md
+  - docs/prds/PRD-self-loop-suppresses-details.md
+  - docs/briefs/BRIEF-self-loop-suppresses-details.md
 planned_chain:
   - brief
   - prd
@@ -18,6 +22,9 @@ chain_ran:
     started_at: 2026-08-17T08:55:00Z
   - name: design
     started_at: 2026-08-17T09:50:00Z
+  - name: plan
+    started_at: 2026-08-17T10:25:00Z
+plan_execution_mode: single-pr
 child_snapshots:
   brief:
     status: Accepted
@@ -28,9 +35,13 @@ child_snapshots:
     content_hash: 1d28015951c4d2ff06cc7964891c32bb0a89e57d
     captured_at: 2026-08-17T10:20:00Z
   design:
-    status: Accepted
-    content_hash: 5798d32b36e26421a9b763dad611b64620e92632
-    captured_at: 2026-08-17T10:20:00Z
+    status: Planned
+    content_hash: 2c7a22e0a2ba9b3b91bacc66afbe7483d6f4dfe0
+    captured_at: 2026-08-17T10:30:00Z
+  plan:
+    status: Active
+    content_hash: 8a0fe9fcb30ac3532e58fdcc7b0a91752f534c33
+    captured_at: 2026-08-17T10:30:00Z
 consolidation_judgments:
   - hop: brief->prd
     stage: judgment
@@ -53,6 +64,17 @@ consolidation_judgments:
       DESIGN cites the PRD's requirements by number throughout and deliberately
       does not restate the twenty-one requirements or the acceptance-criteria
       contract, so folding would mean carrying the whole of both.
+  - hop: design->plan
+    stage: judgment
+    verdict: keep
+    finding: >-
+      The DESIGN holds three argued decisions with their rejected options and
+      measured evidence, a security review, and the record of why the delivery
+      boundary is split from the gate epoch. The PLAN carries none of that and
+      should not: it is a work decomposition. Folding would also point the wrong
+      way for lifetime -- the DESIGN is durable and the PLAN is deleted by the
+      implementation cascade, so the surviving document would be the one that
+      disappears.
 worktree_rebases:
   - phase: brief
     upstream_commits: []
