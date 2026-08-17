@@ -363,11 +363,22 @@ fn status_directive_details_expects_match_what_next_would_return() {
         "expects.fields should contain the accepts schema: {status}"
     );
 
-    // The first `koto next` call on the same phase must produce
-    // byte-identical directive/details text (DESIGN: "recovered text is
-    // identical to what `next` would have produced").
+    // The first `koto next` call on the same phase must produce the same
+    // underlying directive/details text (DESIGN: "recovered text is
+    // identical to what `next` would have produced"). `next`'s directive
+    // additionally carries the Issue 4 recovery pointer -- `status` is
+    // the retrieval the pointer names, so it does not point at itself --
+    // which is why the comparison strips that known prefix rather than
+    // asserting flat equality.
     let next = run_koto(root, &["next", "wf"]);
-    assert_eq!(next["directive"], status["directive"]);
+    assert_eq!(
+        next["directive"].as_str().unwrap(),
+        format!(
+            "{}{}",
+            koto::cli::next_types::RECOVERY_POINTER,
+            status["directive"].as_str().unwrap()
+        )
+    );
     assert_eq!(next["details"], status["details"]);
 }
 

@@ -145,11 +145,86 @@ fn state_path(dir: &Path, name: &str) -> PathBuf {
     session_dir(dir, name).join(format!("koto-{name}.state.jsonl"))
 }
 
+/// `work` declares instructions (`<!-- details -->`), unlike
+/// `CHILD_TEMPLATE`, so a session on this template can exercise the
+/// Issue 4 recovery pointer alongside the abandonment notice.
+const CHILD_TEMPLATE_WITH_DETAILS: &str = r#"---
+name: child-task-details
+version: "1.0"
+initial_state: work
+states:
+  work:
+    accepts:
+      marker:
+        type: enum
+        required: true
+        values: [done, fail, recheck]
+      summary:
+        type: string
+        required: false
+    transitions:
+      - target: done
+        when:
+          marker: done
+      - target: failed
+        when:
+          marker: fail
+      - target: recheck
+        when:
+          marker: recheck
+  recheck:
+    accepts:
+      marker:
+        type: enum
+        required: true
+        values: [done, fail]
+    transitions:
+      - target: done
+        when:
+          marker: done
+      - target: failed
+        when:
+          marker: fail
+  done:
+    terminal: true
+  failed:
+    terminal: true
+    failure: true
+---
+
+## work
+
+Review the change and report a summary.
+
+<!-- details -->
+
+Work instructions.
+
+## recheck
+
+Check it again.
+
+## done
+
+Done.
+
+## failed
+
+Failed.
+"#;
+
 /// One coordinator and one dispatched child, shaped so `bind` accepts
 /// the child and the epoch fence applies to its writes.
 fn setup(dir: &Path, child: &str) {
+    setup_with_child_template(dir, child, CHILD_TEMPLATE);
+}
+
+/// Like [`setup`], but lets the caller pick the child template -- used to
+/// exercise phases that declare instructions, which `CHILD_TEMPLATE`
+/// deliberately does not.
+fn setup_with_child_template(dir: &Path, child: &str, child_template: &str) {
     std::fs::write(dir.join("parent.md"), PARENT_TEMPLATE).unwrap();
-    std::fs::write(dir.join("child.md"), CHILD_TEMPLATE).unwrap();
+    std::fs::write(dir.join("child.md"), child_template).unwrap();
     let parent_tmpl = dir.join("parent.md");
     let child_tmpl = dir.join("child.md");
 
@@ -925,6 +1000,92 @@ fn a_bound_but_unabandoned_leg_carries_no_notice() {
     let envelope = run_ok(tmp.path(), &["next", "child-1"]);
     assert!(envelope.get("leg_abandoned").is_none());
     assert_eq!(delivery_records(tmp.path(), "child-1"), 0);
+}
+
+// ===== Issue 4 of PLAN-inline-phase-details.md: the recovery pointer,
+// spliced alongside the abandonment notice =====
+
+/// When both the recovery pointer and the abandonment notice apply to
+/// the same response, the pointer is spliced first so the notice —
+/// applied second, and therefore closer to the front — is the first
+/// thing the agent reads (DESIGN-inline-phase-details.md "Splice
+/// ordering when both notices apply").
+#[test]
+fn both_the_pointer_and_the_notice_apply_the_notice_ends_up_closest_to_the_front() {
+    let tmp = TempDir::new().unwrap();
+    setup_with_child_template(tmp.path(), "child-1", CHILD_TEMPLATE_WITH_DETAILS);
+    let id = create_request(tmp.path());
+    run_ok(
+        tmp.path(),
+        &["request", "bind", &id, "reviewer-a", "--child", "child-1"],
+    );
+    run_ok(
+        tmp.path(),
+        &[
+            "request",
+            "abandon",
+            &id,
+            "reviewer-a",
+            "--rationale",
+            "the PR was closed",
+            "--dispatch-epoch",
+            "0",
+        ],
+    );
+
+    let envelope = run_ok(tmp.path(), &["next", "child-1"]);
+    let directive = envelope["directive"].as_str().expect("a directive");
+
+    assert!(
+        directive.starts_with("NOTICE FROM KOTO"),
+        "the abandonment notice must be closest to the front when both apply: {directive}"
+    );
+    let notice_pos = directive.find("NOTICE FROM KOTO").unwrap();
+    let pointer_pos = directive
+        .find("[koto] Lost context?")
+        .unwrap_or_else(|| panic!("the recovery pointer must also be present: {directive}"));
+    assert!(
+        notice_pos < pointer_pos,
+        "the notice was spliced second (after the pointer), so it precedes the pointer: \
+         {directive}"
+    );
+    assert!(
+        directive.contains("Review the change and report a summary"),
+        "the phase's own directive text survives both splices unaltered: {directive}"
+    );
+}
+
+/// Without an abandonment, a phase that declares instructions still gets
+/// the pointer on a plain response.
+#[test]
+fn the_pointer_appears_on_a_plain_response_for_a_phase_that_declares_instructions() {
+    let tmp = TempDir::new().unwrap();
+    setup_with_child_template(tmp.path(), "child-1", CHILD_TEMPLATE_WITH_DETAILS);
+
+    let envelope = run_ok(tmp.path(), &["next", "child-1"]);
+    let directive = envelope["directive"].as_str().expect("a directive");
+    assert!(
+        directive.starts_with("[koto] Lost context?"),
+        "the pointer precedes the phase's own directive when nothing else splices in: \
+         {directive}"
+    );
+    assert!(directive.contains("Review the change and report a summary"));
+
+    // The suppressed repeat tick omits `details` but still carries the
+    // pointer -- the pointer keys on whether the phase declares
+    // instructions, not on whether this response carries them.
+    let repeat = run_ok(tmp.path(), &["next", "child-1"]);
+    assert!(
+        repeat.get("details").is_none(),
+        "second tick suppresses details: {repeat}"
+    );
+    assert!(
+        repeat["directive"]
+            .as_str()
+            .unwrap()
+            .starts_with("[koto] Lost context?"),
+        "the pointer still appears on the suppressed response: {repeat}"
+    );
 }
 
 // ===== Issue 13: the batch boundary on `koto status` =====

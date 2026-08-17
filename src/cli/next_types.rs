@@ -152,6 +152,19 @@ impl BatchErrorContext {
     }
 }
 
+/// Koto-authored text pointing an agent at the `koto status` retrieval
+/// (Issue 3 of PLAN-inline-phase-details.md) that can recover a phase's
+/// instructions without moving the workflow.
+///
+/// Spliced into `directive` via [`NextResponse::with_directive_prefix`] —
+/// the same mechanism the leg-abandonment notice uses — by the caller,
+/// gated on whether the *phase* declares instructions rather than on
+/// whether *this response* carries them (DESIGN-inline-phase-details.md
+/// "The one thing the pointer must not key on"). Held under 150
+/// characters by convention (DESIGN-inline-phase-details.md Decision 4).
+pub const RECOVERY_POINTER: &str =
+    "[koto] Lost context? `koto status <session>` returns this phase's directive/details/expects.\n\n";
+
 impl NextResponse {
     /// Return a new `NextResponse` with the directive and details fields substituted
     /// using the given function. Terminal variants have no directive and are returned
@@ -946,6 +959,62 @@ pub fn derive_expects(state: &TemplateState) -> Option<ExpectsSchema> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- RECOVERY_POINTER --
+
+    #[test]
+    fn recovery_pointer_is_under_150_characters() {
+        assert!(
+            RECOVERY_POINTER.chars().count() < 150,
+            "budget stated in DESIGN-inline-phase-details.md Decision 4: {} chars",
+            RECOVERY_POINTER.chars().count()
+        );
+    }
+
+    #[test]
+    fn recovery_pointer_names_the_status_retrieval() {
+        assert!(RECOVERY_POINTER.contains("koto status"));
+    }
+
+    #[test]
+    fn recovery_pointer_via_with_directive_prefix_leaves_directive_unaltered_after_it() {
+        let resp = evidence_required_with_details(Some("Full instructions."))
+            .with_directive_prefix(RECOVERY_POINTER);
+        match resp {
+            NextResponse::EvidenceRequired { directive, .. } => {
+                assert!(directive.starts_with(RECOVERY_POINTER));
+                assert!(directive.ends_with("Collect notes."));
+            }
+            other => panic!("expected EvidenceRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn recovery_pointer_prefix_leaves_terminal_and_error_unchanged() {
+        let terminal = NextResponse::Terminal {
+            state: "done".to_string(),
+            advanced: true,
+            unassigned_children: vec![],
+        };
+        assert_eq!(
+            terminal.clone().with_directive_prefix(RECOVERY_POINTER),
+            terminal
+        );
+
+        let err = NextResponse::Error {
+            state: "gather".to_string(),
+            advanced: false,
+            error: NextError {
+                code: NextErrorCode::InvalidSubmission,
+                message: "bad".to_string(),
+                details: vec![],
+            },
+            batch: None,
+            blocking_conditions: vec![],
+            unassigned_children: vec![],
+        };
+        assert_eq!(err.clone().with_directive_prefix(RECOVERY_POINTER), err);
+    }
 
     // -- NextResponse variant serialization tests --
 

@@ -2904,7 +2904,7 @@ fn handle_next(
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
         blocking_conditions_from_gates, ErrorDetail, ExpectsSchema, IntegrationOutput,
-        IntegrationUnavailableMarker, NextError, NextErrorCode, NextResponse,
+        IntegrationUnavailableMarker, NextError, NextErrorCode, NextResponse, RECOVERY_POINTER,
     };
     use crate::engine::advance::{
         advance_until_stop, merge_epoch_evidence, ActionResult, AdvanceError, IntegrationError,
@@ -3417,6 +3417,17 @@ fn handle_next(
                     instructions_delivered_this_occupancy(&post_events, target)
                 };
                 let resp = resp.with_details_suppressed_unless_full(already_delivered, full);
+
+                // The recovery pointer, spliced before the abandonment
+                // notice below for the same both-apply ordering the
+                // natural path follows. Gated on whether the *target*
+                // phase declares instructions, not on whether this
+                // response carries them.
+                let resp = if target_template_state.details.is_empty() {
+                    resp
+                } else {
+                    resp.with_directive_prefix(RECOVERY_POINTER)
+                };
 
                 // The abandonment notice, spliced after classification
                 // and after variable substitution. Prepending
@@ -4287,6 +4298,20 @@ fn handle_next(
                 instructions_delivered_this_occupancy(&post_events, final_state)
             };
             let resp = resp.with_details_suppressed_unless_full(already_delivered, full);
+
+            // The recovery pointer, spliced before the abandonment notice
+            // below so the notice ends up closest to the front of
+            // `directive` when both apply (DESIGN-inline-phase-details.md
+            // "Splice ordering when both notices apply"). Gated on
+            // whether the phase declares instructions -- not on whether
+            // this response carries them -- so it reaches suppressed
+            // responses too, which is exactly where a context-lost agent
+            // needs it.
+            let resp = if final_template_state.details.is_empty() {
+                resp
+            } else {
+                resp.with_directive_prefix(RECOVERY_POINTER)
+            };
 
             // The abandonment notice, spliced after classification and
             // after variable substitution so caller-influenced text is
