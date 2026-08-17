@@ -555,8 +555,9 @@ Several fields are conditionally absent rather than `null`. When writing code to
 - Check whether `details` is present before reading it; it may be omitted on any action
   type once it's already been delivered since you last arrived at the phase. Use
   `koto status <name>` (see `command-reference.md`) to retrieve it unconditionally
-  without depending on delivery state. On a long loop that is the only way back to it —
-  no further lap will re-deliver.
+  without depending on delivery state. On a long loop that and `koto next --full` are
+  the only ways back to it — no plain lap will re-deliver — and only `koto status`
+  gets there without ticking the workflow.
 - `expects` is always written but may be `null` — this is not the same as absent.
 - `options` inside an `expects` object is omitted (not written) when empty, not written
   as `[]`.

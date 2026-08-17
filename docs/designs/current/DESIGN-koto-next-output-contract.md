@@ -32,6 +32,13 @@ rationale: |
 
 Current
 
+One part of this design no longer describes shipped code: Decision 3's
+visit-count mechanism for the `details` field was replaced, and every passage
+below that states delivery in terms of visit counts describes the original
+mechanism rather than the current one. See
+`docs/designs/current/DESIGN-inline-phase-details.md` for the rule that replaced
+it. Everything else here still holds.
+
 ## Context and Problem Statement
 The `koto next` command's output layer was built incrementally across three design efforts. The CLI output contract (#37) defined the `NextResponse` enum and custom serialization. The unified koto next design (#43) added auto-advancement. The auto-advancement engine (#49) added the advancement loop with `StopReason` -> `NextResponse` mapping. Each effort extended the output without reconciling the caller-facing contract.
 
@@ -120,7 +127,7 @@ The `GateResult -> BlockingCondition` conversion logic (currently duplicated in 
 
 ### Decision 3: Visit count computation
 
-**Superseded.** The mechanism below shipped and was later replaced: koto no longer decides delivery by counting visits. See `docs/designs/current/DESIGN-inline-phase-details.md` for the rule that replaced it and `docs/designs/DESIGN-self-loop-suppresses-details.md` for the boundary it now uses. `derive_visit_counts` survives for an unrelated visited-set consumer in the `/workflows` projection. The rest of this decision is kept as the record of why the original mechanism was chosen.
+**Superseded.** The mechanism below shipped and was later replaced: koto no longer decides delivery by counting visits. See `docs/designs/current/DESIGN-inline-phase-details.md` for the rule that replaced it and `DESIGN-self-loop-suppresses-details` for the boundary it now uses. `derive_visit_counts` survives for an unrelated visited-set consumer in the `/workflows` projection. The rest of this decision is kept as the record of why the original mechanism was chosen.
 
 The `details` field should be included on first visit to a state and omitted on subsequent visits. The JSONL event log contains all state-entry events (`Transitioned`, `DirectedTransition`, `Rewound`), and the PRD prohibits new state files or schema changes. The question is how to compute and propagate visit information.
 

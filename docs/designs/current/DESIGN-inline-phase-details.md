@@ -57,7 +57,7 @@ delivery is now separate from the epoch the gate-blocked classification reads.
 The four decisions below stand; only the boundary moved. The reversal is recorded
 in Decision Outcome rather than edited away, because it overturns an argument
 this document made rather than correcting an oversight. See
-`docs/designs/DESIGN-self-loop-suppresses-details.md`.
+`DESIGN-self-loop-suppresses-details`.
 
 ## Context and Problem Statement
 
@@ -274,7 +274,9 @@ itself overriding koto#90's acceptance criterion 3 — "Subsequent visits (retri
 self-loops) omit `details` from the response" — which is an acceptance criterion
 of the issue this whole mechanism was fixing. And R9 of
 `docs/prds/PRD-koto-next-output-contract.md`, an accepted contract predating both,
-had already settled the same question the same way. Neither was cited, so an
+had already settled the same question the same way -- on the self-loop. Its
+broader visit-count framing would also withhold on a rewind and on a loop-back,
+and neither survives; R9 is honored in part, not adopted. Neither was cited, so an
 override read as a definition.
 
 The issue's author has ruled that the criterion governs. A self-transition no
@@ -282,7 +284,7 @@ longer opens a delivery window: an agent going around a loop it is already in
 holds the instructions and is not re-sent them. The boundary that decides this is
 now separate from the epoch the gate-blocked classification reads, because only
 the first was meant to move. See
-`docs/designs/DESIGN-self-loop-suppresses-details.md` for the split and
+`DESIGN-self-loop-suppresses-details` for the split and
 `docs/prds/PRD-self-loop-suppresses-details.md` for the requirements; the
 Definitions paragraph in this design's own upstream PRD carries the same
 amendment note.

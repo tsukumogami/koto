@@ -681,8 +681,9 @@ recover it.
 
 Records that a `koto next` response carried a phase's instructions to whoever
 called it. A phase's delivery window runs from the state-entry event by which the
-workflow *arrived* at it — an entry recording a different source phase, or any
-rewind — to the end of the log. A delivery recorded inside that window is what
+workflow *arrived* at it — an entry recording a different source phase, an entry
+recording no source at all, as `koto init`'s does, or any rewind — to the end of
+the log. With no such entry anywhere in the log, every event is in scope. A delivery recorded inside that window is what
 lets a later response for the same phase leave the instructions out.
 
 The window is deliberately not the epoch that the gate-blocked classification

@@ -138,10 +138,11 @@ Two terms carry weight across the requirements below, and both are defined here
 rather than left to implication.
 
 **Occupancy.** A phase's occupancy begins when a state-entry event names that
-phase as its target *and records a different phase as its source*, and ends when
-the next such event fires. A rewind always begins one, whichever phases it
-records. A self-transition does not: the agent went around a loop it was already
-in rather than arriving anywhere, so it still holds the instructions.
+phase as its target *and records a different phase as its source, or no source at
+all* — as workflow initialization does — and ends when the next such event fires.
+A rewind always begins one, whichever phases it records. A self-transition does
+not: the agent went around a loop it was already in rather than arriving
+anywhere, so it still holds the instructions.
 
 **Amended.** This paragraph originally read the other way — a self-transition
 ended one occupancy and began another, on the reasoning that treating it
@@ -149,7 +150,10 @@ differently would make the rule depend on the shape of the loop. That reasoning
 overrode koto#90's acceptance criterion 3 ("Subsequent visits (retries,
 self-loops) omit `details` from the response") and R9 of
 `docs/prds/PRD-koto-next-output-contract.md`, which had already settled the same
-question the same way, without citing either. The issue's author has ruled that
+question the same way, without citing either. R9 is honored on the self-loop
+rather than adopted whole: its broader visit-count framing would also withhold on
+a rewind and on a loop-back, and neither survives the rule this document
+specifies. The issue's author has ruled that
 the criterion governs. See `docs/prds/PRD-self-loop-suppresses-details.md`, whose
 Definitions section names the boundary this one now describes and separates it
 from the epoch that the gate-blocked classification reads.
@@ -383,7 +387,7 @@ occurred.
 could be read as deliberate: an operator issuing a directed transition is making
 an explicit choice and arguably always wants full context. Nothing in the code or
 the design documents says so, and the cost of the ambiguity is that koto's
-documented contract is false — the skills tell agents the instructions arrive on
+documented contract is false — the skills told agents the instructions arrive on
 first visit and are omitted afterwards, which is not what this path does. R4
 resolves it toward one uniform rule. The alternative reading is recorded here so
 the DESIGN can overturn it with a stated reason rather than rediscover it.

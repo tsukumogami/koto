@@ -41,7 +41,8 @@ to `0.9.x`).
   criterion 3, which the previous rule overrode without citing it. On a
   long loop the per-lap cost is now the directive alone; an agent that
   loses the procedure mid-loop recovers it with `koto status <name>`,
-  which every instruction-carrying response names in its `directive`.
+  which every response for a phase that declares instructions names in its
+  `directive`, whether or not that response carried them.
   The boundary that decides delivery is now separate from the epoch the
   dashboard's blocked classification reads, so that badge is unchanged.
 

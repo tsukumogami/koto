@@ -79,7 +79,7 @@ koto next coord --with-data @tasks.json
 
 The 1 MB cap applies to both forms (file size is checked before reading). Use `@-` is **not** supported; only file paths are accepted after `@`.
 
-- `--full` -- Include the `details` field in the response regardless of delivery state. By default, `details` is delivered when the workflow arrives at a state -- entering it from a different state, or being rewound into it -- and omitted on every later tick until it arrives again. Going around a loop it is already in is not an arrival: a self-transition, and a `--to` transition into the state the workflow already occupies, both repeat nothing. This flag forces inclusion every time.
+- `--full` -- Include the `details` field in the response regardless of delivery state. By default, `details` is delivered when the workflow arrives at a state -- entering it from a different state, or being rewound into it -- and omitted on every later tick until it arrives again. Going around a loop it is already in is not an arrival: a self-transition, and a `--to` transition into the state the workflow already occupies, both repeat nothing. What decides it is whether the entry event that landed the workflow records a different source state -- so a tick that leaves a state, passes through another, and comes back within the same tick does deliver. This flag forces inclusion every time.
 - `--no-cleanup` -- Skip automatic session directory cleanup when the workflow reaches a terminal state. Useful for debugging or when you need to inspect session artifacts after completion. Without this flag, koto removes the session directory once it outputs the terminal response.
 
 **Runtime variable substitution:**

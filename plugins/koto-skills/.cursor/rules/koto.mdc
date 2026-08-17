@@ -172,7 +172,9 @@ The `details` field carries extended instructions. It's delivered when you
 there, or being rewound into it -- and omitted on every later tick until you
 arrive again, to save context. Going around a loop you are already in is not an
 arrival: a self-transition, and a `koto next --to <this state>` issued while
-you're already there, both repeat nothing. Use `--full` to force inclusion
+you're already there, both repeat nothing. A tick that leaves the state, passes
+through another, and comes back does deliver -- what decides it is whether the
+entry event records a different source state. Use `--full` to force inclusion
 regardless:
 
 ```bash
