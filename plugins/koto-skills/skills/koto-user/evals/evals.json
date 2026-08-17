@@ -128,6 +128,32 @@
         "Response mentions that koto rejects an explicit resolve on a bound leg (`explicit_resolve_on_bound_leg`), or that it would block the real result",
         "Response directs the agent to submit its verdict through `koto next review-443 --with-data` and complete the workflow normally"
       ]
+    },
+    {
+      "id": 11,
+      "name": "details-omitted-on-repeat-tick-same-occupancy",
+      "prompt": "I'm running a koto workflow called 'ship-it'. Ten minutes ago `koto next ship-it` returned:\n```json\n{\"action\":\"gate_blocked\",\"state\":\"preflight\",\"directive\":\"CI must pass before merge.\",\"details\":\"Run the full preflight checklist: lint, unit tests, and the smoke suite against staging. Fix any failures and re-run this command.\",\"advanced\":false,\"expects\":null,\"blocking_conditions\":[{\"name\":\"ci_check\",\"type\":\"command\",\"status\":\"failed\",\"category\":\"corrective\",\"agent_actionable\":true,\"output\":{\"exit_code\":1,\"error\":\"\"}}],\"error\":null}\n```\nI fixed nothing yet and just called `koto next ship-it` again to check. This time it returned:\n```json\n{\"action\":\"gate_blocked\",\"state\":\"preflight\",\"directive\":\"CI must pass before merge.\",\"advanced\":false,\"expects\":null,\"blocking_conditions\":[{\"name\":\"ci_check\",\"type\":\"command\",\"status\":\"failed\",\"category\":\"corrective\",\"agent_actionable\":true,\"output\":{\"exit_code\":1,\"error\":\"\"}}],\"error\":null}\n```\nWhy is `details` missing this time, and is this a bug I should report?",
+      "expected_output": "Agent explains this is expected, not a bug: `details` is delivered once per occupancy of a state, and re-ticking the same failing gate without leaving and re-entering `preflight` stays in the same occupancy, so `details` is correctly omitted on the second call. It should NOT tell the user to report a bug or treat this as an error. It may mention `--full` to force `details` back, or `koto status ship-it` to retrieve it unconditionally.",
+      "files": [],
+      "assertions": [
+        "Response states that the missing `details` on the second call is expected behavior, not a bug",
+        "Response explains the delivery-per-occupancy rule: `details` is delivered once per occupancy of a state and omitted on further ticks that don't leave and re-enter it",
+        "Response does NOT tell the user to report this as a bug or treat it as an error condition",
+        "Response mentions at least one way to see `details` again on demand: `--full` on `koto next`, or `koto status ship-it`"
+      ]
+    },
+    {
+      "id": 12,
+      "name": "details-redelivered-after-rewind",
+      "prompt": "I'm running a koto workflow called 'audit-pass'. I already saw the `details` field once for the `remediate` state (it explained the remediation checklist step by step), then advanced past it. My reviewer just asked me to redo that step from scratch, so I ran `koto rewind audit-pass` and it landed back on `remediate`. If I call `koto next audit-pass` now, will I see the remediation checklist again, or do I need to pass `--full` to get it back?",
+      "expected_output": "Agent explains that `koto rewind` landing back on `remediate` starts a new occupancy of that state, so the next plain `koto next audit-pass` call will deliver `details` again automatically -- `--full` is not required for this case (though it would also work).",
+      "files": [],
+      "assertions": [
+        "Response states that `koto next audit-pass` will show `details` again without needing `--full`",
+        "Response explains that a rewind back into a state starts a new occupancy, which is why `details` is delivered again",
+        "Response does NOT claim the agent must pass `--full` to see `details` after the rewind",
+        "Response distinguishes this from a plain repeat tick that stays in the same occupancy, where `details` would stay omitted"
+      ]
     }
   ]
 }
