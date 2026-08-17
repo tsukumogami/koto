@@ -26,7 +26,7 @@ rationale: |
   questions, so they must read different boundaries; the shipped code says the
   opposite in a comment, and that comment has to be overturned deliberately
   rather than quietly. Duplicating the scan would give the file a fifth copy of a
-  walk it already carries four of, and a boundary argument at the call sites
+  walk it already carries five of, and a boundary argument at the call sites
   would put a silent behavior switch where a typo reaches it. One scan and two
   names costs a rename and buys a unit test that reads as one log through two
   functions with opposite answers, which is exactly what the requirement says.
@@ -65,13 +65,16 @@ without moving three others that happen to be spelled the same way:
   the blocked classification the dashboard (`src/cli/dashboard_data.rs:458`) and
   the `/workflows` projection (`src/workflows_surface/project.rs:183`) both read,
   and it has no direct test coverage anywhere in the repo.
-- `derive_evidence` (`:722`), `derive_overrides` (`:796`) and
-  `derive_last_gate_evaluated` (`:844`) each open-code a similar backwards walk
-  rather than calling the helper — and each already differs from it, returning
-  empty where the helper returns the whole log when no entry event names the
-  phase (`:743-746`, `:817-820`, `:860`, against `:1042-1045`). They also take no
-  phase argument, deriving the current state themselves. They are neighbours of
-  the helper, not callers of it.
+- `derive_evidence` (`:722`), `derive_decisions` (`:759`), `derive_overrides`
+  (`:796`) and `derive_last_gate_evaluated` (`:844`) each open-code a similar
+  backwards walk rather than calling the helper. Each differs from it in source
+  text — returning empty where the helper returns the whole log when no entry
+  event names the phase — but that divergence is unreachable: all four derive
+  their own phase from `derive_state_from_log` (`:709`), which returns the target
+  of the last entry event, and that event necessarily satisfies the walk's own
+  test. So they are structurally foldable, not behaviorally distinct. They are
+  neighbours of the helper rather than callers of it, and there are five walks in
+  the file, four of them open-coded.
 
 `latest_epoch_gate_failed` takes the *latest* gate evaluation inside its slice,
 so widening that slice changes its answer whenever the narrow epoch holds no gate
@@ -132,9 +135,9 @@ section is the record.
 
 **Option A, a sibling scan.** Add a second private function; leave the shared
 helper alone. Zero risk to the gate epoch, and the smallest conceptual change.
-Rejected on one margin: it takes the file from four backwards walks over entry
-events to five, with the two that matter sitting adjacent and differing by one
-line. The margin is slim — the chosen option still leaves four, three of them
+Rejected on one margin: it takes the file from five backwards walks over entry
+events to six, with the two that matter sitting adjacent and differing by one
+line. The margin is slim — the chosen option still leaves five, four of them
 open-coded — and the stale doc comment is not an argument against A, because
 every option here rewrites it.
 
@@ -327,13 +330,17 @@ at `P` suppress. The comment is replaced with the new argument, not trimmed.
 | Response combinator | `src/cli/next_types.rs` | No behavior change; doc comment states the delivery window rather than the occupancy |
 | Event doc comment | `src/engine/types.rs` | Correct the `InstructionsDelivered` comment, which still says nothing appends the event |
 
-`derive_evidence`, `derive_overrides` and `derive_last_gate_evaluated` keep their
-own walks. Folding them into `epoch_slice` would not be a refactor at all: all
-three return empty where the helper returns the whole log when no entry event
-names the phase, so unifying them would change behavior on exactly the case a
-unit test pins. Their independence is also, for now, a feature — PRD R15 pins the
-evidence epoch, and a walk that shares no code with the delivery window cannot
-follow it by accident.
+`derive_evidence`, `derive_decisions`, `derive_overrides` and
+`derive_last_gate_evaluated` keep their own walks. They could be folded into
+`epoch_slice` behind their existing `None` guard without changing behavior — the
+one place their source text diverges from the helper is dead code, because each
+derives its own phase from the last entry event and that event always satisfies
+the walk's test. They are left alone for two reasons that are not that. A
+behavior-preserving refactor of four call sites landing in the same commit as a
+behavior reversal would make the diff unreviewable. And their independence is,
+for now, a hedge: PRD R15 pins the evidence epoch, and a walk that shares no code
+with the delivery window cannot follow it by accident. Consolidating them is
+follow-up work, not an impossibility.
 
 `derive_visit_counts` stays untouched. It is the fossil of the rule the previous
 change replaced, it still has a consumer in the `/workflows` projection, and
@@ -512,7 +519,7 @@ surface, or `koto::engine::types`, so nothing in `docs/STABILITY.md` moves.
   satisfy themselves that `epoch_slice` is the old behavior. It is, by
   construction of the `AnyEntry` arm, but it is work the smallest possible diff
   would not have asked for.
-- The file still carries four backwards scans over entry events, three of them
+- The file still carries five backwards scans over entry events, four of them
   open-coded. This change does not reduce that and is not the place to.
 - The byte-identity fixture takes a diff, in the one file whose purpose is not to
   have one. Bounded by an acceptance criterion that permits exactly the one prose

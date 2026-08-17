@@ -1003,8 +1003,25 @@ pub fn derive_visit_counts(events: &[Event]) -> HashMap<String, usize> {
 enum Boundary {
     /// Every entry naming the phase, a self-entry included.
     AnyEntry,
-    /// Only an entry from a different phase, plus every rewind.
+    /// Entries that mean the agent arrived rather than looped: a transition from
+    /// a different phase, and every rewind. A rewind counts however it records
+    /// its source, because it is an instruction to redo rather than continue.
     ArrivalFromElsewhere,
+}
+
+impl Boundary {
+    /// Whether an entry whose source phase equals its target opens a window.
+    ///
+    /// Written as an exhaustive match rather than an equality test so that
+    /// adding a variant fails to compile here -- at the one place that names the
+    /// decision -- instead of silently defaulting at the two call sites inside
+    /// the scan.
+    fn opens_on_self_entry(self) -> bool {
+        match self {
+            Boundary::AnyEntry => true,
+            Boundary::ArrivalFromElsewhere => false,
+        }
+    }
 }
 
 /// The events since the workflow last entered `current_state` under `boundary`.
@@ -1027,12 +1044,15 @@ enum Boundary {
 /// has since left and the slice will span everything that happened after it,
 /// which answers a different question than the caller meant.
 ///
-/// With no qualifying entry event, every event is in scope. Under
-/// [`Boundary::AnyEntry`] the only phase that can be in that position is the
-/// initial one, which the workflow occupies before it has transitioned
-/// anywhere. Under [`Boundary::ArrivalFromElsewhere`] the whole-log arm does
-/// more work than that: a self-transition on the initial phase leaves a log
-/// with no opener at all, and this arm is what makes that lap suppress.
+/// With no qualifying entry event, every event is in scope. Under either
+/// boundary that arm is unreachable for a log `koto init` produced: init always
+/// appends `Transitioned { from: None, to: <initial> }`, and a `None` source
+/// opens under both -- `AnyEntry` never looks at the source, and
+/// `ArrivalFromElsewhere` reads `None` as "not from this phase". The arm exists
+/// for synthetic and truncated logs, and under `ArrivalFromElsewhere` it is the
+/// one place this boundary's failure direction inverts: a log whose only entries
+/// naming the phase are self-entries falls through here and can be answered by a
+/// record from an earlier visit, suppressing where `AnyEntry` would deliver.
 ///
 /// Only inspects `.payload` and position within `events`; `.seq`,
 /// `.timestamp`, `.event_type`, and `.idempotency_hash` never factor in. The
@@ -1041,15 +1061,22 @@ enum Boundary {
 /// without re-reading the log, and a caller-constructed `Event` with
 /// placeholder metadata is exactly as valid an input here as one read back
 /// from disk.
+///
+/// Inside `.payload`, `to` is read on all three entry variants and `from` on
+/// two. `Transitioned.from` is an `Option<String>` and the other two are plain
+/// `String`s, so the `Transitioned` arm compares through `as_deref()`; an absent
+/// source reads as "not from this phase" and opens the window, which is both
+/// what initialization needs and the safe direction for a log written before the
+/// field existed.
 fn entry_slice<'a>(events: &'a [Event], current_state: &str, boundary: Boundary) -> &'a [Event] {
     let start = events.iter().enumerate().rev().find_map(|(idx, e)| {
         let opens = match &e.payload {
             EventPayload::Transitioned { from, to, .. } => {
                 to == current_state
-                    && (boundary == Boundary::AnyEntry || from.as_deref() != Some(current_state))
+                    && (boundary.opens_on_self_entry() || from.as_deref() != Some(current_state))
             }
             EventPayload::DirectedTransition { from, to, .. } => {
-                to == current_state && (boundary == Boundary::AnyEntry || from != current_state)
+                to == current_state && (boundary.opens_on_self_entry() || from != current_state)
             }
             EventPayload::Rewound { to, .. } => to == current_state,
             _ => false,
@@ -1070,24 +1097,18 @@ fn entry_slice<'a>(events: &'a [Event], current_state: &str, boundary: Boundary)
 /// phase's current epoch.
 ///
 /// Every state-entry event naming the phase closes the epoch, a self-transition
-/// included. This is the boundary the gate-blocked classification reads, and it
-/// is unchanged from the one koto has always used.
+/// included -- see [`entry_slice`] for the mechanism. This is the boundary the
+/// gate-blocked classification reads, and it is unchanged from the one koto has
+/// always used.
 ///
-/// It is deliberately *not* [`delivery_window`]. The two answer different
-/// questions -- "since the machine last entered this state" against "since the
-/// agent last arrived here from somewhere else" -- so they now disagree across a
-/// self-entry, on purpose. Sharing one scan is what keeps them from disagreeing
-/// about anything else.
-///
-/// **Unifying them breaks the dashboard, silently.** This predicate takes the
-/// *latest* gate evaluation inside its slice, so widening the slice changes its
-/// answer whenever the narrow epoch holds no gate evaluation and the wider
-/// window does -- every tick after a self-entry until a fresh evaluation lands.
-/// A gate that failed before the loop's last lap would keep the blocked badge
-/// on. Nothing in the repo tests this function directly; the one test that
-/// catches the mistake is
-/// `the_epoch_and_the_delivery_window_disagree_across_a_self_transition` below,
-/// which asserts both boundaries against a single log.
+/// **Widening it to match [`delivery_window`] breaks the dashboard, silently.**
+/// The predicate built on this slice takes the *latest* gate evaluation inside
+/// it, so a wider window changes the answer whenever the narrow epoch holds no
+/// gate evaluation and the wider one does -- every tick after a self-entry until
+/// a fresh evaluation lands. A gate that failed before a loop's last lap would
+/// keep the blocked badge on. Nothing in the repo exercises that predicate
+/// directly except the one unit test that asserts both boundaries against a
+/// single log.
 fn epoch_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
     entry_slice(events, current_state, Boundary::AnyEntry)
 }
@@ -1095,11 +1116,11 @@ fn epoch_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
 /// The events since the workflow last arrived at `current_state` from somewhere
 /// else -- the phase's current delivery window.
 ///
-/// A transition from the phase to itself does not open one, so a delivery
-/// recorded before a self-transition still counts after it and an agent going
-/// around a loop is not re-sent instructions it already holds. Arrival from a
-/// different phase opens one, and so does any rewind: a rewind is an
-/// instruction to redo the work rather than to continue it, and the agent it
+/// A transition from the phase to itself does not open one -- see
+/// [`entry_slice`] for the mechanism -- so a delivery recorded before a
+/// self-transition still counts after it and an agent going around a loop is not
+/// re-sent instructions it already holds. Any rewind does open one: a rewind is
+/// an instruction to redo the work rather than to continue it, and the agent it
 /// addresses needs the procedure again.
 fn delivery_window<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
     entry_slice(events, current_state, Boundary::ArrivalFromElsewhere)
@@ -1147,10 +1168,8 @@ pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
 /// combinator, so the two cannot disagree about when a phase has already
 /// delivered.
 ///
-/// The window is [`delivery_window`]'s, so arrival from a different phase, a
-/// rewind, and arrival at the initial state all open one, and a transition from
-/// the phase to itself does not. The same precondition applies as for the epoch:
-/// `current_state` is the phase the workflow currently occupies.
+/// The window is [`delivery_window`]'s. The same precondition applies as for the
+/// epoch: `current_state` is the phase the workflow currently occupies.
 ///
 /// The question asked inside the window is unchanged -- has a delivery been
 /// *recorded*? A rule keyed on the shape of the entry event instead would
