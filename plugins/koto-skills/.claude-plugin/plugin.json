@@ -1,6 +1,6 @@
 {
   "name": "koto-skills",
-  "version": "0.11.6-dev",
+  "version": "0.11.6",
   "description": "Workflow skills for koto -- the state machine engine for AI agent workflows",
   "author": {
     "name": "tsukumogami"
