@@ -34,8 +34,27 @@ envelope these ride on. An abandoned leg also prepends a koto-authored stop noti
 `directive` is never present when `action` is `"done"`. The `done` variant has no
 `directive` field in its struct — the key is not written at all, not written as `null`.
 
-`details` follows visit-count logic: present on the first visit to a state, absent on
-subsequent visits unless `--full` is passed. It is always absent on `done` regardless.
+`details` follows a delivery rule, not a visit-count: a phase's `details` are
+delivered once per **occupancy** of that phase, then omitted on any further tick
+that doesn't leave and re-enter the phase, unless `--full` is passed. An occupancy
+begins whenever the workflow enters a phase — including a rewind back into it, a
+self-transition, or a directed (`--to`) transition — and ends when the workflow
+next enters any phase (including the same one again). Concretely: a gate-blocked
+loop that keeps re-evaluating the same failing gate without transitioning stays in
+one occupancy, so `details` shows once and is omitted on every retry after that;
+a `koto rewind` that lands back on the phase starts a new occupancy, so `details`
+is delivered again on the next `koto next`. It is always absent on `done`
+regardless.
+
+If you need the current phase's `directive`/`details`/`expects` without
+depending on whether this particular response happened to carry them —
+recovering from lost context, or just checking without ticking the workflow —
+`koto status <name>` returns them directly and unconditionally; see the
+`koto status` section of `command-reference.md`. Whenever the current phase
+declares instructions, `directive` also carries a short koto-authored pointer to
+that command, regardless of whether `details` is present on this particular
+response — so the pointer is there precisely when it's needed, on the very
+responses that suppressed the details.
 
 `blocking_conditions` is present only on `evidence_required` and `gate_blocked`. On all
 other action types the key does not appear.
@@ -52,7 +71,7 @@ are blocking.
   "action": "evidence_required",
   "state": "review",
   "directive": "Check the output and submit your assessment.",
-  "details": "Extended guidance shown on first visit only.",
+  "details": "Extended guidance shown once per occupancy of this state.",
   "advanced": false,
   "expects": {
     "event_type": "evidence_submitted",
@@ -85,7 +104,8 @@ are blocking.
 - `options` is omitted entirely when the template has no conditional transitions. If
   absent, there is only a fallback transition and all evidence values lead to the same
   next state.
-- `details` is omitted on subsequent visits unless `--full` is passed.
+- `details` is omitted once it's already been delivered for the current occupancy of
+  this phase, unless `--full` is passed.
 
 Submit evidence with:
 ```
@@ -145,8 +165,10 @@ template lets the agent submit override evidence instead of being fully blocked.
   rather than `gate_blocked`.
 - `agent_actionable: true` means the agent can also call `koto overrides record` to
   mark the gate as passed, as an alternative to submitting evidence.
-- `details` is absent here because this is a repeat visit. It would appear on the first
-  visit to this state.
+- `details` is absent here because it was already delivered earlier in this occupancy
+  of the state (for example, an earlier tick against the same failing gate). It would
+  appear again if the workflow left and re-entered this state — via rewind, a
+  self-transition, or a directed transition — starting a new occupancy.
 - `options` is absent from `expects` here because there are no conditional transitions
   (all transitions use the fallback path or a single `when` condition).
 
@@ -525,7 +547,9 @@ Several fields are conditionally absent rather than `null`. When writing code to
 - Check `action` before assuming `blocking_conditions` is present — it only appears on
   `evidence_required` and `gate_blocked`.
 - Check whether `details` is present before reading it; it may be omitted on any action
-  type depending on visit count.
+  type once it's already been delivered for the phase's current occupancy. Use
+  `koto status <name>` (see `command-reference.md`) to retrieve it unconditionally
+  without depending on delivery state.
 - `expects` is always written but may be `null` — this is not the same as absent.
 - `options` inside an `expects` object is omitted (not written) when empty, not written
   as `[]`.

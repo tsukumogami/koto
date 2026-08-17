@@ -64,7 +64,7 @@ After init, follow the koto execution loop:
    - `evidence_required` -- the state needs you to submit data. Do the work, then call `koto next --with-data '{"field": "value"}'`
    - `gate_blocked` -- a precondition hasn't been met. Read `blocking_conditions` for what's failing, fix it, then call `koto next` again
    - `done` -- the workflow finished
-3. Read the `directive` for instructions. On first visit to a state, a `details` field may contain extended guidance (pass `--full` to force it on repeat visits)
+3. Read the `directive` for instructions. A `details` field may contain extended guidance -- it's delivered once per occupancy of a state (each time the workflow enters it, including a rewind or a self-transition back into it) and omitted on further ticks that don't leave and re-enter the state (pass `--full` to force it through anyway). `koto status <session-name>` retrieves the current state's `directive`/`details`/`expects` unconditionally, without depending on delivery state -- useful for recovering guidance you've lost track of
 4. Repeat until `action` is `done`
 
 Each item in `blocking_conditions` has six fields:

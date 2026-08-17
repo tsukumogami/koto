@@ -2904,14 +2904,14 @@ fn handle_next(
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
         blocking_conditions_from_gates, ErrorDetail, ExpectsSchema, IntegrationOutput,
-        IntegrationUnavailableMarker, NextError, NextErrorCode, NextResponse,
+        IntegrationUnavailableMarker, NextError, NextErrorCode, NextResponse, RECOVERY_POINTER,
     };
     use crate::engine::advance::{
         advance_until_stop, merge_epoch_evidence, ActionResult, AdvanceError, IntegrationError,
         StopReason,
     };
     use crate::engine::evidence::validate_evidence;
-    use crate::engine::persistence::{derive_evidence, derive_visit_counts};
+    use crate::engine::persistence::{derive_evidence, instructions_delivered_this_occupancy};
     use crate::engine::substitute::Variables;
     use crate::gate::evaluate_gates;
     use std::sync::atomic::AtomicBool;
@@ -3338,7 +3338,11 @@ fn handle_next(
             to: target.clone(),
             rationale: rationale.clone(),
         };
-        if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
+        // Captured so the in-memory event built below (for the delivery
+        // predicate) carries the same timestamp actually persisted,
+        // rather than a second, slightly later `now_iso8601()` call.
+        let directed_ts = now_iso8601();
+        if let Err(e) = backend.append_event(&name, &payload, &directed_ts) {
             let ne = NextError {
                 code: NextErrorCode::PersistenceError,
                 message: e.to_string(),
@@ -3358,6 +3362,73 @@ fn handle_next(
                     let d = crate::cli::vars::substitute_vars(d, &runtime_vars);
                     variables.substitute(&d)
                 });
+
+                // Whether this occupancy has already delivered the
+                // target phase's instructions. Guarded by
+                // `details.is_empty()` like the natural path, so an
+                // instruction-free phase pays neither this check nor
+                // the write below. The event list is built in memory
+                // from `events` (read once at tick start, before this
+                // directed transition appended) plus the
+                // `DirectedTransition` payload just appended above --
+                // no re-read of the log, which is what keeps this path
+                // from performing a file read the pre-change binary did
+                // not perform (PRD R18).
+                // `instructions_delivered_this_occupancy` only inspects
+                // `.payload`, so a synthetic `Event` wrapping the same
+                // payload and timestamp already persisted is equivalent
+                // to reading it back.
+                //
+                // This provably evaluates to `false` on every call: the
+                // synthetic event is the entry event `occupancy_slice`
+                // matches on, it is always the newest element in
+                // `post_events`, and nothing can follow the newest
+                // element -- so the occupancy slice it computes against
+                // is always empty. That is not dead code standing in
+                // for a constant. A directed transition always appends
+                // a fresh entry event immediately before this check, so
+                // it always starts a fresh, undelivered occupancy by
+                // construction (DESIGN-inline-phase-details.md: "each
+                // [arrival path] starts a fresh occupancy with no
+                // special case in the predicate") -- the general
+                // predicate mechanically derives the right answer here
+                // rather than this call site asserting it. Sharing the
+                // one predicate both call sites use, instead of
+                // hardcoding the answer, is what keeps this path from
+                // silently drifting if the directed-transition append
+                // ever stops being the immediately-preceding event, and
+                // is what satisfies this issue's own acceptance
+                // criterion that this path build its event list in
+                // memory rather than assume a value.
+                let already_delivered = if target_template_state.details.is_empty() {
+                    false
+                } else {
+                    let post_events: Vec<Event> = events
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(Event {
+                            seq: events.len() as u64 + 1,
+                            timestamp: directed_ts.clone(),
+                            event_type: payload.type_name().to_string(),
+                            payload: payload.clone(),
+                            idempotency_hash: None,
+                        }))
+                        .collect();
+                    instructions_delivered_this_occupancy(&post_events, target)
+                };
+                let resp = resp.with_details_suppressed_unless_full(already_delivered, full);
+
+                // The recovery pointer, spliced before the abandonment
+                // notice below for the same both-apply ordering the
+                // natural path follows. Gated on whether the *target*
+                // phase declares instructions, not on whether this
+                // response carries them.
+                let resp = if target_template_state.details.is_empty() {
+                    resp
+                } else {
+                    resp.with_directive_prefix(RECOVERY_POINTER)
+                };
+
                 // The abandonment notice, spliced after classification
                 // and after variable substitution. Prepending
                 // caller-influenced text ahead of the substitution
@@ -3379,6 +3450,22 @@ fn handle_next(
                     None => resp,
                 };
                 println!("{}", serde_json::to_string(&resp)?);
+                // The delivery record is appended only after printing --
+                // see the natural-advancement path for the crash-
+                // direction rationale. Non-fatal on error: the response
+                // has already shipped.
+                if resp.carries_details() {
+                    let ts = now_iso8601();
+                    let delivery_payload = EventPayload::InstructionsDelivered {
+                        state: target.clone(),
+                    };
+                    if let Err(e) = backend.append_event(&name, &delivery_payload, &ts) {
+                        eprintln!(
+                            "warning: failed to append InstructionsDelivered event: {}",
+                            e
+                        );
+                    }
+                }
                 // Auto-cleanup after output when reaching a terminal state.
                 if let next_types::NextResponse::Terminal {
                     state: final_state, ..
@@ -3996,22 +4083,15 @@ fn handle_next(
             // runtime and template variable substitution before serialization.
             let directive = final_template_state.directive.clone();
 
-            // Derive visit counts to decide whether to include details.
-            // Re-read events to capture transitions appended during the advancement loop.
+            // Whether this phase declares instructions at all. The
+            // suppression decision itself is deferred to
+            // `with_details_suppressed_unless_full` below, applied
+            // uniformly with the directed path (DESIGN-inline-phase-
+            // details.md Decision 3).
             let details = if final_template_state.details.is_empty() {
                 None
             } else {
-                let post_events = backend
-                    .read_events(&name)
-                    .map(|(_, evts)| evts)
-                    .unwrap_or_default();
-                let visit_counts = derive_visit_counts(&post_events);
-                let count = visit_counts.get(final_state.as_str()).copied().unwrap_or(0);
-                if full || count <= 1 {
-                    Some(final_template_state.details.clone())
-                } else {
-                    None
-                }
+                Some(final_template_state.details.clone())
             };
 
             // Issue 7: run the discovery scan once per tick. The
@@ -4199,6 +4279,40 @@ fn handle_next(
                 let d = crate::cli::vars::substitute_vars(d, &runtime_vars);
                 variables.substitute(&d)
             });
+
+            // Whether this occupancy has already delivered the phase's
+            // instructions. Guarded by the same `details.is_empty()`
+            // check as above -- an instruction-free phase pays neither
+            // this read nor the write below, which is what preserves
+            // R6/R18's byte-identity guarantee. The events are re-read
+            // here (rather than reusing an earlier read) because the
+            // advancement loop above may have appended transitions and
+            // gate evaluations since the last read.
+            let already_delivered = if final_template_state.details.is_empty() {
+                false
+            } else {
+                let post_events = backend
+                    .read_events(&name)
+                    .map(|(_, evts)| evts)
+                    .unwrap_or_default();
+                instructions_delivered_this_occupancy(&post_events, final_state)
+            };
+            let resp = resp.with_details_suppressed_unless_full(already_delivered, full);
+
+            // The recovery pointer, spliced before the abandonment notice
+            // below so the notice ends up closest to the front of
+            // `directive` when both apply (DESIGN-inline-phase-details.md
+            // "Splice ordering when both notices apply"). Gated on
+            // whether the phase declares instructions -- not on whether
+            // this response carries them -- so it reaches suppressed
+            // responses too, which is exactly where a context-lost agent
+            // needs it.
+            let resp = if final_template_state.details.is_empty() {
+                resp
+            } else {
+                resp.with_directive_prefix(RECOVERY_POINTER)
+            };
+
             // The abandonment notice, spliced after classification and
             // after variable substitution so caller-influenced text is
             // never exposed to `{{...}}` expansion. The `action` table
@@ -4478,6 +4592,25 @@ fn handle_next(
                 "{}",
                 serde_json::to_string(&serde_json::Value::Object(envelope))?
             );
+            // The delivery record is appended only after the response
+            // prints, so a crash between the two re-delivers on the
+            // next tick rather than silently suppressing
+            // (DESIGN-inline-phase-details.md, "Data flow, natural-
+            // advancement path", step 4). Non-fatal on error, matching
+            // the SchedulerRan/BatchFinalized append idiom above: the
+            // response has already shipped and cannot be un-printed.
+            if resp.carries_details() {
+                let ts = now_iso8601();
+                let payload = EventPayload::InstructionsDelivered {
+                    state: final_state.clone(),
+                };
+                if let Err(e) = backend.append_event(&name, &payload, &ts) {
+                    eprintln!(
+                        "warning: failed to append InstructionsDelivered event: {}",
+                        e
+                    );
+                }
+            }
             // Auto-cleanup after output when reaching a terminal state.
             if let NextResponse::Terminal {
                 state: final_state, ..
@@ -4827,6 +4960,16 @@ fn handle_decisions_list(backend: &dyn SessionBackend, name: String) -> Result<(
 /// and terminal status. Read-only: does not evaluate gates, run actions,
 /// or modify the state file.
 ///
+/// Also returns the current phase's instructions as `directive`, `details`,
+/// and `expects` -- conditionally-present keys, absent together when the
+/// phase is terminal and absent individually when the phase declares
+/// neither instructions nor an accepts schema. `directive`/`details` are
+/// substituted through the same pipeline `koto next` uses, so recovered
+/// text matches byte-for-byte. A conditionally-present
+/// `template_hash_mismatch` key reports (rather than fails on) a divergence
+/// between the compiled template read and the hash recorded in the session
+/// header (Issue 3 of PLAN-inline-phase-details.md).
+///
 /// Takes `&Backend` (the concrete enum) rather than `&dyn SessionBackend`
 /// so it can call the inherent `Backend::is_cloud()` accessor to gate
 /// `stale_template_source_dir` wording -- mirrors `handle_resolve`'s
@@ -4895,10 +5038,8 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
         }
     };
 
-    let is_terminal = compiled
-        .states
-        .get(&machine_state.current_state)
-        .is_some_and(|s| s.terminal);
+    let current_template_state = compiled.states.get(&machine_state.current_state);
+    let is_terminal = current_template_state.is_some_and(|s| s.terminal);
 
     let mut response = serde_json::json!({
         "name": name,
@@ -4907,6 +5048,76 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
         "template_hash": machine_state.template_hash,
         "is_terminal": is_terminal,
     });
+
+    // Verify the compiled template read above against the hash recorded
+    // in the session header -- the same check `koto next` performs
+    // before trusting `compiled` (src/cli/mod.rs:3220). `koto next` fails
+    // closed on a mismatch; `handle_status` cannot do the same without
+    // denying an agent its only recovery path at exactly the moment it
+    // has nothing else, so it reports instead of failing. This closes
+    // the pre-existing gap where `is_terminal` above was computed from
+    // an unverified read (DESIGN-inline-phase-details.md Security
+    // Considerations).
+    let actual_template_hash = sha256_hex(&template_bytes);
+    if actual_template_hash != machine_state.template_hash {
+        response["template_hash_mismatch"] = serde_json::json!({
+            "recorded": machine_state.template_hash,
+            "actual": actual_template_hash,
+        });
+    }
+
+    // Optional `directive`/`details`/`expects` — the current phase's
+    // instructions, retrievable without moving the workflow (Issue 3 of
+    // PLAN-inline-phase-details.md). Absent together when the phase is
+    // terminal, matching the terminal response variant's existing
+    // behaviour of carrying no directive (PRD R13). `details` is
+    // additionally absent when the phase declares none. Neither absence
+    // is an error.
+    //
+    // This retrieval always returns the full instructions regardless of
+    // the delivery rule `koto next` applies (PRD R10), and it appends
+    // nothing: no delivery record, no other event, and no lock is taken
+    // anywhere in this function.
+    if let Some(state) = current_template_state {
+        if !state.terminal {
+            let mut runtime_vars = std::collections::HashMap::new();
+            runtime_vars.insert(
+                "SESSION_DIR".to_string(),
+                backend.session_dir(name).to_string_lossy().to_string(),
+            );
+            runtime_vars.insert("SESSION_NAME".to_string(), name.to_string());
+
+            // Re-validates values as defense in depth, mirroring
+            // `handle_next`'s construction of the same type -- this is
+            // the "same two-layer pipeline" `koto next` substitutes
+            // through, so recovered text matches byte-for-byte
+            // (DESIGN-inline-phase-details.md "koto status output").
+            let variables = match crate::engine::substitute::Variables::from_events(&events) {
+                Ok(v) => v,
+                Err(e) => {
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": format!("variable re-validation failed: {}", e),
+                            "command": "status"
+                        }),
+                        EXIT_INFRASTRUCTURE,
+                    );
+                }
+            };
+            let substitute = |raw: &str| -> String {
+                let d = crate::cli::vars::substitute_vars(raw, &runtime_vars);
+                variables.substitute(&d)
+            };
+
+            response["directive"] = serde_json::json!(substitute(&state.directive));
+            if !state.details.is_empty() {
+                response["details"] = serde_json::json!(substitute(&state.details));
+            }
+            if let Some(expects) = crate::cli::next_types::derive_expects(state) {
+                response["expects"] = serde_json::to_value(&expects)?;
+            }
+        }
+    }
 
     // Optional `batch` section — populated when the parent is
     // batch-scoped (current state has a `materialize_children` hook)

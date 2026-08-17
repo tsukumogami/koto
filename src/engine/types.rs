@@ -777,6 +777,38 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         issued_by: Option<String>,
     },
+    /// Records that a response carried a phase's instructions to a caller.
+    ///
+    /// **Nothing appends this yet.** The variant lands ahead of the code that
+    /// writes it so the log format and the predicate reading it can be settled
+    /// and tested before any response changes. Until that wiring exists, a
+    /// session log will never contain one.
+    ///
+    /// Records only the phase the delivery applies to. Whether the caller has
+    /// already been given a phase's instructions cannot be derived from the
+    /// events that already exist: a non-advancing tick on an `accepts`-only
+    /// phase appends nothing at all, so two sessions differing only in whether
+    /// instructions were delivered would produce byte-identical logs. See
+    /// DESIGN-inline-phase-details.md Decision 1.
+    ///
+    /// The phase is named rather than left implicit so a reader can tell a
+    /// delivery belonging to an intermediate phase of a multi-hop advance from
+    /// one belonging to the phase the workflow now occupies. Additive per
+    /// `docs/STABILITY.md`, so it does not move `CURRENT_SCHEMA_VERSION` -- an
+    /// older build lands it in `Unknown` and reads the rest of the log unharmed.
+    ///
+    /// Declared last among the real variants on purpose. The enum is
+    /// `#[serde(untagged)]`, and untagged struct variants ignore fields they do
+    /// not declare, so a variant requiring only `state` matches any payload
+    /// carrying a `state` -- including `WorkflowCancelled`'s and
+    /// `DecisionRecorded`'s. Production reads never see that, because they
+    /// dispatch on `Event`'s `type` string rather than through the derived
+    /// impl, but keeping this variant behind the more specific ones costs
+    /// nothing and removes the trap for anyone who does reach for it.
+    InstructionsDelivered {
+        /// The phase whose instructions the response carried.
+        state: String,
+    },
     /// Catch-all for event type strings not recognized by this koto version.
     ///
     /// Enables graceful degradation when reading logs produced by a newer
@@ -1005,6 +1037,7 @@ impl EventPayload {
             EventPayload::RequestLegResult { .. } => "request.leg_result",
             EventPayload::RequestLegAbandoned { .. } => "request.leg_abandoned",
             EventPayload::RequestClosed { .. } => "request.closed",
+            EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
             EventPayload::Unknown { .. } => "unknown",
         }
     }
@@ -1328,6 +1361,11 @@ impl<'de> Deserialize<'de> for Event {
                     issued_by: p.issued_by,
                 }
             }
+            "instructions_delivered" => {
+                let p: InstructionsDeliveredPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::InstructionsDelivered { state: p.state }
+            }
             other => EventPayload::Unknown {
                 type_name: other.to_string(),
                 raw_payload: payload_val.clone(),
@@ -1412,6 +1450,11 @@ struct ContextAddedPayload {
 #[derive(Deserialize)]
 struct ContextRemovedPayload {
     key: String,
+}
+
+#[derive(Deserialize)]
+struct InstructionsDeliveredPayload {
+    state: String,
 }
 
 #[derive(Deserialize)]
@@ -3370,12 +3413,80 @@ mod tests {
     }
 
     #[test]
-    fn adding_the_request_family_does_not_move_the_schema_version() {
+    fn additive_variants_do_not_move_the_schema_version() {
         // Bumping the constant would make every new log unreadable to an
         // older koto at the header line, converting graceful degradation
         // into a hard error. The request family is additive and rides the
-        // Unknown fallthrough instead.
+        // Unknown fallthrough instead, and so does `instructions_delivered`:
+        // neither is a required event type, so neither meets the bump
+        // condition the constant's own doc comment states.
         assert_eq!(CURRENT_SCHEMA_VERSION, 1);
+
+        // Every additive variant added since the constant was pinned still
+        // round-trips at version 1.
+        for payload in [
+            EventPayload::RequestClosed {
+                request_id: "r1".to_string(),
+                disposition: CloseDisposition::AllResolved,
+                issued_by: None,
+            },
+            EventPayload::InstructionsDelivered {
+                state: "implement".to_string(),
+            },
+        ] {
+            let e = Event {
+                seq: 1,
+                timestamp: "2026-07-30T00:00:00Z".to_string(),
+                event_type: payload.type_name().to_string(),
+                payload,
+                idempotency_hash: None,
+            };
+            let json = serde_json::to_string(&e).unwrap();
+            let back: Event = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.payload, e.payload);
+        }
+    }
+
+    #[test]
+    fn instructions_delivered_round_trips_and_its_envelope_falls_through_to_unknown() {
+        let e = Event {
+            seq: 9,
+            timestamp: "2026-08-16T00:00:00Z".to_string(),
+            event_type: "instructions_delivered".to_string(),
+            payload: EventPayload::InstructionsDelivered {
+                state: "implement".to_string(),
+            },
+            idempotency_hash: None,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // The wire form is an ordinary envelope: nothing about it needs a
+        // reader that knows the variant.
+        assert_eq!(val["type"], "instructions_delivered");
+        assert_eq!(val["payload"]["state"], "implement");
+
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.payload, e.payload);
+
+        // An older build is this deserializer minus the
+        // `"instructions_delivered"` arm, and the arm is selected on the
+        // `type` string alone. Feeding the same envelope under a type string
+        // no build knows exercises the path such a build would take: the
+        // record lands in `Unknown` with its payload intact rather than
+        // failing the log read.
+        let as_older_build = json.replace("instructions_delivered", "some_future_event");
+        let degraded: Event = serde_json::from_str(&as_older_build).unwrap();
+        match &degraded.payload {
+            EventPayload::Unknown {
+                type_name,
+                raw_payload,
+            } => {
+                assert_eq!(type_name, "some_future_event");
+                assert_eq!(raw_payload["state"], "implement");
+            }
+            other => panic!("expected Unknown, got {:?}", other),
+        }
     }
 
     #[test]

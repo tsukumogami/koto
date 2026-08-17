@@ -115,11 +115,15 @@ Work through the design in this order:
 5. Identify preconditions -- these need gates.
 ```
 
-Content before the marker is the **directive** -- always returned by `koto next`. Content after is the **details** -- returned only on first visit to the state, or when the caller passes `--full`.
+Content before the marker is the **directive** -- always returned by `koto next`. Content after is the **details** -- delivered once per **occupancy** of the state, or whenever the caller passes `--full`.
 
-Use details for multi-paragraph instructions, step-by-step procedures, or reference material that clutters the directive on repeat visits. Keep the directive itself short: a one- or two-line summary of what the state expects.
+An occupancy begins when the workflow enters a state -- including a rewind back into it, a self-transition, or a directed (`--to`) transition -- and ends when the workflow next enters any state (including the same one again). This is what an author can rely on: a gate-blocked self-loop that keeps re-evaluating the same failing gate without transitioning stays in one occupancy, so the agent sees `details` once and not again on every retry -- don't write directive text that assumes it repeats. A rewind back into the state, on the other hand, starts a new occupancy and re-delivers `details` -- useful when a phase is meant to be redone with its full instructions in view again.
+
+Use details for multi-paragraph instructions, step-by-step procedures, or reference material that clutters the directive on repeat ticks within the same occupancy. Keep the directive itself short: a one- or two-line summary of what the state expects, since it's what the agent sees on every tick regardless of delivery state.
 
 States without the marker behave exactly as before -- everything is the directive, and `details` is empty.
+
+An agent that has lost track of a state's `details` can retrieve them unconditionally with `koto status <session-name>` -- it returns the current state's `directive`, `details`, and `expects` regardless of what's already been delivered, and records no delivery itself. `koto next` responses also carry a short pointer to this command in `directive` whenever the current state declares instructions, whether or not this particular response included them.
 
 If a section contains multiple `<!-- details -->` markers, only the first one counts. Everything after the first marker is details.
 

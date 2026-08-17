@@ -93,7 +93,7 @@ Gets the current state directive. Submits evidence when `--with-data` is provide
 | `--with-data <json>` | Submit evidence as a JSON object. Must conform to the state's `accepts` schema. Max 1 MB. The `"gates"` key is reserved and rejected. Mutually exclusive with `--to`. Prefix with `@` to read the payload from a file (e.g. `--with-data @evidence.json`); the file is also capped at 1 MB. |
 | `--to <state>` | Force a directed transition to a named state. Must be a valid transition target from the current state. Mutually exclusive with `--with-data`. |
 | `--no-cleanup` | Skip automatic session cleanup when the workflow reaches a terminal state. Useful for debugging artifacts after a workflow ends. |
-| `--full` | Always include the `details` field, even on repeat visits to a state. By default `details` is omitted after the first visit. |
+| `--full` | Always include the `details` field, even if it was already delivered earlier in this occupancy of the state. By default `details` is omitted once delivered, until the workflow leaves and re-enters the state. |
 | `--dispatch-epoch <n>` | The epoch this writer was dispatched with. Required for `--with-data` writes against a child workflow's log; validated before any persistence call and rejected with `epoch_fence_violation` (exit 65) on a mismatch. Parent-workflow ticks don't need it. The same value goes on `koto request progress` / `resolve` / `abandon` for a bound leg. |
 
 **Output shapes** are determined by the `action` field. See `response-shapes.md` for all nine annotated scenarios.
@@ -274,7 +274,7 @@ The `parent_workflow` field is `null` for parentless workflows and a string with
 koto status <name>
 ```
 
-Returns read-only state metadata for a workflow. No gates are evaluated, no actions run, no state changes happen. Useful for checking child workflow progress from a parent agent.
+Returns read-only state metadata for a workflow. No gates are evaluated, no actions run, no state changes happen. Useful for checking child workflow progress from a parent agent, and for recovering the current phase's own instructions -- see below.
 
 | Argument | Required | Description |
 |---|---|---|
@@ -290,6 +290,59 @@ Returns read-only state metadata for a workflow. No gates are evaluated, no acti
   "is_terminal": false
 }
 ```
+
+### Retrieving the current phase's instructions
+
+When the workflow is not at a terminal state, the response also carries the
+current phase's own `directive`, `details`, and `expects` -- the same fields
+`koto next` would show, substituted through the identical pipeline so the text
+matches byte-for-byte:
+
+```json
+{
+  "name": "design.research-agent",
+  "current_state": "synthesize",
+  "template_path": ".koto/research.template.json",
+  "template_hash": "a1b2c3...",
+  "is_terminal": false,
+  "directive": "Synthesize the research findings into a summary.",
+  "details": "Read each child's findings with `koto context get <child> findings`...",
+  "expects": {"event_type": "evidence_submitted", "fields": {"summary": {"type": "string", "required": true}}}
+}
+```
+
+This is the retrieval an agent that has lost context reaches for: it always
+returns the full instructions, regardless of whether `koto next` would suppress
+`details` on the next tick, and calling it records no delivery and changes
+nothing. Every `koto next` response whose phase declares instructions carries a
+short pointer to this command in its `directive` -- see `response-shapes.md` --
+so an agent that has lost everything else still learns it exists.
+
+Key presence:
+- `directive`, `details`, and `expects` are all **absent** together when
+  `is_terminal` is `true` -- there is nothing to substitute for a terminal phase.
+- `details` is additionally absent (on its own) when the current phase declares
+  no details content, even for a non-terminal phase.
+- Retrieving these keys takes no lock on the session -- including for a
+  batch-scoped parent while another process is mid-tick against it -- and never
+  runs a gate command or a default action to compute them.
+
+A `template_hash_mismatch` key appears only when the template read from disk no
+longer matches the hash recorded in the session header:
+
+```json
+{
+  "template_hash_mismatch": {
+    "recorded": "a1b2c3...",
+    "actual": "d4e5f6..."
+  }
+}
+```
+
+`koto status` reports this rather than failing -- unlike `koto next`, which fails
+closed on the same mismatch -- because this command is often the only recovery
+path an agent has left, and denying it here would defeat the purpose. Absent
+means the template matched; there's no boolean form.
 
 A session bound to a request leg also carries a read-only `leg` section mirroring what the session's own `koto next` returns:
 

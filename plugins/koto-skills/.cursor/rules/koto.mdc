@@ -167,13 +167,22 @@ done
 
 ## The details Field
 
-The `details` field carries extended instructions. It's included on first visit
-to a state and omitted on subsequent visits to save context. Use `--full` to
-force inclusion:
+The `details` field carries extended instructions. It's delivered once per
+**occupancy** of a state -- each time the workflow enters the state, including a
+rewind, a self-transition, or a directed (`--to`) transition back into it -- and
+omitted on any further tick that stays in the same occupancy, to save context.
+Use `--full` to force inclusion regardless:
 
 ```bash
 koto next <session> --full
 ```
+
+If you've lost track of a state's instructions and don't want to force a
+delivery, `koto status <session>` returns the current state's `directive`,
+`details`, and `expects` unconditionally, without depending on delivery state or
+changing anything. Whenever the current state declares instructions, `directive`
+also carries a short pointer to this command -- whether or not `details` came
+along on that particular response.
 
 ## Error Handling
 

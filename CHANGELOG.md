@@ -6,6 +6,57 @@ the project's pre-1.0 versioning treats MINOR as MAJOR per the Cargo
 0.x semver convention (`0.10.0` is breaking-change-eligible relative
 to `0.9.x`).
 
+## [Unreleased]
+
+### Fixed
+
+- **`details` suppression now keys on delivery, not visit count.** koto
+  previously decided whether a `koto next` response carried a phase's
+  long-form `details` by counting entries into the phase's state, which
+  came apart from the thing that actually mattered in both directions: a
+  non-advancing tick (e.g. re-evaluating the same failing gate) re-sent
+  `details` forever, while a `koto rewind` back into a phase the agent
+  was told to redo withheld them because rewind counts as a re-entry, not
+  a fresh visit. The directed-transition path (`koto next --to`) applied
+  no suppression rule at all, so it could disagree with the
+  natural-advancement path on the same phase. The new rule records the
+  fact of delivery directly: an `InstructionsDelivered` event is
+  appended whenever a response carries a phase's `details`, and the
+  suppression predicate
+  (`instructions_delivered_this_occupancy`) asks whether a delivery has
+  happened since the most recent entry into the phase. A shared
+  combinator (`NextResponse::with_details_suppressed_unless_full`) now
+  applies that one rule at both response-construction sites, so the
+  directed path and the natural-advancement path can no longer disagree.
+  `--full` still forces `details` through, and now also records a
+  delivery, so the next plain tick doesn't re-deliver.
+
+### Added
+
+- `koto status <name>` now returns the current phase's `directive`,
+  `details`, and `expects` when the workflow is not at a terminal state —
+  a read-only retrieval, substituted through the same pipeline `koto
+  next` uses, that returns the phase's full instructions regardless of
+  the delivery rule above and appends nothing (no delivery record, no
+  lock). This is the recovery path for an agent that has lost track of a
+  phase's instructions, or that never received them because they were
+  suppressed. `directive`, `details`, and `expects` are absent together
+  at a terminal phase; `details` is additionally absent when the phase
+  declares none.
+- `koto status <name>` gains a `template_hash_mismatch` key
+  (`{"recorded", "actual"}`) when the compiled template read from disk no
+  longer matches the hash recorded in the session header. Unlike `koto
+  next`, which fails closed on the same mismatch, `koto status` reports
+  it instead of failing, since this command is often the only recovery
+  path an agent has left.
+- Every `koto next` response whose current phase declares instructions
+  now carries a short koto-authored pointer to `koto status` in its
+  `directive`, so an agent that has lost everything else still learns
+  the retrieval exists. The pointer appears whether or not `details` was
+  actually included on that particular response — that's the case it
+  matters most for — and is spliced in before any leg-abandonment
+  notice.
+
 ## [0.10.0] - 2026-05-24
 
 ### Request-store substrate + first stability lockdown
