@@ -1027,7 +1027,12 @@ enum Boundary {
 /// has since left and the slice will span everything that happened after it,
 /// which answers a different question than the caller meant.
 ///
-/// With no qualifying entry event, every event is in scope.
+/// With no qualifying entry event, every event is in scope. Under
+/// [`Boundary::AnyEntry`] the only phase that can be in that position is the
+/// initial one, which the workflow occupies before it has transitioned
+/// anywhere. Under [`Boundary::ArrivalFromElsewhere`] the whole-log arm does
+/// more work than that: a self-transition on the initial phase leaves a log
+/// with no opener at all, and this arm is what makes that lap suppress.
 ///
 /// Only inspects `.payload` and position within `events`; `.seq`,
 /// `.timestamp`, `.event_type`, and `.idempotency_hash` never factor in. The
@@ -1073,6 +1078,16 @@ fn entry_slice<'a>(events: &'a [Event], current_state: &str, boundary: Boundary)
 /// agent last arrived here from somewhere else" -- so they now disagree across a
 /// self-entry, on purpose. Sharing one scan is what keeps them from disagreeing
 /// about anything else.
+///
+/// **Unifying them breaks the dashboard, silently.** This predicate takes the
+/// *latest* gate evaluation inside its slice, so widening the slice changes its
+/// answer whenever the narrow epoch holds no gate evaluation and the wider
+/// window does -- every tick after a self-entry until a fresh evaluation lands.
+/// A gate that failed before the loop's last lap would keep the blocked badge
+/// on. Nothing in the repo tests this function directly; the one test that
+/// catches the mistake is
+/// `the_epoch_and_the_delivery_window_disagree_across_a_self_transition` below,
+/// which asserts both boundaries against a single log.
 fn epoch_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
     entry_slice(events, current_state, Boundary::AnyEntry)
 }
@@ -2594,6 +2609,19 @@ mod tests {
         )
     }
 
+    fn gate_evaluated(seq: u64, state: &str, gate: &str, outcome: &str) -> Event {
+        make_event(
+            seq,
+            EventPayload::GateEvaluated {
+                state: state.to_string(),
+                gate: gate.to_string(),
+                output: serde_json::json!({}),
+                outcome: outcome.to_string(),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+        )
+    }
+
     fn delivered(seq: u64, state: &str) -> Event {
         make_event(
             seq,
@@ -2610,7 +2638,7 @@ mod tests {
     }
 
     #[test]
-    fn instructions_delivered_true_within_the_current_occupancy() {
+    fn instructions_delivered_true_within_the_current_window() {
         let events = vec![
             transitioned(1, None, "gather"),
             delivered(2, "gather"),
@@ -2710,20 +2738,17 @@ mod tests {
         // This is the test that fails loudly if someone widens the shared scan
         // in place instead of keeping two boundaries.
         let events = vec![
-            transitioned(1, None, "review"),
-            delivered(2, "review"),
-            make_event(
-                3,
-                EventPayload::GateEvaluated {
-                    state: "review".to_string(),
-                    gate: "approval".to_string(),
-                    output: serde_json::json!({}),
-                    outcome: "failed".to_string(),
-                    timestamp: "2026-01-01T00:00:00Z".to_string(),
-                },
-            ),
-            transitioned(4, Some("review"), "review"),
+            transitioned(1, None, "gather"),
+            transitioned(2, Some("gather"), "review"),
+            delivered(3, "review"),
+            gate_evaluated(4, "review", "approval", "failed"),
         ];
+        // Before the lap: the failed gate is inside both windows.
+        assert!(latest_epoch_gate_failed(&events, "review"));
+        assert!(instructions_delivered_this_window(&events, "review"));
+
+        let mut events = events;
+        events.push(transitioned(5, Some("review"), "review"));
         assert!(!latest_epoch_gate_failed(&events, "review"));
         assert!(instructions_delivered_this_window(&events, "review"));
     }
