@@ -3378,6 +3378,28 @@ fn handle_next(
                 // `.payload`, so a synthetic `Event` wrapping the same
                 // payload and timestamp already persisted is equivalent
                 // to reading it back.
+                //
+                // This provably evaluates to `false` on every call: the
+                // synthetic event is the entry event `occupancy_slice`
+                // matches on, it is always the newest element in
+                // `post_events`, and nothing can follow the newest
+                // element -- so the occupancy slice it computes against
+                // is always empty. That is not dead code standing in
+                // for a constant. A directed transition always appends
+                // a fresh entry event immediately before this check, so
+                // it always starts a fresh, undelivered occupancy by
+                // construction (DESIGN-inline-phase-details.md: "each
+                // [arrival path] starts a fresh occupancy with no
+                // special case in the predicate") -- the general
+                // predicate mechanically derives the right answer here
+                // rather than this call site asserting it. Sharing the
+                // one predicate both call sites use, instead of
+                // hardcoding the answer, is what keeps this path from
+                // silently drifting if the directed-transition append
+                // ever stops being the immediately-preceding event, and
+                // is what satisfies this issue's own acceptance
+                // criterion that this path build its event list in
+                // memory rather than assume a value.
                 let already_delivered = if target_template_state.details.is_empty() {
                     false
                 } else {
