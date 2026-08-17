@@ -163,7 +163,7 @@ impl BatchErrorContext {
 /// "The one thing the pointer must not key on"). Held under 150
 /// characters by convention (DESIGN-inline-phase-details.md Decision 4).
 pub const RECOVERY_POINTER: &str =
-    "[koto] Lost context? `koto status <session>` returns this phase's directive/details/expects.\n\n";
+    "[koto] Lost context? `koto status <name>` returns this phase's directive/details/expects.\n\n";
 
 impl NextResponse {
     /// Return a new `NextResponse` with the directive and details fields substituted
