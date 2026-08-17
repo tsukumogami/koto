@@ -14,11 +14,29 @@ chain_skipped: []
 chain_ran:
   - name: brief
     started_at: 2026-08-17T08:27:00Z
+  - name: prd
+    started_at: 2026-08-17T08:55:00Z
 child_snapshots:
   brief:
     status: Accepted
     content_hash: fc841d6762abb3b4449718b76ee631db89c6fd45
     captured_at: 2026-08-17T08:52:00Z
+  prd:
+    status: Accepted
+    content_hash: 7c44797614f293776a42bd8e92f7fd690971d007
+    captured_at: 2026-08-17T09:45:00Z
+consolidation_judgments:
+  - hop: brief->prd
+    stage: judgment
+    verdict: keep
+    finding: >-
+      The PRD deliberately cites the BRIEF's Scope Boundary rather than
+      restating it -- its Out of Scope section opens by saying so and lists only
+      the entries that constrain a requirement. Folding would therefore lose the
+      boundary itself unless the whole of it were carried, which is the opposite
+      of compression. The BRIEF also carries five journeys whose entry points the
+      PRD's user stories cover but whose narrative the requirements do not, and
+      it is the document that records the framing decision the PRD operationalizes.
 worktree_rebases:
   - phase: brief
     upstream_commits: []
