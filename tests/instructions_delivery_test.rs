@@ -69,16 +69,24 @@ fn assert_omits(resp: &serde_json::Value, context: &str) {
 }
 
 /// The recovery pointer is gated on the *phase* declaring instructions, not on
-/// this response carrying them, so it must survive suppression. It is the only
-/// route back to a procedure lost inside a loop, which is what makes suppressing
-/// there safe.
+/// this response carrying them, so it must survive suppression. It is the route
+/// back to a procedure lost inside a loop that does not tick the workflow, which
+/// is what makes suppressing there safe.
+///
+/// Asserted against the constant rather than a copied literal, so a pointer that
+/// degraded to something that no longer names `koto status` would fail here.
+///
+/// `starts_with` is the right shape only while no case in this file involves an
+/// abandoned leg: both call sites splice the pointer first and the abandonment
+/// notice after, so a notice lands *ahead* of the pointer. A future case with one
+/// wants `contains`.
 fn assert_pointer(resp: &serde_json::Value, context: &str) {
     let directive = resp
         .get("directive")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     assert!(
-        directive.starts_with("[koto] Lost context?"),
+        directive.starts_with(koto::cli::next_types::RECOVERY_POINTER),
         "{context}: a suppressed response must still name the retrieval, got directive {:?}",
         directive
     );
@@ -820,6 +828,12 @@ fn override_forces_details_through_on_a_suppressed_self_transition() {
 /// an override unblocks the phase, so the next response would belong to a
 /// different phase -- and on this file's gated template, to a terminal one with
 /// no `details` field to assert against at all.
+///
+/// What this actually guards is the `state` field on `DecisionRecorded`: the
+/// payload names a phase, and a scan that matched on the field rather than on the
+/// variant would read it as a delivery for that phase. It is not evidence about
+/// the boundary itself -- both ticks here omit because neither advances, which is
+/// unchanged behavior.
 #[test]
 fn a_recorded_decision_does_not_reopen_the_delivery_window() {
     let dir = TempDir::new().unwrap();
