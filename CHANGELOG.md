@@ -23,13 +23,28 @@ to `0.9.x`).
   fact of delivery directly: an `InstructionsDelivered` event is
   appended whenever a response carries a phase's `details`, and the
   suppression predicate
-  (`instructions_delivered_this_occupancy`) asks whether a delivery has
-  happened since the most recent entry into the phase. A shared
+  (`instructions_delivered_this_window`) asks whether a delivery has
+  happened since the most recent arrival at the phase. A shared
   combinator (`NextResponse::with_details_suppressed_unless_full`) now
   applies that one rule at both response-construction sites, so the
   directed path and the natural-advancement path can no longer disagree.
   `--full` still forces `details` through, and now also records a
   delivery, so the next plain tick doesn't re-deliver.
+
+- **A self-loop no longer re-sends a phase's `details`.** A phase
+  transitioning to itself, and a `koto next --to <phase>` issued while
+  the workflow already occupies that phase, are laps around a loop the
+  agent is already in rather than arrivals at it — the agent still holds
+  the procedure, so it is not re-sent. Only arrival from a different
+  phase delivers, along with any `koto rewind` into the phase, which
+  means redo this rather than continue. This is koto#90's acceptance
+  criterion 3, which the previous rule overrode without citing it. On a
+  long loop the per-lap cost is now the directive alone; an agent that
+  loses the procedure mid-loop recovers it with `koto status <name>`,
+  which every response for a phase that declares instructions names in its
+  `directive`, whether or not that response carried them.
+  The boundary that decides delivery is now separate from the epoch the
+  dashboard's blocked classification reads, so that badge is unchanged.
 
 ### Added
 

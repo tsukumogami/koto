@@ -34,17 +34,22 @@ envelope these ride on. An abandoned leg also prepends a koto-authored stop noti
 `directive` is never present when `action` is `"done"`. The `done` variant has no
 `directive` field in its struct — the key is not written at all, not written as `null`.
 
-`details` follows a delivery rule, not a visit-count: a phase's `details` are
-delivered once per **occupancy** of that phase, then omitted on any further tick
-that doesn't leave and re-enter the phase, unless `--full` is passed. An occupancy
-begins whenever the workflow enters a phase — including a rewind back into it, a
-self-transition, or a directed (`--to`) transition — and ends when the workflow
-next enters any phase (including the same one again). Concretely: a gate-blocked
-loop that keeps re-evaluating the same failing gate without transitioning stays in
-one occupancy, so `details` shows once and is omitted on every retry after that;
-a `koto rewind` that lands back on the phase starts a new occupancy, so `details`
-is delivered again on the next `koto next`. It is always absent on `done`
-regardless.
+`details` follows an arrival rule, not a visit-count: a phase's `details` are
+delivered when you **arrive** at that phase, and omitted on every later tick until
+you arrive again, unless `--full` is passed. You arrive when the workflow enters
+the phase from a different phase — however it got there, including a loop-back
+from later in the workflow, a directed (`--to`) transition, or a multi-hop tick
+that passes through another phase and comes back. A `koto rewind` into the phase
+also counts as an arrival, whichever phase it came from, because a rewind means
+redo this rather than continue.
+
+You have not arrived when the workflow goes around a loop it is already in. A
+conditional self-transition (`P -> P`) and a `koto next --to P` issued while you
+are already at `P` are both laps, not arrivals, and repeat nothing. Neither does a
+tick that does not move at all: a gate-blocked loop re-evaluating the same failing
+gate shows `details` once and omits it on every retry after that.
+
+`details` is always absent on `done`, regardless.
 
 If you need the current phase's `directive`/`details`/`expects` without
 depending on whether this particular response happened to carry them —
@@ -71,7 +76,7 @@ are blocking.
   "action": "evidence_required",
   "state": "review",
   "directive": "Check the output and submit your assessment.",
-  "details": "Extended guidance shown once per occupancy of this state.",
+  "details": "Extended guidance shown when you arrive at this state.",
   "advanced": false,
   "expects": {
     "event_type": "evidence_submitted",
@@ -104,7 +109,7 @@ are blocking.
 - `options` is omitted entirely when the template has no conditional transitions. If
   absent, there is only a fallback transition and all evidence values lead to the same
   next state.
-- `details` is omitted once it's already been delivered for the current occupancy of
+- `details` is omitted once it's already been delivered since you last arrived at
   this phase, unless `--full` is passed.
 
 Submit evidence with:
@@ -165,10 +170,11 @@ template lets the agent submit override evidence instead of being fully blocked.
   rather than `gate_blocked`.
 - `agent_actionable: true` means the agent can also call `koto overrides record` to
   mark the gate as passed, as an alternative to submitting evidence.
-- `details` is absent here because it was already delivered earlier in this occupancy
-  of the state (for example, an earlier tick against the same failing gate). It would
-  appear again if the workflow left and re-entered this state — via rewind, a
-  self-transition, or a directed transition — starting a new occupancy.
+- `details` is absent here because it was already delivered since you last arrived at
+  this state (for example, on an earlier tick against the same failing gate). It would
+  appear again on the next arrival — the workflow moving to a different state and
+  coming back, or a `koto rewind` into this one. A self-transition would not bring it
+  back: that is a lap, not an arrival.
 - `options` is absent from `expects` here because there are no conditional transitions
   (all transitions use the fallback path or a single `when` condition).
 
@@ -547,9 +553,11 @@ Several fields are conditionally absent rather than `null`. When writing code to
 - Check `action` before assuming `blocking_conditions` is present — it only appears on
   `evidence_required` and `gate_blocked`.
 - Check whether `details` is present before reading it; it may be omitted on any action
-  type once it's already been delivered for the phase's current occupancy. Use
+  type once it's already been delivered since you last arrived at the phase. Use
   `koto status <name>` (see `command-reference.md`) to retrieve it unconditionally
-  without depending on delivery state.
+  without depending on delivery state. On a long loop that and `koto next --full` are
+  the only ways back to it — no plain lap will re-deliver — and only `koto status`
+  gets there without ticking the workflow.
 - `expects` is always written but may be `null` — this is not the same as absent.
 - `options` inside an `expects` object is omitted (not written) when empty, not written
   as `[]`.

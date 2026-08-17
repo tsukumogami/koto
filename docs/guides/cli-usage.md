@@ -79,7 +79,7 @@ koto next coord --with-data @tasks.json
 
 The 1 MB cap applies to both forms (file size is checked before reading). Use `@-` is **not** supported; only file paths are accepted after `@`.
 
-- `--full` -- Include the `details` field in the response regardless of delivery state. By default, `details` is delivered once per occupancy of a state (each time the workflow enters it -- including a rewind, a self-transition, or a directed transition back into it) and omitted on any further tick that stays in the same occupancy. This flag forces inclusion every time.
+- `--full` -- Include the `details` field in the response regardless of delivery state. By default, `details` is delivered when the workflow arrives at a state -- entering it from a different state, or being rewound into it -- and omitted on every later tick until it arrives again. Going around a loop it is already in is not an arrival: a self-transition, and a `--to` transition into the state the workflow already occupies, both repeat nothing. What decides it is whether the entry event that landed the workflow records a different source state -- so a tick that leaves a state, passes through another, and comes back within the same tick does deliver. This flag forces inclusion every time.
 - `--no-cleanup` -- Skip automatic session directory cleanup when the workflow reaches a terminal state. Useful for debugging or when you need to inspect session artifacts after completion. Without this flag, koto removes the session directory once it outputs the terminal response.
 
 **Runtime variable substitution:**
@@ -114,7 +114,7 @@ Every successful response is a JSON object with an `action` field and an `error`
 | `unassigned_children` | array | array | array | array | array | array |
 | `error` | `null` | `null` | `null` | `null` | `null` | `null` |
 
-"yes" = always present. "--" = absent from the JSON (not `null`, just missing). "object or `null`" = present as an object when the state has an `accepts` block, `null` otherwise. "optional" = present once per occupancy of the state (or when `--full` is passed), absent on any further tick within the same occupancy and when the state has no details content. Use `koto status <name>` to retrieve `directive`/`details`/`expects` unconditionally regardless of delivery state -- see the `status` command below.
+"yes" = always present. "--" = absent from the JSON (not `null`, just missing). "object or `null`" = present as an object when the state has an `accepts` block, `null` otherwise. "optional" = present when the workflow arrives at the state (or when `--full` is passed), absent on every later tick until it arrives again and when the state has no details content. Use `koto status <name>` to retrieve `directive`/`details`/`expects` unconditionally regardless of delivery state -- see the `status` command below.
 
 The `unassigned_children` array is present on every `NextResponse` variant (including Terminal `done` and Error) so coordinator-side consumers branch uniformly on the field rather than on the action label. Each element describes a child workflow waiting on agent dispatch with fields `child_session_id`, `role`, `template`, `inputs` (optional), `requested_by`, `created_at`, and `dispatch_epoch`. The discovery scan populates the list from headers under `~/.koto/sessions/*` whose request-store fields name the workflow being ticked as their `coordinator_of_record` and that have not yet been claimed; the list caps at `request_store.directive_batch_size` (default 50) per tick, with overflow surfaced on subsequent ticks.
 

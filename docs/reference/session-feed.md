@@ -680,16 +680,21 @@ recover it.
 #### `instructions_delivered`
 
 Records that a `koto next` response carried a phase's instructions to whoever
-called it. A phase's occupancy runs from the state-entry event naming it to the
-next state-entry event naming any phase; a delivery recorded inside that window
-is what will let a later non-advancing response for the same phase leave the
-instructions out.
+called it. A phase's delivery window runs from the state-entry event by which the
+workflow *arrived* at it — an entry recording a different source phase, an entry
+recording no source at all, as `koto init`'s does, or any rewind — to the end of
+the log. With no such entry anywhere in the log, every event is in scope. A delivery recorded inside that window is what
+lets a later response for the same phase leave the instructions out.
 
-**Not emitted yet.** The event type is reserved and its shape is fixed, but no
-koto build appends one: instruction suppression is still keyed on visit count.
-A reader will not find this event in any session log written today. It is
-documented here because the type is part of the feed contract from the moment
-it exists, and a reader of a future log needs to know what it means.
+The window is deliberately not the epoch that the gate-blocked classification
+reads. An entry event recording the same phase as both source and target — a
+self-transition, or a directed transition into the phase the workflow already
+occupies — closes the epoch but does not open a delivery window, so an agent
+going around a loop it is already in is not re-sent instructions it holds.
+
+Both `koto next` response-construction paths append this event, after the
+response has been printed. The ordering is deliberate: a crash between printing
+and appending re-delivers on the next tick, which is the benign direction.
 
 Nothing else in the feed can stand in for it. A non-advancing tick on a phase
 that is only waiting for evidence appends nothing at all, so two sessions

@@ -371,11 +371,11 @@ impl NextResponse {
 
     /// Return a new `NextResponse` with `details` suppressed (set to
     /// `None`) when the phase's instructions have already been
-    /// delivered during the current occupancy and the caller did not
-    /// force them with `--full`.
+    /// delivered inside the current delivery window and the caller did
+    /// not force them with `--full`.
     ///
     /// `already_delivered` is the verdict of
-    /// [`crate::engine::persistence::instructions_delivered_this_occupancy`]
+    /// [`crate::engine::persistence::instructions_delivered_this_window`]
     /// over the response's phase. `full` is the `koto next --full`
     /// override flag; when set, `details` always survives regardless of
     /// delivery history.
