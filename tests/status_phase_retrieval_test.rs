@@ -250,6 +250,81 @@ Slow gate instructions.
 Done.
 "#;
 
+/// A batch-scoped parent: `plan` declares `materialize_children`, which is
+/// the only condition `state_is_batch_scoped` checks and the only thing
+/// that gates `handle_next`'s `lock_state_file` call site. The `done`
+/// gate requires `finalize: yes`, so the parent stays parked in `plan`
+/// with no children ever needing to be spawned -- this fixture only needs
+/// the current state to be batch-scoped, not an actual batch run.
+const BATCH_PARENT_TEMPLATE: &str = r#"---
+name: batch-parent-fixture
+version: "1.0"
+initial_state: plan
+states:
+  plan:
+    accepts:
+      tasks:
+        type: tasks
+        required: true
+      finalize:
+        type: enum
+        required: false
+        values: [yes]
+    gates:
+      done:
+        type: children-complete
+    materialize_children:
+      from_field: tasks
+      default_template: child.md
+    transitions:
+      - target: summarize
+        when:
+          finalize: yes
+  summarize:
+    terminal: true
+---
+
+## plan
+
+Plan the batch.
+
+<!-- details -->
+
+Batch planning instructions.
+
+## summarize
+
+Summarize results.
+"#;
+
+/// The `default_template` `BATCH_PARENT_TEMPLATE` declares -- never
+/// actually spawned in these tests, but `koto init`'s compile step
+/// resolves and validates it eagerly, so it must exist and compile.
+const BATCH_CHILD_TEMPLATE: &str = r#"---
+name: batch-child-fixture
+version: "1.0"
+initial_state: work
+states:
+  work:
+    accepts:
+      marker:
+        type: string
+        required: true
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## work
+
+Do the work.
+
+## done
+
+Done.
+"#;
+
 // ---------------------------------------------------------------------------
 //  directive / details / expects: presence, substitution, terminal/absence
 // ---------------------------------------------------------------------------
@@ -536,6 +611,38 @@ fn status_returns_promptly_while_another_process_holds_the_state_file_lock() {
     assert!(
         elapsed < Duration::from_secs(2),
         "status must not block on a lock held by another process; took {elapsed:?}"
+    );
+}
+
+/// The specific scenario PLAN-inline-phase-details.md's Issue 3 names: a
+/// batch-scoped parent (its current state declares `materialize_children`,
+/// the only condition that gates `handle_next`'s `lock_state_file` call)
+/// with another process holding the advisory lock for a tick.
+#[test]
+fn status_returns_promptly_while_a_batch_scoped_parents_lock_is_held() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("child.md"), BATCH_CHILD_TEMPLATE).unwrap();
+    init_workflow(root, "wf", BATCH_PARENT_TEMPLATE);
+
+    let backend = koto::session::local::LocalBackend::with_base_dir(sessions_base(root));
+    let _guard = backend
+        .lock_state_file("wf")
+        .expect("this test process should be able to acquire the lock uncontended");
+
+    let started = Instant::now();
+    let status = run_koto(root, &["status", "wf"]);
+    let elapsed = started.elapsed();
+
+    assert_eq!(status["current_state"].as_str(), Some("plan"));
+    assert_eq!(
+        status["directive"].as_str(),
+        Some("Plan the batch."),
+        "retrieval should still work normally on a batch-scoped parent: {status}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "status must not block on a batch-scoped parent's held lock; took {elapsed:?}"
     );
 }
 
