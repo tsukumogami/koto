@@ -3382,22 +3382,28 @@ fn handle_next(
                 // it so is `koto next --to P` issued while the workflow
                 // already stands at `P`. The event just appended is then
                 // a `DirectedTransition { from: P, to: P }`, which does
-                // not open a delivery window, so the scan reaches back
-                // past it to the arrival that did and finds that
-                // arrival's delivery record. The answer is `true` and
-                // the instructions are suppressed -- a hand-driven lap
-                // of a declared loop is not an arrival.
+                // not open a delivery window, so the scan looks past it
+                // to whatever window is already open -- and suppresses
+                // if that window holds a delivery. A hand-driven lap of
+                // a declared loop is not an arrival.
                 //
-                // It answers `false` on every other directed
-                // transition, because those do open a window and the
-                // synthetic event is the newest element with nothing
-                // after it. An earlier version of this comment claimed
-                // that was provably the answer on *every* call; it was
-                // true when a self-entry opened a window and is not
-                // now. Sharing one predicate with the natural path,
-                // rather than hardcoding either answer here, is what
-                // let the boundary move without this call site
-                // noticing.
+                // It does not always suppress there, and the exceptions
+                // are the rule working: a window with no record (a crash
+                // between printing a response and appending its record,
+                // or a `--to P` issued as the very first tick after
+                // init) answers `false` and delivers, because the rule
+                // is keyed on a recorded delivery rather than on the
+                // shape of the entry event.
+                //
+                // On every other directed transition the answer is
+                // `false`, because those open a window and the synthetic
+                // event is the newest element with nothing after it. An
+                // earlier version of this comment claimed that was
+                // provably the answer on *every* call; it was true while
+                // a self-entry opened a window and is not now. Sharing
+                // one predicate with the natural path, rather than
+                // hardcoding either answer here, is what let the
+                // boundary move without this call site noticing.
                 let already_delivered = if target_template_state.details.is_empty() {
                     false
                 } else {
