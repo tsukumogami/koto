@@ -779,10 +779,10 @@ pub enum EventPayload {
     },
     /// Records that a response carried a phase's instructions to a caller.
     ///
-    /// **Nothing appends this yet.** The variant lands ahead of the code that
-    /// writes it so the log format and the predicate reading it can be settled
-    /// and tested before any response changes. Until that wiring exists, a
-    /// session log will never contain one.
+    /// Appended by both `koto next` response-construction sites, after the
+    /// response has been printed, when it carried the phase's instructions.
+    /// The ordering is deliberate: a crash between printing and appending
+    /// re-delivers on the next tick, which is the benign direction.
     ///
     /// Records only the phase the delivery applies to. Whether the caller has
     /// already been given a phase's instructions cannot be derived from the

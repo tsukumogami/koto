@@ -2911,7 +2911,7 @@ fn handle_next(
         StopReason,
     };
     use crate::engine::evidence::validate_evidence;
-    use crate::engine::persistence::{derive_evidence, instructions_delivered_this_occupancy};
+    use crate::engine::persistence::{derive_evidence, instructions_delivered_this_window};
     use crate::engine::substitute::Variables;
     use crate::gate::evaluate_gates;
     use std::sync::atomic::AtomicBool;
@@ -3363,43 +3363,41 @@ fn handle_next(
                     variables.substitute(&d)
                 });
 
-                // Whether this occupancy has already delivered the
-                // target phase's instructions. Guarded by
-                // `details.is_empty()` like the natural path, so an
-                // instruction-free phase pays neither this check nor
-                // the write below. The event list is built in memory
-                // from `events` (read once at tick start, before this
-                // directed transition appended) plus the
-                // `DirectedTransition` payload just appended above --
-                // no re-read of the log, which is what keeps this path
-                // from performing a file read the pre-change binary did
-                // not perform (PRD R18).
-                // `instructions_delivered_this_occupancy` only inspects
+                // Whether the target phase's delivery window already
+                // carries a delivery. Guarded by `details.is_empty()`
+                // like the natural path, so an instruction-free phase
+                // pays neither this check nor the write below. The event
+                // list is built in memory from `events` (read once at
+                // tick start, before this directed transition appended)
+                // plus the `DirectedTransition` payload just appended
+                // above -- no re-read of the log, which is what keeps
+                // this path from performing a file read the pre-change
+                // binary did not perform (PRD R18).
+                // `instructions_delivered_this_window` only inspects
                 // `.payload`, so a synthetic `Event` wrapping the same
                 // payload and timestamp already persisted is equivalent
                 // to reading it back.
                 //
-                // This provably evaluates to `false` on every call: the
-                // synthetic event is the entry event `occupancy_slice`
-                // matches on, it is always the newest element in
-                // `post_events`, and nothing can follow the newest
-                // element -- so the occupancy slice it computes against
-                // is always empty. That is not dead code standing in
-                // for a constant. A directed transition always appends
-                // a fresh entry event immediately before this check, so
-                // it always starts a fresh, undelivered occupancy by
-                // construction (DESIGN-inline-phase-details.md: "each
-                // [arrival path] starts a fresh occupancy with no
-                // special case in the predicate") -- the general
-                // predicate mechanically derives the right answer here
-                // rather than this call site asserting it. Sharing the
-                // one predicate both call sites use, instead of
-                // hardcoding the answer, is what keeps this path from
-                // silently drifting if the directed-transition append
-                // ever stops being the immediately-preceding event, and
-                // is what satisfies this issue's own acceptance
-                // criterion that this path build its event list in
-                // memory rather than assume a value.
+                // This call is decision-bearing, and the case that makes
+                // it so is `koto next --to P` issued while the workflow
+                // already stands at `P`. The event just appended is then
+                // a `DirectedTransition { from: P, to: P }`, which does
+                // not open a delivery window, so the scan reaches back
+                // past it to the arrival that did and finds that
+                // arrival's delivery record. The answer is `true` and
+                // the instructions are suppressed -- a hand-driven lap
+                // of a declared loop is not an arrival.
+                //
+                // It answers `false` on every other directed
+                // transition, because those do open a window and the
+                // synthetic event is the newest element with nothing
+                // after it. An earlier version of this comment claimed
+                // that was provably the answer on *every* call; it was
+                // true when a self-entry opened a window and is not
+                // now. Sharing one predicate with the natural path,
+                // rather than hardcoding either answer here, is what
+                // let the boundary move without this call site
+                // noticing.
                 let already_delivered = if target_template_state.details.is_empty() {
                     false
                 } else {
@@ -3414,7 +3412,7 @@ fn handle_next(
                             idempotency_hash: None,
                         }))
                         .collect();
-                    instructions_delivered_this_occupancy(&post_events, target)
+                    instructions_delivered_this_window(&post_events, target)
                 };
                 let resp = resp.with_details_suppressed_unless_full(already_delivered, full);
 
@@ -4280,14 +4278,21 @@ fn handle_next(
                 variables.substitute(&d)
             });
 
-            // Whether this occupancy has already delivered the phase's
-            // instructions. Guarded by the same `details.is_empty()`
-            // check as above -- an instruction-free phase pays neither
-            // this read nor the write below, which is what preserves
+            // Whether the phase's delivery window already carries a
+            // delivery. Guarded by the same `details.is_empty()` check
+            // as above -- an instruction-free phase pays neither this
+            // read nor the write below, which is what preserves
             // R6/R18's byte-identity guarantee. The events are re-read
             // here (rather than reusing an earlier read) because the
             // advancement loop above may have appended transitions and
             // gate evaluations since the last read.
+            //
+            // The window is not the epoch. A tick whose only movement
+            // was a transition from this phase to itself stays inside
+            // the window the arrival opened, so a looping agent is not
+            // re-sent instructions it already holds; a tick that left
+            // and came back from anywhere else opened a new one and
+            // delivers.
             let already_delivered = if final_template_state.details.is_empty() {
                 false
             } else {
@@ -4295,7 +4300,7 @@ fn handle_next(
                     .read_events(&name)
                     .map(|(_, evts)| evts)
                     .unwrap_or_default();
-                instructions_delivered_this_occupancy(&post_events, final_state)
+                instructions_delivered_this_window(&post_events, final_state)
             };
             let resp = resp.with_details_suppressed_unless_full(already_delivered, full);
 
