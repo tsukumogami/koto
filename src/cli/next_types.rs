@@ -355,6 +355,137 @@ impl NextResponse {
             err @ NextResponse::Error { .. } => err,
         }
     }
+
+    /// Return a new `NextResponse` with `details` suppressed (set to
+    /// `None`) when the phase's instructions have already been
+    /// delivered during the current occupancy and the caller did not
+    /// force them with `--full`.
+    ///
+    /// `already_delivered` is the verdict of
+    /// [`crate::engine::persistence::instructions_delivered_this_occupancy`]
+    /// over the response's phase. `full` is the `koto next --full`
+    /// override flag; when set, `details` always survives regardless of
+    /// delivery history.
+    ///
+    /// This is the one rule DESIGN-inline-phase-details.md Decision 3
+    /// asks for: both response-construction sites call this same
+    /// combinator instead of each implementing their own suppression
+    /// check, so the directed path and the natural-advancement path can
+    /// no longer disagree.
+    ///
+    /// Applies to the same five variants `with_substituted_directive`
+    /// touches; `Terminal` and `Error` carry no `details` and are
+    /// returned unchanged.
+    pub fn with_details_suppressed_unless_full(self, already_delivered: bool, full: bool) -> Self {
+        let suppress = already_delivered && !full;
+        let strip = |details: Option<String>| if suppress { None } else { details };
+        match self {
+            NextResponse::EvidenceRequired {
+                state,
+                directive,
+                details,
+                advanced,
+                expects,
+                blocking_conditions,
+                unassigned_children,
+            } => NextResponse::EvidenceRequired {
+                state,
+                directive,
+                details: strip(details),
+                advanced,
+                expects,
+                blocking_conditions,
+                unassigned_children,
+            },
+            NextResponse::GateBlocked {
+                state,
+                directive,
+                details,
+                advanced,
+                blocking_conditions,
+                unassigned_children,
+            } => NextResponse::GateBlocked {
+                state,
+                directive,
+                details: strip(details),
+                advanced,
+                blocking_conditions,
+                unassigned_children,
+            },
+            NextResponse::Integration {
+                state,
+                directive,
+                details,
+                advanced,
+                expects,
+                integration,
+                unassigned_children,
+            } => NextResponse::Integration {
+                state,
+                directive,
+                details: strip(details),
+                advanced,
+                expects,
+                integration,
+                unassigned_children,
+            },
+            NextResponse::IntegrationUnavailable {
+                state,
+                directive,
+                details,
+                advanced,
+                expects,
+                integration,
+                unassigned_children,
+            } => NextResponse::IntegrationUnavailable {
+                state,
+                directive,
+                details: strip(details),
+                advanced,
+                expects,
+                integration,
+                unassigned_children,
+            },
+            NextResponse::ActionRequiresConfirmation {
+                state,
+                directive,
+                details,
+                advanced,
+                action_output,
+                expects,
+                unassigned_children,
+            } => NextResponse::ActionRequiresConfirmation {
+                state,
+                directive,
+                details: strip(details),
+                advanced,
+                action_output,
+                expects,
+                unassigned_children,
+            },
+            terminal @ NextResponse::Terminal { .. } => terminal,
+            err @ NextResponse::Error { .. } => err,
+        }
+    }
+
+    /// Whether this response carries a phase's instructions in its
+    /// `details` field.
+    ///
+    /// Callers use this after [`NextResponse::with_details_suppressed_unless_full`]
+    /// to decide whether to append an `InstructionsDelivered` record:
+    /// the response carries the instructions exactly when this is
+    /// `true`, which already accounts for suppression. `Terminal` and
+    /// `Error` never carry `details` and always answer `false`.
+    pub fn carries_details(&self) -> bool {
+        match self {
+            NextResponse::EvidenceRequired { details, .. }
+            | NextResponse::GateBlocked { details, .. }
+            | NextResponse::Integration { details, .. }
+            | NextResponse::IntegrationUnavailable { details, .. }
+            | NextResponse::ActionRequiresConfirmation { details, .. } => details.is_some(),
+            NextResponse::Terminal { .. } | NextResponse::Error { .. } => false,
+        }
+    }
 }
 
 impl Serialize for NextResponse {
@@ -1141,6 +1272,136 @@ mod tests {
 
         assert_eq!(json["action"], "done");
         assert_eq!(json["advanced"], false);
+    }
+
+    // -- with_details_suppressed_unless_full / carries_details tests --
+
+    fn evidence_required_with_details(details: Option<&str>) -> NextResponse {
+        NextResponse::EvidenceRequired {
+            state: "gather".to_string(),
+            directive: "Collect notes.".to_string(),
+            details: details.map(|d| d.to_string()),
+            advanced: false,
+            expects: ExpectsSchema {
+                event_type: "evidence_submitted".to_string(),
+                fields: BTreeMap::new(),
+                options: vec![],
+            },
+            blocking_conditions: vec![],
+            unassigned_children: vec![],
+        }
+    }
+
+    #[test]
+    fn suppress_clears_details_when_already_delivered_and_not_full() {
+        let resp = evidence_required_with_details(Some("Full instructions."))
+            .with_details_suppressed_unless_full(true, false);
+        match resp {
+            NextResponse::EvidenceRequired { details, .. } => assert!(details.is_none()),
+            other => panic!("expected EvidenceRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn suppress_keeps_details_when_not_yet_delivered() {
+        let resp = evidence_required_with_details(Some("Full instructions."))
+            .with_details_suppressed_unless_full(false, false);
+        match resp {
+            NextResponse::EvidenceRequired { details, .. } => {
+                assert_eq!(details.as_deref(), Some("Full instructions."))
+            }
+            other => panic!("expected EvidenceRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn suppress_full_flag_overrides_delivery_history() {
+        let resp = evidence_required_with_details(Some("Full instructions."))
+            .with_details_suppressed_unless_full(true, true);
+        match resp {
+            NextResponse::EvidenceRequired { details, .. } => {
+                assert_eq!(details.as_deref(), Some("Full instructions."))
+            }
+            other => panic!("expected EvidenceRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn suppress_no_details_stays_none() {
+        let resp =
+            evidence_required_with_details(None).with_details_suppressed_unless_full(true, false);
+        match resp {
+            NextResponse::EvidenceRequired { details, .. } => assert!(details.is_none()),
+            other => panic!("expected EvidenceRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn suppress_terminal_and_error_pass_through_unchanged() {
+        let terminal = NextResponse::Terminal {
+            state: "done".to_string(),
+            advanced: true,
+            unassigned_children: vec![],
+        };
+        assert_eq!(
+            terminal
+                .clone()
+                .with_details_suppressed_unless_full(true, false),
+            terminal
+        );
+
+        let err = NextResponse::Error {
+            state: "gather".to_string(),
+            advanced: false,
+            error: NextError {
+                code: NextErrorCode::InvalidSubmission,
+                message: "bad".to_string(),
+                details: vec![],
+            },
+            batch: None,
+            blocking_conditions: vec![],
+            unassigned_children: vec![],
+        };
+        assert_eq!(
+            err.clone().with_details_suppressed_unless_full(true, false),
+            err
+        );
+    }
+
+    #[test]
+    fn carries_details_true_when_details_present() {
+        let resp = evidence_required_with_details(Some("Full instructions."));
+        assert!(resp.carries_details());
+    }
+
+    #[test]
+    fn carries_details_false_when_details_absent() {
+        let resp = evidence_required_with_details(None);
+        assert!(!resp.carries_details());
+    }
+
+    #[test]
+    fn carries_details_false_for_terminal_and_error() {
+        let terminal = NextResponse::Terminal {
+            state: "done".to_string(),
+            advanced: true,
+            unassigned_children: vec![],
+        };
+        assert!(!terminal.carries_details());
+
+        let err = NextResponse::Error {
+            state: "gather".to_string(),
+            advanced: false,
+            error: NextError {
+                code: NextErrorCode::InvalidSubmission,
+                message: "bad".to_string(),
+                details: vec![],
+            },
+            batch: None,
+            blocking_conditions: vec![],
+            unassigned_children: vec![],
+        };
+        assert!(!err.carries_details());
     }
 
     // -- NextErrorCode serialization tests --

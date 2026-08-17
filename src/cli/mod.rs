@@ -2911,7 +2911,7 @@ fn handle_next(
         StopReason,
     };
     use crate::engine::evidence::validate_evidence;
-    use crate::engine::persistence::{derive_evidence, derive_visit_counts};
+    use crate::engine::persistence::{derive_evidence, instructions_delivered_this_occupancy};
     use crate::engine::substitute::Variables;
     use crate::gate::evaluate_gates;
     use std::sync::atomic::AtomicBool;
@@ -3338,7 +3338,11 @@ fn handle_next(
             to: target.clone(),
             rationale: rationale.clone(),
         };
-        if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
+        // Captured so the in-memory event built below (for the delivery
+        // predicate) carries the same timestamp actually persisted,
+        // rather than a second, slightly later `now_iso8601()` call.
+        let directed_ts = now_iso8601();
+        if let Err(e) = backend.append_event(&name, &payload, &directed_ts) {
             let ne = NextError {
                 code: NextErrorCode::PersistenceError,
                 message: e.to_string(),
@@ -3358,6 +3362,40 @@ fn handle_next(
                     let d = crate::cli::vars::substitute_vars(d, &runtime_vars);
                     variables.substitute(&d)
                 });
+
+                // Whether this occupancy has already delivered the
+                // target phase's instructions. Guarded by
+                // `details.is_empty()` like the natural path, so an
+                // instruction-free phase pays neither this check nor
+                // the write below. The event list is built in memory
+                // from `events` (read once at tick start, before this
+                // directed transition appended) plus the
+                // `DirectedTransition` payload just appended above --
+                // no re-read of the log, which is what keeps this path
+                // from performing a file read the pre-change binary did
+                // not perform (PRD R18).
+                // `instructions_delivered_this_occupancy` only inspects
+                // `.payload`, so a synthetic `Event` wrapping the same
+                // payload and timestamp already persisted is equivalent
+                // to reading it back.
+                let already_delivered = if target_template_state.details.is_empty() {
+                    false
+                } else {
+                    let post_events: Vec<Event> = events
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(Event {
+                            seq: events.len() as u64 + 1,
+                            timestamp: directed_ts.clone(),
+                            event_type: payload.type_name().to_string(),
+                            payload: payload.clone(),
+                            idempotency_hash: None,
+                        }))
+                        .collect();
+                    instructions_delivered_this_occupancy(&post_events, target)
+                };
+                let resp = resp.with_details_suppressed_unless_full(already_delivered, full);
+
                 // The abandonment notice, spliced after classification
                 // and after variable substitution. Prepending
                 // caller-influenced text ahead of the substitution
@@ -3379,6 +3417,22 @@ fn handle_next(
                     None => resp,
                 };
                 println!("{}", serde_json::to_string(&resp)?);
+                // The delivery record is appended only after printing --
+                // see the natural-advancement path for the crash-
+                // direction rationale. Non-fatal on error: the response
+                // has already shipped.
+                if resp.carries_details() {
+                    let ts = now_iso8601();
+                    let delivery_payload = EventPayload::InstructionsDelivered {
+                        state: target.clone(),
+                    };
+                    if let Err(e) = backend.append_event(&name, &delivery_payload, &ts) {
+                        eprintln!(
+                            "warning: failed to append InstructionsDelivered event: {}",
+                            e
+                        );
+                    }
+                }
                 // Auto-cleanup after output when reaching a terminal state.
                 if let next_types::NextResponse::Terminal {
                     state: final_state, ..
@@ -3996,22 +4050,15 @@ fn handle_next(
             // runtime and template variable substitution before serialization.
             let directive = final_template_state.directive.clone();
 
-            // Derive visit counts to decide whether to include details.
-            // Re-read events to capture transitions appended during the advancement loop.
+            // Whether this phase declares instructions at all. The
+            // suppression decision itself is deferred to
+            // `with_details_suppressed_unless_full` below, applied
+            // uniformly with the directed path (DESIGN-inline-phase-
+            // details.md Decision 3).
             let details = if final_template_state.details.is_empty() {
                 None
             } else {
-                let post_events = backend
-                    .read_events(&name)
-                    .map(|(_, evts)| evts)
-                    .unwrap_or_default();
-                let visit_counts = derive_visit_counts(&post_events);
-                let count = visit_counts.get(final_state.as_str()).copied().unwrap_or(0);
-                if full || count <= 1 {
-                    Some(final_template_state.details.clone())
-                } else {
-                    None
-                }
+                Some(final_template_state.details.clone())
             };
 
             // Issue 7: run the discovery scan once per tick. The
@@ -4199,6 +4246,26 @@ fn handle_next(
                 let d = crate::cli::vars::substitute_vars(d, &runtime_vars);
                 variables.substitute(&d)
             });
+
+            // Whether this occupancy has already delivered the phase's
+            // instructions. Guarded by the same `details.is_empty()`
+            // check as above -- an instruction-free phase pays neither
+            // this read nor the write below, which is what preserves
+            // R6/R18's byte-identity guarantee. The events are re-read
+            // here (rather than reusing an earlier read) because the
+            // advancement loop above may have appended transitions and
+            // gate evaluations since the last read.
+            let already_delivered = if final_template_state.details.is_empty() {
+                false
+            } else {
+                let post_events = backend
+                    .read_events(&name)
+                    .map(|(_, evts)| evts)
+                    .unwrap_or_default();
+                instructions_delivered_this_occupancy(&post_events, final_state)
+            };
+            let resp = resp.with_details_suppressed_unless_full(already_delivered, full);
+
             // The abandonment notice, spliced after classification and
             // after variable substitution so caller-influenced text is
             // never exposed to `{{...}}` expansion. The `action` table
@@ -4478,6 +4545,25 @@ fn handle_next(
                 "{}",
                 serde_json::to_string(&serde_json::Value::Object(envelope))?
             );
+            // The delivery record is appended only after the response
+            // prints, so a crash between the two re-delivers on the
+            // next tick rather than silently suppressing
+            // (DESIGN-inline-phase-details.md, "Data flow, natural-
+            // advancement path", step 4). Non-fatal on error, matching
+            // the SchedulerRan/BatchFinalized append idiom above: the
+            // response has already shipped and cannot be un-printed.
+            if resp.carries_details() {
+                let ts = now_iso8601();
+                let payload = EventPayload::InstructionsDelivered {
+                    state: final_state.clone(),
+                };
+                if let Err(e) = backend.append_event(&name, &payload, &ts) {
+                    eprintln!(
+                        "warning: failed to append InstructionsDelivered event: {}",
+                        e
+                    );
+                }
+            }
             // Auto-cleanup after output when reaching a terminal state.
             if let NextResponse::Terminal {
                 state: final_state, ..
