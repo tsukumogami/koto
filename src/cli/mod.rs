@@ -4935,6 +4935,16 @@ fn handle_decisions_list(backend: &dyn SessionBackend, name: String) -> Result<(
 /// and terminal status. Read-only: does not evaluate gates, run actions,
 /// or modify the state file.
 ///
+/// Also returns the current phase's instructions as `directive`, `details`,
+/// and `expects` -- conditionally-present keys, absent together when the
+/// phase is terminal and absent individually when the phase declares
+/// neither instructions nor an accepts schema. `directive`/`details` are
+/// substituted through the same pipeline `koto next` uses, so recovered
+/// text matches byte-for-byte. A conditionally-present
+/// `template_hash_mismatch` key reports (rather than fails on) a divergence
+/// between the compiled template read and the hash recorded in the session
+/// header (Issue 3 of PLAN-inline-phase-details.md).
+///
 /// Takes `&Backend` (the concrete enum) rather than `&dyn SessionBackend`
 /// so it can call the inherent `Backend::is_cloud()` accessor to gate
 /// `stale_template_source_dir` wording -- mirrors `handle_resolve`'s
