@@ -16,15 +16,21 @@ chain_ran:
     started_at: 2026-08-17T08:27:00Z
   - name: prd
     started_at: 2026-08-17T08:55:00Z
+  - name: design
+    started_at: 2026-08-17T09:50:00Z
 child_snapshots:
   brief:
     status: Accepted
     content_hash: fc841d6762abb3b4449718b76ee631db89c6fd45
     captured_at: 2026-08-17T08:52:00Z
   prd:
+    status: In Progress
+    content_hash: 1d28015951c4d2ff06cc7964891c32bb0a89e57d
+    captured_at: 2026-08-17T10:20:00Z
+  design:
     status: Accepted
-    content_hash: 7c44797614f293776a42bd8e92f7fd690971d007
-    captured_at: 2026-08-17T09:45:00Z
+    content_hash: 5798d32b36e26421a9b763dad611b64620e92632
+    captured_at: 2026-08-17T10:20:00Z
 consolidation_judgments:
   - hop: brief->prd
     stage: judgment
@@ -37,6 +43,16 @@ consolidation_judgments:
       of compression. The BRIEF also carries five journeys whose entry points the
       PRD's user stories cover but whose narrative the requirements do not, and
       it is the document that records the framing decision the PRD operationalizes.
+  - hop: prd->design
+    stage: preflight
+    verdict: keep
+    finding: >-
+      The citation preflight refused the fold: the PRD's own R18 acceptance
+      criterion cites its path inside the grep exclusion list it prescribes, so
+      the PRD is cited by path from a surviving document. Independently, the
+      DESIGN cites the PRD's requirements by number throughout and deliberately
+      does not restate the twenty-one requirements or the acceptance-criteria
+      contract, so folding would mean carrying the whole of both.
 worktree_rebases:
   - phase: brief
     upstream_commits: []

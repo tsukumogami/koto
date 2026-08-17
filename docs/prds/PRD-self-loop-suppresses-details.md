@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 upstream: docs/briefs/BRIEF-self-loop-suppresses-details.md
 source_issue: 90
 problem: |
@@ -30,7 +30,7 @@ motivating_context: |
 
 ## Status
 
-Accepted
+In Progress
 
 ## Problem Statement
 
@@ -423,8 +423,13 @@ call.
       appended, and the natural path still performs exactly the one post-advance
       read it performs today — no more, no fewer. Checkable as a diff review at
       each site. (R17)
-- [ ] `wip/` is empty, and `git grep -n 'wip/' -- ':!wip'` returns no committed
-      reference to a `wip/` path.
+- [ ] The staging directory for non-durable workflow artifacts is empty, and no
+      file this change adds or modifies names a path inside it. The check greps
+      that directory's prefix across the branch's own diff against main, not
+      across the whole repo: several archived designs and the contributor guide
+      mention the directory for unrelated reasons and predate this work. This
+      criterion deliberately does not spell the prefix, so that it does not match
+      its own grep.
 - [ ] The pull request is out of draft. Several jobs, including the artifact
       check, are skipped while a PR is a draft, so a green draft is not a green
       PR.
