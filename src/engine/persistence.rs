@@ -994,29 +994,40 @@ pub fn derive_visit_counts(events: &[Event]) -> HashMap<String, usize> {
     counts
 }
 
-/// The events since the workflow last entered `current_state` -- the phase's
-/// current occupancy.
+/// Which state-entry events close a scan window.
 ///
-/// An occupancy begins when a state-entry event names the phase as its target
-/// and ends when the next state-entry event names any phase, including the same
-/// one. So a self-transition ends one occupancy and begins another, and so does
-/// a rewind into the phase: both append an entry event naming it. State-entry
-/// events are `Transitioned`, `DirectedTransition`, and `Rewound`.
+/// Two questions read the log backwards from an entry into the current phase,
+/// and they no longer want the same entry. See [`epoch_slice`] and
+/// [`delivery_window`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Boundary {
+    /// Every entry naming the phase, a self-entry included.
+    AnyEntry,
+    /// Only an entry from a different phase, plus every rewind.
+    ArrivalFromElsewhere,
+}
+
+/// The events since the workflow last entered `current_state` under `boundary`.
+///
+/// State-entry events are `Transitioned`, `DirectedTransition`, and `Rewound`.
+/// Under [`Boundary::AnyEntry`] every one of them naming the phase closes the
+/// window. Under [`Boundary::ArrivalFromElsewhere`] a transition whose source
+/// phase equals its target does not: the agent did not arrive anywhere, it went
+/// around a loop it was already in.
+///
+/// **The rewind arm deliberately does not bind `from`.** A rewind opens both
+/// windows whatever phases it records, and not reading the field is what keeps
+/// the delivery answer from coming to depend on how `koto rewind` chooses its
+/// destination.
 ///
 /// **`current_state` must be the phase the workflow currently occupies.** The
-/// returned slice runs from the last entry event naming that phase to the end
-/// of the log, and nothing truncates it at the departure -- there is nothing to
+/// returned slice runs from the last qualifying entry event to the end of the
+/// log, and nothing truncates it at the departure -- there is nothing to
 /// truncate when the phase is the current one. Ask about a phase the workflow
 /// has since left and the slice will span everything that happened after it,
 /// which answers a different question than the caller meant.
 ///
-/// With no entry event naming the phase, every event is in scope. The only
-/// phase that can be in that position is the initial one, which the workflow
-/// occupies before it has transitioned anywhere.
-///
-/// Shared rather than copied so the predicates built on it -- the epoch-scoped
-/// gate classification and the delivery check -- cannot come to disagree about
-/// where an occupancy starts.
+/// With no qualifying entry event, every event is in scope.
 ///
 /// Only inspects `.payload` and position within `events`; `.seq`,
 /// `.timestamp`, `.event_type`, and `.idempotency_hash` never factor in. The
@@ -1025,15 +1036,20 @@ pub fn derive_visit_counts(events: &[Event]) -> HashMap<String, usize> {
 /// without re-reading the log, and a caller-constructed `Event` with
 /// placeholder metadata is exactly as valid an input here as one read back
 /// from disk.
-fn occupancy_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
+fn entry_slice<'a>(events: &'a [Event], current_state: &str, boundary: Boundary) -> &'a [Event] {
     let start = events.iter().enumerate().rev().find_map(|(idx, e)| {
-        let to = match &e.payload {
-            EventPayload::Transitioned { to, .. } => Some(to.as_str()),
-            EventPayload::DirectedTransition { to, .. } => Some(to.as_str()),
-            EventPayload::Rewound { to, .. } => Some(to.as_str()),
-            _ => None,
+        let opens = match &e.payload {
+            EventPayload::Transitioned { from, to, .. } => {
+                to == current_state
+                    && (boundary == Boundary::AnyEntry || from.as_deref() != Some(current_state))
+            }
+            EventPayload::DirectedTransition { from, to, .. } => {
+                to == current_state && (boundary == Boundary::AnyEntry || from != current_state)
+            }
+            EventPayload::Rewound { to, .. } => to == current_state,
+            _ => false,
         };
-        if to == Some(current_state) {
+        if opens {
             Some(idx)
         } else {
             None
@@ -1045,18 +1061,55 @@ fn occupancy_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] 
     }
 }
 
+/// The events since the workflow last entered `current_state` at all -- the
+/// phase's current epoch.
+///
+/// Every state-entry event naming the phase closes the epoch, a self-transition
+/// included. This is the boundary the gate-blocked classification reads, and it
+/// is unchanged from the one koto has always used.
+///
+/// It is deliberately *not* [`delivery_window`]. The two answer different
+/// questions -- "since the machine last entered this state" against "since the
+/// agent last arrived here from somewhere else" -- so they now disagree across a
+/// self-entry, on purpose. Sharing one scan is what keeps them from disagreeing
+/// about anything else.
+fn epoch_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
+    entry_slice(events, current_state, Boundary::AnyEntry)
+}
+
+/// The events since the workflow last arrived at `current_state` from somewhere
+/// else -- the phase's current delivery window.
+///
+/// A transition from the phase to itself does not open one, so a delivery
+/// recorded before a self-transition still counts after it and an agent going
+/// around a loop is not re-sent instructions it already holds. Arrival from a
+/// different phase opens one, and so does any rewind: a rewind is an
+/// instruction to redo the work rather than to continue it, and the agent it
+/// addresses needs the procedure again.
+fn delivery_window<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
+    entry_slice(events, current_state, Boundary::ArrivalFromElsewhere)
+}
+
 /// Whether the most recent gate evaluation in `current_state`'s current epoch
 /// did not pass -- the epoch-scoped half of the dashboard's blocked
 /// classification.
 ///
-/// The epoch is the slice of events after the last transition/directed/rewind
-/// into `current_state`; within it, the latest `GateEvaluated` decides. Returns
-/// `false` when the current epoch has no gate evaluation. Callers combine this
-/// with a non-terminal check to get "blocked": the dashboard read seam
-/// (`read_session`) and the `/workflows` projection writer both call this so
-/// they classify a blocked session identically (no drift).
+/// The epoch is [`epoch_slice`]'s -- the events after the last transition,
+/// directed transition or rewind into `current_state`, a self-transition
+/// included. Within it, the latest `GateEvaluated` decides. Returns `false` when
+/// the current epoch has no gate evaluation. Callers combine this with a
+/// non-terminal check to get "blocked": the dashboard read seam (`read_session`)
+/// and the `/workflows` projection writer both call this so they classify a
+/// blocked session identically (no drift).
+///
+/// This boundary is *not* the delivery window. A self-transition closes the
+/// epoch, so a gate verdict from before a loop's last lap drops out of scope and
+/// the blocked badge clears; it does not close the delivery window, so an agent
+/// looping in one phase is not re-sent instructions it holds. The two are
+/// separate answers to separate questions and a change to one must not move the
+/// other.
 pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
-    occupancy_slice(events, current_state)
+    epoch_slice(events, current_state)
         .iter()
         .rev()
         .find_map(|e| {
@@ -1070,7 +1123,7 @@ pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
 }
 
 /// Whether `current_state`'s instructions have already been delivered to a
-/// caller during the phase's current occupancy.
+/// caller inside the phase's current delivery window.
 ///
 /// Called from both `koto next` response-construction sites in
 /// `src/cli/mod.rs` -- the natural-advancement path and the directed-
@@ -1079,16 +1132,23 @@ pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
 /// combinator, so the two cannot disagree about when a phase has already
 /// delivered.
 ///
-/// The occupancy is [`occupancy_slice`]'s, so self-transition, rewind, and
-/// arrival at the initial state all fall out of one definition shared with
-/// [`latest_epoch_gate_failed`], and the same precondition applies:
+/// The window is [`delivery_window`]'s, so arrival from a different phase, a
+/// rewind, and arrival at the initial state all open one, and a transition from
+/// the phase to itself does not. The same precondition applies as for the epoch:
 /// `current_state` is the phase the workflow currently occupies.
+///
+/// The question asked inside the window is unchanged -- has a delivery been
+/// *recorded*? A rule keyed on the shape of the entry event instead would
+/// suppress on a self-entry whose window holds no record at all, which is
+/// reachable when a crash lands between printing a response and appending its
+/// record, and would leave that agent with no lap that ever hands the procedure
+/// back.
 ///
 /// The record is matched on the phase it names as well as on its position in
 /// the slice. Position alone would be enough for the ordinary case, where the
 /// only records after the entry event belong to the phase just entered. The
 /// name check answers the cases where that does not hold: a record for another
-/// phase landing inside this occupancy, and the fallback where no entry event
+/// phase landing inside this window, and the fallback where no entry event
 /// names the phase and the slice is the whole log. It also errs in the safe
 /// direction -- a record naming the wrong phase reads as "not delivered" and
 /// koto delivers again, the same direction the design accepts for a crash
@@ -1096,8 +1156,8 @@ pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
 ///
 /// Takes a plain event slice and touches no backend, so a caller that has the
 /// events in memory does not pay a read to ask.
-pub fn instructions_delivered_this_occupancy(events: &[Event], current_state: &str) -> bool {
-    occupancy_slice(events, current_state).iter().any(|e| {
+pub fn instructions_delivered_this_window(events: &[Event], current_state: &str) -> bool {
+    delivery_window(events, current_state).iter().any(|e| {
         matches!(
             &e.payload,
             EventPayload::InstructionsDelivered { state } if state == current_state
@@ -2497,7 +2557,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // instructions_delivered_this_occupancy
+    // instructions_delivered_this_window / delivery_window
     // -----------------------------------------------------------------------
 
     fn transitioned(seq: u64, from: Option<&str>, to: &str) -> Event {
@@ -2546,7 +2606,7 @@ mod tests {
     #[test]
     fn instructions_delivered_false_when_nothing_was_delivered() {
         let events = vec![transitioned(1, None, "gather")];
-        assert!(!instructions_delivered_this_occupancy(&events, "gather"));
+        assert!(!instructions_delivered_this_window(&events, "gather"));
     }
 
     #[test]
@@ -2563,7 +2623,7 @@ mod tests {
                 },
             ),
         ];
-        assert!(instructions_delivered_this_occupancy(&events, "gather"));
+        assert!(instructions_delivered_this_window(&events, "gather"));
     }
 
     #[test]
@@ -2576,7 +2636,7 @@ mod tests {
             transitioned(3, Some("gather"), "implement"),
             transitioned(4, Some("implement"), "gather"),
         ];
-        assert!(!instructions_delivered_this_occupancy(&events, "gather"));
+        assert!(!instructions_delivered_this_window(&events, "gather"));
     }
 
     #[test]
@@ -2588,24 +2648,84 @@ mod tests {
             delivered(4, "implement"),
             rewound(5, "implement", "gather"),
         ];
-        assert!(!instructions_delivered_this_occupancy(&events, "gather"));
+        assert!(!instructions_delivered_this_window(&events, "gather"));
     }
 
     #[test]
-    fn instructions_delivered_resets_on_a_self_transition() {
-        // A self-transition ends one occupancy and begins another, so the
-        // delivery recorded before it does not answer for the new one.
+    fn instructions_delivered_survives_a_self_transition() {
+        // A self-transition does not open a delivery window -- the agent went
+        // around a loop it was already in rather than arriving anywhere -- so
+        // the delivery recorded before it still answers after it.
         let events = vec![
             transitioned(1, None, "review"),
             delivered(2, "review"),
             transitioned(3, Some("review"), "review"),
         ];
-        assert!(!instructions_delivered_this_occupancy(&events, "review"));
+        assert!(instructions_delivered_this_window(&events, "review"));
 
-        // ...and a delivery after the self-transition does.
+        // ...and it keeps answering however many laps follow.
         let mut events = events;
-        events.push(delivered(4, "review"));
-        assert!(instructions_delivered_this_occupancy(&events, "review"));
+        events.push(transitioned(4, Some("review"), "review"));
+        assert!(instructions_delivered_this_window(&events, "review"));
+    }
+
+    #[test]
+    fn instructions_delivered_false_on_a_self_transition_with_no_record() {
+        // The rule is keyed on the recorded delivery, not on the shape of the
+        // entry event. A window whose record was lost -- a crash between
+        // printing a response and appending it -- delivers again on the next
+        // lap rather than starving an agent that never received the procedure.
+        let events = vec![
+            transitioned(1, None, "gather"),
+            transitioned(2, Some("gather"), "review"),
+            transitioned(3, Some("review"), "review"),
+        ];
+        assert!(!instructions_delivered_this_window(&events, "review"));
+    }
+
+    #[test]
+    fn instructions_delivered_resets_on_a_same_phase_rewind() {
+        // `koto rewind` right after a self-transition records the same phase as
+        // both source and target. A rewind is an instruction to redo the work,
+        // so it opens a window whatever phases it names -- and the rewind arm
+        // does not read `from` at all, which is what keeps this answer
+        // independent of how rewind picks its destination.
+        let events = vec![
+            transitioned(1, None, "review"),
+            delivered(2, "review"),
+            transitioned(3, Some("review"), "review"),
+            rewound(4, "review", "review"),
+        ];
+        assert!(!instructions_delivered_this_window(&events, "review"));
+    }
+
+    #[test]
+    fn the_epoch_and_the_delivery_window_disagree_across_a_self_transition() {
+        // One log, two boundaries, opposite answers -- which is the whole point
+        // of splitting them. The self-transition closes the epoch, so the gate
+        // verdict from the previous lap drops out of scope and the blocked badge
+        // clears; it does not close the delivery window, so the instructions
+        // stay suppressed.
+        //
+        // This is the test that fails loudly if someone widens the shared scan
+        // in place instead of keeping two boundaries.
+        let events = vec![
+            transitioned(1, None, "review"),
+            delivered(2, "review"),
+            make_event(
+                3,
+                EventPayload::GateEvaluated {
+                    state: "review".to_string(),
+                    gate: "approval".to_string(),
+                    output: serde_json::json!({}),
+                    outcome: "failed".to_string(),
+                    timestamp: "2026-01-01T00:00:00Z".to_string(),
+                },
+            ),
+            transitioned(4, Some("review"), "review"),
+        ];
+        assert!(!latest_epoch_gate_failed(&events, "review"));
+        assert!(instructions_delivered_this_window(&events, "review"));
     }
 
     #[test]
@@ -2620,7 +2740,7 @@ mod tests {
             delivered(4, "implement"),
             transitioned(5, Some("implement"), "verify"),
         ];
-        assert!(!instructions_delivered_this_occupancy(&events, "verify"));
+        assert!(!instructions_delivered_this_window(&events, "verify"));
 
         // The slicing alone carries the case above, because the entry into
         // `verify` is the last event. Put an intermediate phase's record
@@ -2628,24 +2748,25 @@ mod tests {
         // left holding the answer.
         let mut events = events;
         events.push(delivered(6, "implement"));
-        assert!(!instructions_delivered_this_occupancy(&events, "verify"));
+        assert!(!instructions_delivered_this_window(&events, "verify"));
     }
 
     #[test]
-    fn instructions_delivered_resets_on_arrival_by_directed_transition() {
+    fn instructions_delivered_survives_a_directed_self_transition() {
         // `DirectedTransition` is the third state-entry kind, and the one the
-        // `--to` handler appends. Two consecutive directed transitions into the
-        // same phase are two occupancies, exactly as two self-transitions are.
+        // `--to` handler appends. Arriving at a different phase opens a window;
+        // a second `--to` issued while already standing there does not, because
+        // routing to the phase you occupy is a lap rather than an arrival.
         let events = vec![
             transitioned(1, None, "gather"),
             directed(2, "gather", "implement"),
             delivered(3, "implement"),
         ];
-        assert!(instructions_delivered_this_occupancy(&events, "implement"));
+        assert!(instructions_delivered_this_window(&events, "implement"));
 
         let mut events = events;
         events.push(directed(4, "implement", "implement"));
-        assert!(!instructions_delivered_this_occupancy(&events, "implement"));
+        assert!(instructions_delivered_this_window(&events, "implement"));
     }
 
     #[test]
@@ -2653,8 +2774,8 @@ mod tests {
         // Same fallback as `latest_epoch_gate_failed`: with no entry event for
         // the state, every event is in scope.
         let events = vec![delivered(1, "gather")];
-        assert!(instructions_delivered_this_occupancy(&events, "gather"));
-        assert!(!instructions_delivered_this_occupancy(&events, "implement"));
+        assert!(instructions_delivered_this_window(&events, "gather"));
+        assert!(!instructions_delivered_this_window(&events, "implement"));
     }
 
     // -----------------------------------------------------------------------
