@@ -1,9 +1,0 @@
-{
-  "impact": "none",
-  "base_branch": "main",
-  "base_head": "b7b07997ecfe80fe7f7468f47ebce6c320495ed2",
-  "commits_ahead_of_branch": 0,
-  "rebase_performed": false,
-  "rationale": "origin/main is at b7b0799, the commit this branch was created from, and `git rev-list --count HEAD..origin/main` is 0. No upstream commit has landed since the chain started, so nothing the PLAN references can have moved.",
-  "classified_at": "2026-08-17T10:40:00Z"
-}
