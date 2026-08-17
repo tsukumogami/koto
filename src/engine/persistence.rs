@@ -1017,6 +1017,14 @@ pub fn derive_visit_counts(events: &[Event]) -> HashMap<String, usize> {
 /// Shared rather than copied so the predicates built on it -- the epoch-scoped
 /// gate classification and the delivery check -- cannot come to disagree about
 /// where an occupancy starts.
+///
+/// Only inspects `.payload` and position within `events`; `.seq`,
+/// `.timestamp`, `.event_type`, and `.idempotency_hash` never factor in. The
+/// directed-transition path relies on this precisely: it builds its
+/// post-append event list in memory from the payload it just appended,
+/// without re-reading the log, and a caller-constructed `Event` with
+/// placeholder metadata is exactly as valid an input here as one read back
+/// from disk.
 fn occupancy_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
     let start = events.iter().enumerate().rev().find_map(|(idx, e)| {
         let to = match &e.payload {
@@ -1064,9 +1072,12 @@ pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
 /// Whether `current_state`'s instructions have already been delivered to a
 /// caller during the phase's current occupancy.
 ///
-/// **Nothing calls this yet, because nothing appends the record it reads.** It
-/// lands ahead of the response-path wiring so the rule can be settled and
-/// tested on its own.
+/// Called from both `koto next` response-construction sites in
+/// `src/cli/mod.rs` -- the natural-advancement path and the directed-
+/// transition path -- through the shared
+/// [`crate::cli::next_types::NextResponse::with_details_suppressed_unless_full`]
+/// combinator, so the two cannot disagree about when a phase has already
+/// delivered.
 ///
 /// The occupancy is [`occupancy_slice`]'s, so self-transition, rewind, and
 /// arrival at the initial state all fall out of one definition shared with
