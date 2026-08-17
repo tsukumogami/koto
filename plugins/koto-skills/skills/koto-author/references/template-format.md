@@ -115,11 +115,13 @@ Work through the design in this order:
 5. Identify preconditions -- these need gates.
 ```
 
-Content before the marker is the **directive** -- always returned by `koto next`. Content after is the **details** -- delivered once per **occupancy** of the state, or whenever the caller passes `--full`.
+Content before the marker is the **directive** -- always returned by `koto next`. Content after is the **details** -- delivered when the agent **arrives** at the state, or whenever the caller passes `--full`.
 
-An occupancy begins when the workflow enters a state -- including a rewind back into it, a self-transition, or a directed (`--to`) transition -- and ends when the workflow next enters any state (including the same one again). This is what an author can rely on: a gate-blocked self-loop that keeps re-evaluating the same failing gate without transitioning stays in one occupancy, so the agent sees `details` once and not again on every retry -- don't write directive text that assumes it repeats. A rewind back into the state, on the other hand, starts a new occupancy and re-delivers `details` -- useful when a phase is meant to be redone with its full instructions in view again.
+An arrival is the workflow entering the state from a different one, however it got there: a conditional or unconditional transition, a directed (`--to`) transition, a loop-back from later in the workflow, or a multi-hop tick that passes through another state and comes back. A `koto rewind` into the state is also an arrival, whichever state it came from, because a rewind means redo this rather than continue -- useful when a phase is meant to be redone with its full instructions in view again.
 
-Use details for multi-paragraph instructions, step-by-step procedures, or reference material that clutters the directive on repeat ticks within the same occupancy. Keep the directive itself short: a one- or two-line summary of what the state expects, since it's what the agent sees on every tick regardless of delivery state.
+This is what an author can rely on, and the part worth reading twice: **a self-loop is not an arrival.** A state that transitions to itself, and a `koto next --to <this state>` issued while the workflow is already there, are laps around a loop the agent is already inside -- the agent still holds the procedure, so `details` is not repeated. Neither is a tick that does not move at all: a gate-blocked state re-evaluating the same failing gate shows `details` once and not again on every retry. Don't write directive text that assumes any of these repeat.
+
+Use details for multi-paragraph instructions, step-by-step procedures, or reference material that clutters the directive on repeat ticks. Keep the directive itself short: a one- or two-line summary of what the state expects, since it's what the agent sees on every tick regardless of delivery state.
 
 States without the marker behave exactly as before -- everything is the directive, and `details` is empty.
 
@@ -667,6 +669,11 @@ transitions:
     when:
       gates.doc_check.exists: false
 ```
+
+A self-loop is a lap, not an arrival, so the state's `details` are not repeated on
+it — see the `<!-- details -->` section above. Write the directive so it stands on
+its own across iterations, and point an agent that has lost the procedure at
+`koto status <session-name>` rather than expecting the next lap to hand it back.
 
 ### Split topology
 

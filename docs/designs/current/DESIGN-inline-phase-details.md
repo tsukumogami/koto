@@ -27,10 +27,12 @@ decision: |
 rationale: |
   The defect is that koto counts the wrong thing, so the fix is to count the
   right thing rather than to tune the wrong one. Recording a delivery costs one
-  event and makes rewind, self-transition, directed transition and multi-hop
-  auto-advance all fall out without special cases, because the predicate keys on
-  position relative to the last entry event and every one of those paths appends
-  one. Deriving delivery from existing events was investigated and disproved: two
+  event and makes rewind, directed transition and multi-hop auto-advance all fall
+  out without special cases, because the predicate keys on position relative to
+  the last entry event and every one of those paths appends one. A
+  self-transition appends one too and was originally included in that list; the
+  boundary now looks past it, per the reversal recorded in Decision Outcome.
+  Deriving delivery from existing events was investigated and disproved: two
   sessions that differ only in whether instructions were delivered produce
   identical logs. Extending `koto status` rather than adding a command avoids
   introducing the CLI's first use of "phase", a noun deliberately confined to the
@@ -48,6 +50,14 @@ Authored under `/scope`'s tactical chain from `PRD-inline-phase-details`. Four
 decisions were evaluated independently and cross-validated; the cross-validation
 surfaced a contradiction in the PRD's own acceptance criteria, which was
 corrected upstream before this document was written.
+
+Amended after koto#90's acceptance criterion 3 was ruled to govern. A
+self-transition no longer opens a delivery window, and the boundary that decides
+delivery is now separate from the epoch the gate-blocked classification reads.
+The four decisions below stand; only the boundary moved. The reversal is recorded
+in Decision Outcome rather than edited away, because it overturns an argument
+this document made rather than correcting an oversight. See
+`docs/designs/DESIGN-self-loop-suppresses-details.md`.
 
 ## Context and Problem Statement
 
@@ -216,10 +226,12 @@ The four decisions compose into one change with a single organising idea:
 
 Recording is what makes the rest fall out. The predicate keys on position
 relative to the most recent entry event, and every way of arriving at a phase —
-conditional transition, unconditional transition, directed transition,
-self-transition, rewind, initialization — appends one. So each of those starts a
-fresh occupancy with no special case in the predicate, which is precisely the
-uniformity R3 and R4 ask for and precisely what a visit count cannot give.
+conditional transition, unconditional transition, directed transition into a
+phase the workflow was not already in, rewind, initialization — appends one. So
+each of those starts a fresh occupancy with no special case in the predicate,
+which is precisely the uniformity R3 and R4 ask for and precisely what a visit
+count cannot give. A self-transition appends an entry event too, and the
+boundary now looks past it: see the reversal recorded below.
 
 The shared combinator is what makes it one rule rather than two implementations
 of one rule. The `koto status` extension is what covers the case the predicate
@@ -243,16 +255,37 @@ is about reads; the delivery record is an additional append to a file the tick
 already opened. The criterion was corrected upstream to exclude writes, and the
 verification step should be run against reads only.
 
-**A contradiction in the PRD was corrected.** Its Definitions made a
-self-transition begin a new occupancy — so instructions must be delivered — while
-an acceptance criterion required a second consecutive directed transition into
-the same phase to omit them. Those two are only jointly reachable when a template
-declares a self-transition, since the directed handler validates its target
-against the current phase's declared transitions (`src/cli/mod.rs:3304-3322`),
-and that path appends `DirectedTransition { from: X, to: X }`, which is a new
-occupancy by the PRD's own definition. The Definitions are normative and R3 is
-explicit, so the criterion was rewritten to test what it was plainly reaching for:
-a directed transition followed by a non-advancing tick.
+**A contradiction in the PRD was found, resolved, and then resolved the other
+way.** Its Definitions made a self-transition begin a new occupancy — so
+instructions must be delivered — while an acceptance criterion required a second
+consecutive directed transition into the same phase to omit them. Those two are
+only jointly reachable when a template declares a self-transition, since the
+directed handler validates its target against the current phase's declared
+transitions (`src/cli/mod.rs:3304-3322`), and that path appends
+`DirectedTransition { from: X, to: X }`, which was a new occupancy by the PRD's
+own definition. This design resolved it toward delivery: the Definitions were
+normative and R3 was explicit, so the criterion was rewritten to test what it
+appeared to be reaching for, a directed transition followed by a non-advancing
+tick.
+
+That resolution has been reversed, and the reversal is what governs. Two things
+went unnoticed at the time. The Definitions paragraph it treated as normative was
+itself overriding koto#90's acceptance criterion 3 — "Subsequent visits (retries,
+self-loops) omit `details` from the response" — which is an acceptance criterion
+of the issue this whole mechanism was fixing. And R9 of
+`docs/prds/PRD-koto-next-output-contract.md`, an accepted contract predating both,
+had already settled the same question the same way. Neither was cited, so an
+override read as a definition.
+
+The issue's author has ruled that the criterion governs. A self-transition no
+longer opens a delivery window: an agent going around a loop it is already in
+holds the instructions and is not re-sent them. The boundary that decides this is
+now separate from the epoch the gate-blocked classification reads, because only
+the first was meant to move. See
+`docs/designs/DESIGN-self-loop-suppresses-details.md` for the split and
+`docs/prds/PRD-self-loop-suppresses-details.md` for the requirements; the
+Definitions paragraph in this design's own upstream PRD carries the same
+amendment note.
 
 ## Solution Architecture
 
@@ -261,7 +294,7 @@ a directed transition followed by a non-advancing tick.
 | Component | File | Change |
 |---|---|---|
 | Event model | `src/engine/types.rs` | `EventPayload::InstructionsDelivered { state }`, its `type_name()` arm (`"instructions_delivered"`), its deserialize arm, a payload struct, and a doc comment in the existing house style explaining additive safety |
-| Delivery predicate | `src/engine/persistence.rs` | `instructions_delivered_this_occupancy(events, state) -> bool`, placed beside `latest_epoch_gate_failed` and sharing its slicing idiom |
+| Delivery predicate | `src/engine/persistence.rs` | `instructions_delivered_this_occupancy(events, state) -> bool`, placed beside `latest_epoch_gate_failed` and sharing its slicing idiom. Since renamed `instructions_delivered_this_window` and given its own boundary; the two no longer share a slice. |
 | Response combinator | `src/cli/next_types.rs` | `with_details_suppressed_unless_full(self, already_delivered, full)`, beside `with_substituted_directive` and `with_directive_prefix` |
 | Pointer splice | `src/cli/next_types.rs` | Reuse `with_directive_prefix`, applied after substitution, when the phase declares instructions |
 | Natural path | `src/cli/mod.rs` (~3999-4016, 4198) | Replace the `derive_visit_counts` / `count <= 1` check with the predicate; call the combinator; append the record when the response carries instructions |
@@ -277,8 +310,8 @@ untouched.
 1. `handle_next` runs `advance_until_stop` as today, which appends whatever entry
    and gate events the tick produces.
 2. The post-advance event list is read once — the same read the tick already
-   performs — and `instructions_delivered_this_occupancy` is evaluated against
-   the phase the loop stopped at.
+   performs — and `instructions_delivered_this_window` (renamed; see the
+   component table) is evaluated against the phase the loop stopped at.
 3. The response is constructed per `StopReason` as today, then passed through
    `with_substituted_directive`, then the new combinator, then the pointer
    splice.
@@ -358,7 +391,9 @@ Four phases, sequenced by what each needs from the one before.
 lists covering: no prior delivery, a delivery in the current occupancy, a
 delivery before the most recent entry event, a rewind entry, a self-transition
 entry, and a multi-hop advance where the delivery belongs to an intermediate
-phase. Nothing observable changes yet.
+phase. Nothing observable changes yet. The self-transition case has since
+inverted and the predicate has been renamed; see the reversal in Decision
+Outcome.
 
 **Phase 2 — the combinator and both call sites.** Add
 `with_details_suppressed_unless_full`, wire the natural path to the new predicate,
@@ -401,7 +436,7 @@ without any additional work. The custom `Event` deserializer routes any
 unrecognized event type to `Unknown` through an unconditional catch-all, so an
 older binary round-trips the new record unharmed, and a crash mid-append produces
 the same recoverable malformed-final-line case any other event type already
-produces on a torn write. The added write is bounded by occupancy count rather
+produces on a torn write. The added write is bounded by arrival count rather
 than tick count, so the design's own motivating case — a long gate-blocked loop —
 adds one record, not one per iteration. Because the predicate is an existence
 check, the unlocked concurrent-append race on a non-batch session produces at

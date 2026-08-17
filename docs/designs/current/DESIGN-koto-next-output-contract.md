@@ -120,6 +120,8 @@ The `GateResult -> BlockingCondition` conversion logic (currently duplicated in 
 
 ### Decision 3: Visit count computation
 
+**Superseded.** The mechanism below shipped and was later replaced: koto no longer decides delivery by counting visits. See `docs/designs/current/DESIGN-inline-phase-details.md` for the rule that replaced it and `docs/designs/DESIGN-self-loop-suppresses-details.md` for the boundary it now uses. `derive_visit_counts` survives for an unrelated visited-set consumer in the `/workflows` projection. The rest of this decision is kept as the record of why the original mechanism was chosen.
+
 The `details` field should be included on first visit to a state and omitted on subsequent visits. The JSONL event log contains all state-entry events (`Transitioned`, `DirectedTransition`, `Rewound`), and the PRD prohibits new state files or schema changes. The question is how to compute and propagate visit information.
 
 #### Chosen: `derive_visit_counts` with `HashMap<String, usize>`

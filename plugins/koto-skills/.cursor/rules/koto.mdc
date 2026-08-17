@@ -167,11 +167,13 @@ done
 
 ## The details Field
 
-The `details` field carries extended instructions. It's delivered once per
-**occupancy** of a state -- each time the workflow enters the state, including a
-rewind, a self-transition, or a directed (`--to`) transition back into it -- and
-omitted on any further tick that stays in the same occupancy, to save context.
-Use `--full` to force inclusion regardless:
+The `details` field carries extended instructions. It's delivered when you
+**arrive** at a state -- entering it from a different state, however you got
+there, or being rewound into it -- and omitted on every later tick until you
+arrive again, to save context. Going around a loop you are already in is not an
+arrival: a self-transition, and a `koto next --to <this state>` issued while
+you're already there, both repeat nothing. Use `--full` to force inclusion
+regardless:
 
 ```bash
 koto next <session> --full

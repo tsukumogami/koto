@@ -138,13 +138,21 @@ Two terms carry weight across the requirements below, and both are defined here
 rather than left to implication.
 
 **Occupancy.** A phase's occupancy begins when a state-entry event names that
-phase as its target, and ends when the next state-entry event names any phase,
-including the same one. A self-transition therefore ends one occupancy and
-begins another, which makes it behave exactly like a loop-back through other
-phases: the instructions are delivered again on arrival. This is the same answer
-the criteria already require for a loop-back, and treating a self-transition
-differently would make the rule depend on the shape of the loop rather than on
-whether the workflow re-entered the phase.
+phase as its target *and records a different phase as its source*, and ends when
+the next such event fires. A rewind always begins one, whichever phases it
+records. A self-transition does not: the agent went around a loop it was already
+in rather than arriving anywhere, so it still holds the instructions.
+
+**Amended.** This paragraph originally read the other way — a self-transition
+ended one occupancy and began another, on the reasoning that treating it
+differently would make the rule depend on the shape of the loop. That reasoning
+overrode koto#90's acceptance criterion 3 ("Subsequent visits (retries,
+self-loops) omit `details` from the response") and R9 of
+`docs/prds/PRD-koto-next-output-contract.md`, which had already settled the same
+question the same way, without citing either. The issue's author has ruled that
+the criterion governs. See `docs/prds/PRD-self-loop-suppresses-details.md`, whose
+Definitions section names the boundary this one now describes and separates it
+from the epoch that the gate-blocked classification reads.
 
 **Transition paths.** koto moves a workflow along two distinct code paths, and
 the requirements name them separately: the **natural-advancement path**, which
@@ -165,8 +173,10 @@ occurred.
   This covers the gate-blocked re-tick and any other non-advancing repeat.
 - **R3.** The first response of a phase's occupancy carries that phase's
   instructions, however the occupancy began: a conditional transition, an
-  unconditional transition, a directed transition, a self-transition, a rewind,
-  or workflow initialization at the initial state.
+  unconditional transition, a directed transition into a phase the workflow was
+  not already in, a rewind, or workflow initialization at the initial state. A
+  self-transition begins no occupancy and carries nothing new — see the amended
+  Definitions above.
 - **R4.** R1 through R3 hold identically on the natural-advancement path and on
   the directed-transition path. There is one rule, not two.
 - **R5.** An explicit override remains available that includes the instructions
@@ -257,9 +267,10 @@ occurred.
       instructions field.
 - [ ] The same workflow, after the gate passes and the workflow later loops back
       to that phase, carries the instructions again on the arrival response.
-- [ ] A phase whose transition targets itself: the arrival response after the
-      self-transition carries the instructions, matching the loop-back case
-      above and the occupancy definition.
+- [ ] A phase whose transition targets itself: the response after the
+      self-transition omits the instructions, because a lap around a loop is not
+      an arrival. Amended along with the Definitions above; this criterion
+      originally required the instructions to be carried.
 - [ ] A phase reached by an unconditional transition carries the instructions on
       arrival, verified separately from the conditional case even though both
       run through the natural-advancement path.
@@ -272,7 +283,10 @@ occurred.
 - [ ] Two consecutive directed transitions into the same phase — reachable only
       when the template declares a self-transition, since the directed handler
       validates the target against the current phase's declared transitions —
-      both carry the instructions, because each begins a new occupancy.
+      carry the instructions on the first and omit them on the second, because
+      routing to the phase you already occupy begins no occupancy. Amended along
+      with the Definitions above; this criterion originally required both to
+      carry.
 - [ ] `koto init` followed by a first `koto next` carries the initial phase's
       instructions.
 - [ ] A batch-spawned child's first `koto next` carries its initial phase's
