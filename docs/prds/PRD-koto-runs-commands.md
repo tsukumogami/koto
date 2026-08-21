@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 upstream: docs/briefs/BRIEF-koto-runs-commands.md
 problem: |
   koto can already run a shell command when a workflow enters a state, but
@@ -25,7 +25,7 @@ goals: |
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
