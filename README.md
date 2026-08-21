@@ -167,6 +167,7 @@ Skills use the [Agent Skills](https://agentskills.io) open standard, which means
 
 - [CLI usage guide](docs/guides/cli-usage.md) -- all subcommands with examples, including template authoring tools
 - [Cloud sync setup](docs/guides/cloud-sync-setup.md) -- configure S3-compatible cloud storage for cross-machine sessions
+- [`default_action` authoring](docs/guides/default-action-authoring.md) -- which commands a template state may run, and how to write the action
 - [Error code reference](docs/reference/error-codes.md) -- structured error codes and handling
 - [Custom skill authoring](docs/guides/custom-skill-authoring.md) -- creating workflow skills for AI agents
 
