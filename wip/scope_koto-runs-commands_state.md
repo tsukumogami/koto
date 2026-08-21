@@ -1,7 +1,7 @@
 ---
 topic: koto-runs-commands
 chain_started: 2026-08-21T02:31:24Z
-last_updated: 2026-08-21T03:06:38Z
+last_updated: 2026-08-21T03:20:21Z
 phase_pointer: phase-3
 exit: UNSET
 exit_artifacts: []
@@ -21,8 +21,13 @@ child_snapshots:
     path: docs/designs/current/DESIGN-koto-runs-commands.md
     status: Accepted
     validator: clean
+  design:
+    path: docs/designs/current/DESIGN-koto-runs-commands.md
+    status: Accepted
+    validator: clean
 consolidation_judgments:
   brief-to-prd: keep  # all six prior koto BRIEFs coexist with their PRDs
+  prd-to-design: keep  # koto keeps PRDs alongside their DESIGNs throughout
 framing_shift: yes
 r6_predicates:
   p1_architectural_alternatives: fires
