@@ -4271,6 +4271,23 @@ fn handle_next(
         };
         let _ = backend.append_event(&name, &event_payload, &now_iso8601());
 
+        // Failure is classified before the confirmation branch. Confirmation
+        // used to fire on success and failure alike, producing a confirm stop
+        // that carried no indication anything had gone wrong; a failing action
+        // now stops as a failure whether or not the flag is set, and the
+        // confirm stop is reached only on success
+        // (DESIGN-koto-runs-commands.md Decision 3).
+        if let Some(failure_kind) = output.failure_kind {
+            return ActionResult::Failed {
+                command,
+                failure_kind,
+                exit_code: output.exit_code,
+                stdout,
+                stderr,
+                truncated: output.truncated,
+            };
+        }
+
         if action.requires_confirmation {
             ActionResult::RequiresConfirmation {
                 exit_code: output.exit_code,
@@ -4358,6 +4375,14 @@ fn handle_next(
             )
             .unwrap_or_default();
 
+            // The author's prose for a failed `default_action`, set by the
+            // gate-blocked arm below and spliced onto `directive` after
+            // substitution. It rides the directive rather than `details`
+            // because `details` can be withheld by
+            // `with_details_suppressed_unless_full`, and a fallback the agent
+            // may not receive is not a fallback (Decision 4).
+            let mut action_fallback: Option<String> = None;
+
             let resp = match advance_result.stop_reason {
                 StopReason::Terminal => NextResponse::Terminal {
                     state: final_state.clone(),
@@ -4367,6 +4392,21 @@ fn handle_next(
                 StopReason::GateBlocked(gate_results) => {
                     let blocking =
                         blocking_conditions_from_gates(&gate_results, &final_template_state.gates);
+                    // A failed `default_action` arrives here under the
+                    // reserved `__action__` name (Decision 3), and only then
+                    // does the author's fallback prose apply -- a state whose
+                    // action succeeded and whose gates then failed must not
+                    // be prefixed with prose about a failure that did not
+                    // happen.
+                    if blocking
+                        .iter()
+                        .any(|c| c.name == crate::template::types::ACTION_CONDITION_NAME)
+                    {
+                        action_fallback = final_template_state
+                            .default_action
+                            .as_ref()
+                            .and_then(|a| a.fallback.clone());
+                    }
                     NextResponse::GateBlocked {
                         state: final_state.clone(),
                         directive: directive.clone(),
@@ -4551,6 +4591,16 @@ fn handle_next(
                 instructions_delivered_this_window(&post_events, final_state)
             };
             let resp = resp.with_details_suppressed_unless_full(already_delivered, full);
+
+            // The action fallback, spliced first so it ends up closest to the
+            // directive it explains: koto's own notices below prepend after
+            // it and are read first. Spliced after substitution, like those
+            // notices, so author prose is never exposed to `{{...}}`
+            // expansion.
+            let resp = match &action_fallback {
+                Some(prose) => resp.with_directive_prefix(&format!("{}\n\n", prose)),
+                None => resp,
+            };
 
             // The recovery pointer, spliced before the abandonment notice
             // below so the notice ends up closest to the front of

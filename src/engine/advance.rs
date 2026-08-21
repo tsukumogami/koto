@@ -5,13 +5,14 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::action::FailureKind;
 use crate::engine::persistence::derive_overrides;
 use crate::engine::substitute::VariableOverlay;
 use crate::engine::types::{now_iso8601, Event, EventPayload};
 use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::template::types::{
     is_is_set_matcher, is_present_matcher, ActionDecl, CompiledTemplate, TemplateState,
-    EVIDENCE_NAMESPACE, GATES_EVIDENCE_NAMESPACE, VARS_NAMESPACE,
+    ACTION_CONDITION_NAME, EVIDENCE_NAMESPACE, GATES_EVIDENCE_NAMESPACE, VARS_NAMESPACE,
 };
 
 /// Maximum number of transitions per invocation. Defense-in-depth against
@@ -48,6 +49,68 @@ pub enum ActionResult {
         stdout: String,
         stderr: String,
     },
+    /// The action did not succeed. `command` is the substituted string that
+    /// actually ran, so the response reports what happened rather than what
+    /// the template declared.
+    Failed {
+        command: String,
+        failure_kind: FailureKind,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        truncated: bool,
+    },
+}
+
+/// Build the synthetic condition map a failed action stops on.
+///
+/// The failure routes through `StopReason::GateBlocked` under the reserved
+/// name `__action__` (DESIGN-koto-runs-commands.md Decision 3), which is why
+/// no eighth `NextResponse` variant exists. `exit_code` is present only for a
+/// non-zero exit: for a spawn failure, a timeout, or a wait error the runner
+/// never obtained a status, and reporting the synthetic `-1` would be the
+/// conflation `failure_kind` exists to end.
+fn action_failure_conditions(
+    state: &str,
+    command: &str,
+    failure_kind: FailureKind,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+    truncated: bool,
+) -> BTreeMap<String, StructuredGateResult> {
+    let mut output = serde_json::Map::new();
+    output.insert("state".to_string(), serde_json::json!(state));
+    output.insert("command".to_string(), serde_json::json!(command));
+    output.insert(
+        "failure_kind".to_string(),
+        serde_json::json!(failure_kind.as_str()),
+    );
+    if failure_kind == FailureKind::NonzeroExit {
+        output.insert("exit_code".to_string(), serde_json::json!(exit_code));
+    }
+    output.insert("stdout".to_string(), serde_json::json!(stdout));
+    output.insert("stderr".to_string(), serde_json::json!(stderr));
+    output.insert("truncated".to_string(), serde_json::json!(truncated));
+
+    // The outcome only sets the condition's `status` string. `failure_kind`
+    // in the payload is the discriminator agents route on; this keeps the
+    // status column honest for a reader skimming the list.
+    let outcome = match failure_kind {
+        FailureKind::NonzeroExit => GateOutcome::Failed,
+        FailureKind::TimedOut => GateOutcome::TimedOut,
+        FailureKind::SpawnFailed | FailureKind::WaitFailed => GateOutcome::Error,
+    };
+
+    let mut map = BTreeMap::new();
+    map.insert(
+        ACTION_CONDITION_NAME.to_string(),
+        StructuredGateResult {
+            outcome,
+            output: serde_json::Value::Object(output),
+        },
+    );
+    map
 }
 
 /// Why the advancement loop stopped.
@@ -304,6 +367,47 @@ where
                 }
                 ActionResult::Skipped => {
                     // Continue to gate evaluation
+                }
+                ActionResult::Failed {
+                    command,
+                    failure_kind,
+                    exit_code,
+                    stdout,
+                    stderr,
+                    truncated,
+                } => {
+                    // Stop at the state that ran the command, and do NOT
+                    // evaluate this state's gates: a state's gates judge the
+                    // work the action did, and the action did not happen.
+                    // Running them would let a passing gate advance past a
+                    // failed command, which is the silent advance R6 forbids
+                    // (DESIGN-koto-runs-commands.md Decision 3).
+                    //
+                    // Because this returns before the gate block, an action
+                    // failure can never be detected *by* a gate. There is no
+                    // path on which a gate observes the failure the action
+                    // already reported.
+                    //
+                    // This runs before the `requires_confirmation` branch
+                    // below by construction -- the closure classifies a
+                    // failure as `Failed` regardless of the flag -- so a
+                    // failing action stops here whether or not confirmation
+                    // was requested, and the confirm stop is reached only on
+                    // success.
+                    let conditions = action_failure_conditions(
+                        &state,
+                        &command,
+                        failure_kind,
+                        exit_code,
+                        &stdout,
+                        &stderr,
+                        truncated,
+                    );
+                    return Ok(AdvanceResult {
+                        final_state: state,
+                        advanced,
+                        stop_reason: StopReason::GateBlocked(conditions),
+                    });
                 }
                 ActionResult::RequiresConfirmation {
                     exit_code,
@@ -2802,6 +2906,7 @@ mod tests {
             working_dir: String::new(),
             requires_confirmation: false,
             polling: None,
+            fallback: None,
         }
     }
 
@@ -2972,6 +3077,243 @@ mod tests {
                 assert_eq!(stdout, "PR #42 created");
             }
             other => panic!("expected ActionRequiresConfirmation, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // action failure short-circuit
+    // -----------------------------------------------------------------------
+
+    fn failed_action(kind: FailureKind, exit_code: i32) -> ActionResult {
+        ActionResult::Failed {
+            command: "check.sh".to_string(),
+            failure_kind: kind,
+            exit_code,
+            stdout: "partial".to_string(),
+            stderr: "boom".to_string(),
+            truncated: false,
+        }
+    }
+
+    /// Build a one-state template whose action is followed by an
+    /// unconditional transition to a terminal state. Without the
+    /// short-circuit, a tick on `run` walks straight through to `done`.
+    fn action_failure_template(
+        gates: BTreeMap<String, crate::template::types::Gate>,
+    ) -> CompiledTemplate {
+        make_template(vec![
+            (
+                "run",
+                TemplateState {
+                    directive: "Run it.".to_string(),
+                    details: String::new(),
+                    transitions: vec![unconditional("done")],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: Some(make_action_decl("check.sh")),
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: None,
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: None,
+                },
+            ),
+        ])
+    }
+
+    fn run_failing_action(
+        template: &CompiledTemplate,
+        result: ActionResult,
+        gate_calls: &std::sync::atomic::AtomicUsize,
+    ) -> AdvanceResult {
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+        let gates_closure = |_: &BTreeMap<String, crate::template::types::Gate>| {
+            gate_calls.fetch_add(1, Ordering::Relaxed);
+            let mut out = BTreeMap::new();
+            out.insert(
+                "check".to_string(),
+                StructuredGateResult {
+                    outcome: GateOutcome::Passed,
+                    output: serde_json::json!({"exit_code": 0}),
+                },
+            );
+            out
+        };
+        let action = |_: &str, _: &ActionDecl, _: bool| -> ActionResult { result.clone() };
+
+        advance_until_stop(
+            "run",
+            template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &gates_closure,
+            &unavailable_integration,
+            &action,
+            &VariableOverlay::new(),
+            &shutdown,
+        )
+        .unwrap()
+    }
+
+    fn action_condition(result: &AdvanceResult) -> &serde_json::Value {
+        match &result.stop_reason {
+            StopReason::GateBlocked(conditions) => {
+                &conditions
+                    .get(ACTION_CONDITION_NAME)
+                    .expect("failure should be reported under the reserved name")
+                    .output
+            }
+            other => panic!("expected GateBlocked, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn failing_action_stops_at_the_state_that_ran_it() {
+        let gate_calls = std::sync::atomic::AtomicUsize::new(0);
+        let template = action_failure_template(BTreeMap::new());
+        let result = run_failing_action(
+            &template,
+            failed_action(FailureKind::NonzeroExit, 3),
+            &gate_calls,
+        );
+
+        assert_eq!(result.final_state, "run");
+        assert!(!result.advanced);
+        let output = action_condition(&result);
+        assert_eq!(output["state"], "run");
+        assert_eq!(output["command"], "check.sh");
+        assert_eq!(output["failure_kind"], "nonzero_exit");
+        assert_eq!(output["exit_code"], 3);
+        assert_eq!(output["stdout"], "partial");
+        assert_eq!(output["stderr"], "boom");
+        assert_eq!(output["truncated"], false);
+    }
+
+    #[test]
+    fn failing_action_does_not_evaluate_the_states_own_gates() {
+        use crate::template::types::Gate;
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "true".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+
+        let gate_calls = std::sync::atomic::AtomicUsize::new(0);
+        let template = action_failure_template(gates);
+        let result = run_failing_action(
+            &template,
+            failed_action(FailureKind::NonzeroExit, 1),
+            &gate_calls,
+        );
+
+        // The gate would have passed. Running it would have let the tick
+        // advance past a command that failed -- the silent advance R6 forbids.
+        assert_eq!(gate_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(result.final_state, "run");
+        assert!(!result.advanced);
+        assert_eq!(action_condition(&result)["failure_kind"], "nonzero_exit");
+    }
+
+    #[test]
+    fn spawn_failure_omits_exit_code() {
+        let gate_calls = std::sync::atomic::AtomicUsize::new(0);
+        let template = action_failure_template(BTreeMap::new());
+        let result = run_failing_action(
+            &template,
+            failed_action(FailureKind::SpawnFailed, -1),
+            &gate_calls,
+        );
+
+        let output = action_condition(&result);
+        assert_eq!(output["failure_kind"], "spawn_failed");
+        assert!(
+            output.get("exit_code").is_none(),
+            "a command that never ran has no exit status to report"
+        );
+    }
+
+    #[test]
+    fn timeout_omits_exit_code() {
+        let gate_calls = std::sync::atomic::AtomicUsize::new(0);
+        let template = action_failure_template(BTreeMap::new());
+        let result = run_failing_action(
+            &template,
+            failed_action(FailureKind::TimedOut, -1),
+            &gate_calls,
+        );
+
+        let output = action_condition(&result);
+        assert_eq!(output["failure_kind"], "timed_out");
+        assert!(output.get("exit_code").is_none());
+    }
+
+    #[test]
+    fn wait_failure_is_an_action_failure_like_the_others() {
+        let gate_calls = std::sync::atomic::AtomicUsize::new(0);
+        let template = action_failure_template(BTreeMap::new());
+        let result = run_failing_action(
+            &template,
+            failed_action(FailureKind::WaitFailed, -1),
+            &gate_calls,
+        );
+
+        assert_eq!(result.final_state, "run");
+        let output = action_condition(&result);
+        assert_eq!(output["failure_kind"], "wait_failed");
+        assert!(output.get("exit_code").is_none());
+    }
+
+    #[test]
+    fn action_failure_status_follows_the_failure_kind() {
+        let gate_calls = std::sync::atomic::AtomicUsize::new(0);
+        let template = action_failure_template(BTreeMap::new());
+        for (kind, expected) in [
+            (FailureKind::NonzeroExit, GateOutcome::Failed),
+            (FailureKind::TimedOut, GateOutcome::TimedOut),
+            (FailureKind::SpawnFailed, GateOutcome::Error),
+            (FailureKind::WaitFailed, GateOutcome::Error),
+        ] {
+            let result = run_failing_action(&template, failed_action(kind, -1), &gate_calls);
+            match &result.stop_reason {
+                StopReason::GateBlocked(conditions) => {
+                    assert_eq!(
+                        conditions[ACTION_CONDITION_NAME].outcome, expected,
+                        "unexpected outcome for {:?}",
+                        kind
+                    );
+                }
+                other => panic!("expected GateBlocked, got {:?}", other),
+            }
         }
     }
 

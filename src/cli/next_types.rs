@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::batch_error::BatchError;
 use crate::gate::{built_in_default, GateOutcome, StructuredGateResult};
-use crate::template::types::{Gate, TemplateState, FIELD_TYPE_TASKS};
+use crate::template::types::{Gate, TemplateState, ACTION_CONDITION_NAME, FIELD_TYPE_TASKS};
 
 /// One entry in the `unassigned_children` list returned by `koto next`.
 ///
@@ -852,6 +852,13 @@ pub struct ErrorDetail {
 /// gate result. `agent_actionable` is set to `true` when the gate has either an
 /// instance-level `override_default` or a built-in default for its gate type, signaling
 /// that the agent can call `koto overrides record` to substitute the gate output.
+///
+/// The reserved `__action__` name is not a gate: it carries a failed
+/// `default_action` through this same list (DESIGN-koto-runs-commands.md
+/// Decision 4). It is never present in `gate_defs` -- the compiler rejects a
+/// gate declared with that name -- so it is typed here explicitly rather than
+/// falling back to `"command"`. It is not agent-actionable: no override can
+/// substitute for a command that did not run.
 pub fn blocking_conditions_from_gates(
     gate_results: &BTreeMap<String, StructuredGateResult>,
     gate_defs: &BTreeMap<String, Gate>,
@@ -865,6 +872,16 @@ pub fn blocking_conditions_from_gates(
                 GateOutcome::TimedOut => "timed_out",
                 GateOutcome::Error => "error",
             };
+            if name == ACTION_CONDITION_NAME {
+                return Some(BlockingCondition {
+                    name: name.clone(),
+                    condition_type: "action".to_string(),
+                    status: status.to_string(),
+                    category: "corrective".to_string(),
+                    agent_actionable: false,
+                    output: result.output.clone(),
+                });
+            }
             let condition_type = gate_defs
                 .get(name)
                 .map(|g| g.gate_type.clone())
@@ -1870,6 +1887,39 @@ mod tests {
             completion: None,
             name_filter: None,
         }
+    }
+
+    #[test]
+    fn blocking_conditions_type_the_reserved_action_condition() {
+        let mut gate_results = BTreeMap::new();
+        gate_results.insert(
+            ACTION_CONDITION_NAME.to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({
+                    "state": "run",
+                    "command": "check.sh",
+                    "failure_kind": "nonzero_exit",
+                    "exit_code": 3,
+                }),
+            },
+        );
+
+        // `__action__` is never a declared gate -- the compiler rejects the
+        // name -- so an empty `gate_defs` is the real shape here.
+        let conditions = blocking_conditions_from_gates(&gate_results, &BTreeMap::new());
+        assert_eq!(conditions.len(), 1);
+
+        let cond = &conditions[0];
+        assert_eq!(cond.name, ACTION_CONDITION_NAME);
+        assert_eq!(cond.condition_type, "action");
+        assert_eq!(cond.status, "failed");
+        assert_eq!(cond.category, "corrective");
+        assert!(
+            !cond.agent_actionable,
+            "no override substitutes for a command that did not run"
+        );
+        assert_eq!(cond.output["failure_kind"], "nonzero_exit");
     }
 
     #[test]

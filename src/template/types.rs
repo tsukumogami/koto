@@ -205,6 +205,16 @@ pub struct ActionDecl {
     pub requires_confirmation: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub polling: Option<PollingConfig>,
+    /// Prose the agent reads when this action fails.
+    ///
+    /// Spliced onto the failure response's `directive` rather than placed in
+    /// `details`, so detail suppression can never withhold it
+    /// (DESIGN-koto-runs-commands.md Decision 4). It is spliced after
+    /// variable substitution and is therefore never expanded — write it as
+    /// literal prose. A state that declares no fallback still stops on
+    /// failure; the response simply carries no prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
 }
 
 /// Polling configuration for actions that need repeated execution.
@@ -235,6 +245,15 @@ pub const GATE_TYPE_CHILDREN_COMPLETE: &str = "children-complete";
 /// Agent submissions starting with this prefix are rejected (Feature 2, R7).
 /// All `gates.*` key checks in advance.rs and types.rs use this constant.
 pub const GATES_EVIDENCE_NAMESPACE: &str = "gates";
+
+/// Condition name reserved for the synthetic result a failed `default_action`
+/// produces (DESIGN-koto-runs-commands.md Decision 3).
+///
+/// A failing action routes through the gate-blocked path under this name, so
+/// the compiler rejects any state that declares a gate called `__action__` —
+/// otherwise an author's gate and the engine's synthetic result would collide
+/// in the same map.
+pub const ACTION_CONDITION_NAME: &str = "__action__";
 
 /// Prefix used in when-clause keys to match on the presence of an agent-submitted
 /// evidence field. Paired with the sentinel value [`PRESENT_MATCHER_VALUE`] to form
@@ -788,6 +807,18 @@ impl CompiledTemplate {
                         state_name, ref_name
                     ));
                 }
+            }
+
+            // Reject the reserved condition name. A failed default_action is
+            // reported under `__action__` through the same blocking-condition
+            // list gates use, so an author's gate of that name would be
+            // overwritten by the engine's synthetic result.
+            if state.gates.contains_key(ACTION_CONDITION_NAME) {
+                return Err(format!(
+                    "state {:?}: gate name {:?} is reserved for default_action failures\n  \
+                     remedy: rename the gate",
+                    state_name, ACTION_CONDITION_NAME
+                ));
             }
 
             // Validate variable references in gate commands.
@@ -2531,6 +2562,7 @@ mod tests {
             working_dir: String::new(),
             requires_confirmation: false,
             polling: None,
+            fallback: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2566,6 +2598,31 @@ mod tests {
     }
 
     #[test]
+    fn rejects_gate_named_with_the_reserved_action_condition() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            ACTION_CONDITION_NAME.to_string(),
+            Gate {
+                gate_type: GATE_TYPE_COMMAND.to_string(),
+                command: "true".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("is reserved for default_action failures"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
     fn rejects_empty_default_action_command() {
         let mut t = minimal_template();
         let state = t.states.get_mut("start").unwrap();
@@ -2574,6 +2631,7 @@ mod tests {
             working_dir: String::new(),
             requires_confirmation: false,
             polling: None,
+            fallback: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2613,6 +2671,7 @@ mod tests {
             working_dir: String::new(),
             requires_confirmation: false,
             polling: None,
+            fallback: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2632,6 +2691,7 @@ mod tests {
             working_dir: "/tmp/{{MISSING}}".to_string(),
             requires_confirmation: false,
             polling: None,
+            fallback: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2654,6 +2714,7 @@ mod tests {
                 interval_secs: 10,
                 timeout_secs: 0,
             }),
+            fallback: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2680,6 +2741,7 @@ mod tests {
             working_dir: String::new(),
             requires_confirmation: false,
             polling: None,
+            fallback: None,
         });
         t.validate(true).unwrap();
     }
@@ -2696,6 +2758,7 @@ mod tests {
                 interval_secs: 30,
                 timeout_secs: 1800,
             }),
+            fallback: None,
         });
         t.validate(true).unwrap();
     }
@@ -2710,6 +2773,7 @@ mod tests {
                 interval_secs: 10,
                 timeout_secs: 300,
             }),
+            fallback: None,
         };
         let json = serde_json::to_string(&action).unwrap();
         let restored: ActionDecl = serde_json::from_str(&json).unwrap();
@@ -2723,6 +2787,7 @@ mod tests {
             working_dir: String::new(),
             requires_confirmation: false,
             polling: None,
+            fallback: None,
         };
         let json = serde_json::to_string(&action).unwrap();
         // Optional/empty fields should be omitted.
