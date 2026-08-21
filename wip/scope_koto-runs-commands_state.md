@@ -1,18 +1,24 @@
 ---
 topic: koto-runs-commands
 chain_started: 2026-08-21T02:31:24Z
-last_updated: 2026-08-21T02:43:16Z
+last_updated: 2026-08-21T03:06:38Z
 phase_pointer: phase-2
 exit: UNSET
 exit_artifacts: []
 planned_chain: [brief, prd, design, plan]
 chain_skipped: []
-chain_ran: [brief]
+chain_ran: [brief, prd]
 child_snapshots:
   brief:
     path: docs/briefs/BRIEF-koto-runs-commands.md
     status: Accepted
     validator: clean
+  prd:
+    path: docs/prds/PRD-koto-runs-commands.md
+    status: Accepted
+    validator: clean
+consolidation_judgments:
+  brief-to-prd: keep  # all six prior koto BRIEFs coexist with their PRDs
 framing_shift: yes
 r6_predicates:
   p1_architectural_alternatives: fires
