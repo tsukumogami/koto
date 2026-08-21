@@ -50,6 +50,19 @@ validation logic is verifiable; the artifact that grants command authority is
 not. Extending the existing `sha256sum` line is a smaller change than anything
 else this exploration recommends.
 
+**A revision-pinning surface already exists, and it halves the problem.**
+(lead-plugin-integrity) Claude Code lets a marketplace entry pin a git-backed
+plugin to an exact 40-character commit `sha`, which takes precedence over `ref`;
+archive sources carry a real `sha256` that refuses the install on mismatch. So
+"which revision of the templates am I running" is answerable today with
+configuration rather than engineering. What does not exist for git sources is any
+content hash, any install-time or update-time hook, and any load-time
+verification — once installed, plugin files are trusted implicitly. The half
+worth building is therefore binding a *specific template* to a reviewed hash at
+the moment `koto init` accepts it. The two compose: pin the plugin so the file on
+disk is known, check the compiled hash at init so nothing substituted something
+else in between.
+
 **No version pinning exists between shirabe and koto.** (lead-template-boundary)
 No `KOTO_VERSION` anywhere in `install.sh` or the workflows; CI installs whatever
 `tsuku install` currently resolves to. And shirabe's own cross-skill guard,
@@ -232,9 +245,6 @@ regardless of everything else here.
 
 ### Gaps
 
-- Whether Claude Code's plugin mechanism exposes an integrity or pinning surface
-  a hash story could hook into. In flight at the time of writing; it decides
-  whether shirabe hooks into something existing or invents a manifest.
 - Where an expected-hash value should live: a koto-side trusted-templates file, a
   shirabe release manifest, or an argument the skill passes at init.
 - Nobody has scoped what capping or hashing the `command` field would break for
