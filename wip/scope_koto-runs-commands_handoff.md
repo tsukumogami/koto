@@ -178,6 +178,30 @@ permanently — a durable rule, not a sequencing constraint. Write it into whate
 authoring guidance this chain produces; it is the single most reusable output of
 either exploration.
 
+**The rule, in one sentence a template author can apply.** Keep `default_action`
+off any command whose successful exit is itself the irreversible,
+externally-visible event — creating, publishing, or closing a PR, posting a
+comment, marking ready for review — but allow it for a command whose only
+irreversibility is bounded and repairable after a successful run, because those
+need better failure diagnosis rather than a pre-execution veto. The joint is
+whether *success itself* creates the harm, or only a *bad run* does.
+
+**Some of this constraint is durable and some is staged, and the difference is
+per-command.** For the PR-creation class the constraint is **durable**: action
+output on the failure path fixes diagnosing a bad failure and does nothing for a
+bad success, which is where all of that class's danger lives. For the
+finalization cascade's push and `--force-with-lease` the constraint is
+**staged**: the risk there genuinely is an undiagnosed failure with no
+success-side problem riding along, so it lifts when the plumbing lands. This
+chain should write the first as a durable authoring rule and the second as a
+temporary sequencing note, and should not blur them into one.
+
+**The counts, so the scope is concrete.** Of the ten writes-remote commands: the
+first exploration had 4 convert-now, 4 convert-after-plumbing, 2 stay-agent-run.
+Under the rule above it becomes 2 / 3 / 5. Under a blanket reading where any
+remote mutation counts as irreversible it collapses to 2 / 0 / 8 — which is the
+over-block this chain should avoid.
+
 **Applied, that rule moves specific commands.** Both `gh pr create` sites and
 `gh pr ready` are permanently agent-run: each fires an unrecallable notification
 the instant it succeeds, and in the PR case consumes an identifier. `git push` to
@@ -189,6 +213,15 @@ convert path (the case for the latter: they push to an already-open PR, firing a
 quiet synchronize rather than a loud open, and `--force-with-lease` refuses
 itself atomically before rewriting history), and whether `gh pr edit` on the
 run's own draft is quiet enough to convert.
+
+The first of those rests on one falsifiable empirical claim, which is the cheapest
+way to settle it: that GitHub's `synchronize` event — new commits pushed to an
+already-open PR — notifies meaningfully more quietly than `opened` or
+`ready_for_review`. Verify that against GitHub's notification documentation. If
+it is wrong, the cascade push folds into the durable ban. `--force-with-lease`
+survives either way, since its argument is the lease's atomic self-refusal before
+any history is rewritten rather than notification volume, and nothing in either
+exploration contradicts that.
 
 **`requires_confirmation` is a misnomer, not a late checkpoint — and this
 document under-stated it.** It executes unconditionally and only afterward
