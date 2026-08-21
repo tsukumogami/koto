@@ -62,7 +62,8 @@ After init, follow the koto execution loop:
 1. Run `koto next` to get the current state's response
 2. Check the `action` field to determine what's needed:
    - `evidence_required` -- the state needs you to submit data. Do the work, then call `koto next --with-data '{"field": "value"}'`
-   - `gate_blocked` -- a precondition hasn't been met. Read `blocking_conditions` for what's failing, fix it, then call `koto next` again
+   - `gate_blocked` -- a precondition hasn't been met. Read `blocking_conditions` for what's failing, fix it, then call `koto next` again. A state's `default_action` that failed arrives here too, under the reserved name `__action__` -- see below
+   - `confirm` -- a state's `default_action` ran successfully and wants confirmation before the workflow advances. Read `directive` and `action_output` (`command`, `exit_code`, `stdout`, `stderr`), then confirm with the evidence the state's `expects` asks for, or submit evidence that redirects
    - `done` -- the workflow finished
 3. Read the `directive` for instructions. A `details` field may contain extended guidance -- it's delivered when you arrive at a state (from a different state, or via a rewind into it) and omitted on every later tick until you arrive again, including on a self-transition, which is a lap rather than an arrival (pass `--full` to force it through anyway). `koto status <session-name>` retrieves the current state's `directive`/`details`/`expects` unconditionally, without depending on delivery state -- useful for recovering guidance you've lost track of, and the way back to it inside a loop without ticking the workflow (`--full` also works, at the cost of a tick)
 4. Repeat until `action` is `done`
@@ -71,12 +72,14 @@ Each item in `blocking_conditions` has six fields:
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `name` | string | Gate name as declared in the template |
-| `type` | string | Gate type (`command`, `context-exists`, `context-matches`, `children-complete`) |
+| `name` | string | Gate name as declared in the template, or the reserved `__action__` for a failed `default_action` |
+| `type` | string | Gate type (`command`, `context-exists`, `context-matches`, `children-complete`), or `action` |
 | `status` | string | `failed`, `timed_out`, or `error` |
 | `category` | string | `"corrective"` (fix something) or `"temporal"` (retry later). `children-complete` gates are temporal; all others are corrective. |
-| `agent_actionable` | boolean | `true` when `koto overrides record` can unblock this gate |
-| `output` | object | Gate-type-specific structured result (e.g., `{"exit_code": 1, "error": ""}` for `command` gates) |
+| `agent_actionable` | boolean | `true` when `koto overrides record` can unblock this gate. Always `false` for `__action__` -- an action failure has nothing to override |
+| `output` | object | Gate-type-specific structured result (e.g., `{"exit_code": 1, "error": ""}` for `command` gates). For `__action__`: `state`, `command`, `failure_kind`, `stdout`, `stderr`, `truncated`, and `exit_code` only when `failure_kind` is `nonzero_exit` |
+
+`__action__` is reserved: the compiler rejects a state that declares a gate by that name, so the condition can never be confused with one of yours. Route on `failure_kind` (`nonzero_exit`, `spawn_failed`, `timed_out`, `wait_failed`, `capture_failed`) rather than on `status` or on message wording. When an action fails, the state's gates are not evaluated at all -- the tick returns first -- so a state whose action failed reports exactly one condition.
 
 To check where you are at any point, call `koto next <session-name>` without `--with-data` — it returns the current state directive and is idempotent. If you don't know the session name, `koto workflows` lists active sessions.
 
@@ -93,11 +96,26 @@ The workflow has 8 states:
 7. **skill_authoring** -- write the paired SKILL.md (new) or refactor the existing one (convert)
 8. **integration_check** -- verify the coupling convention and generate the mermaid preview
 
+## Deciding who runs a command
+
+Every time your workflow needs a command run, you're choosing between three things, and the choice is a design decision rather than a style preference:
+
+- **A gate** when the command's *result* is the question -- the workflow must not proceed until something is objectively true. Gates route on their output; they don't carry it forward.
+- **A `default_action`** when the command's *effect or output* is the point -- read the branch name, create the directory, run the formatter. koto runs it on entering the state, before that state's gates, and `capture_stdout_as` carries one line of its stdout into later states.
+- **Prose in the directive** when the agent should run it. That's the right answer more often than authors expect, and it's the only answer for one whole category of command.
+
+The category: **does the command's risk live in a bad success, or only in a bad failure?** Keep `default_action` off any command whose *successful* exit is itself the irreversible, externally visible event -- `gh pr create`, `gh pr comment`, `gh pr ready`. Nothing arriving afterward can un-fire it, so no koto release will make it engine-runnable. Allow it where the only irreversibility is bounded and repairable after a successful run: a bad failure is a diagnosis problem, and diagnosing failures is exactly what the action failure path does.
+
+An action must also be safe to re-run -- it fires on every tick that enters the state without evidence, gate-blocked retries and self-loops included.
+
+The [`default_action` authoring guide](../../../../docs/guides/default-action-authoring.md) carries the rule in full, with worked examples on both sides, the burden-of-proof rule for a classification that turns on an unchecked claim, and the failure, capture, and anchoring mechanics. The [template format guide](references/template-format.md) carries the field schema. Read the rule before you write your first action.
+
 ## Reference material
 
 The skill bundles reference material, loaded during specific states:
 
 - **Template format guide** (`${CLAUDE_SKILL_DIR}/references/template-format.md`) -- read during state_design and template_drafting. Covers structure (Layer 1), evidence routing (Layer 2), and advanced features (Layer 3). Read only the layers you need.
+- **`default_action` authoring guide** (`docs/guides/default-action-authoring.md` in the koto repository) -- read before declaring a state's `default_action`. Covers which commands the engine may run, the field schema, the failure path and its `failure_kind` vocabulary, `capture_stdout_as`, and execution anchoring.
 - **Batch authoring guide** (`${CLAUDE_SKILL_DIR}/references/batch-authoring.md`) -- read when your workflow fans out a dynamic task list to child workers. Covers `materialize_children`, the `failure_reason` convention (W5), the `skipped_marker` child-template requirement (F5), aggregate-boolean routing (W4), and two-hat coordinators.
 - **Example templates** (`${CLAUDE_SKILL_DIR}/references/examples/`) -- read during state_design. Pick the one matching your complexity:
   - Branching workflows? `evidence-routing-workflow.md`

@@ -82,6 +82,7 @@ Two properties of this path matter while you author:
 
 - **It's strict.** The definition must meet koto's current template standard: every gate that a state declares must be routed with a `gates.<name>.<field>` `when` clause. Legacy boolean-only gates are rejected (no `--allow-legacy-gates` on this path). If compilation fails, koto exits non-zero and names the failing element — fix it and re-pipe.
 - **The source is persisted for audit.** koto writes your definition into the session directory. Don't embed secrets (tokens, keys) in `command` gate strings or variable defaults; reference `$VAR` or files read at gate-evaluation time instead.
+- **The session is bound to the directory you piped it from.** koto records that directory as the session's execution anchor, and every later `koto next` must run there or beneath it — a tick from a different tree is refused with `execution_anchor_mismatch` before anything runs. Every gate and action of an accepted tick runs at the anchor, so `cd` to the tree the task is about before you pipe. Pass `--execution-dir <path>` to bind somewhere else. The anchor guarantees where a workflow's commands *start*; it is not containment and doesn't bound what a running command can reach.
 
 ### Running the workflow
 
@@ -104,6 +105,14 @@ A workflow that compiles isn't automatically a good workflow. Run your decomposi
 - Don't gate on things only you can judge ("the code looks clean"). That's an `accepts` evidence field with a `when` route, not a gate.
 - Every gate needs `gates.<name>.<field>` routing on the same state's transitions. A gate with no routing is rejected on the strict path.
 - Prefer `context-exists` / `context-matches` gates over `command` gates when checking a path or file that comes from a variable — they don't invoke a shell and avoid injection.
+
+**When to let koto run the command**
+
+- A state can declare a `default_action` — a command koto runs itself on entering the state, before that state's gates. Reach for it when the command's *effect or output* is the point (read the branch name, create the directory, run the formatter), and `capture_stdout_as` when a later state needs one line of its stdout. A **gate** is the other shape: use it when the command's *result* is the question. Anything else stays in the directive as prose for you to run.
+- **Does the command's risk live in a bad success, or only in a bad failure?** Keep `default_action` off any command whose *successful* exit is itself the irreversible, externally visible event — `gh pr create`, `gh pr comment`, `gh pr ready`. Nothing arriving afterward can un-fire it. Allow it where the only irreversibility is bounded and repairable after a successful run: a bad failure is a diagnosis problem, and the action failure path stops the tick and hands you the command's exit status, both streams, a `failure_kind`, and the author's `fallback` prose in one response.
+- The temptation is sharper here than in a durable template, because you're the author and the runner at once and the command is right there in front of you. The rule doesn't relax for a one-off — a pull request opened by mistake is just as open.
+- An action must be safe to re-run. It fires on every tick that enters the state without evidence, gate-blocked retries and self-loops included: `mkdir -p`, not `mkdir`.
+- The full rule, with worked examples on both sides, is in the [`default_action` authoring guide](../../../../docs/guides/default-action-authoring.md); the field schema is in the [template format guide](../koto-author/references/template-format.md).
 
 **Branching**
 
@@ -318,6 +327,8 @@ Rule of thumb: first time, ad-hoc; second time you reach for the same shape, mak
 **"koto: command not found"** — koto isn't on PATH. Install it or add its directory to PATH.
 
 **Compilation fails on `--from-stdin`** — koto exits non-zero and names the failing element (a state, transition, or gate). Common causes: a state declared in the frontmatter with no `## state` body section; a gate with no `gates.<name>.<field>` routing on its transitions (rejected on the strict path); overlapping `when` conditions on two transitions from the same state. Fix the named element and re-pipe.
+
+**"execution_anchor_mismatch"** — you piped the definition from one directory and are ticking from another. The message names the directory the session is bound to; `cd` there (or into a subdirectory of it) and re-run. Nothing ran on the refused tick.
 
 **"session already exists"** — a session with this name is already active. Resume it with `koto next <name>`, or cancel and re-init: `koto cancel <name> --cleanup` then re-pipe.
 

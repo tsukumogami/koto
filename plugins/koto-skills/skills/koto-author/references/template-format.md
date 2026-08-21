@@ -562,6 +562,8 @@ The compiler validates `children-complete` gate fields at compile time:
 
 A state can declare a command koto runs itself, on entering the state, before that state's gates are evaluated. It's how a workflow does the mechanical step instead of writing prose asking the agent to do it and then gating on whether it did.
 
+**Action, gate, or prose.** All three run commands, and they answer different questions. A **gate** is for a command whose *result* is the question -- the workflow must not proceed until something is objectively true; a gate routes on its output and carries nothing forward. A **`default_action`** is for a command whose *effect or output* is the point, and `capture_stdout_as` is what carries the output into later states. **Prose in the directive** hands the command to the agent, which is the right answer whenever the rule below puts it there, and a reasonable answer any time the step needs judgment the engine can't apply.
+
 **Read the rule before writing one.** The [default_action authoring guide](../../../../../docs/guides/default-action-authoring.md) states which commands the engine may run, with worked examples on both sides. In one line: *does the command's risk live in a bad success, or only in a bad failure?* A command whose successful exit is itself the irreversible, externally visible event -- `gh pr create`, `gh pr comment`, `gh pr ready` -- stays with the agent permanently, because no signal arriving afterward can un-fire it. A command whose only irreversibility is local and repairable is engine-runnable; its bad-failure risk is what the failure path below exists to answer.
 
 ```yaml
@@ -588,11 +590,13 @@ states:
 
 **When it runs.** Whenever the advance loop enters the state on a tick carrying no evidence for it. A tick that submits evidence skips the action -- which is how confirming doesn't re-run the command. Every other tick that reaches the state runs it again, gate-blocked retries and self-loops included, so the command must be safe to re-run (`mkdir -p`, not `mkdir`).
 
-**Where it runs.** At the session's execution anchor, not the directory `koto next` was typed in. `working_dir` moves one action to a subdirectory: an absolute value is refused before any join, then the value is joined to the anchor, then canonicalized and refused if it escaped via `..`.
+**Where it runs.** At the session's execution anchor, not the directory `koto next` was typed in. `working_dir` moves one action to a subdirectory: an absolute value is refused before any join, then the value is joined to the anchor, then canonicalized and refused if it escaped via `..`. The anchor guarantees the directory a workflow's commands *start* in, checked on every tick. It does not bound what an authorized command can reach once running -- a command is still free to name absolute paths or change directory -- so don't author as if it did, and don't describe it to anyone else as if it did.
 
 **Its output.** Every run appends a `default_action_executed` event with the command, exit code, both streams, and a `truncated` flag; each stream is bounded at 64KB. On a successful run with no `capture_stdout_as`, that log entry is where the output ends -- the agent never sees it.
 
 **When it fails.** The tick stops at the state that ran the command, in an ordinary blocked response (not an error envelope) carrying a condition named `__action__` whose `output` holds the command, `failure_kind`, both streams, and `state`. `exit_code` is present only for `nonzero_exit`. Route on `failure_kind`: `nonzero_exit`, `spawn_failed`, `timed_out`, `wait_failed`, `capture_failed`. The state's `fallback` prose rides the `directive`. It all arrives in the tick that ran the command.
+
+`__action__` is a reserved condition name, so `agent_actionable` is always `false` on it and the compiler rejects any state that declares a gate called `__action__`. A caller can therefore tell an action failure from a gate failure by name alone, and never has to wonder which one it's looking at.
 
 **Its gates do not evaluate after it fails.** A state's gates judge the work its action did, and the action didn't happen. Running them anyway would let a passing gate carry the workflow past a failed command. This holds for a state with no gates at all, which is the case that detected nothing before. Failure is classified ahead of `requires_confirmation`, so a failing action stops as a failure whether or not the flag is set.
 

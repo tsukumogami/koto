@@ -65,11 +65,11 @@ Every `koto next` response includes an `action` field. Dispatch on this field on
 | `action` | What it means | What you do |
 |---|---|---|
 | `evidence_required` | The state needs input. May have gates blocking too. | Read `directive`. Check `blocking_conditions` and `expects.fields` to determine the sub-case — see below. |
-| `gate_blocked` | One or more gates failed and the state has no evidence fallback. | Read `directive` and `blocking_conditions`. Check `category` to distinguish temporal blocks (retry later) from corrective ones (fix something). Check `agent_actionable` on each item — override if possible, otherwise escalate to the user. |
+| `gate_blocked` | One or more gates failed and the state has no evidence fallback. Also how a failed `default_action` arrives. | Read `directive` and `blocking_conditions`. A condition named `__action__` means the state's command failed — see [When a default action fails](#when-a-default-action-fails). Otherwise check `category` to distinguish temporal blocks (retry later) from corrective ones (fix something), and `agent_actionable` on each item — override if possible, otherwise escalate to the user. |
 | `integration` | An integration ran and returned output. | Read `directive` and `integration.output`. Follow the directive's instructions for handling the output. |
 | `integration_unavailable` | An integration is declared but not configured. | Read `directive`. Follow any manual fallback instructions it provides. |
 | `done` | The workflow reached a terminal state. | Stop. The workflow is complete. |
-| `confirm` | A default action ran and requires your confirmation before advancing. | Read `directive` and `action_output` (command, exit code, stdout, stderr). Confirm if correct, or submit evidence to redirect. |
+| `confirm` | A default action ran **successfully** and requires your confirmation before advancing. | Read `directive` and `action_output` (command, exit code, stdout, stderr). Confirm if correct, or submit evidence to redirect. |
 
 Note: `directive` is absent on `done` responses. Don't expect it.
 
@@ -153,6 +153,62 @@ The overridden gate is now treated as passed.
 For `children-complete` gates, the override pretends all children are done. The default value mirrors the extended gate output schema: all aggregate counters are zero, `all_complete` and `all_success` are `true`, the `any_*` and `needs_attention` booleans are `false`, and `children` is empty. Use this when you know children are finished but the gate hasn't picked it up, or when you need to proceed regardless.
 
 When `agent_actionable` is `false`, the gate has no override mechanism. Don't call `koto overrides record` for it — the command will fail. Escalate to the user instead.
+
+## When a default action fails
+
+A state can declare a `default_action` — a command koto runs itself on entering the state, before that state's gates. When it fails, the tick stops at that state and tells you in the same response. There's no second call to make and no error envelope to catch: `koto next` still exits 0 and answers `action: "gate_blocked"`, carrying one blocking condition under the reserved name `__action__`:
+
+```json
+{"action":"gate_blocked","advanced":false,"state":"detect",
+ "blocking_conditions":[{"name":"__action__","type":"action","status":"failed",
+   "agent_actionable":false,"category":"corrective",
+   "output":{"state":"detect","command":"git rev-parse --abbrev-ref HEAD",
+             "failure_kind":"nonzero_exit","exit_code":128,
+             "stdout":"","stderr":"fatal: not a git repository (or any of the parent directories): .git\n",
+             "truncated":false}}],
+ "directive":"koto could not read the branch name. Run `git rev-parse --abbrev-ref HEAD` yourself...\n\nReading the current branch."}
+```
+
+**Route on `failure_kind`, never on message wording.** Two kinds share `status: "failed"`, so `status` doesn't discriminate.
+
+| `failure_kind` | Meaning | What you do |
+|---|---|---|
+| `nonzero_exit` | The command ran and exited non-zero. The only kind carrying a real `exit_code`. | Read `stderr` and fix what the command is complaining about, then re-tick. |
+| `spawn_failed` | No child process started — the tool isn't installed, the path doesn't resolve, or the action's `working_dir` was rejected. | Fix the environment or escalate; re-ticking unchanged won't help. |
+| `timed_out` | The command exceeded its 30-second timeout and its process group was killed. Whatever it printed before the kill is still reported. | Check whether the command is hung on something external before retrying. |
+| `wait_failed` | The child started but waiting on it failed, so no exit status was obtained. | Treat as infrastructure; report it. |
+| `capture_failed` | The command exited zero, but its stdout couldn't be delivered under the state's `capture_stdout_as` name. A `capture_error` object names the case: `empty`, `too_large`, or `disallowed_character`. | The command produced the wrong shape of output. This is a template problem — report it rather than working around it. |
+
+Three things to know:
+
+- **`exit_code` is present only for `nonzero_exit`.** The other kinds omit it rather than reporting a synthetic `-1`. Don't read it unconditionally.
+- **The state's gates did not run.** The tick returns before gate evaluation, so a state whose action failed reports exactly one condition and no gate result. Nothing advanced and nothing later in the workflow executed.
+- **`agent_actionable` is `false` and there is no override.** Don't call `koto overrides record` against `__action__` — it isn't a gate, and the compiler won't let a template declare one by that name.
+
+If the template's author wrote a `fallback`, its text opens the `directive`, ahead of the state's own instructions. That's the author telling you how to do the step by hand. Do that, and carry on.
+
+## Where a session's commands run
+
+A session records the directory it was created in — its **execution anchor** — and every tick is checked against it. Every gate and action of an accepted tick runs there, not in whatever directory you typed `koto next` in, so a command means the same thing wherever in the tree you're standing.
+
+Standing in a subdirectory of the anchor is fine. Ticking from a *different* tree is refused, before the template is read and before any gate or action exists — so a refusal means nothing ran, nothing was evaluated, and nothing moved.
+
+| Error code | Exit | What happened | What you do |
+|---|---|---|---|
+| `execution_anchor_mismatch` | 2 | The tick ran from a directory that is neither the anchor nor beneath it. The message names the bound directory. | `cd` to the directory the message names and re-run. |
+| `execution_anchor_unresolvable` | 3 | The recorded anchor names nothing on this machine — the checkout was deleted, or the session moved machines. | Put the checkout back where the message names, or escalate. |
+
+Both messages tell you to run `koto session rebind <session> --to <dir>`. **That subcommand has not landed yet** — `koto session` currently offers `start`, `dir`, `list`, `cleanup`, `resolve`, and `update`. Route on the error code rather than the message text; the wording will change when the subcommand ships.
+
+A session created before anchoring existed has no recorded directory. Its first tick adopts the directory it's ticked from, records the binding, and says so once on the `directive`:
+
+```
+[koto] Session 'demo' had no recorded directory; it is now bound to /home/dev/repo. Later ticks must run there or below it -- `koto session rebind demo` moves it.
+```
+
+It doesn't refuse and it doesn't adopt silently. Check that the directory it names is the one you meant before you keep ticking — the adopted directory is simply whatever tree was current. The notice appears once; the next tick takes the ordinary path.
+
+**Anchoring is not containment, sandboxing, or isolation.** It guarantees the directory a workflow's commands *start* in. It does not bound what a command can reach once running: a command can name absolute paths or change directory, and nothing here stops it. Don't rely on it as a safety boundary, and don't describe it to a user as one.
 
 ## Resuming a session
 
@@ -480,6 +536,14 @@ Read these on demand, not upfront. The sections above cover the common path. Con
 **"workflow_not_initialized"** — the workflow name doesn't exist. Run `koto workflows` to see what's active, or re-run `koto init` if the session was cleaned up.
 
 **"session already exists"** — a previous session with this name is still active. Call `koto next <name>` to resume. If you don't need it, cancel first with `koto cancel <name>` then re-initialize.
+
+**"execution_anchor_mismatch"** — you're ticking from a different tree than the one the session is bound to. The message names the bound directory; `cd` there (or into a subdirectory of it) and re-run. Nothing ran on the refused tick. See [Where a session's commands run](#where-a-sessions-commands-run).
+
+**"execution_anchor_unresolvable"** — the directory the session is bound to doesn't exist on this machine. Restore the checkout at the path the message names, or escalate. `koto session rebind` is named in the message but hasn't shipped.
+
+**"capture_unset"** — a state's instructions read a `{{NAME}}` that a `capture_stdout_as` was supposed to deliver, and this run never entered the state that produces it. The message names both. This is a template routing problem, not something you can fix by re-ticking — report it to whoever authored the workflow.
+
+**A blocking condition named `__action__`** — the state's own `default_action` command failed; the state's gates never ran. Read `output.failure_kind` to decide what to do, and the front of `directive` for the author's fallback instructions. See [When a default action fails](#when-a-default-action-fails).
 
 **Gate blocked, `agent_actionable` is `false`** — you can't override this gate yourself. Escalate to the user so they can resolve the underlying condition (for example, a required deployment that only they can trigger).
 
