@@ -601,19 +601,16 @@ pub fn handle_recover(backend: &Backend, apply: bool, sessions: &[String]) -> Re
         }
 
         match recover::recover_one(&base, entry) {
-            recover::Outcome::Recovered {
-                id,
-                header_rewritten,
-            } => {
+            recover::Outcome::Recovered { id, header_error } => {
                 recovered += 1;
                 row["status"] = serde_json::json!("recovered");
                 row["recovered_as"] = serde_json::json!(id);
-                row["header_rewritten"] = serde_json::json!(header_rewritten);
-                if !header_rewritten {
-                    row["reason"] = serde_json::json!(
-                        "state file header could not be parsed, so its workflow field \
-                         still names the old id; the session itself is back in place"
-                    );
+                row["header_rewritten"] = serde_json::json!(header_error.is_none());
+                if let Some(e) = header_error {
+                    row["reason"] = serde_json::json!(format!(
+                        "the session is back in place, but its state file header still \
+                         names the old id: {e}"
+                    ));
                 }
             }
             recover::Outcome::Skipped(reason) => {

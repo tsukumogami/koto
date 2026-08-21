@@ -75,16 +75,19 @@ impl Quarantined {
 pub enum Outcome {
     /// Moved back into the flat namespace under `id`.
     ///
-    /// `header_rewritten` is `false` when the state file's header could not
-    /// be parsed, which is the pre-existing corruption case: the session is
-    /// where it belongs and its state file is named correctly, but the
-    /// `workflow` field inside still reads the old name. Nothing was lost
-    /// that was not already unreadable.
+    /// `header_error` is `Some` when the session is where it belongs and its
+    /// state file is named correctly, but the `workflow` field inside still
+    /// reads the old name. The usual cause is the header being unparseable
+    /// already -- koto#193's other finding -- and the move leaves such a
+    /// session no less readable than it was in quarantine, so it is reported
+    /// rather than undone. It carries the underlying message because "could
+    /// not rewrite the header" and "could not parse the header" are not the
+    /// same news, and a reader deciding what to do next needs the difference.
     Recovered {
         /// The flat-namespace id the session now answers to.
         id: String,
-        /// Whether the header's identity fields were updated to match.
-        header_rewritten: bool,
+        /// Why the header's identity fields were left alone, if they were.
+        header_error: Option<String>,
     },
 
     /// Left in place, with the reason. Not an error: a directory with no
@@ -226,8 +229,11 @@ pub fn recover_one(base: &Path, entry: &Quarantined) -> Outcome {
     // It does not make the session less reachable than it is now, so it is
     // recorded rather than treated as a failure -- undoing the move would
     // put a recoverable session back out of reach to protect a field that
-    // was already unreadable.
-    let header_rewritten = rewrite_header_identity(&dest, &id).is_ok();
+    // was already unreadable. The message rides along so the report can say
+    // which failure this was rather than assuming the common one.
+    let header_error = rewrite_header_identity(&dest, &id)
+        .err()
+        .map(|e| format!("{e:#}"));
 
     // Best-effort tidy: both calls only succeed on an empty directory.
     if let Some(repo_dir) = entry.path.parent() {
@@ -235,10 +241,7 @@ pub fn recover_one(base: &Path, entry: &Quarantined) -> Outcome {
     }
     let _ = fs::remove_dir(quarantine_root(base));
 
-    Outcome::Recovered {
-        id,
-        header_rewritten,
-    }
+    Outcome::Recovered { id, header_error }
 }
 
 /// The first unused name at or after `candidate`: `candidate`, then
@@ -381,15 +384,11 @@ mod tests {
 
         let found = scan(tmp.path());
         let outcome = recover_one(tmp.path(), &found[0]);
-        let Outcome::Recovered {
-            id,
-            header_rewritten,
-        } = outcome
-        else {
+        let Outcome::Recovered { id, header_error } = outcome else {
             panic!("expected a recovery, got {outcome:?}");
         };
         assert_eq!(id, "rabcdef1234567890-deploy");
-        assert!(header_rewritten);
+        assert_eq!(header_error, None);
 
         let backend = LocalBackend::with_base_dir(tmp.path().to_path_buf());
         let ids: Vec<String> = backend.list().unwrap().into_iter().map(|s| s.id).collect();
@@ -516,17 +515,14 @@ mod tests {
 
         let found = scan(tmp.path());
         let outcome = recover_one(tmp.path(), &found[0]);
-        let Outcome::Recovered {
-            id,
-            header_rewritten,
-        } = outcome
-        else {
+        let Outcome::Recovered { id, header_error } = outcome else {
             panic!("expected a recovery, got {outcome:?}");
         };
         assert_eq!(id, "rabcdef1234567890-headerless");
+        let header_error = header_error.expect("an unparseable header cannot be rewritten");
         assert!(
-            !header_rewritten,
-            "an unparseable header cannot be rewritten"
+            header_error.contains("failed to read header"),
+            "the report should say which failure this was, got {header_error:?}"
         );
         // The state file is named for its directory, which is what makes the
         // session addressable at all.

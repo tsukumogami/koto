@@ -230,6 +230,42 @@ fn recovery_does_not_write_over_an_existing_session() {
     assert_eq!(fs::read(occupied.join("mine.txt")).unwrap(), b"mine");
 }
 
+/// koto#193's other finding: state files an older koto wrote without a
+/// header. Recovery cannot fix the header, but the session must still come
+/// back within reach, and the report has to say which of the two happened.
+#[test]
+fn a_headerless_session_is_recovered_and_the_report_says_the_header_was_not_touched() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_id = "0123456789abcdef";
+    let sessions = sessions_dir(home.path());
+    write_session(&sessions, "headerless");
+    let old = sessions.join(repo_id).join("headerless");
+    fs::create_dir_all(&old).unwrap();
+    fs::write(
+        old.join("koto-headerless.state.jsonl"),
+        "{\"seq\":1,\"type\":\"context_added\"}\n",
+    )
+    .unwrap();
+
+    let report = run_json(koto_at_home(home.path()).args(["session", "recover", "--apply"]));
+    assert_eq!(report["summary"]["recovered"], 1);
+    assert_eq!(report["sessions"][0]["status"], "recovered");
+    assert_eq!(report["sessions"][0]["header_rewritten"], false);
+    let reason = report["sessions"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("failed to read header"),
+        "the reason should name the underlying failure, got {reason:?}"
+    );
+
+    // The state file moved and was renamed, which is what makes the session
+    // addressable. `session list` still skips it -- an unreadable header is
+    // a separate defect -- so the directory is the evidence.
+    assert!(sessions
+        .join(format!("r{repo_id}-headerless"))
+        .join(format!("koto-r{repo_id}-headerless.state.jsonl"))
+        .is_file());
+}
+
 #[test]
 fn recover_on_a_clean_install_reports_an_empty_quarantine() {
     let home = tempfile::tempdir().unwrap();
