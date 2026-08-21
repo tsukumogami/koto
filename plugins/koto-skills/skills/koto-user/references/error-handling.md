@@ -374,7 +374,7 @@ The scheduler runs ten runtime rules on every task-list submission **before** ap
 | R8 | Spawn-time immutability: for already-spawned tasks, submitted `template` / `vars` / `waits_on` must match the recorded `spawn_entry`. |
 | R9 | Task name matches `^[A-Za-z0-9_-]+$`, 1-64 chars, not in the reserved set (`retry_failed`, `cancel_tasks`). |
 
-See [batch-workflows.md](batch-workflows.md) for how the runner dispatches on each rejection, and `docs/designs/DESIGN-batch-child-spawning.md` in the koto repository for the full rule definitions and rationale.
+See [batch-workflows.md](batch-workflows.md) for how the runner dispatches on each rejection, and `docs/designs/current/DESIGN-batch-child-spawning.md` in the koto repository for the full rule definitions and rationale.
 
 ---
 
