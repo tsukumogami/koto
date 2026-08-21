@@ -479,6 +479,19 @@ conditions gains a `failure_kind` key — additive, and the existing
 `{"exit_code": -1, "error": "timed_out"}` shape is preserved so nothing
 downstream that reads `error` moves. The stderr substring match is deleted.
 
+**Amendment: the set is five kinds, not four.** Planning enumerated the runner's
+`-1` arms against the tree and found three, not two: spawn failure
+(`src/action.rs:53`), timeout (`:96`), and a `wait_timeout` error (`:102`). The
+third is real and is routed today by falling through the stderr match to
+`GateOutcome::Error`. Deleting that match without a kind for it would either lose
+the routing or silently report a wait error as a timeout — the exact conflation
+this decision exists to end. So the runner reports `wait_failed` alongside
+`nonzero_exit`, `spawn_failed`, and `timed_out`; the gate evaluator maps it to
+`GateOutcome::Error`, preserving current behavior exactly; and at the action level
+it is an action failure like the others, reported as `failure_kind: "wait_failed"`
+in the `__action__` payload of Decision 4. This adds a value to an enumeration and
+changes no decision.
+
 ### Decision 11: the repeated migration warning
 
 | Option | Bounded per session | Root cause fixed |
@@ -697,7 +710,7 @@ The `__action__` condition's `output` payload:
 ```
 
 `failure_kind` is one of `nonzero_exit`, `spawn_failed`, `timed_out`,
-`capture_failed`. `exit_code` is present only for `nonzero_exit`; the other
+`wait_failed` (see the amendment under Decision 10), or `capture_failed`. `exit_code` is present only for `nonzero_exit`; the other
 three carry no meaningful status and say so by omitting it rather than
 reporting `-1`. `capture_failed` adds a `capture_error` object naming the key
 and the case. `agent_actionable` is false and `category` is `"corrective"`.
