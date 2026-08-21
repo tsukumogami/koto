@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Accepted
+status: Done
 problem: |
   A template author can't hand koto a mechanical step and trust it. The
   engine runs a command when a state is entered, but the output is
@@ -17,7 +17,7 @@ outcome: |
 
 ## Status
 
-Accepted
+Done
 
 Framing for koto's command-execution surface: what a template state can
 be trusted to run, and what has to be true around the command before an
