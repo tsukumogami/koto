@@ -3126,11 +3126,32 @@ fn handle_next(
     };
     use crate::engine::evidence::validate_evidence;
     use crate::engine::persistence::{derive_evidence, instructions_delivered_this_window};
+    use crate::engine::reentrancy;
     use crate::engine::substitute::Variables;
     use crate::engine::template_source_status::{check_execution_anchor, ExecutionAnchorCheck};
     use crate::gate::evaluate_gates;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+
+    // 0. Refuse a nested tick before anything else runs.
+    //
+    // koto next runs template commands as children, so they inherit the
+    // marker this tick is about to set. A koto next started from inside one
+    // of those commands would append to the event log the outer tick is
+    // still working through; the outer tick would then finish against its
+    // starting snapshot and report a state the session had already left
+    // (koto#208). The check comes before the startup passes below because
+    // those touch the workspace, and a nested tick should touch nothing.
+    if let Some(enclosing) = reentrancy::enclosing_tick() {
+        let err = crate::cli::next_types::NextError {
+            code: crate::cli::next_types::NextErrorCode::NestedInvocation,
+            message: reentrancy::nested_invocation_message(&enclosing, &name),
+            details: vec![],
+        };
+        let json = serde_json::json!({"error": err});
+        exit_with_error_code(json, err.code.exit_code());
+    }
+    reentrancy::mark_tick(&name);
 
     // Resolve request-store operator config through the full 5-level
     // cascade, applying the per-tick `--redelegation-cap` CLI flag (if

@@ -543,6 +543,10 @@ Read these on demand, not upfront. The sections above cover the common path. Con
 
 **"capture_unset"** — a state's instructions read a `{{NAME}}` that a `capture_stdout_as` was supposed to deliver, and this run never entered the state that produces it. The message names both. This is a template routing problem, not something you can fix by re-ticking — report it to whoever authored the workflow.
 
+**"nested_invocation"** — a `koto next` ran from inside a command koto itself was running. koto refuses it: a nested tick would advance the session while the tick that spawned it kept reporting the state it started with. If you hit this from a template's `default_action` or command gate, that call has to come out — the enclosing tick is what advances the session.
+
+**"nested_invocation" when no tick is running** — the marker is an inherited environment variable with no liveness behind it, so a process that outlived its tick keeps it. A command that detaches (`setsid`, a backgrounded subshell) escapes the process-group kill koto uses at timeout and carries `KOTO_TICK_SESSION` for as long as it lives, so a `koto next` it runs minutes later is refused in the name of a tick that exited long ago. The message names the session, which is your clue: if `koto status` on that session shows nothing in progress, clear the marker and re-run — `KOTO_TICK_SESSION= koto next <name>`. Don't clear it reflexively. Inside a command that really is running under a tick, clearing it re-opens the defect the refusal exists to stop.
+
 **A blocking condition named `__action__`** — the state's own `default_action` command failed; the state's gates never ran. Read `output.failure_kind` to decide what to do, and the front of `directive` for the author's fallback instructions. See [When a default action fails](#when-a-default-action-fails).
 
 **Gate blocked, `agent_actionable` is `false`** — you can't override this gate yourself. Escalate to the user so they can resolve the underlying condition (for example, a required deployment that only they can trigger).

@@ -28,6 +28,30 @@ to `0.9.x`).
 
 ### Fixed
 
+- **A nested `koto next` no longer leaves the outer tick reporting a
+  state the session has left.** A `koto next` run from inside a command
+  koto itself was executing — a state's `default_action` or a command
+  gate — performed a real transition, in the reported case advancing the
+  session all the way to its terminal state. The tick that spawned it
+  then finished against the snapshot it started with and answered
+  `advanced: false` on the original state, so the caller was told the
+  workflow was still waiting on a session that had already ended. The
+  answer was wrong rather than missing, and nothing surfaced an error.
+  A tick now exports `KOTO_TICK_SESSION` naming the session it is
+  advancing before it runs anything, and a `koto next` that finds the
+  marker set refuses with the new `nested_invocation` error code (exit
+  2), naming the tick in flight and the call to remove. The refusal is
+  scoped to the process tree rather than to a session name, so a tick on
+  a second workflow from inside a command is refused too — a chain that
+  ticks back into the outer session through another one lands on the
+  same defect. It covers `koto next` only: `koto context` reads and
+  writes from inside a command are a supported pattern and keep working.
+  The marker is inherited and carries no liveness — a command that
+  detaches survives the process-group kill at timeout and keeps it — so
+  the refusal message names the escape hatch, `KOTO_TICK_SESSION= koto
+  next <name>`, for a process that outlived its tick.
+  Closes koto#208.
+
 - **`details` suppression now keys on delivery, not visit count.** koto
   previously decided whether a `koto next` response carried a phase's
   long-form `details` by counting entries into the phase's state, which
