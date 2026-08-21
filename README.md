@@ -67,7 +67,7 @@ koto init review --template review.md
 {"name":"review","state":"assess"}
 ```
 
-This creates a session directory at `~/.koto/sessions/<repo-id>/review/` and writes a state file inside it. The state file starts with three lines: a header (schema version, workflow name, template hash, timestamp), a `workflow_initialized` event, and an initial `transitioned` event.
+This creates a session directory at `~/.koto/sessions/review/` and writes a state file inside it. The state file starts with three lines: a header (schema version, workflow name, template hash, timestamp), a `workflow_initialized` event, and an initial `transitioned` event.
 
 ### 3. Get the current directive
 
@@ -97,7 +97,7 @@ The `action` field is `"execute"` while work remains and `"done"` at the termina
 
 **Templates** define the workflow: states, transitions between them, and directive text for each state. Variables (`{{KEY}}`) are interpolated into directives at runtime. The runtime also injects `{{SESSION_DIR}}`, which resolves to the session's absolute path so templates can reference session-local files. Use `koto template compile` to validate templates during development and see the compiled JSON output.
 
-**Sessions** are stored at `~/.koto/sessions/<repo-id>/<name>/`, keeping state files out of your working directory. Each session holds a state file and any artifacts the workflow produces. When a workflow reaches its terminal state, `koto next` automatically cleans up the session directory (pass `--no-cleanup` to keep it). Use `koto session dir <name>` to get the path, `koto session list` to see all sessions, or `koto session cleanup <name>` to remove one manually.
+**Sessions** are stored at `~/.koto/sessions/<name>/`, keeping state files out of your working directory. Each session holds a state file and any artifacts the workflow produces. When a workflow reaches its terminal state, `koto next` automatically cleans up the session directory (pass `--no-cleanup` to keep it). Use `koto session dir <name>` to get the path, `koto session list` to see all sessions, or `koto session cleanup <name>` to remove one manually.
 
 **Content ownership**: Agents submit workflow artifacts through `koto context add` rather than writing files directly. This gives koto full visibility into what was produced and enables content-aware gates (`context-exists`, `context-matches`) that check content state without shell commands. Use `koto context get` to retrieve content and `koto context list` to see what's been submitted.
 

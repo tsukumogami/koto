@@ -1,6 +1,7 @@
 pub mod cloud;
 pub mod context;
 pub mod local;
+pub mod recover;
 pub mod sync;
 pub mod validate;
 pub mod version;
@@ -429,6 +430,21 @@ impl Backend {
     /// `crate::engine::template_source_status`.
     pub fn is_cloud(&self) -> bool {
         matches!(self, Backend::Cloud(_))
+    }
+
+    /// The local directory sessions are stored under.
+    ///
+    /// Both variants have one: `CloudBackend` keeps a `LocalBackend` for
+    /// every filesystem operation and syncs on top of it. Maintenance verbs
+    /// that address the store as a whole rather than one session -- `koto
+    /// session recover` walking the migration quarantine -- need it under
+    /// either backend, because the quarantine is written by the migration
+    /// that runs for both.
+    pub fn local_base_dir(&self) -> &std::path::Path {
+        match self {
+            Backend::Local(b) => b.base_dir(),
+            Backend::Cloud(b) => b.local_base_dir(),
+        }
     }
 }
 

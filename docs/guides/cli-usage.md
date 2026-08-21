@@ -8,7 +8,9 @@ koto's CLI manages workflow state for AI coding agents. All commands output JSON
 
 ## Session storage
 
-Each workflow's state lives in a dedicated session directory under `~/.koto/sessions/<repo-id>/<name>/`. The `<repo-id>` is derived from the current repository, so sessions from different repos don't collide.
+Each workflow's state lives in a dedicated session directory under `~/.koto/sessions/<name>/`. The namespace is flat and shared across repositories: a session name identifies a session on this machine, wherever it was started.
+
+Older koto versions namespaced sessions by repository (`~/.koto/sessions/<repo-id>/<name>/`). koto migrates that layout on first use. A name that was reused across repositories has several old-layout sources and one flat destination, so only one of them can keep the name; the rest are moved aside into `~/.koto/sessions/.migration-conflicts/<repo-id>/<name>/` and are not listed until you restore them. See [session recover](#session-recover).
 
 The state file inside each session directory is named `koto-<name>.state.jsonl` and uses an event log format:
 
@@ -18,8 +20,8 @@ The state file inside each session directory is named `koto-<name>.state.jsonl` 
 The current state is derived by replaying the log -- it's the `to` field of the last state-changing event (`transitioned`, `directed_transition`, or `rewound`).
 
 ```
-~/.koto/sessions/a1b2c3/my-workflow/koto-my-workflow.state.jsonl
-~/.koto/sessions/a1b2c3/task-42/koto-task-42.state.jsonl
+~/.koto/sessions/my-workflow/koto-my-workflow.state.jsonl
+~/.koto/sessions/task-42/koto-task-42.state.jsonl
 ```
 
 There are no `--state` or `--state-dir` flags. All commands take the workflow name as a positional argument and resolve the session directory automatically.
@@ -46,7 +48,7 @@ koto init <name> --template <path>
 {"name":"my-workflow","state":"assess"}
 ```
 
-This creates a session directory at `~/.koto/sessions/<repo-id>/<name>/` and writes a state file inside it. The state file starts with three lines: a header, a `workflow_initialized` event (seq 1), and an initial `transitioned` event (seq 2, from: null, to: the template's initial state).
+This creates a session directory at `~/.koto/sessions/<name>/` and writes a state file inside it. The state file starts with three lines: a header, a `workflow_initialized` event (seq 1), and an initial `transitioned` event (seq 2, from: null, to: the template's initial state).
 
 Exits non-zero if a workflow with that name already exists or if the template is invalid.
 
@@ -328,7 +330,7 @@ koto session dir <name>
 **Output (plain text):**
 
 ```
-/home/user/.koto/sessions/a1b2c3/my-workflow
+/home/user/.koto/sessions/my-workflow
 ```
 
 The path is printed even if the directory doesn't exist yet (no I/O validation). This lets callers check the path before or after `koto init`.
@@ -361,6 +363,47 @@ koto session list
 Each object contains the session id (same as the workflow name), creation timestamp, and template hash read from the state file header. Returns an empty array `[]` when no sessions exist. Directories without a valid state file are skipped.
 
 Each row also carries `template_source_status`, describing whether the directory the session's template was loaded from (at `koto init` time) still resolves on this machine: `{"path": "...", "exists": true|false, "machine_id": "..."}`, or `null` when the session recorded no `template_source_dir` (or, under a cloud backend, when the row is a remote-only placeholder that has not been synced locally yet). When `exists` is `false`, the object gains a `note` field explaining the staleness. The wording is backend-aware: a local session gets a direct note ("template source directory no longer exists"), while a cloud-synced session gets a softened note acknowledging the directory may simply be missing because the session was resumed on another machine (see `docs/guides/cloud-sync-setup.md`).
+
+#### session recover
+
+Lists, and optionally restores, the sessions the old-layout migration moved aside because their name was already taken. See [Session storage](#session-storage) for how they get there.
+
+```bash
+koto session recover [--apply] [--session <name>]...
+```
+
+**Optional flags:**
+- `--apply` -- Perform the moves. Without it the command only reports what it would do.
+- `--session <name>` -- Limit to quarantined sessions with this name. Repeatable. Without it, every quarantined session is in scope.
+
+**Output (JSON):**
+
+```json
+{
+  "quarantine_dir": "/home/user/.koto/sessions/.migration-conflicts",
+  "applied": true,
+  "sessions": [
+    {
+      "repo_id": "0123456789abcdef",
+      "session": "deploy",
+      "path": "/home/user/.koto/sessions/.migration-conflicts/0123456789abcdef/deploy",
+      "recovered_as": "r0123456789abcdef-deploy",
+      "status": "recovered",
+      "header_rewritten": true
+    }
+  ],
+  "summary": {"total": 1, "recovered": 1, "skipped": 0, "failed": 0},
+  "unmatched": []
+}
+```
+
+A session comes back as `r<repo-id>-<name>`, where `<repo-id>` identifies the repository its old-layout directory belonged to. The leading `r` is there because a session id has to start with a letter. The repo-id leads rather than trails because a session's parent is the dotted prefix of its own name: recovering `deploy` and `deploy.stage-2` as `r<id>-deploy` and `r<id>-deploy.stage-2` keeps the child pointing at its own parent, which a trailing suffix would not.
+
+Recovery moves; it never deletes and never writes over an existing session. If something already holds the name it would use, it takes `r<repo-id>-<name>-2` instead. In a report-only run `recovered_as` is the name recovery would prefer; the `--apply` run reports the name it actually used. A quarantined directory with no state file is not a session, so it is reported as `skipped` and left where it is. A session whose state file header will not parse is still moved back into the flat namespace -- it is no less readable there than in quarantine -- and its row carries `"header_rewritten": false` to say the `workflow` field inside still names the old id.
+
+Names passed to `--session` that match nothing in the quarantine come back under `unmatched` rather than failing the run, so the command is safe to re-run. It exits non-zero only when a move was attempted and failed; those sessions stay in quarantine and the command can be run again.
+
+Under a cloud backend, recovery works on the local session store. Recovered sessions are not pushed to the configured bucket by this command, and the report says so in a `note` field.
 
 #### session cleanup
 

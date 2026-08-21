@@ -100,6 +100,13 @@ impl CloudBackend {
         }
     }
 
+    /// The local directory sessions are stored under. Reached through
+    /// `Backend::local_base_dir`; see its docs for why a cloud backend has
+    /// one at all.
+    pub(crate) fn local_base_dir(&self) -> &Path {
+        self.local.base_dir()
+    }
+
     /// S3 key for a session's state file.
     fn state_key(&self, id: &str) -> String {
         format!("{}/{}/{}", self.prefix, id, state_file_name(id))

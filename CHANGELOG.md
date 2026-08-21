@@ -8,6 +8,24 @@ to `0.9.x`).
 
 ## [Unreleased]
 
+### Added
+
+- **`koto session recover` brings back sessions the layout migration had to
+  set aside.** The migration from the old per-repository layout flattens
+  `sessions/<repo-id>/<name>/` into `sessions/<name>/`. A name reused across
+  repositories has several sources and one destination, so only one of them
+  can keep the name; the rest are moved into
+  `sessions/.migration-conflicts/<repo-id>/<name>/`, where they are preserved
+  and unreachable — not listed, not resumable, not nameable. One install
+  reported a thousand sessions in that state. `koto session recover` reports
+  what is in the quarantine, and `--apply` moves it back into the session
+  list in one run; `--session <name>` narrows it to one workflow. A session
+  returns as `r<repo-id>-<name>`, which is unique per originating repository
+  and, because a session's parent is the dotted prefix of its own name, keeps
+  a parent and its children pointing at each other. Recovery moves and never
+  deletes, never writes over an existing session, and is safe to re-run. The
+  migration now closes with one line naming the command.
+
 ### Fixed
 
 - **`details` suppression now keys on delivery, not visit count.** koto
