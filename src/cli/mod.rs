@@ -844,8 +844,27 @@ fn truncate_output(s: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     let mut truncated = s[..end].to_string();
-    truncated.push_str("\n... [output truncated]");
+    truncated.push_str(TRUNCATION_NOTE);
     truncated
+}
+
+/// Note appended to a stream whose tail was dropped.
+const TRUNCATION_NOTE: &str = "\n... [output truncated]";
+
+/// Mark `s` as truncated when the runner dropped bytes from this stream.
+///
+/// `CommandOutput::truncated` is the authority that something was dropped;
+/// it is one flag for both streams, so the length picks out which one. Only
+/// a stream that reached the retention bound can have been cut, and decoding
+/// drops at most the three trailing bytes of a split character, so a stream
+/// within three bytes of the bound is the one that lost its tail.
+#[cfg(unix)]
+fn mark_truncated(s: String, truncated: bool) -> String {
+    if truncated && s.len() + 3 >= MAX_ACTION_OUTPUT_BYTES && !s.ends_with(TRUNCATION_NOTE) {
+        format!("{}{}", s, TRUNCATION_NOTE)
+    } else {
+        s
+    }
 }
 
 /// Check whether a parsed evidence JSON object contains the reserved "gates" key.
@@ -4035,9 +4054,15 @@ fn handle_next(
             crate::action::run_shell_command(&command, &wd, 30)
         };
 
-        // Truncate output.
-        let stdout = truncate_output(&output.stdout, MAX_ACTION_OUTPUT_BYTES);
-        let stderr = truncate_output(&output.stderr, MAX_ACTION_OUTPUT_BYTES);
+        // Truncate output, then mark whichever stream the runner had to cut.
+        let stdout = mark_truncated(
+            truncate_output(&output.stdout, MAX_ACTION_OUTPUT_BYTES),
+            output.truncated,
+        );
+        let stderr = mark_truncated(
+            truncate_output(&output.stderr, MAX_ACTION_OUTPUT_BYTES),
+            output.truncated,
+        );
 
         // Append DefaultActionExecuted event.
         let event_payload = EventPayload::DefaultActionExecuted {
@@ -5578,6 +5603,23 @@ fn handle_cancel(backend: &dyn SessionBackend, name: &str, cleanup: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn mark_truncated_marks_only_the_stream_that_was_cut() {
+        let cut = "x".repeat(MAX_ACTION_OUTPUT_BYTES);
+        let short = "boom".to_string();
+
+        // One flag, two streams: only the one at the bound lost a tail.
+        assert!(mark_truncated(cut.clone(), true).ends_with(TRUNCATION_NOTE));
+        assert_eq!(mark_truncated(short.clone(), true), short);
+        // A stream that happens to sit exactly at the bound without the
+        // runner dropping anything is not marked.
+        assert_eq!(mark_truncated(cut.clone(), false), cut);
+        // Marking is not applied twice.
+        let marked = mark_truncated(cut, true);
+        assert_eq!(mark_truncated(marked.clone(), true), marked);
+    }
 
     fn export_args(
         format: ExportFormat,
