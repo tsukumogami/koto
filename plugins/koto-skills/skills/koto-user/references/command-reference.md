@@ -42,8 +42,8 @@ Subcommands confirmed from `src/cli/mod.rs`:
 ## koto init
 
 ```
-koto init <name> --template <path> [--parent <parent-name>] [--var KEY=VALUE ...]
-koto init <name> --from-stdin [--var KEY=VALUE ...]
+koto init <name> --template <path> [--parent <parent-name>] [--var KEY=VALUE ...] [--execution-dir <path>]
+koto init <name> --from-stdin [--var KEY=VALUE ...] [--execution-dir <path>]
 ```
 
 Initializes a new workflow. Provide the definition one of two ways:
@@ -58,6 +58,7 @@ Initializes a new workflow. Provide the definition one of two ways:
 | `--from-stdin` | One of `--template` / `--from-stdin` | Read the workflow definition from stdin, strict-compile it into the session directory, and start the session. **Mutually exclusive** with `--template`. **Rejects** `--allow-legacy-gates` (the inline path is strict-only). Does not support `--parent`. |
 | `--parent <parent-name>` | No | Link this workflow as a child of an existing parent workflow. Fails if the parent doesn't exist. Not available with `--from-stdin`. |
 | `--var KEY=VALUE` | No | Set a template variable. Repeatable. Required variables must be supplied; unknown keys are rejected. VALUE is checked against an allowlist (see Notes). |
+| `--execution-dir <path>` | No | Bind the session's execution anchor to this directory instead of the one `koto init` ran in. Canonicalized at init time; a path that doesn't resolve is an error. |
 
 **Success output:**
 ```json
@@ -71,7 +72,8 @@ Initializes a new workflow. Provide the definition one of two ways:
 
 **Notes:**
 - `--var` values are validated against an allowlist because a substituted `{{KEY}}` can land in a gate command (run via `sh -c`) or an agent instruction. Allowed characters: letters, digits, `. _ - /`, `:`, `@`, and spaces. This covers structured data values such as Gmail filters (`newer_than:90d`, `from:user@example.com`) and names with spaces (a calendar title). Shell metacharacters -- `;` `|` `&` `$` `(` `)` `<` `>` `*` `?`, quotes, backticks, and newlines -- are **rejected** so a value cannot inject a command. A space is allowed but is not shell-quoted for you: when a value may contain spaces, quote the reference in the template (e.g. `--calendar "{{CALENDAR}}"`) so it stays a single argument. An empty value (an optional variable left unset, or one with an empty default) is safe unquoted: `--flag {{VAR}}` renders `--flag ''` rather than dropping the token, so the next flag isn't consumed as the value.
-- Reserved variable names `SESSION_DIR` and `SESSION_NAME` cannot be declared in templates. They are injected automatically.
+- Reserved variable names `SESSION_DIR` and `SESSION_NAME` cannot be declared in templates. They are injected automatically. A state's `capture_stdout_as` name is also reserved against them, and against every other state's capture name — the compiler rejects a collision.
+- The session records an **execution anchor** at init: the canonical directory `koto init` ran in, or `--execution-dir` when given. Every later `koto next` must run there or beneath it, and every gate and action of an accepted tick runs at the anchor itself. A child created with `--parent` copies the parent's recorded anchor rather than taking the spawning process's directory, which keeps a whole workflow tree pointed at one checkout. See the `koto next` section below.
 - If a `--template` source uses legacy-mode gates (no `gates.*` when-clause routing), `koto init` emits a warning to **stderr** and still succeeds. The `--from-stdin` path is strict: a legacy gate is **rejected**, naming the offending state and gate.
 - `--from-stdin` writes both the compiled artifact and the human-readable source into the session directory (the source under a fixed filename), so the workflow survives global cache eviction and the authored definition stays recoverable for audit. Do not embed secrets in the definition; reference `$VAR` / files read at gate-evaluation time instead.
 
@@ -96,17 +98,24 @@ Gets the current state directive. Submits evidence when `--with-data` is provide
 | `--full` | Always include the `details` field, even if it was already delivered since you last arrived at the state. By default `details` is omitted once delivered, until the workflow arrives at the state again — from a different state, or via `koto rewind`. A self-transition is a lap rather than an arrival and does not bring it back; a tick that leaves and comes back through another state does. |
 | `--dispatch-epoch <n>` | The epoch this writer was dispatched with. Required for `--with-data` writes against a child workflow's log; validated before any persistence call and rejected with `epoch_fence_violation` (exit 65) on a mismatch. Parent-workflow ticks don't need it. The same value goes on `koto request progress` / `resolve` / `abandon` for a bound leg. |
 
-**Output shapes** are determined by the `action` field. See `response-shapes.md` for all nine annotated scenarios.
+**Output shapes** are determined by the `action` field. See `response-shapes.md` for the annotated scenarios.
+
+**Before any of that**, the tick is checked against the session's execution anchor — the directory recorded at `koto init`. The check runs before the template is read and before any gate or action closure exists, so a refusal means nothing ran, nothing was evaluated, and nothing moved. Running from a subdirectory of the anchor is fine; running from a different tree is refused with `execution_anchor_mismatch` (exit 2), and an anchor that no longer resolves on this machine with `execution_anchor_unresolvable` (exit 3). A session with no recorded anchor adopts the directory of its first tick and says so once on the `directive`. The anchor binds where a session's commands *start*; it does not bound what a running command can reach. Details in `error-handling.md#execution-anchor-refusals`.
 
 **Classification priority (highest wins):**
 1. Terminal state → `action: "done"`
-2. Gate(s) failed + no `accepts` block → `action: "gate_blocked"`
-3. Gate(s) failed + `accepts` block present → `action: "evidence_required"` with non-empty `blocking_conditions`
-4. Integration declared → `action: "integration_unavailable"` (or `"integration"` when available)
-5. `accepts` block present → `action: "evidence_required"`
-6. Fallback (no `accepts`, no integration, not terminal) → `action: "evidence_required"` with empty `expects.fields`
+2. The state's `default_action` failed → `action: "gate_blocked"` with a single `__action__` condition. The action runs on entering the state, ahead of the state's gates, so rules 3-7 are never reached for that state and its gates do not evaluate at all
+3. Gate(s) failed + no `accepts` block → `action: "gate_blocked"`
+4. Gate(s) failed + `accepts` block present → `action: "evidence_required"` with non-empty `blocking_conditions`
+5. Integration declared → `action: "integration_unavailable"` (or `"integration"` when available)
+6. `accepts` block present → `action: "evidence_required"`
+7. Fallback (no `accepts`, no integration, not terminal) → `action: "evidence_required"` with empty `expects.fields`
 
-**Error output:** structured `NextError` JSON on stderr (see `error-handling.md`).
+A `default_action` that succeeded under `requires_confirmation` produces `action: "confirm"` instead of advancing. Failure is classified first, so a failing action stops as a failure whether or not the flag is set.
+
+A tick that carries evidence into a state — `--with-data`, or a recorded gate override — **skips** that state's `default_action` rather than re-running it. Every other tick that enters the state runs it again, gate-blocked retries and self-loops included.
+
+**Error output:** structured `NextError` JSON on stdout (see `error-handling.md`). Exit status carries the class; the JSON carries `error.code`.
 
 ### Converging a fan-out (reading child results)
 
@@ -640,6 +649,14 @@ koto session cleanup <name>
 Removes the entire session directory for the named workflow. Idempotent — succeeds even if the session does not exist. Produces no stdout output.
 
 Under normal operation, `koto next` auto-cleans on terminal state unless `--no-cleanup` was passed. Use this command for manual cleanup after abandoned workflows or after using `--no-cleanup` during debugging.
+
+---
+
+## koto session rebind — not implemented
+
+Both execution-anchor refusals tell you to run `koto session rebind <session> --to <dir>`. **The subcommand does not exist.** `koto session` offers `start`, `dir`, `list`, `cleanup`, `resolve`, and `update`, and nothing else.
+
+Until it ships: repair an `execution_anchor_mismatch` by running `koto next` from the directory the message names, and an `execution_anchor_unresolvable` by putting the checkout back at the path the message names. Route on `error.code` rather than the message text — the wording changes when the subcommand lands.
 
 ---
 

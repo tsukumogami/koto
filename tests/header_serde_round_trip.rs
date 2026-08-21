@@ -17,6 +17,7 @@ fn full_header() -> StateFileHeader {
         created_at: "2026-05-24T00:00:00Z".to_string(),
         parent_workflow: Some("parent".to_string()),
         template_source_dir: None,
+        execution_dir: Some(std::path::PathBuf::from("/abs/checkout")),
         session_id: "sess-1".to_string(),
         intent: Some("ship request-store".to_string()),
         template_name: Some("agent.md".to_string()),
@@ -64,6 +65,7 @@ fn full_header_round_trips() {
     assert!(json.contains("\"deadline\":\"2026-05-24T01:00:00Z\""));
     assert!(json.contains("\"retry_count\":2"));
     assert!(json.contains("\"agent_config\""));
+    assert!(json.contains("\"execution_dir\":\"/abs/checkout\""));
 }
 
 #[test]
@@ -91,6 +93,10 @@ fn pre_request_store_fixture_header_deserializes_with_defaults() {
     assert_eq!(parsed.deadline, None);
     assert_eq!(parsed.retry_count, None);
     assert_eq!(parsed.agent_config, None);
+    // Anchoring is additive over the same frozen fixture: a header
+    // written before `execution_dir` existed still loads, with no
+    // anchor recorded. Its first tick adopts one (R14, R24).
+    assert_eq!(parsed.execution_dir, None);
 }
 
 #[test]
@@ -142,6 +148,7 @@ fn none_valued_request_store_fields_produce_no_keys_on_the_wire() {
         created_at: "2026-05-24T00:00:00Z".to_string(),
         parent_workflow: None,
         template_source_dir: None,
+        execution_dir: None,
         session_id: String::new(),
         intent: None,
         template_name: None,
@@ -170,6 +177,7 @@ fn none_valued_request_store_fields_produce_no_keys_on_the_wire() {
         "deadline",
         "retry_count",
         "agent_config",
+        "execution_dir",
     ] {
         assert!(
             !json.contains(key),
@@ -186,6 +194,51 @@ fn none_valued_request_store_fields_produce_no_keys_on_the_wire() {
         "dispatch_epoch must always serialize, got {}",
         json
     );
+}
+
+/// A header written without `execution_dir` round-trips without gaining the
+/// key (R24). The absence is what makes the session's first tick adopt an
+/// anchor rather than compare against one, so re-serializing it as `null` --
+/// or as any path -- would change what the next tick does.
+#[test]
+fn a_header_written_without_execution_dir_round_trips_without_it() {
+    let unanchored = r#"{
+        "schema_version": 1,
+        "workflow": "old-wf",
+        "template_hash": "abc",
+        "created_at": "2026-01-01T00:00:00Z"
+    }"#;
+    let parsed: StateFileHeader =
+        serde_json::from_str(unanchored).expect("an unanchored header must deserialize");
+    assert_eq!(parsed.execution_dir, None);
+
+    let json = serde_json::to_string(&parsed).expect("serialize");
+    assert!(
+        !json.contains("execution_dir"),
+        "a None anchor must leave no key on the wire, got: {}",
+        json
+    );
+
+    let reparsed: StateFileHeader = serde_json::from_str(&json).expect("reparse");
+    assert_eq!(parsed, reparsed);
+}
+
+/// An anchored header keeps its exact path across a round trip. The anchor is
+/// compared byte-exact against the tick's canonicalized working directory, so
+/// any normalization serde applied here would refuse a session standing in the
+/// right place.
+#[test]
+fn an_anchored_header_preserves_its_path_exactly() {
+    let mut header = full_header();
+    header.execution_dir = Some(std::path::PathBuf::from("/home/user/src/koto"));
+
+    let json = serde_json::to_string(&header).expect("serialize");
+    let parsed: StateFileHeader = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(
+        parsed.execution_dir,
+        Some(std::path::PathBuf::from("/home/user/src/koto"))
+    );
+    assert_eq!(header, parsed);
 }
 
 #[test]

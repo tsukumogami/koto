@@ -92,6 +92,10 @@ struct SourceActionDecl {
     requires_confirmation: bool,
     #[serde(default)]
     polling: Option<SourcePollingConfig>,
+    #[serde(default)]
+    fallback: Option<String>,
+    #[serde(default)]
+    capture_stdout_as: Option<String>,
 }
 
 /// Polling configuration in source YAML.
@@ -245,6 +249,8 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
                 interval_secs: sp.interval_secs,
                 timeout_secs: sp.timeout_secs,
             }),
+            fallback: sa.fallback.clone(),
+            capture_stdout_as: sa.capture_stdout_as.clone(),
         });
 
         let compiled_materialize_children =

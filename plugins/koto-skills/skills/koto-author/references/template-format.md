@@ -139,7 +139,8 @@ Different template features produce different `action` values in the `koto next`
 | State with failing `gates` (no accepts) | `gate_blocked` (with `category: "temporal"` for `children-complete`, `"corrective"` for others) |
 | State with `integration` | `integration` or `integration_unavailable` |
 | Terminal state (`terminal: true`) | `done` |
-| State with `default_action` + `requires_confirmation` | `confirm` |
+| State with `default_action` + `requires_confirmation` | `confirm` (only after a successful run) |
+| State whose `default_action` failed | `gate_blocked`, with a condition named `__action__` |
 
 Knowing these values helps you predict how callers will interact with each state. A state with an `accepts` block always surfaces as `evidence_required` -- the caller's automation can key on that string to know it needs to submit data.
 
@@ -557,6 +558,64 @@ The compiler validates `children-complete` gate fields at compile time:
 - `name_filter` is optional and not validated beyond being a string (the prefix match happens at runtime).
 - Like all gate types, `children-complete` gates must have corresponding `gates.*` when-clause routing or the D5 check will fail.
 
+### `default_action` — a command the engine runs
+
+A state can declare a command koto runs itself, on entering the state, before that state's gates are evaluated. It's how a workflow does the mechanical step instead of writing prose asking the agent to do it and then gating on whether it did.
+
+**Action, gate, or prose.** All three run commands, and they answer different questions. A **gate** is for a command whose *result* is the question -- the workflow must not proceed until something is objectively true; a gate routes on its output and carries nothing forward. A **`default_action`** is for a command whose *effect or output* is the point, and `capture_stdout_as` is what carries the output into later states. **Prose in the directive** hands the command to the agent, which is the right answer whenever the rule below puts it there, and a reasonable answer any time the step needs judgment the engine can't apply.
+
+**Read the rule before writing one.** The [default_action authoring guide](../../../../../docs/guides/default-action-authoring.md) states which commands the engine may run, with worked examples on both sides. In one line: *does the command's risk live in a bad success, or only in a bad failure?* A command whose successful exit is itself the irreversible, externally visible event -- `gh pr create`, `gh pr comment`, `gh pr ready` -- stays with the agent permanently, because no signal arriving afterward can un-fire it. A command whose only irreversibility is local and repairable is engine-runnable; its bad-failure risk is what the failure path below exists to answer.
+
+```yaml
+states:
+  detect:
+    default_action:
+      command: git rev-parse --abbrev-ref HEAD
+      capture_stdout_as: BRANCH
+      fallback: "Read the branch name yourself and carry on with it."
+    transitions:
+      - target: write_up
+```
+
+| Field | Required | Type | Meaning |
+|---|---|---|---|
+| `command` | Yes | string | The command line, passed to `sh -c` as a single string |
+| `capture_stdout_as` | No | string | A name the command's trimmed stdout is delivered under, readable by later states |
+| `fallback` | No | string | Prose the agent reads when the action fails. Spliced onto `directive` after substitution, so write it as literal text |
+| `working_dir` | No | string | A **relative** path under the session's execution anchor. An absolute literal is a compile error |
+| `requires_confirmation` | No | bool | After a *successful* run, stop for confirmation before transitioning |
+| `polling` | No | map | `interval_secs` + `timeout_secs`. Re-runs the command on an interval, re-evaluating the state's gates between runs, until they pass or `timeout_secs` expires |
+
+**Invocation.** One `sh -c` argument, in its own process group, inheriting the environment of the `koto next` process. Every single run gets 30 seconds and that isn't configurable -- `polling`'s `timeout_secs` bounds how long koto keeps retrying, not how long one attempt may take. A command that can't finish in 30 seconds isn't one the engine can run. `{{VARIABLE}}` references are substituted in the shell-safe form before the shell sees the string; quote the reference when a value must stay one argument.
+
+**When it runs.** Whenever the advance loop enters the state on a tick carrying no evidence for it. A tick that submits evidence skips the action -- which is how confirming doesn't re-run the command. Every other tick that reaches the state runs it again, gate-blocked retries and self-loops included, so the command must be safe to re-run (`mkdir -p`, not `mkdir`).
+
+**Where it runs.** At the session's execution anchor, not the directory `koto next` was typed in. `working_dir` moves one action to a subdirectory: an absolute value is refused before any join, then the value is joined to the anchor, then canonicalized and refused if it escaped via `..`. The anchor guarantees the directory a workflow's commands *start* in, checked on every tick. It does not bound what an authorized command can reach once running -- a command is still free to name absolute paths or change directory -- so don't author as if it did, and don't describe it to anyone else as if it did.
+
+**Its output.** Every run appends a `default_action_executed` event with the command, exit code, both streams, and a `truncated` flag; each stream is bounded at 64KB. On a successful run with no `capture_stdout_as`, that log entry is where the output ends -- the agent never sees it.
+
+**When it fails.** The tick stops at the state that ran the command, in an ordinary blocked response (not an error envelope) carrying a condition named `__action__` whose `output` holds the command, `failure_kind`, both streams, and `state`. `exit_code` is present only for `nonzero_exit`. Route on `failure_kind`: `nonzero_exit`, `spawn_failed`, `timed_out`, `wait_failed`, `capture_failed`. The state's `fallback` prose rides the `directive`. It all arrives in the tick that ran the command.
+
+`__action__` is a reserved condition name, so `agent_actionable` is always `false` on it and the compiler rejects any state that declares a gate called `__action__`. A caller can therefore tell an action failure from a gate failure by name alone, and never has to wonder which one it's looking at.
+
+**Its gates do not evaluate after it fails.** A state's gates judge the work its action did, and the action didn't happen. Running them anyway would let a passing gate carry the workflow past a failed command. This holds for a state with no gates at all, which is the case that detected nothing before. Failure is classified ahead of `requires_confirmation`, so a failing action stops as a failure whether or not the flag is set.
+
+#### `capture_stdout_as`
+
+The declared name carries the command's trimmed stdout to states entered after it ran -- in a later tick, and in the same tick when the engine auto-advances through to the reading state.
+
+The name is its own declaration and deliberately does **not** go in the `variables:` block: a declared variable is materialized by `koto init`, so a run that never entered the producing state would render the reference as an empty string. The compiler validates `{{KEY}}` references against the union of the variables block, every state's capture name, and the runtime names, and rejects a capture name colliding with a declared variable, a reserved runtime name, or another state's capture.
+
+Read it anywhere a variable can be read: a later directive or details section, a `vars.NAME: {is_set: true}` when-clause (against a capture, `is_set` answers "has the producing command run yet"), a gate command, a later action command.
+
+Two bounds apply and they do different jobs. **64KB per stream** bounds what the response and event log carry. **4096 bytes** bounds what a capture may deliver, measured after trimming -- far smaller because a captured value is a token landing in prose and possibly a shell word, not a transcript.
+
+Delivery fails three ways, all of them action failures with `failure_kind: "capture_failed"` and a `capture_error` object naming the case: the trimmed output is `empty`, it is `too_large` (over 4096 bytes), or it holds a `disallowed_character` -- the same allowlist declared variables pass, `^[a-zA-Z0-9._/:@ \-]*$`, which forbids newlines and so makes multi-line capture unrepresentable. A skip would be a silent drop, and it would move the error to the reading state where the message names a variable instead of the command that failed to produce it.
+
+Reading a name the run never delivered stops the tick with the `capture_unset` error code rather than rendering an empty string or a raw `{{NAME}}` token.
+
+Lifetime: re-entering the producing state runs the command again and the later value wins; two states declaring the same name is a compile error; a `koto rewind` past the producing state **leaves the value in place**, because a rewind appends an event and truncates nothing; a captured value holding a `{{...}}` token is never re-expanded; and a capture is delivered on a tick that stops for confirmation as well as one that advances.
+
 ### skip_if — automatic transitions
 
 `skip_if` lets a state advance automatically when certain conditions hold, without waiting for evidence from the agent. The engine evaluates `skip_if` before asking for evidence. If the conditions match, the engine fires the matching transition and loops — consecutive `skip_if` states chain within a single `koto next` call.
@@ -879,4 +938,5 @@ Batch authoring introduces error (E), warning (W), and runtime (R) rule IDs used
 - **Evidence routing example**: [evidence-routing-workflow.md](examples/evidence-routing-workflow.md) -- branching with accepts/when
 - **Advanced example**: [complex-workflow.md](examples/complex-workflow.md) -- gates, self-loops, split topology
 - **Batch authoring**: [batch-authoring.md](batch-authoring.md) -- `materialize_children`, E/W/F/R rules, worked examples
+- **`default_action` authoring**: [default-action-authoring.md](../../../../../docs/guides/default-action-authoring.md) -- which commands the engine may run, the failure path, output capture, and execution anchoring
 - **SKILL.md conventions**: [Custom skill authoring guide](../../../../../docs/guides/custom-skill-authoring.md)

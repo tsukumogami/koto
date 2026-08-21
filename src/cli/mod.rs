@@ -58,7 +58,11 @@ thread_local! {
 }
 
 /// Maximum size of captured stdout/stderr from action execution (64 KB).
-const MAX_ACTION_OUTPUT_BYTES: usize = 64 * 1024;
+///
+/// The runner enforces this bound while draining the child's pipes, so the
+/// re-truncation below is a belt-and-braces check rather than the mechanism.
+#[cfg(unix)]
+use crate::action::MAX_ACTION_OUTPUT_BYTES;
 
 /// Exit code space:
 /// - 0: success
@@ -124,6 +128,13 @@ pub enum Command {
         /// Human-readable description of the workflow's goal
         #[arg(long)]
         intent: Option<String>,
+
+        /// Directory this session's commands run in (its execution
+        /// anchor). Defaults to the directory `koto init` is run in,
+        /// or to the parent session's anchor when `--parent` is given.
+        /// Every later `koto next` must run there or beneath it.
+        #[arg(long, value_name = "DIR")]
+        execution_dir: Option<String>,
     },
 
     /// Get the current state directive for a workflow
@@ -840,8 +851,27 @@ fn truncate_output(s: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     let mut truncated = s[..end].to_string();
-    truncated.push_str("\n... [output truncated]");
+    truncated.push_str(TRUNCATION_NOTE);
     truncated
+}
+
+/// Note appended to a stream whose tail was dropped.
+const TRUNCATION_NOTE: &str = "\n... [output truncated]";
+
+/// Mark `s` as truncated when the runner dropped bytes from this stream.
+///
+/// `CommandOutput::truncated` is the authority that something was dropped;
+/// it is one flag for both streams, so the length picks out which one. Only
+/// a stream that reached the retention bound can have been cut, and decoding
+/// drops at most the three trailing bytes of a split character, so a stream
+/// within three bytes of the bound is the one that lost its tail.
+#[cfg(unix)]
+fn mark_truncated(s: String, truncated: bool) -> String {
+    if truncated && s.len() + 3 >= MAX_ACTION_OUTPUT_BYTES && !s.ends_with(TRUNCATION_NOTE) {
+        format!("{}{}", s, TRUNCATION_NOTE)
+    } else {
+        s
+    }
 }
 
 /// Check whether a parsed evidence JSON object contains the reserved "gates" key.
@@ -1016,6 +1046,9 @@ where
                 exit_code: -1,
                 stdout: String::new(),
                 stderr: "polling interrupted by signal".to_string(),
+                // No exit status was ever obtained for this attempt.
+                failure_kind: Some(crate::action::FailureKind::WaitFailed),
+                truncated: false,
             };
         }
 
@@ -1043,6 +1076,10 @@ where
                     "{}\npolling timed out after {} seconds",
                     output.stderr, polling.timeout_secs
                 ),
+                failure_kind: output
+                    .failure_kind
+                    .or(Some(crate::action::FailureKind::TimedOut)),
+                truncated: output.truncated,
             };
         }
 
@@ -1054,6 +1091,9 @@ where
                     exit_code: -1,
                     stdout: String::new(),
                     stderr: "polling interrupted by signal".to_string(),
+                    // No exit status was ever obtained for this attempt.
+                    failure_kind: Some(crate::action::FailureKind::WaitFailed),
+                    truncated: false,
                 };
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -1080,8 +1120,22 @@ pub fn run(app: App) -> Result<()> {
             vars,
             parent,
             intent,
+            execution_dir,
         } => {
             let backend = build_backend()?;
+            // Resolve `--execution-dir` once, before either init path:
+            // a directory that does not resolve is a caller error, and
+            // both paths record the canonical form.
+            let execution_dir = execution_dir.map(|dir| match std::fs::canonicalize(&dir) {
+                Ok(canonical) => canonical,
+                Err(e) => exit_with_error_code(
+                    serde_json::json!({
+                        "error": format!("--execution-dir {}: {}", dir, e),
+                        "command": "init"
+                    }),
+                    2,
+                ),
+            });
             if from_stdin {
                 // --from-stdin is the inline (strict-only) path. Reject the
                 // two incompatible flag combinations before reading stdin
@@ -1123,7 +1177,14 @@ pub fn run(app: App) -> Result<()> {
                 std::io::Read::read_to_end(&mut std::io::stdin(), &mut source_bytes)
                     .map_err(|e| anyhow::anyhow!("failed to read stdin: {}", e))?;
 
-                handle_init_inline(&backend, &name, &source_bytes, &vars, intent.as_deref())
+                handle_init_inline(
+                    &backend,
+                    &name,
+                    &source_bytes,
+                    &vars,
+                    intent.as_deref(),
+                    execution_dir.as_deref(),
+                )
             } else {
                 let template = template.unwrap_or_else(|| {
                     exit_with_error_code(
@@ -1141,6 +1202,7 @@ pub fn run(app: App) -> Result<()> {
                     &vars,
                     parent.as_deref(),
                     intent.as_deref(),
+                    execution_dir.as_deref(),
                 )
             }
         }
@@ -1724,6 +1786,7 @@ fn handle_init(
     vars: &[String],
     parent: Option<&str>,
     intent: Option<&str>,
+    execution_dir: Option<&Path>,
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation.
     if let Err(msg) = crate::discover::validate_workflow_name(name) {
@@ -1780,9 +1843,16 @@ fn handle_init(
     // R8 spawn-time immutability snapshot is populated only by the
     // future batch scheduler, which calls this helper directly with
     // `Some(..)`.
-    if let Err(err) =
-        init_child_from_parent(backend, parent, name, template_path, vars, &mut cache, None)
-    {
+    if let Err(err) = init_child::init_child_from_parent_at(
+        backend,
+        parent,
+        name,
+        template_path,
+        vars,
+        &mut cache,
+        None,
+        execution_dir,
+    ) {
         match err.kind {
             SpawnErrorKind::Collision => {
                 // Match the pre-check's error text so callers can rely
@@ -1892,6 +1962,7 @@ fn handle_init_inline(
     source_bytes: &[u8],
     vars: &[String],
     intent: Option<&str>,
+    execution_dir: Option<&Path>,
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation. Guards
     // `<name>` against path traversal (no `/`, `..`, or `~`).
@@ -1919,7 +1990,9 @@ fn handle_init_inline(
         }));
     }
 
-    if let Err(e) = init_child::init_inline_from_stdin_bytes(backend, name, source_bytes, vars) {
+    if let Err(e) =
+        init_child::init_inline_from_stdin_bytes(backend, name, source_bytes, vars, execution_dir)
+    {
         // Variable-resolution failures are caller errors (exit 2); a
         // strict-compile / validation failure or any I/O error is exit 1.
         // The seam prefixes var-resolution errors so we can classify them
@@ -2864,6 +2937,124 @@ fn record_notice_delivery(backend: &dyn SessionBackend, name: &str, abandoned: &
     }
 }
 
+/// Substitute a directive through the tick's variable lookup order.
+///
+/// The order is fixed everywhere a variable resolves during a tick: runtime
+/// names (`SESSION_DIR`, `SESSION_NAME`) first, then the per-tick overlay, then
+/// the `WorkflowInitialized` bindings. It lives in one function so the response
+/// directive and the directed-transition directive cannot drift apart, and so a
+/// value the tick produced for itself is not left out of one of them.
+#[cfg(unix)]
+fn substitute_directive(
+    raw: &str,
+    runtime_vars: &std::collections::HashMap<String, String>,
+    variables: &crate::engine::substitute::Variables,
+    overlay: &crate::engine::substitute::VariableOverlay,
+) -> String {
+    let with_runtime = crate::cli::vars::substitute_vars(raw, runtime_vars);
+    variables.substitute_with(&with_runtime, overlay)
+}
+
+/// Substitute every gate command in `gates` through the same lookup order as
+/// [`substitute_directive`], using the shell-safe form because the result is
+/// handed to `sh -c` (Issue #186).
+#[cfg(unix)]
+fn substitute_gate_commands(
+    gates: &std::collections::BTreeMap<String, crate::template::types::Gate>,
+    runtime_vars: &std::collections::HashMap<String, String>,
+    variables: &crate::engine::substitute::Variables,
+    overlay: &crate::engine::substitute::VariableOverlay,
+) -> std::collections::BTreeMap<String, crate::template::types::Gate> {
+    gates
+        .iter()
+        .map(|(name, gate)| {
+            let mut g = gate.clone();
+            let with_runtime = crate::cli::vars::substitute_vars(&g.command, runtime_vars);
+            g.command = variables.substitute_command_with(&with_runtime, overlay);
+            (name.clone(), g)
+        })
+        .collect()
+}
+
+/// Resolve an action's substituted `working_dir` against the session's
+/// execution anchor.
+///
+/// The three steps run in the order DESIGN-koto-runs-commands.md Decision 8
+/// requires, and the order is the point:
+///
+/// 1. **Reject an absolute value**, before anything is joined. `Path::join`
+///    with an absolute argument discards the base and returns the argument, so
+///    a join-first implementation would hand back a path outside the anchor
+///    and a containment check afterwards would have nothing left to catch. A
+///    literal absolute value is already a compile error
+///    (`src/template/types.rs`); what reaches here is a value that became
+///    absolute through substitution.
+/// 2. **Join** the relative value to the anchor.
+/// 3. **Canonicalize and contain**: resolve `.`, `..`, and symlinks, then
+///    refuse a result that is no longer under the anchor.
+///
+/// A directory that does not exist cannot be canonicalized, so containment
+/// falls back to a lexical resolution of `..` and the runner reports the
+/// missing directory as it always has.
+///
+/// This bounds where a command *starts*. A command that runs is free to change
+/// directory or name any absolute path, and nothing here bounds what it can
+/// reach.
+///
+/// `Err` carries the message an author sees on the failed action.
+#[cfg(unix)]
+fn resolve_action_working_dir(
+    anchor: &std::path::Path,
+    working_dir: &str,
+) -> std::result::Result<std::path::PathBuf, String> {
+    use std::path::{Component, PathBuf};
+
+    // Step 1: absolute is refused before the join.
+    if std::path::Path::new(working_dir).is_absolute() {
+        return Err(format!(
+            "default_action working_dir resolved to the absolute path '{}'; \
+             working_dir must be relative, and is resolved against the session's \
+             execution directory {}",
+            working_dir,
+            anchor.display()
+        ));
+    }
+
+    // Step 2: only now is it safe to join.
+    let joined = anchor.join(working_dir);
+
+    // Step 3: canonicalize, then contain.
+    let resolved = std::fs::canonicalize(&joined).unwrap_or_else(|_| {
+        // The directory does not exist yet (or is not readable), so resolve
+        // `.` and `..` lexically instead. This still catches an escape; the
+        // command's own spawn failure reports the missing directory.
+        let mut lexical = PathBuf::new();
+        for component in joined.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    lexical.pop();
+                }
+                other => lexical.push(other),
+            }
+        }
+        lexical
+    });
+
+    let anchor_resolved = std::fs::canonicalize(anchor).unwrap_or_else(|_| anchor.to_path_buf());
+    if !resolved.starts_with(&anchor_resolved) {
+        return Err(format!(
+            "default_action working_dir '{}' resolves to {}, which is outside the session's \
+             execution directory {}; working_dir must stay under it",
+            working_dir,
+            resolved.display(),
+            anchor_resolved.display()
+        ));
+    }
+
+    Ok(resolved)
+}
+
 /// Handle the `koto next` command with full output contract support.
 ///
 /// Flow:
@@ -2903,8 +3094,9 @@ fn handle_next(
 ) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
-        blocking_conditions_from_gates, ErrorDetail, ExpectsSchema, IntegrationOutput,
-        IntegrationUnavailableMarker, NextError, NextErrorCode, NextResponse, RECOVERY_POINTER,
+        blocking_conditions_from_gates, execution_anchor_adopted_notice, ErrorDetail,
+        ExpectsSchema, IntegrationOutput, IntegrationUnavailableMarker, NextError, NextErrorCode,
+        NextResponse, RECOVERY_POINTER,
     };
     use crate::engine::advance::{
         advance_until_stop, merge_epoch_evidence, ActionResult, AdvanceError, IntegrationError,
@@ -2913,6 +3105,7 @@ fn handle_next(
     use crate::engine::evidence::validate_evidence;
     use crate::engine::persistence::{derive_evidence, instructions_delivered_this_window};
     use crate::engine::substitute::Variables;
+    use crate::engine::template_source_status::{check_execution_anchor, ExecutionAnchorCheck};
     use crate::gate::evaluate_gates;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -3091,7 +3284,7 @@ fn handle_next(
         exit_with_error_code(json, err.code.exit_code());
     }
 
-    let (header, events) = match backend.read_events(&name) {
+    let (mut header, events) = match backend.read_events(&name) {
         Ok(result) => result,
         Err(err) => {
             let ne = NextError {
@@ -3172,6 +3365,98 @@ fn handle_next(
         exit_with_error_code(json, 66);
     }
 
+    // The execution anchor (Decision 6 / 7 in
+    // DESIGN-koto-runs-commands.md). This runs before the template is
+    // read, before variables are bound, and before any gate or action
+    // closure exists, so "no action executed, no gate evaluated, no
+    // transition" holds because there is nothing here that could do
+    // any of those -- not because a later branch remembers to check.
+    //
+    // What it binds is where this session's commands *start*. A
+    // command that runs is still free to name absolute paths or change
+    // directory; nothing here bounds what it can reach.
+    let mut anchor_adopted: Option<PathBuf> = None;
+    let execution_dir = match check_execution_anchor(header.execution_dir.as_deref(), &current_dir)
+    {
+        ExecutionAnchorCheck::Satisfied { anchor } => anchor,
+        ExecutionAnchorCheck::Adopt { anchor } => {
+            // R14: a session written before anchoring existed adopts
+            // the directory it is ticked from. The event goes down
+            // first so a crash between the two writes repeats a
+            // visible adoption rather than leaving a silent one; the
+            // header field is what makes the next tick take the
+            // ordinary path.
+            let payload = EventPayload::ExecutionAnchorAdopted {
+                anchor: anchor.clone(),
+            };
+            if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
+                let ne = NextError {
+                    code: NextErrorCode::PersistenceError,
+                    message: format!("failed to record execution anchor adoption: {}", e),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": ne});
+                exit_with_error_code(json, ne.code.exit_code());
+            }
+            let state_path = backend
+                .session_dir(&name)
+                .join(crate::session::state_file_name(&name));
+            let recorded = anchor.clone();
+            if let Err(e) = crate::engine::claim::rewrite_header_atomically(&state_path, |mut h| {
+                h.execution_dir = Some(recorded);
+                h
+            }) {
+                let ne = NextError {
+                    code: NextErrorCode::PersistenceError,
+                    message: format!("failed to record execution anchor: {}", e),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": ne});
+                exit_with_error_code(json, ne.code.exit_code());
+            }
+            header.execution_dir = Some(anchor.clone());
+            anchor_adopted = Some(anchor.clone());
+            anchor
+        }
+        ExecutionAnchorCheck::Unresolvable { status } => {
+            let machine = match &status.machine_id {
+                Some(id) => format!(" ({})", id),
+                None => String::new(),
+            };
+            let err = NextError {
+                code: NextErrorCode::ExecutionAnchorUnresolvable,
+                message: format!(
+                    "workflow '{}' is bound to {}, which does not resolve on this machine{}; \
+                     run `koto session rebind {} --to <dir>` if the checkout moved",
+                    name,
+                    status.path.display(),
+                    machine,
+                    name,
+                ),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code());
+        }
+        ExecutionAnchorCheck::Outside { anchor, cwd } => {
+            let err = NextError {
+                code: NextErrorCode::ExecutionAnchorMismatch,
+                message: format!(
+                    "workflow '{}' is bound to {}; `koto next` must run from that directory \
+                     or one beneath it, not {}. Run `koto session rebind {} --to <dir>` if \
+                     the checkout moved",
+                    name,
+                    anchor.display(),
+                    cwd.display(),
+                    name,
+                ),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code());
+        }
+    };
+
     // Construct variable bindings from the WorkflowInitialized event.
     // Re-validates values as defense in depth; exits with infrastructure error on failure.
     let variables = match Variables::from_events(&events) {
@@ -3186,6 +3471,14 @@ fn handle_next(
             exit_with_error_code(json, ne.code.exit_code());
         }
     };
+
+    // The tick's variable overlay: values produced while this tick runs,
+    // layered over the bindings just read. It starts empty and nothing writes
+    // to it yet, so every substitution below resolves exactly as it did before
+    // the overlay existed. What the overlay buys is that the tick now has one
+    // live view of its own variables, reached by every site that resolves one,
+    // rather than three separate snapshots taken before the advancement loop.
+    let overlay = crate::engine::substitute::VariableOverlay::new();
 
     let machine_state = match derive_machine_state(&header, &events, &backend.session_dir(&name)) {
         Some(ms) => ms,
@@ -3358,9 +3651,13 @@ fn handle_next(
 
         match dispatch_next(target, target_template_state, true, &gate_results) {
             Ok(resp) => {
+                // The overlay is provably empty here -- this path returns
+                // before the advancement loop, and the loop is the only thing
+                // that writes to it -- but it goes through the same helper as
+                // the natural path so the two directives resolve identically
+                // by construction rather than by inspection.
                 let resp = resp.with_substituted_directive(|d| {
-                    let d = crate::cli::vars::substitute_vars(d, &runtime_vars);
-                    variables.substitute(&d)
+                    substitute_directive(d, &runtime_vars, &variables, &overlay)
                 });
 
                 // Whether the target phase's delivery window already
@@ -3451,6 +3748,17 @@ fn handle_next(
                     .and_then(|p| discover_abandoned_leg(backend, &name, p, &events));
                 let resp = match &abandoned_leg {
                     Some(a) => resp.with_directive_prefix(&a.directive_prefix()),
+                    None => resp,
+                };
+
+                // The anchor-adoption notice, spliced last so it is
+                // the first thing the agent reads: it reports a
+                // binding that was just created, which every later
+                // tick of this session is judged against.
+                let resp = match &anchor_adopted {
+                    Some(anchor) => {
+                        resp.with_directive_prefix(&execution_anchor_adopted_notice(&name, anchor))
+                    }
                     None => resp,
                 };
                 println!("{}", serde_json::to_string(&resp)?);
@@ -3939,20 +4247,15 @@ fn handle_next(
     let session_name = &name;
     let gate_closure =
         |gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
-            // Substitute both template and runtime variables in gate command strings.
-            let substituted: std::collections::BTreeMap<String, crate::template::types::Gate> =
-                gates
-                    .iter()
-                    .map(|(name, gate)| {
-                        let mut g = gate.clone();
-                        let cmd = crate::cli::vars::substitute_vars(&g.command, &vars_for_gates);
-                        g.command = variables.substitute_command(&cmd);
-                        (name.clone(), g)
-                    })
-                    .collect();
+            // Substitute runtime, overlay, and template variables in gate
+            // command strings. The overlay matters because this closure runs
+            // once per state the loop reaches, so a later state's gate command
+            // must see what an earlier state in the same tick produced.
+            let substituted =
+                substitute_gate_commands(gates, &vars_for_gates, &variables, &overlay);
             evaluate_gates(
                 &substituted,
-                &current_dir,
+                &execution_dir,
                 Some(context_store),
                 Some(session_name),
                 Some(&children_eval),
@@ -3974,12 +4277,35 @@ fn handle_next(
 
         // Substitute variables in command and working_dir. The command goes to
         // `sh -c`, so use the shell-safe form (Issue #186); working_dir is a
-        // path, not a shell word, so it keeps the plain substitution.
-        let command = variables.substitute_command(&action.command);
+        // path, not a shell word, so it keeps the plain substitution. Both read
+        // the overlay first, so a state whose action runs after an earlier
+        // state in this same tick produced a value can use it. Runtime names
+        // are deliberately not substituted here, exactly as before.
+        let command = variables.substitute_command_with(&action.command, &overlay);
         let wd = if action.working_dir.is_empty() {
-            current_dir.clone()
+            execution_dir.clone()
         } else {
-            std::path::PathBuf::from(variables.substitute(&action.working_dir))
+            // Resolve against the anchor: reject an absolute value, then join,
+            // then canonicalize and refuse an escape
+            // (DESIGN-koto-runs-commands.md Decision 8). A rejection is an
+            // action failure under Decision 3 -- same stop, same response
+            // shape, same `fallback` prose. No `DefaultActionExecuted` event
+            // is appended, because no command ran: the failure is reported as
+            // a spawn failure, which is what it is.
+            let substituted = variables.substitute_with(&action.working_dir, &overlay);
+            match resolve_action_working_dir(&execution_dir, &substituted) {
+                Ok(dir) => dir,
+                Err(message) => {
+                    return ActionResult::Failed {
+                        command,
+                        failure_kind: crate::action::FailureKind::SpawnFailed,
+                        exit_code: -1,
+                        stdout: String::new(),
+                        stderr: message,
+                        truncated: false,
+                    };
+                }
+            }
         };
 
         // Execute: polling or one-shot.
@@ -3990,12 +4316,14 @@ fn handle_next(
                 .states
                 .get(state_name)
                 .map(|s| {
-                    // Substitute variables in gate commands.
+                    // Substitute variables in gate commands. Overlay first,
+                    // then the log's bindings; runtime names are not
+                    // substituted on this path, as before.
                     s.gates
                         .iter()
                         .map(|(name, gate)| {
                             let mut g = gate.clone();
-                            g.command = variables.substitute_command(&g.command);
+                            g.command = variables.substitute_command_with(&g.command, &overlay);
                             (name.clone(), g)
                         })
                         .collect::<std::collections::BTreeMap<_, _>>()
@@ -4009,7 +4337,7 @@ fn handle_next(
                 &|gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
                     crate::gate::evaluate_gates(
                         gates,
-                        &current_dir,
+                        &execution_dir,
                         Some(context_store),
                         Some(&name),
                         None, // children-complete not needed in polling loop
@@ -4021,9 +4349,15 @@ fn handle_next(
             crate::action::run_shell_command(&command, &wd, 30)
         };
 
-        // Truncate output.
-        let stdout = truncate_output(&output.stdout, MAX_ACTION_OUTPUT_BYTES);
-        let stderr = truncate_output(&output.stderr, MAX_ACTION_OUTPUT_BYTES);
+        // Truncate output, then mark whichever stream the runner had to cut.
+        let stdout = mark_truncated(
+            truncate_output(&output.stdout, MAX_ACTION_OUTPUT_BYTES),
+            output.truncated,
+        );
+        let stderr = mark_truncated(
+            truncate_output(&output.stderr, MAX_ACTION_OUTPUT_BYTES),
+            output.truncated,
+        );
 
         // Append DefaultActionExecuted event.
         let event_payload = EventPayload::DefaultActionExecuted {
@@ -4032,20 +4366,42 @@ fn handle_next(
             exit_code: output.exit_code,
             stdout: stdout.clone(),
             stderr: stderr.clone(),
+            truncated: output.truncated,
         };
         let _ = backend.append_event(&name, &event_payload, &now_iso8601());
 
-        if action.requires_confirmation {
-            ActionResult::RequiresConfirmation {
+        // Failure is classified before the confirmation branch. Confirmation
+        // used to fire on success and failure alike, producing a confirm stop
+        // that carried no indication anything had gone wrong; a failing action
+        // now stops as a failure whether or not the flag is set, and the
+        // confirm stop is reached only on success
+        // (DESIGN-koto-runs-commands.md Decision 3).
+        if let Some(failure_kind) = output.failure_kind {
+            return ActionResult::Failed {
+                command,
+                failure_kind,
                 exit_code: output.exit_code,
                 stdout,
                 stderr,
+                truncated: output.truncated,
+            };
+        }
+
+        if action.requires_confirmation {
+            ActionResult::RequiresConfirmation {
+                command,
+                exit_code: output.exit_code,
+                stdout,
+                stderr,
+                truncated: output.truncated,
             }
         } else {
             ActionResult::Executed {
+                command,
                 exit_code: output.exit_code,
                 stdout,
                 stderr,
+                truncated: output.truncated,
             }
         }
     };
@@ -4059,6 +4415,7 @@ fn handle_next(
         &gate_closure,
         &integration_closure,
         &action_closure,
+        &overlay,
         &shutdown,
     );
 
@@ -4121,6 +4478,14 @@ fn handle_next(
             )
             .unwrap_or_default();
 
+            // The author's prose for a failed `default_action`, set by the
+            // gate-blocked arm below and spliced onto `directive` after
+            // substitution. It rides the directive rather than `details`
+            // because `details` can be withheld by
+            // `with_details_suppressed_unless_full`, and a fallback the agent
+            // may not receive is not a fallback (Decision 4).
+            let mut action_fallback: Option<String> = None;
+
             let resp = match advance_result.stop_reason {
                 StopReason::Terminal => NextResponse::Terminal {
                     state: final_state.clone(),
@@ -4130,6 +4495,21 @@ fn handle_next(
                 StopReason::GateBlocked(gate_results) => {
                     let blocking =
                         blocking_conditions_from_gates(&gate_results, &final_template_state.gates);
+                    // A failed `default_action` arrives here under the
+                    // reserved `__action__` name (Decision 3), and only then
+                    // does the author's fallback prose apply -- a state whose
+                    // action succeeded and whose gates then failed must not
+                    // be prefixed with prose about a failure that did not
+                    // happen.
+                    if blocking
+                        .iter()
+                        .any(|c| c.name == crate::template::types::ACTION_CONDITION_NAME)
+                    {
+                        action_fallback = final_template_state
+                            .default_action
+                            .as_ref()
+                            .and_then(|a| a.fallback.clone());
+                    }
                     NextResponse::GateBlocked {
                         state: final_state.clone(),
                         directive: directive.clone(),
@@ -4211,7 +4591,10 @@ fn handle_next(
                         command: final_template_state
                             .default_action
                             .as_ref()
-                            .map(|a| variables.substitute_command(&a.command))
+                            // Same substitution the action closure performed,
+                            // overlay included, so the command reported back is
+                            // the command that ran.
+                            .map(|a| variables.substitute_command_with(&a.command, &overlay))
                             .unwrap_or_default(),
                         exit_code,
                         stdout,
@@ -4279,10 +4662,49 @@ fn handle_next(
                 }
             };
 
+            // The final directive of the tick. It reads the overlay, so a state
+            // the loop auto-advanced into renders what an earlier state in this
+            // same tick produced rather than the value the log carried in.
+            //
+            // A capture name the run never delivered must not survive this
+            // pass: a declared variable renders its own empty binding, but a
+            // capture has none, so the token itself would land in an agent's
+            // instructions -- the outcome R4 exists to prevent. The check runs
+            // on each string the response actually substitutes, so a state
+            // whose prose is never rendered (a terminal stop) is not refused
+            // for a name it would never have shown. The template compiled, so
+            // the capture map is available; an error building it is
+            // unreachable and costs the check nothing.
+            let capture_names = compiled.capture_names().unwrap_or_default();
+            let unset_capture: std::cell::RefCell<Option<(String, String)>> =
+                std::cell::RefCell::new(None);
             let resp = resp.with_substituted_directive(|d| {
-                let d = crate::cli::vars::substitute_vars(d, &runtime_vars);
-                variables.substitute(&d)
+                if unset_capture.borrow().is_none() {
+                    if let Some(hit) = crate::engine::substitute::first_unset_capture(
+                        d,
+                        &capture_names,
+                        &variables,
+                        &overlay,
+                    ) {
+                        *unset_capture.borrow_mut() = Some(hit);
+                    }
+                }
+                substitute_directive(d, &runtime_vars, &variables, &overlay)
             });
+            if let Some((key, producer)) = unset_capture.into_inner() {
+                let ne = NextError {
+                    code: NextErrorCode::CaptureUnset,
+                    message: format!(
+                        "state '{}' reads {{{{{}}}}}, which state '{}' delivers with \
+                         capture_stdout_as; this run has not entered that state, so the \
+                         value is unset",
+                        final_state, key, producer
+                    ),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": ne});
+                exit_with_error_code(json, ne.code.exit_code());
+            }
 
             // Whether the phase's delivery window already carries a
             // delivery. Guarded by the same `details.is_empty()` check
@@ -4310,6 +4732,16 @@ fn handle_next(
             };
             let resp = resp.with_details_suppressed_unless_full(already_delivered, full);
 
+            // The action fallback, spliced first so it ends up closest to the
+            // directive it explains: koto's own notices below prepend after
+            // it and are read first. Spliced after substitution, like those
+            // notices, so author prose is never exposed to `{{...}}`
+            // expansion.
+            let resp = match &action_fallback {
+                Some(prose) => resp.with_directive_prefix(&format!("{}\n\n", prose)),
+                None => resp,
+            };
+
             // The recovery pointer, spliced before the abandonment notice
             // below so the notice ends up closest to the front of
             // `directive` when both apply (DESIGN-inline-phase-details.md
@@ -4333,6 +4765,16 @@ fn handle_next(
             // (DESIGN-request-lifecycle.md Decision 4).
             let resp = match &abandoned_leg {
                 Some(a) => resp.with_directive_prefix(&a.directive_prefix()),
+                None => resp,
+            };
+
+            // The anchor-adoption notice, spliced last so it is the
+            // first thing the agent reads (see the directed-transition
+            // path for the same splice).
+            let resp = match &anchor_adopted {
+                Some(anchor) => {
+                    resp.with_directive_prefix(&execution_anchor_adopted_notice(&name, anchor))
+                }
                 None => resp,
             };
 
@@ -5564,6 +6006,143 @@ fn handle_cancel(backend: &dyn SessionBackend, name: &str, cleanup: bool) -> Res
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn mark_truncated_marks_only_the_stream_that_was_cut() {
+        let cut = "x".repeat(MAX_ACTION_OUTPUT_BYTES);
+        let short = "boom".to_string();
+
+        // One flag, two streams: only the one at the bound lost a tail.
+        assert!(mark_truncated(cut.clone(), true).ends_with(TRUNCATION_NOTE));
+        assert_eq!(mark_truncated(short.clone(), true), short);
+        // A stream that happens to sit exactly at the bound without the
+        // runner dropping anything is not marked.
+        assert_eq!(mark_truncated(cut.clone(), false), cut);
+        // Marking is not applied twice.
+        let marked = mark_truncated(cut, true);
+        assert_eq!(mark_truncated(marked.clone(), true), marked);
+    }
+
+    #[cfg(unix)]
+    mod working_dir_resolution {
+        use super::*;
+        use crate::engine::substitute::{VariableOverlay, Variables};
+
+        /// A canonical anchor with a real subdirectory in it.
+        fn anchor() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+            dir
+        }
+
+        #[test]
+        fn a_relative_working_dir_resolves_under_the_anchor() {
+            let tmp = anchor();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+            let resolved = resolve_action_working_dir(&base, "sub").unwrap();
+
+            assert_eq!(resolved, base.join("sub"));
+        }
+
+        #[test]
+        fn a_relative_working_dir_that_does_not_exist_is_left_to_the_runner() {
+            let tmp = anchor();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+            // Nothing to canonicalize, but it is contained, so it passes
+            // through and the command's own spawn failure reports it.
+            let resolved = resolve_action_working_dir(&base, "not-there").unwrap();
+
+            assert_eq!(resolved, base.join("not-there"));
+        }
+
+        #[test]
+        fn an_absolute_working_dir_is_refused_before_the_join() {
+            let tmp = anchor();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+            // The trap this rejection exists for: joining an absolute path
+            // discards the base entirely, so a containment check placed after
+            // the join has nothing left to catch. Clippy warns on the join for
+            // exactly that reason, which is the assertion's point.
+            #[allow(clippy::join_absolute_paths)]
+            let joined = base.join("/etc");
+            assert_eq!(joined, std::path::PathBuf::from("/etc"));
+
+            let err = resolve_action_working_dir(&base, "/etc").unwrap_err();
+
+            assert!(
+                err.contains("/etc") && err.contains("absolute") && err.contains("relative"),
+                "the message must name the path and say what was expected, got: {}",
+                err
+            );
+            assert!(
+                err.contains("working_dir"),
+                "the message must name the field, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn a_variable_derived_absolute_working_dir_is_refused() {
+            let tmp = anchor();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+            // The template's literal value is `{{DIR}}`, which the compiler
+            // cannot see is absolute. Only after substitution is it. This is
+            // the case a join-first implementation passes silently.
+            let variables = Variables::from_events(&[]).unwrap();
+            let overlay = VariableOverlay::new();
+            overlay.insert("DIR", "/etc");
+            let substituted = variables.substitute_with("{{DIR}}", &overlay);
+            assert_eq!(substituted, "/etc");
+
+            let err = resolve_action_working_dir(&base, &substituted).unwrap_err();
+
+            assert!(err.contains("/etc"), "got: {}", err);
+        }
+
+        #[test]
+        fn a_relative_working_dir_that_escapes_upward_is_refused() {
+            let tmp = anchor();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+            let err = resolve_action_working_dir(&base, "..").unwrap_err();
+
+            assert!(
+                err.contains("outside") && err.contains(base.to_str().unwrap()),
+                "the message must say the value left the anchor and name it, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn an_escape_through_a_subdirectory_is_refused() {
+            let tmp = anchor();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+            // Escaping through a directory that exists takes the
+            // canonicalization path rather than the lexical one.
+            let err = resolve_action_working_dir(&base, "sub/../..").unwrap_err();
+            assert!(err.contains("outside"), "got: {}", err);
+
+            // And through one that does not, taking the lexical path.
+            let err = resolve_action_working_dir(&base, "not-there/../../elsewhere").unwrap_err();
+            assert!(err.contains("outside"), "got: {}", err);
+        }
+
+        #[test]
+        fn a_dot_segment_inside_the_anchor_is_kept() {
+            let tmp = anchor();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+            let resolved = resolve_action_working_dir(&base, "sub/../sub").unwrap();
+
+            assert_eq!(resolved, base.join("sub"));
+        }
+    }
+
     fn export_args(
         format: ExportFormat,
         output: Option<&str>,
@@ -5685,6 +6264,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: dir,
+            execution_dir: None,
             session_id: String::new(),
             intent: None,
             template_name: None,
@@ -5798,8 +6378,15 @@ Done.
         let backend = LocalBackend::with_base_dir(sessions.path().to_path_buf());
 
         // Init with no --intent: a default intent should be recorded.
-        handle_init_inline(&backend, "intent-wf", INTENT_TEMPLATE.as_bytes(), &[], None)
-            .expect("inline init");
+        handle_init_inline(
+            &backend,
+            "intent-wf",
+            INTENT_TEMPLATE.as_bytes(),
+            &[],
+            None,
+            None,
+        )
+        .expect("inline init");
 
         let (_h, events) = backend.read_events("intent-wf").expect("read events");
         let intent = crate::engine::types::derive_intent(&events);
@@ -5822,6 +6409,7 @@ Done.
             INTENT_TEMPLATE.as_bytes(),
             &[],
             Some("My explicit intent"),
+            None,
         )
         .expect("inline init");
 
@@ -5855,6 +6443,7 @@ Done.
             &[],
             None,
             None,
+            None,
         )
         .expect("init should succeed");
 
@@ -5881,6 +6470,7 @@ Done.
             "clause-wf-missing",
             tpl_path.to_str().unwrap(),
             &[],
+            None,
             None,
             None,
         )
@@ -5914,6 +6504,7 @@ Done.
             "clause-wf-no-dir",
             INTENT_TEMPLATE.as_bytes(),
             &[],
+            None,
             None,
         )
         .expect("inline init should succeed");
@@ -5963,6 +6554,7 @@ Done.
             "clause-wf-dup-calls",
             tpl_path.to_str().unwrap(),
             &[],
+            None,
             None,
             None,
         )
@@ -6349,6 +6941,7 @@ Done.
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     parent_workflow: Some("parent".to_string()),
                     template_source_dir: None,
+                    execution_dir: None,
                     session_id: String::new(),
                     intent: None,
                     template_name: None,
@@ -6546,6 +7139,135 @@ Done.
         assert_eq!(
             variables.substitute_command("cmd init --start {{START}} --dir {{DIR}}"),
             "cmd init --start '' --dir .sweep"
+        );
+    }
+
+    #[test]
+    fn tick_substitution_sites_read_the_overlay() {
+        // The directive site and the gate-command site, each fed a non-empty
+        // overlay. The log binds BRANCH to a stale value and binds nothing at
+        // all for TAG, so a site that ignored the overlay would render "stale"
+        // or leave `{{TAG}}` standing.
+        use crate::engine::substitute::{VariableOverlay, Variables};
+        use crate::template::types::Gate;
+
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: std::collections::HashMap::from([(
+                    "BRANCH".to_string(),
+                    "stale".to_string(),
+                )]),
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+        let variables = Variables::from_events(&events).unwrap();
+
+        let runtime_vars =
+            std::collections::HashMap::from([("SESSION_DIR".to_string(), "/s/abc".to_string())]);
+
+        let overlay = VariableOverlay::new();
+        overlay.insert("BRANCH", "fresh");
+        overlay.insert("TAG", "v1.2.3");
+
+        // Directive: runtime name first, then overlay over the log binding.
+        assert_eq!(
+            substitute_directive(
+                "read {{SESSION_DIR}}/plan.md on {{BRANCH}} for {{TAG}}",
+                &runtime_vars,
+                &variables,
+                &overlay,
+            ),
+            "read /s/abc/plan.md on fresh for v1.2.3"
+        );
+
+        // Gate command: same order, shell-safe form.
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "test -f {{SESSION_DIR}}/{{TAG}} && git log {{BRANCH}}".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+        let substituted = substitute_gate_commands(&gates, &runtime_vars, &variables, &overlay);
+        assert_eq!(
+            substituted.get("check").unwrap().command,
+            "test -f /s/abc/v1.2.3 && git log fresh"
+        );
+    }
+
+    #[test]
+    fn empty_overlay_leaves_tick_substitution_unchanged() {
+        // Behaviour-neutrality at the two extracted sites: with nothing written
+        // this tick they must produce what the pre-overlay code produced, which
+        // was `substitute_vars` followed by the plain `Variables` call.
+        use crate::engine::substitute::{VariableOverlay, Variables};
+        use crate::template::types::Gate;
+
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: std::collections::HashMap::from([
+                    ("BRANCH".to_string(), "main".to_string()),
+                    ("EMPTY".to_string(), String::new()),
+                ]),
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+        let variables = Variables::from_events(&events).unwrap();
+        let runtime_vars =
+            std::collections::HashMap::from([("SESSION_DIR".to_string(), "/s/abc".to_string())]);
+        let overlay = VariableOverlay::new();
+
+        let raw = "{{SESSION_DIR}} {{BRANCH}} {{EMPTY}} {{UNKNOWN}}";
+        let expected_directive = {
+            let d = crate::cli::vars::substitute_vars(raw, &runtime_vars);
+            variables.substitute(&d)
+        };
+        assert_eq!(
+            substitute_directive(raw, &runtime_vars, &variables, &overlay),
+            expected_directive
+        );
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: raw.to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+        let expected_command = {
+            let c = crate::cli::vars::substitute_vars(raw, &runtime_vars);
+            variables.substitute_command(&c)
+        };
+        assert_eq!(
+            substitute_gate_commands(&gates, &runtime_vars, &variables, &overlay)
+                .get("check")
+                .unwrap()
+                .command,
+            expected_command
         );
     }
 }

@@ -5,12 +5,14 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::action::FailureKind;
 use crate::engine::persistence::derive_overrides;
+use crate::engine::substitute::VariableOverlay;
 use crate::engine::types::{now_iso8601, Event, EventPayload};
 use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::template::types::{
     is_is_set_matcher, is_present_matcher, ActionDecl, CompiledTemplate, TemplateState,
-    EVIDENCE_NAMESPACE, GATES_EVIDENCE_NAMESPACE, VARS_NAMESPACE,
+    ACTION_CONDITION_NAME, EVIDENCE_NAMESPACE, GATES_EVIDENCE_NAMESPACE, VARS_NAMESPACE,
 };
 
 /// Maximum number of transitions per invocation. Defense-in-depth against
@@ -33,20 +35,291 @@ pub enum TransitionResolution {
 /// Result of executing a default action.
 #[derive(Debug, Clone)]
 pub enum ActionResult {
-    /// Action executed successfully.
+    /// Action executed successfully. `command` is the substituted string that
+    /// actually ran, carried for the same reason [`Failed`](Self::Failed)
+    /// carries it: a capture taken from this output can still fail, and the
+    /// report has to name what ran rather than what the template declared.
     Executed {
+        command: String,
         exit_code: i32,
         stdout: String,
         stderr: String,
+        truncated: bool,
     },
     /// Action was skipped (override evidence existed).
     Skipped,
     /// Action executed but requires user confirmation before continuing.
     RequiresConfirmation {
+        command: String,
         exit_code: i32,
         stdout: String,
         stderr: String,
+        truncated: bool,
     },
+    /// The action did not succeed. `command` is the substituted string that
+    /// actually ran, so the response reports what happened rather than what
+    /// the template declared.
+    Failed {
+        command: String,
+        failure_kind: FailureKind,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        truncated: bool,
+    },
+}
+
+/// Build the synthetic condition map a failed action stops on.
+///
+/// The failure routes through `StopReason::GateBlocked` under the reserved
+/// name `__action__` (DESIGN-koto-runs-commands.md Decision 3), which is why
+/// no eighth `NextResponse` variant exists. `exit_code` is present only for a
+/// non-zero exit: for a spawn failure, a timeout, or a wait error the runner
+/// never obtained a status, and reporting the synthetic `-1` would be the
+/// conflation `failure_kind` exists to end.
+fn action_failure_conditions(
+    state: &str,
+    command: &str,
+    failure_kind: FailureKind,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+    truncated: bool,
+) -> BTreeMap<String, StructuredGateResult> {
+    // The outcome only sets the condition's `status` string. `failure_kind`
+    // in the payload is the discriminator agents route on; this keeps the
+    // status column honest for a reader skimming the list.
+    let outcome = match failure_kind {
+        FailureKind::NonzeroExit => GateOutcome::Failed,
+        FailureKind::TimedOut => GateOutcome::TimedOut,
+        FailureKind::SpawnFailed | FailureKind::WaitFailed => GateOutcome::Error,
+    };
+    action_condition(
+        state,
+        command,
+        failure_kind.as_str(),
+        outcome,
+        (failure_kind == FailureKind::NonzeroExit).then_some(exit_code),
+        stdout,
+        stderr,
+        truncated,
+        None,
+    )
+}
+
+/// Build the `__action__` condition map for a capture that could not be
+/// delivered.
+///
+/// A failed capture is an action failure, not a skip: the command's output is
+/// never silently dropped, and an author's `fallback` prose is delivered for
+/// every reason the step did not work (DESIGN-koto-runs-commands.md, "Capture
+/// delivery and its three failure cases"). The command itself exited zero, so
+/// no `exit_code` is reported -- there is no failing status to report, and
+/// `capture_error` says what actually went wrong.
+fn capture_failure_conditions(
+    state: &str,
+    command: &str,
+    stdout: &str,
+    stderr: &str,
+    truncated: bool,
+    error: &CaptureError,
+) -> BTreeMap<String, StructuredGateResult> {
+    action_condition(
+        state,
+        command,
+        CAPTURE_FAILED_KIND,
+        GateOutcome::Failed,
+        None,
+        stdout,
+        stderr,
+        truncated,
+        Some(error.to_json()),
+    )
+}
+
+/// Assemble one `__action__` condition. Both action-failure shapes go through
+/// here so the payload's field set cannot drift between them.
+#[allow(clippy::too_many_arguments)]
+fn action_condition(
+    state: &str,
+    command: &str,
+    failure_kind: &str,
+    outcome: GateOutcome,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    truncated: bool,
+    capture_error: Option<serde_json::Value>,
+) -> BTreeMap<String, StructuredGateResult> {
+    let mut output = serde_json::Map::new();
+    output.insert("state".to_string(), serde_json::json!(state));
+    output.insert("command".to_string(), serde_json::json!(command));
+    output.insert("failure_kind".to_string(), serde_json::json!(failure_kind));
+    if let Some(code) = exit_code {
+        output.insert("exit_code".to_string(), serde_json::json!(code));
+    }
+    output.insert("stdout".to_string(), serde_json::json!(stdout));
+    output.insert("stderr".to_string(), serde_json::json!(stderr));
+    output.insert("truncated".to_string(), serde_json::json!(truncated));
+    if let Some(error) = capture_error {
+        output.insert("capture_error".to_string(), error);
+    }
+
+    let mut map = BTreeMap::new();
+    map.insert(
+        ACTION_CONDITION_NAME.to_string(),
+        StructuredGateResult {
+            outcome,
+            output: serde_json::Value::Object(output),
+        },
+    );
+    map
+}
+
+/// Largest captured value the engine will deliver, in bytes.
+///
+/// Deliberately far below the 64KB response bound: a capture is a token that
+/// lands in prose and possibly in a shell word, and the value allowlist
+/// already rules out newlines, so anything approaching this bound is a
+/// template mistake rather than a value worth carrying.
+pub const MAX_CAPTURE_BYTES: usize = 4096;
+
+/// The `failure_kind` a capture failure reports.
+///
+/// It is a wire string rather than a [`FailureKind`] variant because the
+/// runner can never produce it: the command ran and exited zero, and only
+/// delivery failed.
+const CAPTURE_FAILED_KIND: &str = "capture_failed";
+
+/// Why a capture could not be delivered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CaptureError {
+    /// The command wrote nothing, or nothing but whitespace.
+    Empty { key: String },
+    /// The trimmed output is larger than [`MAX_CAPTURE_BYTES`].
+    TooLarge { key: String, bytes: usize },
+    /// The trimmed output holds a character the variable allowlist forbids --
+    /// a newline among them, which is why a multi-line capture is not
+    /// representable and trimming is mandatory rather than a courtesy.
+    /// `position` is the 0-based character index of the first such character.
+    DisallowedCharacter {
+        key: String,
+        position: usize,
+        character: String,
+    },
+}
+
+impl CaptureError {
+    /// The `capture_error` object carried in the `__action__` payload. `case`
+    /// is the discriminator; the remaining fields are what an author needs to
+    /// find the offending output.
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            CaptureError::Empty { key } => serde_json::json!({
+                "key": key,
+                "case": "empty",
+            }),
+            CaptureError::TooLarge { key, bytes } => serde_json::json!({
+                "key": key,
+                "case": "too_large",
+                "bytes": bytes,
+                "limit": MAX_CAPTURE_BYTES,
+            }),
+            CaptureError::DisallowedCharacter {
+                key,
+                position,
+                character,
+            } => serde_json::json!({
+                "key": key,
+                "case": "disallowed_character",
+                "position": position,
+                "character": character,
+            }),
+        }
+    }
+}
+
+/// Prepare a command's stdout for delivery under `key`.
+///
+/// The order is fixed (DESIGN-koto-runs-commands.md, "Capture delivery and its
+/// three failure cases"): trim, reject empty, reject oversize, then run the
+/// value through the same `validate_value` allowlist every declared variable
+/// passes. Reusing that function rather than restating the character set means
+/// a future widening is a single reviewed change both paths inherit.
+pub fn prepare_capture(key: &str, stdout: &str) -> Result<String, CaptureError> {
+    let value = stdout.trim();
+    if value.is_empty() {
+        return Err(CaptureError::Empty {
+            key: key.to_string(),
+        });
+    }
+    if value.len() > MAX_CAPTURE_BYTES {
+        return Err(CaptureError::TooLarge {
+            key: key.to_string(),
+            bytes: value.len(),
+        });
+    }
+    if crate::engine::substitute::validate_value(key, value).is_err() {
+        // Locate the offending character by asking the same allowlist about
+        // one character at a time, rather than restating the character set
+        // here. The scan stops at the first rejection and only runs on the
+        // failure path, where a bounded value has already been read.
+        let (position, character) = value
+            .chars()
+            .enumerate()
+            .find(|(_, c)| crate::engine::substitute::validate_value(key, &c.to_string()).is_err())
+            .map(|(i, c)| (i, c.to_string()))
+            .unwrap_or((0, String::new()));
+        return Err(CaptureError::DisallowedCharacter {
+            key: key.to_string(),
+            position,
+            character,
+        });
+    }
+    Ok(value.to_string())
+}
+
+/// Deliver a state's captured stdout, or report why it could not be.
+///
+/// Returns `Ok(None)` when the state declares no capture name or the value
+/// was delivered, and `Ok(Some(conditions))` when delivery failed and the tick
+/// must stop at this state with an `__action__` condition.
+///
+/// The event and the overlay are written in the same step, so the durable
+/// record and the view the rest of this tick reads can never disagree. The
+/// event goes first: a value the rest of the tick can see but the log does not
+/// hold would survive exactly one tick and then vanish.
+#[allow(clippy::too_many_arguments)]
+fn deliver_capture<F>(
+    state: &str,
+    action: &ActionDecl,
+    command: &str,
+    stdout: &str,
+    stderr: &str,
+    truncated: bool,
+    overlay: &VariableOverlay,
+    append_event: &mut F,
+) -> Result<Option<BTreeMap<String, StructuredGateResult>>, AdvanceError>
+where
+    F: FnMut(&EventPayload) -> Result<(), String>,
+{
+    let Some(key) = &action.capture_stdout_as else {
+        return Ok(None);
+    };
+    match prepare_capture(key, stdout) {
+        Ok(value) => {
+            append_event(&EventPayload::VariableCaptured {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .map_err(AdvanceError::PersistenceError)?;
+            overlay.insert(key.clone(), value);
+            Ok(None)
+        }
+        Err(error) => Ok(Some(capture_failure_conditions(
+            state, command, stdout, stderr, truncated, &error,
+        ))),
+    }
 }
 
 /// Why the advancement loop stopped.
@@ -164,6 +437,12 @@ pub enum IntegrationError {
 /// - `evaluate_gates`: run gate commands and return results
 /// - `invoke_integration`: call an integration runner
 /// - `execute_action`: run a default action command
+///
+/// `overlay` carries values produced during this tick. The loop re-reads it at
+/// every iteration for `vars.*` when-clause evaluation, so a value written by
+/// an earlier iteration routes the later ones. The caller holds the same
+/// overlay for its gate and action command substitution and for the directive
+/// it finally returns.
 #[allow(clippy::too_many_arguments)]
 pub fn advance_until_stop<F, G, I, A>(
     current_state: &str,
@@ -174,6 +453,7 @@ pub fn advance_until_stop<F, G, I, A>(
     evaluate_gates: &G,
     invoke_integration: &I,
     execute_action: &A,
+    overlay: &VariableOverlay,
     shutdown: &AtomicBool,
 ) -> Result<AdvanceResult, AdvanceError>
 where
@@ -197,15 +477,14 @@ where
     // their own evidence before the unconditional fallback fires.
     let mut fresh_evidence = !evidence.is_empty();
 
-    // Extract template variables from the WorkflowInitialized event for vars.*
-    // when-clause evaluation (Issue #141).
-    let workflow_variables: std::collections::HashMap<String, String> = all_events
-        .iter()
-        .find_map(|e| match &e.payload {
-            EventPayload::WorkflowInitialized { variables, .. } => Some(variables.clone()),
-            _ => None,
-        })
-        .unwrap_or_default();
+    // Extract template variables from the log for vars.* when-clause
+    // evaluation (Issue #141): the WorkflowInitialized block plus every value
+    // captured on an earlier tick. This is the base layer only: it is read
+    // once, before the first iteration, so on its own it cannot see a value
+    // produced by an earlier iteration of this same loop. Each iteration
+    // layers the per-tick overlay over it below.
+    let base_workflow_variables: std::collections::HashMap<String, String> =
+        crate::engine::substitute::bindings_from_events(all_events);
 
     // The starting state is NOT added to visited. The visited set tracks states
     // we've auto-advanced THROUGH during this invocation. The starting state was
@@ -288,17 +567,104 @@ where
             let has_evidence = !current_evidence.is_empty();
             let result = execute_action(&state, action, has_evidence);
             match result {
-                ActionResult::Executed { .. } => {
-                    // Continue to gate evaluation
+                ActionResult::Executed {
+                    command,
+                    stdout,
+                    stderr,
+                    truncated,
+                    ..
+                } => {
+                    // Deliver the capture, if the state declared a name, and
+                    // then continue to gate evaluation.
+                    if let Some(conditions) = deliver_capture(
+                        &state,
+                        action,
+                        &command,
+                        &stdout,
+                        &stderr,
+                        truncated,
+                        overlay,
+                        append_event,
+                    )? {
+                        return Ok(AdvanceResult {
+                            final_state: state,
+                            advanced,
+                            stop_reason: StopReason::GateBlocked(conditions),
+                        });
+                    }
                 }
                 ActionResult::Skipped => {
                     // Continue to gate evaluation
                 }
-                ActionResult::RequiresConfirmation {
+                ActionResult::Failed {
+                    command,
+                    failure_kind,
                     exit_code,
                     stdout,
                     stderr,
+                    truncated,
                 } => {
+                    // Stop at the state that ran the command, and do NOT
+                    // evaluate this state's gates: a state's gates judge the
+                    // work the action did, and the action did not happen.
+                    // Running them would let a passing gate advance past a
+                    // failed command, which is the silent advance R6 forbids
+                    // (DESIGN-koto-runs-commands.md Decision 3).
+                    //
+                    // Because this returns before the gate block, an action
+                    // failure can never be detected *by* a gate. There is no
+                    // path on which a gate observes the failure the action
+                    // already reported.
+                    //
+                    // This runs before the `requires_confirmation` branch
+                    // below by construction -- the closure classifies a
+                    // failure as `Failed` regardless of the flag -- so a
+                    // failing action stops here whether or not confirmation
+                    // was requested, and the confirm stop is reached only on
+                    // success.
+                    let conditions = action_failure_conditions(
+                        &state,
+                        &command,
+                        failure_kind,
+                        exit_code,
+                        &stdout,
+                        &stderr,
+                        truncated,
+                    );
+                    return Ok(AdvanceResult {
+                        final_state: state,
+                        advanced,
+                        stop_reason: StopReason::GateBlocked(conditions),
+                    });
+                }
+                ActionResult::RequiresConfirmation {
+                    command,
+                    exit_code,
+                    stdout,
+                    stderr,
+                    truncated,
+                } => {
+                    // The command ran and exited zero, so its capture is
+                    // delivered here too. Confirming re-enters the state with
+                    // evidence, which skips the action entirely -- capturing
+                    // only on the unconfirmed path would mean a confirmed
+                    // action never delivered its value at all.
+                    if let Some(conditions) = deliver_capture(
+                        &state,
+                        action,
+                        &command,
+                        &stdout,
+                        &stderr,
+                        truncated,
+                        overlay,
+                        append_event,
+                    )? {
+                        return Ok(AdvanceResult {
+                            final_state: state,
+                            advanced,
+                            stop_reason: StopReason::GateBlocked(conditions),
+                        });
+                    }
                     return Ok(AdvanceResult {
                         final_state: state.clone(),
                         advanced,
@@ -471,6 +837,14 @@ where
             );
         }
         let evidence_value = serde_json::Value::Object(merged);
+
+        // Read the overlay here, after this iteration's action has run and
+        // before anything routes on `vars.*`, so a value this iteration
+        // produced is visible to its own when-clauses and to every iteration
+        // after it. Re-read per iteration, never hoisted: hoisting it would
+        // restore the stale pre-loop snapshot this exists to replace. An empty
+        // overlay borrows the base map untouched.
+        let workflow_variables = overlay.layered_over(&base_workflow_variables);
 
         // 7. skip_if evaluation
         // Evaluate skip_if conditions before falling through to transition resolution.
@@ -1538,6 +1912,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -1614,6 +1989,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -1658,6 +2034,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -1706,6 +2083,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -1789,6 +2167,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -1925,6 +2304,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2047,6 +2427,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2154,6 +2535,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2253,6 +2635,7 @@ mod tests {
             &passing_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2289,6 +2672,7 @@ mod tests {
             &failing_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown2,
         )
         .unwrap();
@@ -2325,6 +2709,7 @@ mod tests {
             &timeout_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown3,
         )
         .unwrap();
@@ -2358,6 +2743,7 @@ mod tests {
             &error_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown4,
         )
         .unwrap();
@@ -2419,6 +2805,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2471,6 +2858,7 @@ mod tests {
             &noop_gates,
             &integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2543,6 +2931,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2583,6 +2972,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2661,6 +3051,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2743,6 +3134,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2765,7 +3157,229 @@ mod tests {
             working_dir: String::new(),
             requires_confirmation: false,
             polling: None,
+            fallback: None,
+            capture_stdout_as: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // capture delivery
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prepare_capture_trims_surrounding_whitespace() {
+        // `echo` ends with a newline, so trimming is what makes the ordinary
+        // case work at all rather than failing the allowlist.
+        assert_eq!(prepare_capture("BRANCH", "  main\n").unwrap(), "main");
+    }
+
+    #[test]
+    fn prepare_capture_rejects_output_that_is_only_whitespace() {
+        assert_eq!(
+            prepare_capture("BRANCH", " \n\t "),
+            Err(CaptureError::Empty {
+                key: "BRANCH".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn prepare_capture_accepts_output_at_the_bound() {
+        let value = "a".repeat(MAX_CAPTURE_BYTES);
+        assert_eq!(
+            prepare_capture("BRANCH", &value).unwrap().len(),
+            MAX_CAPTURE_BYTES
+        );
+    }
+
+    #[test]
+    fn prepare_capture_rejects_output_over_the_bound() {
+        let value = "a".repeat(MAX_CAPTURE_BYTES + 1);
+        assert_eq!(
+            prepare_capture("BRANCH", &value),
+            Err(CaptureError::TooLarge {
+                key: "BRANCH".to_string(),
+                bytes: MAX_CAPTURE_BYTES + 1
+            })
+        );
+    }
+
+    #[test]
+    fn prepare_capture_names_the_first_rejected_character() {
+        // An interior newline is why multi-line output is not representable:
+        // trimming cannot reach it, and the allowlist refuses it.
+        assert_eq!(
+            prepare_capture("BRANCH", "main\nsecond"),
+            Err(CaptureError::DisallowedCharacter {
+                key: "BRANCH".to_string(),
+                position: 4,
+                character: "\n".to_string()
+            })
+        );
+    }
+
+    /// A one-state template whose action declares a capture name.
+    fn capturing_template(key: &str) -> CompiledTemplate {
+        let mut action = make_action_decl("echo main");
+        action.capture_stdout_as = Some(key.to_string());
+        make_template(vec![(
+            "detect",
+            TemplateState {
+                directive: "Detect.".to_string(),
+                details: String::new(),
+                transitions: vec![conditional(
+                    "done",
+                    vec![("result", serde_json::json!("ok"))],
+                )],
+                terminal: false,
+                gates: BTreeMap::new(),
+                accepts: None,
+                integration: None,
+                default_action: Some(action),
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
+                skip_if: None,
+            },
+        )])
+    }
+
+    fn executed(stdout: &str) -> ActionResult {
+        ActionResult::Executed {
+            command: "echo main".to_string(),
+            exit_code: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn a_delivered_capture_appends_an_event_and_writes_the_overlay() {
+        let template = capturing_template("BRANCH");
+        let appended = std::cell::RefCell::new(Vec::new());
+        let mut append = |p: &EventPayload| -> Result<(), String> {
+            appended.borrow_mut().push(p.clone());
+            Ok(())
+        };
+        let shutdown = AtomicBool::new(false);
+        let overlay = VariableOverlay::new();
+        let action = |_: &str, _: &ActionDecl, _: bool| executed("main\n");
+
+        advance_until_stop(
+            "detect",
+            &template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &overlay,
+            &shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(overlay.get("BRANCH").as_deref(), Some("main"));
+        assert!(
+            appended.borrow().iter().any(|p| matches!(
+                p,
+                EventPayload::VariableCaptured { key, value } if key == "BRANCH" && value == "main"
+            )),
+            "the event and the overlay are written in the same step; got {:?}",
+            appended.borrow()
+        );
+    }
+
+    #[test]
+    fn a_failed_capture_stops_the_tick_as_an_action_failure() {
+        let template = capturing_template("BRANCH");
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+        let overlay = VariableOverlay::new();
+        let action = |_: &str, _: &ActionDecl, _: bool| executed("   ");
+
+        let result = advance_until_stop(
+            "detect",
+            &template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &overlay,
+            &shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(result.final_state, "detect");
+        assert!(!result.advanced);
+        let StopReason::GateBlocked(conditions) = result.stop_reason else {
+            panic!("expected a gate-blocked stop, got {:?}", result.stop_reason);
+        };
+        let output = &conditions[ACTION_CONDITION_NAME].output;
+        assert_eq!(output["failure_kind"], "capture_failed");
+        assert_eq!(output["command"], "echo main");
+        assert_eq!(output["capture_error"]["key"], "BRANCH");
+        assert_eq!(output["capture_error"]["case"], "empty");
+        assert!(
+            output["exit_code"].is_null(),
+            "the command exited zero, so there is no failing status to report"
+        );
+        assert!(overlay.is_empty(), "a failed capture writes nothing");
+    }
+
+    #[test]
+    fn a_state_without_a_capture_name_writes_no_overlay_entry() {
+        let template = make_template(vec![(
+            "detect",
+            TemplateState {
+                directive: "Detect.".to_string(),
+                details: String::new(),
+                transitions: vec![conditional(
+                    "done",
+                    vec![("result", serde_json::json!("ok"))],
+                )],
+                terminal: false,
+                gates: BTreeMap::new(),
+                accepts: None,
+                integration: None,
+                default_action: Some(make_action_decl("echo main")),
+                materialize_children: None,
+                failure: false,
+                skipped_marker: false,
+                skip_if: None,
+            },
+        )]);
+        let appended = std::cell::RefCell::new(Vec::new());
+        let mut append = |p: &EventPayload| -> Result<(), String> {
+            appended.borrow_mut().push(p.clone());
+            Ok(())
+        };
+        let shutdown = AtomicBool::new(false);
+        let overlay = VariableOverlay::new();
+        let action = |_: &str, _: &ActionDecl, _: bool| executed("main\n");
+
+        advance_until_stop(
+            "detect",
+            &template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &overlay,
+            &shutdown,
+        )
+        .unwrap();
+
+        assert!(overlay.is_empty());
+        assert!(!appended
+            .borrow()
+            .iter()
+            .any(|p| matches!(p, EventPayload::VariableCaptured { .. })));
     }
 
     #[test]
@@ -2801,9 +3415,11 @@ mod tests {
         let action = |_state: &str, _action: &ActionDecl, _has_evidence: bool| -> ActionResult {
             call_count.fetch_add(1, Ordering::Relaxed);
             ActionResult::Executed {
+                command: "echo hello".to_string(),
                 exit_code: 0,
                 stdout: "hello".to_string(),
                 stderr: String::new(),
+                truncated: false,
             }
         };
 
@@ -2816,6 +3432,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2867,6 +3484,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2899,9 +3517,11 @@ mod tests {
 
         let action = |_state: &str, _action: &ActionDecl, _has_evidence: bool| -> ActionResult {
             ActionResult::RequiresConfirmation {
+                command: "gh pr create".to_string(),
                 exit_code: 0,
                 stdout: "PR #42 created".to_string(),
                 stderr: String::new(),
+                truncated: false,
             }
         };
 
@@ -2914,6 +3534,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2932,6 +3553,243 @@ mod tests {
                 assert_eq!(stdout, "PR #42 created");
             }
             other => panic!("expected ActionRequiresConfirmation, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // action failure short-circuit
+    // -----------------------------------------------------------------------
+
+    fn failed_action(kind: FailureKind, exit_code: i32) -> ActionResult {
+        ActionResult::Failed {
+            command: "check.sh".to_string(),
+            failure_kind: kind,
+            exit_code,
+            stdout: "partial".to_string(),
+            stderr: "boom".to_string(),
+            truncated: false,
+        }
+    }
+
+    /// Build a one-state template whose action is followed by an
+    /// unconditional transition to a terminal state. Without the
+    /// short-circuit, a tick on `run` walks straight through to `done`.
+    fn action_failure_template(
+        gates: BTreeMap<String, crate::template::types::Gate>,
+    ) -> CompiledTemplate {
+        make_template(vec![
+            (
+                "run",
+                TemplateState {
+                    directive: "Run it.".to_string(),
+                    details: String::new(),
+                    transitions: vec![unconditional("done")],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: Some(make_action_decl("check.sh")),
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: None,
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: None,
+                },
+            ),
+        ])
+    }
+
+    fn run_failing_action(
+        template: &CompiledTemplate,
+        result: ActionResult,
+        gate_calls: &std::sync::atomic::AtomicUsize,
+    ) -> AdvanceResult {
+        let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+        let gates_closure = |_: &BTreeMap<String, crate::template::types::Gate>| {
+            gate_calls.fetch_add(1, Ordering::Relaxed);
+            let mut out = BTreeMap::new();
+            out.insert(
+                "check".to_string(),
+                StructuredGateResult {
+                    outcome: GateOutcome::Passed,
+                    output: serde_json::json!({"exit_code": 0}),
+                },
+            );
+            out
+        };
+        let action = |_: &str, _: &ActionDecl, _: bool| -> ActionResult { result.clone() };
+
+        advance_until_stop(
+            "run",
+            template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &gates_closure,
+            &unavailable_integration,
+            &action,
+            &VariableOverlay::new(),
+            &shutdown,
+        )
+        .unwrap()
+    }
+
+    fn action_condition(result: &AdvanceResult) -> &serde_json::Value {
+        match &result.stop_reason {
+            StopReason::GateBlocked(conditions) => {
+                &conditions
+                    .get(ACTION_CONDITION_NAME)
+                    .expect("failure should be reported under the reserved name")
+                    .output
+            }
+            other => panic!("expected GateBlocked, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn failing_action_stops_at_the_state_that_ran_it() {
+        let gate_calls = std::sync::atomic::AtomicUsize::new(0);
+        let template = action_failure_template(BTreeMap::new());
+        let result = run_failing_action(
+            &template,
+            failed_action(FailureKind::NonzeroExit, 3),
+            &gate_calls,
+        );
+
+        assert_eq!(result.final_state, "run");
+        assert!(!result.advanced);
+        let output = action_condition(&result);
+        assert_eq!(output["state"], "run");
+        assert_eq!(output["command"], "check.sh");
+        assert_eq!(output["failure_kind"], "nonzero_exit");
+        assert_eq!(output["exit_code"], 3);
+        assert_eq!(output["stdout"], "partial");
+        assert_eq!(output["stderr"], "boom");
+        assert_eq!(output["truncated"], false);
+    }
+
+    #[test]
+    fn failing_action_does_not_evaluate_the_states_own_gates() {
+        use crate::template::types::Gate;
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "true".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+
+        let gate_calls = std::sync::atomic::AtomicUsize::new(0);
+        let template = action_failure_template(gates);
+        let result = run_failing_action(
+            &template,
+            failed_action(FailureKind::NonzeroExit, 1),
+            &gate_calls,
+        );
+
+        // The gate would have passed. Running it would have let the tick
+        // advance past a command that failed -- the silent advance R6 forbids.
+        assert_eq!(gate_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(result.final_state, "run");
+        assert!(!result.advanced);
+        assert_eq!(action_condition(&result)["failure_kind"], "nonzero_exit");
+    }
+
+    #[test]
+    fn spawn_failure_omits_exit_code() {
+        let gate_calls = std::sync::atomic::AtomicUsize::new(0);
+        let template = action_failure_template(BTreeMap::new());
+        let result = run_failing_action(
+            &template,
+            failed_action(FailureKind::SpawnFailed, -1),
+            &gate_calls,
+        );
+
+        let output = action_condition(&result);
+        assert_eq!(output["failure_kind"], "spawn_failed");
+        assert!(
+            output.get("exit_code").is_none(),
+            "a command that never ran has no exit status to report"
+        );
+    }
+
+    #[test]
+    fn timeout_omits_exit_code() {
+        let gate_calls = std::sync::atomic::AtomicUsize::new(0);
+        let template = action_failure_template(BTreeMap::new());
+        let result = run_failing_action(
+            &template,
+            failed_action(FailureKind::TimedOut, -1),
+            &gate_calls,
+        );
+
+        let output = action_condition(&result);
+        assert_eq!(output["failure_kind"], "timed_out");
+        assert!(output.get("exit_code").is_none());
+    }
+
+    #[test]
+    fn wait_failure_is_an_action_failure_like_the_others() {
+        let gate_calls = std::sync::atomic::AtomicUsize::new(0);
+        let template = action_failure_template(BTreeMap::new());
+        let result = run_failing_action(
+            &template,
+            failed_action(FailureKind::WaitFailed, -1),
+            &gate_calls,
+        );
+
+        assert_eq!(result.final_state, "run");
+        let output = action_condition(&result);
+        assert_eq!(output["failure_kind"], "wait_failed");
+        assert!(output.get("exit_code").is_none());
+    }
+
+    #[test]
+    fn action_failure_status_follows_the_failure_kind() {
+        let gate_calls = std::sync::atomic::AtomicUsize::new(0);
+        let template = action_failure_template(BTreeMap::new());
+        for (kind, expected) in [
+            (FailureKind::NonzeroExit, GateOutcome::Failed),
+            (FailureKind::TimedOut, GateOutcome::TimedOut),
+            (FailureKind::SpawnFailed, GateOutcome::Error),
+            (FailureKind::WaitFailed, GateOutcome::Error),
+        ] {
+            let result = run_failing_action(&template, failed_action(kind, -1), &gate_calls);
+            match &result.stop_reason {
+                StopReason::GateBlocked(conditions) => {
+                    assert_eq!(
+                        conditions[ACTION_CONDITION_NAME].outcome, expected,
+                        "unexpected outcome for {:?}",
+                        kind
+                    );
+                }
+                other => panic!("expected GateBlocked, got {:?}", other),
+            }
         }
     }
 
@@ -3003,6 +3861,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3057,9 +3916,11 @@ mod tests {
 
         let action = |_state: &str, _action: &ActionDecl, _has_evidence: bool| -> ActionResult {
             ActionResult::Executed {
+                command: "true".to_string(),
                 exit_code: 0,
                 stdout: "ok".to_string(),
                 stderr: String::new(),
+                truncated: false,
             }
         };
 
@@ -3072,6 +3933,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3148,6 +4010,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3281,6 +4144,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3384,6 +4248,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3527,6 +4392,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3634,6 +4500,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3746,6 +4613,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3844,6 +4712,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3932,6 +4801,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -4108,6 +4978,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -4137,5 +5008,95 @@ mod tests {
                 "skip_if_matched should be Some in the Transitioned event"
             );
         }
+    }
+
+    #[test]
+    fn vars_when_clause_reads_the_overlay() {
+        // The `vars.*` staleness site. The log carries no variables at all, so
+        // the base map built before the first iteration cannot satisfy
+        // `vars.SKIP`. Only the overlay can -- and the loop re-reads it per
+        // iteration, which is what a value produced mid-tick depends on.
+        let template = make_template(vec![
+            (
+                "skippable",
+                TemplateState {
+                    directive: "Skippable.".to_string(),
+                    details: String::new(),
+                    transitions: vec![unconditional("done")],
+                    terminal: false,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: {
+                        let mut m = BTreeMap::new();
+                        m.insert("vars.SKIP".to_string(), serde_json::json!({"is_set": true}));
+                        Some(m)
+                    },
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: None,
+                },
+            ),
+        ]);
+
+        let fired_via_skip_if = |overlay: &VariableOverlay| -> bool {
+            let mut appended: Vec<EventPayload> = Vec::new();
+            let mut append = |payload: &EventPayload| -> Result<(), String> {
+                appended.push(payload.clone());
+                Ok(())
+            };
+            let shutdown = AtomicBool::new(false);
+
+            advance_until_stop(
+                "skippable",
+                &template,
+                &BTreeMap::new(),
+                &[],
+                &mut append,
+                &noop_gates,
+                &unavailable_integration,
+                &noop_action,
+                overlay,
+                &shutdown,
+            )
+            .unwrap();
+
+            appended.iter().any(|p| {
+                matches!(p, EventPayload::Transitioned { condition_type, .. }
+                    if condition_type == "skip_if")
+            })
+        };
+
+        let overlay = VariableOverlay::new();
+        overlay.insert("SKIP", "true");
+        assert!(
+            fired_via_skip_if(&overlay),
+            "a name written to the overlay must satisfy a vars.* when-clause"
+        );
+
+        // Control: the same template, the same empty log, an empty overlay.
+        // Nothing satisfies `vars.SKIP`, so the skip_if branch must not fire.
+        assert!(
+            !fired_via_skip_if(&VariableOverlay::new()),
+            "an empty overlay must leave vars.* evaluation exactly as it was"
+        );
     }
 }

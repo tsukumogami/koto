@@ -259,6 +259,32 @@ pub struct StateFileHeader {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_source_dir: Option<PathBuf>,
 
+    /// Directory this session's ticks execute in -- the execution
+    /// anchor (Decision 6 in DESIGN-koto-runs-commands.md).
+    ///
+    /// Recorded in canonical form (`fs::canonicalize` output) at `koto
+    /// init` time from the process working directory, or from
+    /// `--execution-dir` when the caller names one. A child session
+    /// copies its parent's value rather than deriving one from the
+    /// spawning process (R16).
+    ///
+    /// Every `koto next` checks the process working directory against
+    /// this value and runs the tick's gates and actions here rather
+    /// than wherever `koto next` was typed. `None` on state files
+    /// written before this field existed: the first tick adopts the
+    /// directory it is ticked from, records it here, and says so once
+    /// (R14).
+    ///
+    /// This binds where a session's commands *start*. It does not
+    /// bound what a command can reach once running -- an authorized
+    /// command can name absolute paths or change directory, and
+    /// nothing here stops it (R17).
+    ///
+    /// Additive field: serde-optional, omitted when `None`, so older
+    /// state files round-trip cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_dir: Option<PathBuf>,
+
     /// UUID v4 identifier generated at `koto init` time and preserved
     /// unchanged through rename operations.
     ///
@@ -547,6 +573,13 @@ pub enum EventPayload {
         exit_code: i32,
         stdout: String,
         stderr: String,
+        /// True when the command emitted more output than the runner
+        /// retains, so `stdout`/`stderr` hold only the first bytes.
+        ///
+        /// Additive: events written before the reader-thread change omit
+        /// the field and deserialize as `false`.
+        #[serde(default)]
+        truncated: bool,
     },
     DecisionRecorded {
         state: String,
@@ -662,6 +695,39 @@ pub enum EventPayload {
     /// the last one wins (see `derive_intent`).
     IntentUpdated {
         intent: String,
+    },
+    /// Emitted on the first tick of a session that carries no
+    /// `execution_dir` in its header -- a session created before
+    /// execution anchoring existed (R14). The tick adopts the
+    /// directory it is running from, records it on the header, and
+    /// appends this event.
+    ///
+    /// The event is what makes the adoption visible; the header field
+    /// is what makes it happen once. A later tick finds
+    /// `execution_dir` recorded and takes the ordinary path, so
+    /// exactly one of these can appear per session.
+    ExecutionAnchorAdopted {
+        anchor: PathBuf,
+    },
+    /// A state's `default_action` delivered its stdout under the name the
+    /// state declared in `capture_stdout_as`
+    /// (DESIGN-koto-runs-commands.md Decision 1).
+    ///
+    /// This event is the durable record of a captured value; the per-tick
+    /// overlay is only the in-memory view of the same write.
+    /// [`crate::engine::substitute::bindings_from_events`] folds these in
+    /// event order, so re-entering the producing state means the later value
+    /// wins, and a rewind past that state leaves the value in place -- the log
+    /// is never truncated.
+    ///
+    /// `value` has already been trimmed and checked against the variable
+    /// allowlist, so a value that reached the log is one substitution can use.
+    /// The event is additive and does not move `CURRENT_SCHEMA_VERSION`: an
+    /// older build lands it in [`Unknown`](EventPayload::Unknown) and keeps
+    /// reading the log.
+    VariableCaptured {
+        key: String,
+        value: String,
     },
     /// Carries the auto-promoted [`WorkflowResult`] envelope on a child's
     /// own session log (wire `type: "request_store.result"`, in the
@@ -1030,6 +1096,8 @@ impl EventPayload {
             EventPayload::BatchFinalized { .. } => "batch_finalized",
             EventPayload::ChildCompleted { .. } => "child_completed",
             EventPayload::IntentUpdated { .. } => "intent_updated",
+            EventPayload::ExecutionAnchorAdopted { .. } => "execution_anchor_adopted",
+            EventPayload::VariableCaptured { .. } => "variable_captured",
             EventPayload::RequestStoreResult { .. } => "request_store.result",
             EventPayload::RequestCreated { .. } => "request.created",
             EventPayload::RequestLegBound { .. } => "request.leg_bound",
@@ -1226,6 +1294,7 @@ impl<'de> Deserialize<'de> for Event {
                     exit_code: p.exit_code,
                     stdout: p.stdout,
                     stderr: p.stderr,
+                    truncated: p.truncated,
                 }
             }
             "decision_recorded" => {
@@ -1293,6 +1362,19 @@ impl<'de> Deserialize<'de> for Event {
                 let p: IntentUpdatedPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
                 EventPayload::IntentUpdated { intent: p.intent }
+            }
+            "execution_anchor_adopted" => {
+                let p: ExecutionAnchorAdoptedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::ExecutionAnchorAdopted { anchor: p.anchor }
+            }
+            "variable_captured" => {
+                let p: VariableCapturedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::VariableCaptured {
+                    key: p.key,
+                    value: p.value,
+                }
             }
             "request_store.result" => {
                 let p: RequestStoreResultPayload = serde_json::from_value(payload_val.clone())
@@ -1470,6 +1552,8 @@ struct DefaultActionExecutedPayload {
     exit_code: i32,
     stdout: String,
     stderr: String,
+    #[serde(default)]
+    truncated: bool,
 }
 
 #[derive(Deserialize)]
@@ -1526,6 +1610,17 @@ struct ChildCompletedPayload {
 #[derive(Deserialize)]
 struct IntentUpdatedPayload {
     intent: String,
+}
+
+#[derive(Deserialize)]
+struct ExecutionAnchorAdoptedPayload {
+    anchor: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct VariableCapturedPayload {
+    key: String,
+    value: String,
 }
 
 #[derive(Deserialize)]
@@ -1723,6 +1818,7 @@ mod tests {
             created_at: "2026-03-15T14:30:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            execution_dir: None,
             session_id: String::new(),
             intent: None,
             template_name: None,
@@ -1753,6 +1849,7 @@ mod tests {
             created_at: "2026-03-15T14:30:00Z".to_string(),
             parent_workflow: Some("parent-wf".to_string()),
             template_source_dir: None,
+            execution_dir: None,
             session_id: String::new(),
             intent: None,
             template_name: None,
@@ -1795,6 +1892,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: Some(PathBuf::from("/abs/templates")),
+            execution_dir: None,
             session_id: String::new(),
             intent: None,
             template_name: None,
@@ -1830,6 +1928,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            execution_dir: None,
             session_id: String::new(),
             intent: None,
             template_name: None,
@@ -1863,6 +1962,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            execution_dir: None,
             session_id: String::new(),
             intent: None,
             template_name: None,
@@ -2188,6 +2288,7 @@ mod tests {
                 exit_code: 0,
                 stdout: "Switched to a new branch 'feature'\n".to_string(),
                 stderr: String::new(),
+                truncated: false,
             },
             idempotency_hash: None,
         };
@@ -2206,6 +2307,7 @@ mod tests {
             exit_code: 1,
             stdout: String::new(),
             stderr: "err".to_string(),
+            truncated: false,
         };
         assert_eq!(p.type_name(), "default_action_executed");
     }
@@ -2475,6 +2577,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00.000Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            execution_dir: None,
             session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             intent: None,
             template_name: None,

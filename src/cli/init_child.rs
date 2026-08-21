@@ -356,6 +356,38 @@ pub fn init_child_from_parent(
         cache,
         spawn_entry,
         None,
+        None,
+    )
+}
+
+/// [`init_child_from_parent`] with an explicit execution anchor.
+///
+/// Used by the `koto init --execution-dir <dir>` path, the one caller
+/// that knows better than the default (the directory `koto init` runs
+/// in, or the parent's anchor for a child). Every other caller wants
+/// [`init_child_from_parent`].
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+pub fn init_child_from_parent_at(
+    backend: &dyn SessionBackend,
+    parent_name: Option<&str>,
+    child_name: &str,
+    template_path: &Path,
+    vars: &[String],
+    cache: &mut TemplateCompileCache,
+    spawn_entry: Option<SpawnEntrySnapshot>,
+    execution_dir: Option<&Path>,
+) -> Result<(), TaskSpawnError> {
+    init_child_core(
+        backend,
+        parent_name,
+        child_name,
+        template_path,
+        vars,
+        cache,
+        spawn_entry,
+        None,
+        execution_dir,
     )
 }
 
@@ -392,7 +424,53 @@ pub fn init_child_as_skip_marker_from_parent(
         cache,
         spawn_entry,
         Some(skipped_state_name),
+        None,
     )
+}
+
+/// Canonical form of `path`, falling back to the path as given when it
+/// cannot be canonicalized.
+///
+/// The anchor is compared byte-exactly against `fs::canonicalize`
+/// output on every tick, so it is recorded in that form here. A path
+/// that cannot be canonicalized is recorded verbatim rather than
+/// dropped: `koto next` then refuses with the unresolvable-anchor code
+/// and names the recorded directory, which is more useful than a
+/// session that silently re-adopts.
+fn canonical_or_verbatim(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Resolve the execution anchor to record on a new session's header.
+///
+/// Precedence: an explicit `--execution-dir` override, then the
+/// parent's recorded anchor (R16 -- a child is anchored where its
+/// parent is, not where the spawning process happened to be), then the
+/// directory this process is running in.
+///
+/// Returns `None` only when there is nothing to record at all: no
+/// override, no parent anchor, and an unreadable working directory.
+/// The session's first tick then adopts one under R14.
+fn resolve_execution_dir(
+    backend: &dyn SessionBackend,
+    parent_name: Option<&str>,
+    execution_dir_override: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(dir) = execution_dir_override {
+        return Some(canonical_or_verbatim(dir));
+    }
+    if let Some(parent) = parent_name {
+        if let Some(inherited) = backend
+            .read_header(parent)
+            .ok()
+            .and_then(|h| h.execution_dir)
+        {
+            return Some(inherited);
+        }
+    }
+    std::env::current_dir()
+        .ok()
+        .map(|cwd| canonical_or_verbatim(&cwd))
 }
 
 /// Shared implementation. When `override_initial_state` is `Some`, the
@@ -409,6 +487,7 @@ fn init_child_core(
     cache: &mut TemplateCompileCache,
     spawn_entry: Option<SpawnEntrySnapshot>,
     override_initial_state: Option<&str>,
+    execution_dir_override: Option<&Path>,
 ) -> Result<(), TaskSpawnError> {
     let cached = compile_with_cache(template_path, cache).map_err(|info| {
         let mut err = TaskSpawnError::new(child_name, info.kind, info.message);
@@ -466,6 +545,13 @@ fn init_child_core(
             .and_then(|p| p.parent().map(|x| x.to_path_buf()))
     };
 
+    // Record the execution anchor (Decision 6). A child copies the
+    // parent's recorded anchor explicitly rather than inheriting the
+    // spawning process's working directory (R16); a top-level session
+    // adopts the directory `koto init` ran in. `--execution-dir` wins
+    // over both.
+    let execution_dir = resolve_execution_dir(backend, parent_name, execution_dir_override);
+
     let header = StateFileHeader {
         schema_version: 1,
         workflow: child_name.to_string(),
@@ -473,6 +559,7 @@ fn init_child_core(
         created_at: ts.clone(),
         parent_workflow: parent_name.map(|s| s.to_string()),
         template_source_dir,
+        execution_dir,
         session_id: generate_session_id(),
         intent: None,
         template_name: if cached.compiled.name.is_empty() {
@@ -586,6 +673,7 @@ pub fn init_inline_into_session(
     name: &str,
     source_path: &Path,
     vars: &[String],
+    execution_dir_override: Option<&Path>,
 ) -> anyhow::Result<()> {
     // Create the session directory first: compile_cached_into would
     // create it too, but going through the backend also applies the
@@ -642,6 +730,9 @@ pub fn init_inline_into_session(
         // The compiled artifact lives in the session dir, not a source
         // tree, so there is no parent source dir for the batch resolver.
         template_source_dir: None,
+        // An inline session is always top-level (`--from-stdin`
+        // rejects `--parent`), so there is no parent anchor to copy.
+        execution_dir: resolve_execution_dir(backend, None, execution_dir_override),
         session_id: generate_session_id(),
         intent: None,
         template_name: if compiled.name.is_empty() {
@@ -723,6 +814,7 @@ pub fn init_inline_from_stdin_bytes(
     name: &str,
     source_bytes: &[u8],
     vars: &[String],
+    execution_dir_override: Option<&Path>,
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
 
@@ -743,7 +835,9 @@ pub fn init_inline_from_stdin_bytes(
     // Strict-compile into the session dir and start the session. On
     // failure the compiler error (element-named) propagates; we then tear
     // down the bare session directory so nothing half-built persists.
-    if let Err(e) = init_inline_into_session(backend, name, tmp.path(), vars) {
+    if let Err(e) =
+        init_inline_into_session(backend, name, tmp.path(), vars, execution_dir_override)
+    {
         // Best-effort cleanup of the session dir init_inline_into_session
         // created before compiling. `exists()` checks for the STATE FILE,
         // which is absent on a compile failure, so the session is not
@@ -858,6 +952,12 @@ Done.
     /// the parent — that's `handle_init`'s job — but tests mirror the
     /// realistic shape.
     fn seed_parent(backend: &LocalBackend, parent: &str) {
+        seed_parent_anchored(backend, parent, None)
+    }
+
+    /// `seed_parent` with an explicit recorded execution anchor, for
+    /// the R16 inheritance tests.
+    fn seed_parent_anchored(backend: &LocalBackend, parent: &str, execution_dir: Option<PathBuf>) {
         backend.create(parent).expect("create parent dir");
         let header = StateFileHeader {
             schema_version: 1,
@@ -866,6 +966,7 @@ Done.
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            execution_dir,
             session_id: String::new(),
             intent: None,
             template_name: None,
@@ -1188,7 +1289,7 @@ Done.
 
         let source = write_template(tpl_dir.path(), "inline.md", INLINE_TEMPLATE);
 
-        init_inline_into_session(&backend, "inline-wf", &source, &[]).expect("inline init");
+        init_inline_into_session(&backend, "inline-wf", &source, &[], None).expect("inline init");
 
         let (header, events) = backend.read_events("inline-wf").expect("read events");
 
@@ -1247,7 +1348,7 @@ Done.
         let backend = backend_in(sessions.path());
 
         let source = write_template(tpl_dir.path(), "inline.md", INLINE_TEMPLATE);
-        init_inline_into_session(&backend, "inline-wf", &source, &[]).expect("inline init");
+        init_inline_into_session(&backend, "inline-wf", &source, &[], None).expect("inline init");
 
         let (header, events) = backend.read_events("inline-wf").expect("read events");
         let session_dir = backend.session_dir("inline-wf");
@@ -1299,7 +1400,7 @@ Done.
         let backend = backend_in(sessions.path());
 
         let source = write_template(tpl_dir.path(), "inline.md", INLINE_TEMPLATE);
-        init_inline_into_session(&backend, "inline-old", &source, &[]).expect("inline init");
+        init_inline_into_session(&backend, "inline-old", &source, &[], None).expect("inline init");
 
         backend
             .relocate("inline-old", "inline-new")
@@ -1366,7 +1467,7 @@ Done.
         let backend = backend_in(sessions.path());
 
         let input = INLINE_TEMPLATE.as_bytes();
-        init_inline_from_stdin_bytes(&backend, "inline-wf", input, &[]).expect("inline init");
+        init_inline_from_stdin_bytes(&backend, "inline-wf", input, &[], None).expect("inline init");
 
         // Session started: state file exists.
         assert!(backend.exists("inline-wf"), "session must be registered");
@@ -1399,6 +1500,7 @@ Done.
             "inline-bad",
             BAD_TARGET_TEMPLATE.as_bytes(),
             &[],
+            None,
         )
         .expect_err("strict validation must fail");
 
@@ -1415,6 +1517,138 @@ Done.
         assert!(
             !backend.session_dir("inline-bad").exists(),
             "strict failure must leave no half-built session directory"
+        );
+    }
+
+    // ===== Execution anchor (R16, Decision 6) =====
+
+    #[test]
+    fn child_header_copies_the_parents_execution_dir() {
+        // R16: a child is anchored where its parent is, copied
+        // explicitly from the parent's header rather than derived from
+        // whatever directory the spawning process happens to be in --
+        // which is why the asserted value is a directory this test
+        // never runs in.
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let tpl_dir = TempDir::new().expect("templates dir");
+        let anchor = TempDir::new().expect("anchor dir");
+        let anchor_path = std::fs::canonicalize(anchor.path()).unwrap();
+        let backend = backend_in(sessions.path());
+        seed_parent_anchored(&backend, "parent", Some(anchor_path.clone()));
+
+        let template = write_template(tpl_dir.path(), "child.md", SIMPLE_TEMPLATE);
+        let mut cache = TemplateCompileCache::new();
+        init_child_from_parent(
+            &backend,
+            Some("parent"),
+            "parent.anchored",
+            &template,
+            &["TASK_ID=1".to_string()],
+            &mut cache,
+            None,
+        )
+        .expect("init child");
+
+        let header = backend.read_header("parent.anchored").expect("read header");
+        assert_eq!(
+            header.execution_dir,
+            Some(anchor_path),
+            "child must record the parent's anchor, not the spawning process's directory"
+        );
+    }
+
+    #[test]
+    fn top_level_session_records_the_current_directory() {
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let tpl_dir = TempDir::new().expect("templates dir");
+        let backend = backend_in(sessions.path());
+
+        let template = write_template(tpl_dir.path(), "top.md", SIMPLE_TEMPLATE);
+        let mut cache = TemplateCompileCache::new();
+        init_child_from_parent(
+            &backend,
+            None,
+            "top-level",
+            &template,
+            &["TASK_ID=1".to_string()],
+            &mut cache,
+            None,
+        )
+        .expect("init");
+
+        let header = backend.read_header("top-level").expect("read header");
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(header.execution_dir, Some(cwd));
+    }
+
+    #[test]
+    fn explicit_execution_dir_overrides_both_defaults() {
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let tpl_dir = TempDir::new().expect("templates dir");
+        let parent_anchor = TempDir::new().expect("parent anchor");
+        let chosen = TempDir::new().expect("chosen anchor");
+        let chosen_path = std::fs::canonicalize(chosen.path()).unwrap();
+        let backend = backend_in(sessions.path());
+        seed_parent_anchored(
+            &backend,
+            "parent",
+            Some(std::fs::canonicalize(parent_anchor.path()).unwrap()),
+        );
+
+        let template = write_template(tpl_dir.path(), "child.md", SIMPLE_TEMPLATE);
+        let mut cache = TemplateCompileCache::new();
+        init_child_from_parent_at(
+            &backend,
+            Some("parent"),
+            "parent.override",
+            &template,
+            &["TASK_ID=1".to_string()],
+            &mut cache,
+            None,
+            Some(chosen.path()),
+        )
+        .expect("init child");
+
+        let header = backend.read_header("parent.override").expect("read header");
+        assert_eq!(header.execution_dir, Some(chosen_path));
+    }
+
+    #[test]
+    fn a_recorded_anchor_is_canonical() {
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let tpl_dir = TempDir::new().expect("templates dir");
+        let anchor = TempDir::new().expect("anchor dir");
+        let canonical = std::fs::canonicalize(anchor.path()).unwrap();
+        let sub = anchor.path().join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        let noisy = sub.join("..");
+        let backend = backend_in(sessions.path());
+
+        let template = write_template(tpl_dir.path(), "top.md", SIMPLE_TEMPLATE);
+        let mut cache = TemplateCompileCache::new();
+        init_child_from_parent_at(
+            &backend,
+            None,
+            "canonical-anchor",
+            &template,
+            &["TASK_ID=1".to_string()],
+            &mut cache,
+            None,
+            Some(&noisy),
+        )
+        .expect("init");
+
+        let header = backend
+            .read_header("canonical-anchor")
+            .expect("read header");
+        assert_eq!(
+            header.execution_dir,
+            Some(canonical),
+            "the anchor is compared byte-exactly against canonicalize output, so it is recorded that way"
         );
     }
 }

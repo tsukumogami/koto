@@ -310,6 +310,7 @@ pub fn handle_start(
         created_at: ts.clone(),
         parent_workflow: Some(validated_parent.as_str().to_string()),
         template_source_dir: None,
+        execution_dir: None,
         session_id: generate_session_id(),
         intent: None,
         template_name,

@@ -89,6 +89,7 @@ fn base_header(workflow: &str) -> StateFileHeader {
         created_at: "2026-05-24T00:00:00Z".to_string(),
         parent_workflow: None,
         template_source_dir: None,
+        execution_dir: None,
         session_id: workflow.to_string(),
         intent: None,
         template_name: Some("scrutinize.md".to_string()),

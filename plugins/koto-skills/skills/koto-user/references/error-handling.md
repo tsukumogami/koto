@@ -73,8 +73,11 @@ All `koto next` error codes, their exit codes, and what to do:
 | `precondition_failed` | 2 | No | Caller violated a precondition | Read the error message; the workflow state must change before retrying |
 | `terminal_state` | 2 | No | Workflow is already in a terminal state (done or cancelled) | Stop; start a new workflow if needed |
 | `workflow_not_initialized` | 2 | No | Named workflow does not exist | Run `koto init` first, or check the workflow name |
+| `execution_anchor_mismatch` | 2 | No | The tick ran from a directory that is neither the session's execution anchor nor beneath it. The message names the bound directory | `cd` to that directory (or a subdirectory of it) and re-run. Nothing ran on the refused tick |
 | `template_error` | 3 | No | Template parse failure, hash mismatch, or cycle detected | Report to user; this requires human intervention |
 | `persistence_error` | 3 | No | State file I/O failure or corruption | Report to user; this is an infrastructure problem |
+| `execution_anchor_unresolvable` | 3 | No | The session's recorded execution anchor names nothing on this machine — the checkout was deleted, or the session moved machines | Restore the checkout at the path the message names, or escalate |
+| `capture_unset` | 3 | No | A state's instruction text reads a `capture_stdout_as` name that no state delivered on this run. The message names the value and the state that produces it | A template routing problem: the run never entered the producing state. Report it; re-ticking won't help |
 | `needs_agent_not_dispatched` | 66 | No | `koto next` was called against a `--needs-agent` child that the coordinator has not yet claimed/dispatched | Stop ticking the child directly; route through the coordinator's `koto next` on the parent root instead |
 | `recursion_cap_exceeded` | 64 | No | `koto session start --needs-agent` would push the workflow tree past one of the three recursion caps (`depth`, `fanout`, or `total_unassigned`) | Surface the cap dimension and threshold to the user; restructure the dispatch fanout (collapse a level, batch siblings, or split into separate trees) before retrying |
 
@@ -99,6 +102,71 @@ them via config. The reserved `[request_store.recursion]` namespace
 exists for a future V1.1 promotion to operator-configurable caps, but
 at V1 the fix is always structural: restructure the workflow rather
 than chase a config override.
+
+---
+
+## Execution anchor refusals
+
+Both anchor codes are checked before the template is read and before any gate or action
+closure exists. A refusal therefore means nothing ran, nothing was evaluated, and nothing
+moved — you can retry from the right directory without worrying about a half-applied tick.
+
+```json
+{"error":{"code":"execution_anchor_mismatch","message":"workflow 'my-workflow' is bound to /home/dev/repo; `koto next` must run from that directory or one beneath it, not /tmp/elsewhere. Run `koto session rebind my-workflow --to <dir>` if the checkout moved","details":[]}}
+```
+
+```json
+{"error":{"code":"execution_anchor_unresolvable","message":"workflow 'my-workflow' is bound to /home/dev/repo, which does not resolve on this machine (host-7); run `koto session rebind my-workflow --to <dir>` if the checkout moved","details":[]}}
+```
+
+The two codes differ because the repair differs: change directory for the first, put the
+checkout back (or rebind) for the second.
+
+**`koto session rebind` does not exist yet.** Both messages name it; `koto session`
+currently offers `start`, `dir`, `list`, `cleanup`, `resolve`, and `update`. Route on
+`error.code`, not on the message text — the wording changes when the subcommand ships.
+
+Paths are compared in canonical form, which resolves `.`, `..`, and symlinks and strips
+trailing slashes. Comparison never case-folds, on any platform, and containment is
+compared component-wise, so `/home/dev/repo-2` is not beneath `/home/dev/repo`. A working
+directory that can't be canonicalized at all is compared as given, which fails closed.
+
+A session with no recorded anchor — written before anchoring existed, or created through
+`koto session start` — is not refused. Its first tick adopts the directory it's ticked
+from and prefixes the `directive` with a one-time notice naming the directory it bound.
+Check that the directory is the one you meant.
+
+---
+
+## Command failure kinds
+
+`failure_kind` is **not** an error code. When a command koto runs fails — a state's
+`default_action` or a `command` gate — the tick answers with an ordinary response and
+exit 0, not an error envelope. `failure_kind` is still the machine-readable discriminator
+to route on, because three of these kinds share `exit_code: -1` and telling them apart by
+searching stderr for "timed out" is what the key exists to replace.
+
+| Kind | Meaning |
+|---|---|
+| `nonzero_exit` | The command ran to completion and exited non-zero. |
+| `timed_out` | The command did not finish within its timeout, so its process group was killed. Whatever it wrote before the kill is still reported. |
+| `spawn_failed` | No child process was ever started. Also covers an action refused before the spawn: a `working_dir` that is absolute, or one that resolves outside the session's execution anchor. |
+| `wait_failed` | The child started but waiting on it failed, so no exit status was ever obtained. |
+| `capture_failed` | The command exited zero but its stdout could not be delivered under the state's `capture_stdout_as` name. Action failures only; a gate has nothing to capture. The `capture_error` object alongside it names the case: `empty`, `too_large`, or `disallowed_character`. |
+
+The vocabulary is the same on both surfaces it appears on. What sits beside it is not:
+
+- **In the `__action__` blocking condition** of a `gate_blocked` response, `exit_code` is
+  present **only** for `nonzero_exit`. The others never obtained a status, and a
+  `capture_failed` command exited zero. The condition's `status` narrows the same way —
+  `failed` for `nonzero_exit` and `capture_failed`, `timed_out` for a timeout, `error` for
+  a spawn or wait failure — which is why you route on `failure_kind` rather than `status`.
+- **In command-gate evidence** (a `gate_evaluated` event's `output`, and a recorded
+  override's), `exit_code` is always present, `-1` for the three kinds that never got a
+  status. The key is additive: the passing and plain-failing shapes are unchanged, and a
+  timeout still carries its `{"error": "timed_out"}`.
+
+See `response-shapes.md` scenario (k) for the full failed-action response.
 
 ---
 
@@ -306,7 +374,7 @@ The scheduler runs ten runtime rules on every task-list submission **before** ap
 | R8 | Spawn-time immutability: for already-spawned tasks, submitted `template` / `vars` / `waits_on` must match the recorded `spawn_entry`. |
 | R9 | Task name matches `^[A-Za-z0-9_-]+$`, 1-64 chars, not in the reserved set (`retry_failed`, `cancel_tasks`). |
 
-See [batch-workflows.md](batch-workflows.md) for how the runner dispatches on each rejection, and `docs/designs/DESIGN-batch-child-spawning.md` in the koto repository for the full rule definitions and rationale.
+See [batch-workflows.md](batch-workflows.md) for how the runner dispatches on each rejection, and `docs/designs/current/DESIGN-batch-child-spawning.md` in the koto repository for the full rule definitions and rationale.
 
 ---
 

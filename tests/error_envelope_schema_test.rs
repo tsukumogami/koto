@@ -389,9 +389,67 @@ fn next_error_code_round_trips_through_serde() {
         NextErrorCode::TemplateError,
         NextErrorCode::PersistenceError,
         NextErrorCode::ConcurrentAccess,
+        NextErrorCode::ExecutionAnchorMismatch,
+        NextErrorCode::ExecutionAnchorUnresolvable,
+        NextErrorCode::CaptureUnset,
     ];
     for code in codes {
         let v = serde_json::to_value(&code).unwrap();
         assert!(v.is_string(), "code {:?} should serialize as string", code);
+    }
+}
+
+/// The two execution-anchor refusals are distinguishable by code, not
+/// only by wording, and carry the exit-code class the reference
+/// documents: wrong tree is a caller error, an anchor that no longer
+/// resolves is infrastructure.
+#[test]
+fn execution_anchor_codes_are_distinct_and_classed() {
+    let mismatch = serde_json::to_value(NextErrorCode::ExecutionAnchorMismatch).unwrap();
+    let unresolvable = serde_json::to_value(NextErrorCode::ExecutionAnchorUnresolvable).unwrap();
+    assert_eq!(mismatch, "execution_anchor_mismatch");
+    assert_eq!(unresolvable, "execution_anchor_unresolvable");
+    assert_ne!(mismatch, unresolvable);
+    assert_eq!(NextErrorCode::ExecutionAnchorMismatch.exit_code(), 2);
+    assert_eq!(NextErrorCode::ExecutionAnchorUnresolvable.exit_code(), 3);
+}
+
+/// An instruction reading a capture no state delivered stops the tick under
+/// its own code, at the exit-code class the reference registers: an authoring
+/// problem the agent cannot fix by behaving differently, not a caller error.
+#[test]
+fn capture_unset_is_coded_and_classed_as_infrastructure() {
+    let code = serde_json::to_value(NextErrorCode::CaptureUnset).unwrap();
+    assert_eq!(code, "capture_unset");
+    assert_eq!(NextErrorCode::CaptureUnset.exit_code(), 3);
+}
+
+/// Every registered code lands in the envelope under `error.code` as a bare
+/// string, with no `command` key riding along -- the code identifies the
+/// condition, so there is nothing to string-match.
+#[test]
+fn every_code_serializes_into_the_envelope_shape() {
+    for code in [
+        NextErrorCode::ExecutionAnchorMismatch,
+        NextErrorCode::ExecutionAnchorUnresolvable,
+        NextErrorCode::CaptureUnset,
+    ] {
+        let err = NextError {
+            code: code.clone(),
+            message: "boom".to_string(),
+            details: vec![],
+        };
+        let v = serde_json::json!({ "error": err });
+        assert!(
+            v["error"]["code"].is_string(),
+            "code {:?} must serialize as a string",
+            code
+        );
+        assert_eq!(v["error"]["message"], "boom");
+        assert!(v["error"]["details"].as_array().unwrap().is_empty());
+        assert!(
+            v.get("command").is_none(),
+            "structured envelopes carry no command field"
+        );
     }
 }

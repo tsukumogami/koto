@@ -466,8 +466,19 @@ The `action_output` field carries what the command printed.
 
 **Decision points:**
 - `blocking_conditions` is **absent**.
-- `action_output.stdout` and `action_output.stderr` are truncated to 64 KB each.
+- `action_output.stdout` and `action_output.stderr` are truncated to 64 KB each. The
+  object carries no `truncated` flag — that flag is on the `default_action_executed` event
+  in the session log and on the `__action__` condition of a failure.
 - `expects` may be `null` when the state has no `accepts` block.
+- This response only follows a **successful** run. A failed action never reaches the
+  confirm stop: failure is classified first, so a failing action stops as a failure whether
+  or not `requires_confirmation` is set. See Scenario (k).
+- If the state's action also declared `capture_stdout_as`, **the value is delivered on this
+  tick**, before the confirmation stop. Confirming re-enters the state with evidence, which
+  skips the action, so capturing only on the unconfirmed path would mean a confirmed action
+  never delivered its value at all. The session log shows one `default_action_executed` and
+  one `variable_captured`, both on the tick that stopped for confirmation, neither on the
+  tick that confirmed.
 
 ---
 
@@ -544,6 +555,70 @@ finished yet. This is a temporal condition — it resolves on its own as childre
 
 ---
 
+## Scenario (k): gate_blocked — a state's `default_action` failed
+
+The state declared a `default_action`, koto ran it on entering the state, and it failed.
+This is not an error envelope: `koto next` exits 0 and answers with an ordinary blocked
+response. The failure rides `blocking_conditions` under the reserved name `__action__`.
+
+```json
+{
+  "action": "gate_blocked",
+  "state": "detect",
+  "directive": "koto could not read the branch name. Run `git rev-parse --abbrev-ref HEAD` yourself, read the output above for why koto's run failed, and carry on with the name it prints.\n\nReading the current branch.",
+  "advanced": false,
+  "expects": null,
+  "blocking_conditions": [
+    {
+      "name": "__action__",
+      "type": "action",
+      "status": "failed",
+      "category": "corrective",
+      "agent_actionable": false,
+      "output": {
+        "state": "detect",
+        "command": "git rev-parse --abbrev-ref HEAD",
+        "failure_kind": "nonzero_exit",
+        "exit_code": 128,
+        "stdout": "",
+        "stderr": "fatal: not a git repository (or any of the parent directories): .git\n",
+        "truncated": false
+      }
+    }
+  ],
+  "error": null
+}
+```
+
+**Decision points:**
+- `name` is `__action__` and `type` is `"action"` — this is not a gate. The name is
+  reserved; the compiler rejects a template that declares a gate by it, so the condition
+  can never be one of the author's.
+- `agent_actionable` is `false` and always will be. Do not call `koto overrides record`
+  against `__action__`.
+- **Route on `output.failure_kind`**, one of `nonzero_exit`, `spawn_failed`, `timed_out`,
+  `wait_failed`, `capture_failed`. Don't route on `status`: `nonzero_exit` and
+  `capture_failed` both report `failed`. The kinds are tabulated in
+  `error-handling.md#command-failure-kinds`.
+- `output.exit_code` is present **only** for `nonzero_exit`. The three kinds that never
+  obtained a status omit it rather than reporting a synthetic `-1`, and a `capture_failed`
+  command exited zero. Check `failure_kind` before reading it.
+- `output.stdout` and `output.stderr` are bounded at 64 KB each; `output.truncated` says
+  whether either was cut.
+- `capture_failed` adds a `capture_error` object naming the case —
+  `{"key": "BRANCH", "case": "empty"}`, `"too_large"` (with `bytes` and `limit`), or
+  `"disallowed_character"` (with `position` and `character`).
+- **The state's gates did not evaluate.** The tick returns ahead of gate evaluation, so
+  this response carries exactly one condition and no gate results, even for a state that
+  declares gates. Nothing advanced, and no later state's action ran.
+- The author's `fallback` prose, when the state declares one, is spliced onto the front of
+  `directive` — not into `details`, which a response can withhold. It is delivered
+  verbatim, with no `{{...}}` expansion.
+- `action_output` is **absent** here. That field belongs to the `confirm` response, which
+  only follows a *successful* run.
+
+---
+
 ## Checking for absent fields
 
 Several fields are conditionally absent rather than `null`. When writing code to parse
@@ -559,6 +634,9 @@ Several fields are conditionally absent rather than `null`. When writing code to
   the only ways back to it — no plain lap will re-deliver — and only `koto status`
   gets there without ticking the workflow.
 - `expects` is always written but may be `null` — this is not the same as absent.
+- Inside an `__action__` blocking condition, `output.exit_code` is present only when
+  `output.failure_kind` is `"nonzero_exit"`. Check the kind first. `capture_error` appears
+  only for `"capture_failed"`.
 - `options` inside an `expects` object is omitted (not written) when empty, not written
   as `[]`.
 - `leg` and `leg_abandoned` are absent unless the session is bound to a request leg (and,

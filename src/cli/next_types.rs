@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::batch_error::BatchError;
 use crate::gate::{built_in_default, GateOutcome, StructuredGateResult};
-use crate::template::types::{Gate, TemplateState, FIELD_TYPE_TASKS};
+use crate::template::types::{Gate, TemplateState, ACTION_CONDITION_NAME, FIELD_TYPE_TASKS};
 
 /// One entry in the `unassigned_children` list returned by `koto next`.
 ///
@@ -164,6 +164,24 @@ impl BatchErrorContext {
 /// characters by convention (DESIGN-inline-phase-details.md Decision 4).
 pub const RECOVERY_POINTER: &str =
     "[koto] Lost context? `koto status <name>` returns this phase's directive/details/expects.\n\n";
+
+/// One-time notice that a session which recorded no execution anchor
+/// has adopted the directory this tick ran from (R14).
+///
+/// Spliced into `directive` via [`NextResponse::with_directive_prefix`],
+/// the same mechanism the recovery pointer and the leg-abandonment
+/// notice use. It says what koto bound and how to move it, and claims
+/// nothing about what a command can reach once running -- anchoring
+/// binds where commands start, not where they can go (R17).
+pub fn execution_anchor_adopted_notice(name: &str, anchor: &std::path::Path) -> String {
+    format!(
+        "[koto] Session '{}' had no recorded directory; it is now bound to {}. \
+         Later ticks must run there or below it -- `koto session rebind {}` moves it.\n\n",
+        name,
+        anchor.display(),
+        name,
+    )
+}
 
 impl NextResponse {
     /// Return a new `NextResponse` with the directive and details fields substituted
@@ -689,7 +707,7 @@ pub struct NextError {
     pub details: Vec<ErrorDetail>,
 }
 
-/// The nine error codes for `koto next` domain errors.
+/// The twelve error codes for `koto next` domain errors.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NextErrorCode {
@@ -702,6 +720,25 @@ pub enum NextErrorCode {
     TemplateError,
     PersistenceError,
     ConcurrentAccess,
+    /// The tick ran from a directory that is neither the session's
+    /// execution anchor nor beneath it (R12). Caller error: run from
+    /// the anchor the message names, or rebind the session to where
+    /// the checkout now is.
+    ExecutionAnchorMismatch,
+    /// The session's recorded execution anchor names nothing on this
+    /// machine (R15). Distinct from
+    /// [`NextErrorCode::ExecutionAnchorMismatch`] so a caller can tell
+    /// "you are in the wrong tree" from "the recorded tree is gone"
+    /// without matching on wording.
+    ExecutionAnchorUnresolvable,
+    /// A state's instruction text read a capture name no state has delivered
+    /// on this run (R4, unset case). The producing state exists -- a name no
+    /// state declares is a compile error -- but the run reached the reading
+    /// state without passing through it, so there is no value to render.
+    /// Rendering the empty string or the raw `{{KEY}}` token instead is
+    /// exactly what this code exists to prevent, which is why it is a stop
+    /// rather than a fallback.
+    CaptureUnset,
 }
 
 impl NextErrorCode {
@@ -719,8 +756,14 @@ impl NextErrorCode {
             NextErrorCode::PreconditionFailed => 2,
             NextErrorCode::TerminalState => 2,
             NextErrorCode::WorkflowNotInitialized => 2,
+            NextErrorCode::ExecutionAnchorMismatch => 2,
             NextErrorCode::TemplateError => 3,
             NextErrorCode::PersistenceError => 3,
+            NextErrorCode::ExecutionAnchorUnresolvable => 3,
+            // An authoring problem, not something the agent can fix by
+            // behaving differently: the template routed to a state that reads
+            // a value the path it took never produces.
+            NextErrorCode::CaptureUnset => 3,
         }
     }
 }
@@ -821,6 +864,13 @@ pub struct ErrorDetail {
 /// gate result. `agent_actionable` is set to `true` when the gate has either an
 /// instance-level `override_default` or a built-in default for its gate type, signaling
 /// that the agent can call `koto overrides record` to substitute the gate output.
+///
+/// The reserved `__action__` name is not a gate: it carries a failed
+/// `default_action` through this same list (DESIGN-koto-runs-commands.md
+/// Decision 4). It is never present in `gate_defs` -- the compiler rejects a
+/// gate declared with that name -- so it is typed here explicitly rather than
+/// falling back to `"command"`. It is not agent-actionable: no override can
+/// substitute for a command that did not run.
 pub fn blocking_conditions_from_gates(
     gate_results: &BTreeMap<String, StructuredGateResult>,
     gate_defs: &BTreeMap<String, Gate>,
@@ -834,6 +884,16 @@ pub fn blocking_conditions_from_gates(
                 GateOutcome::TimedOut => "timed_out",
                 GateOutcome::Error => "error",
             };
+            if name == ACTION_CONDITION_NAME {
+                return Some(BlockingCondition {
+                    name: name.clone(),
+                    condition_type: "action".to_string(),
+                    status: status.to_string(),
+                    category: "corrective".to_string(),
+                    agent_actionable: false,
+                    output: result.output.clone(),
+                });
+            }
             let condition_type = gate_defs
                 .get(name)
                 .map(|g| g.gate_type.clone())
@@ -1839,6 +1899,39 @@ mod tests {
             completion: None,
             name_filter: None,
         }
+    }
+
+    #[test]
+    fn blocking_conditions_type_the_reserved_action_condition() {
+        let mut gate_results = BTreeMap::new();
+        gate_results.insert(
+            ACTION_CONDITION_NAME.to_string(),
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: serde_json::json!({
+                    "state": "run",
+                    "command": "check.sh",
+                    "failure_kind": "nonzero_exit",
+                    "exit_code": 3,
+                }),
+            },
+        );
+
+        // `__action__` is never a declared gate -- the compiler rejects the
+        // name -- so an empty `gate_defs` is the real shape here.
+        let conditions = blocking_conditions_from_gates(&gate_results, &BTreeMap::new());
+        assert_eq!(conditions.len(), 1);
+
+        let cond = &conditions[0];
+        assert_eq!(cond.name, ACTION_CONDITION_NAME);
+        assert_eq!(cond.condition_type, "action");
+        assert_eq!(cond.status, "failed");
+        assert_eq!(cond.category, "corrective");
+        assert!(
+            !cond.agent_actionable,
+            "no override substitutes for a command that did not run"
+        );
+        assert_eq!(cond.output["failure_kind"], "nonzero_exit");
     }
 
     #[test]

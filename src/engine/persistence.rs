@@ -1214,6 +1214,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            execution_dir: None,
             session_id: String::new(),
             intent: None,
             template_name: None,
@@ -2576,6 +2577,7 @@ mod tests {
                     exit_code: 0,
                     stdout: "hi\n".to_string(),
                     stderr: String::new(),
+                    truncated: false,
                 },
             ),
             make_event(

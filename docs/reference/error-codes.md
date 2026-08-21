@@ -55,7 +55,7 @@ Domain errors use this shape:
 }
 ```
 
-The `details` array is empty when the error isn't field-specific. The nine error codes:
+The `details` array is empty when the error isn't field-specific. The twelve error codes:
 
 | Code | Exit | Meaning |
 |------|:----:|---------|
@@ -68,6 +68,9 @@ The `details` array is empty when the error isn't field-specific. The nine error
 | `workflow_not_initialized` | 2 | No state file found for the given workflow name. |
 | `template_error` | 3 | A structural template problem: cycle detected, chain limit reached, ambiguous transition, dead-end state, unresolvable transition, or unknown state. |
 | `persistence_error` | 3 | A disk I/O failure while reading or writing the state file. |
+| `execution_anchor_mismatch` | 2 | The tick ran from a directory that is neither the session's execution anchor nor beneath it. The message names the bound directory. Run `koto next` from there, or rebind the session. |
+| `execution_anchor_unresolvable` | 3 | The session's recorded execution anchor names nothing on this machine -- the checkout was deleted or the session moved machines. Rebind the session to where the tree is now. |
+| `capture_unset` | 3 | A state's instruction text reads a `capture_stdout_as` name that no state delivered on this run. The message names the value and the state that produces it. |
 
 Exit code 1 means transient -- the agent can retry without changing its behavior. Exit code 2 means the agent must change something (fix the payload, pick a different target, etc.).
 
@@ -77,8 +80,73 @@ Exit code 1 means transient -- the agent can retry without changing its behavior
 |:---------:|----------|------|
 | 0 | Success | Normal response (any variant) |
 | 1 | Transient | `gate_blocked`, `integration_unavailable`, engine I/O errors |
-| 2 | Caller error | `invalid_submission`, `precondition_failed`, `terminal_state`, `workflow_not_initialized` |
-| 3 | Infrastructure | Corrupt state file, template hash mismatch, template parse failure |
+| 2 | Caller error | `invalid_submission`, `precondition_failed`, `terminal_state`, `workflow_not_initialized`, `execution_anchor_mismatch` |
+| 3 | Infrastructure | Corrupt state file, template hash mismatch, template parse failure, `execution_anchor_unresolvable`, `capture_unset` |
+
+#### Execution anchoring
+
+A session records the directory it was created in and every tick is checked against it. Both refusals below happen before the template is read and before any gate or action closure exists, so neither runs a command, evaluates a gate, or moves the workflow.
+
+**Wrong tree (exit code 2)** -- the tick ran from a directory that is neither the anchor nor beneath it:
+
+```json
+{"error":{"code":"execution_anchor_mismatch","message":"workflow 'my-workflow' is bound to /home/dev/repo; `koto next` must run from that directory or one beneath it, not /tmp/elsewhere. Run `koto session rebind my-workflow --to <dir>` if the checkout moved","details":[]}}
+```
+
+Standing in a subdirectory of the anchor is fine -- the tick is accepted and its commands still run at the anchor itself, so a command means the same thing from anywhere in the tree.
+
+**Anchor does not resolve (exit code 3)** -- the recorded directory names nothing on this machine:
+
+```json
+{"error":{"code":"execution_anchor_unresolvable","message":"workflow 'my-workflow' is bound to /home/dev/repo, which does not resolve on this machine (host-7); run `koto session rebind my-workflow --to <dir>` if the checkout moved","details":[]}}
+```
+
+The two codes are separate because the repairs differ: change directory for the first, rebind for the second.
+
+Both messages name `koto session rebind`, which is not implemented yet -- `koto session` currently offers `start`, `dir`, `list`, `cleanup`, and `resolve`. Until it lands, the first refusal is repaired by running from the anchor, and the second by putting the checkout back where the header names. Route on the code, not on the message: the wording will change when the subcommand exists.
+
+Anchor comparison is byte-exact over `fs::canonicalize` output. That resolves `.`, `..`, and symlinks and strips trailing slashes, so a symlinked path and a trailing-slash variant of the anchor both satisfy it. It does not case-fold: a path differing only in case names a different directory and is refused, on every platform including case-insensitive filesystems.
+
+Anchoring binds where a session's commands *start*. It does not bound what a command reaches once running -- a command can name absolute paths or change directory, and nothing here stops it.
+
+#### An undelivered capture (exit code 3)
+
+A state can declare a name for its command's output with `capture_stdout_as`, and a later state can read that name in its instruction text. The name is not an init-time variable, so nothing materializes it: if the run reaches the reading state without passing through the state that produces it, there is no value.
+
+```json
+{"error":{"code":"capture_unset","message":"state 'report' reads {{BRANCH}}, which state 'detect' delivers with capture_stdout_as; this run has not entered that state, so the value is unset","details":[]}}
+```
+
+The tick stops rather than rendering an empty string or the raw `{{BRANCH}}` token, either of which would put a placeholder into an agent's instructions. A name no state declares at all is caught earlier, when the template compiles. The fix is usually in the template: route through the producing state, or move the reference to a state that always follows it.
+
+A failed *delivery* is a different thing and does not use this code. When the command runs but its output cannot be delivered -- it is empty, it exceeds 4096 bytes, or it holds a character the value allowlist forbids -- the tick stops at the state that ran the command, through the ordinary blocked response with an `__action__` condition whose `failure_kind` is `capture_failed`.
+
+#### Command failure kinds
+
+A command koto runs -- a state's `default_action` or a command gate -- reports *why* it failed under a `failure_kind` key. This is not a `next` error code: the tick answers with an ordinary blocked response rather than an error envelope. It is still the machine-readable discriminator to read, because three of these kinds share `exit_code: -1` and telling them apart by searching stderr for "timed out" is exactly what the key exists to replace.
+
+| Kind | Meaning |
+|------|---------|
+| `nonzero_exit` | The command ran to completion and exited non-zero. |
+| `timed_out` | The command did not finish within its timeout, so its process group was killed. Whatever it wrote before the kill is still reported. |
+| `spawn_failed` | No child process was ever started. Also covers an action refused before the spawn: a `working_dir` that is absolute, or one that resolves outside the session's execution anchor. |
+| `wait_failed` | The child started but waiting on it failed, so no exit status was ever obtained. |
+| `capture_failed` | The command exited zero but its stdout could not be delivered under the state's `capture_stdout_as` name. Action failures only; a gate has nothing to capture. The `capture_error` object alongside it names the case: `empty`, `too_large`, or `disallowed_character`. |
+
+The vocabulary is the same on the two surfaces it appears on. What sits beside it is not.
+
+**On a blocked `koto next` response**, inside the `__action__` blocking condition an action failure produces:
+
+```json
+{"name":"__action__","type":"action","status":"failed","category":"corrective","agent_actionable":false,
+ "output":{"state":"lint","command":"cargo clippy","failure_kind":"nonzero_exit","exit_code":1,"stdout":"","stderr":"...","truncated":false}}
+```
+
+`exit_code` is present here only for `nonzero_exit`. Three of the others never obtained a status at all, and reporting the synthetic `-1` would be the conflation `failure_kind` exists to end; a `capture_failed` command exited zero, so it has no failing status to report either. The condition's `status` narrows the same way: `failed` for `nonzero_exit` and `capture_failed`, `timed_out` for a timeout, `error` for a spawn or wait failure. Route on `failure_kind`, not on `status` -- two kinds share `failed`.
+
+**In command-gate evidence**, on the `output` object of a `gate_evaluated` event and of a recorded override. `exit_code` is always present there, `-1` for the three kinds that never got a status. The key is additive: the passing and plain-failing shapes are unchanged, and the `{"exit_code": -1, "error": "timed_out"}` a timeout has always produced still carries its `error` field, so nothing reading `error` moves.
+
+An action failure that got as far as running writes a `default_action_executed` event before the tick stops. A `working_dir` rejection does not, because no command ran.
 
 #### Pre-dispatch I/O errors
 

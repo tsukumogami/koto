@@ -205,6 +205,32 @@ pub struct ActionDecl {
     pub requires_confirmation: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub polling: Option<PollingConfig>,
+    /// Prose the agent reads when this action fails.
+    ///
+    /// Spliced onto the failure response's `directive` rather than placed in
+    /// `details`, so detail suppression can never withhold it
+    /// (DESIGN-koto-runs-commands.md Decision 4). It is spliced after
+    /// variable substitution and is therefore never expanded — write it as
+    /// literal prose. A state that declares no fallback still stops on
+    /// failure; the response simply carries no prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    /// The name this command's trimmed stdout is delivered under.
+    ///
+    /// The name is its own declaration; it is deliberately not written in the
+    /// template's `variables:` block, because a declared variable is
+    /// materialized by `koto init` and would render as the empty string on a
+    /// run that never entered this state
+    /// (DESIGN-koto-runs-commands.md Decision 2). The compiler validates
+    /// `{{KEY}}` references against the union of the variables block, every
+    /// state's capture name, and the runtime names, and rejects a capture name
+    /// that collides with any of them.
+    ///
+    /// A state that declares no name behaves exactly as it did before captures
+    /// existed: the command's stdout reaches the event log and the response,
+    /// and nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_stdout_as: Option<String>,
 }
 
 /// Polling configuration for actions that need repeated execution.
@@ -235,6 +261,15 @@ pub const GATE_TYPE_CHILDREN_COMPLETE: &str = "children-complete";
 /// Agent submissions starting with this prefix are rejected (Feature 2, R7).
 /// All `gates.*` key checks in advance.rs and types.rs use this constant.
 pub const GATES_EVIDENCE_NAMESPACE: &str = "gates";
+
+/// Condition name reserved for the synthetic result a failed `default_action`
+/// produces (DESIGN-koto-runs-commands.md Decision 3).
+///
+/// A failing action routes through the gate-blocked path under this name, so
+/// the compiler rejects any state that declares a gate called `__action__` —
+/// otherwise an author's gate and the engine's synthetic result would collide
+/// in the same map.
+pub const ACTION_CONDITION_NAME: &str = "__action__";
 
 /// Prefix used in when-clause keys to match on the presence of an agent-submitted
 /// evidence field. Paired with the sentinel value [`PRESENT_MATCHER_VALUE`] to form
@@ -470,7 +505,91 @@ pub const FIELD_TYPE_TASKS: &str = "tasks";
 /// runtime (e.g., SESSION_DIR is the session directory path).
 const RUNTIME_VARIABLE_NAMES: &[&str] = &["SESSION_DIR", "SESSION_NAME"];
 
+/// True when `name` is spelled the way a `{{KEY}}` reference can find it:
+/// an uppercase letter followed by uppercase letters, digits, or underscores.
+///
+/// This is the name half of [`VAR_REF_PATTERN`]. A capture spelled any other
+/// way is unreferenceable, so the compiler rejects it at the declaration
+/// rather than leaving an author to discover the reference never resolves.
+fn is_capture_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
 impl CompiledTemplate {
+    /// Every `capture_stdout_as` name in the template, mapped to the state
+    /// that delivers it.
+    ///
+    /// The map is the capture namespace: names live here rather than in the
+    /// `variables:` block, so `koto init` never materializes one and a run
+    /// that skipped the producing state has no value to render
+    /// (DESIGN-koto-runs-commands.md Decision 2). Returning the producing
+    /// state is what lets the run-time stop for an undelivered name say which
+    /// state would have delivered it.
+    ///
+    /// Fails on the three collisions that would make a name ambiguous: with a
+    /// declared variable, with a reserved runtime name, or with another
+    /// state's capture name. Answering all three here means precedence between
+    /// two producers never arises at run time.
+    pub fn capture_names(&self) -> Result<BTreeMap<String, String>, String> {
+        let mut captures: BTreeMap<String, String> = BTreeMap::new();
+        for (state_name, state) in &self.states {
+            let Some(action) = &state.default_action else {
+                continue;
+            };
+            let Some(key) = &action.capture_stdout_as else {
+                continue;
+            };
+            if key.is_empty() {
+                return Err(format!(
+                    "state {:?}: default_action capture_stdout_as must not be empty\n  \
+                     remedy: name the capture or drop the field",
+                    state_name
+                ));
+            }
+            if !is_capture_name(key) {
+                return Err(format!(
+                    "state {:?}: default_action capture_stdout_as {:?} is not a valid name; \
+                     a name starts with an uppercase letter and continues with uppercase \
+                     letters, digits, or underscores, so that {{{{{}}}}} can reference it\n  \
+                     remedy: rename the capture",
+                    state_name, key, key
+                ));
+            }
+            if self.variables.contains_key(key) {
+                return Err(format!(
+                    "state {:?}: default_action capture_stdout_as {:?} collides with a \
+                     declared variable; a capture name is its own declaration and must not \
+                     appear in the variables block\n  \
+                     remedy: rename the capture, or remove {:?} from the variables block",
+                    state_name, key, key
+                ));
+            }
+            if RUNTIME_VARIABLE_NAMES.contains(&key.as_str()) {
+                return Err(format!(
+                    "state {:?}: default_action capture_stdout_as {:?} is a reserved runtime \
+                     variable name\n  \
+                     remedy: rename the capture",
+                    state_name, key
+                ));
+            }
+            if let Some(other) = captures.get(key) {
+                return Err(format!(
+                    "state {:?}: default_action capture_stdout_as {:?} is already delivered by \
+                     state {:?}; two states must not declare the same capture name\n  \
+                     remedy: rename one of the captures",
+                    state_name, key, other
+                ));
+            }
+            captures.insert(key.clone(), state_name.clone());
+        }
+        Ok(captures)
+    }
+
     /// Validate the compiled template against all schema rules.
     ///
     /// When `strict` is `true`, a state that has gates but no `gates.*`
@@ -504,6 +623,11 @@ impl CompiledTemplate {
                 self.initial_state
             ));
         }
+        // Collect the capture names before the per-state loop: a `{{KEY}}`
+        // reference resolves against the union of the variables block, every
+        // state's capture name, and the runtime names, and a state may read a
+        // name a later state in the map delivers.
+        let captures = self.capture_names()?;
         for (state_name, state) in &self.states {
             if state.directive.is_empty() {
                 return Err(format!("state {:?} has empty directive", state_name));
@@ -776,11 +900,12 @@ impl CompiledTemplate {
             }
 
             // Validate evidence routing rules on transitions (D3 included).
-            self.validate_evidence_routing(state_name, state)?;
+            self.validate_evidence_routing(state_name, state, &captures)?;
 
             // Validate variable references in directives.
             for ref_name in extract_refs(&state.directive) {
                 if !self.variables.contains_key(&ref_name)
+                    && !captures.contains_key(&ref_name)
                     && !RUNTIME_VARIABLE_NAMES.contains(&ref_name.as_str())
                 {
                     return Err(format!(
@@ -790,10 +915,23 @@ impl CompiledTemplate {
                 }
             }
 
+            // Reject the reserved condition name. A failed default_action is
+            // reported under `__action__` through the same blocking-condition
+            // list gates use, so an author's gate of that name would be
+            // overwritten by the engine's synthetic result.
+            if state.gates.contains_key(ACTION_CONDITION_NAME) {
+                return Err(format!(
+                    "state {:?}: gate name {:?} is reserved for default_action failures\n  \
+                     remedy: rename the gate",
+                    state_name, ACTION_CONDITION_NAME
+                ));
+            }
+
             // Validate variable references in gate commands.
             for gate in state.gates.values() {
                 for ref_name in extract_refs(&gate.command) {
                     if !self.variables.contains_key(&ref_name)
+                        && !captures.contains_key(&ref_name)
                         && !RUNTIME_VARIABLE_NAMES.contains(&ref_name.as_str())
                     {
                         return Err(format!(
@@ -823,6 +961,7 @@ impl CompiledTemplate {
                 // Validate variable references in action command.
                 for ref_name in extract_refs(&action.command) {
                     if !self.variables.contains_key(&ref_name)
+                        && !captures.contains_key(&ref_name)
                         && !RUNTIME_VARIABLE_NAMES.contains(&ref_name.as_str())
                     {
                         return Err(format!(
@@ -834,6 +973,7 @@ impl CompiledTemplate {
                 // Validate variable references in action working_dir.
                 for ref_name in extract_refs(&action.working_dir) {
                     if !self.variables.contains_key(&ref_name)
+                        && !captures.contains_key(&ref_name)
                         && !RUNTIME_VARIABLE_NAMES.contains(&ref_name.as_str())
                     {
                         return Err(format!(
@@ -841,6 +981,23 @@ impl CompiledTemplate {
                             state_name, ref_name
                         ));
                     }
+                }
+                // Reject a literal absolute working_dir. The value is joined
+                // to the session's execution anchor at run time, and
+                // `Path::join` with an absolute argument silently discards
+                // the base -- so an absolute path would leave the anchor
+                // while looking like it had been resolved against it. This is
+                // the first of the three rejections
+                // (DESIGN-koto-runs-commands.md Decision 8); a value that only
+                // becomes absolute after substitution is caught at run time,
+                // and containment is checked after the join.
+                if std::path::Path::new(&action.working_dir).is_absolute() {
+                    return Err(format!(
+                        "state '{}': default_action working_dir '{}' is an absolute path; \
+                         working_dir must be relative, and is resolved against the session's \
+                         execution directory",
+                        state_name, action.working_dir
+                    ));
                 }
                 // Require polling.timeout_secs > 0 when polling is declared.
                 if let Some(polling) = &action.polling {
@@ -1406,6 +1563,7 @@ impl CompiledTemplate {
         &self,
         state_name: &str,
         state: &TemplateState,
+        captures: &BTreeMap<String, String>,
     ) -> Result<(), String> {
         let has_accepts = state.accepts.is_some();
 
@@ -1499,8 +1657,13 @@ impl CompiledTemplate {
                     ));
                 }
                 let var_name = segments[1];
-                // The variable must be declared in the template's variables block.
-                if !self.variables.contains_key(var_name) {
+                // The variable must be declared: either in the variables
+                // block, or as some state's capture name. A capture is only
+                // ever set once its state has run, so `vars.NAME is_set` is
+                // exactly the question "did the command that produces NAME
+                // already run" -- which is why the capture namespace belongs
+                // in this check.
+                if !self.variables.contains_key(var_name) && !captures.contains_key(var_name) {
                     return Err(format!(
                         "state {:?} transition to {:?}: when clause references undeclared variable {:?}; \
                          add it to the template's variables block",
@@ -2521,6 +2684,100 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // capture names
+    // -----------------------------------------------------------------------
+
+    /// `minimal_template` with a capture named `key` on `start`.
+    fn capturing_template(key: &str) -> CompiledTemplate {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.default_action = Some(ActionDecl {
+            command: "echo main".to_string(),
+            working_dir: String::new(),
+            requires_confirmation: false,
+            polling: None,
+            fallback: None,
+            capture_stdout_as: Some(key.to_string()),
+        });
+        t
+    }
+
+    #[test]
+    fn capture_names_maps_a_name_to_its_producing_state() {
+        let t = capturing_template("BRANCH");
+        let names = t.capture_names().unwrap();
+        assert_eq!(names.get("BRANCH").map(String::as_str), Some("start"));
+    }
+
+    #[test]
+    fn a_reference_to_a_capture_name_compiles() {
+        // The capture namespace is what makes this reference legal without
+        // declaring BRANCH in the variables block, where `koto init` would
+        // materialize it as the empty string.
+        let mut t = capturing_template("BRANCH");
+        t.states.get_mut("done").unwrap().directive = "On {{BRANCH}}.".to_string();
+        t.validate(true).unwrap();
+    }
+
+    #[test]
+    fn a_capture_name_colliding_with_a_declared_variable_is_rejected() {
+        let mut t = capturing_template("BRANCH");
+        t.variables.insert(
+            "BRANCH".to_string(),
+            VariableDecl {
+                description: "the branch".to_string(),
+                required: false,
+                default: String::new(),
+            },
+        );
+        let err = t.validate(true).unwrap_err();
+        assert!(err.contains("variables block"), "got: {}", err);
+    }
+
+    #[test]
+    fn a_capture_name_colliding_with_a_runtime_name_is_rejected() {
+        let t = capturing_template("SESSION_DIR");
+        let err = t.validate(true).unwrap_err();
+        assert!(err.contains("reserved runtime"), "got: {}", err);
+    }
+
+    #[test]
+    fn two_states_declaring_the_same_capture_name_is_rejected() {
+        let mut t = capturing_template("BRANCH");
+        t.states.get_mut("done").unwrap().default_action = Some(ActionDecl {
+            command: "echo other".to_string(),
+            working_dir: String::new(),
+            requires_confirmation: false,
+            polling: None,
+            fallback: None,
+            capture_stdout_as: Some("BRANCH".to_string()),
+        });
+        let err = t.validate(true).unwrap_err();
+        assert!(err.contains("already delivered by state"), "got: {}", err);
+    }
+
+    #[test]
+    fn an_unreferenceable_capture_name_is_rejected() {
+        // `{{branch}}` matches nothing the reference pattern can find, so a
+        // lowercase name would be a capture no state could ever read.
+        let t = capturing_template("branch");
+        let err = t.validate(true).unwrap_err();
+        assert!(err.contains("is not a valid name"), "got: {}", err);
+    }
+
+    #[test]
+    fn a_misspelled_reference_is_still_rejected() {
+        let mut t = capturing_template("BRANCH");
+        t.states.get_mut("done").unwrap().directive = "On {{BRANHC}}.".to_string();
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("BRANHC") && err.contains("variables block"),
+            "got: {}",
+            err
+        );
+    }
+
     #[test]
     fn rejects_integration_and_default_action() {
         let mut t = minimal_template();
@@ -2531,6 +2788,8 @@ mod tests {
             working_dir: String::new(),
             requires_confirmation: false,
             polling: None,
+            fallback: None,
+            capture_stdout_as: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2566,6 +2825,31 @@ mod tests {
     }
 
     #[test]
+    fn rejects_gate_named_with_the_reserved_action_condition() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            ACTION_CONDITION_NAME.to_string(),
+            Gate {
+                gate_type: GATE_TYPE_COMMAND.to_string(),
+                command: "true".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("is reserved for default_action failures"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
     fn rejects_empty_default_action_command() {
         let mut t = minimal_template();
         let state = t.states.get_mut("start").unwrap();
@@ -2574,6 +2858,8 @@ mod tests {
             working_dir: String::new(),
             requires_confirmation: false,
             polling: None,
+            fallback: None,
+            capture_stdout_as: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2613,6 +2899,8 @@ mod tests {
             working_dir: String::new(),
             requires_confirmation: false,
             polling: None,
+            fallback: None,
+            capture_stdout_as: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2632,6 +2920,8 @@ mod tests {
             working_dir: "/tmp/{{MISSING}}".to_string(),
             requires_confirmation: false,
             polling: None,
+            fallback: None,
+            capture_stdout_as: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2640,6 +2930,41 @@ mod tests {
             "got: {}",
             err
         );
+    }
+
+    #[test]
+    fn rejects_literal_absolute_action_working_dir() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.default_action = Some(ActionDecl {
+            command: "echo ok".to_string(),
+            working_dir: "/etc".to_string(),
+            requires_confirmation: false,
+            polling: None,
+            fallback: None,
+            capture_stdout_as: None,
+        });
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("'/etc'") && err.contains("absolute") && err.contains("relative"),
+            "the error must name the path and say what was expected, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn accepts_a_relative_action_working_dir() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.default_action = Some(ActionDecl {
+            command: "echo ok".to_string(),
+            working_dir: "sub/dir".to_string(),
+            requires_confirmation: false,
+            polling: None,
+            fallback: None,
+            capture_stdout_as: None,
+        });
+        t.validate(true).unwrap();
     }
 
     #[test]
@@ -2654,6 +2979,8 @@ mod tests {
                 interval_secs: 10,
                 timeout_secs: 0,
             }),
+            fallback: None,
+            capture_stdout_as: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2680,6 +3007,8 @@ mod tests {
             working_dir: String::new(),
             requires_confirmation: false,
             polling: None,
+            fallback: None,
+            capture_stdout_as: None,
         });
         t.validate(true).unwrap();
     }
@@ -2696,6 +3025,8 @@ mod tests {
                 interval_secs: 30,
                 timeout_secs: 1800,
             }),
+            fallback: None,
+            capture_stdout_as: None,
         });
         t.validate(true).unwrap();
     }
@@ -2710,6 +3041,8 @@ mod tests {
                 interval_secs: 10,
                 timeout_secs: 300,
             }),
+            fallback: None,
+            capture_stdout_as: None,
         };
         let json = serde_json::to_string(&action).unwrap();
         let restored: ActionDecl = serde_json::from_str(&json).unwrap();
@@ -2723,6 +3056,8 @@ mod tests {
             working_dir: String::new(),
             requires_confirmation: false,
             polling: None,
+            fallback: None,
+            capture_stdout_as: None,
         };
         let json = serde_json::to_string(&action).unwrap();
         // Optional/empty fields should be omitted.

@@ -27,6 +27,10 @@ header:
       type: string
       required: false
       nullable: true
+    execution_dir:
+      type: string
+      required: false
+      nullable: true
 
 events:
   workflow_initialized:
@@ -209,6 +213,9 @@ events:
       stderr:
         type: string
         required: true
+      truncated:
+        type: boolean
+        required: false
 
   decision_recorded:
     tier: 2
@@ -258,6 +265,23 @@ events:
         type: string
         required: true
 
+  variable_captured:
+    tier: 2
+    fields:
+      key:
+        type: string
+        required: true
+      value:
+        type: string
+        required: true
+
+  execution_anchor_adopted:
+    tier: 2
+    fields:
+      anchor:
+        type: string
+        required: true
+
   scheduler_ran:
     tier: 3
     fields:
@@ -303,7 +327,8 @@ version signal.
   "created_at": "2026-05-07T10:00:00.000Z",
   "session_id": "550e8400-e29b-41d4-a716-446655440000",
   "parent_workflow": null,
-  "template_source_dir": "/home/user/.claude/plugins/cache/shirabe/skills/work-on"
+  "template_source_dir": "/home/user/.claude/plugins/cache/shirabe/skills/work-on",
+  "execution_dir": "/home/user/src/koto"
 }
 ```
 
@@ -316,6 +341,11 @@ version signal.
 | `session_id` | string | No | UUID v4 generated at `koto init` time. Absent (empty string) in files written before this field existed. |
 | `parent_workflow` | string | No | Name of the parent workflow for batch-spawned children. Absent for top-level sessions. |
 | `template_source_dir` | string | No | Absolute path to the directory containing the source template at init time. Absent for stdin/inline templates and older files. |
+| `execution_dir` | string | No | The session's execution anchor: the canonical absolute directory its ticks run gates and actions in. Recorded at `koto init` time from the process working directory, or from `--execution-dir`. A child copies its parent's value. Absent on files written before the field existed and on sessions created through `koto session start`; the first tick of such a session adopts the directory it is ticked from, writes it here, and records an `execution_anchor_adopted` event. |
+
+`execution_dir` is where a session's commands *start*, not a boundary on what
+they reach. A command that runs is free to name absolute paths or change
+directory, and nothing in this contract stops it.
 
 ## Event Envelope
 
@@ -732,7 +762,8 @@ Records when a state's automatic shell command ran.
     "command": "cargo clippy -- -D warnings",
     "exit_code": 0,
     "stdout": "    Finished dev profile",
-    "stderr": ""
+    "stderr": "",
+    "truncated": false
   }
 }
 ```
@@ -741,9 +772,26 @@ Records when a state's automatic shell command ran.
 |-------|------|----------|-------------|
 | `state` | string | Yes | State where the command ran. |
 | `command` | string | Yes | Shell command string as configured in the template. |
-| `exit_code` | integer | Yes | Process exit code. |
-| `stdout` | string | Yes | Standard output. May be large. |
-| `stderr` | string | Yes | Standard error. May be large. |
+| `exit_code` | integer | Yes | Process exit code. `-1` when no exit status was ever obtained — the child could not be spawned, the command timed out and its process group was killed, or waiting on it failed. |
+| `stdout` | string | Yes | Standard output, up to the retention bound. May be large. |
+| `stderr` | string | Yes | Standard error, up to the retention bound. May be large. |
+| `truncated` | boolean | No | True when either stream emitted more than the runner retains (64KB per stream) and `stdout`/`stderr` hold only the leading bytes. One flag covers both streams. Absent on events written before the field existed; readers MUST treat absence as `false`. |
+
+The event is written only when a child process was actually started. An action
+refused before the spawn — an absolute `working_dir`, or one that resolves
+outside the execution anchor — leaves no `default_action_executed` behind.
+That refusal reaches the caller as an `__action__` blocking condition on the
+`koto next` response, not as a feed event; see the failure-kind vocabulary in
+`error-codes.md`.
+
+`truncated` marks the loss in the log rather than only in the response, so a
+consumer reading the feed after the fact can tell a command that printed exactly
+this much from one whose output was cut.
+
+A state whose action requires confirmation writes this event on the tick that
+stops for confirmation, not on the tick that confirms: the confirming tick
+arrives with evidence, which skips the action rather than re-running it. One
+command, one event.
 
 ---
 
@@ -820,6 +868,77 @@ child state access) should use this event to reconstruct batch outcomes.
 | `task_name` | string | Yes | Short task name — the segment after the parent prefix dot. |
 | `outcome` | string | Yes | Terminal outcome: `"success"`, `"failure"`, or `"skipped"`. |
 | `final_state` | string | Yes | The child's terminal state name. |
+
+---
+
+#### `variable_captured`
+
+Records that a state's `default_action` delivered its stdout under the name the
+state declared in `capture_stdout_as`. This event is the durable record of a
+captured value — the per-tick overlay the engine threads through an advance is
+only the in-memory view of the same write.
+
+```json
+{
+  "type": "variable_captured",
+  "payload": {
+    "key": "BRANCH",
+    "value": "feature/anchoring"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `key` | string | Yes | The name the state declared in `capture_stdout_as`. Later states reference it as `{{BRANCH}}` for a key of `BRANCH`. |
+| `value` | string | Yes | The command's stdout, already trimmed and checked against the variable allowlist. A value that reached the log is one substitution can use. |
+
+Consumers fold these in event order: re-entering the producing state means the
+later value wins. A rewind past that state leaves the value in place — the log is
+never truncated — so a captured name outlives the state that produced it.
+
+The event appears only on a successful delivery. A command that ran but whose
+output could not be delivered (empty, over 4096 bytes, or holding a character
+the allowlist forbids) appends no `variable_captured`; the tick stops instead,
+and the reason reaches the caller on the response.
+
+A capture is delivered on a tick that stops for confirmation as well as on one
+that advances, so this event does not imply the workflow moved. It has to work
+that way: confirming re-enters the state with evidence, which skips the action,
+so capturing only on the unconfirmed path would mean a confirmed action never
+delivered its value at all. The consequence for a reader is that a confirmed
+action leaves exactly one `variable_captured` and one `default_action_executed`
+in the log — both on the tick that stopped for confirmation, neither on the tick
+that confirmed.
+
+---
+
+#### `execution_anchor_adopted`
+
+Written once, on the first tick of a session whose header carries no
+`execution_dir`, recording the directory that tick bound the session to. A
+session normally records its anchor at `koto init` time and never produces this
+event. It is written for the cases that leave the header field absent: a log
+written before the field existed, a session created through `koto session start`,
+and the corner where `koto init` could not read a working directory to record.
+
+```json
+{
+  "type": "execution_anchor_adopted",
+  "payload": {
+    "anchor": "/home/user/src/koto"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `anchor` | string | Yes | The canonical absolute directory the session is now bound to. Matches the `execution_dir` the same tick writes to the header. |
+
+The event is appended before the header field is written, so a crash between the
+two repeats a visible adoption on the next tick rather than leaving a silent one.
+A consumer that sees two adoptions for one session is looking at that crash, not
+at a rebinding.
 
 ---
 
@@ -950,9 +1069,12 @@ the session still in a non-terminal state represents an incomplete or cancelled 
 
 **Gate output schema is gate-type-specific**: The `output` field on `gate_evaluated`
 and `override_applied`/`actual_output` on `gate_override_recorded` carry gate-specific
-JSON. Command gates emit `{"exit_code": N, "error": String-or-null}`. Context-exists
-gates emit a different structure. No unified schema is enforced; consumers must handle
-each gate type they care about and tolerate unknown gate output shapes.
+JSON. Command gates emit `{"exit_code": N, "error": String}`, plus a `failure_kind`
+key naming why the command failed when it did not run to a normal exit — the three
+outcomes that share `exit_code: -1` are told apart by that key rather than by matching
+on wording. The vocabulary is in `error-codes.md`. Context-exists gates emit a different
+structure. No unified schema is enforced; consumers must handle each gate type they care
+about and tolerate unknown gate output shapes.
 
 **`batch_finalized.superseded_by` is not in raw JSONL**: The `superseded_by` field
 appears in the Rust type and in `koto status` output but is never written to the raw
