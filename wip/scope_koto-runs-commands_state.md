@@ -18,8 +18,8 @@ child_snapshots:
     status: Accepted
     validator: clean
   design:
-    path: docs/designs/DESIGN-koto-runs-commands.md
-    status: Proposed
+    path: docs/designs/current/DESIGN-koto-runs-commands.md
+    status: Accepted
     validator: clean
 consolidation_judgments:
   brief-to-prd: keep  # all six prior koto BRIEFs coexist with their PRDs
