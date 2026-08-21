@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Draft
+status: Accepted
 problem: |
   A template author can't hand koto a mechanical step and trust it. The
   engine runs a command when a state is entered, but the output is
@@ -17,12 +17,33 @@ outcome: |
 
 ## Status
 
-Draft
+Accepted
 
 Framing for koto's command-execution surface: what a template state can
 be trusted to run, and what has to be true around the command before an
-author will move one there. The downstream PRD owns the requirements;
-the Open Questions below mark what it must settle first.
+author will move one there.
+
+The downstream PRD owns the requirements, along with three framing
+questions this brief deliberately leaves open. None of them blocks the
+framing.
+
+- **Does a write to koto's own context store count as a side effect
+  under the authoring rule?** The rule is stated against changes to the
+  repository and to remote services; a write to the engine's own store
+  is a different risk class and nobody has classified it. The answer
+  decides how much of an existing workflow is convertible.
+- **What happens to sessions that already exist when anchoring lands?**
+  They have no recorded tree, so the refuse-on-mismatch behavior has
+  nothing to compare against. Refuse until someone binds them, warn once
+  and adopt the tree found, or bind silently? New-session behavior is
+  settled; this is the migration story, and it decides whether the
+  feature ships as additive or as breaking.
+- **Is pushing commits to a pull request that's already open quiet
+  enough for the engine to do?** Opening one is clearly not; pushing to
+  a branch nobody watches clearly is. The case between rests on one
+  checkable claim about how loudly a push to an open pull request
+  notifies, and the answer moves a handful of commands across the
+  boundary.
 
 ## Problem Statement
 
@@ -233,33 +254,6 @@ parts:
   `tsukumogami/shirabe:docs/designs/current/DESIGN-work-on-retry-clearing.md`,
   which is marked Current and chose its approach deliberately. No engine change
   retires it.
-
-## Open Questions
-
-Three framing questions this brief hands to the downstream PRD.
-
-1. **Does a write to koto's own context store count as a side effect under the
-   authoring rule?** The rule is stated against changes to the repository and to
-   remote services; a write to the engine's own store is a different risk class
-   and nobody has classified it. The answer decides how much of an existing
-   workflow is convertible, which is why it's framing rather than design.
-
-2. **What happens to sessions that already exist when anchoring lands?** They
-   have no recorded tree, so the refuse-on-mismatch behavior the scope bullet
-   commits to has nothing to compare against. Does koto refuse them until someone
-   binds them, warn once and adopt the tree it finds, or bind silently? The
-   behavior for new sessions is settled; this is only the migration story, and it
-   decides whether the feature ships as additive or as breaking.
-
-3. **Is pushing commits to a pull request that's already open quiet enough for
-   the engine to do?** Opening a pull request is clearly not, and a push to a
-   branch nobody is watching clearly is. The case in between rests on one
-   checkable claim about how loudly a push to an open pull request notifies, and
-   the answer moves a handful of commands from one side of the boundary to the
-   other.
-
-None of the three blocks acceptance. Each names a boundary the PRD draws more
-precisely; the problem, the outcome, and the journeys hold whichever way they go.
 
 ## References
 
