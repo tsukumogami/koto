@@ -163,17 +163,58 @@ sit inside a prose iteration loop in SKILL.md, not inside any koto template.
 Converting them would mean designing a koto-driven coordination-loop template,
 which is a different and much larger project than anything else in the bucket.
 
+**The disagreement resolved into the exploration's most useful idea: a second
+axis.** (lead-remap-remote, reconciling with lead-confirmation) Asked to argue
+with the confirmation lead rather than around it, the re-map lead found its own
+table had scored reversibility on one axis only — can the local artifact be
+reset — and missed an independent one: does the command fire an
+externally-visible event that cannot be un-fired. `gh pr close` undoes a
+`gh pr create`'s *state*; it does not undo the "opened" notification every
+watcher already received. That second axis is what koto issue #71 was actually
+about.
+
+Re-scored on it, the lead conceded three of its own rows. `gh pr create` in both
+templates and `gh pr ready` move to stays-agent-run: each fires an unrecallable
+notification and, in the PR case, consumes an identifier, the instant it
+succeeds. `git push` to a branch you solely own, before any PR references it,
+survives as convertible on both axes — nobody is watching that ref.
+
+**And the rule that falls out of it is durable, not a staging decision.**
+(lead-remap-remote) Action output on the failure path fixes diagnosability of a
+failed attempt. It does nothing for the success path, which is exactly where an
+irreversible externally-visible event lives — structurally the same critique the
+confirmation lead levelled at `requires_confirmation`, since a post-hoc signal
+cannot gate an event that already happened. So the operative question for a
+template author is **whether a command's risk lives in a bad success or a bad
+failure**. Risk in a bad failure is fixed by the plumbing already scoped. Risk in
+a bad success is not fixed by anything on the roadmap, and those commands stay
+with the agent permanently.
+
+**A correction that makes the recommended pattern true rather than aspirational.**
+(lead-remap-remote) The confirmation lead called `pr_creation`'s
+agent-runs-it-with-a-koto-gate-verifying pattern defensible. Checked directly:
+`work-on.md:695` has no `gates:` block at all — `pr_creation` goes straight to
+`accepts:`, and the state's only truth is the agent's self-reported `pr_status`
+enum. Nothing independently confirms the PR exists. Keeping `gh pr create`
+agent-run remains right, but the pattern is currently agent self-report, not
+verification. Adding the gate is small, concrete, cheap, and worth doing
+regardless of everything else here.
+
 ### Tensions
 
-- **Two leads disagree about irreversible commands, and the disagreement is
-  live.** The confirmation lead recommends keeping `default_action` off
-  irreversible commands by authoring rule, arguing the agent-runs-it-with-a-gate
-  pattern is already right for `pr_creation`. The re-map lead was commissioned to
-  evaluate converting exactly those commands. I sent the confirmation position to
-  the re-map lead and asked it to argue rather than route around it, including
-  the sharper distinction both should be using: writes-remote is not a synonym
-  for irreversible — `git push` to your own branch and `gh pr ready` are
-  trivially re-runnable, while `gh pr create` and posting a comment are not.
+- **Two genuine disagreements survive the reconciliation, and both are worth
+  carrying forward rather than papering over.** The re-map lead keeps the
+  finalization cascade's push and `--force-with-lease` on the convert-after-
+  plumbing path rather than banning them, arguing that pushing commits to an
+  already-open PR fires a quiet "synchronize" event rather than the loud
+  "opened" or "ready for review" one, and that `--force-with-lease` is a command
+  that can refuse itself — it fails atomically before rewriting history if the
+  remote moved, which `gh pr create` has no equivalent of. The confirmation lead
+  never evaluated either push case, so this is unadjudicated ground rather than a
+  settled split. Separately, `gh pr edit` on the run's own draft PR is flagged as
+  contestable: editing a PR you just opened consumes no new identifier and
+  notifies more quietly, but "quieter" is a judgment call rather than the bright
+  line that "no notification at all" and "notification every time" both are.
 
 - **Everything that would bound the blast radius is either theatre or breaks
   distribution.** The blast-radius and anchoring leads reached this
@@ -191,10 +232,9 @@ which is a different and much larger project than anything else in the bucket.
 
 ### Gaps
 
-- The re-map lead had not returned when this was written. Conversion scope under
-  the amended principle is the one open question from the original six.
-- Whether the Claude Code plugin mechanism exposes any integrity or pinning
-  surface a manifest could hook into, or whether shirabe would be inventing one.
+- Whether Claude Code's plugin mechanism exposes an integrity or pinning surface
+  a hash story could hook into. In flight at the time of writing; it decides
+  whether shirabe hooks into something existing or invents a manifest.
 - Where an expected-hash value should live: a koto-side trusted-templates file, a
   shirabe release manifest, or an argument the skill passes at init.
 - Nobody has scoped what capping or hashing the `command` field would break for
