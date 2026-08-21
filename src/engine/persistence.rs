@@ -2576,6 +2576,7 @@ mod tests {
                     exit_code: 0,
                     stdout: "hi\n".to_string(),
                     stderr: String::new(),
+                    truncated: false,
                 },
             ),
             make_event(

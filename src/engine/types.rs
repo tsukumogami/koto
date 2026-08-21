@@ -547,6 +547,13 @@ pub enum EventPayload {
         exit_code: i32,
         stdout: String,
         stderr: String,
+        /// True when the command emitted more output than the runner
+        /// retains, so `stdout`/`stderr` hold only the first bytes.
+        ///
+        /// Additive: events written before the reader-thread change omit
+        /// the field and deserialize as `false`.
+        #[serde(default)]
+        truncated: bool,
     },
     DecisionRecorded {
         state: String,
@@ -1226,6 +1233,7 @@ impl<'de> Deserialize<'de> for Event {
                     exit_code: p.exit_code,
                     stdout: p.stdout,
                     stderr: p.stderr,
+                    truncated: p.truncated,
                 }
             }
             "decision_recorded" => {
@@ -1470,6 +1478,8 @@ struct DefaultActionExecutedPayload {
     exit_code: i32,
     stdout: String,
     stderr: String,
+    #[serde(default)]
+    truncated: bool,
 }
 
 #[derive(Deserialize)]
@@ -2188,6 +2198,7 @@ mod tests {
                 exit_code: 0,
                 stdout: "Switched to a new branch 'feature'\n".to_string(),
                 stderr: String::new(),
+                truncated: false,
             },
             idempotency_hash: None,
         };
@@ -2206,6 +2217,7 @@ mod tests {
             exit_code: 1,
             stdout: String::new(),
             stderr: "err".to_string(),
+            truncated: false,
         };
         assert_eq!(p.type_name(), "default_action_executed");
     }

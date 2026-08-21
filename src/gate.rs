@@ -10,7 +10,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::action::run_shell_command;
+use crate::action::{run_shell_command, CommandOutput, FailureKind};
 use crate::session::context::ContextStore;
 use crate::template::types::{
     Gate, GATE_TYPE_CHILDREN_COMPLETE, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS,
@@ -205,30 +205,42 @@ fn evaluate_context_matches_gate(
 
 fn evaluate_command_gate(gate: &Gate, working_dir: &Path) -> StructuredGateResult {
     let output = run_shell_command(&gate.command, working_dir, gate.timeout);
+    command_gate_result(output)
+}
 
-    if output.exit_code == -1 {
-        // Distinguish timeout from spawn/wait errors by checking the message.
-        if output.stderr.contains("timed out") {
-            StructuredGateResult {
-                outcome: GateOutcome::TimedOut,
-                output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
-            }
-        } else {
-            StructuredGateResult {
-                outcome: GateOutcome::Error,
-                output: serde_json::json!({"exit_code": -1, "error": output.stderr}),
-            }
-        }
-    } else if output.exit_code == 0 {
-        StructuredGateResult {
-            outcome: GateOutcome::Passed,
-            output: serde_json::json!({"exit_code": 0, "error": ""}),
-        }
-    } else {
-        StructuredGateResult {
+/// Map a command result onto a gate outcome and its evidence.
+///
+/// The runner reports why a command failed, so the three outcomes that used
+/// to share `exit_code: -1` are told apart by `failure_kind` rather than by
+/// searching stderr for "timed out". Evidence for those three gains a
+/// `failure_kind` key; the passing and failing shapes are unchanged, which
+/// keeps recorded gate evidence and overrides comparable byte for byte.
+fn command_gate_result(output: CommandOutput) -> StructuredGateResult {
+    match output.failure_kind {
+        Some(FailureKind::TimedOut) => StructuredGateResult {
+            outcome: GateOutcome::TimedOut,
+            output: serde_json::json!({
+                "exit_code": -1,
+                "error": "timed_out",
+                "failure_kind": FailureKind::TimedOut.as_str(),
+            }),
+        },
+        Some(kind @ (FailureKind::SpawnFailed | FailureKind::WaitFailed)) => StructuredGateResult {
+            outcome: GateOutcome::Error,
+            output: serde_json::json!({
+                "exit_code": -1,
+                "error": output.stderr,
+                "failure_kind": kind.as_str(),
+            }),
+        },
+        Some(FailureKind::NonzeroExit) => StructuredGateResult {
             outcome: GateOutcome::Failed,
             output: serde_json::json!({"exit_code": output.exit_code, "error": ""}),
-        }
+        },
+        None => StructuredGateResult {
+            outcome: GateOutcome::Passed,
+            output: serde_json::json!({"exit_code": 0, "error": ""}),
+        },
     }
 }
 
@@ -343,6 +355,97 @@ mod tests {
         assert_eq!(results["slow"].outcome, GateOutcome::TimedOut);
         assert_eq!(results["slow"].output["exit_code"], -1);
         assert_eq!(results["slow"].output["error"], "timed_out");
+    }
+
+    /// Build a `CommandOutput` for the mapping tests below. `wait_failed`
+    /// cannot be provoked from a real command, so the mapping is exercised
+    /// directly rather than through `run_shell_command`.
+    fn failed_output(kind: FailureKind, exit_code: i32, stderr: &str) -> CommandOutput {
+        CommandOutput {
+            exit_code,
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+            failure_kind: Some(kind),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn timed_out_maps_to_timed_out_with_the_existing_evidence_shape() {
+        let result = command_gate_result(failed_output(FailureKind::TimedOut, -1, "partial"));
+        assert_eq!(result.outcome, GateOutcome::TimedOut);
+        assert_eq!(result.output["exit_code"], -1);
+        assert_eq!(result.output["error"], "timed_out");
+        assert_eq!(result.output["failure_kind"], "timed_out");
+    }
+
+    #[test]
+    fn spawn_failed_maps_to_error() {
+        let result = command_gate_result(failed_output(
+            FailureKind::SpawnFailed,
+            -1,
+            "failed to spawn command: boom",
+        ));
+        assert_eq!(result.outcome, GateOutcome::Error);
+        assert_eq!(result.output["exit_code"], -1);
+        assert_eq!(result.output["error"], "failed to spawn command: boom");
+        assert_eq!(result.output["failure_kind"], "spawn_failed");
+    }
+
+    #[test]
+    fn wait_failed_maps_to_error_and_is_not_reported_as_a_timeout() {
+        let result = command_gate_result(failed_output(
+            FailureKind::WaitFailed,
+            -1,
+            "error waiting for command: boom",
+        ));
+        assert_eq!(result.outcome, GateOutcome::Error);
+        assert_eq!(result.output["exit_code"], -1);
+        assert_eq!(result.output["error"], "error waiting for command: boom");
+        assert_eq!(result.output["failure_kind"], "wait_failed");
+    }
+
+    #[test]
+    fn nonzero_exit_evidence_is_unchanged() {
+        let result = command_gate_result(failed_output(FailureKind::NonzeroExit, 3, ""));
+        assert_eq!(result.outcome, GateOutcome::Failed);
+        assert_eq!(
+            result.output,
+            serde_json::json!({"exit_code": 3, "error": ""})
+        );
+    }
+
+    #[test]
+    fn passing_evidence_is_byte_identical_to_the_recorded_default() {
+        let result = command_gate_result(CommandOutput {
+            exit_code: 0,
+            stdout: "hi\n".to_string(),
+            stderr: String::new(),
+            failure_kind: None,
+            truncated: false,
+        });
+        assert_eq!(result.outcome, GateOutcome::Passed);
+        assert_eq!(
+            serde_json::to_string(&result.output).unwrap(),
+            serde_json::to_string(&built_in_default(GATE_TYPE_COMMAND).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn gate_output_above_the_pipe_buffer_does_not_deadlock() {
+        let dir = tmp_dir();
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "loud".to_string(),
+            make_gate(
+                "for i in $(seq 1 4096); do printf '%063d\\n' \"$i\"; done; exit 0",
+                10,
+            ),
+        );
+
+        let results = evaluate_gates(&gates, dir.path(), None, None, None);
+        assert_eq!(results["loud"].outcome, GateOutcome::Passed);
+        assert_eq!(results["loud"].output["exit_code"], 0);
     }
 
     #[test]

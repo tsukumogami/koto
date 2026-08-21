@@ -58,7 +58,11 @@ thread_local! {
 }
 
 /// Maximum size of captured stdout/stderr from action execution (64 KB).
-const MAX_ACTION_OUTPUT_BYTES: usize = 64 * 1024;
+///
+/// The runner enforces this bound while draining the child's pipes, so the
+/// re-truncation below is a belt-and-braces check rather than the mechanism.
+#[cfg(unix)]
+use crate::action::MAX_ACTION_OUTPUT_BYTES;
 
 /// Exit code space:
 /// - 0: success
@@ -1016,6 +1020,9 @@ where
                 exit_code: -1,
                 stdout: String::new(),
                 stderr: "polling interrupted by signal".to_string(),
+                // No exit status was ever obtained for this attempt.
+                failure_kind: Some(crate::action::FailureKind::WaitFailed),
+                truncated: false,
             };
         }
 
@@ -1043,6 +1050,10 @@ where
                     "{}\npolling timed out after {} seconds",
                     output.stderr, polling.timeout_secs
                 ),
+                failure_kind: output
+                    .failure_kind
+                    .or(Some(crate::action::FailureKind::TimedOut)),
+                truncated: output.truncated,
             };
         }
 
@@ -1054,6 +1065,9 @@ where
                     exit_code: -1,
                     stdout: String::new(),
                     stderr: "polling interrupted by signal".to_string(),
+                    // No exit status was ever obtained for this attempt.
+                    failure_kind: Some(crate::action::FailureKind::WaitFailed),
+                    truncated: false,
                 };
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -4032,6 +4046,7 @@ fn handle_next(
             exit_code: output.exit_code,
             stdout: stdout.clone(),
             stderr: stderr.clone(),
+            truncated: output.truncated,
         };
         let _ = backend.append_event(&name, &event_payload, &now_iso8601());
 
