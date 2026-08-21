@@ -1,5 +1,41 @@
 # /scope Handoff: koto-runs-commands
 
+## Author Ruling — read first
+
+Recorded 2026-08-20, after the exploration concluded, in response to the
+author's direct correction. It overturns a conclusion two leads reached
+independently, so it sits above everything else in this file.
+
+The exploration found that a `default_action` runs `sh -c` from the koto binary
+rather than through the agent's tool layer, so a user's allow/deny/ask rules for
+`git push` or `gh pr create` never see it. It treated that as the strongest
+objection to the whole direction. The mechanism is real; the conclusion was
+wrong.
+
+**That behavior is the intent.** Loading a skill that drives koto is itself the
+broad grant — invoking a koto-backed workflow authorizes every command that
+workflow bakes in, deliberately, with the risk acknowledged and accepted.
+Consent moves from per-command prompting to the decision to run the workflow at
+all, and that relocation is the feature: it is what lets koto carry mechanical
+work without interrupting the agent at every step.
+
+Do not re-derive this as an objection. Anywhere below where the permission
+surface is described as a constraint, this section supersedes it. What follows
+from the ruling:
+
+- The permission argument is struck as a reason to keep any command with the
+  agent, and no longer constrains scope.
+- The carve-out for remote mutations survives on narrower grounds only —
+  irreversibility, and the fact that failure diagnosis is currently blind.
+  Both are fixable, the second by plumbing this chain already scopes.
+- Conversion scope is therefore **wider** than the figures recorded here.
+  Treat every published yield as a floor.
+- `requires_confirmation` matters more, not less: it is the only in-band
+  checkpoint left, which makes its after-the-fact firing a defect worth fixing.
+- Untouched by the ruling: action output is persisted to an event log committed
+  to feature branches, so a command whose output carries a secret leaks it.
+  That is about what gets written down, not who authorized the command.
+
 ## Provenance
 
 Written by `/explore` on 2026-08-20 from
@@ -87,16 +123,21 @@ shared execution layer sit underneath all three.
   populating `action_output` on every stop reason. Once auto-advance chains
   through several states, the acting state and the stopping state diverge, which
   makes the latter the more invasive change despite looking smaller.
-- **Conversion is scoped by a principle, not a percentage.** koto runs a step
-  when it is isolated to its own state, gate-verifiable independent of the
-  action's own exit code, and either read-only or a repo-local mutation safe to
-  reach twice. Remote mutations and anything needing per-repo configuration stay
-  agent-run.
+- **Conversion is scoped by a principle, not a percentage** (as amended by the
+  Author Ruling). koto runs a step when it is isolated to its own state and
+  gate-verifiable independent of the action's own exit code. Reversible,
+  repo-local steps convert now. Irreversible outward-facing steps — PR creation,
+  comments, pushes to shared branches — convert once failure output reaches the
+  agent; they are deferred on diagnosability and irreversibility, never on
+  authorization. Only commands needing per-repo knowledge to know what to run
+  stay agent-run, and that set shrinks once a `TEST_COMMAND` style variable
+  carries the answer.
 - **A blanket read-only restriction is rejected.** Applied line by line it
   collapses the yield to nothing and cannot be enforced at compile time.
-- **The permission-bypass problem is accepted as unfixable inside koto.** No
-  preview-before-execution mechanism exists, and building one reproduces the
-  prose-plus-gate pattern that already exists. It becomes a scoping constraint.
+- **Engine-run commands bypass the agent's permission layer by design.** No
+  preview-before-execution mechanism exists in koto, and building one would
+  reproduce the prose-plus-gate pattern already in place. Per the Author Ruling
+  above, this is the intended trade, not a constraint on scope.
 - **Defect severity is stated as latent, not active.** Measured: `go test ./...`
   across 63 packages on the tsuku monorepo emits 3,793 bytes, well under the
   trigger, and only one of eleven shipped gates writes captured stdout at all.
@@ -179,8 +220,8 @@ koto use in shirabe" and that question was settled in round 1 — neither, exact
 a shipped capability nobody adopted, plus three specific gaps. The framing moved
 twice more after that. Round 2's adversarial lead reframed the question from
 "how much can we convert" to "which commands should an engine run at all",
-producing the permission-bypass constraint that no amount of conversion work
-addresses. Round 3 then moved the centre of gravity off conversion entirely:
+producing a permission-surface finding that the author has since ruled is the
+intended design rather than a constraint. Round 3 then moved the centre of gravity off conversion entirely:
 the two highest-priority items are defects in the shared execution layer that
 predate the question, and the item that most directly answers the original
 concern about side effects in the wrong place — execution anchoring — is
@@ -236,13 +277,13 @@ to look at.
   after the output defect is fixed, 70% with a further capability, ceiling near
   79%. An estimate that unstable under a single corrected fact is itself a
   complexity signal.
-- The adversarial lead's objections are not dismissible and are not all
-  addressable by building something. Engine-run commands bypass the user's
-  permission layer; a compiled command string cannot span the tooling variety of
-  the repositories a shipped plugin targets; and an incident already on record —
+- Two of the adversarial lead's three objections stand; the third has been
+  ruled on. A compiled command string cannot span the tooling variety of the
+  repositories a shipped plugin targets, and an incident already on record —
   twelve child workflows dispatched against a branch nobody created, because an
   error was filtered away — is the exact silent-failure shape that converting a
-  step without the failure plumbing would reproduce.
+  step without the failure plumbing would reproduce. Its permission-surface
+  objection does not stand: see the Author Ruling above.
 - The conversion principle needs to survive contact with real states. The two
   states koto's own design named as targets both fail it, which means adoption
   implies splitting states rather than annotating them, and state granularity is
