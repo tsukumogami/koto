@@ -6,6 +6,13 @@
 > ruled on where consent lives, and corrected three of this document's premises.
 > Both sets of research are on this branch under `wip/research/`. There is one
 > chain, not two — run `/scope koto-runs-commands` once.
+>
+> The second exploration surfaced template-integrity work that the author then
+> ruled out of scope: rely on the pinning the agent harnesses already provide and
+> invent nothing there. It, and three other real findings, are listed under
+> **Follow-Ups** and are not this chain's work. Keep the scope on the goal: koto
+> runs the mechanical commands on the happy path, hands the agent judgment, falls
+> back to prose on failure, and never runs against the wrong tree.
 
 ## Author Ruling — read first
 
@@ -103,11 +110,6 @@ shared execution layer sit underneath all three.
 - Authoring documentation for `default_action`, which currently amounts to one
   table row and a Rust integration test — and which must now carry the
   bad-success/bad-failure rule.
-- Template trust: binding a specific template to a reviewed hash at the moment
-  `koto init` accepts it, and deciding where the expected value lives.
-- Bounding what the event log records, without losing the failure diagnosability
-  this chain is otherwise building toward.
-
 ### Out of scope
 
 - shirabe's template rewrite. It depends on this work and warrants its own run
@@ -120,6 +122,16 @@ shared execution layer sit underneath all three.
   koto change reaches it.
 - CI monitoring as a typed integration. koto's own design names that as the
   right long-term home for `ci_monitor`, but it is a separate feature.
+- **Template integrity work of any kind.** Author's decision: rely on the pinning
+  the agent harnesses already provide and invent nothing in this space. Claude
+  Code already lets a marketplace entry pin a git-backed plugin to an exact
+  commit `sha` that takes precedence over `ref`, and archive sources carry a
+  `sha256`; Codex has its own equivalent. No `--expect-hash`, no manifest, no
+  koto-side trust store, no release-checksum extension. The exploration's
+  findings on this are recorded as follow-ups below and must not be pulled into
+  this chain's scope.
+- **Bounding what the event log records.** A real finding, not this goal's work.
+  Follow-up below.
 
 ## Decisions Already Settled
 
@@ -248,41 +260,18 @@ containment when `working_dir` is absolute, so that case must be rejected ahead
 of the join. Ship root-plus-refuse-plus-safe-join as one inseparable increment,
 then the bind verb and structured errors.
 
-**Template trust is new scope, and half of it already exists.** Under the ruling
-the template is where authority is granted, and nothing treats it as such. Every
-template route resolves to a local-disk read (`src/template/compile.rs:156-157`)
-— no network or cloud source anywhere — so the trust decision happens once, at
-install or authoring time. koto already computes a SHA-256 of the compiled
-template and fail-closed re-verifies it on nearly every mutating command
-(`src/cli/mod.rs:3210-3226`, `4750-4767`; `src/cli/overrides.rs:178-199`), but
-that pins an already-accepted template against mid-run change; nothing asks
-whether accepting it was right. Meanwhile Claude Code already lets a marketplace
-entry pin a git-backed plugin to an exact commit `sha` that takes precedence over
-`ref`, and archive sources carry a real `sha256`. So "which revision am I
-running" is solvable with configuration today; "is this template the one that was
-reviewed" is the half worth building, most cheaply as an optional `--expect-hash`
-on `koto init` reusing `sha256_hex` and `compile_cached`. Open: where the
-expected value lives — koto-side, a shirabe release manifest, or an argument the
-skill passes.
-
-**The event log's exposure is the `command` field, not stdout.** This document's
-upstream design doc claims state files are committed to feature branches; that is
-stale and has been since session storage moved to `~/.koto/sessions/`. The live
-distribution path is the opt-in cloud sync, which uploads the whole state file to
-a team-shared bucket after every mutating call with no client-side encryption.
-stdout and stderr are capped at 64KB — the only enforced content bound — while
-the post-substitution `command` string, gate-override payloads, evidence fields,
-and init-time variables are unbounded with no redaction anywhere. A secret
-interpolated into a command's own arguments is written down verbatim even when
-the command prints nothing. Gate commands never capture stdout at all, and since
-neither template uses `default_action` yet, exposure through this mechanism is
-currently zero. Bounding it fights the debuggability goal this chain already has,
-so the resolution is about where output travels rather than whether it is
-captured.
+**Template integrity is deliberately not this chain's problem.** The second
+exploration mapped it and the author ruled it out of scope: rely on the pinning
+the agent harnesses already provide, and invent nothing here. The findings are
+kept as follow-ups below rather than as work. One of them is worth knowing while
+authoring, though: every template route resolves to a local-disk read
+(`src/template/compile.rs:156-157`) — no network, cloud, or config-driven source
+exists anywhere — so nothing about template content changes at runtime, and this
+chain can treat the template on disk as fixed for the duration of a run.
 
 ## Work That Should Not Wait For This Chain
 
-Four items are one-file changes needing no design, on top of the six defect fixes
+Two items are one-file changes needing no design, on top of the six defect fixes
 the first exploration named. File them and land them independently:
 
 - Give `pr_creation` a verifying gate. It has no `gates:` block at all
@@ -291,13 +280,45 @@ the first exploration named. File them and land them independently:
   `gh pr list --head "$(git rev-parse --abbrev-ref HEAD)" --json number --jq '.[0].number' | grep -q .`.
   Everyone citing agent-runs-it-with-a-gate as the defensible pattern is citing
   something that is currently agent self-report with nothing verifying it.
-- Reject an absolute `working_dir` explicitly ahead of the `Path::join`.
-- Extend shirabe's release checksums to cover templates. The workflow already
-  runs `sha256sum shirabe-*` (`.github/workflows/release-binaries.yml:93-112`)
-  for the binary; the artifact that grants command authority is published with no
-  integrity metadata at all.
-- Document `sha` pinning for the shirabe plugin entry. It is a supported control
-  that exists today and costs a line.
+- Reject an absolute `working_dir` explicitly ahead of the `Path::join`. This one
+  belongs with the anchoring work rather than ahead of it if the two land
+  together.
+
+## Follow-Ups — Explicitly Out of This Chain
+
+Real findings the exploration produced that do not serve this goal. They are
+recorded so they are not lost and so nobody re-derives them, and they must not be
+pulled into scope. The research backing each is under `wip/research/`.
+
+- **Template integrity.** Author's decision: rely on existing harness pinning,
+  invent nothing. Claude Code supports pinning a git-backed plugin to an exact
+  commit `sha` (it takes precedence over `ref`), and archive sources carry a
+  `sha256` that refuses a mismatched install; Codex has its own equivalent. If
+  anyone later wants tighter binding at `koto init` time, the findings in
+  `explore_koto-command-authority_r1_lead-template-boundary.md` and
+  `..._lead-plugin-integrity.md` cover what exists and what does not. Not now.
+- **Event-log content bounds.** stdout and stderr are capped at 64KB; the
+  post-substitution `command` string, gate-override payloads, evidence fields,
+  and init-time variables are not, and there is no redaction anywhere. A secret
+  interpolated into a command's arguments is recorded verbatim even when the
+  command prints nothing. The upstream design doc's claim that state files are
+  committed to feature branches is stale — the live distribution path is the
+  opt-in cloud sync, which uploads the whole state file to a team-shared bucket
+  with no client-side encryption. Exposure today is zero, since neither template
+  uses `default_action` yet. Detail in `..._lead-event-log.md`.
+- **Renaming `requires_confirmation`.** It executes unconditionally and only then
+  branches on the flag, failing koto issue #71's stated acceptance criterion. The
+  authoring rule this chain adopts makes the flag unnecessary rather than wrong,
+  so a rename is tidying, not enabling work. Its blast radius across templates,
+  docs, and tests was never counted. Detail in `..._lead-confirmation.md`.
+- **Runtime containment.** Two leads independently concluded that every option
+  which would bound what an authorized command reaches either collapses into
+  unenforced documentation or breaks koto's single-binary, no-sudo, four-platform
+  distribution. Recorded so the question is not reopened from scratch. Detail in
+  `..._lead-blast-radius.md` and `..._lead-anchoring.md`.
+- **Extending shirabe's release checksums to templates**, and documenting plugin
+  `sha` pinning as practice. Both sit inside the template-integrity decision
+  above and wait on it.
 
 ## Coverage Notes
 
@@ -305,16 +326,10 @@ the first exploration named. File them and land them independently:
   principle is unresolved, and it is the hinge for how much of `/work-on`
   remains convertible. The principle names git and remote mutations; a write to
   koto's own context store is a different risk class and nobody decided which.
-- **Where the expected template hash lives**: a koto-side trusted-templates file,
-  a shirabe release manifest, or an argument the skill passes at `koto init`.
-  koto has no plugin concept to hang trust on, which argues for the latter two.
-- **What bounding the `command` field costs the audit trail.** Capping or hashing
-  it protects against interpolated secrets and degrades the record the log exists
-  to keep. Nobody scoped the trade.
-- **The rename's blast radius.** How many templates, docs, tests, and skill files
-  reference `requires_confirmation` was not counted.
-- **Whether `sha` pinning fits how this workspace expects plugin updates to
-  arrive.** Worth checking before recommending it as practice.
+- **Whether GitHub's `synchronize` event notifies meaningfully more quietly than
+  `opened` or `ready_for_review`.** This single unverified claim decides one of
+  the two live disagreements above. Checking it against GitHub's notification
+  documentation is the cheapest thing on this list.
 - **The retry-clearing question needs a shirabe decision this chain cannot
   make.** `docs/designs/current/DESIGN-work-on-retry-clearing.md` is marked
   Current and chose manual clear-and-verify deliberately, reasoning that a
