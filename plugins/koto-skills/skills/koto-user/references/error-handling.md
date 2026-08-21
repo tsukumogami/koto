@@ -78,6 +78,7 @@ All `koto next` error codes, their exit codes, and what to do:
 | `persistence_error` | 3 | No | State file I/O failure or corruption | Report to user; this is an infrastructure problem |
 | `execution_anchor_unresolvable` | 3 | No | The session's recorded execution anchor names nothing on this machine — the checkout was deleted, or the session moved machines | Restore the checkout at the path the message names, or escalate |
 | `capture_unset` | 3 | No | A state's instruction text reads a `capture_stdout_as` name that no state delivered on this run. The message names the value and the state that produces it | A template routing problem: the run never entered the producing state. Report it; re-ticking won't help |
+| `nested_invocation` | 2 | No | The tick was started from inside a command koto is running. The message names the session whose tick is in flight | Don't tick koto from a template's command. Take the `koto next` call out and let the enclosing tick advance the session |
 | `needs_agent_not_dispatched` | 66 | No | `koto next` was called against a `--needs-agent` child that the coordinator has not yet claimed/dispatched | Stop ticking the child directly; route through the coordinator's `koto next` on the parent root instead |
 | `recursion_cap_exceeded` | 64 | No | `koto session start --needs-agent` would push the workflow tree past one of the three recursion caps (`depth`, `fanout`, or `total_unassigned`) | Surface the cap dimension and threshold to the user; restructure the dispatch fanout (collapse a level, batch siblings, or split into separate trees) before retrying |
 
@@ -135,6 +136,35 @@ A session with no recorded anchor — written before anchoring existed, or creat
 `koto session start` — is not refused. Its first tick adopts the directory it's ticked
 from and prefixes the `directive` with a one-time notice naming the directory it bound.
 Check that the directory is the one you meant.
+
+---
+
+## Nested tick refusals
+
+`koto next` runs a state's `default_action` and its command gates as child processes, and
+they inherit its environment. Before it runs anything, a tick exports
+`KOTO_TICK_SESSION` naming the session it is advancing. A `koto next` that finds that
+variable already set was started from inside one of those commands, and refuses:
+
+```json
+{"error":{"code":"nested_invocation","message":"koto next cannot run inside a command koto is running: the tick on session 'my-workflow' spawned this process and has not finished. ...","details":[]}}
+```
+
+Exit 2, and nothing ran — no gate evaluated, no action executed, no event appended.
+
+The refusal exists because a nested tick is not merely redundant. It appends to the same
+event log the outer tick is halfway through processing, so it really does advance the
+session; the outer tick then finishes against the snapshot it started with and reports a
+state the workflow has already left. The caller's view is wrong rather than absent, which
+is why koto refuses rather than letting it through.
+
+Two things it does not cover. It refuses `koto next` only — `koto context`, `koto status`,
+`koto request`, and the rest all work from inside a command as before. And it keys on the
+process tree, not the session name, so a tick on some *other* workflow from inside a
+command is refused too.
+
+If you hit this, the fix is in the template: take the `koto next` out of the command. The
+enclosing tick is what advances the session.
 
 ---
 

@@ -181,6 +181,25 @@ injection, not word splitting -- quote the reference when a value must stay a si
 command: mytool --calendar "{{CALENDAR}}"
 ```
 
+### One command the engine refuses: `koto next`
+
+Automating a workflow's own bookkeeping by having a state tick itself looks like the obvious
+move, and it is the one thing a command may not do. A command runs inside a tick. A `koto next`
+started from inside it performs a real transition -- in the case that prompted this rule it drove
+the session all the way to its terminal state -- while the tick that spawned it finished against
+the snapshot it started with and answered `advanced: false` on the state the session had already
+left. The caller's view was wrong, not absent, so nothing surfaced an error.
+
+koto now refuses the nested call: it exports `KOTO_TICK_SESSION` before running anything, and a
+`koto next` that sees it fails with the `nested_invocation` code and exit 2, naming the tick in
+flight. The refusal is scoped to the process tree rather than to one session name, so ticking a
+*different* workflow from a command is refused too -- a chain that ticks back into the outer
+session through a second one lands on the same defect.
+
+Every other `koto` subcommand still works from a command. `koto context add` and `koto context
+remove` in particular are a supported pattern -- clearing a key on a loop-back edge is authored
+exactly that way.
+
 ### When it runs, and when it doesn't
 
 The action runs when the advance loop enters the state on a tick that carries no evidence for

@@ -543,6 +543,8 @@ Read these on demand, not upfront. The sections above cover the common path. Con
 
 **"capture_unset"** — a state's instructions read a `{{NAME}}` that a `capture_stdout_as` was supposed to deliver, and this run never entered the state that produces it. The message names both. This is a template routing problem, not something you can fix by re-ticking — report it to whoever authored the workflow.
 
+**"nested_invocation"** — a `koto next` ran from inside a command koto itself was running. koto refuses it: a nested tick would advance the session while the tick that spawned it kept reporting the state it started with. If you hit this from a template's `default_action` or command gate, that call has to come out — the enclosing tick is what advances the session. If you hit it from your own shell, you are inside a command koto is running; step out of it before ticking.
+
 **A blocking condition named `__action__`** — the state's own `default_action` command failed; the state's gates never ran. Read `output.failure_kind` to decide what to do, and the front of `directive` for the author's fallback instructions. See [When a default action fails](#when-a-default-action-fails).
 
 **Gate blocked, `agent_actionable` is `false`** — you can't override this gate yourself. Escalate to the user so they can resolve the underlying condition (for example, a required deployment that only they can trigger).

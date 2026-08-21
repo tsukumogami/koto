@@ -739,6 +739,12 @@ pub enum NextErrorCode {
     /// exactly what this code exists to prevent, which is why it is a stop
     /// rather than a fallback.
     CaptureUnset,
+    /// The tick was started from inside a command an outer tick is running
+    /// (koto#208). A nested tick advances the session behind the outer
+    /// tick's back, and the outer tick goes on reporting the state it
+    /// started with -- a wrong answer rather than a missing one. Caller
+    /// error: take the `koto next` call out of the template's command.
+    NestedInvocation,
 }
 
 impl NextErrorCode {
@@ -757,6 +763,9 @@ impl NextErrorCode {
             NextErrorCode::TerminalState => 2,
             NextErrorCode::WorkflowNotInitialized => 2,
             NextErrorCode::ExecutionAnchorMismatch => 2,
+            // The template (or whoever wrote the command) has to change:
+            // re-running the nested tick will refuse identically.
+            NextErrorCode::NestedInvocation => 2,
             NextErrorCode::TemplateError => 3,
             NextErrorCode::PersistenceError => 3,
             NextErrorCode::ExecutionAnchorUnresolvable => 3,

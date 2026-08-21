@@ -55,7 +55,7 @@ Domain errors use this shape:
 }
 ```
 
-The `details` array is empty when the error isn't field-specific. The twelve error codes:
+The `details` array is empty when the error isn't field-specific. The thirteen error codes:
 
 | Code | Exit | Meaning |
 |------|:----:|---------|
@@ -71,6 +71,7 @@ The `details` array is empty when the error isn't field-specific. The twelve err
 | `execution_anchor_mismatch` | 2 | The tick ran from a directory that is neither the session's execution anchor nor beneath it. The message names the bound directory. Run `koto next` from there, or rebind the session. |
 | `execution_anchor_unresolvable` | 3 | The session's recorded execution anchor names nothing on this machine -- the checkout was deleted or the session moved machines. Rebind the session to where the tree is now. |
 | `capture_unset` | 3 | A state's instruction text reads a `capture_stdout_as` name that no state delivered on this run. The message names the value and the state that produces it. |
+| `nested_invocation` | 2 | The tick was started from inside a command koto is running. Take the `koto next` call out of the command. |
 
 Exit code 1 means transient -- the agent can retry without changing its behavior. Exit code 2 means the agent must change something (fix the payload, pick a different target, etc.).
 
@@ -80,7 +81,7 @@ Exit code 1 means transient -- the agent can retry without changing its behavior
 |:---------:|----------|------|
 | 0 | Success | Normal response (any variant) |
 | 1 | Transient | `gate_blocked`, `integration_unavailable`, engine I/O errors |
-| 2 | Caller error | `invalid_submission`, `precondition_failed`, `terminal_state`, `workflow_not_initialized`, `execution_anchor_mismatch` |
+| 2 | Caller error | `invalid_submission`, `precondition_failed`, `terminal_state`, `workflow_not_initialized`, `execution_anchor_mismatch`, `nested_invocation` |
 | 3 | Infrastructure | Corrupt state file, template hash mismatch, template parse failure, `execution_anchor_unresolvable`, `capture_unset` |
 
 #### Execution anchoring
@@ -120,6 +121,20 @@ A state can declare a name for its command's output with `capture_stdout_as`, an
 The tick stops rather than rendering an empty string or the raw `{{BRANCH}}` token, either of which would put a placeholder into an agent's instructions. A name no state declares at all is caught earlier, when the template compiles. The fix is usually in the template: route through the producing state, or move the reference to a state that always follows it.
 
 A failed *delivery* is a different thing and does not use this code. When the command runs but its output cannot be delivered -- it is empty, it exceeds 4096 bytes, or it holds a character the value allowlist forbids -- the tick stops at the state that ran the command, through the ordinary blocked response with an `__action__` condition whose `failure_kind` is `capture_failed`.
+
+#### A tick inside a tick (exit code 2)
+
+`koto next` runs a state's `default_action` and its command gates as child processes, and those children inherit the tick's environment. Before it runs anything, the tick exports `KOTO_TICK_SESSION` naming the session it is advancing. A `koto next` that finds that variable already set was started from inside one of those commands, and refuses:
+
+```json
+{"error":{"code":"nested_invocation","message":"koto next cannot run inside a command koto is running: the tick on session 'my-workflow' spawned this process and has not finished. A nested tick advances the workflow while the outer tick keeps reporting the state it started with, so the caller is told the session is somewhere it has already left. Remove the `koto next my-workflow` call from the template's command -- the enclosing tick is what advances the session.","details":[]}}
+```
+
+The refusal is not about wasted work. A nested tick appends to the same event log the outer tick is halfway through processing: it really does advance the session, and the outer tick then finishes against the snapshot it started with and reports a state the workflow has already left. That is a wrong answer rather than a missing one, so nothing else surfaces it.
+
+Two things this does *not* cover. It refuses `koto next` only -- `koto context`, `koto status`, and the rest run from inside a command as before, and reading or writing context on the loop-back edge of a state stays a supported pattern. And it is scoped to the process tree, not to the session name: a tick on some *other* workflow is refused too, because a chain that ticks back into the outer session through a second one lands on the same defect.
+
+`KOTO_TICK_SESSION` is a marker, not an input. Nothing reads it to decide which session to act on, and a blank value counts as absent.
 
 #### Command failure kinds
 
