@@ -110,6 +110,7 @@ shared execution layer sit underneath all three.
 - Authoring documentation for `default_action`, which currently amounts to one
   table row and a Rust integration test — and which must now carry the
   bad-success/bad-failure rule.
+
 ### Out of scope
 
 - shirabe's template rewrite. It depends on this work and warrants its own run
