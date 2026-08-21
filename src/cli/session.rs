@@ -3,6 +3,7 @@ use anyhow::Result;
 use crate::cli::ChildrenPolicy;
 use crate::engine::types::{ValidatedCoordId, ValidatedSessionId};
 use crate::session::cloud::{ChildResolution, CloudBackend};
+use crate::session::recover;
 use crate::session::Backend;
 use crate::session::SessionBackend;
 
@@ -532,6 +533,137 @@ pub fn handle_list(backend: &Backend) -> Result<()> {
         }
     }
     println!("{}", serde_json::to_string_pretty(&rows)?);
+    Ok(())
+}
+
+/// Report, and with `apply` restore, the sessions the old-layout migration
+/// moved into quarantine because their name was already taken at the flat
+/// level.
+///
+/// Reporting is the default because this moves real user data. `--apply`
+/// commits, and it commits in bulk: an install that accumulated a thousand
+/// collisions is not one anybody should resolve a session at a time.
+/// `--session` narrows the set by original name for the case where somebody
+/// wants one workflow back and not the rest.
+///
+/// Idempotent by construction. A name that matches nothing in the quarantine
+/// is reported under `unmatched` rather than failing, so re-running after a
+/// successful recovery is a no-op instead of an error. The command exits
+/// non-zero only when a move was attempted and failed, which leaves that
+/// session in quarantine and the run repeatable.
+pub fn handle_recover(backend: &Backend, apply: bool, sessions: &[String]) -> Result<()> {
+    let base = backend.local_base_dir().to_path_buf();
+    let mut entries = recover::scan(&base);
+
+    let mut unmatched: Vec<&String> = Vec::new();
+    if !sessions.is_empty() {
+        for wanted in sessions {
+            let matched = entries
+                .iter()
+                .any(|e| e.session_id.as_deref() == Some(wanted.as_str()));
+            if !matched {
+                unmatched.push(wanted);
+            }
+        }
+        entries.retain(|e| {
+            e.session_id
+                .as_deref()
+                .is_some_and(|id| sessions.iter().any(|s| s == id))
+        });
+    }
+
+    let mut rows = Vec::with_capacity(entries.len());
+    let (mut recovered, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+
+    for entry in &entries {
+        let mut row = serde_json::json!({
+            "repo_id": entry.repo_id,
+            "session": entry.session_id,
+            "path": entry.path.display().to_string(),
+            "recovered_as": entry.proposed_id(),
+        });
+
+        if !apply {
+            match entry.proposed_id() {
+                Some(_) => {
+                    row["status"] = serde_json::json!("pending");
+                }
+                None => {
+                    skipped += 1;
+                    row["status"] = serde_json::json!("skipped");
+                    row["reason"] = serde_json::json!(
+                        "no state file, or a name that would not be a valid session id"
+                    );
+                }
+            }
+            rows.push(row);
+            continue;
+        }
+
+        match recover::recover_one(&base, entry) {
+            recover::Outcome::Recovered {
+                id,
+                header_rewritten,
+            } => {
+                recovered += 1;
+                row["status"] = serde_json::json!("recovered");
+                row["recovered_as"] = serde_json::json!(id);
+                row["header_rewritten"] = serde_json::json!(header_rewritten);
+                if !header_rewritten {
+                    row["reason"] = serde_json::json!(
+                        "state file header could not be parsed, so its workflow field \
+                         still names the old id; the session itself is back in place"
+                    );
+                }
+            }
+            recover::Outcome::Skipped(reason) => {
+                skipped += 1;
+                row["status"] = serde_json::json!("skipped");
+                row["reason"] = serde_json::json!(reason);
+            }
+            recover::Outcome::Failed(reason) => {
+                failed += 1;
+                row["status"] = serde_json::json!("failed");
+                row["reason"] = serde_json::json!(reason);
+            }
+        }
+        rows.push(row);
+    }
+
+    let mut report = serde_json::json!({
+        "quarantine_dir": recover::quarantine_root(&base).display().to_string(),
+        "applied": apply,
+        "sessions": rows,
+        "summary": {
+            "total": entries.len(),
+            "recovered": recovered,
+            "skipped": skipped,
+            "failed": failed,
+        },
+        "unmatched": unmatched,
+    });
+
+    if !apply && entries.len() > skipped {
+        report["hint"] = serde_json::json!(
+            "run `koto session recover --apply` to move these back into the session list"
+        );
+    }
+    if backend.is_cloud() {
+        report["note"] = serde_json::json!(
+            "recovery works on the local session store; recovered sessions are not \
+             pushed to the configured bucket by this command"
+        );
+    }
+
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    if failed > 0 {
+        anyhow::bail!(
+            "{} session(s) could not be recovered and are still in {}",
+            failed,
+            recover::quarantine_root(&base).display()
+        );
+    }
     Ok(())
 }
 

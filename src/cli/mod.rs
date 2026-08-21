@@ -476,6 +476,25 @@ pub enum SessionCommand {
         #[arg(long)]
         intent: String,
     },
+
+    /// List, and optionally restore, sessions the old-layout migration set
+    /// aside because their name was already taken.
+    ///
+    /// Reports without touching anything by default. `--apply` performs the
+    /// moves. Each session comes back as `r<repo-id>-<name>`, which is
+    /// unique per originating repository and keeps parent/child pairs
+    /// together. Nothing is deleted and no existing session is written over.
+    Recover {
+        /// Perform the moves. Without it the command only reports what it
+        /// would do.
+        #[arg(long)]
+        apply: bool,
+
+        /// Limit to quarantined sessions with this name. Repeat for
+        /// several. Without it, every quarantined session is in scope.
+        #[arg(long = "session", value_name = "NAME")]
+        sessions: Vec<String>,
+    },
 }
 
 /// Policy for reconciling a parent's children during `session resolve`.
@@ -1340,6 +1359,9 @@ pub fn run(app: App) -> Result<()> {
                     keep,
                     children,
                 } => session::handle_resolve(&backend, &name, &keep, children),
+                SessionCommand::Recover { apply, sessions } => {
+                    session::handle_recover(&backend, apply, &sessions)
+                }
                 SessionCommand::Update { name, intent } => {
                     session::handle_update(&backend, &name, &intent)?;
                     println!(

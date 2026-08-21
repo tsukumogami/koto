@@ -52,6 +52,17 @@ fn migration_conflict_notice_goes_to_stderr_not_stdout() {
         "migration notice leaked onto stdout: {stdout:?}"
     );
 
+    // The run closes by naming the way out of the quarantine, and that
+    // pointer is a diagnostic too: same stream, same rule.
+    assert!(
+        stderr.contains("koto session recover"),
+        "the notice should name the command that restores the session, got stderr: {stderr:?}"
+    );
+    assert!(
+        !stdout.contains("koto session recover"),
+        "the recovery pointer leaked onto stdout: {stdout:?}"
+    );
+
     // stdout must carry only the command result: a single JSON value.
     let trimmed = stdout.trim();
     serde_json::from_str::<serde_json::Value>(trimmed)

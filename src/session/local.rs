@@ -50,6 +50,15 @@ impl LocalBackend {
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
         Self { base_dir }
     }
+
+    /// The directory sessions are stored under.
+    ///
+    /// Exposed so maintenance verbs that work on the store as a whole --
+    /// `koto session recover` walking the migration quarantine, for one --
+    /// can address it without duplicating the home-directory lookup.
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
 }
 
 impl SessionBackend for LocalBackend {
@@ -322,41 +331,10 @@ impl SessionBackend for LocalBackend {
             )
         })?;
 
-        // Step 2: Rename the state file inside the (now renamed) directory.
-        let old_state_in_new_dir = to_dir.join(state_file_name(from));
-        let new_state = to_dir.join(state_file_name(to));
-        fs::rename(&old_state_in_new_dir, &new_state).with_context(|| {
-            format!(
-                "failed to rename state file {} -> {}",
-                old_state_in_new_dir.display(),
-                new_state.display()
-            )
-        })?;
-
-        // Step 3: Rewrite the header to update `workflow` and `parent_workflow`.
-        let mut header = persistence::read_header(&new_state)
-            .with_context(|| format!("failed to read header from {}", new_state.display()))?;
-
-        header.workflow = to.to_string();
-        header.parent_workflow = to.rsplit_once('.').map(|(parent, _)| parent.to_string());
-
-        // Read the entire file, replace the first line, write it back.
-        let content = fs::read_to_string(&new_state)
-            .with_context(|| format!("failed to read state file {}", new_state.display()))?;
-        let mut lines: Vec<&str> = content.lines().collect();
-
-        let new_header_line =
-            serde_json::to_string(&header).expect("StateFileHeader serialize is infallible");
-
-        if lines.is_empty() {
-            anyhow::bail!("state file {} is empty", new_state.display());
-        }
-        lines[0] = &new_header_line;
-
-        let new_content = lines.join("\n") + "\n";
-        fs::write(&new_state, new_content.as_bytes()).with_context(|| {
-            format!("failed to write updated state file {}", new_state.display())
-        })?;
+        // Steps 2 and 3: rename the state file inside the (now renamed)
+        // directory and rewrite the header's identity fields.
+        rename_state_file(&to_dir, from, to)?;
+        rewrite_header_identity(&to_dir, to)?;
 
         Ok(())
     }
@@ -649,6 +627,64 @@ pub(crate) fn repo_id(working_dir: &Path) -> anyhow::Result<String> {
     Ok(hash[..16].to_string())
 }
 
+/// Rename a session's state file inside `dir` from the `from` identity to
+/// the `to` identity.
+///
+/// A session directory and the state file it holds carry the same name
+/// (`<id>/koto-<id>.state.jsonl`), so renaming the directory alone leaves a
+/// session that `exists()` and `list()` both look straight past. Every caller
+/// that renames a session directory has to follow with this.
+pub(crate) fn rename_state_file(dir: &Path, from: &str, to: &str) -> anyhow::Result<()> {
+    let old_state = dir.join(state_file_name(from));
+    let new_state = dir.join(state_file_name(to));
+    fs::rename(&old_state, &new_state).with_context(|| {
+        format!(
+            "failed to rename state file {} -> {}",
+            old_state.display(),
+            new_state.display()
+        )
+    })
+}
+
+/// Rewrite the `workflow` and `parent_workflow` fields of the header line in
+/// `dir`'s state file so they agree with the session's new identity `to`.
+///
+/// `parent_workflow` is derived from the name rather than carried over,
+/// because a session's parent is the dotted prefix of its own id: renaming
+/// `a.b` to `c.b` moves it under `c`. A new name with no dot has no parent.
+///
+/// Fails when the header cannot be read. Callers that only rename live
+/// sessions (`relocate`) treat that as fatal; callers that may be handed an
+/// already-corrupt state file (recovery) decide for themselves.
+pub(crate) fn rewrite_header_identity(dir: &Path, to: &str) -> anyhow::Result<()> {
+    let state = dir.join(state_file_name(to));
+
+    let mut header = persistence::read_header(&state)
+        .with_context(|| format!("failed to read header from {}", state.display()))?;
+
+    header.workflow = to.to_string();
+    header.parent_workflow = to.rsplit_once('.').map(|(parent, _)| parent.to_string());
+
+    // Read the entire file, replace the first line, write it back.
+    let content = fs::read_to_string(&state)
+        .with_context(|| format!("failed to read state file {}", state.display()))?;
+    let mut lines: Vec<&str> = content.lines().collect();
+
+    let new_header_line =
+        serde_json::to_string(&header).expect("StateFileHeader serialize is infallible");
+
+    if lines.is_empty() {
+        anyhow::bail!("state file {} is empty", state.display());
+    }
+    lines[0] = &new_header_line;
+
+    let new_content = lines.join("\n") + "\n";
+    fs::write(&state, new_content.as_bytes())
+        .with_context(|| format!("failed to write updated state file {}", state.display()))?;
+
+    Ok(())
+}
+
 /// Directory that holds old-layout sessions whose name was already taken
 /// at the flat level when migration ran.
 ///
@@ -656,6 +692,10 @@ pub(crate) fn repo_id(working_dir: &Path) -> anyhow::Result<String> {
 /// state file at `<dir>/<state_file_name(dir_name)>`, and this container
 /// holds per-repo subdirectories rather than a state file, so it never
 /// surfaces as a session.
+///
+/// Quarantine is a holding pen, not a destination:
+/// [`crate::session::recover`] walks this tree and moves what it finds back
+/// into the flat namespace under a name that no longer collides.
 pub(crate) const MIGRATION_CONFLICT_DIR: &str = ".migration-conflicts";
 
 /// Pick a free path for a quarantined session under `dir`.
@@ -691,11 +731,17 @@ fn quarantine_destination(dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf>
 /// destination. Moving it is what lets the old-layout directory drain so
 /// the trailing `remove_dir` succeeds; leaving it in place kept the
 /// directory alive and reprinted the same notice on every invocation.
+///
+/// Quarantining a session takes it out of the flat namespace, so the run
+/// closes with one line pointing at `koto session recover`, which is what
+/// puts those sessions back within reach.
 fn migrate_if_needed(base: &Path) {
     let entries = match fs::read_dir(base) {
         Ok(e) => e,
         Err(_) => return,
     };
+
+    let mut quarantined_count = 0usize;
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -748,12 +794,15 @@ fn migrate_if_needed(base: &Path) {
                     continue;
                 };
                 match fs::rename(session_entry.path(), &quarantined) {
-                    Ok(()) => eprintln!(
-                        "koto: migration conflict {}: session already exists at {}; the old-layout copy was moved to {}",
-                        session_name.to_string_lossy(),
-                        dest.display(),
-                        quarantined.display()
-                    ),
+                    Ok(()) => {
+                        quarantined_count += 1;
+                        eprintln!(
+                            "koto: migration conflict {}: session already exists at {}; the old-layout copy was moved to {}",
+                            session_name.to_string_lossy(),
+                            dest.display(),
+                            quarantined.display()
+                        )
+                    }
                     Err(e) => eprintln!(
                         "koto: migration conflict {}: session already exists at {}, and the old-layout copy could not be moved to {}: {}",
                         session_name.to_string_lossy(),
@@ -784,6 +833,14 @@ fn migrate_if_needed(base: &Path) {
             );
         }
         let _ = fs::remove_dir(&old_dir);
+    }
+
+    if quarantined_count > 0 {
+        eprintln!(
+            "koto: {} session(s) were moved aside as name collisions and are not listed; \
+             run `koto session recover` to see them and `koto session recover --apply` to restore them",
+            quarantined_count
+        );
     }
 }
 
@@ -2323,6 +2380,70 @@ mod tests {
         let backend = LocalBackend::with_base_dir(tmp.path().to_path_buf());
         let ids: Vec<String> = backend.list().unwrap().into_iter().map(|s| s.id).collect();
         assert_eq!(ids, vec!["conflict".to_string()]);
+    }
+
+    /// koto#193's actual defect, end to end: a session whose name was taken
+    /// at the flat level had no way back into the session list, on any
+    /// number of invocations. Migration strands it here, and recovery is
+    /// what returns it.
+    ///
+    /// The two halves have to be tested together. Quarantine on its own
+    /// looks correct -- nothing is deleted -- while leaving the session
+    /// exactly as unreachable as the skip it replaced.
+    #[test]
+    fn a_quarantined_session_is_reachable_again_after_recovery() {
+        use crate::session::recover;
+
+        let tmp = TempDir::new().unwrap();
+        let repo_id = "abcdef1234567890";
+
+        // Two different repositories used the same workflow name. One of
+        // them is already at the flat level; the other is still in the old
+        // layout with a real state file.
+        write_state_file(tmp.path(), "deploy", "2026-01-01T00:00:00Z");
+        let old_dir = tmp.path().join(repo_id);
+        fs::create_dir_all(&old_dir).unwrap();
+        write_state_file(&old_dir, "deploy", "2025-06-01T00:00:00Z");
+
+        migrate_if_needed(tmp.path());
+
+        let backend = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        let after_migration: Vec<String> =
+            backend.list().unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(
+            after_migration,
+            vec!["deploy".to_string()],
+            "the migration cannot list both, which is the condition being recovered from"
+        );
+
+        let quarantined = recover::scan(tmp.path());
+        assert_eq!(quarantined.len(), 1);
+        for entry in &quarantined {
+            let outcome = recover::recover_one(tmp.path(), entry);
+            assert!(
+                matches!(outcome, recover::Outcome::Recovered { .. }),
+                "{outcome:?}"
+            );
+        }
+
+        let after_recovery: Vec<String> =
+            backend.list().unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(
+            after_recovery,
+            vec!["deploy".to_string(), "rabcdef1234567890-deploy".to_string()],
+            "both sessions must be listable once recovery has run"
+        );
+
+        // The recovered one is the old-layout copy, not a second view of the
+        // session that won the flat name.
+        let recovered = backend
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "rabcdef1234567890-deploy")
+            .unwrap();
+        assert_eq!(recovered.created_at, "2025-06-01T00:00:00Z");
+        assert!(backend.exists("rabcdef1234567890-deploy"));
     }
 
     /// Every path under `root`, relative and sorted, for comparing a

@@ -167,6 +167,6 @@ Verify the Stop hook fails silently when koto isn't available or no workflow is 
 
 ## Notes
 
-- These tests assume session storage at `~/.koto/sessions/<repo-id>/<name>/`. Use `koto session dir <name>` to find the exact path for a given session.
+- These tests assume session storage at `~/.koto/sessions/<name>/`. Use `koto session dir <name>` to find the exact path for a given session.
 - The Stop hook relies on `koto workflows` checking for active sessions. Run all tests from the project root.
 - If Test 1 fails, Tests 2 and 3 can still be run by copying the skill files manually into `.claude/skills/hello-koto/` and running `koto init` directly.

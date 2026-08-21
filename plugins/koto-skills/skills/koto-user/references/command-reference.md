@@ -21,6 +21,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session dir` | Runner — primary |
 | `koto session list` | Runner — primary |
 | `koto session cleanup` | Runner — primary |
+| `koto session recover` | Operator — one-time migration recovery |
 | `koto session resolve` | Runner — cloud backend only |
 | `koto status` | Runner — primary |
 | `koto request create/bind/get/wait/list` | Runner — coordinator |
@@ -652,9 +653,47 @@ Under normal operation, `koto next` auto-cleans on terminal state unless `--no-c
 
 ---
 
+## koto session recover
+
+```
+koto session recover [--apply] [--session <name>]...
+```
+
+Reports, and with `--apply` restores, sessions the old-layout migration moved aside because their name was already taken.
+
+koto used to namespace sessions by repository (`~/.koto/sessions/<repo-id>/<name>/`) and now uses one flat namespace. A name reused across repositories has several old-layout sources and one destination, so only one of them keeps the name; the others land in `~/.koto/sessions/.migration-conflicts/<repo-id>/<name>/` and stop appearing in `koto session list` or `koto workflows`. The migration says so once, naming this command.
+
+Without `--apply` the command only reports. `--session <name>` narrows the set by original name and is repeatable; a name that matches nothing comes back under `unmatched` rather than failing.
+
+**Success output:**
+```json
+{
+  "quarantine_dir": "/home/user/.koto/sessions/.migration-conflicts",
+  "applied": true,
+  "sessions": [
+    {
+      "repo_id": "0123456789abcdef",
+      "session": "deploy",
+      "path": "/home/user/.koto/sessions/.migration-conflicts/0123456789abcdef/deploy",
+      "recovered_as": "r0123456789abcdef-deploy",
+      "status": "recovered",
+      "header_rewritten": true
+    }
+  ],
+  "summary": {"total": 1, "recovered": 1, "skipped": 0, "failed": 0},
+  "unmatched": []
+}
+```
+
+A session returns as `r<repo-id>-<name>`. The repo-id leads rather than trails so that a parent and its children keep pointing at each other — a session's parent is the dotted prefix of its own name. Recovery moves and never deletes, and never writes over an existing session: if the name is taken it uses `r<repo-id>-<name>-2`.
+
+Exits non-zero only when a move was attempted and failed. Those sessions stay in quarantine, so the command can simply be run again.
+
+---
+
 ## koto session rebind — not implemented
 
-Both execution-anchor refusals tell you to run `koto session rebind <session> --to <dir>`. **The subcommand does not exist.** `koto session` offers `start`, `dir`, `list`, `cleanup`, `resolve`, and `update`, and nothing else.
+Both execution-anchor refusals tell you to run `koto session rebind <session> --to <dir>`. **The subcommand does not exist.** `koto session` offers `start`, `dir`, `list`, `cleanup`, `recover`, `resolve`, and `update`, and nothing else.
 
 Until it ships: repair an `execution_anchor_mismatch` by running `koto next` from the directory the message names, and an `execution_anchor_unresolvable` by putting the checkout back at the path the message names. Route on `error.code` rather than the message text — the wording changes when the subcommand lands.
 

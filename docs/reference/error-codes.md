@@ -14,7 +14,7 @@ Three surfaces use a structured envelope instead, where `error` is an object car
 
 ### init
 
-**Workflow already exists** — a session for this name already exists under `~/.koto/sessions/<repo-id>/<name>/` (its `koto-<name>.state.jsonl` state file is present):
+**Workflow already exists** — a session for this name already exists under `~/.koto/sessions/<name>/` (its `koto-<name>.state.jsonl` state file is present):
 
 ```json
 {"error":"workflow 'my-workflow' already exists","command":"init"}
