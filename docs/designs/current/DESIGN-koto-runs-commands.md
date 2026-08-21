@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-koto-runs-commands.md
 problem: |
   `default_action` runs a command and then loses everything about it: the
@@ -42,7 +42,7 @@ rationale: |
 
 ## Status
 
-Accepted
+Planned
 
 ## Upstream Design Reference
 
