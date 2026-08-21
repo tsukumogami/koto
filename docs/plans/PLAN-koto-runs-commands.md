@@ -611,6 +611,12 @@ their terminal statuses.
       before the pull request flips out of draft.
 - [ ] `shirabe validate --lifecycle-chain` passes on the chain after the transitions.
 
+**Note on the DESIGN's location**: the DESIGN already sits at
+`docs/designs/current/DESIGN-koto-runs-commands.md` while at status `Planned`, ahead of
+the `Planned -> Current` transition that normally carries the directory move. It was
+moved early during the planning chain and validates clean there. So the final transition
+is status-only — do not expect a `git mv` to be outstanding, and do not add one.
+
 **Dependencies**: Blocked by Issue 3, Issue 10, Issue 13, Issue 14
 
 **Type**: task
