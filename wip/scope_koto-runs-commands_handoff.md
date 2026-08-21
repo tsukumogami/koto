@@ -1,5 +1,12 @@
 # /scope Handoff: koto-runs-commands
 
+> **This handoff consolidates two explorations.** `koto-runs-commands` asked
+> whether koto should run the mechanical commands shirabe's workflows hand to
+> agents. `koto-command-authority` re-asked the scope question after the author
+> ruled on where consent lives, and corrected three of this document's premises.
+> Both sets of research are on this branch under `wip/research/`. There is one
+> chain, not two — run `/scope koto-runs-commands` once.
+
 ## Author Ruling — read first
 
 Recorded 2026-08-20, after the exploration concluded, in response to the
@@ -55,7 +62,13 @@ the chain here because every open design question is koto's. The files:
   twenty-one lead files plus two rounds of orchestrator probes run against the
   shipped `koto 0.11.6` binary.
 
-Three discover-converge rounds. Round 1 established what exists. Round 2
+A second exploration, `koto-command-authority`, ran afterward on this branch:
+`wip/explore_koto-command-authority_findings.md`, its decisions and crystallize
+files, and eight lead files under `wip/research/explore_koto-command-authority_*`.
+It exists because the Author Ruling above arrived after this handoff was first
+written, and it re-answered the scope question under it.
+
+Three discover-converge rounds in the first exploration. Round 1 established what exists. Round 2
 designed the koto-side changes, mapped both templates state by state, and ran an
 adversarial lead against the whole premise. Round 3 adjudicated the resulting
 disagreement, swept for missed surface, and sequenced the work. The author
@@ -88,7 +101,12 @@ shared execution layer sit underneath all three.
 - A durable statement of which commands an engine should run and which belong to
   the agent, so template authors can apply it without re-deriving it.
 - Authoring documentation for `default_action`, which currently amounts to one
-  table row and a Rust integration test.
+  table row and a Rust integration test — and which must now carry the
+  bad-success/bad-failure rule.
+- Template trust: binding a specific template to a reviewed hash at the moment
+  `koto init` accepts it, and deciding where the expected value lives.
+- Bounding what the event log records, without losing the failure diagnosability
+  this chain is otherwise building toward.
 
 ### Out of scope
 
@@ -142,12 +160,128 @@ shared execution layer sit underneath all three.
   across 63 packages on the tsuku monorepo emits 3,793 bytes, well under the
   trigger, and only one of eleven shipped gates writes captured stdout at all.
 
+## What the Second Exploration Changed
+
+Six findings from `koto-command-authority` alter what this chain should specify.
+Three of them correct premises stated elsewhere in this document.
+
+**The authoring rule that governs conversion is now stated, and it is durable.**
+Reversibility has two axes, and only the second governs: not "can the local
+artifact be reset" but "does the command fire an externally-visible event that
+cannot be un-fired." `gh pr close` undoes a `gh pr create`'s state and not its
+notification. The operative question for a template author is therefore **whether
+a command's risk lives in a bad success or a bad failure.** Risk in a bad failure
+is fixed by the action-output plumbing this chain already scopes. Risk in a bad
+success is fixed by nothing on any roadmap, because a post-hoc signal cannot gate
+an event that already happened. Commands of the second kind stay agent-run
+permanently — a durable rule, not a sequencing constraint. Write it into whatever
+authoring guidance this chain produces; it is the single most reusable output of
+either exploration.
+
+**Applied, that rule moves specific commands.** Both `gh pr create` sites and
+`gh pr ready` are permanently agent-run: each fires an unrecallable notification
+the instant it succeeds, and in the PR case consumes an identifier. `git push` to
+a branch you solely own, before any PR references it, stays convertible — nobody
+watches that ref. Two disagreements survive deliberately and this chain should
+settle them with the argument visible: whether the finalization cascade's push
+and `--force-with-lease` belong with `gh pr create` or on the plumbing-then-
+convert path (the case for the latter: they push to an already-open PR, firing a
+quiet synchronize rather than a loud open, and `--force-with-lease` refuses
+itself atomically before rewriting history), and whether `gh pr edit` on the
+run's own draft is quiet enough to convert.
+
+**`requires_confirmation` is a misnomer, not a late checkpoint — and this
+document under-stated it.** It executes unconditionally and only afterward
+branches on the flag (`src/cli/mod.rs:3985-4048`), which fails the stated
+acceptance criterion of koto issue #71, "preventing auto-execution," and
+contradicts its own design doc's security section while matching that doc's
+architecture section. It shipped through PR #75 with no review comments, and a
+test at `advance.rs:2878-2936` encodes a `create-pr` action reporting
+"PR #42 created" as confirmation output. Recommended treatment: rename it and
+write the authoring rule above, rather than build confirm-before-execute — which
+is buildable (new stop reason, hash-bound approval so an approval cannot be
+replayed against a different command, rewind invalidation, a third branch in the
+override-evidence check) but expensive and, given the rule, unnecessary.
+
+**Anchoring's promise must be scoped down in its own design.** It guarantees the
+directory a session can be ticked from. It does not bound what an authorized
+command reaches — a command can name absolute paths or `cd` away regardless.
+Every option that would close that gap (path allowlists, containers, restricted
+users, Linux namespaces, destructive-pattern denylists) either collapses into
+unenforced documentation or breaks koto's single-binary, no-sudo, four-platform
+distribution. Say so plainly rather than let "guard" imply containment. One
+implementation trap to fix before it ships: `Path::join` silently discards
+containment when `working_dir` is absolute, so that case must be rejected ahead
+of the join. Ship root-plus-refuse-plus-safe-join as one inseparable increment,
+then the bind verb and structured errors.
+
+**Template trust is new scope, and half of it already exists.** Under the ruling
+the template is where authority is granted, and nothing treats it as such. Every
+template route resolves to a local-disk read (`src/template/compile.rs:156-157`)
+— no network or cloud source anywhere — so the trust decision happens once, at
+install or authoring time. koto already computes a SHA-256 of the compiled
+template and fail-closed re-verifies it on nearly every mutating command
+(`src/cli/mod.rs:3210-3226`, `4750-4767`; `src/cli/overrides.rs:178-199`), but
+that pins an already-accepted template against mid-run change; nothing asks
+whether accepting it was right. Meanwhile Claude Code already lets a marketplace
+entry pin a git-backed plugin to an exact commit `sha` that takes precedence over
+`ref`, and archive sources carry a real `sha256`. So "which revision am I
+running" is solvable with configuration today; "is this template the one that was
+reviewed" is the half worth building, most cheaply as an optional `--expect-hash`
+on `koto init` reusing `sha256_hex` and `compile_cached`. Open: where the
+expected value lives — koto-side, a shirabe release manifest, or an argument the
+skill passes.
+
+**The event log's exposure is the `command` field, not stdout.** This document's
+upstream design doc claims state files are committed to feature branches; that is
+stale and has been since session storage moved to `~/.koto/sessions/`. The live
+distribution path is the opt-in cloud sync, which uploads the whole state file to
+a team-shared bucket after every mutating call with no client-side encryption.
+stdout and stderr are capped at 64KB — the only enforced content bound — while
+the post-substitution `command` string, gate-override payloads, evidence fields,
+and init-time variables are unbounded with no redaction anywhere. A secret
+interpolated into a command's own arguments is written down verbatim even when
+the command prints nothing. Gate commands never capture stdout at all, and since
+neither template uses `default_action` yet, exposure through this mechanism is
+currently zero. Bounding it fights the debuggability goal this chain already has,
+so the resolution is about where output travels rather than whether it is
+captured.
+
+## Work That Should Not Wait For This Chain
+
+Four items are one-file changes needing no design, on top of the six defect fixes
+the first exploration named. File them and land them independently:
+
+- Give `pr_creation` a verifying gate. It has no `gates:` block at all
+  (`work-on.md:695`); the state's only truth is the agent's self-reported
+  `pr_status` enum. The idiom `execute.md:397` already uses works:
+  `gh pr list --head "$(git rev-parse --abbrev-ref HEAD)" --json number --jq '.[0].number' | grep -q .`.
+  Everyone citing agent-runs-it-with-a-gate as the defensible pattern is citing
+  something that is currently agent self-report with nothing verifying it.
+- Reject an absolute `working_dir` explicitly ahead of the `Path::join`.
+- Extend shirabe's release checksums to cover templates. The workflow already
+  runs `sha256sum shirabe-*` (`.github/workflows/release-binaries.yml:93-112`)
+  for the binary; the artifact that grants command authority is published with no
+  integrity metadata at all.
+- Document `sha` pinning for the shirabe plugin entry. It is a supported control
+  that exists today and costs a line.
+
 ## Coverage Notes
 
 - **Whether koto-store writes count as side effects** under the conversion
   principle is unresolved, and it is the hinge for how much of `/work-on`
   remains convertible. The principle names git and remote mutations; a write to
   koto's own context store is a different risk class and nobody decided which.
+- **Where the expected template hash lives**: a koto-side trusted-templates file,
+  a shirabe release manifest, or an argument the skill passes at `koto init`.
+  koto has no plugin concept to hang trust on, which argues for the latter two.
+- **What bounding the `command` field costs the audit trail.** Capping or hashing
+  it protects against interpolated secrets and degrades the record the log exists
+  to keep. Nobody scoped the trade.
+- **The rename's blast radius.** How many templates, docs, tests, and skill files
+  reference `requires_confirmation` was not counted.
+- **Whether `sha` pinning fits how this workspace expects plugin updates to
+  arrive.** Worth checking before recommending it as practice.
 - **The retry-clearing question needs a shirabe decision this chain cannot
   make.** `docs/designs/current/DESIGN-work-on-retry-clearing.md` is marked
   Current and chose manual clear-and-verify deliberately, reasoning that a
