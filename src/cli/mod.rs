@@ -128,6 +128,13 @@ pub enum Command {
         /// Human-readable description of the workflow's goal
         #[arg(long)]
         intent: Option<String>,
+
+        /// Directory this session's commands run in (its execution
+        /// anchor). Defaults to the directory `koto init` is run in,
+        /// or to the parent session's anchor when `--parent` is given.
+        /// Every later `koto next` must run there or beneath it.
+        #[arg(long, value_name = "DIR")]
+        execution_dir: Option<String>,
     },
 
     /// Get the current state directive for a workflow
@@ -1113,8 +1120,22 @@ pub fn run(app: App) -> Result<()> {
             vars,
             parent,
             intent,
+            execution_dir,
         } => {
             let backend = build_backend()?;
+            // Resolve `--execution-dir` once, before either init path:
+            // a directory that does not resolve is a caller error, and
+            // both paths record the canonical form.
+            let execution_dir = execution_dir.map(|dir| match std::fs::canonicalize(&dir) {
+                Ok(canonical) => canonical,
+                Err(e) => exit_with_error_code(
+                    serde_json::json!({
+                        "error": format!("--execution-dir {}: {}", dir, e),
+                        "command": "init"
+                    }),
+                    2,
+                ),
+            });
             if from_stdin {
                 // --from-stdin is the inline (strict-only) path. Reject the
                 // two incompatible flag combinations before reading stdin
@@ -1156,7 +1177,14 @@ pub fn run(app: App) -> Result<()> {
                 std::io::Read::read_to_end(&mut std::io::stdin(), &mut source_bytes)
                     .map_err(|e| anyhow::anyhow!("failed to read stdin: {}", e))?;
 
-                handle_init_inline(&backend, &name, &source_bytes, &vars, intent.as_deref())
+                handle_init_inline(
+                    &backend,
+                    &name,
+                    &source_bytes,
+                    &vars,
+                    intent.as_deref(),
+                    execution_dir.as_deref(),
+                )
             } else {
                 let template = template.unwrap_or_else(|| {
                     exit_with_error_code(
@@ -1174,6 +1202,7 @@ pub fn run(app: App) -> Result<()> {
                     &vars,
                     parent.as_deref(),
                     intent.as_deref(),
+                    execution_dir.as_deref(),
                 )
             }
         }
@@ -1757,6 +1786,7 @@ fn handle_init(
     vars: &[String],
     parent: Option<&str>,
     intent: Option<&str>,
+    execution_dir: Option<&Path>,
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation.
     if let Err(msg) = crate::discover::validate_workflow_name(name) {
@@ -1813,9 +1843,16 @@ fn handle_init(
     // R8 spawn-time immutability snapshot is populated only by the
     // future batch scheduler, which calls this helper directly with
     // `Some(..)`.
-    if let Err(err) =
-        init_child_from_parent(backend, parent, name, template_path, vars, &mut cache, None)
-    {
+    if let Err(err) = init_child::init_child_from_parent_at(
+        backend,
+        parent,
+        name,
+        template_path,
+        vars,
+        &mut cache,
+        None,
+        execution_dir,
+    ) {
         match err.kind {
             SpawnErrorKind::Collision => {
                 // Match the pre-check's error text so callers can rely
@@ -1925,6 +1962,7 @@ fn handle_init_inline(
     source_bytes: &[u8],
     vars: &[String],
     intent: Option<&str>,
+    execution_dir: Option<&Path>,
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation. Guards
     // `<name>` against path traversal (no `/`, `..`, or `~`).
@@ -1952,7 +1990,9 @@ fn handle_init_inline(
         }));
     }
 
-    if let Err(e) = init_child::init_inline_from_stdin_bytes(backend, name, source_bytes, vars) {
+    if let Err(e) =
+        init_child::init_inline_from_stdin_bytes(backend, name, source_bytes, vars, execution_dir)
+    {
         // Variable-resolution failures are caller errors (exit 2); a
         // strict-compile / validation failure or any I/O error is exit 1.
         // The seam prefixes var-resolution errors so we can classify them
@@ -2936,8 +2976,9 @@ fn handle_next(
 ) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
-        blocking_conditions_from_gates, ErrorDetail, ExpectsSchema, IntegrationOutput,
-        IntegrationUnavailableMarker, NextError, NextErrorCode, NextResponse, RECOVERY_POINTER,
+        blocking_conditions_from_gates, execution_anchor_adopted_notice, ErrorDetail,
+        ExpectsSchema, IntegrationOutput, IntegrationUnavailableMarker, NextError, NextErrorCode,
+        NextResponse, RECOVERY_POINTER,
     };
     use crate::engine::advance::{
         advance_until_stop, merge_epoch_evidence, ActionResult, AdvanceError, IntegrationError,
@@ -2946,6 +2987,7 @@ fn handle_next(
     use crate::engine::evidence::validate_evidence;
     use crate::engine::persistence::{derive_evidence, instructions_delivered_this_window};
     use crate::engine::substitute::Variables;
+    use crate::engine::template_source_status::{check_execution_anchor, ExecutionAnchorCheck};
     use crate::gate::evaluate_gates;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -3124,7 +3166,7 @@ fn handle_next(
         exit_with_error_code(json, err.code.exit_code());
     }
 
-    let (header, events) = match backend.read_events(&name) {
+    let (mut header, events) = match backend.read_events(&name) {
         Ok(result) => result,
         Err(err) => {
             let ne = NextError {
@@ -3204,6 +3246,98 @@ fn handle_next(
         });
         exit_with_error_code(json, 66);
     }
+
+    // The execution anchor (Decision 6 / 7 in
+    // DESIGN-koto-runs-commands.md). This runs before the template is
+    // read, before variables are bound, and before any gate or action
+    // closure exists, so "no action executed, no gate evaluated, no
+    // transition" holds because there is nothing here that could do
+    // any of those -- not because a later branch remembers to check.
+    //
+    // What it binds is where this session's commands *start*. A
+    // command that runs is still free to name absolute paths or change
+    // directory; nothing here bounds what it can reach.
+    let mut anchor_adopted: Option<PathBuf> = None;
+    let execution_dir = match check_execution_anchor(header.execution_dir.as_deref(), &current_dir)
+    {
+        ExecutionAnchorCheck::Satisfied { anchor } => anchor,
+        ExecutionAnchorCheck::Adopt { anchor } => {
+            // R14: a session written before anchoring existed adopts
+            // the directory it is ticked from. The event goes down
+            // first so a crash between the two writes repeats a
+            // visible adoption rather than leaving a silent one; the
+            // header field is what makes the next tick take the
+            // ordinary path.
+            let payload = EventPayload::ExecutionAnchorAdopted {
+                anchor: anchor.clone(),
+            };
+            if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
+                let ne = NextError {
+                    code: NextErrorCode::PersistenceError,
+                    message: format!("failed to record execution anchor adoption: {}", e),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": ne});
+                exit_with_error_code(json, ne.code.exit_code());
+            }
+            let state_path = backend
+                .session_dir(&name)
+                .join(crate::session::state_file_name(&name));
+            let recorded = anchor.clone();
+            if let Err(e) = crate::engine::claim::rewrite_header_atomically(&state_path, |mut h| {
+                h.execution_dir = Some(recorded);
+                h
+            }) {
+                let ne = NextError {
+                    code: NextErrorCode::PersistenceError,
+                    message: format!("failed to record execution anchor: {}", e),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": ne});
+                exit_with_error_code(json, ne.code.exit_code());
+            }
+            header.execution_dir = Some(anchor.clone());
+            anchor_adopted = Some(anchor.clone());
+            anchor
+        }
+        ExecutionAnchorCheck::Unresolvable { status } => {
+            let machine = match &status.machine_id {
+                Some(id) => format!(" ({})", id),
+                None => String::new(),
+            };
+            let err = NextError {
+                code: NextErrorCode::ExecutionAnchorUnresolvable,
+                message: format!(
+                    "workflow '{}' is bound to {}, which does not resolve on this machine{}; \
+                     run `koto session rebind {} --to <dir>` if the checkout moved",
+                    name,
+                    status.path.display(),
+                    machine,
+                    name,
+                ),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code());
+        }
+        ExecutionAnchorCheck::Outside { anchor, cwd } => {
+            let err = NextError {
+                code: NextErrorCode::ExecutionAnchorMismatch,
+                message: format!(
+                    "workflow '{}' is bound to {}; `koto next` must run from that directory \
+                     or one beneath it, not {}. Run `koto session rebind {} --to <dir>` if \
+                     the checkout moved",
+                    name,
+                    anchor.display(),
+                    cwd.display(),
+                    name,
+                ),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code());
+        }
+    };
 
     // Construct variable bindings from the WorkflowInitialized event.
     // Re-validates values as defense in depth; exits with infrastructure error on failure.
@@ -3484,6 +3618,17 @@ fn handle_next(
                     .and_then(|p| discover_abandoned_leg(backend, &name, p, &events));
                 let resp = match &abandoned_leg {
                     Some(a) => resp.with_directive_prefix(&a.directive_prefix()),
+                    None => resp,
+                };
+
+                // The anchor-adoption notice, spliced last so it is
+                // the first thing the agent reads: it reports a
+                // binding that was just created, which every later
+                // tick of this session is judged against.
+                let resp = match &anchor_adopted {
+                    Some(anchor) => {
+                        resp.with_directive_prefix(&execution_anchor_adopted_notice(&name, anchor))
+                    }
                     None => resp,
                 };
                 println!("{}", serde_json::to_string(&resp)?);
@@ -3985,7 +4130,7 @@ fn handle_next(
                     .collect();
             evaluate_gates(
                 &substituted,
-                &current_dir,
+                &execution_dir,
                 Some(context_store),
                 Some(session_name),
                 Some(&children_eval),
@@ -4010,7 +4155,7 @@ fn handle_next(
         // path, not a shell word, so it keeps the plain substitution.
         let command = variables.substitute_command(&action.command);
         let wd = if action.working_dir.is_empty() {
-            current_dir.clone()
+            execution_dir.clone()
         } else {
             std::path::PathBuf::from(variables.substitute(&action.working_dir))
         };
@@ -4042,7 +4187,7 @@ fn handle_next(
                 &|gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
                     crate::gate::evaluate_gates(
                         gates,
-                        &current_dir,
+                        &execution_dir,
                         Some(context_store),
                         Some(&name),
                         None, // children-complete not needed in polling loop
@@ -4373,6 +4518,16 @@ fn handle_next(
             // (DESIGN-request-lifecycle.md Decision 4).
             let resp = match &abandoned_leg {
                 Some(a) => resp.with_directive_prefix(&a.directive_prefix()),
+                None => resp,
+            };
+
+            // The anchor-adoption notice, spliced last so it is the
+            // first thing the agent reads (see the directed-transition
+            // path for the same splice).
+            let resp = match &anchor_adopted {
+                Some(anchor) => {
+                    resp.with_directive_prefix(&execution_anchor_adopted_notice(&name, anchor))
+                }
                 None => resp,
             };
 
@@ -5742,6 +5897,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: dir,
+            execution_dir: None,
             session_id: String::new(),
             intent: None,
             template_name: None,
@@ -5855,8 +6011,15 @@ Done.
         let backend = LocalBackend::with_base_dir(sessions.path().to_path_buf());
 
         // Init with no --intent: a default intent should be recorded.
-        handle_init_inline(&backend, "intent-wf", INTENT_TEMPLATE.as_bytes(), &[], None)
-            .expect("inline init");
+        handle_init_inline(
+            &backend,
+            "intent-wf",
+            INTENT_TEMPLATE.as_bytes(),
+            &[],
+            None,
+            None,
+        )
+        .expect("inline init");
 
         let (_h, events) = backend.read_events("intent-wf").expect("read events");
         let intent = crate::engine::types::derive_intent(&events);
@@ -5879,6 +6042,7 @@ Done.
             INTENT_TEMPLATE.as_bytes(),
             &[],
             Some("My explicit intent"),
+            None,
         )
         .expect("inline init");
 
@@ -5912,6 +6076,7 @@ Done.
             &[],
             None,
             None,
+            None,
         )
         .expect("init should succeed");
 
@@ -5938,6 +6103,7 @@ Done.
             "clause-wf-missing",
             tpl_path.to_str().unwrap(),
             &[],
+            None,
             None,
             None,
         )
@@ -5971,6 +6137,7 @@ Done.
             "clause-wf-no-dir",
             INTENT_TEMPLATE.as_bytes(),
             &[],
+            None,
             None,
         )
         .expect("inline init should succeed");
@@ -6020,6 +6187,7 @@ Done.
             "clause-wf-dup-calls",
             tpl_path.to_str().unwrap(),
             &[],
+            None,
             None,
             None,
         )
@@ -6406,6 +6574,7 @@ Done.
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     parent_workflow: Some("parent".to_string()),
                     template_source_dir: None,
+                    execution_dir: None,
                     session_id: String::new(),
                     intent: None,
                     template_name: None,

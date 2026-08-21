@@ -36,6 +36,7 @@ fn write_session_file(dir: &Path, session_id: &str) -> PathBuf {
         created_at: "2026-05-24T00:00:00Z".into(),
         parent_workflow: None,
         template_source_dir: None,
+        execution_dir: None,
         session_id: session_id.to_string(),
         intent: None,
         template_name: Some("test".into()),

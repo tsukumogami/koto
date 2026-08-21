@@ -31,6 +31,7 @@ fn init_parent_backend(dir: &std::path::Path, parent: &str) -> LocalBackend {
         created_at: "2026-05-24T00:00:00Z".to_string(),
         parent_workflow: None,
         template_source_dir: None,
+        execution_dir: None,
         session_id: "parent-session-uuid".to_string(),
         intent: None,
         template_name: None,

@@ -596,6 +596,7 @@ mod tests {
             created_at: "2026-05-24T00:00:00Z".into(),
             parent_workflow: None,
             template_source_dir: None,
+            execution_dir: None,
             session_id: "wf".into(),
             intent: None,
             template_name: Some("verdict".into()),

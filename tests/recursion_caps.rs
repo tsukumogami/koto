@@ -47,6 +47,7 @@ fn unassigned_child_header(workflow: &str, parent: Option<&str>) -> StateFileHea
         created_at: "2026-05-24T00:00:00Z".into(),
         parent_workflow: parent.map(|p| p.to_string()),
         template_source_dir: None,
+        execution_dir: None,
         session_id: workflow.to_string(),
         intent: None,
         template_name: Some("verdict".into()),

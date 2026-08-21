@@ -165,6 +165,24 @@ impl BatchErrorContext {
 pub const RECOVERY_POINTER: &str =
     "[koto] Lost context? `koto status <name>` returns this phase's directive/details/expects.\n\n";
 
+/// One-time notice that a session which recorded no execution anchor
+/// has adopted the directory this tick ran from (R14).
+///
+/// Spliced into `directive` via [`NextResponse::with_directive_prefix`],
+/// the same mechanism the recovery pointer and the leg-abandonment
+/// notice use. It says what koto bound and how to move it, and claims
+/// nothing about what a command can reach once running -- anchoring
+/// binds where commands start, not where they can go (R17).
+pub fn execution_anchor_adopted_notice(name: &str, anchor: &std::path::Path) -> String {
+    format!(
+        "[koto] Session '{}' had no recorded directory; it is now bound to {}. \
+         Later ticks must run there or below it -- `koto session rebind {}` moves it.\n\n",
+        name,
+        anchor.display(),
+        name,
+    )
+}
+
 impl NextResponse {
     /// Return a new `NextResponse` with the directive and details fields substituted
     /// using the given function. Terminal variants have no directive and are returned
@@ -689,7 +707,7 @@ pub struct NextError {
     pub details: Vec<ErrorDetail>,
 }
 
-/// The nine error codes for `koto next` domain errors.
+/// The eleven error codes for `koto next` domain errors.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NextErrorCode {
@@ -702,6 +720,17 @@ pub enum NextErrorCode {
     TemplateError,
     PersistenceError,
     ConcurrentAccess,
+    /// The tick ran from a directory that is neither the session's
+    /// execution anchor nor beneath it (R12). Caller error: run from
+    /// the anchor the message names, or rebind the session to where
+    /// the checkout now is.
+    ExecutionAnchorMismatch,
+    /// The session's recorded execution anchor names nothing on this
+    /// machine (R15). Distinct from
+    /// [`NextErrorCode::ExecutionAnchorMismatch`] so a caller can tell
+    /// "you are in the wrong tree" from "the recorded tree is gone"
+    /// without matching on wording.
+    ExecutionAnchorUnresolvable,
 }
 
 impl NextErrorCode {
@@ -719,8 +748,10 @@ impl NextErrorCode {
             NextErrorCode::PreconditionFailed => 2,
             NextErrorCode::TerminalState => 2,
             NextErrorCode::WorkflowNotInitialized => 2,
+            NextErrorCode::ExecutionAnchorMismatch => 2,
             NextErrorCode::TemplateError => 3,
             NextErrorCode::PersistenceError => 3,
+            NextErrorCode::ExecutionAnchorUnresolvable => 3,
         }
     }
 }

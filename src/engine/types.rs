@@ -259,6 +259,32 @@ pub struct StateFileHeader {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_source_dir: Option<PathBuf>,
 
+    /// Directory this session's ticks execute in -- the execution
+    /// anchor (Decision 6 in DESIGN-koto-runs-commands.md).
+    ///
+    /// Recorded in canonical form (`fs::canonicalize` output) at `koto
+    /// init` time from the process working directory, or from
+    /// `--execution-dir` when the caller names one. A child session
+    /// copies its parent's value rather than deriving one from the
+    /// spawning process (R16).
+    ///
+    /// Every `koto next` checks the process working directory against
+    /// this value and runs the tick's gates and actions here rather
+    /// than wherever `koto next` was typed. `None` on state files
+    /// written before this field existed: the first tick adopts the
+    /// directory it is ticked from, records it here, and says so once
+    /// (R14).
+    ///
+    /// This binds where a session's commands *start*. It does not
+    /// bound what a command can reach once running -- an authorized
+    /// command can name absolute paths or change directory, and
+    /// nothing here stops it (R17).
+    ///
+    /// Additive field: serde-optional, omitted when `None`, so older
+    /// state files round-trip cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_dir: Option<PathBuf>,
+
     /// UUID v4 identifier generated at `koto init` time and preserved
     /// unchanged through rename operations.
     ///
@@ -670,6 +696,19 @@ pub enum EventPayload {
     IntentUpdated {
         intent: String,
     },
+    /// Emitted on the first tick of a session that carries no
+    /// `execution_dir` in its header -- a session created before
+    /// execution anchoring existed (R14). The tick adopts the
+    /// directory it is running from, records it on the header, and
+    /// appends this event.
+    ///
+    /// The event is what makes the adoption visible; the header field
+    /// is what makes it happen once. A later tick finds
+    /// `execution_dir` recorded and takes the ordinary path, so
+    /// exactly one of these can appear per session.
+    ExecutionAnchorAdopted {
+        anchor: PathBuf,
+    },
     /// Carries the auto-promoted [`WorkflowResult`] envelope on a child's
     /// own session log (wire `type: "request_store.result"`, in the
     /// reserved `request_store.*` namespace;
@@ -1037,6 +1076,7 @@ impl EventPayload {
             EventPayload::BatchFinalized { .. } => "batch_finalized",
             EventPayload::ChildCompleted { .. } => "child_completed",
             EventPayload::IntentUpdated { .. } => "intent_updated",
+            EventPayload::ExecutionAnchorAdopted { .. } => "execution_anchor_adopted",
             EventPayload::RequestStoreResult { .. } => "request_store.result",
             EventPayload::RequestCreated { .. } => "request.created",
             EventPayload::RequestLegBound { .. } => "request.leg_bound",
@@ -1302,6 +1342,11 @@ impl<'de> Deserialize<'de> for Event {
                     .map_err(serde::de::Error::custom)?;
                 EventPayload::IntentUpdated { intent: p.intent }
             }
+            "execution_anchor_adopted" => {
+                let p: ExecutionAnchorAdoptedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::ExecutionAnchorAdopted { anchor: p.anchor }
+            }
             "request_store.result" => {
                 let p: RequestStoreResultPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
@@ -1539,6 +1584,11 @@ struct IntentUpdatedPayload {
 }
 
 #[derive(Deserialize)]
+struct ExecutionAnchorAdoptedPayload {
+    anchor: PathBuf,
+}
+
+#[derive(Deserialize)]
 struct RequestStoreResultPayload {
     result: WorkflowResult,
 }
@@ -1733,6 +1783,7 @@ mod tests {
             created_at: "2026-03-15T14:30:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            execution_dir: None,
             session_id: String::new(),
             intent: None,
             template_name: None,
@@ -1763,6 +1814,7 @@ mod tests {
             created_at: "2026-03-15T14:30:00Z".to_string(),
             parent_workflow: Some("parent-wf".to_string()),
             template_source_dir: None,
+            execution_dir: None,
             session_id: String::new(),
             intent: None,
             template_name: None,
@@ -1805,6 +1857,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: Some(PathBuf::from("/abs/templates")),
+            execution_dir: None,
             session_id: String::new(),
             intent: None,
             template_name: None,
@@ -1840,6 +1893,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            execution_dir: None,
             session_id: String::new(),
             intent: None,
             template_name: None,
@@ -1873,6 +1927,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            execution_dir: None,
             session_id: String::new(),
             intent: None,
             template_name: None,
@@ -2487,6 +2542,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00.000Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            execution_dir: None,
             session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             intent: None,
             template_name: None,
