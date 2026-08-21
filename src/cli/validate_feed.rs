@@ -314,4 +314,92 @@ Body text.
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("validation error"), "got: {}", msg);
     }
+
+    // -- The shipped contract --
+    //
+    // The tests above run against a hand-written spec, which proves the
+    // validator works but says nothing about what koto actually ships. These
+    // run against `docs/reference/session-feed.md` itself, so an event the
+    // engine emits but the contract never declares fails here.
+
+    fn shipped_spec() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/reference/session-feed.md")
+    }
+
+    /// A header carrying `execution_dir`.
+    fn anchored_header_line() -> &'static str {
+        r#"{"schema_version":1,"workflow":"w","template_hash":"h","created_at":"2024-01-01T00:00:00Z","execution_dir":"/home/user/src/koto"}"#
+    }
+
+    /// A log holding everything the command-running work added -- the anchored
+    /// header, both new events, and an action event carrying `truncated` --
+    /// validates clean against the contract koto ships.
+    #[test]
+    fn shipped_spec_accepts_the_command_running_events() {
+        let log = write_temp(&format!(
+            "{}\n{}\n{}\n{}\n",
+            anchored_header_line(),
+            r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"execution_anchor_adopted","payload":{"anchor":"/home/user/src/koto"}}"#,
+            r#"{"seq":2,"timestamp":"2024-01-01T00:00:01Z","type":"default_action_executed","payload":{"state":"detect","command":"git branch --show-current","exit_code":0,"stdout":"main","stderr":"","truncated":true}}"#,
+            r#"{"seq":3,"timestamp":"2024-01-01T00:00:02Z","type":"variable_captured","payload":{"key":"BRANCH","value":"main"}}"#,
+        ));
+        let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+        assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
+    }
+
+    /// Acceptance alone would prove nothing: the validator skips event types it
+    /// does not recognize, so an unregistered event passes silently. Feeding a
+    /// malformed instance of each new event is what shows the contract declares
+    /// it and the validator is checking its fields.
+    #[test]
+    fn shipped_spec_declares_the_new_events_rather_than_skipping_them() {
+        for (event, malformed) in [
+            (
+                "execution_anchor_adopted",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"execution_anchor_adopted","payload":{}}"#,
+            ),
+            (
+                "variable_captured",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"variable_captured","payload":{"key":"BRANCH"}}"#,
+            ),
+        ] {
+            let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), malformed));
+            let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+            assert!(
+                result.is_err(),
+                "{} is not declared in the shipped spec: a payload missing its \
+                 required fields validated clean, which is the unknown-type skip, \
+                 not acceptance",
+                event
+            );
+        }
+    }
+
+    /// `truncated` is pinned as a boolean, not merely tolerated as an unknown
+    /// key. The action event's fields are listed individually, so a field the
+    /// engine writes and the contract omits is a break.
+    #[test]
+    fn shipped_spec_pins_the_action_events_truncated_field() {
+        let log = write_temp(&format!(
+            "{}\n{}\n",
+            anchored_header_line(),
+            r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"default_action_executed","payload":{"state":"lint","command":"c","exit_code":0,"stdout":"","stderr":"","truncated":"yes"}}"#
+        ));
+        let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("validation error"), "got: {}", msg);
+    }
+
+    /// `truncated` is optional: events written before the field existed omit it
+    /// and must still validate (R24).
+    #[test]
+    fn shipped_spec_accepts_an_action_event_without_truncated() {
+        let log = write_temp(&format!(
+            "{}\n{}\n",
+            anchored_header_line(),
+            r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"default_action_executed","payload":{"state":"lint","command":"c","exit_code":0,"stdout":"","stderr":""}}"#
+        ));
+        let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+        assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
+    }
 }

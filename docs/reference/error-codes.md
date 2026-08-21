@@ -103,6 +103,8 @@ Standing in a subdirectory of the anchor is fine -- the tick is accepted and its
 
 The two codes are separate because the repairs differ: change directory for the first, rebind for the second.
 
+Both messages name `koto session rebind`, which is not implemented yet -- `koto session` currently offers `start`, `dir`, `list`, `cleanup`, and `resolve`. Until it lands, the first refusal is repaired by running from the anchor, and the second by putting the checkout back where the header names. Route on the code, not on the message: the wording will change when the subcommand exists.
+
 Anchor comparison is byte-exact over `fs::canonicalize` output. That resolves `.`, `..`, and symlinks and strips trailing slashes, so a symlinked path and a trailing-slash variant of the anchor both satisfy it. It does not case-fold: a path differing only in case names a different directory and is refused, on every platform including case-insensitive filesystems.
 
 Anchoring binds where a session's commands *start*. It does not bound what a command reaches once running -- a command can name absolute paths or change directory, and nothing here stops it.
@@ -118,6 +120,33 @@ A state can declare a name for its command's output with `capture_stdout_as`, an
 The tick stops rather than rendering an empty string or the raw `{{BRANCH}}` token, either of which would put a placeholder into an agent's instructions. A name no state declares at all is caught earlier, when the template compiles. The fix is usually in the template: route through the producing state, or move the reference to a state that always follows it.
 
 A failed *delivery* is a different thing and does not use this code. When the command runs but its output cannot be delivered -- it is empty, it exceeds 4096 bytes, or it holds a character the value allowlist forbids -- the tick stops at the state that ran the command, through the ordinary blocked response with an `__action__` condition whose `failure_kind` is `capture_failed`.
+
+#### Command failure kinds
+
+A command koto runs -- a state's `default_action` or a command gate -- reports *why* it failed under a `failure_kind` key. This is not a `next` error code: the tick answers with an ordinary blocked response rather than an error envelope. It is still the machine-readable discriminator to read, because three of these kinds share `exit_code: -1` and telling them apart by searching stderr for "timed out" is exactly what the key exists to replace.
+
+| Kind | Meaning |
+|------|---------|
+| `nonzero_exit` | The command ran to completion and exited non-zero. |
+| `timed_out` | The command did not finish within its timeout, so its process group was killed. Whatever it wrote before the kill is still reported. |
+| `spawn_failed` | No child process was ever started. Also covers an action refused before the spawn: a `working_dir` that is absolute, or one that resolves outside the session's execution anchor. |
+| `wait_failed` | The child started but waiting on it failed, so no exit status was ever obtained. |
+| `capture_failed` | The command exited zero but its stdout could not be delivered under the state's `capture_stdout_as` name. Action failures only; a gate has nothing to capture. The `capture_error` object alongside it names the case: `empty`, `too_large`, or `disallowed_character`. |
+
+The vocabulary is the same on the two surfaces it appears on. What sits beside it is not.
+
+**On a blocked `koto next` response**, inside the `__action__` blocking condition an action failure produces:
+
+```json
+{"name":"__action__","type":"action","status":"failed","category":"corrective","agent_actionable":false,
+ "output":{"state":"lint","command":"cargo clippy","failure_kind":"nonzero_exit","exit_code":1,"stdout":"","stderr":"...","truncated":false}}
+```
+
+`exit_code` is present here only for `nonzero_exit`. Three of the others never obtained a status at all, and reporting the synthetic `-1` would be the conflation `failure_kind` exists to end; a `capture_failed` command exited zero, so it has no failing status to report either. The condition's `status` narrows the same way: `failed` for `nonzero_exit` and `capture_failed`, `timed_out` for a timeout, `error` for a spawn or wait failure. Route on `failure_kind`, not on `status` -- two kinds share `failed`.
+
+**In command-gate evidence**, on the `output` object of a `gate_evaluated` event and of a recorded override. `exit_code` is always present there, `-1` for the three kinds that never got a status. The key is additive: the passing and plain-failing shapes are unchanged, and the `{"exit_code": -1, "error": "timed_out"}` a timeout has always produced still carries its `error` field, so nothing reading `error` moves.
+
+An action failure that got as far as running writes a `default_action_executed` event before the tick stops. A `working_dir` rejection does not, because no command ran.
 
 #### Pre-dispatch I/O errors
 

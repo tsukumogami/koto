@@ -196,6 +196,51 @@ fn none_valued_request_store_fields_produce_no_keys_on_the_wire() {
     );
 }
 
+/// A header written without `execution_dir` round-trips without gaining the
+/// key (R24). The absence is what makes the session's first tick adopt an
+/// anchor rather than compare against one, so re-serializing it as `null` --
+/// or as any path -- would change what the next tick does.
+#[test]
+fn a_header_written_without_execution_dir_round_trips_without_it() {
+    let unanchored = r#"{
+        "schema_version": 1,
+        "workflow": "old-wf",
+        "template_hash": "abc",
+        "created_at": "2026-01-01T00:00:00Z"
+    }"#;
+    let parsed: StateFileHeader =
+        serde_json::from_str(unanchored).expect("an unanchored header must deserialize");
+    assert_eq!(parsed.execution_dir, None);
+
+    let json = serde_json::to_string(&parsed).expect("serialize");
+    assert!(
+        !json.contains("execution_dir"),
+        "a None anchor must leave no key on the wire, got: {}",
+        json
+    );
+
+    let reparsed: StateFileHeader = serde_json::from_str(&json).expect("reparse");
+    assert_eq!(parsed, reparsed);
+}
+
+/// An anchored header keeps its exact path across a round trip. The anchor is
+/// compared byte-exact against the tick's canonicalized working directory, so
+/// any normalization serde applied here would refuse a session standing in the
+/// right place.
+#[test]
+fn an_anchored_header_preserves_its_path_exactly() {
+    let mut header = full_header();
+    header.execution_dir = Some(std::path::PathBuf::from("/home/user/src/koto"));
+
+    let json = serde_json::to_string(&header).expect("serialize");
+    let parsed: StateFileHeader = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(
+        parsed.execution_dir,
+        Some(std::path::PathBuf::from("/home/user/src/koto"))
+    );
+    assert_eq!(header, parsed);
+}
+
 #[test]
 fn dispatch_epoch_defaults_to_zero_when_absent() {
     let json = r#"{
