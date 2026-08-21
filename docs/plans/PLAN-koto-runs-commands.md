@@ -615,61 +615,38 @@ their terminal statuses.
 
 **Type**: task
 
-## Dependency Graph
-
-```mermaid
-graph TD
-    I1["1: drain pipes, typed failure kinds"]
-    I2["2: quarantine colliding session dir"]
-    I3["3: shared-path defect tests"]
-    I4["4: record and enforce the anchor"]
-    I5["5: koto session rebind"]
-    I6["6: stop the tick on action failure"]
-    I7["7: working_dir rejection and join"]
-    I8["8: per-tick variable overlay"]
-    I9["9: capture stdout into a name"]
-    I10["10: feed, error-code, baseline contracts"]
-    I11["11: authoring rule and docs"]
-    I12["12: koto-author, koto-user, koto-adhoc"]
-    I13["13: default_action eval and eval runs"]
-    I14["14: containment sweep, follow-up filing"]
-    I15["15: clean wip/, finalize the chain"]
-
-    I1 --> I3
-    I2 --> I3
-    I1 --> I6
-    I1 --> I10
-    I4 --> I5
-    I4 --> I7
-    I4 --> I10
-    I5 --> I10
-    I5 --> I11
-    I6 --> I7
-    I6 --> I9
-    I8 --> I9
-    I9 --> I10
-    I7 --> I11
-    I9 --> I11
-    I11 --> I12
-    I11 --> I14
-    I12 --> I13
-    I12 --> I14
-    I3 --> I15
-    I10 --> I15
-    I13 --> I15
-    I14 --> I15
-
-    classDef done fill:#c8e6c9
-    classDef ready fill:#bbdefb
-    classDef blocked fill:#fff9c4
-
-    class I1,I2,I4,I8 ready
-    class I3,I5,I6,I7,I9,I10,I11,I12,I13,I14,I15 blocked
-```
-
-**Legend**: Green = done, Blue = ready, Yellow = blocked
-
 ## Implementation Sequence
+
+This section carries the dependency structure in full. `shirabe validate` raises `FC14`
+against a single-pr PLAN that also populates a `## Dependency Graph` section, and the
+resolution went the way the decomposition argues: the work lands in one pull request, so
+the frontmatter stays `single-pr` and the mermaid diagram is what gives. Nothing was lost
+with it. The machine-read copy of the structure is each outline's `**Dependencies**:`
+field — that is what `plan-to-tasks.sh` parses to emit `waits_on` edges, and it resolves
+all thirteen with or without a diagram — and the human-read copy is the blocking table
+below, which the diagram only restated in picture form.
+
+### What blocks what
+
+| Issue | Blocked by | Blocks |
+|-------|-----------|--------|
+| 1. drain pipes, typed failure kinds | — | 3, 6, 10 |
+| 2. quarantine colliding session dir | — | 3 |
+| 3. shared-path defect tests | 1, 2 | 15 |
+| 4. record and enforce the anchor | — | 5, 7, 10 |
+| 5. `koto session rebind` | 4 | 10, 11 |
+| 6. stop the tick on action failure | 1 | 7, 9 |
+| 7. `working_dir` rejection and join | 4, 6 | 11 |
+| 8. per-tick variable overlay | — | 9 |
+| 9. capture stdout into a name | 6, 8 | 10, 11 |
+| 10. feed, error-code, baseline contracts | 1, 4, 5, 9 | 15 |
+| 11. authoring rule and docs | 5, 7, 9 | 12, 14 |
+| 12. koto-author, koto-user, koto-adhoc | 11 | 13, 14 |
+| 13. `default_action` eval and eval runs | 12 | 15 |
+| 14. containment sweep, follow-up filing | 11, 12 | 15 |
+| 15. clean `wip/`, finalize the chain | 3, 10, 13, 14 | — |
+
+Four issues start unblocked: 1, 2, 4, and 8. Everything else waits on something.
 
 ### Critical path
 
@@ -690,7 +667,7 @@ done at any point before 9 — including first.
 `1, 2, 4, 8, 3, 6, 5, 7, 9, 10, 11, 12, 13, 14, 15`
 
 This front-loads the four issues with no dependencies. Two notes on the ordering that the
-graph deliberately does not encode as edges:
+blocking table deliberately does not record as edges:
 
 - **Do Issue 4 before Issue 8**, even though neither blocks the other. Both rewrite the
   top of `handle_next`; sequencing them avoids a conflict that has nothing to do with
