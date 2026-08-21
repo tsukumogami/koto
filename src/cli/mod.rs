@@ -2937,6 +2937,45 @@ fn record_notice_delivery(backend: &dyn SessionBackend, name: &str, abandoned: &
     }
 }
 
+/// Substitute a directive through the tick's variable lookup order.
+///
+/// The order is fixed everywhere a variable resolves during a tick: runtime
+/// names (`SESSION_DIR`, `SESSION_NAME`) first, then the per-tick overlay, then
+/// the `WorkflowInitialized` bindings. It lives in one function so the response
+/// directive and the directed-transition directive cannot drift apart, and so a
+/// value the tick produced for itself is not left out of one of them.
+#[cfg(unix)]
+fn substitute_directive(
+    raw: &str,
+    runtime_vars: &std::collections::HashMap<String, String>,
+    variables: &crate::engine::substitute::Variables,
+    overlay: &crate::engine::substitute::VariableOverlay,
+) -> String {
+    let with_runtime = crate::cli::vars::substitute_vars(raw, runtime_vars);
+    variables.substitute_with(&with_runtime, overlay)
+}
+
+/// Substitute every gate command in `gates` through the same lookup order as
+/// [`substitute_directive`], using the shell-safe form because the result is
+/// handed to `sh -c` (Issue #186).
+#[cfg(unix)]
+fn substitute_gate_commands(
+    gates: &std::collections::BTreeMap<String, crate::template::types::Gate>,
+    runtime_vars: &std::collections::HashMap<String, String>,
+    variables: &crate::engine::substitute::Variables,
+    overlay: &crate::engine::substitute::VariableOverlay,
+) -> std::collections::BTreeMap<String, crate::template::types::Gate> {
+    gates
+        .iter()
+        .map(|(name, gate)| {
+            let mut g = gate.clone();
+            let with_runtime = crate::cli::vars::substitute_vars(&g.command, runtime_vars);
+            g.command = variables.substitute_command_with(&with_runtime, overlay);
+            (name.clone(), g)
+        })
+        .collect()
+}
+
 /// Handle the `koto next` command with full output contract support.
 ///
 /// Flow:
@@ -3354,6 +3393,14 @@ fn handle_next(
         }
     };
 
+    // The tick's variable overlay: values produced while this tick runs,
+    // layered over the bindings just read. It starts empty and nothing writes
+    // to it yet, so every substitution below resolves exactly as it did before
+    // the overlay existed. What the overlay buys is that the tick now has one
+    // live view of its own variables, reached by every site that resolves one,
+    // rather than three separate snapshots taken before the advancement loop.
+    let overlay = crate::engine::substitute::VariableOverlay::new();
+
     let machine_state = match derive_machine_state(&header, &events, &backend.session_dir(&name)) {
         Some(ms) => ms,
         None => {
@@ -3525,9 +3572,13 @@ fn handle_next(
 
         match dispatch_next(target, target_template_state, true, &gate_results) {
             Ok(resp) => {
+                // The overlay is provably empty here -- this path returns
+                // before the advancement loop, and the loop is the only thing
+                // that writes to it -- but it goes through the same helper as
+                // the natural path so the two directives resolve identically
+                // by construction rather than by inspection.
                 let resp = resp.with_substituted_directive(|d| {
-                    let d = crate::cli::vars::substitute_vars(d, &runtime_vars);
-                    variables.substitute(&d)
+                    substitute_directive(d, &runtime_vars, &variables, &overlay)
                 });
 
                 // Whether the target phase's delivery window already
@@ -4117,17 +4168,12 @@ fn handle_next(
     let session_name = &name;
     let gate_closure =
         |gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
-            // Substitute both template and runtime variables in gate command strings.
-            let substituted: std::collections::BTreeMap<String, crate::template::types::Gate> =
-                gates
-                    .iter()
-                    .map(|(name, gate)| {
-                        let mut g = gate.clone();
-                        let cmd = crate::cli::vars::substitute_vars(&g.command, &vars_for_gates);
-                        g.command = variables.substitute_command(&cmd);
-                        (name.clone(), g)
-                    })
-                    .collect();
+            // Substitute runtime, overlay, and template variables in gate
+            // command strings. The overlay matters because this closure runs
+            // once per state the loop reaches, so a later state's gate command
+            // must see what an earlier state in the same tick produced.
+            let substituted =
+                substitute_gate_commands(gates, &vars_for_gates, &variables, &overlay);
             evaluate_gates(
                 &substituted,
                 &execution_dir,
@@ -4152,12 +4198,15 @@ fn handle_next(
 
         // Substitute variables in command and working_dir. The command goes to
         // `sh -c`, so use the shell-safe form (Issue #186); working_dir is a
-        // path, not a shell word, so it keeps the plain substitution.
-        let command = variables.substitute_command(&action.command);
+        // path, not a shell word, so it keeps the plain substitution. Both read
+        // the overlay first, so a state whose action runs after an earlier
+        // state in this same tick produced a value can use it. Runtime names
+        // are deliberately not substituted here, exactly as before.
+        let command = variables.substitute_command_with(&action.command, &overlay);
         let wd = if action.working_dir.is_empty() {
             execution_dir.clone()
         } else {
-            std::path::PathBuf::from(variables.substitute(&action.working_dir))
+            std::path::PathBuf::from(variables.substitute_with(&action.working_dir, &overlay))
         };
 
         // Execute: polling or one-shot.
@@ -4168,12 +4217,14 @@ fn handle_next(
                 .states
                 .get(state_name)
                 .map(|s| {
-                    // Substitute variables in gate commands.
+                    // Substitute variables in gate commands. Overlay first,
+                    // then the log's bindings; runtime names are not
+                    // substituted on this path, as before.
                     s.gates
                         .iter()
                         .map(|(name, gate)| {
                             let mut g = gate.clone();
-                            g.command = variables.substitute_command(&g.command);
+                            g.command = variables.substitute_command_with(&g.command, &overlay);
                             (name.clone(), g)
                         })
                         .collect::<std::collections::BTreeMap<_, _>>()
@@ -4244,6 +4295,7 @@ fn handle_next(
         &gate_closure,
         &integration_closure,
         &action_closure,
+        &overlay,
         &shutdown,
     );
 
@@ -4396,7 +4448,10 @@ fn handle_next(
                         command: final_template_state
                             .default_action
                             .as_ref()
-                            .map(|a| variables.substitute_command(&a.command))
+                            // Same substitution the action closure performed,
+                            // overlay included, so the command reported back is
+                            // the command that ran.
+                            .map(|a| variables.substitute_command_with(&a.command, &overlay))
                             .unwrap_or_default(),
                         exit_code,
                         stdout,
@@ -4464,9 +4519,11 @@ fn handle_next(
                 }
             };
 
+            // The final directive of the tick. It reads the overlay, so a state
+            // the loop auto-advanced into renders what an earlier state in this
+            // same tick produced rather than the value the log carried in.
             let resp = resp.with_substituted_directive(|d| {
-                let d = crate::cli::vars::substitute_vars(d, &runtime_vars);
-                variables.substitute(&d)
+                substitute_directive(d, &runtime_vars, &variables, &overlay)
             });
 
             // Whether the phase's delivery window already carries a
@@ -6772,6 +6829,135 @@ Done.
         assert_eq!(
             variables.substitute_command("cmd init --start {{START}} --dir {{DIR}}"),
             "cmd init --start '' --dir .sweep"
+        );
+    }
+
+    #[test]
+    fn tick_substitution_sites_read_the_overlay() {
+        // The directive site and the gate-command site, each fed a non-empty
+        // overlay. The log binds BRANCH to a stale value and binds nothing at
+        // all for TAG, so a site that ignored the overlay would render "stale"
+        // or leave `{{TAG}}` standing.
+        use crate::engine::substitute::{VariableOverlay, Variables};
+        use crate::template::types::Gate;
+
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: std::collections::HashMap::from([(
+                    "BRANCH".to_string(),
+                    "stale".to_string(),
+                )]),
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+        let variables = Variables::from_events(&events).unwrap();
+
+        let runtime_vars =
+            std::collections::HashMap::from([("SESSION_DIR".to_string(), "/s/abc".to_string())]);
+
+        let overlay = VariableOverlay::new();
+        overlay.insert("BRANCH", "fresh");
+        overlay.insert("TAG", "v1.2.3");
+
+        // Directive: runtime name first, then overlay over the log binding.
+        assert_eq!(
+            substitute_directive(
+                "read {{SESSION_DIR}}/plan.md on {{BRANCH}} for {{TAG}}",
+                &runtime_vars,
+                &variables,
+                &overlay,
+            ),
+            "read /s/abc/plan.md on fresh for v1.2.3"
+        );
+
+        // Gate command: same order, shell-safe form.
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "test -f {{SESSION_DIR}}/{{TAG}} && git log {{BRANCH}}".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+        let substituted = substitute_gate_commands(&gates, &runtime_vars, &variables, &overlay);
+        assert_eq!(
+            substituted.get("check").unwrap().command,
+            "test -f /s/abc/v1.2.3 && git log fresh"
+        );
+    }
+
+    #[test]
+    fn empty_overlay_leaves_tick_substitution_unchanged() {
+        // Behaviour-neutrality at the two extracted sites: with nothing written
+        // this tick they must produce what the pre-overlay code produced, which
+        // was `substitute_vars` followed by the plain `Variables` call.
+        use crate::engine::substitute::{VariableOverlay, Variables};
+        use crate::template::types::Gate;
+
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: std::collections::HashMap::from([
+                    ("BRANCH".to_string(), "main".to_string()),
+                    ("EMPTY".to_string(), String::new()),
+                ]),
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+        let variables = Variables::from_events(&events).unwrap();
+        let runtime_vars =
+            std::collections::HashMap::from([("SESSION_DIR".to_string(), "/s/abc".to_string())]);
+        let overlay = VariableOverlay::new();
+
+        let raw = "{{SESSION_DIR}} {{BRANCH}} {{EMPTY}} {{UNKNOWN}}";
+        let expected_directive = {
+            let d = crate::cli::vars::substitute_vars(raw, &runtime_vars);
+            variables.substitute(&d)
+        };
+        assert_eq!(
+            substitute_directive(raw, &runtime_vars, &variables, &overlay),
+            expected_directive
+        );
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: raw.to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+        let expected_command = {
+            let c = crate::cli::vars::substitute_vars(raw, &runtime_vars);
+            variables.substitute_command(&c)
+        };
+        assert_eq!(
+            substitute_gate_commands(&gates, &runtime_vars, &variables, &overlay)
+                .get("check")
+                .unwrap()
+                .command,
+            expected_command
         );
     }
 }

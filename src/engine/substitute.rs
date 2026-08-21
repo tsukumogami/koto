@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use regex::Regex;
@@ -32,6 +34,80 @@ const VALUE_PATTERN: &str = r"^[a-zA-Z0-9._/:@ \-]*$";
 #[derive(Debug)]
 pub struct Variables {
     vars: HashMap<String, String>,
+}
+
+/// Values produced during the tick that is running right now, layered over the
+/// bindings [`Variables::from_events`] read before it started.
+///
+/// One tick creates one overlay and hands it to every consumer that resolves a
+/// variable: the gate closure, the action closure, `advance_until_stop`, and
+/// the final directive substitution. Without it those consumers read a binding
+/// built before the advancement loop ran, so a value produced mid-tick is on
+/// disk and invisible to the rest of the same tick -- which is exactly the case
+/// auto-advance exists for.
+///
+/// The overlay is per-tick and lives only as long as the call. The event log
+/// stays the durable record: a later tick reconstructs everything through
+/// [`Variables::from_events`] and starts again with an empty overlay. Writers
+/// update the overlay in the same step that appends the event, so the on-disk
+/// record and the in-memory view never diverge.
+///
+/// It is passed as an explicit parameter rather than read from a global, so a
+/// new consumer inside the loop that ignores it is visible in review.
+///
+/// Interior mutability is what lets the advancement loop write to an overlay
+/// that the gate and action closures are holding a shared borrow of. Nothing
+/// resolves a variable while a write is in flight, so the `RefCell` never
+/// re-enters.
+#[derive(Debug, Default)]
+pub struct VariableOverlay {
+    values: RefCell<HashMap<String, String>>,
+}
+
+impl VariableOverlay {
+    /// Create an empty overlay for one tick.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a value under `key` for the rest of this tick.
+    ///
+    /// A second write to the same name replaces the first, matching the event
+    /// fold: re-entering a producing state means the later value wins.
+    pub fn insert(&self, key: impl Into<String>, value: impl Into<String>) {
+        self.values.borrow_mut().insert(key.into(), value.into());
+    }
+
+    /// Look up a name written earlier in this tick.
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.values.borrow().get(key).cloned()
+    }
+
+    /// True when nothing has been written this tick.
+    pub fn is_empty(&self) -> bool {
+        self.values.borrow().is_empty()
+    }
+
+    /// Layer this overlay over `base` for a consumer that needs a plain map --
+    /// `vars.*` when-clause evaluation is the one in the tree.
+    ///
+    /// Call it at each read rather than once, so a value written earlier in the
+    /// same tick is visible. An empty overlay borrows `base` untouched, which is
+    /// what keeps a tick that captures nothing byte-identical to one that never
+    /// had an overlay at all.
+    pub fn layered_over<'a>(
+        &self,
+        base: &'a HashMap<String, String>,
+    ) -> Cow<'a, HashMap<String, String>> {
+        if self.is_empty() {
+            return Cow::Borrowed(base);
+        }
+        let mut merged = base.clone();
+        for (key, value) in self.values.borrow().iter() {
+            merged.insert(key.clone(), value.clone());
+        }
+        Cow::Owned(merged)
+    }
 }
 
 /// Error returned when a variable value fails validation.
@@ -85,7 +161,21 @@ impl Variables {
     /// depth: a missing variable is a user or template error, not an internal
     /// invariant break that should crash with a backtrace (Issue #184).
     pub fn substitute(&self, input: &str) -> String {
-        self.substitute_inner(input, false)
+        self.substitute_inner(input, false, None)
+    }
+
+    /// Like [`substitute`](Self::substitute), but consults a per-tick overlay
+    /// before the bindings read from the log.
+    ///
+    /// The lookup order across the whole engine is fixed: runtime names
+    /// (`SESSION_DIR`, `SESSION_NAME`) substitute first, in a separate pass the
+    /// caller runs through `crate::cli::vars::substitute_vars`; then this
+    /// overlay; then the `WorkflowInitialized` bindings. Because a value from
+    /// either of the last two layers is written into the output of a single
+    /// pass, a value that itself contains a `{{...}}` token is never
+    /// re-expanded.
+    pub fn substitute_with(&self, input: &str, overlay: &VariableOverlay) -> String {
+        self.substitute_inner(input, false, Some(overlay))
     }
 
     /// Like [`substitute`](Self::substitute), but safe for values that land in a
@@ -104,10 +194,22 @@ impl Variables {
     /// does: quoting a value that may contain spaces stays the template author's
     /// responsibility (Issue #180), so this method changes nothing for them.
     pub fn substitute_command(&self, input: &str) -> String {
-        self.substitute_inner(input, true)
+        self.substitute_inner(input, true, None)
     }
 
-    fn substitute_inner(&self, input: &str, shell_safe: bool) -> String {
+    /// Like [`substitute_command`](Self::substitute_command), but consults a
+    /// per-tick overlay before the bindings read from the log. Same lookup
+    /// order as [`substitute_with`](Self::substitute_with).
+    pub fn substitute_command_with(&self, input: &str, overlay: &VariableOverlay) -> String {
+        self.substitute_inner(input, true, Some(overlay))
+    }
+
+    fn substitute_inner(
+        &self,
+        input: &str,
+        shell_safe: bool,
+        overlay: Option<&VariableOverlay>,
+    ) -> String {
         let re = Regex::new(VAR_REF_PATTERN).expect("VAR_REF_PATTERN is a valid regex");
         let mut result = String::with_capacity(input.len());
         let mut last_end = 0;
@@ -118,7 +220,15 @@ impl Variables {
 
             result.push_str(&input[last_end..whole_match.start()]);
 
-            match self.vars.get(key) {
+            // Overlay before bindings: a value captured earlier in this tick
+            // wins over the one the log carried into it. Runtime names were
+            // already replaced by the caller's earlier pass, so they cannot
+            // reach here.
+            let resolved = overlay
+                .and_then(|o| o.get(key))
+                .or_else(|| self.vars.get(key).cloned());
+
+            match resolved.as_deref() {
                 Some(value) if shell_safe && value.is_empty() => {
                     // Empty value in a shell command. Emit an explicit empty
                     // argument so the token stays a distinct, empty word --
@@ -507,5 +617,146 @@ mod tests {
 
         let vars = Variables::from_events(&events).unwrap();
         assert_eq!(vars.substitute("{{PATH}}"), "org/repo-name_v1.2");
+    }
+
+    // -----------------------------------------------------------------------
+    // VariableOverlay
+    // -----------------------------------------------------------------------
+
+    fn vars_from(pairs: &[(&str, &str)]) -> Variables {
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+        Variables::from_events(&events).unwrap()
+    }
+
+    #[test]
+    fn overlay_starts_empty() {
+        let overlay = VariableOverlay::new();
+        assert!(overlay.is_empty());
+        assert_eq!(overlay.get("BRANCH"), None);
+    }
+
+    #[test]
+    fn overlay_later_write_wins() {
+        let overlay = VariableOverlay::new();
+        overlay.insert("BRANCH", "first");
+        overlay.insert("BRANCH", "second");
+        assert_eq!(overlay.get("BRANCH").as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn empty_overlay_substitutes_exactly_as_before() {
+        // Behaviour-neutrality at the substitution layer: with nothing written
+        // this tick, the overlay-aware entry points must agree with the ones
+        // that predate them, character for character.
+        let vars = vars_from(&[("BRANCH", "main"), ("EMPTY", "")]);
+        let overlay = VariableOverlay::new();
+
+        let plain = "on {{BRANCH}} and {{EMPTY}} and {{UNKNOWN}}";
+        assert_eq!(
+            vars.substitute(plain),
+            vars.substitute_with(plain, &overlay)
+        );
+
+        let command = "git checkout {{BRANCH}} --flag {{EMPTY}} {{UNKNOWN}}";
+        assert_eq!(
+            vars.substitute_command(command),
+            vars.substitute_command_with(command, &overlay)
+        );
+    }
+
+    #[test]
+    fn overlay_resolves_a_name_the_log_never_carried() {
+        let vars = vars_from(&[("OTHER", "x")]);
+        let overlay = VariableOverlay::new();
+        overlay.insert("BRANCH", "feature-42");
+
+        assert_eq!(
+            vars.substitute_with("work on {{BRANCH}}", &overlay),
+            "work on feature-42"
+        );
+        assert_eq!(
+            vars.substitute_command_with("git log {{BRANCH}}", &overlay),
+            "git log feature-42"
+        );
+    }
+
+    #[test]
+    fn overlay_wins_over_the_log_binding() {
+        // Lookup order: overlay before the WorkflowInitialized bindings.
+        let vars = vars_from(&[("BRANCH", "stale")]);
+        let overlay = VariableOverlay::new();
+        overlay.insert("BRANCH", "fresh");
+
+        assert_eq!(vars.substitute_with("{{BRANCH}}", &overlay), "fresh");
+        assert_eq!(
+            vars.substitute_command_with("{{BRANCH}}", &overlay),
+            "fresh"
+        );
+    }
+
+    #[test]
+    fn overlay_value_is_not_re_expanded() {
+        // Overlay and bindings resolve in one pass, so a value that itself
+        // looks like a reference is emitted literally rather than expanded
+        // through the layer below it.
+        let vars = vars_from(&[("INNER", "expanded")]);
+        let overlay = VariableOverlay::new();
+        overlay.insert("OUTER", "{{INNER}}");
+
+        assert_eq!(vars.substitute_with("{{OUTER}}", &overlay), "{{INNER}}");
+    }
+
+    #[test]
+    fn overlay_empty_value_stays_shell_safe() {
+        // The #186 empty-argument rule applies to an overlay value too: an
+        // unquoted reference resolving to empty still renders as `''`.
+        let vars = vars_from(&[]);
+        let overlay = VariableOverlay::new();
+        overlay.insert("BRANCH", "");
+
+        assert_eq!(
+            vars.substitute_command_with("git log {{BRANCH}} --oneline", &overlay),
+            "git log '' --oneline"
+        );
+    }
+
+    #[test]
+    fn layered_over_borrows_base_when_overlay_is_empty() {
+        let base = HashMap::from([("A".to_string(), "1".to_string())]);
+        let overlay = VariableOverlay::new();
+        let layered = overlay.layered_over(&base);
+        assert!(matches!(layered, Cow::Borrowed(_)));
+        assert_eq!(layered.get("A").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn layered_over_shadows_base_and_adds_new_names() {
+        let base = HashMap::from([
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "stale".to_string()),
+        ]);
+        let overlay = VariableOverlay::new();
+        overlay.insert("B", "fresh");
+        overlay.insert("C", "new");
+
+        let layered = overlay.layered_over(&base);
+        assert_eq!(layered.get("A").map(String::as_str), Some("1"));
+        assert_eq!(layered.get("B").map(String::as_str), Some("fresh"));
+        assert_eq!(layered.get("C").map(String::as_str), Some("new"));
+        // The base is untouched: the overlay layers over it, never into it.
+        assert_eq!(base.get("B").map(String::as_str), Some("stale"));
     }
 }

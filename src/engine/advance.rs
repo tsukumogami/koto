@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine::persistence::derive_overrides;
+use crate::engine::substitute::VariableOverlay;
 use crate::engine::types::{now_iso8601, Event, EventPayload};
 use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::template::types::{
@@ -164,6 +165,12 @@ pub enum IntegrationError {
 /// - `evaluate_gates`: run gate commands and return results
 /// - `invoke_integration`: call an integration runner
 /// - `execute_action`: run a default action command
+///
+/// `overlay` carries values produced during this tick. The loop re-reads it at
+/// every iteration for `vars.*` when-clause evaluation, so a value written by
+/// an earlier iteration routes the later ones. The caller holds the same
+/// overlay for its gate and action command substitution and for the directive
+/// it finally returns.
 #[allow(clippy::too_many_arguments)]
 pub fn advance_until_stop<F, G, I, A>(
     current_state: &str,
@@ -174,6 +181,7 @@ pub fn advance_until_stop<F, G, I, A>(
     evaluate_gates: &G,
     invoke_integration: &I,
     execute_action: &A,
+    overlay: &VariableOverlay,
     shutdown: &AtomicBool,
 ) -> Result<AdvanceResult, AdvanceError>
 where
@@ -198,8 +206,11 @@ where
     let mut fresh_evidence = !evidence.is_empty();
 
     // Extract template variables from the WorkflowInitialized event for vars.*
-    // when-clause evaluation (Issue #141).
-    let workflow_variables: std::collections::HashMap<String, String> = all_events
+    // when-clause evaluation (Issue #141). This is the base layer only: it is
+    // read once, before the first iteration, so on its own it cannot see a
+    // value produced by an earlier iteration of this same loop. Each iteration
+    // layers the per-tick overlay over it below.
+    let base_workflow_variables: std::collections::HashMap<String, String> = all_events
         .iter()
         .find_map(|e| match &e.payload {
             EventPayload::WorkflowInitialized { variables, .. } => Some(variables.clone()),
@@ -471,6 +482,14 @@ where
             );
         }
         let evidence_value = serde_json::Value::Object(merged);
+
+        // Read the overlay here, after this iteration's action has run and
+        // before anything routes on `vars.*`, so a value this iteration
+        // produced is visible to its own when-clauses and to every iteration
+        // after it. Re-read per iteration, never hoisted: hoisting it would
+        // restore the stale pre-loop snapshot this exists to replace. An empty
+        // overlay borrows the base map untouched.
+        let workflow_variables = overlay.layered_over(&base_workflow_variables);
 
         // 7. skip_if evaluation
         // Evaluate skip_if conditions before falling through to transition resolution.
@@ -1538,6 +1557,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -1614,6 +1634,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -1658,6 +1679,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -1706,6 +1728,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -1789,6 +1812,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -1925,6 +1949,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2047,6 +2072,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2154,6 +2180,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2253,6 +2280,7 @@ mod tests {
             &passing_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2289,6 +2317,7 @@ mod tests {
             &failing_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown2,
         )
         .unwrap();
@@ -2325,6 +2354,7 @@ mod tests {
             &timeout_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown3,
         )
         .unwrap();
@@ -2358,6 +2388,7 @@ mod tests {
             &error_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown4,
         )
         .unwrap();
@@ -2419,6 +2450,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2471,6 +2503,7 @@ mod tests {
             &noop_gates,
             &integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2543,6 +2576,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2583,6 +2617,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2661,6 +2696,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2743,6 +2779,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2816,6 +2853,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2867,6 +2905,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -2914,6 +2953,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3003,6 +3043,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3072,6 +3113,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3148,6 +3190,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3281,6 +3324,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3384,6 +3428,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3527,6 +3572,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3634,6 +3680,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3746,6 +3793,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3844,6 +3892,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -3932,6 +3981,7 @@ mod tests {
             &gate_eval,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -4108,6 +4158,7 @@ mod tests {
             &noop_gates,
             &unavailable_integration,
             &noop_action,
+            &VariableOverlay::new(),
             &shutdown,
         )
         .unwrap();
@@ -4137,5 +4188,95 @@ mod tests {
                 "skip_if_matched should be Some in the Transitioned event"
             );
         }
+    }
+
+    #[test]
+    fn vars_when_clause_reads_the_overlay() {
+        // The `vars.*` staleness site. The log carries no variables at all, so
+        // the base map built before the first iteration cannot satisfy
+        // `vars.SKIP`. Only the overlay can -- and the loop re-reads it per
+        // iteration, which is what a value produced mid-tick depends on.
+        let template = make_template(vec![
+            (
+                "skippable",
+                TemplateState {
+                    directive: "Skippable.".to_string(),
+                    details: String::new(),
+                    transitions: vec![unconditional("done")],
+                    terminal: false,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: {
+                        let mut m = BTreeMap::new();
+                        m.insert("vars.SKIP".to_string(), serde_json::json!({"is_set": true}));
+                        Some(m)
+                    },
+                },
+            ),
+            (
+                "done",
+                TemplateState {
+                    directive: "Done.".to_string(),
+                    details: String::new(),
+                    transitions: vec![],
+                    terminal: true,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: None,
+                },
+            ),
+        ]);
+
+        let fired_via_skip_if = |overlay: &VariableOverlay| -> bool {
+            let mut appended: Vec<EventPayload> = Vec::new();
+            let mut append = |payload: &EventPayload| -> Result<(), String> {
+                appended.push(payload.clone());
+                Ok(())
+            };
+            let shutdown = AtomicBool::new(false);
+
+            advance_until_stop(
+                "skippable",
+                &template,
+                &BTreeMap::new(),
+                &[],
+                &mut append,
+                &noop_gates,
+                &unavailable_integration,
+                &noop_action,
+                overlay,
+                &shutdown,
+            )
+            .unwrap();
+
+            appended.iter().any(|p| {
+                matches!(p, EventPayload::Transitioned { condition_type, .. }
+                    if condition_type == "skip_if")
+            })
+        };
+
+        let overlay = VariableOverlay::new();
+        overlay.insert("SKIP", "true");
+        assert!(
+            fired_via_skip_if(&overlay),
+            "a name written to the overlay must satisfy a vars.* when-clause"
+        );
+
+        // Control: the same template, the same empty log, an empty overlay.
+        // Nothing satisfies `vars.SKIP`, so the skip_if branch must not fire.
+        assert!(
+            !fired_via_skip_if(&VariableOverlay::new()),
+            "an empty overlay must leave vars.* evaluation exactly as it was"
+        );
     }
 }
