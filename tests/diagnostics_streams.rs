@@ -19,13 +19,14 @@ fn koto_at_home(home: &Path) -> Command {
 }
 
 #[test]
-fn migration_skipped_notice_goes_to_stderr_not_stdout() {
+fn migration_conflict_notice_goes_to_stderr_not_stdout() {
     let home = tempfile::tempdir().unwrap();
     let sessions = home.path().join(".koto").join("sessions");
 
     // Old per-repo layout: `sessions/<16-hex>/<session>/`. Placing a
     // session there whose name already exists at the flat level forces
-    // the "migration skipped: session already exists" notice.
+    // the "migration conflict: session already exists" notice, which the
+    // migration emits once as it quarantines the old-layout copy.
     let repo_id = "0123456789abcdef";
     let session = "collide-session";
     let old = sessions.join(repo_id).join(session);
@@ -43,11 +44,11 @@ fn migration_skipped_notice_goes_to_stderr_not_stdout() {
 
     // The diagnostic must be on stderr, never on stdout.
     assert!(
-        stderr.contains("migration skipped"),
+        stderr.contains("migration conflict"),
         "expected migration notice on stderr, got stderr: {stderr:?}"
     );
     assert!(
-        !stdout.contains("migration skipped"),
+        !stdout.contains("migration conflict"),
         "migration notice leaked onto stdout: {stdout:?}"
     );
 

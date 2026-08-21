@@ -649,11 +649,48 @@ pub(crate) fn repo_id(working_dir: &Path) -> anyhow::Result<String> {
     Ok(hash[..16].to_string())
 }
 
+/// Directory that holds old-layout sessions whose name was already taken
+/// at the flat level when migration ran.
+///
+/// Dot-prefixed on purpose: `list()` only reports a directory that holds a
+/// state file at `<dir>/<state_file_name(dir_name)>`, and this container
+/// holds per-repo subdirectories rather than a state file, so it never
+/// surfaces as a session.
+pub(crate) const MIGRATION_CONFLICT_DIR: &str = ".migration-conflicts";
+
+/// Pick a free path for a quarantined session under `dir`.
+///
+/// Returns `dir/<name>` when nothing is there, otherwise `dir/<name>.1`,
+/// `dir/<name>.2`, and so on. Quarantine moves data the user may still
+/// need, so it never writes over an existing entry.
+fn quarantine_destination(dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
+    let first = dir.join(name);
+    if !first.exists() {
+        return Some(first);
+    }
+    for n in 1..1000u32 {
+        let mut candidate = name.to_os_string();
+        candidate.push(format!(".{n}"));
+        let path = dir.join(candidate);
+        if !path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// Migrate sessions from the old per-repo layout to the flat layout.
 ///
 /// The old layout placed sessions under `base/<repo-id>/` where `<repo-id>`
 /// was exactly 16 lowercase hexadecimal characters. This function detects
 /// such subdirectories and moves their contents up one level to `base/`.
+///
+/// When the flat level already holds a session of the same name, the
+/// old-layout copy is moved -- never deleted -- to
+/// `base/.migration-conflicts/<repo-id>/<name>/`, and the notice names that
+/// destination. Moving it is what lets the old-layout directory drain so
+/// the trailing `remove_dir` succeeds; leaving it in place kept the
+/// directory alive and reprinted the same notice on every invocation.
 fn migrate_if_needed(base: &Path) {
     let entries = match fs::read_dir(base) {
         Ok(e) => e,
@@ -689,11 +726,42 @@ fn migrate_if_needed(base: &Path) {
             let session_name = session_entry.file_name();
             let dest = base.join(&session_name);
             if dest.exists() {
-                eprintln!(
-                    "koto: migration skipped {}: session already exists at {}",
-                    session_name.to_string_lossy(),
-                    dest.display()
-                );
+                let quarantine_dir = base.join(MIGRATION_CONFLICT_DIR).join(&name);
+                if let Err(e) = fs::create_dir_all(&quarantine_dir) {
+                    eprintln!(
+                        "koto: migration conflict {}: session already exists at {}, and the quarantine directory {} could not be created: {}",
+                        session_name.to_string_lossy(),
+                        dest.display(),
+                        quarantine_dir.display(),
+                        e
+                    );
+                    continue;
+                }
+                let Some(quarantined) = quarantine_destination(&quarantine_dir, &session_name)
+                else {
+                    eprintln!(
+                        "koto: migration conflict {}: session already exists at {}, and no free name was left under {}",
+                        session_name.to_string_lossy(),
+                        dest.display(),
+                        quarantine_dir.display()
+                    );
+                    continue;
+                };
+                match fs::rename(session_entry.path(), &quarantined) {
+                    Ok(()) => eprintln!(
+                        "koto: migration conflict {}: session already exists at {}; the old-layout copy was moved to {}",
+                        session_name.to_string_lossy(),
+                        dest.display(),
+                        quarantined.display()
+                    ),
+                    Err(e) => eprintln!(
+                        "koto: migration conflict {}: session already exists at {}, and the old-layout copy could not be moved to {}: {}",
+                        session_name.to_string_lossy(),
+                        dest.display(),
+                        quarantined.display(),
+                        e
+                    ),
+                }
             } else {
                 match fs::rename(session_entry.path(), &dest) {
                     Ok(()) => migrated_count += 1,
@@ -2137,10 +2205,11 @@ mod tests {
     }
 
     #[test]
-    fn migrate_leaves_collision_in_place() {
+    fn migrate_quarantines_collision_and_keeps_its_contents() {
         let tmp = TempDir::new().unwrap();
         // Create old-layout session
-        let old_dir = tmp.path().join("abcdef1234567890");
+        let repo_id = "abcdef1234567890";
+        let old_dir = tmp.path().join(repo_id);
         let old_session = old_dir.join("conflict");
         fs::create_dir_all(&old_session).unwrap();
         fs::write(old_session.join("old.jsonl"), b"old").unwrap();
@@ -2152,9 +2221,122 @@ mod tests {
 
         migrate_if_needed(tmp.path());
 
-        // Conflicting session at base level is untouched
-        assert!(tmp.path().join("conflict").join("new.jsonl").exists());
-        // Old session remains (not moved)
-        assert!(old_session.join("old.jsonl").exists());
+        // Conflicting session at base level is untouched.
+        assert_eq!(
+            fs::read(tmp.path().join("conflict").join("new.jsonl")).unwrap(),
+            b"new"
+        );
+        // The old-layout copy was moved aside, not deleted, and its
+        // contents survived the move byte for byte.
+        let quarantined = tmp
+            .path()
+            .join(MIGRATION_CONFLICT_DIR)
+            .join(repo_id)
+            .join("conflict");
+        assert_eq!(fs::read(quarantined.join("old.jsonl")).unwrap(), b"old");
+        // The old-layout directory drained and was removed, so the
+        // condition is gone rather than reported again next time.
+        assert!(!old_dir.exists());
+    }
+
+    #[test]
+    fn migrate_collision_is_a_noop_on_the_second_run() {
+        let tmp = TempDir::new().unwrap();
+        let old_session = tmp.path().join("abcdef1234567890").join("conflict");
+        fs::create_dir_all(&old_session).unwrap();
+        fs::write(old_session.join("old.jsonl"), b"old").unwrap();
+        fs::create_dir_all(tmp.path().join("conflict")).unwrap();
+
+        migrate_if_needed(tmp.path());
+        let after_first: Vec<_> = walk_sorted(tmp.path());
+        migrate_if_needed(tmp.path());
+        let after_second: Vec<_> = walk_sorted(tmp.path());
+
+        // Nothing left for the second run to find or report.
+        assert_eq!(after_first, after_second);
+        assert!(!tmp.path().join("abcdef1234567890").exists());
+    }
+
+    #[test]
+    fn migrate_quarantines_two_collisions_independently() {
+        let tmp = TempDir::new().unwrap();
+        let repo_a = "abcdef1234567890";
+        let repo_b = "0123456789abcdef";
+        for (repo, session, body) in [(repo_a, "alpha", &b"a"[..]), (repo_b, "beta", &b"b"[..])] {
+            let old = tmp.path().join(repo).join(session);
+            fs::create_dir_all(&old).unwrap();
+            fs::write(old.join("old.jsonl"), body).unwrap();
+            fs::create_dir_all(tmp.path().join(session)).unwrap();
+        }
+
+        migrate_if_needed(tmp.path());
+
+        let conflicts = tmp.path().join(MIGRATION_CONFLICT_DIR);
+        assert_eq!(
+            fs::read(conflicts.join(repo_a).join("alpha").join("old.jsonl")).unwrap(),
+            b"a"
+        );
+        assert_eq!(
+            fs::read(conflicts.join(repo_b).join("beta").join("old.jsonl")).unwrap(),
+            b"b"
+        );
+        assert!(!tmp.path().join(repo_a).exists());
+        assert!(!tmp.path().join(repo_b).exists());
+    }
+
+    #[test]
+    fn quarantine_never_overwrites_an_existing_entry() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let name = std::ffi::OsStr::new("conflict");
+
+        assert_eq!(quarantine_destination(dir, name).unwrap(), dir.join(name));
+        fs::create_dir_all(dir.join("conflict")).unwrap();
+        assert_eq!(
+            quarantine_destination(dir, name).unwrap(),
+            dir.join("conflict.1")
+        );
+        fs::create_dir_all(dir.join("conflict.1")).unwrap();
+        assert_eq!(
+            quarantine_destination(dir, name).unwrap(),
+            dir.join("conflict.2")
+        );
+    }
+
+    #[test]
+    fn quarantine_container_is_not_listed_as_a_session() {
+        let tmp = TempDir::new().unwrap();
+        let old_session = tmp.path().join("abcdef1234567890").join("conflict");
+        fs::create_dir_all(&old_session).unwrap();
+        fs::write(old_session.join("old.jsonl"), b"old").unwrap();
+        // A real session at the flat level, so `list()` has something to find.
+        write_state_file(tmp.path(), "conflict", "2026-01-01T00:00:00Z");
+
+        migrate_if_needed(tmp.path());
+
+        let backend = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        let ids: Vec<String> = backend.list().unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec!["conflict".to_string()]);
+    }
+
+    /// Every path under `root`, relative and sorted, for comparing a
+    /// directory tree before and after an operation.
+    fn walk_sorted(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path.clone());
+                }
+                out.push(path.strip_prefix(root).unwrap().to_path_buf());
+            }
+        }
+        out.sort();
+        out
     }
 }
