@@ -89,6 +89,21 @@
         "Response does NOT suggest using `koto init` or `koto template compile`",
         "Response treats this as a general Kubernetes configuration question"
       ]
+    },
+    {
+      "id": 8,
+      "name": "default-action-authoring-boundary",
+      "prompt": "I'm writing a koto template for a release workflow and I want koto to run two commands itself so the agent doesn't have to. In the `detect_version` state, `grep -m1 '^version' Cargo.toml | cut -d'\"' -f2` prints the crate version on a single line, and the `announce` state two states later has to render that version into its directive text. In the `open_pr` state, `gh pr create --base main --title \"Release\" --body-file notes.md` opens the release pull request. Write the YAML for both states.",
+      "expected_output": "Agent writes a `default_action` for `detect_version` with `capture_stdout_as` naming the version and `fallback` prose for the failure path, and has `announce` read the captured name as a `{{...}}` reference without declaring it in `variables:`. For `open_pr` it declines to write a `default_action` and keeps `gh pr create` in the state's directive for the agent to run, giving the engine-runnable rule as the reason: a successful `gh pr create` is itself the irreversible, externally visible event, so no signal arriving afterward can un-fire it.",
+      "files": [],
+      "assertions": [
+        "`detect_version` declares a `default_action` whose `command` is the version-reading command and whose `capture_stdout_as` names the value (e.g. `capture_stdout_as: VERSION`)",
+        "The `detect_version` action declares `fallback:` prose telling the agent how to do the step by hand when the command fails",
+        "The `announce` state reads the captured name as a `{{...}}` reference, and the capture name is NOT also declared in the template's `variables:` block",
+        "`gh pr create` is NOT placed in a `default_action` -- the response leaves it in the `open_pr` state's directive for the agent to run",
+        "The response gives the engine-runnable rule as the reason: a successful `gh pr create` is itself the irreversible, externally visible event and nothing arriving later can un-fire it (not merely that the command is 'risky', 'important', or 'needs review')",
+        "The response does NOT offer `requires_confirmation`, a gate, or a future koto release as a way to make `gh pr create` engine-runnable"
+      ]
     }
   ]
 }
