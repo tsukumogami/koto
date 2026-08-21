@@ -788,6 +788,11 @@ That refusal reaches the caller as an `__action__` blocking condition on the
 consumer reading the feed after the fact can tell a command that printed exactly
 this much from one whose output was cut.
 
+A state whose action requires confirmation writes this event on the tick that
+stops for confirmation, not on the tick that confirms: the confirming tick
+arrives with evidence, which skips the action rather than re-running it. One
+command, one event.
+
 ---
 
 #### `decision_recorded`
@@ -896,6 +901,15 @@ The event appears only on a successful delivery. A command that ran but whose
 output could not be delivered (empty, over 4096 bytes, or holding a character
 the allowlist forbids) appends no `variable_captured`; the tick stops instead,
 and the reason reaches the caller on the response.
+
+A capture is delivered on a tick that stops for confirmation as well as on one
+that advances, so this event does not imply the workflow moved. It has to work
+that way: confirming re-enters the state with evidence, which skips the action,
+so capturing only on the unconfirmed path would mean a confirmed action never
+delivered its value at all. The consequence for a reader is that a confirmed
+action leaves exactly one `variable_captured` and one `default_action_executed`
+in the log — both on the tick that stopped for confirmation, neither on the tick
+that confirmed.
 
 ---
 
