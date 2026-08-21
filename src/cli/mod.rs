@@ -2976,6 +2976,85 @@ fn substitute_gate_commands(
         .collect()
 }
 
+/// Resolve an action's substituted `working_dir` against the session's
+/// execution anchor.
+///
+/// The three steps run in the order DESIGN-koto-runs-commands.md Decision 8
+/// requires, and the order is the point:
+///
+/// 1. **Reject an absolute value**, before anything is joined. `Path::join`
+///    with an absolute argument discards the base and returns the argument, so
+///    a join-first implementation would hand back a path outside the anchor
+///    and a containment check afterwards would have nothing left to catch. A
+///    literal absolute value is already a compile error
+///    (`src/template/types.rs`); what reaches here is a value that became
+///    absolute through substitution.
+/// 2. **Join** the relative value to the anchor.
+/// 3. **Canonicalize and contain**: resolve `.`, `..`, and symlinks, then
+///    refuse a result that is no longer under the anchor.
+///
+/// A directory that does not exist cannot be canonicalized, so containment
+/// falls back to a lexical resolution of `..` and the runner reports the
+/// missing directory as it always has.
+///
+/// This bounds where a command *starts*. A command that runs is free to change
+/// directory or name any absolute path, and nothing here bounds what it can
+/// reach.
+///
+/// `Err` carries the message an author sees on the failed action.
+#[cfg(unix)]
+fn resolve_action_working_dir(
+    anchor: &std::path::Path,
+    working_dir: &str,
+) -> std::result::Result<std::path::PathBuf, String> {
+    use std::path::{Component, PathBuf};
+
+    // Step 1: absolute is refused before the join.
+    if std::path::Path::new(working_dir).is_absolute() {
+        return Err(format!(
+            "default_action working_dir resolved to the absolute path '{}'; \
+             working_dir must be relative, and is resolved against the session's \
+             execution directory {}",
+            working_dir,
+            anchor.display()
+        ));
+    }
+
+    // Step 2: only now is it safe to join.
+    let joined = anchor.join(working_dir);
+
+    // Step 3: canonicalize, then contain.
+    let resolved = std::fs::canonicalize(&joined).unwrap_or_else(|_| {
+        // The directory does not exist yet (or is not readable), so resolve
+        // `.` and `..` lexically instead. This still catches an escape; the
+        // command's own spawn failure reports the missing directory.
+        let mut lexical = PathBuf::new();
+        for component in joined.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    lexical.pop();
+                }
+                other => lexical.push(other),
+            }
+        }
+        lexical
+    });
+
+    let anchor_resolved = std::fs::canonicalize(anchor).unwrap_or_else(|_| anchor.to_path_buf());
+    if !resolved.starts_with(&anchor_resolved) {
+        return Err(format!(
+            "default_action working_dir '{}' resolves to {}, which is outside the session's \
+             execution directory {}; working_dir must stay under it",
+            working_dir,
+            resolved.display(),
+            anchor_resolved.display()
+        ));
+    }
+
+    Ok(resolved)
+}
+
 /// Handle the `koto next` command with full output contract support.
 ///
 /// Flow:
@@ -4206,7 +4285,27 @@ fn handle_next(
         let wd = if action.working_dir.is_empty() {
             execution_dir.clone()
         } else {
-            std::path::PathBuf::from(variables.substitute_with(&action.working_dir, &overlay))
+            // Resolve against the anchor: reject an absolute value, then join,
+            // then canonicalize and refuse an escape
+            // (DESIGN-koto-runs-commands.md Decision 8). A rejection is an
+            // action failure under Decision 3 -- same stop, same response
+            // shape, same `fallback` prose. No `DefaultActionExecuted` event
+            // is appended, because no command ran: the failure is reported as
+            // a spawn failure, which is what it is.
+            let substituted = variables.substitute_with(&action.working_dir, &overlay);
+            match resolve_action_working_dir(&execution_dir, &substituted) {
+                Ok(dir) => dir,
+                Err(message) => {
+                    return ActionResult::Failed {
+                        command,
+                        failure_kind: crate::action::FailureKind::SpawnFailed,
+                        exit_code: -1,
+                        stdout: String::new(),
+                        stderr: message,
+                        truncated: false,
+                    };
+                }
+            }
         };
 
         // Execute: polling or one-shot.
@@ -5881,6 +5980,126 @@ mod tests {
         // Marking is not applied twice.
         let marked = mark_truncated(cut, true);
         assert_eq!(mark_truncated(marked.clone(), true), marked);
+    }
+
+    #[cfg(unix)]
+    mod working_dir_resolution {
+        use super::*;
+        use crate::engine::substitute::{VariableOverlay, Variables};
+
+        /// A canonical anchor with a real subdirectory in it.
+        fn anchor() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+            dir
+        }
+
+        #[test]
+        fn a_relative_working_dir_resolves_under_the_anchor() {
+            let tmp = anchor();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+            let resolved = resolve_action_working_dir(&base, "sub").unwrap();
+
+            assert_eq!(resolved, base.join("sub"));
+        }
+
+        #[test]
+        fn a_relative_working_dir_that_does_not_exist_is_left_to_the_runner() {
+            let tmp = anchor();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+            // Nothing to canonicalize, but it is contained, so it passes
+            // through and the command's own spawn failure reports it.
+            let resolved = resolve_action_working_dir(&base, "not-there").unwrap();
+
+            assert_eq!(resolved, base.join("not-there"));
+        }
+
+        #[test]
+        fn an_absolute_working_dir_is_refused_before_the_join() {
+            let tmp = anchor();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+            // The trap this rejection exists for: joining an absolute path
+            // discards the base entirely, so a containment check placed after
+            // the join has nothing left to catch. Clippy warns on the join for
+            // exactly that reason, which is the assertion's point.
+            #[allow(clippy::join_absolute_paths)]
+            let joined = base.join("/etc");
+            assert_eq!(joined, std::path::PathBuf::from("/etc"));
+
+            let err = resolve_action_working_dir(&base, "/etc").unwrap_err();
+
+            assert!(
+                err.contains("/etc") && err.contains("absolute") && err.contains("relative"),
+                "the message must name the path and say what was expected, got: {}",
+                err
+            );
+            assert!(
+                err.contains("working_dir"),
+                "the message must name the field, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn a_variable_derived_absolute_working_dir_is_refused() {
+            let tmp = anchor();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+            // The template's literal value is `{{DIR}}`, which the compiler
+            // cannot see is absolute. Only after substitution is it. This is
+            // the case a join-first implementation passes silently.
+            let variables = Variables::from_events(&[]).unwrap();
+            let overlay = VariableOverlay::new();
+            overlay.insert("DIR", "/etc");
+            let substituted = variables.substitute_with("{{DIR}}", &overlay);
+            assert_eq!(substituted, "/etc");
+
+            let err = resolve_action_working_dir(&base, &substituted).unwrap_err();
+
+            assert!(err.contains("/etc"), "got: {}", err);
+        }
+
+        #[test]
+        fn a_relative_working_dir_that_escapes_upward_is_refused() {
+            let tmp = anchor();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+            let err = resolve_action_working_dir(&base, "..").unwrap_err();
+
+            assert!(
+                err.contains("outside") && err.contains(base.to_str().unwrap()),
+                "the message must say the value left the anchor and name it, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn an_escape_through_a_subdirectory_is_refused() {
+            let tmp = anchor();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+            // Escaping through a directory that exists takes the
+            // canonicalization path rather than the lexical one.
+            let err = resolve_action_working_dir(&base, "sub/../..").unwrap_err();
+            assert!(err.contains("outside"), "got: {}", err);
+
+            // And through one that does not, taking the lexical path.
+            let err = resolve_action_working_dir(&base, "not-there/../../elsewhere").unwrap_err();
+            assert!(err.contains("outside"), "got: {}", err);
+        }
+
+        #[test]
+        fn a_dot_segment_inside_the_anchor_is_kept() {
+            let tmp = anchor();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+            let resolved = resolve_action_working_dir(&base, "sub/../sub").unwrap();
+
+            assert_eq!(resolved, base.join("sub"));
+        }
     }
 
     fn export_args(

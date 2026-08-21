@@ -512,3 +512,181 @@ fn a_child_session_records_the_parents_anchor() {
         "a child copies the parent's anchor rather than adopting the spawning directory"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Decision 8: `working_dir` resolves against the anchor, and cannot leave it
+// ---------------------------------------------------------------------------
+
+/// A workflow whose action writes a marker at a relative path from a
+/// `working_dir` supplied by the caller.
+fn working_dir_template(working_dir: &str, variables: &str) -> String {
+    format!(
+        r#"---
+name: wd
+version: "1.0"
+initial_state: mark
+{variables}states:
+  mark:
+    default_action:
+      command: "printf ok > marker.txt"
+      working_dir: "{working_dir}"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## mark
+
+Write the marker.
+
+## done
+
+Done.
+"#
+    )
+}
+
+/// The single `__action__` condition of a blocked response.
+fn action_condition(run: &Run) -> &serde_json::Value {
+    assert_eq!(
+        run.json["action"], "gate_blocked",
+        "a refused working_dir stops the tick as an action failure; got {}",
+        run.stdout
+    );
+    run.json["blocking_conditions"]
+        .as_array()
+        .expect("blocking_conditions should be an array")
+        .iter()
+        .find(|c| c["name"] == "__action__")
+        .expect("the stop should carry an __action__ condition")
+}
+
+#[test]
+fn a_relative_working_dir_resolves_against_the_anchor_not_the_tick_directory() {
+    let home = TempDir::new().unwrap();
+    let anchor = dir(home.path(), "checkout");
+    // Both candidates exist, so the command can run in either and the
+    // marker's location is the whole answer.
+    let at_anchor = dir(&anchor, "sub");
+    let elsewhere = dir(&anchor, "elsewhere");
+    let at_tick_dir = dir(&elsewhere, "sub");
+
+    init_at(home.path(), &anchor, "wd", &working_dir_template("sub", ""));
+
+    // Tick from a subdirectory of the anchor, which containment accepts.
+    let run = run_koto(home.path(), &elsewhere, &["next", "wd"]);
+    assert!(run.success, "tick failed: {}", run.stdout);
+
+    assert!(
+        at_anchor.join("marker.txt").exists(),
+        "working_dir is relative to the anchor; got {}",
+        run.stdout
+    );
+    assert!(
+        !at_tick_dir.join("marker.txt").exists(),
+        "working_dir must not be relative to the directory `koto next` was typed in"
+    );
+}
+
+#[test]
+fn a_variable_derived_absolute_working_dir_is_an_action_failure() {
+    let home = TempDir::new().unwrap();
+    let anchor = dir(home.path(), "checkout");
+    // A real directory outside the anchor: the template names it only
+    // through a variable, so the compiler cannot see it is absolute and
+    // the rejection has to happen after substitution.
+    let outside = dir(home.path(), "outside");
+
+    let variables = "variables:\n  DIR:\n    description: \"Where to run\"\n    required: true\n";
+    let src = home.path().join("wd-template.md");
+    std::fs::write(&src, working_dir_template("{{DIR}}", variables)).unwrap();
+    let init = run_koto(
+        home.path(),
+        &anchor,
+        &[
+            "init",
+            "wd",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            &format!("DIR={}", outside.to_str().unwrap()),
+        ],
+    );
+    assert!(init.success, "init failed: {}", init.stdout);
+
+    let run = run_koto(home.path(), &anchor, &["next", "wd"]);
+    assert!(run.success, "tick failed: {}", run.stdout);
+
+    let condition = action_condition(&run);
+    let stderr = condition["output"]["stderr"].as_str().unwrap_or_default();
+    assert!(
+        stderr.contains("working_dir")
+            && stderr.contains("absolute")
+            && stderr.contains(outside.to_str().unwrap()),
+        "the failure must name the field and the offending path, got {}",
+        run.stdout
+    );
+
+    // The command never ran, so nothing was written and the tick stayed put.
+    assert!(
+        !outside.join("marker.txt").exists(),
+        "an absolute working_dir must not be joined away and used"
+    );
+    assert_eq!(run.json["state"], "mark");
+    assert_eq!(run.json["advanced"], false);
+    assert!(
+        !event_types(home.path(), "wd").contains(&"default_action_executed".to_string()),
+        "no command ran, so no execution is recorded"
+    );
+}
+
+#[test]
+fn a_relative_working_dir_that_escapes_upward_is_an_action_failure() {
+    let home = TempDir::new().unwrap();
+    let anchor = dir(home.path(), "checkout");
+    // `..` from the anchor lands here.
+    let above = home.path().to_path_buf();
+
+    init_at(home.path(), &anchor, "wd", &working_dir_template("..", ""));
+
+    let run = run_koto(home.path(), &anchor, &["next", "wd"]);
+    assert!(run.success, "tick failed: {}", run.stdout);
+
+    let condition = action_condition(&run);
+    let stderr = condition["output"]["stderr"].as_str().unwrap_or_default();
+    assert!(
+        stderr.contains("working_dir") && stderr.contains("outside"),
+        "the failure must say the value left the anchor, got {}",
+        run.stdout
+    );
+    assert!(
+        !above.join("marker.txt").exists(),
+        "a working_dir that escapes upward must not run"
+    );
+}
+
+#[test]
+fn a_literal_absolute_working_dir_never_compiles() {
+    let home = TempDir::new().unwrap();
+    let anchor = dir(home.path(), "checkout");
+
+    let src = home.path().join("abs-template.md");
+    std::fs::write(&src, working_dir_template("/tmp", "")).unwrap();
+    let run = run_koto(
+        home.path(),
+        &anchor,
+        &["init", "wd", "--template", src.to_str().unwrap()],
+    );
+
+    assert!(
+        !run.success,
+        "init should refuse the template: {}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("/tmp") && run.stdout.contains("absolute"),
+        "the compile error must name the path, got {}",
+        run.stdout
+    );
+}

@@ -873,6 +873,23 @@ impl CompiledTemplate {
                         ));
                     }
                 }
+                // Reject a literal absolute working_dir. The value is joined
+                // to the session's execution anchor at run time, and
+                // `Path::join` with an absolute argument silently discards
+                // the base -- so an absolute path would leave the anchor
+                // while looking like it had been resolved against it. This is
+                // the first of the three rejections
+                // (DESIGN-koto-runs-commands.md Decision 8); a value that only
+                // becomes absolute after substitution is caught at run time,
+                // and containment is checked after the join.
+                if std::path::Path::new(&action.working_dir).is_absolute() {
+                    return Err(format!(
+                        "state '{}': default_action working_dir '{}' is an absolute path; \
+                         working_dir must be relative, and is resolved against the session's \
+                         execution directory",
+                        state_name, action.working_dir
+                    ));
+                }
                 // Require polling.timeout_secs > 0 when polling is declared.
                 if let Some(polling) = &action.polling {
                     if polling.timeout_secs == 0 {
@@ -2700,6 +2717,39 @@ mod tests {
             "got: {}",
             err
         );
+    }
+
+    #[test]
+    fn rejects_literal_absolute_action_working_dir() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.default_action = Some(ActionDecl {
+            command: "echo ok".to_string(),
+            working_dir: "/etc".to_string(),
+            requires_confirmation: false,
+            polling: None,
+            fallback: None,
+        });
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("'/etc'") && err.contains("absolute") && err.contains("relative"),
+            "the error must name the path and say what was expected, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn accepts_a_relative_action_working_dir() {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.default_action = Some(ActionDecl {
+            command: "echo ok".to_string(),
+            working_dir: "sub/dir".to_string(),
+            requires_confirmation: false,
+            polling: None,
+            fallback: None,
+        });
+        t.validate(true).unwrap();
     }
 
     #[test]
