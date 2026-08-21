@@ -127,7 +127,15 @@ shared execution layer sit underneath all three.
   `advanced: false` with the original state, and a follow-up `koto status`
   reports the session missing.
 - **`check-staleness.sh` could not be read** — it is not in shirabe's tree — so
-  one gate's exposure to the output defect is unverified.
+  one gate's exposure to the output defect is unverified. Its stdout is consumed
+  internally by `jq -e`, so the only open channel is the script's own stderr.
+- **There is no existing test coverage to extend for the output defect.** A
+  search of `tests/integration_test.rs` and `action.rs`'s own unit tests found
+  zero tests exercising output above the buffer or the truncation path at all,
+  so the fix carries new tests rather than modified ones. The polling loop and
+  the default-action path both call the same function, so it is one fix and not
+  several; the only other piped spawn in `src/` reads its child line by line
+  while it runs and is a different shape.
 - **Where the authoring documentation belongs** is unsettled: extending
   `template-format.md`'s existing layer structure, or a new layer, since
   `default_action` changes engine behavior rather than being a routing primitive.
