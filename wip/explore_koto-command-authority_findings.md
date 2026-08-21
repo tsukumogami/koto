@@ -253,3 +253,5 @@ regardless of everything else here.
 ### Decisions
 
 Recorded in `wip/explore_koto-command-authority_decisions.md`.
+
+## Decision: Crystallize

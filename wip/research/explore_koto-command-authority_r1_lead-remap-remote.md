@@ -145,6 +145,40 @@ idiom `execute.md:397`'s own guard already uses) is a small, concrete piece of w
 that would make the "genuinely defensible" claim fully true rather than partly true,
 and it's cheap regardless of anything else in either document.
 
+### Direct answers to the follow-up (apply the rule, accept/reject it, test durability)
+
+**1. Applying "no `default_action` on irreversible commands" to all ten rows, with counts against the original.**
+
+| # | command | verdict before this exploration | verdict under the blanket rule, read narrowly (my proposed cut, see #2) | verdict under the blanket rule, read maximally (any writes-remote mutation to a shared/external system counts) |
+|---|---|---|---|---|
+| 1 | `git push` pre-PR (`execute.md:395`) | converted-now | converted-now | converted-now — no external visibility exists at all, no reading of "outward-facing" catches it |
+| 2 | `gh pr create` (`execute.md:397`) | converted-now | **stays-agent-run** | stays-agent-run |
+| 3 | `gh pr edit` own draft (`execute.md:555`) | converted-after-plumbing | converted-after-plumbing (contestable) | stays-agent-run |
+| 4 | cascade push (`execute.md:596`) | converted-after-plumbing | converted-after-plumbing | stays-agent-run |
+| 5 | `gh pr ready` (`execute.md:605`) | converted-now | **stays-agent-run** | stays-agent-run |
+| 6 | `SKILL.md` coordination `gh pr edit` | stays-agent-run (structural) | stays-agent-run | stays-agent-run |
+| 7 | `SKILL.md` coordination `gh pr close` | stays-agent-run (structural) | stays-agent-run | stays-agent-run |
+| 8 | `git push` pre-PR (`phase-6-pr.md:20`) | converted-now | converted-now | converted-now |
+| 9 | `force-with-lease` (`phase-6-pr.md:23`) | converted-after-plumbing | converted-after-plumbing | stays-agent-run |
+| 10 | `gh pr create` (work-on `pr_creation`) | converted-after-plumbing | **stays-agent-run** | stays-agent-run |
+
+**Counts, out of 10**: before this exploration — 4 converted-now, 4 converted-after-plumbing, 2 stays-agent-run. Under my narrower cut — 2 converted-now, 3 converted-after-plumbing, 5 stays-agent-run. Under the maximal reading — 2 converted-now, 0 converted-after-plumbing, 8 stays-agent-run. The three flips (#2, #5, #10) are the ones I already conceded in the section above; #3, #4, #9 are where the narrow and maximal readings disagree, which is exactly the joint question in #2 below.
+
+**2. Do I accept the rule as stated? No — not without sharpening it, and here's the one-sentence version I'd write instead.** "No `default_action` on irreversible commands" is directionally right but `irreversible` is undefined, and a maximal reading sweeps in #4 and #9, which I don't think belong with #2/#5/#10. The mechanism difference: #2/#5/#10 are commands whose *successful exit is itself* the unrecoverable event (a PR is created, a ready-for-review notification fires) — no gate, no later action, nothing downstream un-happens that. #4 and #9 are commands whose only irreversibility is bounded and correctable *after* a successful run (revert-and-repush; a lease that refuses atomically before rewriting anything rather than clobbering blind) — their real failure mode is a *silent bad run*, not an *unrecoverable good one*. I'd write the rule a template author could apply as:
+
+> Keep `default_action` off any command whose successful exit is itself the irreversible, externally-visible event (creating, publishing, or closing a PR; posting a comment; marking ready for review) — but allow it for a command whose only irreversibility is bounded and repairable after a successful run, because those need better failure diagnosis, not a pre-execution veto.
+
+That cuts at "does success itself create the harm" rather than at "does this command touch something remote," which is the joint the blanket rule as stated doesn't name.
+
+**3. Does the sibling's "unrecoverable and undiagnosable" argument survive once action output reaches the failure path — staged constraint or durable rule?** The answer splits cleanly along the same line as #2, and this is the sharpest thing this reconciliation produced: **it depends on which half of "unrecoverable and undiagnosable" is actually doing the work for a given command.**
+
+- For #2/#5/#10 (`gh pr create`, `gh pr ready`): action-output-on-failure fixes *diagnosability of a failed attempt*. It does nothing for a *successful* one, and these commands' entire danger is in an unreviewed success — the notification fires, the PR exists, the instant `koto next` returns 0. So the constraint on these three is **durable, not staged**. No amount of failure-path plumbing changes it, because the plumbing addresses a failure mode these commands don't primarily have. This matches the sibling's own conclusion and I'm not disagreeing with it for these three.
+- For #4/#9 (cascade push, force-with-lease): here the actual risk *is* "a failure I can't currently diagnose" — an opaque gate exit code with the real git/script error discarded. There's no separate success-side checkpoint problem the way there is for `gh pr create`: a push landing exactly as intended *is* the desired outcome, full stop, with no distinct "and also this fired an unrecoverable notification regardless of the content" clause riding along. So the constraint on these two is **staged, not durable** — action-output-on-failure is the specific, sufficient fix, and once it lands the case for keeping them agent-run goes away.
+
+So: durable for three of the ten rows, staged for two, and the deciding question for any future row is "does this command's risk live in a bad success or a bad failure" — not "is it labeled writes-remote" and not "is it labeled irreversible" without further qualification.
+
+**4. Where the disagreement is, plainly, and what would settle it.** I disagree with reading the rule to also catch #4/#9, on the mechanism argument in #2/#3 above. This rests on one empirical claim I have not verified against either document or against GitHub's actual notification behavior: that a `synchronize` event (new commits pushed to an already-open PR) is meaningfully quieter, notification-wise, than an `opened` or `ready_for_review` event. If that's wrong — if GitHub notifies PR watchers just as prominently for new commits as for opens — my case for keeping #4 out of the ban weakens a lot, and I'd move it to stays-agent-run alongside #2/#5/#10, converging fully with the sibling's document. `force-with-lease` (#9) I'd defend even then, since its argument doesn't depend on notification volume at all — it rests on the lease's atomic self-refusal, a property `gh pr create` genuinely lacks. That's the concrete thing that would settle it: whichever of us checks GitHub's actual notification tiering for `synchronize` vs. `opened`/`ready_for_review` events resolves #4; #9 stays a live disagreement regardless, since neither document has evidence on it yet.
+
 ## Implications
 
 **Superseded by the Reconciliation section above.** This paragraph originally argued row #5 (`gh pr ready`) was the clearest case for splitting `plan_completion` into a converts-now `mark_ready` state and a plumbing-gated `run_cascade` state. After reconciling with `r1_lead-confirmation.md`, row #5 itself moved to stays-agent-run-or-equivalent-caution — it fires an un-un-fireable "ready for review" notification on success, the same category as `gh pr create`, not the git-push category I'd compared it to. The state-split argument still holds as a general lesson (bundling steps of different risk levels inside one `default_action` blocks the safe one), but `plan_completion` is no longer the example: row #4 (the cascade) is the only mechanical step left in that state, and it isn't paired with anything else in this bucket bar to safely split off. I'm leaving the original paragraph's reasoning below for the record rather than deleting it, since the *pattern* — a state split freeing a safe step from a risky sibling — remains a real, general finding even though this specific instance doesn't.
