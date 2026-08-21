@@ -163,8 +163,30 @@ Two things it does not cover. It refuses `koto next` only — `koto context`, `k
 process tree, not the session name, so a tick on some *other* workflow from inside a
 command is refused too.
 
-If you hit this, the fix is in the template: take the `koto next` out of the command. The
-enclosing tick is what advances the session.
+If you hit this, the fix is usually in the template: take the `koto next` out of the
+command. The enclosing tick is what advances the session.
+
+### When the tick named in the message is already gone
+
+The marker is a plain inherited environment variable. Nothing behind it checks whether the
+tick still exists, and the message does not claim it does.
+
+That matters for one case. koto kills a timed-out command by its process group, and a
+command that detached itself first — `setsid`, or a backgrounded subshell — is no longer in
+that group, so it survives. It also still carries `KOTO_TICK_SESSION`. A `koto next` such a
+process runs minutes later is refused in the name of a tick that exited long ago.
+
+Tell the two apart with `koto status` on the session the message names. If a tick really is
+in flight, the refusal is doing its job and the command is what has to change. If nothing is
+running, clear the marker for the one invocation:
+
+```sh
+KOTO_TICK_SESSION= koto next <name>
+```
+
+A blank value counts as absent, which is why this works. Clear it only after checking —
+inside a command that genuinely is running under a tick, clearing it re-opens the defect the
+refusal exists to stop.
 
 ---
 

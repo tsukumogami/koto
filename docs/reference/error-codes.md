@@ -127,14 +127,16 @@ A failed *delivery* is a different thing and does not use this code. When the co
 `koto next` runs a state's `default_action` and its command gates as child processes, and those children inherit the tick's environment. Before it runs anything, the tick exports `KOTO_TICK_SESSION` naming the session it is advancing. A `koto next` that finds that variable already set was started from inside one of those commands, and refuses:
 
 ```json
-{"error":{"code":"nested_invocation","message":"koto next cannot run inside a command koto is running: the tick on session 'my-workflow' spawned this process and has not finished. A nested tick advances the workflow while the outer tick keeps reporting the state it started with, so the caller is told the session is somewhere it has already left. Remove the `koto next my-workflow` call from the template's command -- the enclosing tick is what advances the session.","details":[]}}
+{"error":{"code":"nested_invocation","message":"koto next cannot run inside a command koto is running: this process inherited KOTO_TICK_SESSION from a tick on session 'my-workflow'. A nested tick advances the workflow while that tick goes on reporting the state it started with, so the caller is told the session is somewhere it has already left. If this is a template's command, remove the `koto next my-workflow` call -- the enclosing tick is what advances the session. If that tick has already exited and this process outlived it (a command that detaches with setsid or backgrounds itself does), clear the marker: `KOTO_TICK_SESSION= koto next my-workflow`.","details":[]}}
 ```
 
 The refusal is not about wasted work. A nested tick appends to the same event log the outer tick is halfway through processing: it really does advance the session, and the outer tick then finishes against the snapshot it started with and reports a state the workflow has already left. That is a wrong answer rather than a missing one, so nothing else surfaces it.
 
 Two things this does *not* cover. It refuses `koto next` only -- `koto context`, `koto status`, and the rest run from inside a command as before, and reading or writing context on the loop-back edge of a state stays a supported pattern. And it is scoped to the process tree, not to the session name: a tick on some *other* workflow is refused too, because a chain that ticks back into the outer session through a second one lands on the same defect.
 
-`KOTO_TICK_SESSION` is a marker, not an input. Nothing reads it to decide which session to act on, and a blank value counts as absent.
+`KOTO_TICK_SESSION` is a marker, not an input. Nothing reads it to decide which session to act on.
+
+It also carries no liveness, and the message deliberately does not claim otherwise. koto kills a timed-out command by its process group, so a command that detached itself first -- `setsid`, or a backgrounded subshell -- survives, and keeps the marker for as long as it lives. A `koto next` that process runs after the tick exits is refused in the name of a tick that is already gone. Adding a pid and a liveness probe would trade that for pid-reuse ambiguity, and no shipped template detaches, so the marker stays a plain inherited flag and the way out is documented instead: a blank value counts as absent, so `KOTO_TICK_SESSION= koto next <name>` clears it for one invocation. The refusal message says so itself, because whoever hits this cannot read this page from inside the failing process. Check `koto status` on the session the message names before reaching for it -- inside a command that really is under a live tick, clearing the marker re-opens the defect.
 
 #### Command failure kinds
 

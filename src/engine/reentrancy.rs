@@ -43,16 +43,29 @@ pub fn mark_tick(session: &str) {
 
 /// The message a nested `koto next` refuses with.
 ///
-/// `enclosing` is the session the outer tick is advancing, `requested` the
-/// session this invocation asked for. Both are named because they are often
-/// the same session and the reader needs to see that they are.
+/// `enclosing` is the session named by the marker, `requested` the session
+/// this invocation asked for. Both are named because they are often the same
+/// session and the reader needs to see that they are.
+///
+/// The message does not claim the enclosing tick is still running, because
+/// nothing here checks. The marker has no liveness: a command that detaches
+/// itself -- `setsid`, a backgrounded subshell -- escapes the process-group
+/// kill at timeout and carries the marker for as long as it lives, so a
+/// `koto next` it runs minutes later is refused by a tick that exited long
+/// ago. No shipped template does this, which is why the marker stays a plain
+/// inherited flag rather than growing a pid and a liveness probe. The person
+/// who hits it cannot read this comment, so the escape hatch is named in the
+/// message itself.
 pub fn nested_invocation_message(enclosing: &str, requested: &str) -> String {
     format!(
-        "koto next cannot run inside a command koto is running: the tick on session '{enclosing}' \
-         spawned this process and has not finished. A nested tick advances the workflow while the \
-         outer tick keeps reporting the state it started with, so the caller is told the session \
-         is somewhere it has already left. Remove the `koto next {requested}` call from the \
-         template's command -- the enclosing tick is what advances the session."
+        "koto next cannot run inside a command koto is running: this process inherited \
+         {TICK_SESSION_ENV} from a tick on session '{enclosing}'. A nested tick advances the \
+         workflow while that tick goes on reporting the state it started with, so the caller is \
+         told the session is somewhere it has already left. If this is a template's command, \
+         remove the `koto next {requested}` call -- the enclosing tick is what advances the \
+         session. If that tick has already exited and this process outlived it (a command that \
+         detaches with setsid or backgrounds itself does), clear the marker: \
+         `{TICK_SESSION_ENV}= koto next {requested}`."
     )
 }
 
@@ -70,6 +83,30 @@ mod tests {
         assert!(
             msg.contains("koto next inner"),
             "should name the call to remove: {msg}"
+        );
+    }
+
+    /// The marker has no liveness, so a process that outlived its tick can be
+    /// refused by one that is long gone. The way out has to be in the message
+    /// -- whoever hits it is by definition not reading this file.
+    #[test]
+    fn the_message_carries_the_escape_hatch() {
+        let msg = nested_invocation_message("outer", "inner");
+        assert!(
+            msg.contains("KOTO_TICK_SESSION= koto next inner"),
+            "should spell out the command that clears the marker: {msg}"
+        );
+    }
+
+    /// The message must not assert that the enclosing tick is still running.
+    /// Nothing checks, and a detached command outliving its tick makes the
+    /// claim false at exactly the moment someone is trying to debug it.
+    #[test]
+    fn the_message_does_not_claim_the_tick_is_still_running() {
+        let msg = nested_invocation_message("outer", "inner");
+        assert!(
+            !msg.contains("has not finished"),
+            "the message states liveness it never checked: {msg}"
         );
     }
 

@@ -16,6 +16,11 @@ use assert_cmd::Command;
 use assert_fs::TempDir;
 use std::path::{Path, PathBuf};
 
+/// The marker a tick exports and a nested one reads. Spelled out rather than
+/// imported so the test fails if the name changes -- agents and the reference
+/// docs both hard-code it.
+const MARKER: &str = "KOTO_TICK_SESSION";
+
 // ---------------------------------------------------------------------------
 // harness
 // ---------------------------------------------------------------------------
@@ -279,6 +284,51 @@ fn context_writes_from_inside_a_command_still_work() {
         "hello",
         "the value the command wrote should be readable afterwards"
     );
+}
+
+/// The marker has no liveness: a command that detaches itself escapes the
+/// process-group kill at timeout and carries `KOTO_TICK_SESSION` for as long
+/// as it lives, so a tick that exited long ago can still refuse it. Clearing
+/// the variable is the way out, and the refusal message names it -- so it is
+/// a contract, not an accident of how the marker is read.
+#[test]
+fn clearing_the_marker_lets_a_tick_through() {
+    let dir = TempDir::new().unwrap();
+    init_ok(dir.path(), "nesting", &gate_runs_template("true"));
+
+    let refused = koto_cmd(dir.path())
+        .env(MARKER, "some-tick-that-exited")
+        .args(["next", "nesting"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "a stale marker refuses: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("KOTO_TICK_SESSION= koto next nesting"),
+        "the refusal must name the way out, since whoever hits it cannot \
+         read the source: {message}"
+    );
+
+    // Exactly what the message told them to run.
+    let cleared = koto_cmd(dir.path())
+        .env(MARKER, "")
+        .args(["next", "nesting"])
+        .output()
+        .unwrap();
+    assert!(
+        cleared.status.success(),
+        "clearing the marker must let the tick through: stdout={} stderr={}",
+        String::from_utf8_lossy(&cleared.stdout),
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&cleared.stdout).unwrap();
+    assert_eq!(body["state"], "s", "the cleared tick should run: {body}");
 }
 
 /// A plain `koto next` from a shell is not nested, and the marker an outer

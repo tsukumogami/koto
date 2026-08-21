@@ -28,6 +28,10 @@ to `0.9.x`).
   ticks back into the outer session through another one lands on the
   same defect. It covers `koto next` only: `koto context` reads and
   writes from inside a command are a supported pattern and keep working.
+  The marker is inherited and carries no liveness — a command that
+  detaches survives the process-group kill at timeout and keeps it — so
+  the refusal message names the escape hatch, `KOTO_TICK_SESSION= koto
+  next <name>`, for a process that outlived its tick.
   Closes koto#208.
 
 - **`details` suppression now keys on delivery, not visit count.** koto

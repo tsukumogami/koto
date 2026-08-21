@@ -191,10 +191,18 @@ the snapshot it started with and answered `advanced: false` on the state the ses
 left. The caller's view was wrong, not absent, so nothing surfaced an error.
 
 koto now refuses the nested call: it exports `KOTO_TICK_SESSION` before running anything, and a
-`koto next` that sees it fails with the `nested_invocation` code and exit 2, naming the tick in
-flight. The refusal is scoped to the process tree rather than to one session name, so ticking a
-*different* workflow from a command is refused too -- a chain that ticks back into the outer
-session through a second one lands on the same defect.
+`koto next` that sees it fails with the `nested_invocation` code and exit 2, naming the session
+the marker came from. The refusal is scoped to the process tree rather than to one session name,
+so ticking a *different* workflow from a command is refused too -- a chain that ticks back into
+the outer session through a second one lands on the same defect.
+
+The marker is inherited and has no liveness behind it, which matters if you write a command that
+detaches. koto kills a timed-out command by its process group; a command that called `setsid` or
+backgrounded itself is no longer in that group, so it survives the kill and keeps the marker for
+as long as it runs. A `koto next` it issues after the tick exits is refused by a tick that is
+already gone. The refusal message names the way out (`KOTO_TICK_SESSION= koto next <name>`), but
+the cleaner answer is not to leave processes behind a command: koto stops watching at the
+timeout, so anything still running past it is outside the engine's model.
 
 Every other `koto` subcommand still works from a command. `koto context add` and `koto context
 remove` in particular are a supported pattern -- clearing a key on a loop-back edge is authored
