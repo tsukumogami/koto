@@ -1,13 +1,18 @@
 ---
 topic: koto-runs-commands
 chain_started: 2026-08-21T02:31:24Z
-last_updated: 2026-08-21T02:32:10Z
+last_updated: 2026-08-21T02:43:16Z
 phase_pointer: phase-2
 exit: UNSET
 exit_artifacts: []
 planned_chain: [brief, prd, design, plan]
 chain_skipped: []
-chain_ran: []
+chain_ran: [brief]
+child_snapshots:
+  brief:
+    path: docs/briefs/BRIEF-koto-runs-commands.md
+    status: Accepted
+    validator: clean
 framing_shift: yes
 r6_predicates:
   p1_architectural_alternatives: fires
