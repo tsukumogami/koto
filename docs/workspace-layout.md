@@ -21,9 +21,11 @@ of authority for this document).
 ```
 ~/.koto/
 ├── sessions/                                  # AUTHORITATIVE state
-│   └── <session-id>/
-│       ├── koto-<session-id>.state.jsonl      # header + event log
-│       └── claim.lock                         # derived (request-store sidecar)
+│   ├── <session-id>/
+│   │   ├── koto-<session-id>.state.jsonl      # header + event log
+│   │   └── claim.lock                         # derived (request-store sidecar)
+│   └── .migration-conflicts/                  # AUTHORITATIVE state (see below)
+│       └── <repo-id>/<session-id>/
 ├── requests/                                  # AUTHORITATIVE state
 │   └── <request_id>/
 │       ├── request.jsonl                      # header + event log
@@ -37,6 +39,14 @@ of authority for this document).
 
 Sessions under `~/.koto/sessions/` ARE the authoritative state and
 must not be deleted manually except via `koto session cleanup`.
+
+`sessions/.migration-conflicts/` is session state too, not a cache: it
+holds sessions the layout migration could not place because their name
+was already taken at the flat level. They are whole sessions with their
+event logs intact, and deleting the directory destroys them. Run `koto
+session recover` to see what is in there and `koto session recover
+--apply` to move it back into the session list.
+
 Request records under `~/.koto/requests/` are authoritative too and
 have no cleanup verb at all. The four derived files below are safe to
 delete.
