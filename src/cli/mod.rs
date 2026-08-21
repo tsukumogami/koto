@@ -4389,15 +4389,19 @@ fn handle_next(
 
         if action.requires_confirmation {
             ActionResult::RequiresConfirmation {
+                command,
                 exit_code: output.exit_code,
                 stdout,
                 stderr,
+                truncated: output.truncated,
             }
         } else {
             ActionResult::Executed {
+                command,
                 exit_code: output.exit_code,
                 stdout,
                 stderr,
+                truncated: output.truncated,
             }
         }
     };
@@ -4661,9 +4665,46 @@ fn handle_next(
             // The final directive of the tick. It reads the overlay, so a state
             // the loop auto-advanced into renders what an earlier state in this
             // same tick produced rather than the value the log carried in.
+            //
+            // A capture name the run never delivered must not survive this
+            // pass: a declared variable renders its own empty binding, but a
+            // capture has none, so the token itself would land in an agent's
+            // instructions -- the outcome R4 exists to prevent. The check runs
+            // on each string the response actually substitutes, so a state
+            // whose prose is never rendered (a terminal stop) is not refused
+            // for a name it would never have shown. The template compiled, so
+            // the capture map is available; an error building it is
+            // unreachable and costs the check nothing.
+            let capture_names = compiled.capture_names().unwrap_or_default();
+            let unset_capture: std::cell::RefCell<Option<(String, String)>> =
+                std::cell::RefCell::new(None);
             let resp = resp.with_substituted_directive(|d| {
+                if unset_capture.borrow().is_none() {
+                    if let Some(hit) = crate::engine::substitute::first_unset_capture(
+                        d,
+                        &capture_names,
+                        &variables,
+                        &overlay,
+                    ) {
+                        *unset_capture.borrow_mut() = Some(hit);
+                    }
+                }
                 substitute_directive(d, &runtime_vars, &variables, &overlay)
             });
+            if let Some((key, producer)) = unset_capture.into_inner() {
+                let ne = NextError {
+                    code: NextErrorCode::CaptureUnset,
+                    message: format!(
+                        "state '{}' reads {{{{{}}}}}, which state '{}' delivers with \
+                         capture_stdout_as; this run has not entered that state, so the \
+                         value is unset",
+                        final_state, key, producer
+                    ),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": ne});
+                exit_with_error_code(json, ne.code.exit_code());
+            }
 
             // Whether the phase's delivery window already carries a
             // delivery. Guarded by the same `details.is_empty()` check

@@ -709,6 +709,26 @@ pub enum EventPayload {
     ExecutionAnchorAdopted {
         anchor: PathBuf,
     },
+    /// A state's `default_action` delivered its stdout under the name the
+    /// state declared in `capture_stdout_as`
+    /// (DESIGN-koto-runs-commands.md Decision 1).
+    ///
+    /// This event is the durable record of a captured value; the per-tick
+    /// overlay is only the in-memory view of the same write.
+    /// [`crate::engine::substitute::bindings_from_events`] folds these in
+    /// event order, so re-entering the producing state means the later value
+    /// wins, and a rewind past that state leaves the value in place -- the log
+    /// is never truncated.
+    ///
+    /// `value` has already been trimmed and checked against the variable
+    /// allowlist, so a value that reached the log is one substitution can use.
+    /// The event is additive and does not move `CURRENT_SCHEMA_VERSION`: an
+    /// older build lands it in [`Unknown`](EventPayload::Unknown) and keeps
+    /// reading the log.
+    VariableCaptured {
+        key: String,
+        value: String,
+    },
     /// Carries the auto-promoted [`WorkflowResult`] envelope on a child's
     /// own session log (wire `type: "request_store.result"`, in the
     /// reserved `request_store.*` namespace;
@@ -1077,6 +1097,7 @@ impl EventPayload {
             EventPayload::ChildCompleted { .. } => "child_completed",
             EventPayload::IntentUpdated { .. } => "intent_updated",
             EventPayload::ExecutionAnchorAdopted { .. } => "execution_anchor_adopted",
+            EventPayload::VariableCaptured { .. } => "variable_captured",
             EventPayload::RequestStoreResult { .. } => "request_store.result",
             EventPayload::RequestCreated { .. } => "request.created",
             EventPayload::RequestLegBound { .. } => "request.leg_bound",
@@ -1347,6 +1368,14 @@ impl<'de> Deserialize<'de> for Event {
                     .map_err(serde::de::Error::custom)?;
                 EventPayload::ExecutionAnchorAdopted { anchor: p.anchor }
             }
+            "variable_captured" => {
+                let p: VariableCapturedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::VariableCaptured {
+                    key: p.key,
+                    value: p.value,
+                }
+            }
             "request_store.result" => {
                 let p: RequestStoreResultPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
@@ -1586,6 +1615,12 @@ struct IntentUpdatedPayload {
 #[derive(Deserialize)]
 struct ExecutionAnchorAdoptedPayload {
     anchor: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct VariableCapturedPayload {
+    key: String,
+    value: String,
 }
 
 #[derive(Deserialize)]

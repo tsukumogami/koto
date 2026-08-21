@@ -707,7 +707,7 @@ pub struct NextError {
     pub details: Vec<ErrorDetail>,
 }
 
-/// The eleven error codes for `koto next` domain errors.
+/// The twelve error codes for `koto next` domain errors.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NextErrorCode {
@@ -731,6 +731,14 @@ pub enum NextErrorCode {
     /// "you are in the wrong tree" from "the recorded tree is gone"
     /// without matching on wording.
     ExecutionAnchorUnresolvable,
+    /// A state's instruction text read a capture name no state has delivered
+    /// on this run (R4, unset case). The producing state exists -- a name no
+    /// state declares is a compile error -- but the run reached the reading
+    /// state without passing through it, so there is no value to render.
+    /// Rendering the empty string or the raw `{{KEY}}` token instead is
+    /// exactly what this code exists to prevent, which is why it is a stop
+    /// rather than a fallback.
+    CaptureUnset,
 }
 
 impl NextErrorCode {
@@ -752,6 +760,10 @@ impl NextErrorCode {
             NextErrorCode::TemplateError => 3,
             NextErrorCode::PersistenceError => 3,
             NextErrorCode::ExecutionAnchorUnresolvable => 3,
+            // An authoring problem, not something the agent can fix by
+            // behaving differently: the template routed to a state that reads
+            // a value the path it took never produces.
+            NextErrorCode::CaptureUnset => 3,
         }
     }
 }

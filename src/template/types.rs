@@ -215,6 +215,22 @@ pub struct ActionDecl {
     /// failure; the response simply carries no prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
+    /// The name this command's trimmed stdout is delivered under.
+    ///
+    /// The name is its own declaration; it is deliberately not written in the
+    /// template's `variables:` block, because a declared variable is
+    /// materialized by `koto init` and would render as the empty string on a
+    /// run that never entered this state
+    /// (DESIGN-koto-runs-commands.md Decision 2). The compiler validates
+    /// `{{KEY}}` references against the union of the variables block, every
+    /// state's capture name, and the runtime names, and rejects a capture name
+    /// that collides with any of them.
+    ///
+    /// A state that declares no name behaves exactly as it did before captures
+    /// existed: the command's stdout reaches the event log and the response,
+    /// and nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_stdout_as: Option<String>,
 }
 
 /// Polling configuration for actions that need repeated execution.
@@ -489,7 +505,91 @@ pub const FIELD_TYPE_TASKS: &str = "tasks";
 /// runtime (e.g., SESSION_DIR is the session directory path).
 const RUNTIME_VARIABLE_NAMES: &[&str] = &["SESSION_DIR", "SESSION_NAME"];
 
+/// True when `name` is spelled the way a `{{KEY}}` reference can find it:
+/// an uppercase letter followed by uppercase letters, digits, or underscores.
+///
+/// This is the name half of [`VAR_REF_PATTERN`]. A capture spelled any other
+/// way is unreferenceable, so the compiler rejects it at the declaration
+/// rather than leaving an author to discover the reference never resolves.
+fn is_capture_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
 impl CompiledTemplate {
+    /// Every `capture_stdout_as` name in the template, mapped to the state
+    /// that delivers it.
+    ///
+    /// The map is the capture namespace: names live here rather than in the
+    /// `variables:` block, so `koto init` never materializes one and a run
+    /// that skipped the producing state has no value to render
+    /// (DESIGN-koto-runs-commands.md Decision 2). Returning the producing
+    /// state is what lets the run-time stop for an undelivered name say which
+    /// state would have delivered it.
+    ///
+    /// Fails on the three collisions that would make a name ambiguous: with a
+    /// declared variable, with a reserved runtime name, or with another
+    /// state's capture name. Answering all three here means precedence between
+    /// two producers never arises at run time.
+    pub fn capture_names(&self) -> Result<BTreeMap<String, String>, String> {
+        let mut captures: BTreeMap<String, String> = BTreeMap::new();
+        for (state_name, state) in &self.states {
+            let Some(action) = &state.default_action else {
+                continue;
+            };
+            let Some(key) = &action.capture_stdout_as else {
+                continue;
+            };
+            if key.is_empty() {
+                return Err(format!(
+                    "state {:?}: default_action capture_stdout_as must not be empty\n  \
+                     remedy: name the capture or drop the field",
+                    state_name
+                ));
+            }
+            if !is_capture_name(key) {
+                return Err(format!(
+                    "state {:?}: default_action capture_stdout_as {:?} is not a valid name; \
+                     a name starts with an uppercase letter and continues with uppercase \
+                     letters, digits, or underscores, so that {{{{{}}}}} can reference it\n  \
+                     remedy: rename the capture",
+                    state_name, key, key
+                ));
+            }
+            if self.variables.contains_key(key) {
+                return Err(format!(
+                    "state {:?}: default_action capture_stdout_as {:?} collides with a \
+                     declared variable; a capture name is its own declaration and must not \
+                     appear in the variables block\n  \
+                     remedy: rename the capture, or remove {:?} from the variables block",
+                    state_name, key, key
+                ));
+            }
+            if RUNTIME_VARIABLE_NAMES.contains(&key.as_str()) {
+                return Err(format!(
+                    "state {:?}: default_action capture_stdout_as {:?} is a reserved runtime \
+                     variable name\n  \
+                     remedy: rename the capture",
+                    state_name, key
+                ));
+            }
+            if let Some(other) = captures.get(key) {
+                return Err(format!(
+                    "state {:?}: default_action capture_stdout_as {:?} is already delivered by \
+                     state {:?}; two states must not declare the same capture name\n  \
+                     remedy: rename one of the captures",
+                    state_name, key, other
+                ));
+            }
+            captures.insert(key.clone(), state_name.clone());
+        }
+        Ok(captures)
+    }
+
     /// Validate the compiled template against all schema rules.
     ///
     /// When `strict` is `true`, a state that has gates but no `gates.*`
@@ -523,6 +623,11 @@ impl CompiledTemplate {
                 self.initial_state
             ));
         }
+        // Collect the capture names before the per-state loop: a `{{KEY}}`
+        // reference resolves against the union of the variables block, every
+        // state's capture name, and the runtime names, and a state may read a
+        // name a later state in the map delivers.
+        let captures = self.capture_names()?;
         for (state_name, state) in &self.states {
             if state.directive.is_empty() {
                 return Err(format!("state {:?} has empty directive", state_name));
@@ -795,11 +900,12 @@ impl CompiledTemplate {
             }
 
             // Validate evidence routing rules on transitions (D3 included).
-            self.validate_evidence_routing(state_name, state)?;
+            self.validate_evidence_routing(state_name, state, &captures)?;
 
             // Validate variable references in directives.
             for ref_name in extract_refs(&state.directive) {
                 if !self.variables.contains_key(&ref_name)
+                    && !captures.contains_key(&ref_name)
                     && !RUNTIME_VARIABLE_NAMES.contains(&ref_name.as_str())
                 {
                     return Err(format!(
@@ -825,6 +931,7 @@ impl CompiledTemplate {
             for gate in state.gates.values() {
                 for ref_name in extract_refs(&gate.command) {
                     if !self.variables.contains_key(&ref_name)
+                        && !captures.contains_key(&ref_name)
                         && !RUNTIME_VARIABLE_NAMES.contains(&ref_name.as_str())
                     {
                         return Err(format!(
@@ -854,6 +961,7 @@ impl CompiledTemplate {
                 // Validate variable references in action command.
                 for ref_name in extract_refs(&action.command) {
                     if !self.variables.contains_key(&ref_name)
+                        && !captures.contains_key(&ref_name)
                         && !RUNTIME_VARIABLE_NAMES.contains(&ref_name.as_str())
                     {
                         return Err(format!(
@@ -865,6 +973,7 @@ impl CompiledTemplate {
                 // Validate variable references in action working_dir.
                 for ref_name in extract_refs(&action.working_dir) {
                     if !self.variables.contains_key(&ref_name)
+                        && !captures.contains_key(&ref_name)
                         && !RUNTIME_VARIABLE_NAMES.contains(&ref_name.as_str())
                     {
                         return Err(format!(
@@ -1454,6 +1563,7 @@ impl CompiledTemplate {
         &self,
         state_name: &str,
         state: &TemplateState,
+        captures: &BTreeMap<String, String>,
     ) -> Result<(), String> {
         let has_accepts = state.accepts.is_some();
 
@@ -1547,8 +1657,13 @@ impl CompiledTemplate {
                     ));
                 }
                 let var_name = segments[1];
-                // The variable must be declared in the template's variables block.
-                if !self.variables.contains_key(var_name) {
+                // The variable must be declared: either in the variables
+                // block, or as some state's capture name. A capture is only
+                // ever set once its state has run, so `vars.NAME is_set` is
+                // exactly the question "did the command that produces NAME
+                // already run" -- which is why the capture namespace belongs
+                // in this check.
+                if !self.variables.contains_key(var_name) && !captures.contains_key(var_name) {
                     return Err(format!(
                         "state {:?} transition to {:?}: when clause references undeclared variable {:?}; \
                          add it to the template's variables block",
@@ -2569,6 +2684,100 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // capture names
+    // -----------------------------------------------------------------------
+
+    /// `minimal_template` with a capture named `key` on `start`.
+    fn capturing_template(key: &str) -> CompiledTemplate {
+        let mut t = minimal_template();
+        let state = t.states.get_mut("start").unwrap();
+        state.default_action = Some(ActionDecl {
+            command: "echo main".to_string(),
+            working_dir: String::new(),
+            requires_confirmation: false,
+            polling: None,
+            fallback: None,
+            capture_stdout_as: Some(key.to_string()),
+        });
+        t
+    }
+
+    #[test]
+    fn capture_names_maps_a_name_to_its_producing_state() {
+        let t = capturing_template("BRANCH");
+        let names = t.capture_names().unwrap();
+        assert_eq!(names.get("BRANCH").map(String::as_str), Some("start"));
+    }
+
+    #[test]
+    fn a_reference_to_a_capture_name_compiles() {
+        // The capture namespace is what makes this reference legal without
+        // declaring BRANCH in the variables block, where `koto init` would
+        // materialize it as the empty string.
+        let mut t = capturing_template("BRANCH");
+        t.states.get_mut("done").unwrap().directive = "On {{BRANCH}}.".to_string();
+        t.validate(true).unwrap();
+    }
+
+    #[test]
+    fn a_capture_name_colliding_with_a_declared_variable_is_rejected() {
+        let mut t = capturing_template("BRANCH");
+        t.variables.insert(
+            "BRANCH".to_string(),
+            VariableDecl {
+                description: "the branch".to_string(),
+                required: false,
+                default: String::new(),
+            },
+        );
+        let err = t.validate(true).unwrap_err();
+        assert!(err.contains("variables block"), "got: {}", err);
+    }
+
+    #[test]
+    fn a_capture_name_colliding_with_a_runtime_name_is_rejected() {
+        let t = capturing_template("SESSION_DIR");
+        let err = t.validate(true).unwrap_err();
+        assert!(err.contains("reserved runtime"), "got: {}", err);
+    }
+
+    #[test]
+    fn two_states_declaring_the_same_capture_name_is_rejected() {
+        let mut t = capturing_template("BRANCH");
+        t.states.get_mut("done").unwrap().default_action = Some(ActionDecl {
+            command: "echo other".to_string(),
+            working_dir: String::new(),
+            requires_confirmation: false,
+            polling: None,
+            fallback: None,
+            capture_stdout_as: Some("BRANCH".to_string()),
+        });
+        let err = t.validate(true).unwrap_err();
+        assert!(err.contains("already delivered by state"), "got: {}", err);
+    }
+
+    #[test]
+    fn an_unreferenceable_capture_name_is_rejected() {
+        // `{{branch}}` matches nothing the reference pattern can find, so a
+        // lowercase name would be a capture no state could ever read.
+        let t = capturing_template("branch");
+        let err = t.validate(true).unwrap_err();
+        assert!(err.contains("is not a valid name"), "got: {}", err);
+    }
+
+    #[test]
+    fn a_misspelled_reference_is_still_rejected() {
+        let mut t = capturing_template("BRANCH");
+        t.states.get_mut("done").unwrap().directive = "On {{BRANHC}}.".to_string();
+        let err = t.validate(true).unwrap_err();
+        assert!(
+            err.contains("BRANHC") && err.contains("variables block"),
+            "got: {}",
+            err
+        );
+    }
+
     #[test]
     fn rejects_integration_and_default_action() {
         let mut t = minimal_template();
@@ -2580,6 +2789,7 @@ mod tests {
             requires_confirmation: false,
             polling: None,
             fallback: None,
+            capture_stdout_as: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2649,6 +2859,7 @@ mod tests {
             requires_confirmation: false,
             polling: None,
             fallback: None,
+            capture_stdout_as: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2689,6 +2900,7 @@ mod tests {
             requires_confirmation: false,
             polling: None,
             fallback: None,
+            capture_stdout_as: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2709,6 +2921,7 @@ mod tests {
             requires_confirmation: false,
             polling: None,
             fallback: None,
+            capture_stdout_as: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2729,6 +2942,7 @@ mod tests {
             requires_confirmation: false,
             polling: None,
             fallback: None,
+            capture_stdout_as: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2748,6 +2962,7 @@ mod tests {
             requires_confirmation: false,
             polling: None,
             fallback: None,
+            capture_stdout_as: None,
         });
         t.validate(true).unwrap();
     }
@@ -2765,6 +2980,7 @@ mod tests {
                 timeout_secs: 0,
             }),
             fallback: None,
+            capture_stdout_as: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2792,6 +3008,7 @@ mod tests {
             requires_confirmation: false,
             polling: None,
             fallback: None,
+            capture_stdout_as: None,
         });
         t.validate(true).unwrap();
     }
@@ -2809,6 +3026,7 @@ mod tests {
                 timeout_secs: 1800,
             }),
             fallback: None,
+            capture_stdout_as: None,
         });
         t.validate(true).unwrap();
     }
@@ -2824,6 +3042,7 @@ mod tests {
                 timeout_secs: 300,
             }),
             fallback: None,
+            capture_stdout_as: None,
         };
         let json = serde_json::to_string(&action).unwrap();
         let restored: ActionDecl = serde_json::from_str(&json).unwrap();
@@ -2838,6 +3057,7 @@ mod tests {
             requires_confirmation: false,
             polling: None,
             fallback: None,
+            capture_stdout_as: None,
         };
         let json = serde_json::to_string(&action).unwrap();
         // Optional/empty fields should be omitted.

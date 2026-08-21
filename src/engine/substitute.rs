@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use regex::Regex;
 
@@ -130,17 +130,41 @@ impl std::fmt::Display for SubstitutionError {
 
 impl std::error::Error for SubstitutionError {}
 
+/// Fold a session's log into the variable bindings a tick starts from: the
+/// `WorkflowInitialized` block, then every value a `default_action` captured.
+///
+/// Captures fold in event order, so re-entering a producing state means the
+/// later value wins. Nothing removes a binding: a rewind appends a `Rewound`
+/// event and truncates no log, so a value captured before the rewind is still
+/// bound after it (DESIGN-koto-runs-commands.md, "Lifetime and identity of a
+/// captured value").
+///
+/// One function rather than two folds, because `Variables` and the advance
+/// loop's `vars.*` map must agree on what is set -- a directive that renders a
+/// captured value while a `vars.NAME is_set` clause calls the same name unset
+/// would be the worse kind of bug to chase.
+pub fn bindings_from_events(events: &[Event]) -> HashMap<String, String> {
+    let mut vars: HashMap<String, String> = HashMap::new();
+    for event in events {
+        match &event.payload {
+            EventPayload::WorkflowInitialized { variables, .. } => {
+                vars.extend(variables.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+            EventPayload::VariableCaptured { key, value } => {
+                vars.insert(key.clone(), value.clone());
+            }
+            _ => {}
+        }
+    }
+    vars
+}
+
 impl Variables {
-    /// Extract variables from the WorkflowInitialized event in the log.
+    /// Extract variables from the log: the WorkflowInitialized bindings plus
+    /// every captured value, folded in event order.
     /// Re-validates all values against the allowlist as defense in depth.
     pub fn from_events(events: &[Event]) -> Result<Self, SubstitutionError> {
-        let vars = events
-            .iter()
-            .find_map(|e| match &e.payload {
-                EventPayload::WorkflowInitialized { variables, .. } => Some(variables.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
+        let vars = bindings_from_events(events);
 
         // Re-validate every value against the allowlist.
         for (key, value) in &vars {
@@ -262,6 +286,47 @@ impl Variables {
     pub fn is_empty(&self) -> bool {
         self.vars.is_empty()
     }
+
+    /// True when `key` resolves against the bindings read from the log.
+    ///
+    /// Used to tell an undelivered capture name from a delivered one before
+    /// substitution runs, where an unresolved name has to become an error
+    /// rather than the token itself.
+    pub fn is_bound(&self, key: &str) -> bool {
+        self.vars.contains_key(key)
+    }
+}
+
+/// The first `{{KEY}}` reference in `input` that names a declared capture no
+/// state has delivered, paired with the state that would have delivered it.
+///
+/// A capture name is not a declared variable, so `koto init` never
+/// materializes one and the ordinary pass-through behaviour would render the
+/// raw `{{KEY}}` token into an agent's instructions -- the outcome R4 exists to
+/// prevent. The caller turns a hit into a typed run-time stop; declared
+/// variables keep passing through untouched.
+///
+/// Both layers a value can arrive from are consulted, in the tick's fixed
+/// order: the overlay for a capture this tick produced, then the bindings the
+/// log carried in.
+pub fn first_unset_capture(
+    input: &str,
+    captures: &BTreeMap<String, String>,
+    variables: &Variables,
+    overlay: &VariableOverlay,
+) -> Option<(String, String)> {
+    if captures.is_empty() {
+        return None;
+    }
+    for name in crate::template::types::extract_refs(input) {
+        let Some(producer) = captures.get(&name) else {
+            continue;
+        };
+        if overlay.get(&name).is_none() && !variables.is_bound(&name) {
+            return Some((name, producer.clone()));
+        }
+    }
+    None
 }
 
 /// Validate a variable value against the allowlist regex.
@@ -758,5 +823,155 @@ mod tests {
         assert_eq!(layered.get("C").map(String::as_str), Some("new"));
         // The base is untouched: the overlay layers over it, never into it.
         assert_eq!(base.get("B").map(String::as_str), Some("stale"));
+    }
+
+    // -----------------------------------------------------------------------
+    // captured values: the event fold and the undelivered-name check
+    // -----------------------------------------------------------------------
+
+    fn event(seq: u64, payload: EventPayload) -> Event {
+        Event {
+            seq,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        }
+    }
+
+    fn initialized(pairs: &[(&str, &str)]) -> EventPayload {
+        EventPayload::WorkflowInitialized {
+            template_path: "/cache/abc.json".to_string(),
+            variables: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            spawn_entry: None,
+        }
+    }
+
+    fn captured(key: &str, value: &str) -> EventPayload {
+        EventPayload::VariableCaptured {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn bindings_fold_captures_over_the_initialized_block() {
+        let events = vec![
+            event(1, initialized(&[("REPO", "widgets")])),
+            event(2, captured("BRANCH", "main")),
+        ];
+        let bindings = bindings_from_events(&events);
+        assert_eq!(bindings.get("REPO").map(String::as_str), Some("widgets"));
+        assert_eq!(bindings.get("BRANCH").map(String::as_str), Some("main"));
+    }
+
+    #[test]
+    fn a_second_capture_of_the_same_name_wins() {
+        // Re-entering the producing state appends rather than replaces, so
+        // the fold has to be ordered for the later value to win.
+        let events = vec![
+            event(1, initialized(&[])),
+            event(2, captured("BRANCH", "first")),
+            event(3, captured("BRANCH", "second")),
+        ];
+        assert_eq!(
+            bindings_from_events(&events)
+                .get("BRANCH")
+                .map(String::as_str),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn a_rewind_leaves_a_captured_value_bound() {
+        // A rewind appends an event and truncates nothing, so the value a
+        // command already produced is still bound afterwards.
+        let events = vec![
+            event(1, initialized(&[])),
+            event(2, captured("BRANCH", "main")),
+            event(
+                3,
+                EventPayload::Rewound {
+                    from: "report".to_string(),
+                    to: "detect".to_string(),
+                    rationale: None,
+                },
+            ),
+        ];
+        assert_eq!(
+            bindings_from_events(&events)
+                .get("BRANCH")
+                .map(String::as_str),
+            Some("main")
+        );
+    }
+
+    #[test]
+    fn from_events_validates_a_captured_value() {
+        // Defense in depth: delivery already ran the value through the
+        // allowlist, so a value that fails here came from a hand-edited log.
+        let events = vec![
+            event(1, initialized(&[])),
+            event(2, captured("BRANCH", "value;rm -rf")),
+        ];
+        let err = Variables::from_events(&events).unwrap_err();
+        assert_eq!(err.key, "BRANCH");
+    }
+
+    fn capture_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn first_unset_capture_finds_an_undelivered_name() {
+        let variables = vars_from(&[]);
+        let overlay = VariableOverlay::new();
+        let captures = capture_map(&[("BRANCH", "detect")]);
+        assert_eq!(
+            first_unset_capture("on {{BRANCH}}", &captures, &variables, &overlay),
+            Some(("BRANCH".to_string(), "detect".to_string()))
+        );
+    }
+
+    #[test]
+    fn first_unset_capture_ignores_a_name_the_tick_just_produced() {
+        let variables = vars_from(&[]);
+        let overlay = VariableOverlay::new();
+        overlay.insert("BRANCH", "main");
+        let captures = capture_map(&[("BRANCH", "detect")]);
+        assert_eq!(
+            first_unset_capture("on {{BRANCH}}", &captures, &variables, &overlay),
+            None
+        );
+    }
+
+    #[test]
+    fn first_unset_capture_ignores_a_name_an_earlier_tick_produced() {
+        let variables = vars_from(&[("BRANCH", "main")]);
+        let overlay = VariableOverlay::new();
+        let captures = capture_map(&[("BRANCH", "detect")]);
+        assert_eq!(
+            first_unset_capture("on {{BRANCH}}", &captures, &variables, &overlay),
+            None
+        );
+    }
+
+    #[test]
+    fn first_unset_capture_leaves_declared_variables_alone() {
+        // An unresolved declared variable keeps its pass-through behaviour:
+        // only capture names become a stop.
+        let variables = vars_from(&[]);
+        let overlay = VariableOverlay::new();
+        let captures = capture_map(&[("BRANCH", "detect")]);
+        assert_eq!(
+            first_unset_capture("on {{REPO}}", &captures, &variables, &overlay),
+            None
+        );
     }
 }

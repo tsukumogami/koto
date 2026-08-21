@@ -55,7 +55,7 @@ Domain errors use this shape:
 }
 ```
 
-The `details` array is empty when the error isn't field-specific. The eleven error codes:
+The `details` array is empty when the error isn't field-specific. The twelve error codes:
 
 | Code | Exit | Meaning |
 |------|:----:|---------|
@@ -70,6 +70,7 @@ The `details` array is empty when the error isn't field-specific. The eleven err
 | `persistence_error` | 3 | A disk I/O failure while reading or writing the state file. |
 | `execution_anchor_mismatch` | 2 | The tick ran from a directory that is neither the session's execution anchor nor beneath it. The message names the bound directory. Run `koto next` from there, or rebind the session. |
 | `execution_anchor_unresolvable` | 3 | The session's recorded execution anchor names nothing on this machine -- the checkout was deleted or the session moved machines. Rebind the session to where the tree is now. |
+| `capture_unset` | 3 | A state's instruction text reads a `capture_stdout_as` name that no state delivered on this run. The message names the value and the state that produces it. |
 
 Exit code 1 means transient -- the agent can retry without changing its behavior. Exit code 2 means the agent must change something (fix the payload, pick a different target, etc.).
 
@@ -80,7 +81,7 @@ Exit code 1 means transient -- the agent can retry without changing its behavior
 | 0 | Success | Normal response (any variant) |
 | 1 | Transient | `gate_blocked`, `integration_unavailable`, engine I/O errors |
 | 2 | Caller error | `invalid_submission`, `precondition_failed`, `terminal_state`, `workflow_not_initialized`, `execution_anchor_mismatch` |
-| 3 | Infrastructure | Corrupt state file, template hash mismatch, template parse failure, `execution_anchor_unresolvable` |
+| 3 | Infrastructure | Corrupt state file, template hash mismatch, template parse failure, `execution_anchor_unresolvable`, `capture_unset` |
 
 #### Execution anchoring
 
@@ -105,6 +106,18 @@ The two codes are separate because the repairs differ: change directory for the 
 Anchor comparison is byte-exact over `fs::canonicalize` output. That resolves `.`, `..`, and symlinks and strips trailing slashes, so a symlinked path and a trailing-slash variant of the anchor both satisfy it. It does not case-fold: a path differing only in case names a different directory and is refused, on every platform including case-insensitive filesystems.
 
 Anchoring binds where a session's commands *start*. It does not bound what a command reaches once running -- a command can name absolute paths or change directory, and nothing here stops it.
+
+#### An undelivered capture (exit code 3)
+
+A state can declare a name for its command's output with `capture_stdout_as`, and a later state can read that name in its instruction text. The name is not an init-time variable, so nothing materializes it: if the run reaches the reading state without passing through the state that produces it, there is no value.
+
+```json
+{"error":{"code":"capture_unset","message":"state 'report' reads {{BRANCH}}, which state 'detect' delivers with capture_stdout_as; this run has not entered that state, so the value is unset","details":[]}}
+```
+
+The tick stops rather than rendering an empty string or the raw `{{BRANCH}}` token, either of which would put a placeholder into an agent's instructions. A name no state declares at all is caught earlier, when the template compiles. The fix is usually in the template: route through the producing state, or move the reference to a state that always follows it.
+
+A failed *delivery* is a different thing and does not use this code. When the command runs but its output cannot be delivered -- it is empty, it exceeds 4096 bytes, or it holds a character the value allowlist forbids -- the tick stops at the state that ran the command, through the ordinary blocked response with an `__action__` condition whose `failure_kind` is `capture_failed`.
 
 #### Pre-dispatch I/O errors
 
