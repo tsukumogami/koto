@@ -26,7 +26,7 @@
 //!   same question of the *other* recorded directory a header carries:
 //!   `execution_dir`, the session's execution anchor
 //!   (DESIGN-koto-runs-commands.md Decisions 6 and 7). The anchor
-//!   check adds the containment comparison `koto next` runs on every
+//!   check adds the beneath-the-anchor comparison `koto next` runs on every
 //!   tick, but the "does this directory exist" half goes through
 //!   [`check_template_source_path`] rather than duplicating it.
 //! - [`format_stale_template_source_note`] is the shared wording helper

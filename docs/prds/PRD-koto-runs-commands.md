@@ -671,7 +671,8 @@ actually hit.
   exposure is zero today only because no template declares an action — which is the
   condition this feature is designed to end. This feature owes a follow-up issue on
   the log's content bounds, and that issue should be filed before the first template
-  declares an action.
+  declares an action. Filed as
+  [koto#206](https://github.com/tsukumogami/koto/issues/206).
 - **The push-to-open-pull-request classification is unresolved by evidence,** not by
   argument. D3 records the default and the reason; a later author who checks the claim
   can move it.

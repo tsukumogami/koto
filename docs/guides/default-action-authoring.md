@@ -216,7 +216,8 @@ and the resolution happens in a fixed order that matters:
 3. The result is canonicalized and refused if it escaped the anchor through `..`.
 
 The order is the whole point. `Path::join` with an absolute argument returns the argument and
-discards the base, so a containment check placed after the join would have nothing left to catch.
+discards the base, so a beneath-the-anchor check placed after the join would have nothing left to
+catch.
 
 ### What happens to its output
 
@@ -475,8 +476,8 @@ A session records the directory it was created in, and **every tick is checked a
 check runs before the template is read and before any gate or action closure exists, so a refusal
 means nothing ran, nothing was evaluated, and nothing moved.
 
-Standing in a subdirectory of the anchor is fine -- containment satisfies the check, because
-working from a subdirectory is ordinary and isn't the hazard. The hazard is ticking a session
+Standing in a subdirectory of the anchor is fine -- being beneath the anchor satisfies the check,
+because working from a subdirectory is ordinary and isn't the hazard. The hazard is ticking a session
 from a *different* tree. Every gate and action of an accepted tick runs at the anchor itself, so
 a command means the same thing no matter where in the tree you typed `koto next`.
 
@@ -522,7 +523,7 @@ no platform on which the comparison quietly becomes case-insensitive. Where the 
 is case-insensitive, the two spellings name the same directory, so there's no case-differing path
 to refuse in the first place.
 
-Containment is compared component-wise, so `/home/dev/repo-2` is not beneath `/home/dev/repo`. A
+"Beneath" is compared component-wise, so `/home/dev/repo-2` is not beneath `/home/dev/repo`. A
 working directory that can't be canonicalized at all is compared as given, which fails closed:
 the tick is refused rather than accepted on a path koto can't vouch for.
 

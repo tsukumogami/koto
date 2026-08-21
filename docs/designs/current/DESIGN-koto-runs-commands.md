@@ -32,8 +32,8 @@ rationale: |
   and no change to the seven-variant response contract, its hand-rolled
   Serialize impl, or its three exhaustive combinators. Synthesizing a gate
   result rather than redefining what a non-zero exit means keeps gates the
-  arbiter of success, as PRD decision D5 requires. Containment plus
-  execute-at-anchor was chosen over root equality because it refuses the
+  arbiter of success, as PRD decision D5 requires. The beneath-the-anchor
+  test plus execute-at-anchor was chosen over root equality because it refuses the
   wrong-tree case just as firmly while making a command's behavior
   independent of which subdirectory the developer stood in.
 ---
@@ -388,18 +388,18 @@ rebind verb works on a child exactly as on any other session.
 
 | Option | Wrong-tree case | Developer in a subdirectory | Command behavior |
 |--------|-----------------|---------------------------|------------------|
-| A. Containment; execute at the anchor | Refused | Accepted | Same from anywhere |
+| A. Beneath the anchor; execute at the anchor | Refused | Accepted | Same from anywhere |
 | B. Root equality; execute at the cwd | Refused | Refused | Same by construction |
-| C. Containment; execute at the cwd | Refused | Accepted | Varies by subdirectory |
+| C. Beneath the anchor; execute at the cwd | Refused | Accepted | Varies by subdirectory |
 
 **Chosen: A**, departing from the exploration's recommendation of B.
 
 B refuses a developer who did `cd src/` before ticking, which is an ordinary
 thing to do and has nothing to do with the hazard R12 exists to close. The
 hazard is a *different tree*, and a different checkout is not beneath the
-anchor, so containment refuses it just as firmly.
+anchor, so the beneath test refuses it just as firmly.
 
-C is what containment naively implies and is worse than either: the tick is
+C is what "beneath" naively implies and is worse than either: the tick is
 accepted but the command runs somewhere the session never agreed to, so
 `cat README.md` means different things depending on where the developer stood.
 Executing at the anchor removes that variance entirely — and removing it is
@@ -429,7 +429,7 @@ anchor.
 
 `Path::join` with an absolute argument silently discards the base, so a join
 alone would let an absolute `working_dir` escape the anchor while appearing to
-be contained. The rejection has to happen **before** the join:
+sit beneath it. The rejection has to happen **before** the join:
 
 1. **Compile time**: a literal absolute `working_dir` is a compile error.
 2. **Run time, after substitution**: an absolute result — reachable when the
@@ -733,7 +733,7 @@ invocations, and for two colliding sessions each producing their own message.
 
 **Phase 3: anchoring.** Header field; adoption with notice; the per-tick check
 with its two codes; execute-at-anchor; `working_dir` rejection then join then
-containment; `koto session rebind`; extend the resolve-check module. Ships
+the beneath check; `koto session rebind`; extend the resolve-check module. Ships
 without any of the output or failure work, and closes Story 3 on its own.
 
 **Phase 4: the failure path.** `fallback:` on the action declaration; the
@@ -783,9 +783,9 @@ to, checked on every tick.
 
 **An absolute `working_dir` must be rejected before the join.** `Path::join`
 with an absolute argument discards the base silently, so a design that joins
-first and checks afterwards would report containment it does not have. The
+first and checks afterwards would vouch for a path it never verified. The
 rejection is at compile time for a literal and at run time after substitution
-for a variable-derived value, both ahead of the join, with a `..` containment
+for a variable-derived value, both ahead of the join, with a `..` beneath-the-anchor
 check after canonicalization.
 
 **Captured output is written to the event log.** A command whose stdout
