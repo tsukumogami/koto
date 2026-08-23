@@ -143,14 +143,30 @@ Every SKILL.md starts with frontmatter:
 ```yaml
 ---
 name: hello-koto
-description: |
-  Run a hello-koto greeting ritual using koto workflow guidance. Use when the user
-  invokes /hello-koto <name> to awaken a tsukumogami spirit.
+description: >-
+  Awaken a tsukumogami spirit and walk it through its greeting ritual, one named
+  spirit at a time. Reach for this whenever someone asks to greet, name, or wake
+  the spirit of an object -- "give the old kettle a name", "say hello to the
+  workshop tools" -- because the ritual's steps have to run in order and the
+  greeting has to be recorded, and performing it by hand leaves no trace of which
+  spirit was woken. Do NOT use it to author a new ritual template (koto-author)
+  or to drive a workflow that is already running (koto-user).
 ---
 ```
 
 - `name` -- Short identifier. Match the template name.
-- `description` -- When the agent should use this skill. Be specific about the trigger.
+- `description` -- The only text an agent reads when deciding whether to load your
+  skill, so write it to select rather than to summarize:
+  - Lead with the job in terms an agent can match against its own situation, not
+    with the artifact you produce or a role label.
+  - Push on the cases where nobody says your skill's name. Those are the ones that
+    go uncaught; a request that already names the skill needs no help.
+  - Name what goes wrong when the skill isn't loaded.
+  - Close with a negative boundary naming the sibling skills yours gets confused
+    with.
+  - Spend nothing on flags, file layouts, or anything else an agent can't act on
+    before loading. Use the `>-` folded scalar so the whole thing reads as one
+    paragraph.
 
 ### Body sections
 
