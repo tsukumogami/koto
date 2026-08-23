@@ -1,7 +1,24 @@
 ---
 name: koto-adhoc
-description: |
-  Decompose a novel, one-off complex task into a koto workflow and run it immediately via `koto init --from-stdin`, with no template file to author or commit. Use when you (or the person directing you) hit a multi-phase task that needs ordered, recoverable, auditable execution but has no matching template — for example "break this migration into steps and run it under koto" or "I want koto to govern this investigation." Self-activate when you're about to drive a complex task that would benefit from koto's state machine and no template exists yet. For a workflow you'll run again and again, author a durable template with koto-author instead.
+description: >-
+  Decompose a multi-phase task into a state-machine workflow and run it
+  immediately, with no template file to author or commit. Reach for this the
+  moment you are handed work with ordered phases or a decision partway through
+  and are about to start step one by hand: "snapshot the table first, then
+  migrate, then check the row counts match before we cut traffic over",
+  "reproduce the nightly failure, classify the cause, then fix whichever one
+  it is", "don't touch the changelog until the suite is actually green", "I'll
+  probably get interrupted, set it up so you can pick it back up where you
+  left off", "keep a record of what you did at each step". None of those name
+  a workflow engine and every one of them is this. Driving that work by hand
+  is what loses the order: a verification boundary gets stepped over, an
+  interrupted run restarts from a phase nobody can name, and nothing records
+  what actually ran. Do NOT reach for it when the task is a single linear pass
+  with no decision points and no verification boundary - plain step-by-step
+  execution is simpler and this only adds overhead. Use koto-author instead
+  when you expect to run this same workflow shape again and want a durable
+  template, and koto-user when a template for the task already exists and you
+  just need to run it.
 ---
 
 # koto-adhoc

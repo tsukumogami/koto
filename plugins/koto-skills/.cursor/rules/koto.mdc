@@ -1,5 +1,5 @@
 ---
-description: koto workflow engine -- state machine for AI agent workflows. Use when running koto commands or managing workflow state.
+description: koto workflow engine -- a state machine that holds a multi-phase task in order, survives interruption, and records every transition. Use when work has ordered phases, a decision partway through, or a verification boundary that must not be stepped over; when an interrupted run has to pick up where it left off; or when a running workflow has stalled or returned something you cannot act on. Not for designing a state machine for a business domain.
 globs:
 alwaysApply: false
 ---
