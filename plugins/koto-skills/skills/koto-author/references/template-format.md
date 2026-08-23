@@ -330,12 +330,56 @@ states:
       - target: converge
         when:
           gates.children-done.all_complete: true
-      - target: fan_out
+          gates.children-done.needs_attention: false
+      - target: triage_failures
         when:
-          gates.children-done.all_complete: false
+          gates.children-done.all_complete: true
+          gates.children-done.needs_attention: true
   converge:
     # ... process child results
+  triage_failures:
+    # ... retry, skip, or give up
 ```
+
+This is the one shape to memorize, and every part of it is load-bearing.
+
+**Two conjuncts per branch, not one.** `all_complete: true` is the "the batch has
+stopped moving" half; `needs_attention` is the "and here's how it went" half.
+Splitting them across branches -- `all_success: true` on one, `needs_attention:
+true` on the other -- is rejected at compile time, because the mutual-exclusivity
+rule needs the two branches to share a field with differing values, and those two
+share none. Repeating `all_complete: true` in both branches gives them the shared
+field; `needs_attention` differing across them makes the pair exclusive.
+
+**Two branches, and deliberately no third one for the waiting case.** While
+children are still running, `all_complete` is `false`, so the first conjunct
+fails on *both* branches and neither matches. The tick doesn't advance: a state
+with no `accepts` block stops with `gate_blocked` and `category: "temporal"`, and
+a coordinator that also accepts a task list stops with `evidence_required`
+carrying the same gate output. Either way the workflow sits still and the agent
+ticks again. That stop **is** the wait -- you don't write a transition for it.
+
+**Never guard a branch on a `false` aggregate on its own.** While children are
+pending, `all_complete`, `all_success`, and `needs_attention` are *all* `false`.
+So a lone `needs_attention: false` branch fires while the batch is still running
+and converges on results that don't exist yet. Pairing it with
+`all_complete: true`, as above, is what holds it back.
+
+**Don't add a self-loop to "keep polling."** A `gates.children-done.all_complete: false`
+transition pointing back at `fan_out` looks like it keeps the agent cycling, but
+the engine takes it: it records a `fan_out -> fan_out` transition that moved
+nothing, re-evaluates the same gate on the next lap of the advance loop, resolves
+to `fan_out` a second time, and now sees a state it has already visited this
+tick. `koto next` then fails with `template_error` (exit 3), "cycle detected:
+advancement loop would revisit state 'fan_out'" -- every poll, for as long as the
+children run. Leaving the transition out gets the wait described above instead.
+
+**Never route the clean branch on `all_complete` alone.** `all_complete` only
+says every child stopped. A child that stopped *in failure* satisfies it too, so
+a success branch guarded by `all_complete` by itself walks a failed batch
+straight into `converge`. That's the second conjunct's whole job. On a state that
+also declares `materialize_children`, the compiler catches the omission as
+warning W4 -- see [batch-authoring.md](batch-authoring.md) for the full rule.
 
 ### Gate output fields
 
@@ -761,9 +805,18 @@ states:
       - target: synthesize
         when:
           gates.children-done.all_complete: true
-      - target: fan_out
+          gates.children-done.needs_attention: false
+      - target: note_gaps
         when:
-          gates.children-done.all_complete: false
+          gates.children-done.all_complete: true
+          gates.children-done.needs_attention: true
+  note_gaps:
+    accepts:
+      gaps:
+        type: string
+        required: true
+    transitions:
+      - target: synthesize
   synthesize:
     accepts:
       summary:
@@ -782,6 +835,10 @@ Spawn child workflows for each research topic. Use `koto init <name> --parent {{
 <!-- details -->
 
 After spawning children, call `koto next {{SESSION_NAME}}` to check progress. The `children-done` gate will block until all `research.*` children reach a terminal state. You don't need to do anything to unblock it — just wait for the children to finish, then call `koto next` again.
+
+## note_gaps
+
+At least one research child failed or was skipped. Read `blocking_conditions[0].output.children` to see which ones and why, then submit a short `gaps` note describing what the synthesis will be missing.
 
 ## synthesize
 

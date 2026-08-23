@@ -368,6 +368,12 @@ pub enum GateSchemaFieldType {
     /// when this enum is glob-imported with `use GateSchemaFieldType::*`.
     Str,
     Boolean,
+    /// JSON-array field. Only `children-complete` produces one (`children`),
+    /// and it exists in the schema so an `override_default` can carry the same
+    /// shape the gate actually emits. Routing on an array in a `when` clause
+    /// compares whole values, which is rarely what an author wants -- route on
+    /// the aggregate booleans instead.
+    Array,
 }
 
 /// Return the static output field schema for a known gate type.
@@ -385,11 +391,28 @@ pub fn gate_type_schema(gate_type: &str) -> Option<&'static [(&'static str, Gate
         GATE_TYPE_COMMAND => Some(&[("exit_code", Number), ("error", Str)]),
         GATE_TYPE_CONTEXT_EXISTS => Some(&[("exists", Boolean), ("error", Str)]),
         GATE_TYPE_CONTEXT_MATCHES => Some(&[("matches", Boolean), ("error", Str)]),
+        // Must stay in step with the output `build_children_complete_output()`
+        // assembles in `src/cli/batch.rs` and with the built-in default below.
+        // When these drift, the compiler rejects `when` clauses on fields the
+        // gate really does emit -- which is how routing on `all_success` and
+        // `needs_attention` came to be rejected while warning W4 was actively
+        // recommending them (issue #207).
         GATE_TYPE_CHILDREN_COMPLETE => Some(&[
             ("total", Number),
             ("completed", Number),
             ("pending", Number),
+            ("success", Number),
+            ("failed", Number),
+            ("skipped", Number),
+            ("blocked", Number),
+            ("spawn_failed", Number),
             ("all_complete", Boolean),
+            ("all_success", Boolean),
+            ("any_failed", Boolean),
+            ("any_skipped", Boolean),
+            ("any_spawn_failed", Boolean),
+            ("needs_attention", Boolean),
+            ("children", Array),
             ("error", Str),
         ]),
         _ => None,
@@ -476,6 +499,7 @@ fn gate_schema_field_type_name(t: &GateSchemaFieldType) -> &'static str {
         GateSchemaFieldType::Number => "number",
         GateSchemaFieldType::Str => "string",
         GateSchemaFieldType::Boolean => "boolean",
+        GateSchemaFieldType::Array => "array",
     }
 }
 
@@ -485,6 +509,7 @@ fn json_value_matches_schema_type(value: &serde_json::Value, t: &GateSchemaField
         GateSchemaFieldType::Number => value.is_number(),
         GateSchemaFieldType::Str => value.is_string(),
         GateSchemaFieldType::Boolean => value.is_boolean(),
+        GateSchemaFieldType::Array => value.is_array(),
     }
 }
 
@@ -1816,6 +1841,7 @@ impl CompiledTemplate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn minimal_template() -> CompiledTemplate {
         let mut states = BTreeMap::new();
@@ -3146,6 +3172,55 @@ command: "./check.sh"
         assert_eq!(schema.len(), 2);
         assert_eq!(schema[0], ("matches", Boolean));
         assert_eq!(schema[1], ("error", Str));
+    }
+
+    /// The children-complete compile-time schema must cover exactly the fields
+    /// the gate emits at runtime.
+    ///
+    /// Issue #207: the schema listed only `total`, `completed`, `pending`,
+    /// `all_complete`, `error` while the gate emitted sixteen fields, so the
+    /// compiler rejected `when` clauses on `all_success` and `needs_attention`
+    /// -- the exact fields warning W4 tells authors to route on. Comparing
+    /// against `gate_type_builtin_default`, which is itself kept in step with
+    /// `gate::built_in_default` by `builtin_defaults_match_gate_module`, pins
+    /// the two together so the same drift can't return silently.
+    #[test]
+    fn children_complete_schema_covers_every_emitted_field() {
+        let schema = gate_type_schema(GATE_TYPE_CHILDREN_COMPLETE)
+            .expect("children-complete schema must exist");
+        let schema_fields: BTreeSet<&str> = schema.iter().map(|(n, _)| *n).collect();
+
+        let default = gate_type_builtin_default(GATE_TYPE_CHILDREN_COMPLETE)
+            .expect("children-complete default must exist");
+        let emitted_fields: BTreeSet<&str> = default
+            .as_object()
+            .expect("children-complete default is an object")
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+
+        assert_eq!(
+            schema_fields, emitted_fields,
+            "children-complete compile-time schema and emitted output have drifted; \
+             a field missing from the schema makes the compiler reject when clauses \
+             that route on it (issue #207)"
+        );
+
+        // The routing booleans W4's remedy names must be usable in when clauses.
+        for field in [
+            "all_complete",
+            "all_success",
+            "any_failed",
+            "any_skipped",
+            "any_spawn_failed",
+            "needs_attention",
+        ] {
+            assert!(
+                schema_fields.contains(field),
+                "W4 tells authors to route on {:?}, so the schema must accept it",
+                field
+            );
+        }
     }
 
     #[test]

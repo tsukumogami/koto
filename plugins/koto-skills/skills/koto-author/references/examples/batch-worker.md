@@ -16,10 +16,6 @@ states:
         type: enum
         values: [complete, blocked, skipped_by_scheduler]
         required: true
-    gates:
-      tests:
-        type: command
-        command: "echo skip"
     transitions:
       - target: done
         when:

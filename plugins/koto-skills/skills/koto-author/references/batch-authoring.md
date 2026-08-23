@@ -120,26 +120,58 @@ The `children-complete` gate surfaces fifteen output fields: eight counts (`tota
 
 | Boolean | Derived from | When to route on it |
 |---|---|---|
-| `all_complete` | `pending == 0 AND blocked == 0 AND spawn_failed == 0` | Gate-passing condition, not a route. Routing on this alone triggers W4. |
-| `all_success` | Every child in terminal-success | Clean-completion branch ("go to summary"). |
-| `needs_attention` | `any_failed OR any_skipped OR any_spawn_failed` | Retry / analyze branch. Paired with `all_success` to cover every exit. |
+| `all_complete` | `pending == 0 AND blocked == 0 AND spawn_failed == 0` | "The batch stopped moving." Every branch's first conjunct — but never a route on its own, which is what W4 catches. |
+| `needs_attention` | `any_failed OR any_skipped OR any_spawn_failed` | "And here's how it went." The second conjunct that splits clean from dirty. |
+| `all_success` | Every child in terminal-success | Equivalent to `all_complete AND NOT needs_attention`. Readable, but see the compile-time constraint below before reaching for it. |
 | `any_failed` | At least one failure | Fine-grained routing when `any_skipped` and `any_failed` need different states. |
 | `any_skipped` | At least one skipped | Same. |
 | `any_spawn_failed` | At least one `spawn_failed` outcome | Fine-grained routing; folded into `needs_attention`. |
 
-The safe default is a two-branch coordinator:
+The safe default is a two-branch coordinator where **both branches carry both conjuncts**:
 
 ```yaml
 transitions:
   - target: summarize
     when:
-      gates.done.all_success: true
+      gates.done.all_complete: true
+      gates.done.needs_attention: false
   - target: analyze_failures
     when:
+      gates.done.all_complete: true
       gates.done.needs_attention: true
 ```
 
-Routing only on `all_complete: true` fires W4 — an outright failure still satisfies `all_complete`, so the parent would slide past the retry window into the clean-completion branch.
+Routing only on `all_complete: true` fires W4 — an outright failure still satisfies `all_complete`, so the parent would slide past the retry window into the clean-completion branch. The `needs_attention` conjunct is what silences it.
+
+**Why not the more readable `all_success: true` / `needs_attention: true` pair?**
+Because it doesn't compile. Mutual exclusivity is checked syntactically: two
+conditional transitions must share at least one `when` field whose values differ.
+`all_success` and `needs_attention` share no field, so the compiler rejects the
+state with "transitions ... are not mutually exclusive: transitions share no
+fields". Repeating `all_complete: true` on both branches supplies the shared
+field, and `needs_attention` differing across them supplies the disjoint value.
+
+**Two branches cover every exit, including "still running."** Those two guards
+look like they leave a hole: while children are in flight nothing matches. That's
+the point. `all_complete` is `false` until the batch stops moving, so the first
+conjunct fails on both branches, the tick doesn't advance, and the agent ticks
+again. On a coordinator state that accepts a task list, that stop surfaces as
+`evidence_required` carrying the gate output; on a gate-only fan-out state with
+no `accepts` block, it surfaces as `gate_blocked` with `category: "temporal"`.
+The waiting case is that stop, so it doesn't get a transition.
+
+**Never guard a branch on a bare `false`.** While children are pending,
+`all_complete`, `all_success`, and `needs_attention` are *all* `false`. A branch
+guarded by `needs_attention: false` alone therefore fires while the batch is
+still running and summarizes results that don't exist yet. The
+`all_complete: true` conjunct is what holds it back.
+
+**Don't fill the apparent hole with a self-loop.** A
+`gates.<gate>.all_complete: false` transition back to the coordinator state gets
+taken by the engine: it records a same-state move, re-evaluates the same gate on
+the next lap of the advance loop, and lands on a state it already visited this
+tick — so `koto next` exits 3 with `template_error`, "cycle detected", on every
+poll while the children run. Two branches, no third.
 
 ## Two-hat coordinators (coordinator-as-child)
 
