@@ -25,9 +25,11 @@ states:
     transitions:
       - target: summarize
         when:
-          gates.done.all_success: true
+          gates.done.all_complete: true
+          gates.done.needs_attention: false
       - target: analyze_failures
         when:
+          gates.done.all_complete: true
           gates.done.needs_attention: true
   analyze_failures:
     accepts:
@@ -40,11 +42,6 @@ states:
         when:
           evidence.retry_failed: present
       - target: summarize
-        when:
-          decision: give_up
-      - target: summarize
-        when:
-          decision: acknowledge
   summarize:
     terminal: true
 ---
@@ -61,14 +58,19 @@ The `children-complete` gate holds in `gate_blocked` (`temporal`) until every no
 
 <!-- details -->
 
-The `scheduler.feedback.entries` map tells you exactly how every submitted task was handled (`accepted`, `already_running`, `already_terminal_success`, `already_terminal_failure`, `already_skipped`, `blocked`, `errored`, `respawning`). The children-complete gate output routes the parent: `all_success: true` advances to `summarize`, `needs_attention: true` advances to `analyze_failures`. Without a `needs_attention` branch, a failed batch would satisfy `all_complete: true` and slide past the retry window (compile warning W4 catches that footgun).
+The `scheduler.feedback.entries` map tells you exactly how every submitted task was handled (`accepted`, `already_running`, `already_terminal_success`, `already_terminal_failure`, `already_skipped`, `blocked`, `errored`, `respawning`). The children-complete gate output routes the parent. Both branches carry `all_complete: true` and split on `needs_attention`: `false` advances to `summarize`, `true` advances to `analyze_failures`. Without the `needs_attention` conjunct, a failed batch would satisfy `all_complete: true` and slide past the retry window (compile warning W4 catches that footgun); the repeated `all_complete` conjunct is what makes the two branches mutually exclusive at compile time. Those two transitions are the whole routing table — there is no third one for "children still running". While the batch is in flight `all_complete` is `false`, so neither guard matches and the tick stops without advancing, which is exactly the polling behavior described above. Adding an `all_complete: false` self-loop to force polling breaks it: the engine takes the transition, re-evaluates the same gate, revisits the same state within the tick, and `koto next` exits 3 with `template_error`, "cycle detected".
 
 ## analyze_failures
 
 At least one child failed or was skipped. Two recovery paths:
 
-- Retry: copy the `invocation` from `reserved_actions[0]` and run it. The parent re-enters `plan_and_await` and the scheduler respawns the named children.
-- Give up or acknowledge: submit `{"decision": "give_up"}` or `{"decision": "acknowledge"}` to route to `summarize` with the batch outcome as-is.
+- Retry: copy the `invocation` from `reserved_actions[0]` and run it. That submits the reserved `retry_failed` key, which the `evidence.retry_failed: present` branch routes back to `plan_and_await`, and the scheduler respawns the named children.
+- Give up or acknowledge: submit `{"decision": "give_up"}` or `{"decision": "acknowledge"}`. Neither matches the retry branch, so the unconditional transition carries the workflow to `summarize` with the batch outcome as-is.
+
+The retry branch is the state's only conditional transition, paired with an
+unconditional fallback. That matters: mutual exclusivity is only checked between
+*conditional* transitions, and `evidence.retry_failed: present` shares no field
+with a `decision` value, so a second conditional branch here would not compile.
 
 ## summarize
 
