@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-context-key-charset.md
 problem: |
   A koto variable value may hold a space, a `:` or an `@`; a context key may
@@ -32,7 +32,7 @@ rationale: |
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
