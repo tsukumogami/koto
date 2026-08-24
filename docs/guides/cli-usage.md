@@ -423,6 +423,14 @@ Produces no output on success. This is the manual equivalent of the auto-cleanup
 
 The `context` subcommand group manages workflow content. Agents use these commands to submit artifacts, retrieve them, and check whether specific content has been produced. All content is stored opaquely by koto and keyed by session name and content key.
 
+#### What a content key may hold
+
+A key is `/`-separated. Each component starts with a letter or digit and continues in letters, digits, `.`, `_` and `-`; `.` and `..` components are refused, as are leading, trailing and doubled slashes, and the whole key is capped at 255 characters.
+
+That is narrower than what a variable value may hold, and the gap is exactly three characters: a value may also carry a space, a `:` and an `@`. The two are different on purpose and are not converging. A value is content -- it reaches a directive, a command argument, a regex -- and those three are there so a value can be a calendar title or a filter like `from:user@example.com`. A key is an address: it becomes a directory name under the session, an entry in the store's manifest, and an argument in the `koto context add` and `koto context get` commands templates run, where a space would split it in two.
+
+The two meet when a context gate's `key` resolves a `{{KEY}}` reference. `key: "{{TITLE}}-note"` with a `TITLE` of `Weekly Planning` asks for `Weekly Planning-note`, which is not a usable key. koto says which character it refused, at the gate and at `koto context exists` alike, in the same words -- but the fix is to scope the key on a slug-shaped variable rather than on the prose one.
+
 #### context add
 
 Submits content to the store for a given session and key. Reads from stdin by default.
@@ -481,11 +489,21 @@ koto context exists <name> <key>
 - `<name>` -- Workflow/session name.
 - `<key>` -- Content key.
 
-Exits 0 if the key exists, 1 if it doesn't. This is the CLI equivalent of the `context-exists` gate type in templates.
+Exits 0 if the key exists and 1 if it doesn't, printing nothing either way. This is the CLI equivalent of the `context-exists` gate type in templates.
 
-Note that a `1` means "not present" and nothing more precise: the check cannot
-distinguish a key that was never written from a store it could not read. Callers
-that need to act on the difference should not infer it from this exit code.
+Exits 2 when the argument is not a usable context key -- see "What a content key may hold" above -- and prints a JSON error naming the offending character and the component it sits in:
+
+```json
+{"error":"context key \"Weekly Planning-note\" is not usable: context key contains invalid character ' ' in component 'Weekly Planning-note'; allowed: letters, digits, '.', '_', '-'\n  remedy: ...","command":"context exists"}
+```
+
+Exit 2 is non-zero, so `if koto context exists ...; then` behaves as it always has; what changes is that the reason is printed rather than absent.
+
+Note that a `1` still means "not present" and nothing more precise: the check
+cannot distinguish a key that was never written from a store it could not read.
+Callers that need to act on that difference should not infer it from this exit
+code. The one case that used to hide inside exit 1 and now does not is the
+unusable key.
 
 #### context remove
 
@@ -501,7 +519,7 @@ koto context remove <name> <key>
 
 **Idempotent:** removing a key that is not there succeeds. That shape is
 deliberate — the alternative would push every caller to probe with `context
-exists` first, and per the note above that probe cannot tell "absent" from
+exists` first, and per the note above that probe still cannot tell "absent" from
 "unreadable", so the guard would silently skip keys it should have removed.
 
 The removal appends a `context_removed` event to the session's event log,
