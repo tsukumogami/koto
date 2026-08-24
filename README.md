@@ -140,10 +140,11 @@ The `sparsePaths` entry keeps the checkout small -- Claude Code only fetches the
 
 ### What the plugin provides
 
-The plugin includes two skills:
+The plugin includes three skills:
 
-- **koto-author** -- How to author koto-backed skills. Use when creating or converting skills that need structured, resumable workflows.
-- **koto-user** -- How to run koto-backed workflows. Use when a SKILL.md tells you to call `koto init` or `koto next`.
+- **koto-adhoc** -- Decompose a multi-phase task into a state-machine workflow and run it immediately, with no template file to author or commit. Reach for it the moment you are handed work with ordered phases or a decision partway through and are about to start step one by hand.
+- **koto-author** -- Build a skill whose workflow is enforced by a state machine instead of by prose the agent has to remember to follow. Reach for it instead of hand-writing the SKILL.md yourself whenever a skill, command, or repeatable procedure has ordered phases, branching, or a checkpoint.
+- **koto-user** -- Drive a workflow session koto is running, and get it unstuck when it stalls: a directive you cannot confidently act on, a blocking condition, a run that keeps returning the same state, a workflow to resume, or a step to undo.
 
 ### Workflow cycle
 

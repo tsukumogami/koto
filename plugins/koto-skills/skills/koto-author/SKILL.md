@@ -1,7 +1,27 @@
 ---
 name: koto-author
-description: |
-  How to author koto-backed skills. Use when creating or converting skills that need structured, resumable workflows.
+description: >-
+  Build a skill whose workflow is enforced by a state machine instead of by
+  prose the agent has to remember to follow: it produces the whole skill
+  directory, SKILL.md and paired template together, through a guided workflow
+  that compile-validates before it ships. Reach for this INSTEAD of
+  hand-writing the SKILL.md yourself whenever you are asked for a skill, a
+  slash command, or a repeatable procedure with ordered phases, branching, or
+  a checkpoint: "write me a skill for our deploy pipeline", "add a command
+  that walks someone through onboarding a service", "fan out one child agent
+  per issue and wait for all of them". Reach for it too when an existing skill
+  is failing at exactly this - it loses its place when a session is
+  interrupted, tracks phases in a state file it writes itself, or has grown an
+  if/else tree nobody can follow - since converting one is a first-class mode
+  here. Hand-writing the template instead is where it goes wrong: overlapping
+  when clauses and unrouted gates fail compilation, and the rule that keeps
+  the engine from auto-running a command whose successful exit is itself the
+  irreversible event (gh pr create) is not something a hand-author discovers.
+  Do NOT use it to run a workflow that already exists (koto-user), or for a
+  one-off task you will never repeat and need not commit a template for
+  (koto-adhoc). The skill-creator skill complements it rather than replacing
+  it: this one gets the structure right, that one grades the resulting
+  behavior.
 ---
 
 # koto-author

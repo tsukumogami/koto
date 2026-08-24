@@ -1,7 +1,26 @@
 ---
 name: koto-user
-description: |
-  How to run koto-backed workflows. Use when a SKILL.md tells you to call koto init or koto next.
+description: >-
+  Drive a workflow session koto is running, and get it unstuck when it stalls.
+  Load this whenever a koto next call has put something in front of you that
+  you cannot confidently act on: a directive or action you are unsure how to
+  dispatch on, a blocking condition you are about to try to override, a run
+  that keeps returning the same state, an anchor or nested-invocation refusal,
+  or a coordinator that has been waiting on its children longer than it
+  should. It is also the answer to "where did we leave off on that?", "resume
+  the thing from yesterday", "we did that out of order, undo the last step",
+  and to a ~/.koto that keeps growing or discovery scans that have got slow.
+  Guessing through these is expensive and quiet: one refusal's own message
+  names a subcommand that has never shipped, so following it literally loops
+  forever; some blocking conditions cannot be overridden at all and the
+  attempt just fails; and a session's execution anchor is not a sandbox, so
+  treating it as one tells a user something untrue about what a workflow can
+  reach. Do NOT load it to design a state machine for a business domain -
+  order lifecycles, request status models and the like are ordinary software
+  design with nothing to do with koto. To write a durable template or a
+  workflow-backed skill use koto-author; to decompose a fresh one-off task
+  that has no template yet use koto-adhoc, which hands the run loop back here
+  once the session is started.
 ---
 
 # koto-user
@@ -10,7 +29,7 @@ koto is a workflow orchestration engine for AI coding agents. It enforces execut
 
 You use koto by calling `koto next` in a loop. Each call returns a JSON object that tells you what to do next. You do it, then call `koto next` again.
 
-This skill is for koto-backed workflows only. If the SKILL.md you're following doesn't mention `koto init` or `koto next`, this skill doesn't apply. For authoring new koto templates, use koto-author instead.
+This skill is for koto-backed workflows only -- a session koto is already running, or one you're about to start from a template. If no koto session is involved, this skill doesn't apply. For authoring a durable template or a workflow-backed skill, use koto-author instead; for a one-off task that has no template yet, koto-adhoc.
 
 ## Prerequisites
 
