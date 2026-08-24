@@ -65,11 +65,24 @@ resolves v0.12.0's prose against *today's* command surface, because the check is
 compiled against this crate and cannot walk a foreign tree's clap definition
 without building it.
 
-That is sound for this demonstration and would not be for every one.
-`session rebind` has never existed at any commit in koto's history, so no verb
-set the project has ever had resolves it, and the result is the same under any
-reading. A run against some other tag, checking a verb that has since been
-added or removed, would need that caveat read carefully.
+That matters more than it first looks, and the run above is a snapshot rather
+than something you can re-execute to the same output.
+
+The run was executed while `koto session rebind` did not yet exist, so the verb
+set it resolved against had no `rebind` in it and all sixteen sites were
+reported. #218 has since landed the verb. Re-running the identical command
+today resolves those sites against the current command surface and reports
+**zero** findings for that token. That is the mechanism working correctly, not
+a regression: the root argument carries the corpus and the compiled crate
+carries the verb set, so an old corpus is always read against today's CLI.
+
+The durable proof is therefore not this run but
+`catches_the_v0_12_0_string_literals` in `tests/doc_names.rs`. That test holds
+the three v0.12.0 literals verbatim and supplies the v0.12.0 verb set
+explicitly, so it does not depend on the current clap tree and keeps asserting
+the detection whatever ships next. It is what a reviewer should look at to
+satisfy themselves the check catches the motivating defect; the archive run
+above is the one-time demonstration that produced it.
 
 ## The pre-exception finding list
 
