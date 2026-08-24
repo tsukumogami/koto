@@ -95,7 +95,7 @@ use crate::session::state_file_name;
 /// Any change to this template must be authored as a deliberate
 /// security-reviewed edit; the snapshot test in `tests/respawn.rs`
 /// asserts byte-equality so accidental drift is caught at CI.
-pub const RESUME_CONTEXT_PROMPT: &str = "You are resuming session <id>. Read your prior state via `koto session info <id>` and prior children via `koto session list --parent <id>`; advance from where you left off.";
+pub const RESUME_CONTEXT_PROMPT: &str = "You are resuming session <id>. Read your prior state via `koto status <id>` and prior children via `koto workflows --children <id>`; advance from where you left off.";
 
 /// Default substrate transcript-retention floor. Claude Code Agent
 /// Teams documents 30 days; bunki BK2's hosted substrate may differ.
@@ -804,7 +804,7 @@ mod tests {
         // changing the test deliberately.
         assert_eq!(
             RESUME_CONTEXT_PROMPT,
-            "You are resuming session <id>. Read your prior state via `koto session info <id>` and prior children via `koto session list --parent <id>`; advance from where you left off."
+            "You are resuming session <id>. Read your prior state via `koto status <id>` and prior children via `koto workflows --children <id>`; advance from where you left off."
         );
     }
 }

@@ -5,7 +5,7 @@
 //! and returns the *first* rule violation it finds, or `Ok(())` when
 //! every whole-submission rule passes. No `EvidenceSubmitted` event
 //! may be appended to a batch parent's log before this check succeeds
-//! (Decision 11 in `docs/designs/DESIGN-batch-child-spawning.md`).
+//! (Decision 11 in `docs/designs/current/DESIGN-batch-child-spawning.md`).
 //!
 //! # Scope
 //!

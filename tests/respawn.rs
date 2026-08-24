@@ -594,13 +594,13 @@ fn resume_context_prompt_is_fixed_form_snapshot() {
     // deliberate breaking change requiring a test update.
     assert_eq!(
         RESUME_CONTEXT_PROMPT,
-        "You are resuming session <id>. Read your prior state via `koto session info <id>` and prior children via `koto session list --parent <id>`; advance from where you left off."
+        "You are resuming session <id>. Read your prior state via `koto status <id>` and prior children via `koto workflows --children <id>`; advance from where you left off."
     );
     let id = ValidatedSessionId::new("test-session").unwrap();
     let rendered = render_resume_context_prompt(&id);
     assert_eq!(
         rendered,
-        "You are resuming session test-session. Read your prior state via `koto session info test-session` and prior children via `koto session list --parent test-session`; advance from where you left off."
+        "You are resuming session test-session. Read your prior state via `koto status test-session` and prior children via `koto workflows --children test-session`; advance from where you left off."
     );
 }
 

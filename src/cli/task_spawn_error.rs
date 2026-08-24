@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 /// Discriminator for the reason a single task's spawn failed.
 ///
 /// Mirrors the Key Interfaces definition in
-/// `docs/designs/DESIGN-batch-child-spawning.md` (Decision 12). The
+/// `docs/designs/current/DESIGN-batch-child-spawning.md` (Decision 12). The
 /// string representation is `snake_case` so the JSON surface agents see
 /// matches the design doc verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

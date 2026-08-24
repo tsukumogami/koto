@@ -327,7 +327,7 @@ To inspect what happened in a prior attempt:
 
 ```bash
 koto status parent~1.task-a     # state, outcome, evidence
-koto query parent~1.task-a      # full event log
+koto session dir parent~1.task-a    # the directory holding its full event log
 koto workflows --children parent~1  # all children of that attempt
 ```
 

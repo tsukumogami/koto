@@ -5,7 +5,7 @@
 //! directory, `JSON.parse`s each file, applies defaults to every field, sorts
 //! by `startTime`, and renders each as a run entry (established empirically
 //! against Claude Code v2.1.209; see
-//! `docs/designs/DESIGN-native-workflows-render.md`). The shape here is a
+//! `docs/designs/current/DESIGN-native-workflows-render.md`). The shape here is a
 //! minimal *valid* projection for the initial render (name, current state, running/done)
 //! that later features add fields to without breaking the initial readers. The
 //! koto-namespaced [`KotoBlock`] identifies the file as koto's and carries a

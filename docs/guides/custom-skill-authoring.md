@@ -2,7 +2,7 @@
 
 This guide walks through creating a koto workflow skill from scratch. A skill pairs a workflow template (the state machine definition) with a SKILL.md file (instructions telling the agent how to call koto). By the end, you'll have a working skill that you can use in your own project or contribute to the koto-skills plugin.
 
-The hello-koto skill in `plugins/koto-skills/skills/hello-koto/` is the reference implementation. This guide explains every piece of it, then covers how to build your own.
+This guide builds one worked example end to end -- a greeting ritual called hello-koto -- and every piece of it appears inline below, so nothing here depends on a skill you have to go and find. For a shipped skill to read alongside it, `plugins/koto-skills/skills/koto-author/` is the closest in shape: a SKILL.md paired with a template under `koto-templates/`.
 
 ## What's in a skill
 
@@ -190,7 +190,7 @@ How the agent gets the template to a stable path. koto stores absolute paths in 
 ```markdown
 ## Template Setup
 
-The hello-koto template (`hello-koto.md`) is in the same directory as this skill file.
+The hello-koto template is in the same directory as this skill file.
 Before initializing a workflow, ensure the template is at a stable project-local path:
 
 1. Check if `.koto/templates/hello-koto.md` already exists in the project.
@@ -260,7 +260,7 @@ Each gate type produces structured output matching its schema (see [Gate output 
 
 #### Response schemas
 
-Document the JSON shapes returned by `koto next` (including directed transitions via `koto next <name> --to <state>`) so the agent can parse them correctly. See the hello-koto SKILL.md for examples. You can also point to the [CLI usage guide](cli-usage.md) for the full command reference.
+Document the JSON shapes returned by `koto next` (including directed transitions via `koto next <name> --to <state>`) so the agent can parse them correctly. `plugins/koto-skills/skills/koto-user/references/response-shapes.md` catalogues them, and the [CLI usage guide](cli-usage.md) has the full command reference.
 
 #### Error handling
 
@@ -323,16 +323,14 @@ plugins/koto-skills/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── skills/
-│   └── hello-koto/
+│   └── koto-author/
 │       ├── SKILL.md
-│       └── hello-koto.md
+│       ├── koto-templates/
+│       ├── references/
+│       └── evals/
+│           └── evals.json
 ├── hooks.json
-├── eval.sh
-└── evals/
-    └── hello-koto/
-        ├── prompt.txt
-        ├── skill_path.txt
-        └── patterns.txt
+└── hooks/
 ```
 
 To add a new skill:
@@ -344,9 +342,14 @@ To add a new skill:
 ```json
 {
   "name": "koto-skills",
-  "version": "0.1.0",
+  "version": "0.12.1-dev",
   "description": "Workflow skills for koto -- the state machine engine for AI agent workflows",
-  "skills": ["./skills/hello-koto", "./skills/your-new-skill"]
+  "skills": [
+    "./skills/koto-adhoc",
+    "./skills/koto-author",
+    "./skills/koto-user",
+    "./skills/your-new-skill"
+  ]
 }
 ```
 
@@ -359,7 +362,7 @@ Plugin-distributed skills have a constraint that project-scoped skills don't. Wh
 
 The SKILL.md handles this by instructing the agent to copy the template to a project-local path (like `.koto/templates/<name>.md`) before running `koto init`. This is a one-time step per project. After the copy, the template is local and stable.
 
-Your SKILL.md's Template Setup section should include these instructions. See the hello-koto SKILL.md for the pattern.
+Your SKILL.md's Template Setup section should include these instructions. `plugins/koto-skills/skills/koto-author/SKILL.md` is a shipped example of the pattern.
 
 ## Security: directive text is agent-visible
 
@@ -495,52 +498,66 @@ If it compiles, it's structurally valid.
 
 ### Test with the eval harness
 
-The eval harness (`plugins/koto-skills/eval.sh`) catches behavioral regressions that structural validation misses. It sends SKILL.md content to the Anthropic API and checks that the model's response contains the expected koto command sequence.
+Structural validation says a skill compiles. The eval harness says an agent
+reading it does the right thing, which is the failure structural validation
+cannot see. `scripts/run-evals.sh` spawns a `claude -p` session per skill,
+runs each case with and without the skill in context, and grades both against
+the case's assertions -- so the report tells you not just whether the skill
+works but whether it adds anything.
 
-Each eval case is a directory under `plugins/koto-skills/evals/` with three files:
+Evals live beside the skill they test, at
+`plugins/<plugin>/skills/<name>/evals/evals.json`. One file per skill, holding
+a `skill_name` and an `evals` array:
 
-| File | Purpose |
-|------|---------|
-| `prompt.txt` | The user prompt (e.g., `/hello-koto Hasami`) |
-| `skill_path.txt` | Path to the SKILL.md, relative to the repo root. Alternatively, use `skill.txt` with inline content. |
-| `patterns.txt` | One regex per line. All must match the model's response. Lines starting with `#` are comments. |
-
-Here's how the hello-koto eval is set up:
-
-**`evals/hello-koto/prompt.txt`:**
+```json
+{
+  "skill_name": "your-new-skill",
+  "evals": [
+    {
+      "id": 1,
+      "name": "init-with-the-right-template",
+      "prompt": "Awaken a spirit called Hasami.",
+      "expected_output": "Agent copies the template to a project-local path, runs koto init with it, then drives the run loop with koto next.",
+      "files": [],
+      "assertions": [
+        "Response runs `koto init` with `--template` pointing at the project-local copy",
+        "Response drives the workflow with `koto next` rather than asserting completion",
+        "Response submits the greeting through `koto context add` before expecting the gate to pass"
+      ]
+    }
+  ]
+}
 ```
-/hello-koto Hasami
-```
 
-**`evals/hello-koto/skill_path.txt`:**
-```
-plugins/koto-skills/skills/hello-koto/SKILL.md
-```
+Write assertions about what the agent *does* -- which commands, in which order,
+with which evidence -- rather than about wording. An assertion on phrasing fails
+on a rewrite that changed nothing that matters, and a skill whose evals fail
+that way gets its evals deleted rather than fixed.
 
-**`evals/hello-koto/patterns.txt`:**
-```
-# The model should call koto init with the hello-koto template path.
-koto init\b.*--template\b.*hello-koto
+`files` is a list of fixture files the case needs on disk; leave it empty when
+the prompt stands alone.
 
-# The model should call koto next to get the directive.
-koto next
-```
-
-To add an eval for your skill, create a directory under `evals/` with these three files. The patterns should verify that the model calls `koto init` with the right template and uses `koto next` to get directives. Keep the patterns focused on structural correctness (does the agent call the right commands?) rather than output wording.
-
-Run evals locally:
+Run them:
 
 ```bash
-ANTHROPIC_API_KEY=sk-... bash plugins/koto-skills/eval.sh
+# One skill
+scripts/run-evals.sh your-new-skill
+
+# Every skill that has evals
+scripts/run-evals.sh --all
+
+# Which skills have evals at all
+scripts/run-evals.sh --list
+
+# Re-grade the last run without spending tokens
+scripts/run-evals.sh --validate your-new-skill
 ```
 
-Or run a specific eval case:
-
-```bash
-ANTHROPIC_API_KEY=sk-... bash plugins/koto-skills/eval.sh plugins/koto-skills/evals/hello-koto/
-```
-
-The `eval-plugins` workflow (`.github/workflows/eval-plugins.yml`) runs these automatically on PRs touching `plugins/`. It requires an `ANTHROPIC_API_KEY` repo secret. Each eval call costs roughly $0.01-0.03.
+Running evals needs an `ANTHROPIC_API_KEY` and spawns real Claude sessions, so
+it is a manual step rather than a CI one. What CI does enforce is that every
+skill *has* at least one eval: `scripts/check-evals-exist.sh`, run by the
+`eval-plugins` workflow on any PR touching `plugins/`. Include the results table
+in your PR description -- `CLAUDE.md` has the format.
 
 ## Worked example: hello-koto
 
@@ -548,7 +565,7 @@ Pulling it all together, here's how the hello-koto skill was built. Use this as 
 
 ### The template
 
-The template (`plugins/koto-skills/skills/hello-koto/hello-koto.md`) defines two states:
+The template, as given in Step 1 above, defines two states:
 
 - **awakening** -- The agent writes a greeting and submits it via `koto context add`. A `context-exists` gate (`key: spirit-greeting.txt`) blocks the transition until the key exists in the content store.
 - **eternal** -- Terminal state. Nothing to do.
@@ -558,13 +575,13 @@ One variable, `SPIRIT_NAME`, is interpolated into the awakening directive.
 ### Compiling and extracting
 
 ```bash
-$ koto template compile plugins/koto-skills/skills/hello-koto/hello-koto.md | jq '.states | keys'
+$ koto template compile .koto/templates/hello-koto.md | jq '.states | keys'
 [
   "awakening",
   "eternal"
 ]
 
-$ koto template compile plugins/koto-skills/skills/hello-koto/hello-koto.md | jq '.states.awakening.gates'
+$ koto template compile .koto/templates/hello-koto.md | jq '.states.awakening.gates'
 {
   "greeting_exists": {
     "type": "context-exists",
@@ -577,7 +594,7 @@ This tells us the SKILL.md needs to document one gate (`greeting_exists`) on the
 
 ### The SKILL.md
 
-The SKILL.md (`plugins/koto-skills/skills/hello-koto/SKILL.md`) covers all seven sections:
+The SKILL.md covers all seven sections:
 
 - **Prerequisites**: koto on PATH
 - **Template Setup**: copy to `.koto/templates/hello-koto.md`
@@ -588,7 +605,7 @@ The SKILL.md (`plugins/koto-skills/skills/hello-koto/SKILL.md`) covers all seven
 
 ### The eval
 
-The eval case (`plugins/koto-skills/evals/hello-koto/`) sends `/hello-koto Hasami` as the user prompt and checks that the model response includes `koto init` with the template path and a `koto next` call.
+The eval case sends `Awaken a spirit called Hasami` as the prompt and asserts that the response runs `koto init` with the template path and drives the loop with `koto next`.
 
 ### The full agent flow
 

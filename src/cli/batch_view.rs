@@ -7,7 +7,7 @@
 //! rows. The goal is that the two commands can never diverge — they
 //! read the same view and project fields as needed.
 //!
-//! See `docs/designs/DESIGN-batch-child-spawning.md` Decision 6 and
+//! See `docs/designs/current/DESIGN-batch-child-spawning.md` Decision 6 and
 //! Decision 13 for the field-level schema.
 
 use serde::{Deserialize, Serialize};

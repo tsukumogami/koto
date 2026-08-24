@@ -167,7 +167,7 @@ output's `children[]` array gains a `result` object:
 ```
 
 The coordinator reads each child's `status` / `summary` / optional `payload`
-straight from its own directive — it never runs `koto query` or `koto next`
+straight from its own directive — it never runs `koto status` or `koto next`
 against a child to learn what the child produced. `status` is one of `success`
 / `failure` / `skipped` (the same classification as the child's terminal
 outcome); `summary` is always present (a default is synthesized when the child's

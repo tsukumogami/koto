@@ -898,7 +898,7 @@ pub enum EventPayload {
     /// Enables graceful degradation when reading logs produced by a newer
     /// koto version that introduced a new event type. The original type
     /// string and raw payload are preserved so operators can inspect them
-    /// via `koto query --events`.
+    /// in the session's event log, under `koto session dir`.
     ///
     /// This variant is deserialization-only. Callers must not pass it to
     /// `append_event` — doing so would write a corrupted event to disk.
@@ -1054,7 +1054,7 @@ pub struct SupersededByRef {
 ///
 /// Mirrors the non-trivial-tick summary captured in
 /// `SchedulerOutcome::Scheduled`; emitted as the `tick_summary` body
-/// of the event so `koto query --events` can surface per-tick audit
+/// of the event so the session's event log can surface per-tick audit
 /// without re-running the scheduler.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchedulerTickSummary {
