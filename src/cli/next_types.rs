@@ -731,13 +731,16 @@ pub enum NextErrorCode {
     /// "you are in the wrong tree" from "the recorded tree is gone"
     /// without matching on wording.
     ExecutionAnchorUnresolvable,
-    /// A state's instruction text read a capture name no state has delivered
-    /// on this run (R4, unset case). The producing state exists -- a name no
+    /// A state read a capture name no state has delivered on this run (R4,
+    /// unset case) -- in its instruction text, or in its `default_action`'s
+    /// `command` or `working_dir`. The producing state exists -- a name no
     /// state declares is a compile error -- but the run reached the reading
-    /// state without passing through it, so there is no value to render.
+    /// state without passing through it, so there is no value to substitute.
     /// Rendering the empty string or the raw `{{KEY}}` token instead is
     /// exactly what this code exists to prevent, which is why it is a stop
-    /// rather than a fallback.
+    /// rather than a fallback. On the action path the refusal happens before
+    /// the command is spawned, so the token never reaches `sh -c` and nothing
+    /// ran (Issue #221).
     CaptureUnset,
     /// The tick was started from inside a command an outer tick is running
     /// (koto#208). A nested tick advances the session behind the outer

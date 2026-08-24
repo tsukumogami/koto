@@ -44,6 +44,37 @@ to `0.9.x`).
 
 ### Fixed
 
+- **A `default_action` that reads an undelivered capture name is now
+  refused instead of handing the raw token to `sh -c`.** A `{{KEY}}`
+  naming another state's `capture_stdout_as` compiles inside
+  `default_action.command`, so an author was told the reference was
+  valid; at run time, if the producing state had not run yet, the
+  literal `{{KEY}}` reached the shell and the command exited 0. A
+  command that echoed the token failed loudly on the value allowlist,
+  which is what made this look narrower than it was — one that consumed
+  it, the `koto context add {{TOKEN}} key` shape, did the wrong thing
+  quietly. Both `command` and `working_dir` are now checked before
+  either is substituted, so nothing is spawned and no
+  `default_action_executed` event is written; the run stops with
+  `capture_unset` (exit 3), naming the state, which of the two fields
+  read the name, the name itself, and the state that would have
+  delivered it. This is the same typed stop a directive reading the
+  same name already got. It is deliberately not an action failure: the
+  author's `fallback` prose describes a command that ran and failed,
+  and an `__action__` condition is routable, so a template could have
+  carried the run past the defect with the value still unset. A
+  delivered capture resolves exactly as before, whether it was
+  delivered earlier in the same tick or on an earlier one, and a
+  `working_dir` naming an undelivered capture — which used to fail as a
+  bare spawn failure that never mentioned the capture — now reports the
+  same refusal as the command. One further behaviour changes: an action
+  whose command reads the very name that action delivers is refused on
+  entry, where it used to hand the raw token to the shell. Its message
+  says so in its own terms rather than reporting a state the run has not
+  entered, because the run is standing in that state and the fix is not
+  a routing one.
+  Closes koto#221.
+
 - **`{{SESSION_NAME}}` and `{{SESSION_DIR}}` now resolve inside a
   `default_action` command.** Both reached `sh -c` as literal text while
   the same references in a gate command resolved, and the template

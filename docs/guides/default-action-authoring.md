@@ -488,7 +488,7 @@ others.
 
 ### Reading a name that was never delivered
 
-A state whose text reads a capture the run never produced stops the tick with the `capture_unset`
+A state that reads a capture the run never produced stops the tick with the `capture_unset`
 error code (exit 3), naming both the value and the state that would have delivered it:
 
 ```json
@@ -500,6 +500,19 @@ would put a placeholder into an agent's instructions. The check runs on each str
 actually substitutes, so prose that's never rendered is never refused. A name no state declares
 at all is caught earlier, when the template compiles. The fix is usually in the template: route
 through the producing state, or move the reference to a state that always follows it.
+
+The same stop covers the state's own action. A `{{NAME}}` in `command` or in `working_dir`
+is checked before either is substituted, so the token never reaches `sh -c`, nothing is
+spawned, and no `default_action_executed` event is written. That message names the field too:
+
+```json
+{"error":{"code":"capture_unset","message":"state 'report' has a default_action whose command reads {{BRANCH}}, which state 'detect' delivers with capture_stdout_as; this run has not entered that state, so the value is unset and the command did not run","details":[]}}
+```
+
+It's a stop and not an action failure, so your `fallback` prose is not delivered for it — that
+prose describes a command that ran and didn't succeed, and here nothing ran. A capture that
+*has* been delivered resolves normally, whether the producing state ran earlier in this same
+tick or on an earlier one; only a name that is unbound right now is refused.
 
 ### Lifetime of a delivered value
 
