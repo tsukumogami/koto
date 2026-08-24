@@ -245,6 +245,34 @@ names, and must be overridden for them specifically. Declared `variables:`
 keep their current pass-through behavior; nothing about existing templates
 changes.
 
+**Amendment: "reaching substitution" includes the action's own fields.** As
+shipped, the stop was wired only into the directive and details substitution.
+The reasoning written down for it was about prose -- the token would land in an
+agent's instructions -- so the same reference inside the state's own
+`default_action` went on resolving the ordinary way, and the raw `{{KEY}}`
+token was handed to `sh -c`, where the command consumed it and exited 0
+(Issue #221). `working_dir` had it too: the token was joined to the execution
+anchor and the run failed as a spawn failure that never named the capture.
+
+A token in an instruction is wrong because a person or an agent reads it. A
+token in a command is wrong for the same reason and worse, because nothing
+reads it -- the shell just runs. So both fields are checked before either is
+substituted, and a hit is the same typed stop, naming the state, the field, the
+name, and the state that would have delivered it. Nothing is spawned and no
+`DefaultActionExecuted` event is appended.
+
+Deliberately *not* an action failure under Decision 3. The author's `fallback:`
+prose describes a command that ran and did not succeed, which is not what
+happened; and an `__action__` condition is routable, so a template with a
+transition on it would carry the run past an authoring defect with the value
+still unset. The compile-time alternative -- reject the forward reference --
+was rejected because a capture is legitimately unbound until its producing
+state runs. The question a command needs answered is whether the name is bound
+*now*, not whether it could ever be.
+
+This does not reach a gate's `command`, which is substituted through the same
+shell-safe helper and still ships an undelivered name to `sh -c` (Issue #225).
+
 ### Decision 3: failure detection, and what happens to the state's own gates
 
 | Option | Gate-less state | Gated state | Keeps gates the arbiter |

@@ -778,6 +778,327 @@ fn init_rejects_a_var_named_after_a_capture() {
 }
 
 // ---------------------------------------------------------------------------
+// a name that was never delivered, read by a command instead of by prose
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_undelivered_capture_in_an_action_command_is_refused_before_the_shell_runs() {
+    // Issue #221, in the shape the report used. `s` runs before `producer`, so
+    // `TOKEN` has no value when `s`'s command is assembled. The token used to
+    // pass through and `sh -c` wrote `using-{{TOKEN}}` to a file at exit 0 --
+    // and the near-miss that hid it is that a command echoing the token would
+    // have failed loudly on the value allowlist. This one consumes it instead,
+    // which is the quiet case.
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: forward
+version: "1.0"
+initial_state: s
+states:
+  s:
+    default_action:
+      command: 'printf "%s" "using-{{TOKEN}}" > out.txt'
+      fallback: "the action did not run"
+    transitions:
+      - target: producer
+  producer:
+    default_action:
+      command: "echo abc"
+      capture_stdout_as: TOKEN
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## s
+
+Consume the token.
+
+## producer
+
+Produce it.
+
+## done
+
+Done.
+"#;
+    init_ok(dir.path(), "forward", template);
+
+    let (code, body) = run_next_failing(dir.path(), "forward", &[]);
+
+    assert_eq!(
+        code, 3,
+        "the same infrastructure-class refusal a directive gets: {body}"
+    );
+    assert_eq!(body["error"]["code"], "capture_unset");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("TOKEN") && message.contains("producer") && message.contains("'s'"),
+        "the message names the undelivered name, the state that would have \
+         delivered it, and the state that read it: {message}"
+    );
+    assert!(
+        message.contains("command"),
+        "the message names which of the two fields read it: {message}"
+    );
+
+    assert!(
+        !dir.path().join("out.txt").exists(),
+        "the command must not have run"
+    );
+    assert!(
+        !state_log(dir.path(), "forward")
+            .iter()
+            .any(|e| e["type"] == "default_action_executed"),
+        "nothing ran, so nothing should be recorded as having run"
+    );
+}
+
+#[test]
+fn an_undelivered_capture_in_an_action_working_dir_is_refused_the_same_way() {
+    // `working_dir` is validated against the same reference set as `command`
+    // and substituted on the same tick, so a reader assumes the two behave
+    // alike. Before this they did not: the raw token was joined to the
+    // execution anchor and the run failed as `spawn_failed` under `__action__`,
+    // carrying the author's `fallback` prose and never naming the capture.
+    // Same refusal now, with the field named.
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: forwardwd
+version: "1.0"
+initial_state: s
+states:
+  s:
+    default_action:
+      command: "pwd > pwd.txt"
+      working_dir: "{{TOKEN}}"
+      fallback: "the action did not run"
+    transitions:
+      - target: producer
+  producer:
+    default_action:
+      command: "echo abc"
+      capture_stdout_as: TOKEN
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## s
+
+Run somewhere.
+
+## producer
+
+Produce it.
+
+## done
+
+Done.
+"#;
+    init_ok(dir.path(), "forwardwd", template);
+
+    let (code, body) = run_next_failing(dir.path(), "forwardwd", &[]);
+
+    assert_eq!(code, 3, "got {body}");
+    assert_eq!(body["error"]["code"], "capture_unset");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("TOKEN") && message.contains("producer"),
+        "the message names the undelivered name and its producer: {message}"
+    );
+    assert!(
+        message.contains("working_dir"),
+        "a reader has to be able to tell which field it was: {message}"
+    );
+    assert!(
+        !body.to_string().contains("the action did not run"),
+        "the author's fallback describes a command that ran and failed, and \
+         nothing ran: {body}"
+    );
+    assert!(
+        !dir.path().join("pwd.txt").exists(),
+        "the command must not have run"
+    );
+}
+
+#[test]
+fn an_action_reading_the_name_it_delivers_is_refused_and_says_so_in_its_own_terms() {
+    // The extreme case of the same defect: the producing state and the reading
+    // state are the same one, so the value cannot exist on this entry no matter
+    // how the run was routed. Before this it passed the raw token to `sh -c`.
+    //
+    // It gets its own sentence. The general one would tell the operator that
+    // the run has not entered a state it is standing in, and would point at
+    // routing when the fix is that the command has to run before its own output
+    // exists.
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: selfref
+version: "1.0"
+initial_state: start
+states:
+  start:
+    default_action:
+      command: 'printf "%s" "using-{{TOKEN}}" > out.txt'
+      capture_stdout_as: TOKEN
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Read what you are about to write.
+
+## done
+
+Done.
+"#;
+    init_ok(dir.path(), "selfref", template);
+
+    let (code, body) = run_next_failing(dir.path(), "selfref", &[]);
+
+    assert_eq!(code, 3, "got {body}");
+    assert_eq!(body["error"]["code"], "capture_unset");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("that same action"),
+        "the self-reference gets its own wording: {message}"
+    );
+    assert!(
+        !message.contains("has not entered"),
+        "the run is standing in the state, so routing is not the fix: {message}"
+    );
+    assert!(
+        !dir.path().join("out.txt").exists(),
+        "the command must not have run"
+    );
+}
+
+#[test]
+fn a_capture_delivered_earlier_in_the_same_tick_resolves_in_an_action_command() {
+    // The guard refuses only what is unbound *now*. A capture is legitimately
+    // unbound until its producing state runs, and here that state runs first
+    // inside the same tick -- so the value lives in the per-tick overlay and
+    // not yet in the log's bindings.
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: sametick
+version: "1.0"
+initial_state: producer
+states:
+  producer:
+    default_action:
+      command: "echo abc"
+      capture_stdout_as: TOKEN
+    transitions:
+      - target: consumer
+  consumer:
+    default_action:
+      command: 'printf "%s" "using-{{TOKEN}}" > out.txt'
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## producer
+
+Produce it.
+
+## consumer
+
+Consume it.
+
+## done
+
+Done.
+"#;
+    init_ok(dir.path(), "sametick", template);
+
+    let resp = run_next(dir.path(), "sametick");
+    assert_eq!(resp["state"], "done", "got {resp}");
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+        "using-abc",
+        "the delivered value should have reached the shell"
+    );
+}
+
+#[test]
+fn a_capture_delivered_on_an_earlier_tick_resolves_in_an_action_command() {
+    // The other layer: this tick's overlay holds no `TOKEN`, and the value
+    // comes from the `variable_captured` event an earlier tick wrote. Both
+    // layers are consulted, so neither one alone can make the guard fire on a
+    // name that is bound.
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: latertick
+version: "1.0"
+initial_state: producer
+states:
+  producer:
+    default_action:
+      command: "echo abc"
+      capture_stdout_as: TOKEN
+    accepts:
+      ack:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: consumer
+        when:
+          ack: ok
+  consumer:
+    default_action:
+      command: 'printf "%s" "using-{{TOKEN}}" > out.txt'
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## producer
+
+Produce it, then acknowledge.
+
+## consumer
+
+Consume it.
+
+## done
+
+Done.
+"#;
+    init_ok(dir.path(), "latertick", template);
+
+    let first = run_next(dir.path(), "latertick");
+    assert_eq!(
+        first["state"], "producer",
+        "the first tick should stop for evidence at the producing state: {first}"
+    );
+    assert!(
+        !dir.path().join("out.txt").exists(),
+        "the consumer has not run yet"
+    );
+
+    let second = run_next_with(dir.path(), "latertick", &["--with-data", r#"{"ack":"ok"}"#]);
+    assert_eq!(second["state"], "done", "got {second}");
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+        "using-abc",
+        "a value the log carried in should resolve exactly as one from the overlay does"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // a state that declares no capture is untouched
 // ---------------------------------------------------------------------------
 

@@ -658,7 +658,7 @@ Two bounds apply and they do different jobs. **64KB per stream** bounds what the
 
 Delivery fails three ways, all of them action failures with `failure_kind: "capture_failed"` and a `capture_error` object naming the case: the trimmed output is `empty`, it is `too_large` (over 4096 bytes), or it holds a `disallowed_character` -- the same allowlist declared variables pass, `^[a-zA-Z0-9._/:@ \-]*$`, which forbids newlines and so makes multi-line capture unrepresentable. A skip would be a silent drop, and it would move the error to the reading state where the message names a variable instead of the command that failed to produce it.
 
-Reading a name the run never delivered stops the tick with the `capture_unset` error code rather than rendering an empty string or a raw `{{NAME}}` token.
+Reading a name the run never delivered stops the tick with the `capture_unset` error code rather than rendering an empty string or a raw `{{NAME}}` token. That covers a state's own action: a `{{NAME}}` in `command` or in `working_dir` is checked before either is substituted, so the token never reaches `sh -c` and nothing is spawned. It is a stop and not an action failure, so `fallback` prose is not delivered for it.
 
 Lifetime: re-entering the producing state runs the command again and the later value wins; two states declaring the same name is a compile error; a `koto rewind` past the producing state **leaves the value in place**, because a rewind appends an event and truncates nothing; a captured value holding a `{{...}}` token is never re-expanded; and a capture is delivered on a tick that stops for confirmation as well as one that advances.
 

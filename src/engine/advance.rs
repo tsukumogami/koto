@@ -32,6 +32,28 @@ pub enum TransitionResolution {
     NoTransitions,
 }
 
+/// Which part of a `default_action` a refusal names.
+///
+/// `command` and `working_dir` both carry `{{KEY}}` references and both are
+/// validated against the same reference set at compile time, so an author reads
+/// them as behaving alike. They do, and this is what lets the stop say which of
+/// the two it was without the operator having to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionField {
+    Command,
+    WorkingDir,
+}
+
+impl ActionField {
+    /// The field's name as an author writes it in a template.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActionField::Command => "command",
+            ActionField::WorkingDir => "working_dir",
+        }
+    }
+}
+
 /// Result of executing a default action.
 #[derive(Debug, Clone)]
 pub enum ActionResult {
@@ -55,6 +77,22 @@ pub enum ActionResult {
         stdout: String,
         stderr: String,
         truncated: bool,
+    },
+    /// The action did not run, because a `{{KEY}}` in it names a capture no
+    /// state has delivered on this run.
+    ///
+    /// Distinct from [`Failed`](Self::Failed) because nothing was spawned:
+    /// there is no exit code, no output, and no `DefaultActionExecuted` event
+    /// to append. The caller turns this into the same typed run-time stop a
+    /// directive reading an undelivered name already gets, rather than into an
+    /// `__action__` failure -- the author's `fallback` prose describes a
+    /// command that ran and failed, and an `__action__` condition is routable,
+    /// so a template could carry the run past the defect with the value still
+    /// unset (Issue #221).
+    Refused {
+        field: ActionField,
+        key: String,
+        producer: String,
     },
     /// The action did not succeed. `command` is the substituted string that
     /// actually ran, so the response reports what happened rather than what
@@ -357,6 +395,20 @@ pub enum StopReason {
         stdout: String,
         stderr: String,
     },
+    /// A `default_action` was refused before it ran: a `{{KEY}}` in its
+    /// `command` or `working_dir` names a capture no state has delivered on
+    /// this run.
+    ///
+    /// Not a [`GateBlocked`](Self::GateBlocked) under `__action__`, which is
+    /// where a failing action stops. Nothing ran, so there is nothing for the
+    /// author's `fallback` prose to describe, and the caller reports it as the
+    /// same authoring stop a directive gets for the same defect (Issue #221).
+    ActionRefusedUnsetCapture {
+        state: String,
+        field: ActionField,
+        key: String,
+        producer: String,
+    },
     /// SIGTERM or SIGINT received between iterations.
     SignalReceived,
     /// Conditional transitions exist but no evidence matches, and the state
@@ -601,6 +653,30 @@ where
                 }
                 ActionResult::Skipped => {
                     // Continue to gate evaluation
+                }
+                ActionResult::Refused {
+                    field,
+                    key,
+                    producer,
+                } => {
+                    // Stop where the refusal happened, before this state's
+                    // gates, for the same reason the `Failed` arm does: a
+                    // state's gates judge the work the action did, and the
+                    // action did not happen. Unlike that arm there is no
+                    // `__action__` condition to build -- nothing ran, so there
+                    // is no command, exit code, or output to report, and the
+                    // stop carries only what the operator needs to fix the
+                    // template.
+                    return Ok(AdvanceResult {
+                        final_state: state.clone(),
+                        advanced,
+                        stop_reason: StopReason::ActionRefusedUnsetCapture {
+                            state,
+                            field,
+                            key,
+                            producer,
+                        },
+                    });
                 }
                 ActionResult::Failed {
                     command,
@@ -3727,6 +3803,62 @@ mod tests {
         assert_eq!(result.final_state, "run");
         assert!(!result.advanced);
         assert_eq!(action_condition(&result)["failure_kind"], "nonzero_exit");
+    }
+
+    #[test]
+    fn refused_action_stops_before_the_gates_and_carries_no_action_condition() {
+        use crate::template::types::Gate;
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: "true".to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+
+        let gate_calls = std::sync::atomic::AtomicUsize::new(0);
+        let template = action_failure_template(gates);
+        let result = run_failing_action(
+            &template,
+            ActionResult::Refused {
+                field: ActionField::Command,
+                key: "TOKEN".to_string(),
+                producer: "producer".to_string(),
+            },
+            &gate_calls,
+        );
+
+        // The gate would have passed. A refusal has to short-circuit it for the
+        // same reason a failure does -- a passing gate would advance the tick
+        // past a command that never ran.
+        assert_eq!(gate_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(result.final_state, "run");
+        assert!(!result.advanced);
+        match result.stop_reason {
+            // Deliberately not a `GateBlocked` under `__action__`: nothing ran,
+            // so there is no command, exit code, or output to report and no
+            // condition for the author's `fallback` prose to explain.
+            StopReason::ActionRefusedUnsetCapture {
+                state,
+                field,
+                key,
+                producer,
+            } => {
+                assert_eq!(state, "run");
+                assert_eq!(field, ActionField::Command);
+                assert_eq!(key, "TOKEN");
+                assert_eq!(producer, "producer");
+            }
+            other => panic!("expected ActionRefusedUnsetCapture, got {:?}", other),
+        }
     }
 
     #[test]

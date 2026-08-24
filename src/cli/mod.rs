@@ -3022,12 +3022,12 @@ fn substitute_text(
 /// `koto context add {{SESSION_NAME}} key` in an action got a session directory
 /// named with the literal token and an exit code of 0 (Issue #220).
 ///
-/// That is not the whole of "a literal token reached `sh -c`". Only the two
-/// runtime names and delivered values resolve here: an undelivered capture name
-/// still passes through as its raw token, because the `first_unset_capture`
-/// guard that refuses one in a directive is not wired into the command path
-/// (Issue #221). A gate's `key` and `pattern` are not substituted at all
-/// (Issue #222).
+/// That is not the whole of "a literal token reached `sh -c`". A gate's `key`
+/// and `pattern` are not substituted at all (Issue #222).
+///
+/// An undelivered capture name never reaches here from an action: the caller
+/// refuses it before substituting (Issue #221). A gate command is not guarded
+/// that way and still ships one to `sh -c` (Issue #225).
 #[cfg(unix)]
 fn substitute_shell_command(
     raw: &str,
@@ -4346,6 +4346,14 @@ fn handle_next(
             )
         };
 
+    // Every `capture_stdout_as` name in the template, mapped to the state that
+    // delivers it. Read once per tick and shared by the two positions that
+    // refuse an undelivered name: the action closure below, before it hands a
+    // command to `sh -c`, and the final directive substitution after the loop.
+    // The template compiled, so the map is available; an error building it is
+    // unreachable and costs the check nothing.
+    let capture_names = compiled.capture_names().unwrap_or_default();
+
     let session_name = &name;
     let gate_closure =
         |gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
@@ -4374,6 +4382,45 @@ fn handle_next(
         // If override evidence exists, skip the action.
         if has_evidence {
             return ActionResult::Skipped;
+        }
+
+        // A capture name this run has not delivered must not reach
+        // substitution. A declared variable renders its own binding, empty or
+        // not, but a capture has none, so the pass-through would put the raw
+        // `{{KEY}}` token into a string that is about to be handed to `sh -c`
+        // -- and the command would then succeed on it. That is the same defect
+        // a directive is already refused for, with a worse outcome, so it gets
+        // the same refusal rather than an `__action__` failure (Issue #221).
+        //
+        // Checked here, before either field is substituted, so nothing is
+        // spawned and no `DefaultActionExecuted` event is appended. Both layers
+        // a value can arrive from are consulted, so a capture an earlier state
+        // delivered in this same tick passes.
+        //
+        // `command` is checked before `working_dir` only because it is the
+        // field an author reaches for first; either hit refuses identically.
+        for (field, raw) in [
+            (
+                crate::engine::advance::ActionField::Command,
+                &action.command,
+            ),
+            (
+                crate::engine::advance::ActionField::WorkingDir,
+                &action.working_dir,
+            ),
+        ] {
+            if let Some((key, producer)) = crate::engine::substitute::first_unset_capture(
+                raw,
+                &capture_names,
+                &variables,
+                &overlay,
+            ) {
+                return ActionResult::Refused {
+                    field,
+                    key,
+                    producer,
+                };
+            }
         }
 
         // Substitute variables in command and working_dir through the tick's
@@ -4705,6 +4752,55 @@ fn handle_next(
                     expects,
                     unassigned_children: unassigned_children.clone(),
                 },
+                StopReason::ActionRefusedUnsetCapture {
+                    state: action_state,
+                    field,
+                    key,
+                    producer,
+                } => {
+                    // Same code, same exit status, and as near the same wording
+                    // as the two positions allow, as the stop a directive gets
+                    // for reading the same undelivered name. What differs is
+                    // that this one names the field and says the command did
+                    // not run, because the operator's next question after "which
+                    // name" is "did anything happen anyway".
+                    //
+                    // A state whose action reads the name that same action
+                    // delivers gets its own wording. The general sentence would
+                    // tell the operator the run has not entered a state it is
+                    // standing in, and the fix is a different one: not routing,
+                    // but that the value cannot exist before the command that
+                    // produces it has run.
+                    let message = if action_state == producer {
+                        format!(
+                            "state '{}' has a default_action whose {} reads {{{{{}}}}}, the name \
+                             that same action delivers with capture_stdout_as; the value does \
+                             not exist until the command has produced it, so the command did \
+                             not run",
+                            action_state,
+                            field.as_str(),
+                            key
+                        )
+                    } else {
+                        format!(
+                            "state '{}' has a default_action whose {} reads {{{{{}}}}}, which \
+                             state '{}' delivers with capture_stdout_as; this run has not \
+                             entered that state, so the value is unset and the command did \
+                             not run",
+                            action_state,
+                            field.as_str(),
+                            key,
+                            producer
+                        )
+                    };
+                    let err = NextError {
+                        code: NextErrorCode::CaptureUnset,
+                        message,
+                        details: vec![],
+                    };
+                    let json = serde_json::json!({"error": err});
+                    exit_with_error_code(json, err.code.exit_code());
+                }
                 StopReason::CycleDetected { state: cycle_state } => {
                     // Cycle is a template bug; report as an error.
                     let err = NextError {
@@ -4774,10 +4870,8 @@ fn handle_next(
             // instructions -- the outcome R4 exists to prevent. The check runs
             // on each string the response actually substitutes, so a state
             // whose prose is never rendered (a terminal stop) is not refused
-            // for a name it would never have shown. The template compiled, so
-            // the capture map is available; an error building it is
-            // unreachable and costs the check nothing.
-            let capture_names = compiled.capture_names().unwrap_or_default();
+            // for a name it would never have shown. The map is the one the
+            // action closure reads, built once above.
             let unset_capture: std::cell::RefCell<Option<(String, String)>> =
                 std::cell::RefCell::new(None);
             let resp = resp.with_substituted_directive(|d| {

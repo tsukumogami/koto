@@ -2550,7 +2550,16 @@ fn confirmation_response_reports_the_command_that_ran() {
     // advancement loop, by which point the overlay held this state's own
     // capture -- so a command referencing its own capture name was reported
     // resolved when it had run unresolved. The executed string is carried out
-    // of the loop instead.
+    // of the loop instead (Issue #220).
+    //
+    // This used to reference `{{TOKEN}}`, the state's own capture, because that
+    // is the one name whose resolution differs between the two passes. Issue
+    // #221 refuses such an action before it runs -- the value cannot exist
+    // until the command has produced it -- so the sharper form is no longer a
+    // template koto will execute, and the difference between carrying the
+    // string and re-deriving it is no longer observable from outside. What is
+    // still worth pinning is that the echo is the executed string: it equals
+    // the one the event log recorded, and it carries the runtime name resolved.
     //
     // The command deliberately keeps every `{{...}}` reference out of its
     // stdout: the captured value has to satisfy the value allowlist, which
@@ -2565,7 +2574,7 @@ initial_state: start
 states:
   start:
     default_action:
-      command: 'test -z "{{TOKEN}}{{SESSION_NAME}}" ; printf ok'
+      command: 'test -n "{{SESSION_NAME}}" ; printf ok'
       capture_stdout_as: TOKEN
       requires_confirmation: true
       fallback: "the action did not run"
