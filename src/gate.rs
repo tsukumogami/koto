@@ -168,29 +168,20 @@ fn evaluate_context_exists_gate(
 /// `error` field the payload already carries.
 ///
 /// This became worth checking when `key` started substituting, because a
-/// reference is now how an unusable key arises. The two character sets do not
-/// line up: a variable value may hold a space, a `:` or an `@`, and
-/// `validate_context_key` allows none of them; a key must also start each
-/// `/`-separated component with an alphanumeric, so `{{PREFIX}}-note` with an
-/// empty prefix leaves `-note`, which the store refuses. Whether the two sets
-/// should converge is Issue #227; this only stops the refusal being silent.
+/// reference is now how an unusable key arises. The wording itself lives with
+/// the rule it describes, in [`crate::session::validate::unusable_context_key_reason`],
+/// because `koto context exists` asks the same question about the same key and
+/// the two surfaces must not answer it differently (Issue #227).
 ///
 /// `field` names the evidence key the gate's shape carries, so a caller reading
 /// `exists` or `matches` still finds it.
 fn unusable_key_result(key: &str, field: &str) -> Option<StructuredGateResult> {
-    let err = crate::session::validate::validate_context_key(key).err()?;
+    let reason = crate::session::validate::unusable_context_key_reason(key)?;
     Some(StructuredGateResult {
         outcome: GateOutcome::Error,
         output: serde_json::json!({
             field: false,
-            "error": format!(
-                "context gate key {:?} is not a usable context key: {}\n  \
-                 remedy: this is the key after substitution, so check what any \
-                 {{{{KEY}}}} reference in the gate's key resolved to -- an unset \
-                 optional variable leaves nothing behind. A variable value may \
-                 hold a space, ':' or '@'; a context key may not",
-                key, err
-            )
+            "error": reason
         }),
     })
 }

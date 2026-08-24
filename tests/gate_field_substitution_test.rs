@@ -795,6 +795,220 @@ Done.
 }
 
 // ---------------------------------------------------------------------------
+// Issue #227: the value grammar is wider than the key grammar
+// ---------------------------------------------------------------------------
+
+/// A value koto documents as legal, substituted into a gate's `key`, says which
+/// character makes the result unusable.
+///
+/// This is the case Issue #227 was filed about and the one the tests above miss.
+/// They cover a key that resolved to nothing and a key left with a leading
+/// hyphen -- both reachable only from an unset optional variable. This one needs
+/// no mistake at all: `VALUE_PATTERN` admits a space, a `:` and an `@` on
+/// purpose, so a calendar title or a filter expression is a legal value, and
+/// `validate_context_key` admits none of the three. A template that scopes a key
+/// on such a value is doing the obvious thing.
+///
+/// Left alone the store answers an unusable key exactly as it answers a missing
+/// one, so the gate would report `{"exists": false, "error": ""}` -- a gate that
+/// will not pass with nothing pointing at why.
+///
+/// Each of the three characters gets its own case rather than one standing for
+/// the family: they enter `validate_context_key` by two different routes (the
+/// first-character rule and the trailing-character rule), and a change that
+/// stopped reporting one of them would leave the other two passing.
+#[test]
+fn a_legal_value_that_cannot_be_a_key_says_which_character() {
+    // (value, the character the message must name)
+    let cases = [
+        ("Weekly Planning", "' '"),
+        ("newer_than:90d", "':'"),
+        ("user@example.com", "'@'"),
+    ];
+
+    for (n, (title, character)) in cases.iter().enumerate() {
+        let dir = TempDir::new().unwrap();
+        let template = r#"---
+name: gate-legal-value-illegal-key
+version: "1.0"
+initial_state: s
+variables:
+  TITLE:
+    description: "names the thing the note is about"
+    required: true
+states:
+  s:
+    gates:
+      has_note:
+        type: context-exists
+        key: "{{TITLE}}-note"
+    accepts:
+      status:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: done
+        when:
+          status: ok
+          gates.has_note.exists: true
+  done:
+    terminal: true
+---
+
+## s
+
+Wait.
+
+## done
+
+Done.
+"#;
+
+        let name = format!("tprobe{n}");
+        let src = dir.path().join("title-template.md");
+        std::fs::write(&src, template).unwrap();
+        let output = koto_cmd(dir.path())
+            .args([
+                "init",
+                &name,
+                "--template",
+                src.to_str().unwrap(),
+                "--var",
+                &format!("TITLE={title}"),
+            ])
+            .output()
+            .unwrap();
+        // The value's legality is half the point: if `--var` ever stopped
+        // accepting these, the asymmetry would have closed from the other side
+        // and this test would be asserting something that cannot happen.
+        assert!(
+            output.status.success(),
+            "koto documents {title:?} as a legal value: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let resp = next(dir.path(), &name);
+        let cond = blocking_condition(&resp, "has_note")
+            .unwrap_or_else(|| panic!("the gate should block for {title:?}; got {resp}"));
+        assert_eq!(
+            cond["output"]["exists"], false,
+            "the exists evidence key should still be present and false; got {resp}"
+        );
+
+        let message = cond["output"]["error"].as_str().unwrap_or_default();
+        assert!(
+            !message.is_empty(),
+            "an unusable key must not report as a bare absence; got {resp}"
+        );
+        assert!(
+            message.contains(character),
+            "the message for {title:?} should name {character}; got {message}"
+        );
+        assert!(
+            message.contains(&format!("{title}-note")),
+            "the message should quote the substituted key, not the reference; got {message}"
+        );
+    }
+}
+
+/// The gate and the CLI word a refusal identically.
+///
+/// Two surfaces answer the same question about the same key, and before this
+/// they answered it in different words -- the gate in gate-shaped language and
+/// the CLI not at all. Equality is the assertion rather than "both mention the
+/// character", because near-identical wordings are how the two drift apart: a
+/// caller comparing them would pass either way, and only a byte-for-byte check
+/// notices the day one of them gains a clause.
+#[test]
+fn the_gate_and_the_cli_word_a_refusal_identically() {
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: gate-wording-parity
+version: "1.0"
+initial_state: s
+variables:
+  TITLE:
+    description: "names the thing the note is about"
+    required: true
+states:
+  s:
+    gates:
+      has_note:
+        type: context-exists
+        key: "{{TITLE}}-note"
+    accepts:
+      status:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: done
+        when:
+          status: ok
+          gates.has_note.exists: true
+  done:
+    terminal: true
+---
+
+## s
+
+Wait.
+
+## done
+
+Done.
+"#;
+
+    let src = dir.path().join("parity-template.md");
+    std::fs::write(&src, template).unwrap();
+    let output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "wprobe1",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "TITLE=Weekly Planning",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "init should accept the value");
+
+    let resp = next(dir.path(), "wprobe1");
+    let cond = blocking_condition(&resp, "has_note")
+        .unwrap_or_else(|| panic!("the gate should block; got {resp}"));
+    let from_gate = cond["output"]["error"].as_str().unwrap_or_default();
+
+    let cli = koto_cmd(dir.path())
+        .args(["context", "exists", "wprobe1", "Weekly Planning-note"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        cli.status.code(),
+        Some(2),
+        "the CLI should report the key unusable rather than absent"
+    );
+    let body: Value = serde_json::from_slice(&cli.stdout).unwrap_or_else(|e| {
+        panic!(
+            "the CLI should print a JSON error: {e}; got {}",
+            String::from_utf8_lossy(&cli.stdout)
+        )
+    });
+    let from_cli = body["error"].as_str().unwrap_or_default();
+
+    assert_eq!(
+        from_gate, from_cli,
+        "the two surfaces must word one refusal one way"
+    );
+    assert!(
+        !from_gate.is_empty(),
+        "the shared wording should not be empty"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // name_filter and fallback (Issues #224 and #228)
 // ---------------------------------------------------------------------------
 

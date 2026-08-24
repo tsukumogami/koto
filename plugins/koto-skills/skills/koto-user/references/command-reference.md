@@ -803,11 +803,12 @@ koto context exists <session> <key>
 
 Checks whether a key exists in the session's context store.
 
-**Exit-code-as-boolean contract:**
+**Exit-code contract:**
 - Exit 0 — key is present
 - Exit 1 — key is absent
+- Exit 2 — the argument is not a usable context key
 
-No stdout output. No JSON error on exit 1. This differs from all other context commands, which produce JSON errors on failure. The design is intentional for shell conditional use:
+No stdout output on 0 or 1, and no JSON error on exit 1. That much differs from all other context commands, which produce JSON errors on failure, and it is intentional for shell conditional use:
 
 ```sh
 if koto context exists my-workflow scope.md; then
@@ -815,12 +816,17 @@ if koto context exists my-workflow scope.md; then
 fi
 ```
 
+Exit 2 is the case where the key is not a key. A context key is narrower than a variable value: each `/`-separated component starts with a letter or digit and continues in letters, digits, `.`, `_` and `-`, while a value may also hold a space, a `:` and an `@`. So a key composed from a variable can be something the store will not accept, and this is where you find out — with a JSON error naming the offending character and the component it sits in, in the same words a context gate uses for the same key.
+
+Exit 2 is non-zero, so the shell conditional above is unaffected: an unusable key does not run the `then` branch. What changes is that the reason is printed instead of absent. A caller that distinguishes "absent" from "unusable" reads the status rather than inferring it.
+
 This command is also usable directly in `gates: command:` entries in templates.
 
 **Exit 1 means "not present" and nothing more precise.** The check cannot
 distinguish a key that was never written from a store it could not read. Do not
 build a guard that treats exit 1 as "safe to skip" — on a transient read failure
-that guard skips a key that is really there.
+that guard skips a key that is really there. Exit 2 is the one case that used to
+hide inside exit 1 and no longer does.
 
 ---
 
