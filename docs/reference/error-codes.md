@@ -211,6 +211,24 @@ Reinitialize the workflow to pick up the new template.
 
 ---
 
+### context exists
+
+**Not a usable context key (exit code 2)** -- the argument does not satisfy the
+context-key grammar, so the store was never asked. This is distinct from exit 1,
+which means the key is usable and absent, and it is the one case that used to be
+indistinguishable from an ordinary absence:
+
+```json
+{"error":"context key \"Weekly Planning-note\" is not usable: context key contains invalid character ' ' in component 'Weekly Planning-note'; allowed: letters, digits, '.', '_', '-'\n  remedy: a variable value may hold a space, ':' or '@'; a context key may not. Where the key comes from a {{KEY}} reference, check what that reference resolved to -- an unset optional variable leaves nothing behind","command":"context exists"}
+```
+
+Exit 2 is the caller-must-fix-the-input class, the same one `invalid_submission`
+and `precondition_failed` use. A context gate reports the same condition through
+its own evidence rather than an exit code, with the same message in the `error`
+field. Exits 0 and 1 print nothing; only this case produces a body.
+
+---
+
 ### template compile
 
 **Compilation failed** — invalid YAML, missing required fields, or unknown gate type:

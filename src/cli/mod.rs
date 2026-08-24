@@ -74,6 +74,11 @@ use crate::action::MAX_ACTION_OUTPUT_BYTES;
 /// `exit_code_for_engine_error()` and this constant handle code 3.
 pub(super) const EXIT_INFRASTRUCTURE: i32 = 3;
 
+/// The caller must fix its input. Shared with the domain errors that already
+/// exit 2 -- a malformed submission, an unmet precondition, an unknown workflow
+/// -- and used by `context exists` for a key that is not a usable context key.
+pub(super) const EXIT_CALLER_ERROR: i32 = 2;
+
 #[derive(Parser)]
 #[command(
     name = "koto",
@@ -1444,10 +1449,22 @@ pub fn run(app: App) -> Result<()> {
                     Ok(())
                 }
                 ContextCommand::Exists { session, key } => {
-                    if context::handle_exists(store, &session, &key) {
-                        std::process::exit(0);
-                    } else {
-                        std::process::exit(1);
+                    // Three outcomes, not two. Exit 1 stays "not here" so a
+                    // caller that branches on success-versus-failure is
+                    // unaffected; exit 2 is "not a key at all", which koto
+                    // already uses for input the caller must fix.
+                    match context::handle_exists(store, &session, &key) {
+                        context::KeyPresence::Present => std::process::exit(0),
+                        context::KeyPresence::Absent => std::process::exit(1),
+                        context::KeyPresence::Unusable(reason) => {
+                            exit_with_error_code(
+                                serde_json::json!({
+                                    "error": reason,
+                                    "command": "context exists"
+                                }),
+                                EXIT_CALLER_ERROR,
+                            );
+                        }
                     }
                 }
                 ContextCommand::Remove { session, key } => {

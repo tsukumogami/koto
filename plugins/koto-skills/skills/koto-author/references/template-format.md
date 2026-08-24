@@ -51,6 +51,17 @@ Koto also provides two built-in variables that don't need to be declared. Both r
 
 A reference in a context gate's `key` is how you scope a context key to the session that owns it, so an action storing `{{SESSION_NAME}}-note` and a gate reading `key: "{{SESSION_NAME}}-note"` agree. In a `context-matches` `pattern`, the substituted value is escaped and matches itself -- the regex you wrote around it still works, but the value cannot contribute regex syntax of its own. The one gate field that does not resolve a reference is `name_filter` on a `children-complete` gate; write that prefix literally for now.
 
+**A value may hold characters a context key may not, so choose key names that survive substitution.** The two grammars are different and are staying that way:
+
+| | Allowed |
+|---|---|
+| A variable value | letters, digits, `.`, `_`, `/`, `-`, and also a space, a `:` and an `@` |
+| A context key | `/`-separated components, each starting with a letter or digit and continuing in letters, digits, `.`, `_` and `-` |
+
+A value is content: it lands in a directive an agent reads, in a command argument, in a pattern, so it admits a space and a `:` and an `@` on purpose -- a calendar title or a filter like `from:user@example.com` is a legal value. A key is an address: it becomes a directory name under the session, a key in the store's manifest, and an argument in the `koto context add` and `koto context get` commands your own template runs, where a space would split it into two words.
+
+So `key: "{{TITLE}}-note"` with a `TITLE` of `Weekly Planning` is a gate that cannot pass. koto tells you which character it refused and in which component rather than reporting the key absent, but the fix is yours: scope the key on a slug-shaped variable and keep the prose value for the directive.
+
 ### States
 
 Each state is a key under `states:`. A state can have:
@@ -407,9 +418,9 @@ Each gate type produces structured output that the engine injects into the evide
 | `command` | `exit_code` | number | Process exit code. `0` = passed; positive = failed; `-1` = timed out or spawn error. |
 | `command` | `error` | string | Empty on normal pass or fail. `"timed_out"` on timeout. OS error message on spawn failure. |
 | `context-exists` | `exists` | boolean | `true` if the key was found in the context store. |
-| `context-exists` | `error` | string | Empty on normal pass or fail. Error message when the context store is unavailable. |
+| `context-exists` | `error` | string | Empty on normal pass or fail. Carries the reason when the store is unavailable, or when `key` is not a usable context key -- the same wording `koto context exists` prints for that key. |
 | `context-matches` | `matches` | boolean | `true` if the content at `key` matches `pattern`. |
-| `context-matches` | `error` | string | Empty on normal pass or fail. Error message when the store is unavailable or the pattern is invalid. |
+| `context-matches` | `error` | string | Empty on normal pass or fail. Carries the reason when the store is unavailable, when the pattern is invalid, or when `key` is not a usable context key. |
 | `children-complete` | `total` | number | Total number of matching children. |
 | `children-complete` | `completed` | number | Children in a terminal state (success + failure + skipped). |
 | `children-complete` | `pending` | number | Children not yet terminal (covers both "not yet spawned" and "spawned and running"). |

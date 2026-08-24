@@ -81,11 +81,43 @@ pub fn handle_get(
     Ok(())
 }
 
-/// Check if a key exists. Returns Ok(true) if present, Ok(false) if not.
+/// What the store can say about a key: it is here, it is not here, or it is not
+/// a key at all.
 ///
-/// The caller is responsible for mapping the boolean to exit codes.
-pub fn handle_exists(store: &dyn ContextStore, session: &str, key: &str) -> bool {
-    store.ctx_exists(session, key)
+/// The third arm is why this is not a bool. `ctx_exists` reports a key that
+/// fails the grammar as absent, so the two negatives used to arrive
+/// indistinguishable and a caller probing with a substituted key would decide a
+/// key was missing when koto had in fact refused to look for it (Issue #227).
+pub enum KeyPresence {
+    /// The key is in the store.
+    Present,
+    /// The key is a usable key and the store does not have it.
+    Absent,
+    /// The key is not usable, carrying the reason from
+    /// [`crate::session::validate::unusable_context_key_reason`].
+    Unusable(String),
+}
+
+/// Check whether a key exists, distinguishing a key the store will not accept
+/// from one it accepts and does not have.
+///
+/// The key is checked here rather than in the store because the store's own
+/// answer is a bool with nowhere to put a reason, and because the context gate
+/// already checks caller-side -- one mechanism for the question rather than two.
+/// The wording is not composed here either: both callers share
+/// [`crate::session::validate::unusable_context_key_reason`] so they cannot
+/// drift into describing the same key differently.
+///
+/// The caller is responsible for mapping the outcome to exit codes.
+pub fn handle_exists(store: &dyn ContextStore, session: &str, key: &str) -> KeyPresence {
+    if let Some(reason) = crate::session::validate::unusable_context_key_reason(key) {
+        return KeyPresence::Unusable(reason);
+    }
+    if store.ctx_exists(session, key) {
+        KeyPresence::Present
+    } else {
+        KeyPresence::Absent
+    }
 }
 
 /// Remove a key and its content from the store, then emit a `context_removed`
