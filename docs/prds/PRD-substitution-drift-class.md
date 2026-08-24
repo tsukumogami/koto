@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   koto template authors get no signal when a field consumes a {{KEY}}
   reference verbatim. The compiler's list of fields it validates references
@@ -27,7 +27,7 @@ motivating_context: |
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-substitution-drift-class](docs/briefs/BRIEF-substitution-drift-class.md); carried in Absorbed Brief.
 
