@@ -7551,7 +7551,12 @@ Done.
             pattern: "^{{TOKEN}}$".to_string(),
             override_default: None,
             completion: None,
-            name_filter: None,
+            // `Some`, not `None`: the accessor omits an absent field entirely,
+            // so a `None` here would leave `name_filter` unnamed and the
+            // assertion below would pass without ever looking at it. The
+            // staleness check cannot catch that -- it only walks fields the
+            // accessor names.
+            name_filter: Some("{{TOKEN}}.research.".to_string()),
         };
         for (field, raw) in authored.substitutable_fields() {
             assert!(

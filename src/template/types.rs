@@ -232,12 +232,19 @@ impl Gate {
     ///
     /// One list, next to the struct that owns the fields, because two lists is
     /// the bug. The compiler validates references in exactly this set and
-    /// `substitute_gate_fields` rewrites exactly this set, and each of the three
+    /// `substitute_gate_fields` rewrites exactly this set, and each of the
     /// fixes before this one was an instance of those two sets disagreeing: a
     /// `default_action` command the compiler accepted and the runtime skipped
     /// (Issue #220), a gate `key` and `pattern` neither of them touched
-    /// (Issue #222), and `name_filter` on a `children-complete` gate, still in
-    /// neither (Issue #224).
+    /// (Issue #222), and `name_filter` on a `children-complete` gate, in
+    /// neither until Issue #224 put it here.
+    ///
+    /// `name_filter` is `Option<String>`, which is why this returns a `Vec`
+    /// rather than a fixed-size array: a field that is absent contributes no
+    /// entry, and there is no `String` to borrow a name from. A gate that does
+    /// not declare the field is unaffected by everything downstream of this
+    /// list, which is the distinction the empty-value refusal in
+    /// `evaluate_children_complete` depends on.
     ///
     /// Adding a field here is what wires it into compile-time validation;
     /// `every_field_the_compiler_validates_is_one_the_tick_substitutes` in
@@ -259,13 +266,17 @@ impl Gate {
             pattern,
             override_default: _,
             completion: _,
-            name_filter: _,
+            name_filter,
         } = self;
-        vec![
+        let mut fields = vec![
             ("command", command.as_str()),
             ("key", key.as_str()),
             ("pattern", pattern.as_str()),
-        ]
+        ];
+        if let Some(filter) = name_filter {
+            fields.push(("name_filter", filter.as_str()));
+        }
+        fields
     }
 }
 
