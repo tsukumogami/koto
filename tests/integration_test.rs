@@ -3171,6 +3171,85 @@ fn context_exists_returns_exit_0_when_present() {
     );
 }
 
+/// A key the store cannot use is told apart from a key it simply does not have.
+///
+/// The two used to arrive as the same silent exit 1, because `ctx_exists`
+/// reports an unusable key as absent and this verb mapped that bool straight
+/// onto a status. A template probing with a substituted key would then decide
+/// the key was missing and seed it, when koto had refused to look (Issue #227).
+///
+/// All three outcomes are asserted against one session so the test fails if any
+/// pair of them ever collapses, rather than only if the new one is wrong. The
+/// three keys carry the three characters a variable value may hold and a context
+/// key may not -- `Weekly Planning-note` is the case the issue was filed about.
+#[test]
+fn context_exists_tells_an_unusable_key_from_an_absent_one() {
+    let dir = TempDir::new().unwrap();
+    create_session_dir(dir.path(), "ctx-wf");
+
+    koto_cmd(dir.path())
+        .args(["context", "add", "ctx-wf", "present.md"])
+        .write_stdin("data")
+        .assert()
+        .success();
+
+    let status_for = |key: &str| {
+        koto_cmd(dir.path())
+            .args(["context", "exists", "ctx-wf", key])
+            .output()
+            .unwrap()
+    };
+
+    let present = status_for("present.md");
+    assert_eq!(present.status.code(), Some(0), "a present key exits 0");
+    assert!(present.stdout.is_empty(), "a present key prints nothing");
+
+    let absent = status_for("absent.md");
+    assert_eq!(absent.status.code(), Some(1), "an absent key exits 1");
+    assert!(absent.stdout.is_empty(), "an absent key prints nothing");
+
+    for (key, character) in [
+        ("Weekly Planning-note", "' '"),
+        ("newer_than:90d-note", "':'"),
+        ("user@example.com-note", "'@'"),
+    ] {
+        let unusable = status_for(key);
+
+        // Both assertions, deliberately. The number is the contract callers
+        // read; the non-zero property is what keeps a caller that only branches
+        // on success working, and a change that made this exit 0 would satisfy
+        // neither reading of "distinct from absent".
+        assert_ne!(
+            unusable.status.code(),
+            Some(0),
+            "an unusable key must not report success: {key}"
+        );
+        assert_eq!(
+            unusable.status.code(),
+            Some(2),
+            "an unusable key exits 2, koto's caller-must-fix-the-input status: {key}"
+        );
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&unusable.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "an unusable key should print a JSON error for {key}: {e}; got {}",
+                    String::from_utf8_lossy(&unusable.stdout)
+                )
+            });
+        assert_eq!(body["command"], "context exists");
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(character),
+            "the error for {key} should name {character}; got {message}"
+        );
+        assert!(
+            message.contains("remedy:"),
+            "the error for {key} should say what to change; got {message}"
+        );
+    }
+}
+
 #[test]
 fn context_exists_returns_exit_1_when_missing() {
     let dir = TempDir::new().unwrap();

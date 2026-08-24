@@ -36,8 +36,14 @@ pub struct Manifest {
 ///
 /// Note the asymmetry a caller has to live with: this grammar is narrower than
 /// the variable-value allowlist, so a legal `--var` value can hold a space, a
-/// `:` or an `@` and produce an illegal key. Whether the two should converge is
-/// Issue #227.
+/// `:` or an `@` and produce an illegal key. The two are not going to converge
+/// (Issue #227). A value is content and admits those three so it can hold a
+/// title or a filter expression; a key is an address, and one of its uses is as
+/// an argument in the `koto context add` and `koto context get` commands
+/// templates run, where a space would word-split. What the asymmetry gets
+/// instead of convergence is a shared wording:
+/// [`crate::session::validate::unusable_context_key_reason`] is how a caller
+/// turns a refusal into something an operator can act on.
 pub trait ContextStore: Send + Sync {
     /// Store content under the given key, creating or replacing it.
     fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()>;
@@ -50,7 +56,11 @@ pub trait ContextStore: Send + Sync {
     /// A key that fails the grammar above is reported absent rather than as an
     /// error, so this returning `false` does not distinguish "no such key" from
     /// "not a key at all". A caller that needs to tell them apart checks the
-    /// key itself first.
+    /// key itself first, with
+    /// [`crate::session::validate::unusable_context_key_reason`] -- which is
+    /// what the context gates and `koto context exists` do, and is why this
+    /// signature stays a bool rather than growing a result every caller would
+    /// have to handle.
     fn ctx_exists(&self, session: &str, key: &str) -> bool;
 
     /// Remove a key and its content from the store.
