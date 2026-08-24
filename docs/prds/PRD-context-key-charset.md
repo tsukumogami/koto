@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 problem: |
   A koto variable value may hold three characters a context key may not -- a
   space, a `:` and an `@` -- and one substitution step separates the two
@@ -23,7 +23,7 @@ source_issue: 227
 
 ## Status
 
-In Progress
+Done
 
 Absorbed [BRIEF-context-key-charset](docs/briefs/BRIEF-context-key-charset.md); carried in Absorbed Brief.
 
