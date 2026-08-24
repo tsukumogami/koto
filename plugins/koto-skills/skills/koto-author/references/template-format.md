@@ -49,7 +49,7 @@ Koto also provides two built-in variables that don't need to be declared. Both r
 - `{{SESSION_NAME}}` -- the active session name
 - `{{SESSION_DIR}}` -- the session directory path
 
-A reference in a context gate's `key` is how you scope a context key to the session that owns it, so an action storing `{{SESSION_NAME}}-note` and a gate reading `key: "{{SESSION_NAME}}-note"` agree. In a `context-matches` `pattern`, the substituted value is escaped and matches itself -- the regex you wrote around it still works, but the value cannot contribute regex syntax of its own. The one gate field that does not resolve a reference is `name_filter` on a `children-complete` gate; write that prefix literally for now.
+A reference in a context gate's `key` is how you scope a context key to the session that owns it, so an action storing `{{SESSION_NAME}}-note` and a gate reading `key: "{{SESSION_NAME}}-note"` agree. In a `context-matches` `pattern`, the substituted value is escaped and matches itself -- the regex you wrote around it still works, but the value cannot contribute regex syntax of its own. A `children-complete` gate's `name_filter` resolves a reference too, which is how you scope a gate to your own fan-out: children spawned as `{{SESSION_NAME}}.research.1` are matched by `name_filter: "{{SESSION_NAME}}.research."`. It takes the plain form, since it is a name prefix rather than a shell word or a regex. If it resolves to an empty string the gate refuses with a reason instead of running -- an empty prefix would not narrow the gate, it would remove the filter and match every child of the parent.
 
 ### States
 
@@ -616,7 +616,7 @@ This flag is transitional. New templates should always use `gates.*` routing and
 The compiler validates `children-complete` gate fields at compile time:
 
 - `completion` must use a recognized prefix: `"terminal"` (the only one shipped so far), `"state:<name>"`, or `"context:<key>"`. Unknown prefixes are rejected.
-- `name_filter` is optional and not validated beyond being a string (the prefix match happens at runtime).
+- `name_filter` is optional. `{{KEY}}` references in it are validated like any other, so one naming a variable you never declared is refused at compile time; the prefix match itself happens at runtime, and a filter that resolves to an empty string is refused there.
 - Like all gate types, `children-complete` gates must have corresponding `gates.*` when-clause routing or the D5 check will fail.
 
 ### `default_action` — a command the engine runs
