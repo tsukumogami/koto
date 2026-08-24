@@ -7601,6 +7601,86 @@ Done.
     }
 
     #[test]
+    fn every_action_field_the_compiler_validates_is_one_the_tick_substitutes() {
+        // The `ActionDecl` sibling of the gate guard above, and it exists for
+        // the same reason one struct over: the compiler validates references in
+        // exactly the fields `ActionDecl::substitutable_fields` names, so a
+        // field that joins that list without the tick being wired would promise
+        // a resolution nothing delivers. That is the shape Issue #220 took on
+        // this very struct -- a `default_action` command the compiler accepted
+        // and the runtime skipped.
+        //
+        // The tick has no single helper for action fields the way it does for
+        // gates: `command` goes through the shell-safe form and `working_dir`
+        // through the plain one, at two call sites in the action closure. So
+        // this walks the accessor and routes each field through the form that
+        // closure uses, which is what makes a field added to the accessor and
+        // nowhere else fail here.
+        use crate::engine::substitute::{VariableOverlay, Variables};
+        use crate::template::types::ActionDecl;
+
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: std::collections::HashMap::from([(
+                    "TOKEN".to_string(),
+                    "resolved".to_string(),
+                )]),
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+        let variables = Variables::from_events(&events).unwrap();
+        let runtime_vars = std::collections::HashMap::new();
+        let overlay = VariableOverlay::new();
+
+        let authored = ActionDecl {
+            command: "echo {{TOKEN}}".to_string(),
+            working_dir: "sub/{{TOKEN}}".to_string(),
+            requires_confirmation: false,
+            polling: None,
+            fallback: None,
+            capture_stdout_as: None,
+        };
+        for (field, raw) in authored.substitutable_fields() {
+            assert!(
+                raw.contains("{{TOKEN}}"),
+                "this fixture is stale: the accessor names {field:?}, which it \
+                 does not fill with a reference, so the assertion below would \
+                 pass vacuously for that field"
+            );
+        }
+
+        for (field, raw) in authored.substitutable_fields() {
+            // The form the action closure uses for this field. A field added to
+            // the accessor with no arm here fails the match rather than being
+            // silently waved through.
+            let substituted = match field {
+                "command" => substitute_shell_command(raw, &runtime_vars, &variables, &overlay),
+                "working_dir" => substitute_plain(raw, &runtime_vars, &variables, &overlay),
+                other => panic!(
+                    "ActionDecl::substitutable_fields names {other:?}, which the \
+                     action closure has no substitution arm for. Wire it there, \
+                     then add the form here."
+                ),
+            };
+            assert!(
+                !substituted.contains("{{"),
+                "action field {field:?} is validated by the compiler but reached \
+                 the runtime with a raw token: {substituted:?}"
+            );
+            assert!(
+                substituted.contains("resolved"),
+                "action field {field:?} should carry the resolved value; got \
+                 {substituted:?}"
+            );
+        }
+    }
+
+    #[test]
     fn gate_key_and_pattern_substitute_in_their_own_forms() {
         // Issue #222: `key` and `pattern` were substituted by nothing. They are
         // now, but not in the same form as each other or as `command` -- so this
