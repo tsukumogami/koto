@@ -3074,8 +3074,18 @@ fn substitute_regex_literal(
 /// action storing `{{SESSION_NAME}}-note` and a `context-exists` gate reading
 /// `key: "{{SESSION_NAME}}-note"` sat in the same state and disagreed about what
 /// that reference meant, and the disagreement surfaced as a gate that would not
-/// pass. The one gate field still outside this is `name_filter`, on a
-/// `children-complete` gate (Issue #224).
+/// pass. `name_filter` was the last gate field outside this, and joined it in
+/// Issue #224.
+///
+/// `name_filter` takes the plain form and keeps its `Option`. Plain because a
+/// prefix is compared against child workflow names and nothing parses it
+/// further -- the shell form would render an empty value as `''`, two literal
+/// quote characters that no child name starts with, which turns a detectable
+/// empty into a silent no-match. Keeping the `Option` is what lets
+/// `evaluate_children_complete` tell a gate that declared no filter from one
+/// whose filter resolved to nothing; `.as_deref().unwrap_or("")` anywhere on
+/// this path would erase that difference and with it the refusal that depends
+/// on it.
 #[cfg(unix)]
 fn substitute_gate_fields(
     gates: &std::collections::BTreeMap<String, crate::template::types::Gate>,
@@ -3090,6 +3100,10 @@ fn substitute_gate_fields(
             g.command = substitute_shell_command(&g.command, runtime_vars, variables, overlay);
             g.key = substitute_plain(&g.key, runtime_vars, variables, overlay);
             g.pattern = substitute_regex_literal(&g.pattern, runtime_vars, variables, overlay);
+            g.name_filter = gate
+                .name_filter
+                .as_deref()
+                .map(|filter| substitute_plain(filter, runtime_vars, variables, overlay));
             (name.clone(), g)
         })
         .collect()
