@@ -14,7 +14,8 @@ goals: |
   character it refused rather than reporting a bad key as an absent one. An
   author writing a variable reference into a context key learns the rule before
   they write, and an operator who hits it anyway can act on koto's answer.
-upstream: docs/briefs/BRIEF-context-key-charset.md
+absorbed:
+  - docs/briefs/BRIEF-context-key-charset.md
 source_issue: 227
 ---
 
@@ -23,6 +24,37 @@ source_issue: 227
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-context-key-charset](docs/briefs/BRIEF-context-key-charset.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+koto validates two kinds of user-supplied string against grammars that were
+never reconciled, and the gap between them is three characters wide. A variable
+value may hold a space, a `:` and an `@`; a context key may hold none of the
+three, because a key becomes a path component on disk. One substitution step
+separates them, and since a context gate's `key` began resolving `{{KEY}}`
+references the two meet routinely.
+
+The problem that follows is not that a key gets refused. It is that nobody can
+find out why. The rule lives in two Rust doc comments and in no guide, no skill
+and no message an author sees before the fact, so the boundary is discovered by
+crossing it. And the crossing is reported inconsistently: a gate now names the
+character it refused, while `koto context exists` -- the verb a command gate or
+a fallback action probes with -- answers an unusable key exactly as it answers a
+missing one, with no output at all.
+
+What a user should get instead is the rule stated where they are already
+reading, before they write a key that cannot work, and the same plain answer
+from every surface when they cross the line anyway: which character, in which
+component, and that a value may carry it where a key may not. A maintainer
+picking up either grammar should find the decision about whether the two
+converge written down rather than inferred from what the code happens to do.
+
+The framing draws on `docs/designs/current/DESIGN-template-variable-substitution.md`
+for the substitution model the value grammar belongs to, and on
+`docs/designs/current/DESIGN-local-session-storage.md` for the storage model the
+key grammar is narrow for.
 
 ## Problem Statement
 
