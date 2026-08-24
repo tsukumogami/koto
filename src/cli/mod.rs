@@ -2985,15 +2985,23 @@ fn record_notice_delivery(backend: &dyn SessionBackend, name: &str, abandoned: &
     }
 }
 
-/// Substitute a directive through the tick's variable lookup order.
+/// Substitute a string that is not handed to a shell.
 ///
 /// The order is fixed everywhere a variable resolves during a tick: runtime
 /// names (`SESSION_DIR`, `SESSION_NAME`) first, then the per-tick overlay, then
-/// the `WorkflowInitialized` bindings. It lives in one function so the response
-/// directive and the directed-transition directive cannot drift apart, and so a
-/// value the tick produced for itself is not left out of one of them.
+/// the `WorkflowInitialized` bindings. A value from either of the last two is
+/// written into the output of a single pass, so it is never re-expanded. The
+/// runtime names are a separate earlier pass whose output the second one scans,
+/// so they are not covered by that -- what protects them is that neither value
+/// can contain a brace by construction.
+///
+/// The only difference from [`substitute_shell_command`] is what an empty value
+/// renders as: that one emits `''` so an unquoted `--flag {{VAR}}` stays a
+/// well-formed argument (Issue #186), and this one emits nothing. So the choice
+/// between them is not prose-versus-path -- it is whether the result reaches
+/// `sh -c`. Directives, details and an action's `working_dir` do not.
 #[cfg(unix)]
-fn substitute_directive(
+fn substitute_text(
     raw: &str,
     runtime_vars: &std::collections::HashMap<String, String>,
     variables: &crate::engine::substitute::Variables,
@@ -3003,9 +3011,36 @@ fn substitute_directive(
     variables.substitute_with(&with_runtime, overlay)
 }
 
-/// Substitute every gate command in `gates` through the same lookup order as
-/// [`substitute_directive`], using the shell-safe form because the result is
+/// Substitute a command string through the same lookup order as
+/// [`substitute_text`], using the shell-safe form because the result is
 /// handed to `sh -c` (Issue #186).
+///
+/// Every string a tick hands to a shell resolves here -- gate commands and a
+/// `default_action` command alike. One function is what keeps the two from
+/// disagreeing about which names resolve, and they did disagree: an action
+/// command skipped the runtime pass, so an author who wrote
+/// `koto context add {{SESSION_NAME}} key` in an action got a session directory
+/// named with the literal token and an exit code of 0 (Issue #220).
+///
+/// That is not the whole of "a literal token reached `sh -c`". Only the two
+/// runtime names and delivered values resolve here: an undelivered capture name
+/// still passes through as its raw token, because the `first_unset_capture`
+/// guard that refuses one in a directive is not wired into the command path
+/// (Issue #221). A gate's `key` and `pattern` are not substituted at all
+/// (Issue #222).
+#[cfg(unix)]
+fn substitute_shell_command(
+    raw: &str,
+    runtime_vars: &std::collections::HashMap<String, String>,
+    variables: &crate::engine::substitute::Variables,
+    overlay: &crate::engine::substitute::VariableOverlay,
+) -> String {
+    let with_runtime = crate::cli::vars::substitute_vars(raw, runtime_vars);
+    variables.substitute_command_with(&with_runtime, overlay)
+}
+
+/// Substitute every gate command in `gates` through
+/// [`substitute_shell_command`].
 #[cfg(unix)]
 fn substitute_gate_commands(
     gates: &std::collections::BTreeMap<String, crate::template::types::Gate>,
@@ -3017,8 +3052,7 @@ fn substitute_gate_commands(
         .iter()
         .map(|(name, gate)| {
             let mut g = gate.clone();
-            let with_runtime = crate::cli::vars::substitute_vars(&g.command, runtime_vars);
-            g.command = variables.substitute_command_with(&with_runtime, overlay);
+            g.command = substitute_shell_command(&g.command, runtime_vars, variables, overlay);
             (name.clone(), g)
         })
         .collect()
@@ -3726,7 +3760,7 @@ fn handle_next(
                 // the natural path so the two directives resolve identically
                 // by construction rather than by inspection.
                 let resp = resp.with_substituted_directive(|d| {
-                    substitute_directive(d, &runtime_vars, &variables, &overlay)
+                    substitute_text(d, &runtime_vars, &variables, &overlay)
                 });
 
                 // Whether the target phase's delivery window already
@@ -4312,7 +4346,6 @@ fn handle_next(
             )
         };
 
-    let vars_for_gates = runtime_vars.clone();
     let session_name = &name;
     let gate_closure =
         |gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
@@ -4320,8 +4353,7 @@ fn handle_next(
             // command strings. The overlay matters because this closure runs
             // once per state the loop reaches, so a later state's gate command
             // must see what an earlier state in the same tick produced.
-            let substituted =
-                substitute_gate_commands(gates, &vars_for_gates, &variables, &overlay);
+            let substituted = substitute_gate_commands(gates, &runtime_vars, &variables, &overlay);
             evaluate_gates(
                 &substituted,
                 &execution_dir,
@@ -4344,13 +4376,15 @@ fn handle_next(
             return ActionResult::Skipped;
         }
 
-        // Substitute variables in command and working_dir. The command goes to
-        // `sh -c`, so use the shell-safe form (Issue #186); working_dir is a
-        // path, not a shell word, so it keeps the plain substitution. Both read
-        // the overlay first, so a state whose action runs after an earlier
-        // state in this same tick produced a value can use it. Runtime names
-        // are deliberately not substituted here, exactly as before.
-        let command = variables.substitute_command_with(&action.command, &overlay);
+        // Substitute variables in command and working_dir through the tick's
+        // fixed lookup order: runtime names, then the overlay, then the log's
+        // bindings. The command goes to `sh -c`, so it uses the shell-safe form
+        // (Issue #186); working_dir is a path, not a shell word, so it uses the
+        // plain form the directive sites use. The overlay layer is why a state
+        // whose action runs after an earlier state in this same tick can use
+        // what that state produced.
+        let command =
+            substitute_shell_command(&action.command, &runtime_vars, &variables, &overlay);
         let wd = if action.working_dir.is_empty() {
             execution_dir.clone()
         } else {
@@ -4361,7 +4395,8 @@ fn handle_next(
             // shape, same `fallback` prose. No `DefaultActionExecuted` event
             // is appended, because no command ran: the failure is reported as
             // a spawn failure, which is what it is.
-            let substituted = variables.substitute_with(&action.working_dir, &overlay);
+            let substituted =
+                substitute_text(&action.working_dir, &runtime_vars, &variables, &overlay);
             match resolve_action_working_dir(&execution_dir, &substituted) {
                 Ok(dir) => dir,
                 Err(message) => {
@@ -4385,17 +4420,15 @@ fn handle_next(
                 .states
                 .get(state_name)
                 .map(|s| {
-                    // Substitute variables in gate commands. Overlay first,
-                    // then the log's bindings; runtime names are not
-                    // substituted on this path, as before.
-                    s.gates
-                        .iter()
-                        .map(|(name, gate)| {
-                            let mut g = gate.clone();
-                            g.command = variables.substitute_command_with(&g.command, &overlay);
-                            (name.clone(), g)
-                        })
-                        .collect::<std::collections::BTreeMap<_, _>>()
+                    // Same helper and same order as the top-level gate closure,
+                    // so a gate re-evaluated inside the polling loop resolves
+                    // the names available at that point exactly as it does
+                    // outside it. Two things still differ. The overlay does not
+                    // yet hold this action's own capture, which is inherent --
+                    // the value does not exist until the command finishes. The
+                    // evaluator below passes no `children_eval`, which is a
+                    // choice: see the note there.
+                    substitute_gate_commands(&s.gates, &runtime_vars, &variables, &overlay)
                 })
                 .unwrap_or_default();
             execute_with_polling(
@@ -4648,6 +4681,7 @@ fn handle_next(
                 }
                 StopReason::ActionRequiresConfirmation {
                     state: action_state,
+                    command,
                     exit_code,
                     stdout,
                     stderr,
@@ -4657,14 +4691,13 @@ fn handle_next(
                     details: details.clone(),
                     advanced,
                     action_output: crate::cli::next_types::ActionOutput {
-                        command: final_template_state
-                            .default_action
-                            .as_ref()
-                            // Same substitution the action closure performed,
-                            // overlay included, so the command reported back is
-                            // the command that ran.
-                            .map(|a| variables.substitute_command_with(&a.command, &overlay))
-                            .unwrap_or_default(),
+                        // The string the action closure substituted and ran,
+                        // carried out of the advancement loop rather than
+                        // derived again here. A second pass would read an
+                        // overlay that has since gained this state's own
+                        // capture, so it could report a command that never
+                        // executed (Issue #220).
+                        command,
                         exit_code,
                         stdout,
                         stderr,
@@ -4758,7 +4791,7 @@ fn handle_next(
                         *unset_capture.borrow_mut() = Some(hit);
                     }
                 }
-                substitute_directive(d, &runtime_vars, &variables, &overlay)
+                substitute_text(d, &runtime_vars, &variables, &overlay)
             });
             if let Some((key, producer)) = unset_capture.into_inner() {
                 let ne = NextError {
@@ -7245,7 +7278,7 @@ Done.
 
         // Directive: runtime name first, then overlay over the log binding.
         assert_eq!(
-            substitute_directive(
+            substitute_text(
                 "read {{SESSION_DIR}}/plan.md on {{BRANCH}} for {{TAG}}",
                 &runtime_vars,
                 &variables,
@@ -7273,6 +7306,74 @@ Done.
         assert_eq!(
             substituted.get("check").unwrap().command,
             "test -f /s/abc/v1.2.3 && git log fresh"
+        );
+    }
+
+    #[test]
+    fn action_and_gate_commands_resolve_the_same_names() {
+        // Issue #220: an action command skipped the runtime-name pass that gate
+        // commands ran, so {{SESSION_NAME}} reached `sh -c` as a literal token
+        // while the same reference in a gate on the same tick resolved.
+        //
+        // This calls the helper directly, so the equality below guards the gate
+        // side -- it fails if `substitute_gate_commands` stops delegating. The
+        // action call site is covered end-to-end by
+        // `runtime_names_substituted_in_default_action_command` in
+        // tests/integration_test.rs. The literal assertion pins the shared order.
+        use crate::engine::substitute::{VariableOverlay, Variables};
+        use crate::template::types::Gate;
+
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: std::collections::HashMap::from([(
+                    "SLUG".to_string(),
+                    "myslug".to_string(),
+                )]),
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+        let variables = Variables::from_events(&events).unwrap();
+
+        let runtime_vars = std::collections::HashMap::from([
+            ("SESSION_DIR".to_string(), "/s/abc".to_string()),
+            ("SESSION_NAME".to_string(), "abc".to_string()),
+        ]);
+        let overlay = VariableOverlay::new();
+        overlay.insert("TAG", "v1.2.3");
+
+        let raw = "koto context add {{SESSION_NAME}} {{TAG}} --from-file {{SESSION_DIR}}/{{SLUG}}";
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: raw.to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+
+        let as_action = substitute_shell_command(raw, &runtime_vars, &variables, &overlay);
+        let as_gate = substitute_gate_commands(&gates, &runtime_vars, &variables, &overlay)
+            .get("check")
+            .unwrap()
+            .command
+            .clone();
+
+        assert_eq!(as_action, as_gate);
+        assert_eq!(
+            as_action,
+            "koto context add abc v1.2.3 --from-file /s/abc/myslug"
         );
     }
 
@@ -7309,7 +7410,7 @@ Done.
             variables.substitute(&d)
         };
         assert_eq!(
-            substitute_directive(raw, &runtime_vars, &variables, &overlay),
+            substitute_text(raw, &runtime_vars, &variables, &overlay),
             expected_directive
         );
 

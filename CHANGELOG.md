@@ -44,6 +44,29 @@ to `0.9.x`).
 
 ### Fixed
 
+- **`{{SESSION_NAME}}` and `{{SESSION_DIR}}` now resolve inside a
+  `default_action` command.** Both reached `sh -c` as literal text while
+  the same references in a gate command resolved, and the template
+  compiler accepts either name in `default_action.command` and
+  `default_action.working_dir` — so an author was told the reference was
+  valid in a position where it did not resolve. The failure was silent:
+  `koto context add {{SESSION_NAME}} key` wrote into a session directory
+  named with the literal token and exited 0, and the state's own
+  `context-matches` gate then reported the real key as absent, so it
+  looked like a gate that would not pass rather than a command that did
+  the wrong thing. The runtime-name pass now runs on the action command,
+  the action's `working_dir`, and the gate commands a polling action
+  re-evaluates from inside its own loop. One behaviour changes for an
+  existing template: `working_dir: "{{SESSION_DIR}}"` used to stay
+  literal and fail with a bare "No such file or directory"; it now
+  resolves to an absolute path and is refused with a message saying a
+  `working_dir` must be relative. Separately, the command reported on an
+  `action_requires_confirmation` response is now the string the action
+  ran, carried out of the advancement loop rather than substituted a
+  second time against an overlay that has since gained the state's own
+  capture.
+  Closes koto#220.
+
 - **A nested `koto next` no longer leaves the outer tick reporting a
   state the session has left.** A `koto next` run from inside a command
   koto itself was executing — a state's `default_action` or a command

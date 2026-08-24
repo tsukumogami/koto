@@ -181,6 +181,26 @@ injection, not word splitting -- quote the reference when a value must stay a si
 command: mytool --calendar "{{CALENDAR}}"
 ```
 
+The two runtime names resolve here too, but the allowlist above does not apply to them. It is
+enforced on a declared variable when its value is bound at `koto init`; the runtime names are
+never bound that way, and are replaced by a separate pass that validates nothing.
+
+What makes them safe is validation at creation instead. `{{SESSION_NAME}}` is the session's own
+name, and a session name is checked before the session can hold anything: a letter, then letters,
+digits, and `. _ -` (an internally generated epoch-branch name may also carry a `~`). None of
+those are shell-special mid-word, and a name cannot begin with the one that would be, so it is
+safe unquoted. `{{SESSION_DIR}}` is the path to the session's
+directory: the sessions base with that validated name on the end. Nothing constrains the base --
+it is the operator's home directory, and can contain a space. Quote it.
+
+```yaml
+command: koto context add {{SESSION_NAME}} findings.md --from-file "{{SESSION_DIR}}/findings.md"
+```
+
+`working_dir` resolves both names as well, but `{{SESSION_DIR}}` is not usable there: it resolves
+to an absolute path, and a `working_dir` must be relative so it can be resolved against the
+execution anchor. koto refuses the action and says so.
+
 ### One command the engine refuses: `koto next`
 
 Automating a workflow's own bookkeeping by having a state tick itself looks like the obvious
