@@ -609,7 +609,7 @@ state's `vars.*` when clause reading pre-loop values within the same tick.
 
 Lookup order is fixed and documented: runtime names (`SESSION_DIR`,
 `SESSION_NAME`) substitute first, as they do today
-(`src/cli/vars.rs:19-26`), then the overlay, then the `WorkflowInitialized`
+(`substitute_vars` in `src/cli/vars.rs`), then the overlay, then the `WorkflowInitialized`
 bindings. Because captures resolve in the final layer, a captured value
 containing a `{{...}}` token is never re-expanded. The allowlist forbids
 braces anyway; the layering means that is a second defense rather than the

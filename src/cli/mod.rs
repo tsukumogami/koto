@@ -2989,9 +2989,11 @@ fn record_notice_delivery(backend: &dyn SessionBackend, name: &str, abandoned: &
 ///
 /// The order is fixed everywhere a variable resolves during a tick: runtime
 /// names (`SESSION_DIR`, `SESSION_NAME`) first, then the per-tick overlay, then
-/// the `WorkflowInitialized` bindings. Because each layer's value is written
-/// into the output of a single pass, a value that itself contains a `{{...}}`
-/// token is never re-expanded.
+/// the `WorkflowInitialized` bindings. A value from either of the last two is
+/// written into the output of a single pass, so it is never re-expanded. The
+/// runtime names are a separate earlier pass whose output the second one scans,
+/// so they are not covered by that -- what protects them is that neither value
+/// can contain a brace by construction.
 ///
 /// The only difference from [`substitute_shell_command`] is what an empty value
 /// renders as: that one emits `''` so an unquoted `--flag {{VAR}}` stays a
@@ -4421,11 +4423,11 @@ fn handle_next(
                     // Same helper and same order as the top-level gate closure,
                     // so a gate re-evaluated inside the polling loop resolves
                     // the names available at that point exactly as it does
-                    // outside it. Two things still differ, both inherent to
-                    // running mid-action: the overlay does not yet hold this
-                    // action's own capture, and the evaluator below passes no
-                    // children_eval, so a children-complete gate is not
-                    // evaluable here.
+                    // outside it. Two things still differ. The overlay does not
+                    // yet hold this action's own capture, which is inherent --
+                    // the value does not exist until the command finishes. The
+                    // evaluator below passes no `children_eval`, which is a
+                    // choice: see the note there.
                     substitute_gate_commands(&s.gates, &runtime_vars, &variables, &overlay)
                 })
                 .unwrap_or_default();

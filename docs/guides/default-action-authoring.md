@@ -186,9 +186,10 @@ enforced on a declared variable when its value is bound at `koto init`; the runt
 never bound that way, and are replaced by a separate pass that validates nothing.
 
 What makes them safe is validation at creation instead. `{{SESSION_NAME}}` is the session's own
-name, and a session name is checked when the session is made: a letter or digit, then letters,
+name, and a session name is checked before the session can hold anything: a letter, then letters,
 digits, and `. _ -` (an internally generated epoch-branch name may also carry a `~`). None of
-those are shell-special mid-word, so it is safe unquoted. `{{SESSION_DIR}}` is the path to the session's
+those are shell-special mid-word, and a name cannot begin with the one that would be, so it is
+safe unquoted. `{{SESSION_DIR}}` is the path to the session's
 directory: the sessions base with that validated name on the end. Nothing constrains the base --
 it is the operator's home directory, and can contain a space. Quote it.
 
