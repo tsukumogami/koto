@@ -103,6 +103,43 @@ pub fn validate_context_key(key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The reason a context key is unusable, or `None` when it is usable.
+///
+/// Two callers ask this question about the same key and used to answer it in
+/// different words -- a context gate before it hands the key to the store, and
+/// `koto context exists` before it does the same. One wording is the whole point
+/// of this function: the two surfaces print the same string for the same key, so
+/// an operator learns what is wrong rather than which surface they are on, and a
+/// third caller gets the answer by calling rather than by paraphrasing.
+///
+/// The message is therefore surface-neutral. It says nothing about gates,
+/// because it is not always about a gate; [`validate_context_key`]'s own error
+/// already names the offending character and the component it sits in, so the
+/// reason carries that verbatim and adds only the part the caller cannot know:
+/// that the two character sets do not line up, and that a `{{KEY}}` reference is
+/// the usual way a key ends up holding something a key may not hold.
+///
+/// The asymmetry it describes is deliberate on both sides. A variable value is
+/// content -- it reaches a directive, a command argument, a pattern -- and it
+/// admits a space, a `:` and an `@` so it can hold a title or a filter
+/// expression. A context key is an address: it becomes a path component on disk,
+/// a key in the store's manifest, and an argument in the `koto context add` and
+/// `koto context get` commands templates run. Widening the key grammar to close
+/// the gap would legalize keys that word-split at that third use, so the two
+/// stay apart and this function is how the boundary gets reported. The design
+/// doc filed under Issue #227 records the reasoning and the alternatives.
+pub fn unusable_context_key_reason(key: &str) -> Option<String> {
+    let err = validate_context_key(key).err()?;
+    Some(format!(
+        "context key {:?} is not usable: {}\n  \
+         remedy: a variable value may hold a space, ':' or '@'; a context key \
+         may not. Where the key comes from a {{{{KEY}}}} reference, check what \
+         that reference resolved to -- an unset optional variable leaves nothing \
+         behind",
+        key, err
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +324,91 @@ mod tests {
         assert!(validate_context_key("file@name.md").is_err());
         assert!(validate_context_key("file name.md").is_err());
         assert!(validate_context_key("file\tname.md").is_err());
+    }
+
+    // -- unusable_context_key_reason --
+    //
+    // The three characters below are the whole of the gap between what a
+    // variable value may hold and what a context key may hold, so each gets its
+    // own case: a reason that stopped naming one of them would leave an operator
+    // with the same silence the function exists to end.
+
+    #[test]
+    fn reason_is_none_for_a_usable_key() {
+        assert_eq!(unusable_context_key_reason("research/r1/lead.md"), None);
+    }
+
+    #[test]
+    fn reason_names_a_space_and_the_component_it_sits_in() {
+        let reason = unusable_context_key_reason("Weekly Planning-note")
+            .expect("a space is not a legal context key character");
+        assert!(
+            reason.contains("' '"),
+            "the reason should quote the offending character; got {reason}"
+        );
+        assert!(
+            reason.contains("Weekly Planning-note"),
+            "the reason should name the component; got {reason}"
+        );
+    }
+
+    #[test]
+    fn reason_names_a_colon() {
+        let reason = unusable_context_key_reason("newer_than:90d-note")
+            .expect("a colon is not a legal context key character");
+        assert!(
+            reason.contains("':'"),
+            "the reason should quote the colon; got {reason}"
+        );
+    }
+
+    #[test]
+    fn reason_names_an_at_sign() {
+        let reason = unusable_context_key_reason("user@example.com-note")
+            .expect("an at-sign is not a legal context key character");
+        assert!(
+            reason.contains("'@'"),
+            "the reason should quote the at-sign; got {reason}"
+        );
+    }
+
+    /// A key one character away from a working one: a component must start with
+    /// an alphanumeric, so `{{PREFIX}}-note` with nothing in `PREFIX` leaves
+    /// `-note` while `{{PREFIX}}note` leaves `note` and works.
+    #[test]
+    fn reason_names_a_leading_hyphen() {
+        let reason =
+            unusable_context_key_reason("-note").expect("a component may not start with a hyphen");
+        assert!(
+            reason.contains("letter"),
+            "the reason should say a component starts with a letter or digit; got {reason}"
+        );
+    }
+
+    #[test]
+    fn reason_says_a_key_that_resolved_to_nothing_is_empty() {
+        let reason = unusable_context_key_reason("").expect("an empty key is not usable");
+        assert!(
+            reason.contains("empty"),
+            "the reason should say the key is empty; got {reason}"
+        );
+    }
+
+    /// Every reason ends with the same remedy, because the caller that prints it
+    /// has no idea whether a reference produced the key and cannot add one.
+    #[test]
+    fn every_reason_carries_the_remedy() {
+        for key in ["Weekly Planning-note", "a:b", "a@b", "-note", ""] {
+            let reason = unusable_context_key_reason(key)
+                .unwrap_or_else(|| panic!("{key:?} should be unusable"));
+            assert!(
+                reason.contains("remedy:"),
+                "the reason for {key:?} should say what to change; got {reason}"
+            );
+            assert!(
+                reason.contains("a context key may not"),
+                "the reason for {key:?} should name the two grammars; got {reason}"
+            );
+        }
     }
 }
