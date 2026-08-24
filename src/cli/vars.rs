@@ -1,14 +1,15 @@
 //! Runtime variable substitution for template strings.
 //!
-//! Replaces `{{KEY}}` tokens with values from a variable map. Used by
-//! `handle_next` to inject `SESSION_DIR` and `SESSION_NAME` into every string a
-//! tick substitutes -- directives and details, gate commands, and a
-//! `default_action` command and its `working_dir` -- before they reach the shell
-//! or JSON serialization.
+//! Replaces `{{KEY}}` tokens with values from a variable map. `handle_next` uses
+//! it to inject `SESSION_DIR` and `SESSION_NAME` into every string a tick
+//! substitutes -- directives and details, gate commands, and a `default_action`
+//! command and its `working_dir` -- before they reach the shell or JSON
+//! serialization. `handle_status` uses it on the same directive and details, so
+//! phase retrieval matches what `koto next` renders.
 //!
 //! This pass runs before the one that resolves declared variables, and it
-//! validates nothing: the two names it injects are engine-side values, checked
-//! when the session is created rather than against the value allowlist.
+//! validates nothing. The two names it injects are checked when the session is
+//! created rather than against the value allowlist.
 
 use std::collections::HashMap;
 

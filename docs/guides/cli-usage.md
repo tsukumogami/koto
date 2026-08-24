@@ -86,7 +86,7 @@ The 1 MB cap applies to both forms (file size is checked before reading). Use `@
 
 **Runtime variable substitution:**
 
-Before running a `default_action` command, evaluating gate commands, or serializing directives, `koto next` replaces two tokens: `{{SESSION_DIR}}` with the absolute path to the workflow's session directory, and `{{SESSION_NAME}}` with the name the session was created under. This lets templates reference session-local files, and address the session itself, without hard-coding either:
+Before running a `default_action` command, resolving its `working_dir`, evaluating gate commands, or serializing directives and details, `koto next` replaces two tokens: `{{SESSION_DIR}}` with the absolute path to the workflow's session directory, and `{{SESSION_NAME}}` with the name the session was created under. This lets templates reference session-local files, and address the session itself, without hard-coding either:
 
 ```markdown
 ## plan
