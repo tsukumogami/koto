@@ -477,6 +477,29 @@ pub enum SessionCommand {
         intent: String,
     },
 
+    /// Move a session's execution anchor to another directory.
+    ///
+    /// The anchor is the directory every tick of a session runs its
+    /// gates and actions in, and `koto next` refuses from anywhere
+    /// outside it. This is the only verb that changes one, so a
+    /// checkout that genuinely moved is repaired deliberately and the
+    /// move is recorded as an `execution_anchor_rebound` event rather
+    /// than happening silently.
+    ///
+    /// Works on any session, including one created by another session
+    /// (`koto session start --parent`) and on a child exactly as on any
+    /// other session.
+    Rebind {
+        /// Session name
+        name: String,
+
+        /// Directory to bind the session to. Defaults to the current
+        /// working directory, which is the common case: stand in the
+        /// checkout you moved to and rebind.
+        #[arg(long = "to")]
+        to: Option<String>,
+    },
+
     /// List, and optionally restore, sessions the old-layout migration set
     /// aside because their name was already taken.
     ///
@@ -1372,6 +1395,9 @@ pub fn run(app: App) -> Result<()> {
                         }))?
                     );
                     Ok(())
+                }
+                SessionCommand::Rebind { name, to } => {
+                    session::handle_rebind(&backend, &name, to.as_deref())
                 }
             }
         }

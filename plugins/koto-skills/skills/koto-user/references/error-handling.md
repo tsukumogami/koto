@@ -121,11 +121,13 @@ moved — you can retry from the right directory without worrying about a half-a
 ```
 
 The two codes differ because the repair differs: change directory for the first, put the
-checkout back (or rebind) for the second.
+checkout back or rebind for the second.
 
-**`koto session rebind` does not exist yet.** Both messages name it; `koto session`
-currently offers `start`, `dir`, `list`, `cleanup`, `resolve`, and `update`. Route on
-`error.code`, not on the message text — the wording changes when the subcommand ships.
+`koto session rebind <session> --to <dir>` moves the session's anchor, and `--to` defaults
+to the directory you run it from. It's the only verb that changes an anchor and it records
+the move as an `execution_anchor_rebound` event. Rebind when the checkout genuinely moved;
+for a mismatch on a checkout that did not move, changing directory is the right repair, not
+rebinding. Route on `error.code`, not on the message text.
 
 Paths are compared in canonical form, which resolves `.`, `..`, and symlinks and strips
 trailing slashes. Comparison never case-folds, on any platform, and containment is

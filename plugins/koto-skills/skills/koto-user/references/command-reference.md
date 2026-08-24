@@ -22,6 +22,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session list` | Runner — primary |
 | `koto session cleanup` | Runner — primary |
 | `koto session recover` | Operator — one-time migration recovery |
+| `koto session rebind` | Runner — after a checkout moves |
 | `koto session resolve` | Runner — cloud backend only |
 | `koto status` | Runner — primary |
 | `koto request create/bind/get/wait/list` | Runner — coordinator |
@@ -693,11 +694,29 @@ Exits non-zero only when a move was attempted and failed. Those sessions stay in
 
 ---
 
-## koto session rebind — not implemented
+## koto session rebind
 
-Both execution-anchor refusals tell you to run `koto session rebind <session> --to <dir>`. **The subcommand does not exist.** `koto session` offers `start`, `dir`, `list`, `cleanup`, `recover`, `resolve`, and `update`, and nothing else.
+```
+koto session rebind <name> [--to <dir>]
+```
 
-Until it ships: repair an `execution_anchor_mismatch` by running `koto next` from the directory the message names, and an `execution_anchor_unresolvable` by putting the checkout back at the path the message names. Route on `error.code` rather than the message text — the wording changes when the subcommand lands.
+Moves a session's execution anchor — the directory every tick runs its gates and actions in, and the one `koto next` refuses from anywhere outside. Use it when a checkout genuinely moved. `--to` defaults to the directory you run the command in, so the usual repair is to stand in the new checkout and run `koto session rebind <name>`.
+
+```json
+{"name":"deploy","rebound":true,"from":"/home/dev/repo","to":"/home/dev/work/repo"}
+```
+
+| Field | Meaning |
+|---|---|
+| `rebound` | `true` when the anchor moved. `false` when the session was already bound to that directory — an idempotent success that appends nothing. |
+| `from` | The directory the session was bound to before. `null` when it recorded none. |
+| `to` | The canonical absolute directory the session is now bound to. |
+
+This is the only verb that changes an anchor, and a real move appends an `execution_anchor_rebound` event, so the log shows every directory the session has been bound to. It works on any session, including one created by another session; rebinding a child does not move its parent.
+
+The target is canonicalized before it is recorded, so what lands on the header is the form the per-tick check compares against. A `--to` that names nothing, or names a file, is refused and the anchor is left alone. So is an unknown session name. These refusals go to stderr with exit 1, not to a JSON error envelope.
+
+Which refusal you are repairing matters. `execution_anchor_unresolvable` leaves rebinding as the only way out short of restoring the tree. `execution_anchor_mismatch` on a checkout that did *not* move means you are simply standing in the wrong place — change directory instead of rebinding, or you will point the session at the wrong tree.
 
 ---
 

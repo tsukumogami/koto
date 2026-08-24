@@ -10,12 +10,12 @@ description: >-
   should. It is also the answer to "where did we leave off on that?", "resume
   the thing from yesterday", "we did that out of order, undo the last step",
   and to a ~/.koto that keeps growing or discovery scans that have got slow.
-  Guessing through these is expensive and quiet: one refusal's own message
-  names a subcommand that has never shipped, so following it literally loops
-  forever; some blocking conditions cannot be overridden at all and the
-  attempt just fails; and a session's execution anchor is not a sandbox, so
-  treating it as one tells a user something untrue about what a workflow can
-  reach. Do NOT load it to design a state machine for a business domain -
+  Guessing through these is expensive and quiet: an anchor refusal names a
+  repair that is right only when the checkout really moved, and reaching for
+  it otherwise binds the session to the wrong tree; some blocking conditions
+  cannot be overridden at all and the attempt just fails; and a session's
+  execution anchor is not a sandbox, so treating it as one tells a user
+  something untrue about what a workflow can reach. Do NOT load it to design a state machine for a business domain -
   order lifecycles, request status models and the like are ordinary software
   design with nothing to do with koto. To write a durable template or a
   workflow-backed skill use koto-author; to decompose a fresh one-off task
@@ -215,9 +215,11 @@ Standing in a subdirectory of the anchor is fine. Ticking from a *different* tre
 | Error code | Exit | What happened | What you do |
 |---|---|---|---|
 | `execution_anchor_mismatch` | 2 | The tick ran from a directory that is neither the anchor nor beneath it. The message names the bound directory. | `cd` to the directory the message names and re-run. |
-| `execution_anchor_unresolvable` | 3 | The recorded anchor names nothing on this machine — the checkout was deleted, or the session moved machines. | Put the checkout back where the message names, or escalate. |
+| `execution_anchor_unresolvable` | 3 | The recorded anchor names nothing on this machine — the checkout was deleted, or the session moved machines. | Put the checkout back where the message names, or rebind the session to where the tree is now. |
 
-Both messages tell you to run `koto session rebind <session> --to <dir>`. **That subcommand has not landed yet** — `koto session` currently offers `start`, `dir`, `list`, `cleanup`, `resolve`, and `update`. Route on the error code rather than the message text; the wording will change when the subcommand ships.
+When the checkout genuinely moved, `koto session rebind <session> [--to <dir>]` moves the anchor to match; `--to` defaults to the directory you run it from. It's the only verb that changes an anchor, and it records the move as an `execution_anchor_rebound` event.
+
+Reach for it deliberately. A `execution_anchor_mismatch` usually means you're standing in the wrong place, not that the checkout moved, and rebinding then points the session at the wrong tree. Route on the error code rather than the message text.
 
 A session created before anchoring existed has no recorded directory. Its first tick adopts the directory it's ticked from, records the binding, and says so once on the `directive`:
 
@@ -558,7 +560,7 @@ Read these on demand, not upfront. The sections above cover the common path. Con
 
 **"execution_anchor_mismatch"** — you're ticking from a different tree than the one the session is bound to. The message names the bound directory; `cd` there (or into a subdirectory of it) and re-run. Nothing ran on the refused tick. See [Where a session's commands run](#where-a-sessions-commands-run).
 
-**"execution_anchor_unresolvable"** — the directory the session is bound to doesn't exist on this machine. Restore the checkout at the path the message names, or escalate. `koto session rebind` is named in the message but hasn't shipped.
+**"execution_anchor_unresolvable"** — the directory the session is bound to doesn't exist on this machine. Restore the checkout at the path the message names, or, if it moved, run `koto session rebind <session> --to <dir>` to point the session at where the tree is now.
 
 **"capture_unset"** — a state's instructions read a `{{NAME}}` that a `capture_stdout_as` was supposed to deliver, and this run never entered the state that produces it. The message names both. This is a template routing problem, not something you can fix by re-ticking — report it to whoever authored the workflow.
 

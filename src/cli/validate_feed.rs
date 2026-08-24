@@ -332,14 +332,18 @@ Body text.
     }
 
     /// A log holding everything the command-running work added -- the anchored
-    /// header, both new events, and an action event carrying `truncated` --
-    /// validates clean against the contract koto ships.
+    /// header, the anchoring events, and an action event carrying `truncated`
+    /// -- validates clean against the contract koto ships. The rebind appears
+    /// twice: once with the anchor it moved away from, once without, which is
+    /// what a session that had no anchor to move away from writes.
     #[test]
     fn shipped_spec_accepts_the_command_running_events() {
         let log = write_temp(&format!(
-            "{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n",
             anchored_header_line(),
             r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"execution_anchor_adopted","payload":{"anchor":"/home/user/src/koto"}}"#,
+            r#"{"seq":4,"timestamp":"2024-01-01T00:00:03Z","type":"execution_anchor_rebound","payload":{"from":"/home/user/src/koto","to":"/home/user/work/koto"}}"#,
+            r#"{"seq":5,"timestamp":"2024-01-01T00:00:04Z","type":"execution_anchor_rebound","payload":{"to":"/home/user/work/koto"}}"#,
             r#"{"seq":2,"timestamp":"2024-01-01T00:00:01Z","type":"default_action_executed","payload":{"state":"detect","command":"git branch --show-current","exit_code":0,"stdout":"main","stderr":"","truncated":true}}"#,
             r#"{"seq":3,"timestamp":"2024-01-01T00:00:02Z","type":"variable_captured","payload":{"key":"BRANCH","value":"main"}}"#,
         ));
@@ -361,6 +365,10 @@ Body text.
             (
                 "variable_captured",
                 r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"variable_captured","payload":{"key":"BRANCH"}}"#,
+            ),
+            (
+                "execution_anchor_rebound",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"execution_anchor_rebound","payload":{"from":"/home/user/src/koto"}}"#,
             ),
         ] {
             let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), malformed));

@@ -282,6 +282,17 @@ events:
         type: string
         required: true
 
+  execution_anchor_rebound:
+    tier: 2
+    fields:
+      from:
+        type: string
+        required: false
+        nullable: true
+      to:
+        type: string
+        required: true
+
   scheduler_ran:
     tier: 3
     fields:
@@ -341,7 +352,7 @@ version signal.
 | `session_id` | string | No | UUID v4 generated at `koto init` time. Absent (empty string) in files written before this field existed. |
 | `parent_workflow` | string | No | Name of the parent workflow for batch-spawned children. Absent for top-level sessions. |
 | `template_source_dir` | string | No | Absolute path to the directory containing the source template at init time. Absent for stdin/inline templates and older files. |
-| `execution_dir` | string | No | The session's execution anchor: the canonical absolute directory its ticks run gates and actions in. Recorded at `koto init` time from the process working directory, or from `--execution-dir`. A child copies its parent's value. Absent on files written before the field existed and on sessions created through `koto session start`; the first tick of such a session adopts the directory it is ticked from, writes it here, and records an `execution_anchor_adopted` event. |
+| `execution_dir` | string | No | The session's execution anchor: the canonical absolute directory its ticks run gates and actions in. Recorded at `koto init` time from the process working directory, or from `--execution-dir`. A child copies its parent's value. Absent on files written before the field existed and on sessions created through `koto session start`; the first tick of such a session adopts the directory it is ticked from, writes it here, and records an `execution_anchor_adopted` event. Once recorded, `koto session rebind` is the only thing that changes it, and it records an `execution_anchor_rebound` event when it does. |
 
 `execution_dir` is where a session's commands *start*, not a boundary on what
 they reach. A command that runs is free to name absolute paths or change
@@ -938,7 +949,37 @@ and the corner where `koto init` could not read a working directory to record.
 The event is appended before the header field is written, so a crash between the
 two repeats a visible adoption on the next tick rather than leaving a silent one.
 A consumer that sees two adoptions for one session is looking at that crash, not
-at a rebinding.
+at a rebinding — rebinding has its own event.
+
+---
+
+#### `execution_anchor_rebound`
+
+Written by `koto session rebind`, the one verb that moves a session's execution
+anchor after it is recorded. A checkout that genuinely moved is repaired by one
+deliberate command, and this event is what keeps the move from being silent.
+
+```json
+{
+  "type": "execution_anchor_rebound",
+  "payload": {
+    "from": "/home/user/src/koto",
+    "to": "/home/user/work/koto"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `from` | string | No | The directory the session was bound to before the rebind. Absent when it recorded none — a log written before anchoring existed, rebound before a tick had the chance to adopt one. |
+| `to` | string | Yes | The canonical absolute directory the session is now bound to. Matches the `execution_dir` the same command writes to the header. |
+
+Several of these can appear in one log: a checkout can move more than once, and
+each move is its own event. A rebind to the directory the session is already
+bound to writes nothing, so consecutive events always differ.
+
+The event is appended before the header field is written, the same ordering
+`execution_anchor_adopted` uses and for the same reason.
 
 ---
 
