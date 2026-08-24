@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 upstream: docs/prds/PRD-substitution-drift-class.md
 problem: |
   Which koto template fields resolve {{KEY}} references is decided twice --
@@ -29,7 +29,7 @@ rationale: |
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 
