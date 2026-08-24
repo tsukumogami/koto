@@ -793,3 +793,632 @@ Done.
         "an empty prefix should leave the rest of the key intact; got {resp}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// name_filter and fallback (Issues #224 and #228)
+// ---------------------------------------------------------------------------
+
+/// A child template that walks straight to a terminal state, so a parent's
+/// `children-complete` gate has something to count.
+fn child_template() -> &'static str {
+    r#"---
+name: filter-child
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Do the work.
+
+## done
+
+Done.
+"#
+}
+
+/// Write a template to a file and return the path, without initializing anything.
+fn write_template(dir: &Path, filename: &str, content: &str) -> PathBuf {
+    let src = dir.join(filename);
+    std::fs::write(&src, content).unwrap();
+    src
+}
+
+/// Initialize a child under `parent`, advancing it to its terminal state.
+fn spawn_terminal_child(dir: &Path, name: &str, parent: &str, child_src: &Path) {
+    let output = koto_cmd(dir)
+        .args([
+            "init",
+            name,
+            "--template",
+            child_src.to_str().unwrap(),
+            "--parent",
+            parent,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // `--no-cleanup` keeps the terminal child's session on disk, which is what
+    // the parent's gate reads.
+    let output = koto_cmd(dir)
+        .args(["next", name, "--no-cleanup"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child advance failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A `children-complete` gate's `name_filter` resolves `{{SESSION_NAME}}`, so a
+/// gate scoped to the parent's own fan-out counts the children the parent
+/// spawned (Issue #224).
+///
+/// This is the motivating case rather than a reduced one. Children are spawned
+/// as `<parent>.research.<n>`, which is what the skill guidance points at, and
+/// the gate scopes to them with `{{SESSION_NAME}}.research.`. Against a build
+/// that does not substitute the field, no child name starts with a literal
+/// `{{SESSION_NAME}}`, the gate matches nothing, and it reports "no matching
+/// children found" -- the quiet failure the issue describes, since a filter that
+/// matches nothing looks exactly like a fan-out that has not finished.
+///
+/// The unrelated child is what makes this a test of the *filter* rather than of
+/// counting: a build that substituted the reference but dropped the prefix match
+/// would also see the research child, and would additionally see this one.
+#[test]
+fn name_filter_resolves_the_session_name_it_scopes_to() {
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: parent-session-scoped
+version: "1.0"
+initial_state: wait
+states:
+  wait:
+    gates:
+      research_done:
+        type: children-complete
+        completion: "terminal"
+        name_filter: "{{SESSION_NAME}}.research."
+    accepts:
+      status:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: done
+        when:
+          status: ok
+          gates.research_done.all_complete: true
+  done:
+    terminal: true
+---
+
+## wait
+
+Wait for the research children.
+
+## done
+
+Done.
+"#;
+
+    let parent_src = write_template(dir.path(), "parent-scoped.md", template);
+    let child_src = write_template(dir.path(), "filter-child.md", child_template());
+
+    let output = koto_cmd(dir.path())
+        .args(["init", "kprobe", "--template", parent_src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init should accept a runtime name in name_filter: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    spawn_terminal_child(dir.path(), "kprobe.research.r1", "kprobe", &child_src);
+    spawn_terminal_child(dir.path(), "kprobe.other", "kprobe", &child_src);
+
+    let resp = next(dir.path(), "kprobe");
+    let cond = blocking_condition(&resp, "research_done")
+        .unwrap_or_else(|| panic!("the gate should report its evidence; got {resp}"));
+
+    // The gate's own verdict, not whether the response advanced. These children
+    // carry no dereferenceable result, so the converge predicate holds the gate
+    // regardless of the filter -- asserting on advancement would pass or fail
+    // for a reason this test is not about.
+    assert_eq!(
+        cond["output"]["total"], 1,
+        "the filter should resolve to `kprobe.research.` and match exactly the \
+         research child; got {resp}"
+    );
+    assert_eq!(
+        cond["output"]["children"][0]["name"], "kprobe.research.r1",
+        "the matched child should be the one under the resolved prefix; got {resp}"
+    );
+    assert_eq!(
+        cond["output"]["all_complete"], true,
+        "the matched child is terminal, so the gate's completion verdict is \
+         true; got {resp}"
+    );
+}
+
+/// The same gate, counting. Pinned separately because "the gate passed" and
+/// "the gate counted exactly the fan-out it names" are different claims, and a
+/// build that resolved the reference but ignored the prefix would satisfy only
+/// the first.
+///
+/// One research child is left short of terminal, so the gate does not pass and
+/// its evidence is on the response to be read.
+#[test]
+fn name_filter_counts_only_the_fan_out_it_names() {
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: parent-counting
+version: "1.0"
+initial_state: wait
+states:
+  wait:
+    gates:
+      research_done:
+        type: children-complete
+        completion: "terminal"
+        name_filter: "{{SESSION_NAME}}.research."
+    accepts:
+      status:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: done
+        when:
+          status: ok
+          gates.research_done.all_complete: true
+  done:
+    terminal: true
+---
+
+## wait
+
+Wait for the research children.
+
+## done
+
+Done.
+"#;
+
+    let parent_src = write_template(dir.path(), "parent-counting.md", template);
+    let child_src = write_template(dir.path(), "filter-child.md", child_template());
+
+    koto_cmd(dir.path())
+        .args(["init", "cprobe", "--template", parent_src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    spawn_terminal_child(dir.path(), "cprobe.research.r1", "cprobe", &child_src);
+
+    // A second research child, initialized but never advanced, so the gate has
+    // something to still be waiting on.
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "cprobe.research.r2",
+            "--template",
+            child_src.to_str().unwrap(),
+            "--parent",
+            "cprobe",
+        ])
+        .output()
+        .unwrap();
+    // And one outside the fan-out, also unfinished. A gate that ignored the
+    // prefix would count three here rather than two.
+    koto_cmd(dir.path())
+        .args([
+            "init",
+            "cprobe.audit",
+            "--template",
+            child_src.to_str().unwrap(),
+            "--parent",
+            "cprobe",
+        ])
+        .output()
+        .unwrap();
+
+    let resp = next(dir.path(), "cprobe");
+    let cond = blocking_condition(&resp, "research_done")
+        .unwrap_or_else(|| panic!("the gate should not pass with r2 unfinished; got {resp}"));
+    assert_eq!(
+        cond["output"]["total"], 2,
+        "the gate should count the two research children and not the audit child; got {resp}"
+    );
+}
+
+/// An undeclared reference in `name_filter` is refused at compile time, naming
+/// the gate and the field (Issue #224).
+///
+/// Without this the raw token passes through, the filter matches nothing, and
+/// the gate blocks forever with nothing anywhere naming the reference -- and
+/// the compile-time warning that catches a missing trailing dot stays silent,
+/// because the trailing dot is there.
+#[test]
+fn undeclared_reference_in_name_filter_is_rejected_at_compile_time() {
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: parent-undeclared-filter
+version: "1.0"
+initial_state: wait
+states:
+  wait:
+    gates:
+      research_done:
+        type: children-complete
+        completion: "terminal"
+        name_filter: "{{NOT_DECLARED}}.research."
+    accepts:
+      status:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: done
+        when:
+          status: ok
+          gates.research_done.all_complete: true
+  done:
+    terminal: true
+---
+
+## wait
+
+Wait.
+
+## done
+
+Done.
+"#;
+
+    let output = try_init(dir.path(), "badfilter", template);
+    assert!(!output.status.success(), "init should refuse the template");
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        message.contains("not declared")
+            && message.contains("NOT_DECLARED")
+            && message.contains("research_done")
+            && message.contains("name_filter"),
+        "the error should say the reference is undeclared and name the gate and \
+         the field; got {message}"
+    );
+}
+
+/// A `name_filter` that resolves to empty is refused at the gate, not applied.
+///
+/// An empty prefix does not narrow the gate -- it removes the filter, so a gate
+/// written to wait on one fan-out would silently wait on every child of the
+/// parent. That is the fail-open direction, and worse than the symptom the
+/// issue was filed about. The compiler cannot catch it: it reads the authored
+/// string, and `"{{PREFIX}}"` is only empty once `PREFIX` resolves to nothing.
+///
+/// The unrelated child is load-bearing. Without it, a build that applied the
+/// empty filter would find the same single child and pass, and the test would
+/// report success for the behaviour it exists to reject.
+#[test]
+fn a_name_filter_that_resolves_to_empty_is_an_error_not_a_wider_match() {
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: parent-empty-filter
+version: "1.0"
+initial_state: wait
+variables:
+  PREFIX:
+    description: "scopes the gate to one fan-out"
+    required: false
+states:
+  wait:
+    gates:
+      research_done:
+        type: children-complete
+        completion: "terminal"
+        name_filter: "{{PREFIX}}"
+    accepts:
+      status:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: done
+        when:
+          status: ok
+          gates.research_done.all_complete: true
+  done:
+    terminal: true
+---
+
+## wait
+
+Wait.
+
+## done
+
+Done.
+"#;
+
+    let parent_src = write_template(dir.path(), "parent-empty.md", template);
+    let child_src = write_template(dir.path(), "filter-child.md", child_template());
+
+    let output = koto_cmd(dir.path())
+        .args(["init", "eprobe", "--template", parent_src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init should accept an optional variable in name_filter: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Every child of this parent is terminal, so an empty filter -- which
+    // matches all of them -- would pass the gate.
+    spawn_terminal_child(dir.path(), "eprobe.research.r1", "eprobe", &child_src);
+    spawn_terminal_child(dir.path(), "eprobe.audit", "eprobe", &child_src);
+
+    let resp = next(dir.path(), "eprobe");
+    let cond = blocking_condition(&resp, "research_done").unwrap_or_else(|| {
+        panic!("an empty name_filter must not pass by matching every child; got {resp}")
+    });
+    let error = cond["output"]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("empty"),
+        "the gate should say why rather than reporting a bare not-complete; got {resp}"
+    );
+}
+
+/// A gate that declares no `name_filter` is untouched by the empty-value
+/// refusal.
+///
+/// "Absent" and "resolved to empty" are different states, and the fix has to
+/// tell them apart -- collapsing them is the specific wrong implementation the
+/// design rules out. Without this test, a fix that treated a missing filter as
+/// an empty one would break every unfiltered `children-complete` gate in
+/// existence and no test here would say so.
+#[test]
+fn a_gate_with_no_name_filter_still_watches_every_child() {
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: parent-unfiltered
+version: "1.0"
+initial_state: wait
+states:
+  wait:
+    gates:
+      all_done:
+        type: children-complete
+        completion: "terminal"
+    accepts:
+      status:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: done
+        when:
+          status: ok
+          gates.all_done.all_complete: true
+  done:
+    terminal: true
+---
+
+## wait
+
+Wait.
+
+## done
+
+Done.
+"#;
+
+    let parent_src = write_template(dir.path(), "parent-unfiltered.md", template);
+    let child_src = write_template(dir.path(), "filter-child.md", child_template());
+
+    koto_cmd(dir.path())
+        .args(["init", "uprobe", "--template", parent_src.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    spawn_terminal_child(dir.path(), "uprobe.research.r1", "uprobe", &child_src);
+    spawn_terminal_child(dir.path(), "uprobe.audit", "uprobe", &child_src);
+
+    let resp = next(dir.path(), "uprobe");
+    let cond = blocking_condition(&resp, "all_done")
+        .unwrap_or_else(|| panic!("the gate should report its evidence; got {resp}"));
+    assert_eq!(
+        cond["output"]["total"], 2,
+        "an absent name_filter means no filter, so both children count; got {resp}"
+    );
+    assert_eq!(
+        cond["output"]["all_complete"], true,
+        "both children are terminal, so the gate's completion verdict is true; \
+         got {resp}"
+    );
+    assert_eq!(
+        cond["output"]["error"], "",
+        "an absent name_filter is not an empty one, and must not reach the \
+         empty-value refusal; got {resp}"
+    );
+}
+
+/// A `{{KEY}}` reference in a `default_action`'s `fallback` is refused at
+/// compile time (Issue #228).
+///
+/// The field is spliced onto a failure response's directive after substitution
+/// has run, deliberately, so the prose reaches the agent as written. That is
+/// documented behaviour and it does not change. What changes is that an author
+/// who writes a reference there is now told, instead of finding out from an
+/// agent that could not follow a pointer to `{{SESSION_DIR}}`.
+///
+/// The reference names a DECLARED variable, which is the case a check written
+/// against undeclared names would miss and the one an author is most likely to
+/// write: the same `{{V}}` resolves in the directive two lines away.
+#[test]
+fn a_reference_in_a_default_action_fallback_is_rejected_at_compile_time() {
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: action-fallback-ref
+version: "1.0"
+initial_state: s
+variables:
+  V:
+    description: "a declared variable"
+    required: true
+states:
+  s:
+    default_action:
+      command: 'false'
+      fallback: "the run left something in {{V}}, go and read it"
+    accepts:
+      status:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: done
+        when:
+          status: ok
+  done:
+    terminal: true
+---
+
+## s
+
+Directive prose sees {{V}}.
+
+## done
+
+Done.
+"#;
+
+    let src = write_template(dir.path(), "fallback-ref.md", template);
+    let output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "fbprobe",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "V=alpha",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "init should refuse a reference in fallback: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        message.contains("fallback") && message.contains("never expanded"),
+        "the error should name the field and say it is never expanded; got {message}"
+    );
+    assert!(
+        message.contains("directive"),
+        "the error should point at the directive, which does resolve a \
+         reference -- telling an author their reference will not work without \
+         saying where one would leaves them nowhere; got {message}"
+    );
+}
+
+/// `fallback` prose with no reference in it still reaches the agent on failure,
+/// unchanged.
+///
+/// The refusal above must not have been written broadly enough to refuse the
+/// field itself, and the splice it guards is the whole reason the field exists.
+#[test]
+fn a_fallback_without_a_reference_still_reaches_the_agent() {
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: action-fallback-plain
+version: "1.0"
+initial_state: s
+variables:
+  V:
+    description: "a declared variable"
+    required: true
+states:
+  s:
+    default_action:
+      command: 'false'
+      fallback: "the command failed; read the error above and carry on yourself"
+    accepts:
+      status:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: done
+        when:
+          status: ok
+  done:
+    terminal: true
+---
+
+## s
+
+Directive prose sees {{V}}.
+
+## done
+
+Done.
+"#;
+
+    let src = write_template(dir.path(), "fallback-plain.md", template);
+    let output = koto_cmd(dir.path())
+        .args([
+            "init",
+            "fbplain",
+            "--template",
+            src.to_str().unwrap(),
+            "--var",
+            "V=alpha",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init should accept literal fallback prose: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let resp = next(dir.path(), "fbplain");
+    let directive = resp["directive"].as_str().unwrap_or_default();
+    assert!(
+        directive.contains("read the error above and carry on yourself"),
+        "the fallback prose should be spliced onto the directive when the action \
+         fails; got {resp}"
+    );
+    assert!(
+        directive.contains("alpha"),
+        "the directive itself still resolves its own reference; got {resp}"
+    );
+}
