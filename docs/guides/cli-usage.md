@@ -86,7 +86,7 @@ The 1 MB cap applies to both forms (file size is checked before reading). Use `@
 
 **Runtime variable substitution:**
 
-Before running a `default_action` command, resolving its `working_dir`, evaluating gate commands, or serializing directives and details, `koto next` replaces two tokens: `{{SESSION_DIR}}` with the absolute path to the workflow's session directory, and `{{SESSION_NAME}}` with the name the session was created under. This lets templates reference session-local files, and address the session itself, without hard-coding either:
+Before running a `default_action` command, resolving its `working_dir`, evaluating a gate's `command`, `key` or `pattern`, or serializing directives and details, `koto next` replaces two tokens: `{{SESSION_DIR}}` with the absolute path to the workflow's session directory, and `{{SESSION_NAME}}` with the name the session was created under. This lets templates reference session-local files, and address the session itself, without hard-coding either:
 
 ```markdown
 ## plan
@@ -97,6 +97,10 @@ Write an implementation plan to {{SESSION_DIR}}/plan.md.
 ```
 
 `SESSION_DIR` and `SESSION_NAME` are reserved variable names and can't be overridden by template-defined variables.
+
+A `context-matches` gate's `pattern` is a regex, so a value substituted into it is escaped and matches itself. Anchors, classes and quantifiers you write around a `{{KEY}}` still mean what they say -- what changes is that the value can no longer contribute regex syntax of its own. A session name may contain a dot, so `pattern: "^ready {{SESSION_NAME}}$"` against a session named `probe.one` matches `ready probe.one` and not `ready probeXone`.
+
+A reference in either field can still resolve to a value the gate cannot use, and the compiler cannot see that because the value does not exist yet. Two cases are reported as a gate error carrying the reason, rather than as a mismatch you would have to diagnose: a `key` that resolves to something the context store refuses, and a `pattern` that resolves to an empty string, which would otherwise match every input and pass the gate on anything at all.
 
 **Response variants:**
 

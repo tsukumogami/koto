@@ -201,6 +201,23 @@ command: koto context add {{SESSION_NAME}} findings.md --from-file "{{SESSION_DI
 to an absolute path, and a `working_dir` must be relative so it can be resolved against the
 execution anchor. koto refuses the action and says so.
 
+A gate on the same state reads the same references, which is what lets an action and the gate
+beside it agree about a context key scoped to the session:
+
+```yaml
+default_action:
+  command: 'koto context add {{SESSION_NAME}} {{SESSION_NAME}}-note --from-file note.txt'
+gates:
+  has_note:
+    type: context-exists
+    key: "{{SESSION_NAME}}-note"
+```
+
+A gate's `key` takes the plain form rather than the shell-safe one -- it is a store key, not a
+shell word -- so an empty value renders as nothing and `key: "{{PREFIX}}note"` with an empty
+prefix asks for `note`. A `context-matches` `pattern` escapes each value it substitutes, so the
+value matches itself and the regex you wrote around it is the only regex in play.
+
 ### One command the engine refuses: `koto next`
 
 Automating a workflow's own bookkeeping by having a state tick itself looks like the obvious

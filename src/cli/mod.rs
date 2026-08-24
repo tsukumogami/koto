@@ -2985,7 +2985,8 @@ fn record_notice_delivery(backend: &dyn SessionBackend, name: &str, abandoned: &
     }
 }
 
-/// Substitute a string that is not handed to a shell.
+/// Substitute a string whose consumer reads a value as itself: directives,
+/// details, an action's `working_dir`, and a context gate's `key`.
 ///
 /// The order is fixed everywhere a variable resolves during a tick: runtime
 /// names (`SESSION_DIR`, `SESSION_NAME`) first, then the per-tick overlay, then
@@ -2995,13 +2996,12 @@ fn record_notice_delivery(backend: &dyn SessionBackend, name: &str, abandoned: &
 /// so they are not covered by that -- what protects them is that neither value
 /// can contain a brace by construction.
 ///
-/// The only difference from [`substitute_shell_command`] is what an empty value
-/// renders as: that one emits `''` so an unquoted `--flag {{VAR}}` stays a
-/// well-formed argument (Issue #186), and this one emits nothing. So the choice
-/// between them is not prose-versus-path -- it is whether the result reaches
-/// `sh -c`. Directives, details and an action's `working_dir` do not.
+/// The two siblings exist because their consumers do *not* read a value as
+/// itself: [`substitute_shell_command`] hands it to `sh -c`, and
+/// [`substitute_regex_literal`] hands it to the regex engine. Which form goes
+/// where, and why, is argued once on `engine::substitute::ValueForm`.
 #[cfg(unix)]
-fn substitute_text(
+fn substitute_plain(
     raw: &str,
     runtime_vars: &std::collections::HashMap<String, String>,
     variables: &crate::engine::substitute::Variables,
@@ -3012,7 +3012,7 @@ fn substitute_text(
 }
 
 /// Substitute a command string through the same lookup order as
-/// [`substitute_text`], using the shell-safe form because the result is
+/// [`substitute_plain`], using the shell-safe form because the result is
 /// handed to `sh -c` (Issue #186).
 ///
 /// Every string a tick hands to a shell resolves here -- gate commands and a
@@ -3022,12 +3022,17 @@ fn substitute_text(
 /// `koto context add {{SESSION_NAME}} key` in an action got a session directory
 /// named with the literal token and an exit code of 0 (Issue #220).
 ///
-/// That is not the whole of "a literal token reached `sh -c`". A gate's `key`
-/// and `pattern` are not substituted at all (Issue #222).
+/// That is not the whole of "a literal token reached `sh -c`". An undelivered
+/// capture name never reaches here from an action: the caller refuses it before
+/// substituting (Issue #221). A gate command is not guarded that way and still
+/// ships one to `sh -c` (Issue #225).
 ///
-/// An undelivered capture name never reaches here from an action: the caller
-/// refuses it before substituting (Issue #221). A gate command is not guarded
-/// that way and still ships one to `sh -c` (Issue #225).
+/// The runtime-name pass is the plain `substitute_vars` rather than a shell-word
+/// form, and that is deliberate rather than an oversight to fix: the shell-word
+/// form exists only to render an empty value as `''`, and neither `SESSION_DIR`
+/// nor `SESSION_NAME` can be empty. `substitute_regex_literal` pairs differently
+/// -- both of its passes escape -- because a path can carry a regex
+/// metacharacter where it cannot carry an emptiness.
 #[cfg(unix)]
 fn substitute_shell_command(
     raw: &str,
@@ -3039,10 +3044,40 @@ fn substitute_shell_command(
     variables.substitute_command_with(&with_runtime, overlay)
 }
 
-/// Substitute every gate command in `gates` through
-/// [`substitute_shell_command`].
+/// Substitute a string the regex engine will compile, through the same lookup
+/// order as [`substitute_plain`], escaping each value so it matches itself.
+///
+/// A `context-matches` gate's `pattern` is the only such string a tick
+/// substitutes. The pattern an author wrote is untouched -- what gets escaped is
+/// the value written into it. Both passes escape, because `SESSION_DIR` is a
+/// path and never saw the value allowlist. See
+/// `engine::substitute::Variables::substitute_regex_literal_with` before
+/// weakening either: the compiler's regex check depends on this (Issue #222).
 #[cfg(unix)]
-fn substitute_gate_commands(
+fn substitute_regex_literal(
+    raw: &str,
+    runtime_vars: &std::collections::HashMap<String, String>,
+    variables: &crate::engine::substitute::Variables,
+    overlay: &crate::engine::substitute::VariableOverlay,
+) -> String {
+    let with_runtime = crate::cli::vars::substitute_vars_regex_literal(raw, runtime_vars);
+    variables.substitute_regex_literal_with(&with_runtime, overlay)
+}
+
+/// Substitute every substitutable field of every gate in `gates`.
+///
+/// Three fields, three forms, chosen by what each is handed to rather than by
+/// what it looks like -- `sh -c`, the context store, the regex engine. The
+/// reasoning behind that axis is on `engine::substitute::ValueForm`.
+///
+/// `key` and `pattern` were substituted by nothing at all until Issue #222: an
+/// action storing `{{SESSION_NAME}}-note` and a `context-exists` gate reading
+/// `key: "{{SESSION_NAME}}-note"` sat in the same state and disagreed about what
+/// that reference meant, and the disagreement surfaced as a gate that would not
+/// pass. The one gate field still outside this is `name_filter`, on a
+/// `children-complete` gate (Issue #224).
+#[cfg(unix)]
+fn substitute_gate_fields(
     gates: &std::collections::BTreeMap<String, crate::template::types::Gate>,
     runtime_vars: &std::collections::HashMap<String, String>,
     variables: &crate::engine::substitute::Variables,
@@ -3053,6 +3088,8 @@ fn substitute_gate_commands(
         .map(|(name, gate)| {
             let mut g = gate.clone();
             g.command = substitute_shell_command(&g.command, runtime_vars, variables, overlay);
+            g.key = substitute_plain(&g.key, runtime_vars, variables, overlay);
+            g.pattern = substitute_regex_literal(&g.pattern, runtime_vars, variables, overlay);
             (name.clone(), g)
         })
         .collect()
@@ -3760,7 +3797,7 @@ fn handle_next(
                 // the natural path so the two directives resolve identically
                 // by construction rather than by inspection.
                 let resp = resp.with_substituted_directive(|d| {
-                    substitute_text(d, &runtime_vars, &variables, &overlay)
+                    substitute_plain(d, &runtime_vars, &variables, &overlay)
                 });
 
                 // Whether the target phase's delivery window already
@@ -4357,11 +4394,11 @@ fn handle_next(
     let session_name = &name;
     let gate_closure =
         |gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
-            // Substitute runtime, overlay, and template variables in gate
-            // command strings. The overlay matters because this closure runs
-            // once per state the loop reaches, so a later state's gate command
-            // must see what an earlier state in the same tick produced.
-            let substituted = substitute_gate_commands(gates, &runtime_vars, &variables, &overlay);
+            // Substitute runtime, overlay, and template variables in every
+            // substitutable gate field. The overlay matters because this closure
+            // runs once per state the loop reaches, so a later state's gate must
+            // see what an earlier state in the same tick produced.
+            let substituted = substitute_gate_fields(gates, &runtime_vars, &variables, &overlay);
             evaluate_gates(
                 &substituted,
                 &execution_dir,
@@ -4443,7 +4480,7 @@ fn handle_next(
             // is appended, because no command ran: the failure is reported as
             // a spawn failure, which is what it is.
             let substituted =
-                substitute_text(&action.working_dir, &runtime_vars, &variables, &overlay);
+                substitute_plain(&action.working_dir, &runtime_vars, &variables, &overlay);
             match resolve_action_working_dir(&execution_dir, &substituted) {
                 Ok(dir) => dir,
                 Err(message) => {
@@ -4475,7 +4512,7 @@ fn handle_next(
                     // the value does not exist until the command finishes. The
                     // evaluator below passes no `children_eval`, which is a
                     // choice: see the note there.
-                    substitute_gate_commands(&s.gates, &runtime_vars, &variables, &overlay)
+                    substitute_gate_fields(&s.gates, &runtime_vars, &variables, &overlay)
                 })
                 .unwrap_or_default();
             execute_with_polling(
@@ -4885,7 +4922,7 @@ fn handle_next(
                         *unset_capture.borrow_mut() = Some(hit);
                     }
                 }
-                substitute_text(d, &runtime_vars, &variables, &overlay)
+                substitute_plain(d, &runtime_vars, &variables, &overlay)
             });
             if let Some((key, producer)) = unset_capture.into_inner() {
                 let ne = NextError {
@@ -7372,7 +7409,7 @@ Done.
 
         // Directive: runtime name first, then overlay over the log binding.
         assert_eq!(
-            substitute_text(
+            substitute_plain(
                 "read {{SESSION_DIR}}/plan.md on {{BRANCH}} for {{TAG}}",
                 &runtime_vars,
                 &variables,
@@ -7396,7 +7433,7 @@ Done.
                 name_filter: None,
             },
         );
-        let substituted = substitute_gate_commands(&gates, &runtime_vars, &variables, &overlay);
+        let substituted = substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay);
         assert_eq!(
             substituted.get("check").unwrap().command,
             "test -f /s/abc/v1.2.3 && git log fresh"
@@ -7410,7 +7447,7 @@ Done.
         // while the same reference in a gate on the same tick resolved.
         //
         // This calls the helper directly, so the equality below guards the gate
-        // side -- it fails if `substitute_gate_commands` stops delegating. The
+        // side -- it fails if `substitute_gate_fields` stops delegating. The
         // action call site is covered end-to-end by
         // `runtime_names_substituted_in_default_action_command` in
         // tests/integration_test.rs. The literal assertion pins the shared order.
@@ -7458,7 +7495,7 @@ Done.
         );
 
         let as_action = substitute_shell_command(raw, &runtime_vars, &variables, &overlay);
-        let as_gate = substitute_gate_commands(&gates, &runtime_vars, &variables, &overlay)
+        let as_gate = substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay)
             .get("check")
             .unwrap()
             .command
@@ -7469,6 +7506,151 @@ Done.
             as_action,
             "koto context add abc v1.2.3 --from-file /s/abc/myslug"
         );
+    }
+
+    #[test]
+    fn every_field_the_compiler_validates_is_one_the_tick_substitutes() {
+        // The guard `Gate::substitutable_fields` exists to hold. That accessor
+        // is what the compiler validates references in; this asserts the tick
+        // actually resolves every field it names, so the two cannot drift apart
+        // the way they did for a `default_action` command (Issue #220) and for
+        // `key` and `pattern` (Issue #222).
+        //
+        // Add a field to the accessor and this fails until
+        // `substitute_gate_fields` handles it -- which is the direction that
+        // matters, since the compiler promising a resolution the runtime does
+        // not deliver is the shape both of those bugs took.
+        use crate::engine::substitute::{VariableOverlay, Variables};
+        use crate::template::types::Gate;
+
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: std::collections::HashMap::from([(
+                    "TOKEN".to_string(),
+                    "resolved".to_string(),
+                )]),
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+        let variables = Variables::from_events(&events).unwrap();
+        let runtime_vars = std::collections::HashMap::new();
+        let overlay = VariableOverlay::new();
+
+        // A reference in every field the accessor names. Kept in sync with the
+        // accessor by the assertion below rather than by memory.
+        let authored = Gate {
+            gate_type: "context-matches".to_string(),
+            command: "echo {{TOKEN}}".to_string(),
+            timeout: 0,
+            key: "{{TOKEN}}-note".to_string(),
+            pattern: "^{{TOKEN}}$".to_string(),
+            override_default: None,
+            completion: None,
+            name_filter: None,
+        };
+        for (field, raw) in authored.substitutable_fields() {
+            assert!(
+                raw.contains("{{TOKEN}}"),
+                "this fixture is stale: the accessor names {field:?}, which it \
+                 does not fill with a reference, so the assertion below would \
+                 pass vacuously for that field"
+            );
+        }
+
+        let mut gates = BTreeMap::new();
+        gates.insert("check".to_string(), authored);
+        let out = substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay);
+        let substituted = out.get("check").unwrap();
+
+        for (field, raw) in substituted.substitutable_fields() {
+            assert!(
+                !raw.contains("{{"),
+                "gate field {field:?} is validated by the compiler but reached \
+                 the evaluator with a raw token: {raw:?}. Wire it into \
+                 substitute_gate_fields."
+            );
+            assert!(
+                raw.contains("resolved"),
+                "gate field {field:?} should carry the resolved value; got {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_key_and_pattern_substitute_in_their_own_forms() {
+        // Issue #222: `key` and `pattern` were substituted by nothing. They are
+        // now, but not in the same form as each other or as `command` -- so this
+        // pins which form each field gets, since getting that wrong is silent.
+        //
+        // All three layers appear so the shared lookup order is exercised, and
+        // the values carry a dot: harmless in a key, a wildcard in an unescaped
+        // pattern. Integration coverage of the same three fields end to end is
+        // in tests/gate_field_substitution_test.rs.
+        use crate::engine::substitute::{VariableOverlay, Variables};
+        use crate::template::types::Gate;
+
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: std::collections::HashMap::from([
+                    ("SLUG".to_string(), "my.slug".to_string()),
+                    ("BLANK".to_string(), String::new()),
+                ]),
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+        let variables = Variables::from_events(&events).unwrap();
+
+        let runtime_vars = std::collections::HashMap::from([
+            ("SESSION_DIR".to_string(), "/s/probe.one".to_string()),
+            ("SESSION_NAME".to_string(), "probe.one".to_string()),
+        ]);
+        let overlay = VariableOverlay::new();
+        overlay.insert("TAG", "v1.2.3");
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: "context-matches".to_string(),
+                command: "grep {{TAG}} {{SESSION_DIR}}/out --flag {{BLANK}}".to_string(),
+                timeout: 0,
+                key: "{{SESSION_NAME}}-{{SLUG}}-{{BLANK}}note".to_string(),
+                pattern: "^ready {{SESSION_NAME}} {{TAG}}$".to_string(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+
+        let out = substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay);
+        let g = out.get("check").unwrap();
+
+        // Shell-safe: an empty value becomes an explicit empty argument so the
+        // trailing `--flag` keeps one (Issue #186).
+        assert_eq!(g.command, "grep v1.2.3 /s/probe.one/out --flag ''");
+
+        // Plain: a context key is not a shell word, so an empty value renders as
+        // nothing rather than as two apostrophes the store would have to hold.
+        assert_eq!(g.key, "probe.one-my.slug-note");
+
+        // Regex-literal: every dot a value carried is escaped, so it matches
+        // itself. The `^` and `$` the author wrote are untouched.
+        assert_eq!(g.pattern, r"^ready probe\.one v1\.2\.3$");
+
+        // And the escaping is load-bearing, not cosmetic.
+        let re = regex::Regex::new(&g.pattern).unwrap();
+        assert!(re.is_match("ready probe.one v1.2.3"));
+        assert!(!re.is_match("ready probeXone v1.2.3"));
     }
 
     #[test]
@@ -7504,7 +7686,7 @@ Done.
             variables.substitute(&d)
         };
         assert_eq!(
-            substitute_text(raw, &runtime_vars, &variables, &overlay),
+            substitute_plain(raw, &runtime_vars, &variables, &overlay),
             expected_directive
         );
 
@@ -7527,7 +7709,7 @@ Done.
             variables.substitute_command(&c)
         };
         assert_eq!(
-            substitute_gate_commands(&gates, &runtime_vars, &variables, &overlay)
+            substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay)
                 .get("check")
                 .unwrap()
                 .command,

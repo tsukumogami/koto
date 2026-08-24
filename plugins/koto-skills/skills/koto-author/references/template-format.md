@@ -44,10 +44,12 @@ Variables are declared at the root level and interpolated into directive text us
 
 An optional variable (`required: false`) that the caller omits resolves to its `default`, or to an empty string when no default is declared. Every declared variable is always materialized, so a `{{VARIABLE_NAME}}` reference never fails to resolve. When such a reference lands unquoted in a gate or action command (`--flag {{VAR}}`) and the value is empty, koto renders it as an explicit empty argument (`--flag ''`) so the command stays well-formed instead of dropping the token.
 
-Koto also provides two built-in variables that don't need to be declared. Both resolve everywhere a declared variable does: directives, details, gate commands, and a `default_action` command and its `working_dir`.
+Koto also provides two built-in variables that don't need to be declared. Both resolve everywhere a declared variable does: directives, details, a gate's `command`, `key` and `pattern`, and a `default_action` command and its `working_dir`.
 
 - `{{SESSION_NAME}}` -- the active session name
 - `{{SESSION_DIR}}` -- the session directory path
+
+A reference in a context gate's `key` is how you scope a context key to the session that owns it, so an action storing `{{SESSION_NAME}}-note` and a gate reading `key: "{{SESSION_NAME}}-note"` agree. In a `context-matches` `pattern`, the substituted value is escaped and matches itself -- the regex you wrote around it still works, but the value cannot contribute regex syntax of its own. The one gate field that does not resolve a reference is `name_filter` on a `children-complete` gate; write that prefix literally for now.
 
 ### States
 
@@ -296,6 +298,21 @@ gates:
     key: plan.md
     pattern: "^## Step \\d+"
 ```
+
+`key` and `pattern` both resolve `{{KEY}}` references, so a gate can be scoped to whatever the action beside it wrote:
+
+```yaml
+default_action:
+  command: 'koto context add {{SESSION_NAME}} {{SESSION_NAME}}-note --from-file note.txt'
+gates:
+  has_note:
+    type: context-exists
+    key: "{{SESSION_NAME}}-note"
+```
+
+A value substituted into `pattern` is escaped, so it matches itself rather than acting as a regex fragment -- write the regex structure in the pattern and let the variable carry the value. That holds in a character class you opened and under `(?x)` too. An undeclared reference in either field is a compile error, the same as in a gate command.
+
+What the compiler cannot check is the value, since it does not exist yet. Two cases are caught at run time and reported as a gate `error` with the reason attached: a `key` that resolves to something the context store will not accept (empty, or breaking the key rules -- note a value may hold a space, `:` or `@`, and a key may not), and a `pattern` that resolves to empty, which would otherwise match every input and pass the gate on anything.
 
 #### `children-complete` gate type
 

@@ -17,6 +17,40 @@ pub fn extract_refs(input: &str) -> Vec<String> {
         .collect()
 }
 
+/// A `context-matches` pattern with every `{{KEY}}` reference replaced by a
+/// single literal character, so the compiler can still check that the pattern is
+/// a valid regex before any value exists.
+///
+/// A raw `{{KEY}}` is not a valid regex -- `{` opens a repetition the parser
+/// then cannot read -- so without this the compiler rejects every pattern that
+/// references a variable, which is how `pattern` was closed to substitution
+/// before Issue #222.
+///
+/// The stand-in works because the runtime escapes each value it writes into a
+/// pattern: an escaped value contributes literal characters and nothing else, so
+/// it can neither add structure nor complete some the author left dangling.
+/// Under an unescaped substitution this check could not exist at all, since a
+/// value could turn a valid pattern into an invalid one after compile time.
+/// `Variables::substitute_regex_literal_with` carries the same note from the
+/// other end, because that is the function someone would edit to break this.
+///
+/// It is a check, not a proof. Two positions in the grammar give a literal
+/// structural weight of its own -- a character-class range, where a literal's
+/// identity decides whether `[a-X]` is ordered, and a repetition bound, where
+/// `{2,X}` needs a decimal -- so there the stand-in and the real value can
+/// disagree in either direction. Neither disagreement is silent, and
+/// `pattern_stand_in_keeps_the_authors_structure` pins both with the reasoning
+/// attached.
+fn pattern_with_refs_as_literals(pattern: &str) -> String {
+    let re = Regex::new(VAR_REF_PATTERN).expect("VAR_REF_PATTERN is a valid regex");
+    // `x` rather than an arbitrary letter: a stand-in inside a character-class
+    // range has to keep the range ordered, and `x` sits late enough in the
+    // alphabet that `[a-{{V}}]` stays valid. An `A` here would make that
+    // pattern a compile error about range ordering, several files from
+    // anything that mentions this choice.
+    re.replace_all(pattern, "x").into_owned()
+}
+
 /// A compiled template in FormatVersion=1 JSON format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompiledTemplate {
@@ -190,6 +224,34 @@ pub struct Gate {
     /// only research children, not all children).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_filter: Option<String>,
+}
+
+impl Gate {
+    /// Every field of this gate that a tick substitutes `{{KEY}}` references in,
+    /// paired with the name errors report it under.
+    ///
+    /// One list, next to the struct that owns the fields, because two lists is
+    /// the bug. The compiler validates references in exactly this set and
+    /// `substitute_gate_fields` rewrites exactly this set, and each of the three
+    /// fixes before this one was an instance of those two sets disagreeing: a
+    /// `default_action` command the compiler accepted and the runtime skipped
+    /// (Issue #220), a gate `key` and `pattern` neither of them touched
+    /// (Issue #222), and `name_filter` on a `children-complete` gate, still in
+    /// neither (Issue #224).
+    ///
+    /// Adding a field here is what wires it into compile-time validation;
+    /// `every_field_the_compiler_validates_is_one_the_tick_substitutes` in
+    /// `src/cli/mod.rs` then fails until the runtime side is wired too, so the
+    /// pair cannot drift apart silently again. `name_filter` is deliberately
+    /// absent until #224 decides what an empty substituted value means for a
+    /// prefix that currently means "no filter" when empty.
+    pub fn substitutable_fields(&self) -> Vec<(&'static str, &str)> {
+        vec![
+            ("command", self.command.as_str()),
+            ("key", self.key.as_str()),
+            ("pattern", self.pattern.as_str()),
+        ]
+    }
 }
 
 /// A default action declaration for a template state.
@@ -698,11 +760,29 @@ impl CompiledTemplate {
                                 state_name, gate_name
                             ));
                         }
-                        // Validate that the pattern is a valid regex.
-                        if let Err(e) = regex::Regex::new(&gate.pattern) {
+                        // Validate that the pattern is a valid regex, with any
+                        // `{{KEY}}` reference stood in for -- see
+                        // `pattern_with_refs_as_literals`. The message quotes
+                        // what the author wrote, not the stand-in.
+                        let stand_in = pattern_with_refs_as_literals(&gate.pattern);
+                        if let Err(e) = regex::Regex::new(&stand_in) {
+                            // When the pattern holds a reference, the parse
+                            // error below renders the stand-in, so its caret can
+                            // point at an `x` the author never typed. Say so
+                            // rather than leaving them hunting for it.
+                            let note = if stand_in == gate.pattern {
+                                String::new()
+                            } else {
+                                format!(
+                                    "\n  note: checked as {:?}, with each {{{{KEY}}}} reference \
+                                     stood in for by one literal character -- the parse error \
+                                     below refers to that form",
+                                    stand_in
+                                )
+                            };
                             return Err(format!(
-                                "state {:?} gate {:?}: invalid regex pattern {:?}: {}",
-                                state_name, gate_name, gate.pattern, e
+                                "state {:?} gate {:?}: invalid regex pattern {:?}: {}{}",
+                                state_name, gate_name, gate.pattern, e, note
                             ));
                         }
                     }
@@ -952,17 +1032,37 @@ impl CompiledTemplate {
                 ));
             }
 
-            // Validate variable references in gate commands.
-            for gate in state.gates.values() {
-                for ref_name in extract_refs(&gate.command) {
-                    if !self.variables.contains_key(&ref_name)
-                        && !captures.contains_key(&ref_name)
-                        && !RUNTIME_VARIABLE_NAMES.contains(&ref_name.as_str())
-                    {
-                        return Err(format!(
-                            "state '{}': variable reference '{{{{{}}}}}' is not declared in the template's variables block",
-                            state_name, ref_name
-                        ));
+            // Validate variable references in every substitutable gate field.
+            //
+            // `key` and `pattern` joined `command` here with Issue #222, when
+            // they started substituting at run time. An undeclared reference in
+            // either is the quietest failure this compiler can catch: the raw
+            // token passes through, the store is asked for a key literally
+            // spelled `{{FOO}}-note`, and the gate reports the real key absent
+            // with nothing naming the reference. Checking here is what keeps
+            // substituting those fields from relocating that silence rather
+            // than ending it.
+            //
+            // The field list comes from `Gate::substitutable_fields` rather than
+            // being written out again here, so this loop and the runtime's
+            // cannot disagree about which fields participate -- see that
+            // accessor for why two lists is the bug rather than a tidiness
+            // question. Every gate type is checked, not only the ones that read
+            // a given field, because a stray `pattern` on a `command` gate
+            // should still not name a variable nobody declared. Gates that
+            // leave a field empty cost nothing: `extract_refs("")` is empty.
+            for (gate_name, gate) in &state.gates {
+                for (field, raw) in gate.substitutable_fields() {
+                    for ref_name in extract_refs(raw) {
+                        if !self.variables.contains_key(&ref_name)
+                            && !captures.contains_key(&ref_name)
+                            && !RUNTIME_VARIABLE_NAMES.contains(&ref_name.as_str())
+                        {
+                            return Err(format!(
+                                "state '{}': variable reference '{{{{{}}}}}' in gate '{}' '{}' is not declared in the template's variables block",
+                                state_name, ref_name, gate_name, field
+                            ));
+                        }
                     }
                 }
             }
@@ -2914,6 +3014,115 @@ mod tests {
         );
         let err = t.validate(true).unwrap_err();
         assert!(err.contains("invalid regex pattern"), "got: {}", err);
+    }
+
+    /// A gate whose `key` or `pattern` names a variable no one declared. Both
+    /// fields substitute (Issue #222), and an undeclared reference in either
+    /// leaves a raw token to be asked of the context store, so the compiler has
+    /// to be the one that catches it.
+    #[test]
+    fn rejects_undeclared_variable_in_gate_key_and_pattern() {
+        for (key, pattern, field) in [
+            ("{{MISSING}}-note", "^ok$", "key"),
+            ("review.md", "^{{MISSING}}$", "pattern"),
+        ] {
+            let mut t = minimal_template();
+            let state = t.states.get_mut("start").unwrap();
+            state.gates.insert(
+                "review".to_string(),
+                Gate {
+                    gate_type: GATE_TYPE_CONTEXT_MATCHES.to_string(),
+                    command: String::new(),
+                    timeout: 0,
+                    key: key.to_string(),
+                    pattern: pattern.to_string(),
+                    override_default: None,
+                    completion: None,
+                    name_filter: None,
+                },
+            );
+            let err = t.validate(true).unwrap_err();
+            assert!(
+                err.contains("variable reference '{{MISSING}}'")
+                    && err.contains("gate 'review'")
+                    && err.contains(field),
+                "the {} case should name the reference, the gate and the field; got: {}",
+                field,
+                err
+            );
+        }
+    }
+
+    /// A declared name, a capture name and a runtime name are all usable in a
+    /// gate's `key` and `pattern`, exactly as they are in a gate's `command`.
+    #[test]
+    fn accepts_declared_and_runtime_names_in_gate_key_and_pattern() {
+        let mut t = minimal_template();
+        t.variables.insert(
+            "SLUG".to_string(),
+            VariableDecl {
+                description: "scopes the key".to_string(),
+                required: true,
+                default: String::new(),
+            },
+        );
+        let state = t.states.get_mut("start").unwrap();
+        state.gates.insert(
+            "review".to_string(),
+            Gate {
+                gate_type: GATE_TYPE_CONTEXT_MATCHES.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: "{{SESSION_NAME}}-{{SLUG}}".to_string(),
+                pattern: "^done: {{SLUG}}$".to_string(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(BTreeMap::from([(
+                "gates.review.matches".to_string(),
+                serde_json::json!(true),
+            )])),
+        }];
+        t.validate(true).unwrap();
+    }
+
+    /// The regex check survives a pattern that references a variable, which is
+    /// what makes `pattern` substitutable at all: a raw `{{KEY}}` is not a valid
+    /// regex, so before Issue #222 such a pattern was refused outright with an
+    /// error that blamed the regex rather than the reference.
+    #[test]
+    fn pattern_stand_in_keeps_the_authors_structure() {
+        // References stand in as literals, so a valid pattern stays valid.
+        assert!(
+            regex::Regex::new(&pattern_with_refs_as_literals("^ready {{SESSION_NAME}}$")).is_ok()
+        );
+        assert!(regex::Regex::new(&pattern_with_refs_as_literals("({{A}}|{{B}})+")).is_ok());
+        // And an invalid one is still caught: only the references are replaced.
+        assert!(regex::Regex::new(&pattern_with_refs_as_literals("[invalid {{A}}")).is_err());
+        // A pattern with no reference is untouched.
+        assert_eq!(
+            pattern_with_refs_as_literals(r"status:\s+PASS"),
+            r"status:\s+PASS"
+        );
+
+        // The two positions where a literal carries structural weight of its
+        // own, pinned so the limit is recorded rather than rediscovered. See
+        // this function's docs for why neither is silent.
+        //
+        // A character-class range: the stand-in is ordered, so this compiles
+        // here, and a value of "A" would not at run time.
+        assert!(regex::Regex::new(&pattern_with_refs_as_literals("[a-{{V}}]")).is_ok());
+        assert!(regex::Regex::new("[a-A]").is_err());
+        // A repetition bound: the stand-in is not a decimal, so this is refused
+        // here even though a MAX of "5" would have run. It was refused before
+        // Issue #222 too -- a raw `{{MAX}}` is not a valid regex either.
+        assert!(regex::Regex::new(&pattern_with_refs_as_literals("a{2,{{MAX}}}")).is_err());
+        assert!(regex::Regex::new("a{2,{{MAX}}}").is_err());
+        assert!(regex::Regex::new("a{2,5}").is_ok());
     }
 
     #[test]
