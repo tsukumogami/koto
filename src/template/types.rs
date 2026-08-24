@@ -242,14 +242,29 @@ impl Gate {
     /// Adding a field here is what wires it into compile-time validation;
     /// `every_field_the_compiler_validates_is_one_the_tick_substitutes` in
     /// `src/cli/mod.rs` then fails until the runtime side is wired too, so the
-    /// pair cannot drift apart silently again. `name_filter` is deliberately
-    /// absent until #224 decides what an empty substituted value means for a
-    /// prefix that currently means "no filter" when empty.
+    /// pair cannot drift apart silently again.
+    ///
+    /// The body destructures `self` exhaustively rather than reaching for the
+    /// fields it wants, so a field added to `Gate` stops this function
+    /// compiling until someone says whether it carries references. That is the
+    /// whole guarantee: an enumeration a maintainer can forget to update is
+    /// what the fixes above were each an instance of. Do not simplify the
+    /// pattern to `..`.
     pub fn substitutable_fields(&self) -> Vec<(&'static str, &str)> {
+        let Self {
+            gate_type: _,
+            command,
+            timeout: _,
+            key,
+            pattern,
+            override_default: _,
+            completion: _,
+            name_filter: _,
+        } = self;
         vec![
-            ("command", self.command.as_str()),
-            ("key", self.key.as_str()),
-            ("pattern", self.pattern.as_str()),
+            ("command", command.as_str()),
+            ("key", key.as_str()),
+            ("pattern", pattern.as_str()),
         ]
     }
 }
@@ -293,6 +308,76 @@ pub struct ActionDecl {
     /// and nothing else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_stdout_as: Option<String>,
+}
+
+impl ActionDecl {
+    /// Every field of this action declaration that a tick substitutes `{{KEY}}`
+    /// references in, paired with the name errors report it under.
+    ///
+    /// The `Gate` counterpart above says why one list beats two, and this is
+    /// the same argument one struct over: the compiler validated `command` and
+    /// `working_dir` from two hand-written loops, and the field it validated
+    /// from neither -- `fallback` -- is Issue #228. A `default_action` command
+    /// the compiler accepted and the runtime skipped was Issue #220, on this
+    /// same struct.
+    ///
+    /// `fallback` is not here. It carries references and is refused them; see
+    /// [`ActionDecl::literal_fields`], which is the list that says so.
+    /// `capture_stdout_as` is in neither list: it declares a name rather than
+    /// carrying a reference, and the compiler checks it for collisions on its
+    /// own path.
+    ///
+    /// The body destructures `self` exhaustively for the reason
+    /// [`Gate::substitutable_fields`] gives. Do not simplify the pattern
+    /// to `..`.
+    pub fn substitutable_fields(&self) -> Vec<(&'static str, &str)> {
+        let Self {
+            command,
+            working_dir,
+            requires_confirmation: _,
+            polling: _,
+            fallback: _,
+            capture_stdout_as: _,
+        } = self;
+        vec![
+            ("command", command.as_str()),
+            ("working_dir", working_dir.as_str()),
+        ]
+    }
+
+    /// Every field of this action declaration that reaches its reader as
+    /// literal prose, paired with the name errors report it under.
+    ///
+    /// A field here promises the opposite of one in
+    /// [`ActionDecl::substitutable_fields`]: a `{{KEY}}` reference written into
+    /// it is refused at compile time rather than resolved at run time. The two
+    /// promises are why there are two lists instead of one list with a tag --
+    /// each carries its own compiler error and its own test.
+    ///
+    /// `fallback` is spliced onto a failure response's directive *after*
+    /// substitution has run, deliberately, so author prose is never exposed to
+    /// expansion. That behaviour is intended and documented on the field. What
+    /// was missing until Issue #228 was the other half: nothing told an author
+    /// that the reference they wrote would not resolve.
+    ///
+    /// The body destructures `self` exhaustively for the reason
+    /// [`Gate::substitutable_fields`] gives. Do not simplify the pattern
+    /// to `..`.
+    pub fn literal_fields(&self) -> Vec<(&'static str, &str)> {
+        let Self {
+            command: _,
+            working_dir: _,
+            requires_confirmation: _,
+            polling: _,
+            fallback,
+            capture_stdout_as: _,
+        } = self;
+        let mut fields = Vec::new();
+        if let Some(prose) = fallback {
+            fields.push(("fallback", prose.as_str()));
+        }
+        fields
+    }
 }
 
 /// Polling configuration for actions that need repeated execution.
