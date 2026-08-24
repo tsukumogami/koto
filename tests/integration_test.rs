@@ -2315,6 +2315,241 @@ All done.
 }
 
 // ---------------------------------------------------------------------------
+// Issue 220: runtime names resolve inside a default_action, not just in gates
+// ---------------------------------------------------------------------------
+
+/// Read the single line an action wrote and fail with its contents on mismatch.
+fn read_action_output(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("action should have written {}: {}", path.display(), e))
+}
+
+#[test]
+fn runtime_names_substituted_in_default_action_command() {
+    // The gate path substituted {{SESSION_NAME}} and {{SESSION_DIR}} while the
+    // action path did not, so `koto context add {{SESSION_NAME}} key` in an
+    // action wrote into a directory named with the literal token and exited 0.
+    // The declared variable is here to separate the two layers: it resolved
+    // before this fix, so a run where only it resolves is the old behaviour.
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: action-runtime-vars
+version: "1.0"
+initial_state: start
+variables:
+  SLUG:
+    description: "A declared variable, resolved by the other layer"
+    required: true
+states:
+  start:
+    default_action:
+      command: 'printf "name=[{{SESSION_NAME}}] dir=[{{SESSION_DIR}}] slug=[{{SLUG}}]" > action-out.txt'
+      fallback: "the action did not run"
+    accepts:
+      status:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: done
+        when:
+          status: ok
+  done:
+    terminal: true
+---
+
+## start
+
+Run the action.
+
+## done
+
+All done.
+"#;
+
+    init_workflow_with_vars(dir.path(), "act-vars-wf", template, &["SLUG=myslug"]);
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "act-vars-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let written = read_action_output(&dir.path().join("action-out.txt"));
+
+    assert!(
+        !written.contains("{{"),
+        "no reference should reach the shell unresolved, got: {}",
+        written
+    );
+
+    // The state stops for evidence rather than advancing to a terminal state,
+    // so the session directory is still on disk to compare against.
+    let session_dir = std::fs::canonicalize(sessions_base(dir.path()).join("act-vars-wf")).unwrap();
+    assert_eq!(
+        written,
+        format!(
+            "name=[act-vars-wf] dir=[{}] slug=[myslug]",
+            session_dir.display()
+        ),
+        "both runtime names and the declared variable should resolve in an action command"
+    );
+
+    // The recorded command is what an operator reads back when an action goes
+    // wrong, so it has to be the command that ran, not the template's text.
+    let log = std::fs::read_to_string(session_state_path(dir.path(), "act-vars-wf")).unwrap();
+    let recorded = log
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("log line should be JSON"))
+        .find(|e| e["type"] == "default_action_executed")
+        .expect("the action should have recorded an execution event")["payload"]["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !recorded.contains("{{"),
+        "the recorded command should be the substituted one, got: {}",
+        recorded
+    );
+}
+
+#[test]
+fn runtime_names_substituted_in_default_action_working_dir() {
+    // `working_dir` is validated against the same runtime names at compile
+    // time, so it has to resolve them at run time too. It keeps the plain
+    // substitution rather than the shell-safe one because it is a path, not a
+    // shell word.
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: action-runtime-workdir
+version: "1.0"
+initial_state: start
+states:
+  start:
+    default_action:
+      command: 'pwd > where.txt'
+      working_dir: "{{SESSION_NAME}}"
+      fallback: "the action did not run"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Run the action.
+
+## done
+
+All done.
+"#;
+
+    // The action's working_dir must exist for the run to start there.
+    let workdir = dir.path().join("act-wd-wf");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    init_workflow(dir.path(), "act-wd-wf", template);
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "act-wd-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let written = read_action_output(&workdir.join("where.txt"));
+    assert_eq!(
+        std::fs::canonicalize(written.trim()).unwrap(),
+        std::fs::canonicalize(&workdir).unwrap(),
+        "the action should have run in the directory {{{{SESSION_NAME}}}} names"
+    );
+}
+
+#[test]
+fn runtime_names_substituted_in_polling_gate_command() {
+    // A polling action re-evaluates the state's gates from inside its own loop.
+    // That copy of the substitution has to resolve the same names the loop's
+    // gate evaluation resolves, or a gate passes outside the polling loop and
+    // never inside it.
+    //
+    // The gate appends the name it sees on every evaluation, so the polling
+    // loop's line survives the advance loop's later evaluation of the same
+    // gate -- an overwrite would hide exactly the line under test.
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: polling-runtime-vars
+version: "1.0"
+initial_state: wait
+states:
+  wait:
+    default_action:
+      command: 'touch ready.marker'
+      polling:
+        interval_secs: 1
+        timeout_secs: 10
+    gates:
+      ready:
+        type: command
+        command: 'printf "%s\n" "{{SESSION_NAME}}" >> seen-names.txt; test -f ready.marker'
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## wait
+
+Wait for readiness.
+
+## done
+
+All done.
+"#;
+
+    init_workflow(dir.path(), "poll-vars-wf", template);
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "poll-vars-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let seen = read_action_output(&dir.path().join("seen-names.txt"));
+    let lines: Vec<&str> = seen.lines().collect();
+    assert!(
+        !lines.is_empty(),
+        "the gate should have been evaluated at least once"
+    );
+    for line in &lines {
+        assert_eq!(
+            *line, "poll-vars-wf",
+            "every gate evaluation, inside the polling loop and outside it, \
+             should see the real session name; got lines {:?}",
+            lines
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session subcommand tests (scenario-16, scenario-17, scenario-18)
 // ---------------------------------------------------------------------------
 

@@ -181,6 +181,18 @@ injection, not word splitting -- quote the reference when a value must stay a si
 command: mytool --calendar "{{CALENDAR}}"
 ```
 
+The two runtime names resolve here too. `{{SESSION_NAME}}` is the name the session was created
+under and `{{SESSION_DIR}}` is the absolute path to its directory, so an action can hand either
+to a command without the template knowing them in advance:
+
+```yaml
+command: koto context add {{SESSION_NAME}} findings.md --from-file {{SESSION_DIR}}/findings.md
+```
+
+`working_dir` resolves them as well, but `{{SESSION_DIR}}` is not usable there: it resolves to an
+absolute path, and a `working_dir` must be relative so it can be resolved against the execution
+anchor. koto refuses the action and says so.
+
 ### One command the engine refuses: `koto next`
 
 Automating a workflow's own bookkeeping by having a state tick itself looks like the obvious

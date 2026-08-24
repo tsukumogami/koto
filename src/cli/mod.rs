@@ -3003,9 +3003,29 @@ fn substitute_directive(
     variables.substitute_with(&with_runtime, overlay)
 }
 
-/// Substitute every gate command in `gates` through the same lookup order as
+/// Substitute a command string through the same lookup order as
 /// [`substitute_directive`], using the shell-safe form because the result is
 /// handed to `sh -c` (Issue #186).
+///
+/// Every string a tick hands to a shell resolves here -- gate commands and a
+/// `default_action` command alike. One function is what keeps the two from
+/// disagreeing about which names resolve, and they did disagree: an action
+/// command skipped the runtime pass, so an author who wrote
+/// `koto context add {{SESSION_NAME}} key` in an action got a session directory
+/// named with the literal token and an exit code of 0 (Issue #220).
+#[cfg(unix)]
+fn substitute_shell_command(
+    raw: &str,
+    runtime_vars: &std::collections::HashMap<String, String>,
+    variables: &crate::engine::substitute::Variables,
+    overlay: &crate::engine::substitute::VariableOverlay,
+) -> String {
+    let with_runtime = crate::cli::vars::substitute_vars(raw, runtime_vars);
+    variables.substitute_command_with(&with_runtime, overlay)
+}
+
+/// Substitute every gate command in `gates` through
+/// [`substitute_shell_command`].
 #[cfg(unix)]
 fn substitute_gate_commands(
     gates: &std::collections::BTreeMap<String, crate::template::types::Gate>,
@@ -3017,8 +3037,7 @@ fn substitute_gate_commands(
         .iter()
         .map(|(name, gate)| {
             let mut g = gate.clone();
-            let with_runtime = crate::cli::vars::substitute_vars(&g.command, runtime_vars);
-            g.command = variables.substitute_command_with(&with_runtime, overlay);
+            g.command = substitute_shell_command(&g.command, runtime_vars, variables, overlay);
             (name.clone(), g)
         })
         .collect()
@@ -4344,13 +4363,15 @@ fn handle_next(
             return ActionResult::Skipped;
         }
 
-        // Substitute variables in command and working_dir. The command goes to
-        // `sh -c`, so use the shell-safe form (Issue #186); working_dir is a
-        // path, not a shell word, so it keeps the plain substitution. Both read
-        // the overlay first, so a state whose action runs after an earlier
-        // state in this same tick produced a value can use it. Runtime names
-        // are deliberately not substituted here, exactly as before.
-        let command = variables.substitute_command_with(&action.command, &overlay);
+        // Substitute variables in command and working_dir through the tick's
+        // fixed lookup order: runtime names, then the overlay, then the log's
+        // bindings. The command goes to `sh -c`, so it uses the shell-safe form
+        // (Issue #186); working_dir is a path, not a shell word, so it keeps
+        // the plain substitution. The overlay layer is why a state whose action
+        // runs after an earlier state in this same tick can use what that state
+        // produced.
+        let command =
+            substitute_shell_command(&action.command, &runtime_vars, &variables, &overlay);
         let wd = if action.working_dir.is_empty() {
             execution_dir.clone()
         } else {
@@ -4361,7 +4382,9 @@ fn handle_next(
             // shape, same `fallback` prose. No `DefaultActionExecuted` event
             // is appended, because no command ran: the failure is reported as
             // a spawn failure, which is what it is.
-            let substituted = variables.substitute_with(&action.working_dir, &overlay);
+            let with_runtime =
+                crate::cli::vars::substitute_vars(&action.working_dir, &runtime_vars);
+            let substituted = variables.substitute_with(&with_runtime, &overlay);
             match resolve_action_working_dir(&execution_dir, &substituted) {
                 Ok(dir) => dir,
                 Err(message) => {
@@ -4385,17 +4408,10 @@ fn handle_next(
                 .states
                 .get(state_name)
                 .map(|s| {
-                    // Substitute variables in gate commands. Overlay first,
-                    // then the log's bindings; runtime names are not
-                    // substituted on this path, as before.
-                    s.gates
-                        .iter()
-                        .map(|(name, gate)| {
-                            let mut g = gate.clone();
-                            g.command = variables.substitute_command_with(&g.command, &overlay);
-                            (name.clone(), g)
-                        })
-                        .collect::<std::collections::BTreeMap<_, _>>()
+                    // Same substitution the top-level gate closure performs, so
+                    // a gate re-evaluated inside the polling loop resolves the
+                    // names it resolves outside it.
+                    substitute_gate_commands(&s.gates, &runtime_vars, &variables, &overlay)
                 })
                 .unwrap_or_default();
             execute_with_polling(
@@ -4661,9 +4677,16 @@ fn handle_next(
                             .default_action
                             .as_ref()
                             // Same substitution the action closure performed,
-                            // overlay included, so the command reported back is
-                            // the command that ran.
-                            .map(|a| variables.substitute_command_with(&a.command, &overlay))
+                            // runtime names and overlay included, so the command
+                            // reported back is the command that ran.
+                            .map(|a| {
+                                substitute_shell_command(
+                                    &a.command,
+                                    &runtime_vars,
+                                    &variables,
+                                    &overlay,
+                                )
+                            })
                             .unwrap_or_default(),
                         exit_code,
                         stdout,
@@ -7273,6 +7296,70 @@ Done.
         assert_eq!(
             substituted.get("check").unwrap().command,
             "test -f /s/abc/v1.2.3 && git log fresh"
+        );
+    }
+
+    #[test]
+    fn action_and_gate_commands_resolve_the_same_names() {
+        // Issue #220: an action command skipped the runtime-name pass that gate
+        // commands ran, so {{SESSION_NAME}} reached `sh -c` as a literal token
+        // while the same reference in a gate on the same tick resolved. Both
+        // now go through `substitute_shell_command`; this asserts they agree
+        // rather than that either one produces a particular string.
+        use crate::engine::substitute::{VariableOverlay, Variables};
+        use crate::template::types::Gate;
+
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: std::collections::HashMap::from([(
+                    "SLUG".to_string(),
+                    "myslug".to_string(),
+                )]),
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+        let variables = Variables::from_events(&events).unwrap();
+
+        let runtime_vars = std::collections::HashMap::from([
+            ("SESSION_DIR".to_string(), "/s/abc".to_string()),
+            ("SESSION_NAME".to_string(), "abc".to_string()),
+        ]);
+        let overlay = VariableOverlay::new();
+        overlay.insert("TAG", "v1.2.3");
+
+        let raw = "koto context add {{SESSION_NAME}} {{TAG}} --from-file {{SESSION_DIR}}/{{SLUG}}";
+
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            Gate {
+                gate_type: "command".to_string(),
+                command: raw.to_string(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+            },
+        );
+
+        let as_action = substitute_shell_command(raw, &runtime_vars, &variables, &overlay);
+        let as_gate = substitute_gate_commands(&gates, &runtime_vars, &variables, &overlay)
+            .get("check")
+            .unwrap()
+            .command
+            .clone();
+
+        assert_eq!(as_action, as_gate);
+        assert_eq!(
+            as_action,
+            "koto context add abc v1.2.3 --from-file /s/abc/myslug"
         );
     }
 
