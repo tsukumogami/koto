@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: Done
 problem: |
   koto states names that resolve to nothing -- a subcommand in an error message,
   a verb in a shipped skill, a path in a guide -- and every gate the repository
@@ -29,7 +29,7 @@ motivating_context: |
 
 ## Status
 
-Accepted
+Done
 
 ## Problem Statement
 

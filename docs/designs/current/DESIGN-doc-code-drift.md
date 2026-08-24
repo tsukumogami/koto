@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Current
 problem: |
   koto has no mechanism that resolves a name it states against the thing that
   name refers to. Building one needs four things decided: where the check runs,
@@ -48,7 +48,7 @@ user_visible_surface: true
 
 ## Status
 
-Accepted
+Current
 
 ## Context and Problem Statement
 

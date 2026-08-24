@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Accepted
+status: Done
 problem: |
   koto prints and documents names that resolve to nothing: a subcommand in an
   error message, a verb in a shipped skill, a path in a guide. Every gate the
@@ -22,7 +22,7 @@ motivating_context: |
 
 ## Status
 
-Accepted
+Done
 
 Framing only. The mechanism — where the check runs, how its scope is expressed,
 and what shape its escape hatch takes — is the downstream DESIGN's to settle.
