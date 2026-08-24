@@ -409,6 +409,352 @@ fn an_anchor_that_no_longer_resolves_is_a_distinct_refusal() {
 }
 
 // ---------------------------------------------------------------------------
+// R13: rebinding a session whose checkout moved
+//
+// Both refusals above name `koto session rebind` as the repair, so
+// these cases are the other half of those: a refusal a developer can
+// actually act on, and a move that lands in the log rather than
+// happening quietly.
+// ---------------------------------------------------------------------------
+
+/// The `execution_anchor_rebound` payloads in a session's log, oldest
+/// first.
+fn rebound_events(home: &Path, name: &str) -> Vec<serde_json::Value> {
+    events(home, name)
+        .into_iter()
+        .filter(|e| e["type"] == "execution_anchor_rebound")
+        .map(|e| e["payload"].clone())
+        .collect()
+}
+
+#[test]
+fn a_moved_checkout_is_repaired_by_rebinding_and_ticks_from_the_new_tree() {
+    let home = TempDir::new().unwrap();
+    let old = dir(home.path(), "checkout");
+    let moved = dir(home.path(), "moved-checkout");
+    init_at(home.path(), &old, "wf", MARKER_TEMPLATE);
+
+    // Where this starts: the session is bound to a tree the developer
+    // is no longer standing in, and the tick is refused.
+    let refused = run_koto(home.path(), &moved, &["next", "wf"]);
+    assert!(!refused.success);
+    assert_eq!(refused.json["error"]["code"], "execution_anchor_mismatch");
+
+    // The one command the refusal names.
+    let rebind = run_koto(
+        home.path(),
+        &moved,
+        &["session", "rebind", "wf", "--to", moved.to_str().unwrap()],
+    );
+    assert!(rebind.success, "rebind failed: {}", rebind.stdout);
+    assert_eq!(rebind.json["rebound"], serde_json::json!(true));
+    assert_eq!(
+        rebind.json["from"],
+        serde_json::json!(old.to_str().unwrap())
+    );
+    assert_eq!(
+        rebind.json["to"],
+        serde_json::json!(moved.to_str().unwrap())
+    );
+
+    // The header now names the new tree...
+    assert_eq!(
+        header(home.path(), "wf")["execution_dir"],
+        serde_json::json!(moved.to_str().unwrap())
+    );
+
+    // ...and the move is in the log, with both ends of it.
+    assert_eq!(
+        rebound_events(home.path(), "wf"),
+        vec![serde_json::json!({
+            "from": old.to_str().unwrap(),
+            "to": moved.to_str().unwrap(),
+        })]
+    );
+
+    // The tick that was refused now runs, and it runs in the new tree.
+    let tick = run_koto(home.path(), &moved, &["next", "wf"]);
+    assert!(
+        tick.success,
+        "the tick that was refused must now succeed: {}",
+        tick.stdout
+    );
+    assert!(
+        moved.join("marker.txt").exists(),
+        "the action must run at the new anchor"
+    );
+    assert!(!old.join("marker.txt").exists());
+}
+
+#[test]
+fn rebind_defaults_to_the_directory_it_runs_in() {
+    let home = TempDir::new().unwrap();
+    let old = dir(home.path(), "checkout");
+    let moved = dir(home.path(), "moved-checkout");
+    init_at(home.path(), &old, "wf", PLAIN_TEMPLATE);
+
+    // No `--to`: stand in the checkout you moved to and rebind.
+    let rebind = run_koto(home.path(), &moved, &["session", "rebind", "wf"]);
+    assert!(rebind.success, "rebind failed: {}", rebind.stdout);
+    assert_eq!(
+        rebind.json["to"],
+        serde_json::json!(moved.to_str().unwrap())
+    );
+    assert_eq!(
+        header(home.path(), "wf")["execution_dir"],
+        serde_json::json!(moved.to_str().unwrap())
+    );
+
+    assert!(run_koto(home.path(), &moved, &["next", "wf"]).success);
+}
+
+#[test]
+fn rebind_repairs_an_anchor_that_no_longer_resolves() {
+    // The other refusal: the recorded directory is gone, so there is
+    // nowhere to change to. Rebinding is the only way out.
+    let home = TempDir::new().unwrap();
+    let old = dir(home.path(), "checkout");
+    let moved = dir(home.path(), "moved-checkout");
+    init_at(home.path(), &old, "wf", PLAIN_TEMPLATE);
+    std::fs::remove_dir_all(&old).unwrap();
+
+    let refused = run_koto(home.path(), &moved, &["next", "wf"]);
+    assert_eq!(
+        refused.json["error"]["code"],
+        "execution_anchor_unresolvable"
+    );
+
+    let rebind = run_koto(
+        home.path(),
+        &moved,
+        &["session", "rebind", "wf", "--to", moved.to_str().unwrap()],
+    );
+    assert!(rebind.success, "rebind failed: {}", rebind.stdout);
+
+    let tick = run_koto(home.path(), &moved, &["next", "wf"]);
+    assert!(
+        tick.success,
+        "a deleted checkout must be repairable without restoring it: {}",
+        tick.stdout
+    );
+}
+
+#[test]
+fn rebind_is_symlink_and_trailing_slash_insensitive() {
+    // What lands on the header is canonical, because that is the form
+    // the per-tick check compares against.
+    let home = TempDir::new().unwrap();
+    let old = dir(home.path(), "checkout");
+    let moved = dir(home.path(), "moved-checkout");
+    let link = home.path().join("link-to-moved");
+    std::os::unix::fs::symlink(&moved, &link).unwrap();
+    init_at(home.path(), &old, "wf", PLAIN_TEMPLATE);
+
+    let rebind = run_koto(
+        home.path(),
+        &old,
+        &[
+            "session",
+            "rebind",
+            "wf",
+            "--to",
+            &format!("{}/", link.to_str().unwrap()),
+        ],
+    );
+    assert!(rebind.success, "rebind failed: {}", rebind.stdout);
+    assert_eq!(
+        header(home.path(), "wf")["execution_dir"],
+        serde_json::json!(moved.to_str().unwrap()),
+        "the anchor is stored canonical, not as the caller spelled it"
+    );
+}
+
+#[test]
+fn rebinding_to_the_directory_already_bound_appends_nothing() {
+    let home = TempDir::new().unwrap();
+    let anchor = dir(home.path(), "checkout");
+    init_at(home.path(), &anchor, "wf", PLAIN_TEMPLATE);
+    let before = event_types(home.path(), "wf");
+
+    let rebind = run_koto(
+        home.path(),
+        &anchor,
+        &["session", "rebind", "wf", "--to", anchor.to_str().unwrap()],
+    );
+    assert!(rebind.success);
+    assert_eq!(
+        rebind.json["rebound"],
+        serde_json::json!(false),
+        "an anchor that did not move is reported as not rebound"
+    );
+    assert_eq!(
+        event_types(home.path(), "wf"),
+        before,
+        "the event means the anchor moved; a no-op did not move it"
+    );
+}
+
+#[test]
+fn rebind_works_on_a_session_created_by_another_session() {
+    // R16: a child is anchored to its parent's tree, and nothing about
+    // rebinding cares how the session was created.
+    let home = TempDir::new().unwrap();
+    let old = dir(home.path(), "checkout");
+    let moved = dir(home.path(), "moved-checkout");
+    init_at(home.path(), &old, "parent", PLAIN_TEMPLATE);
+
+    let src = home.path().join("child-template.md");
+    std::fs::write(&src, MARKER_TEMPLATE).unwrap();
+    let created = run_koto(
+        home.path(),
+        &old,
+        &[
+            "init",
+            "parent.child",
+            "--template",
+            src.to_str().unwrap(),
+            "--parent",
+            "parent",
+        ],
+    );
+    assert!(created.success, "child init failed: {}", created.stdout);
+
+    let rebind = run_koto(
+        home.path(),
+        &moved,
+        &[
+            "session",
+            "rebind",
+            "parent.child",
+            "--to",
+            moved.to_str().unwrap(),
+        ],
+    );
+    assert!(rebind.success, "rebind failed: {}", rebind.stdout);
+    assert_eq!(
+        header(home.path(), "parent.child")["execution_dir"],
+        serde_json::json!(moved.to_str().unwrap())
+    );
+
+    // The child moved; the parent did not. Rebinding is per session.
+    assert_eq!(
+        header(home.path(), "parent")["execution_dir"],
+        serde_json::json!(old.to_str().unwrap())
+    );
+
+    let tick = run_koto(home.path(), &moved, &["next", "parent.child"]);
+    assert!(tick.success, "child tick failed: {}", tick.stdout);
+    assert!(moved.join("marker.txt").exists());
+}
+
+#[test]
+fn a_session_with_no_recorded_anchor_can_be_rebound_before_it_adopts_one() {
+    // A log written before anchoring existed carries no anchor to move
+    // away from, so the event records only where it landed.
+    let home = TempDir::new().unwrap();
+    let old = dir(home.path(), "checkout");
+    let moved = dir(home.path(), "moved-checkout");
+    init_at(home.path(), &old, "wf", PLAIN_TEMPLATE);
+    strip_anchor(home.path(), "wf");
+
+    let rebind = run_koto(
+        home.path(),
+        &old,
+        &["session", "rebind", "wf", "--to", moved.to_str().unwrap()],
+    );
+    assert!(rebind.success, "rebind failed: {}", rebind.stdout);
+    assert_eq!(rebind.json["from"], serde_json::Value::Null);
+
+    assert_eq!(
+        rebound_events(home.path(), "wf"),
+        vec![serde_json::json!({"to": moved.to_str().unwrap()})],
+        "with nothing to move away from, the payload carries only `to`"
+    );
+
+    // And the session is anchored now: the first tick does not adopt.
+    let tick = run_koto(home.path(), &moved, &["next", "wf"]);
+    assert!(tick.success, "tick failed: {}", tick.stdout);
+    assert!(
+        !event_types(home.path(), "wf")
+            .iter()
+            .any(|t| t == "execution_anchor_adopted"),
+        "a rebind ahead of the first tick is what bound it, so nothing adopts"
+    );
+}
+
+#[test]
+fn rebinding_to_a_directory_that_does_not_exist_leaves_the_anchor_alone() {
+    let home = TempDir::new().unwrap();
+    let anchor = dir(home.path(), "checkout");
+    init_at(home.path(), &anchor, "wf", PLAIN_TEMPLATE);
+    let before = event_types(home.path(), "wf");
+
+    let run = run_koto(
+        home.path(),
+        &anchor,
+        &[
+            "session",
+            "rebind",
+            "wf",
+            "--to",
+            "/definitely/not/a/directory/koto",
+        ],
+    );
+    assert!(!run.success, "a target that does not resolve must refuse");
+
+    assert_eq!(
+        header(home.path(), "wf")["execution_dir"],
+        serde_json::json!(anchor.to_str().unwrap()),
+        "a refused rebind must not move the anchor"
+    );
+    assert_eq!(event_types(home.path(), "wf"), before);
+}
+
+#[test]
+fn rebinding_to_a_file_rather_than_a_directory_is_refused() {
+    let home = TempDir::new().unwrap();
+    let anchor = dir(home.path(), "checkout");
+    init_at(home.path(), &anchor, "wf", PLAIN_TEMPLATE);
+    let file = home.path().join("not-a-directory");
+    std::fs::write(&file, "x").unwrap();
+
+    let run = run_koto(
+        home.path(),
+        &anchor,
+        &["session", "rebind", "wf", "--to", file.to_str().unwrap()],
+    );
+    assert!(!run.success);
+    assert_eq!(
+        header(home.path(), "wf")["execution_dir"],
+        serde_json::json!(anchor.to_str().unwrap())
+    );
+}
+
+#[test]
+fn rebinding_a_session_that_does_not_exist_is_refused() {
+    let home = TempDir::new().unwrap();
+    let anchor = dir(home.path(), "checkout");
+
+    let run = run_koto(
+        home.path(),
+        &anchor,
+        &[
+            "session",
+            "rebind",
+            "nope",
+            "--to",
+            anchor.to_str().unwrap(),
+        ],
+    );
+    assert!(!run.success);
+    assert!(
+        run.stdout.is_empty(),
+        "the refusal belongs on stderr, not in the JSON body: {}",
+        run.stdout
+    );
+}
+
+// ---------------------------------------------------------------------------
 // R14: a session written before anchoring existed
 // ---------------------------------------------------------------------------
 

@@ -10,6 +10,22 @@ to `0.9.x`).
 
 ### Added
 
+- **`koto session rebind` moves a session whose checkout moved.** Execution
+  anchoring shipped in 0.12.0 with the enforcement but not the repair: both
+  refusals told the user to run `koto session rebind <session> --to <dir>`,
+  and no such subcommand existed, so a developer whose checkout genuinely
+  moved was refused and then sent to a command that did nothing. The verb now
+  exists. `koto session rebind <name> [--to <dir>]` canonicalizes the target,
+  defaulting to the directory it runs in, writes it to the session header,
+  and appends an `execution_anchor_rebound` event carrying the directory the
+  session left and the one it landed on, so a move is audited rather than
+  silent. It is the only verb that changes an anchor, it works on a session
+  created by another session exactly as on any other, and rebinding a child
+  does not move its parent. Rebinding to the directory a session is already
+  bound to appends nothing and reports `"rebound": false`; a target that does
+  not resolve, names a file, or belongs to an unknown session is refused with
+  the anchor left alone.
+
 - **`koto session recover` brings back sessions the layout migration had to
   set aside.** The migration from the old per-repository layout flattens
   `sessions/<repo-id>/<name>/` into `sessions/<name>/`. A name reused across

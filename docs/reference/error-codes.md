@@ -104,7 +104,7 @@ Standing in a subdirectory of the anchor is fine -- the tick is accepted and its
 
 The two codes are separate because the repairs differ: change directory for the first, rebind for the second.
 
-Both messages name `koto session rebind`, which is not implemented yet -- `koto session` currently offers `start`, `dir`, `list`, `cleanup`, and `resolve`. Until it lands, the first refusal is repaired by running from the anchor, and the second by putting the checkout back where the header names. Route on the code, not on the message: the wording will change when the subcommand exists.
+Both messages name `koto session rebind <session> --to <dir>`, which moves the session's anchor to the directory you name (or, with `--to` omitted, to the directory you run it from). It's the only verb that changes an anchor, and it records the move as an `execution_anchor_rebound` event. The wrong-tree refusal can also be repaired by simply running from the anchor; the unresolvable one cannot, so rebinding is its only repair short of restoring the tree. Route on the code rather than the message text.
 
 Anchor comparison is byte-exact over `fs::canonicalize` output. That resolves `.`, `..`, and symlinks and strips trailing slashes, so a symlinked path and a trailing-slash variant of the anchor both satisfy it. It does not case-fold: a path differing only in case names a different directory and is refused, on every platform including case-insensitive filesystems.
 

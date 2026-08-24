@@ -495,6 +495,106 @@ pub fn handle_update(backend: &dyn SessionBackend, name: &str, intent: &str) -> 
     Ok(())
 }
 
+/// Move a session's execution anchor to `to`, defaulting to the
+/// current working directory.
+///
+/// The anchor is the directory every tick runs its gates and actions
+/// in, and `koto next` refuses from anywhere outside it. This is the
+/// only verb that changes one (Decision 6 of
+/// `DESIGN-koto-runs-commands.md`), so a checkout that genuinely moved
+/// is repaired by one deliberate command and the move lands in the log
+/// as an `execution_anchor_rebound` event instead of happening
+/// silently. Nothing here cares how the session was created, so it
+/// works on a child exactly as on any other session.
+///
+/// Rebinding to the directory the session is already bound to appends
+/// nothing and reports `rebound: false`. The event means the anchor
+/// moved; a no-op invocation did not move it.
+pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>) -> Result<()> {
+    use crate::engine::claim::rewrite_header_atomically;
+    use crate::engine::types::{now_iso8601, EventPayload};
+    use crate::session::state_file_name;
+    use anyhow::Context;
+    use std::path::PathBuf;
+
+    // `name` reaches a path join below, so it goes through the
+    // newtype before any filesystem call, as every other
+    // caller-supplied session id in this module does.
+    let name = ValidatedSessionId::new(name)?.into_inner();
+    let name = name.as_str();
+
+    if !backend.exists(name) {
+        anyhow::bail!("session '{}' does not exist", name);
+    }
+
+    let requested = match to {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::current_dir()
+            .context("--to was omitted and the current directory could not be read")?,
+    };
+
+    // The per-tick check compares canonical paths, so the anchor is
+    // stored the way it will be read. Canonicalizing here also means a
+    // target that does not resolve is refused now, rather than written
+    // and then refused on every tick afterwards.
+    let target = std::fs::canonicalize(&requested).with_context(|| {
+        format!(
+            "cannot rebind '{}' to {}: no such directory on this machine",
+            name,
+            requested.display()
+        )
+    })?;
+    if !target.is_dir() {
+        anyhow::bail!(
+            "cannot rebind '{}' to {}: not a directory",
+            name,
+            target.display()
+        );
+    }
+
+    let from = backend.read_header(name)?.execution_dir;
+
+    if from.as_deref() == Some(target.as_path()) {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "name": name,
+                "rebound": false,
+                "from": from,
+                "to": target,
+            }))?
+        );
+        return Ok(());
+    }
+
+    // Event first, header second, matching the adoption path in
+    // `handle_next`: a crash between the two leaves a visible record of
+    // the move rather than a silent one.
+    let payload = EventPayload::ExecutionAnchorRebound {
+        from: from.clone(),
+        to: target.clone(),
+    };
+    backend.append_event(name, &payload, &now_iso8601())?;
+
+    let state_path = backend.session_dir(name).join(state_file_name(name));
+    let recorded = target.clone();
+    rewrite_header_atomically(&state_path, |mut h| {
+        h.execution_dir = Some(recorded);
+        h
+    })?;
+
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "name": name,
+            "rebound": true,
+            "from": from,
+            "to": target,
+        }))?
+    );
+    Ok(())
+}
+
 /// Print the absolute session directory path.
 pub fn handle_dir(backend: &dyn SessionBackend, name: &str) -> Result<()> {
     let dir = backend.session_dir(name);

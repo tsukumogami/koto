@@ -709,6 +709,24 @@ pub enum EventPayload {
     ExecutionAnchorAdopted {
         anchor: PathBuf,
     },
+    /// Emitted by `koto session rebind` when a developer deliberately
+    /// moves a session's execution anchor (R13). Rebinding is the only
+    /// way an anchor changes once it is recorded, so the log tells a
+    /// reader every directory the session has been bound to and when
+    /// each move happened.
+    ///
+    /// `from` is absent when the session recorded no anchor -- a log
+    /// written before anchoring existed, rebound before a tick had the
+    /// chance to adopt one.
+    ///
+    /// Unlike [`ExecutionAnchorAdopted`](EventPayload::ExecutionAnchorAdopted),
+    /// several of these can appear in one log: a checkout can move more
+    /// than once.
+    ExecutionAnchorRebound {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<PathBuf>,
+        to: PathBuf,
+    },
     /// A state's `default_action` delivered its stdout under the name the
     /// state declared in `capture_stdout_as`
     /// (DESIGN-koto-runs-commands.md Decision 1).
@@ -1097,6 +1115,7 @@ impl EventPayload {
             EventPayload::ChildCompleted { .. } => "child_completed",
             EventPayload::IntentUpdated { .. } => "intent_updated",
             EventPayload::ExecutionAnchorAdopted { .. } => "execution_anchor_adopted",
+            EventPayload::ExecutionAnchorRebound { .. } => "execution_anchor_rebound",
             EventPayload::VariableCaptured { .. } => "variable_captured",
             EventPayload::RequestStoreResult { .. } => "request_store.result",
             EventPayload::RequestCreated { .. } => "request.created",
@@ -1368,6 +1387,14 @@ impl<'de> Deserialize<'de> for Event {
                     .map_err(serde::de::Error::custom)?;
                 EventPayload::ExecutionAnchorAdopted { anchor: p.anchor }
             }
+            "execution_anchor_rebound" => {
+                let p: ExecutionAnchorReboundPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::ExecutionAnchorRebound {
+                    from: p.from,
+                    to: p.to,
+                }
+            }
             "variable_captured" => {
                 let p: VariableCapturedPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
@@ -1615,6 +1642,13 @@ struct IntentUpdatedPayload {
 #[derive(Deserialize)]
 struct ExecutionAnchorAdoptedPayload {
     anchor: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct ExecutionAnchorReboundPayload {
+    #[serde(default)]
+    from: Option<PathBuf>,
+    to: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -2905,6 +2939,43 @@ mod tests {
         let serialized = serde_json::to_string(&event).unwrap();
         assert!(serialized.contains("intent_updated"));
         assert!(serialized.contains("test goal"));
+    }
+
+    #[test]
+    fn execution_anchor_rebound_roundtrips() {
+        use super::{Event, EventPayload};
+        let json = r#"{"seq":1,"timestamp":"2026-01-01T00:00:00Z","type":"execution_anchor_rebound","payload":{"from":"/old/checkout","to":"/new/checkout"}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        match &event.payload {
+            EventPayload::ExecutionAnchorRebound { from, to } => {
+                assert_eq!(from.as_deref(), Some(std::path::Path::new("/old/checkout")));
+                assert_eq!(to, std::path::Path::new("/new/checkout"));
+            }
+            other => panic!("expected a rebind payload, got {:?}", other),
+        }
+        let serialized = serde_json::to_string(&event).unwrap();
+        assert!(serialized.contains("execution_anchor_rebound"));
+        assert!(serialized.contains("/old/checkout"));
+    }
+
+    #[test]
+    fn execution_anchor_rebound_without_a_previous_anchor_omits_from() {
+        use super::{Event, EventPayload};
+        // A session that recorded no anchor has nothing to move away
+        // from, and the payload says so by leaving the key out rather
+        // than writing a null.
+        let json = r#"{"seq":1,"timestamp":"2026-01-01T00:00:00Z","type":"execution_anchor_rebound","payload":{"to":"/new/checkout"}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            event.payload,
+            EventPayload::ExecutionAnchorRebound { from: None, .. }
+        ));
+        let serialized = serde_json::to_string(&event).unwrap();
+        assert!(
+            !serialized.contains("\"from\""),
+            "an absent previous anchor must not serialize a key: {}",
+            serialized
+        );
     }
 
     // ===== Issue 3: ValidatedSessionId / ValidatedCoordId newtypes =====

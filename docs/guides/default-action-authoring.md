@@ -574,11 +574,20 @@ A developer whose checkout genuinely moved rebinds the session with one delibera
 koto session rebind <session> --to <dir>
 ```
 
-**This subcommand has not landed yet.** Both refusal messages already name it, and `koto session`
-currently offers `start`, `dir`, `list`, `cleanup`, `resolve`, and `update`. Until it ships, the
-mismatch refusal is repaired by running from the anchor and the unresolvable refusal by putting
-the checkout back where the header names. Route on the error code rather than the message text --
-the wording will change when the subcommand exists.
+`--to` is optional and defaults to the directory you run the command in, which is the common
+case: stand in the checkout you moved to and rebind. The target is canonicalized before it's
+recorded, and a directory that doesn't resolve is refused there and then rather than written and
+refused on every tick afterwards.
+
+This is the only verb that changes an anchor, and the move lands in the log as an
+`execution_anchor_rebound` event carrying the directory the session left and the one it landed
+on, so a rebind is auditable rather than silent. Rebinding to the directory the session is
+already bound to writes nothing and reports `"rebound": false`. It works on any session,
+including one created by another session, and rebinding a child doesn't move its parent.
+
+Both refusals name it, but the repairs still differ: the mismatch refusal can also be repaired by
+just running from the anchor, while the unresolvable one leaves rebinding as the only way out
+short of restoring the tree. Route on the error code rather than the message text.
 
 A session created before anchoring existed has no recorded directory, so it adopts the one it's
 first ticked from, records an `execution_anchor_adopted` event, and says so once on the
@@ -597,6 +606,6 @@ happened to be current, which may not be the right one.
 - [Error codes and failure kinds](../reference/error-codes.md) -- the machine-readable
   vocabulary: error codes, exit codes, `failure_kind` values, and the anchoring refusals
 - [Session feed data contract](../reference/session-feed.md) -- `default_action_executed`,
-  `variable_captured`, and `execution_anchor_adopted` payloads
+  `variable_captured`, `execution_anchor_adopted`, and `execution_anchor_rebound` payloads
 - [Template format](../../plugins/koto-skills/skills/koto-author/references/template-format.md) --
   the full template surface this action sits inside
