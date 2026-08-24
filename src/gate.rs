@@ -59,6 +59,14 @@ pub struct StructuredGateResult {
 /// When `None`, children-complete gates produce an error result. The CLI
 /// handler supplies a closure that captures the session backend and template
 /// loading logic.
+///
+/// Gates arrive here **already substituted**. A context gate's `key` and
+/// `pattern` are read as given, so passing an authored gate means asking the
+/// store for a key spelled `{{SESSION_NAME}}-note` -- which is the defect
+/// Issue #222 fixed, not a supported call. `crate::cli::substitute_gate_fields`
+/// is what produces the substituted form, and both production callers go
+/// through it. Nothing in the type distinguishes the two, so this note is the
+/// whole of the guard.
 pub fn evaluate_gates(
     gates: &BTreeMap<String, Gate>,
     working_dir: &Path,
@@ -132,6 +140,9 @@ fn evaluate_context_exists_gate(
             };
         }
     };
+    if let Some(result) = unusable_key_result(&gate.key, "exists") {
+        return result;
+    }
     if store.ctx_exists(sess, &gate.key) {
         StructuredGateResult {
             outcome: GateOutcome::Passed,
@@ -143,6 +154,45 @@ fn evaluate_context_exists_gate(
             output: serde_json::json!({"exists": false, "error": ""}),
         }
     }
+}
+
+/// The result for a context gate whose `key` the context store will not accept
+/// by the time the gate is evaluated, or `None` when the key is fine.
+///
+/// The store answers an unusable key by reporting it absent: `ctx_exists`
+/// returns `false` when validation fails, and `get` returns an error the gate
+/// renders as a plain mismatch. Either way the evidence is
+/// `{"exists": false, "error": ""}` -- byte-identical to the key genuinely not
+/// being there. That is a gate that will not pass with nothing pointing at why,
+/// which is the symptom Issue #222 was filed about, so the reason goes in the
+/// `error` field the payload already carries.
+///
+/// This became worth checking when `key` started substituting, because a
+/// reference is now how an unusable key arises. The two character sets do not
+/// line up: a variable value may hold a space, a `:` or an `@`, and
+/// `validate_context_key` allows none of them; a key must also start each
+/// `/`-separated component with an alphanumeric, so `{{PREFIX}}-note` with an
+/// empty prefix leaves `-note`, which the store refuses. Whether the two sets
+/// should converge is Issue #227; this only stops the refusal being silent.
+///
+/// `field` names the evidence key the gate's shape carries, so a caller reading
+/// `exists` or `matches` still finds it.
+fn unusable_key_result(key: &str, field: &str) -> Option<StructuredGateResult> {
+    let err = crate::session::validate::validate_context_key(key).err()?;
+    Some(StructuredGateResult {
+        outcome: GateOutcome::Error,
+        output: serde_json::json!({
+            field: false,
+            "error": format!(
+                "context gate key {:?} is not a usable context key: {}\n  \
+                 remedy: this is the key after substitution, so check what any \
+                 {{{{KEY}}}} reference in the gate's key resolved to -- an unset \
+                 optional variable leaves nothing behind. A variable value may \
+                 hold a space, ':' or '@'; a context key may not",
+                key, err
+            )
+        }),
+    })
 }
 
 fn evaluate_context_matches_gate(
@@ -162,6 +212,28 @@ fn evaluate_context_matches_gate(
             };
         }
     };
+    if let Some(result) = unusable_key_result(&gate.key, "matches") {
+        return result;
+    }
+    // An empty pattern matches every input, so a gate whose pattern collapsed to
+    // nothing would pass on content it was written to reject -- failing open,
+    // which is worse than the failing-closed symptom Issue #222 was filed about.
+    // The compiler refuses an empty authored pattern; it reads the authored
+    // string, so a pattern that is only empty after substitution is this
+    // function's to catch.
+    if gate.pattern.is_empty() {
+        return StructuredGateResult {
+            outcome: GateOutcome::Error,
+            output: serde_json::json!({
+                "matches": false,
+                "error": "context-matches pattern resolved to an empty string, \
+                          which would match any content at all; a {{KEY}} \
+                          reference in the gate's pattern has no value\n  \
+                          remedy: give the variable a default, or make the \
+                          pattern more than the reference alone"
+            }),
+        };
+    }
     let content = match store.get(sess, &gate.key) {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(s) => s,

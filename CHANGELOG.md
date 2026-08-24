@@ -74,6 +74,49 @@ to `0.9.x`).
   entered, because the run is standing in that state and the fix is not
   a routing one.
   Closes koto#221.
+- **A context gate's `key` and `pattern` now resolve `{{KEY}}`
+  references.** Substitution rewrote a gate's `command` and nothing else,
+  so a state whose action stored `{{SESSION_NAME}}-note` and whose gate
+  read `key: "{{SESSION_NAME}}-note"` disagreed about what that reference
+  meant: the store held `kprobe1-note` and the gate asked for a key
+  spelled with the raw token, reporting the real one absent. Nothing said
+  so — the compiler validated references in directives, gate commands and
+  a `default_action`, but never in these two fields, so an author got no
+  signal either way and the symptom was a gate that would not pass.
+  Scoping a context key by session name works now, and both fields join
+  the compiler's validation, so an undeclared reference in either is a
+  compile error naming the gate and the field rather than a token handed
+  to the context store.
+
+  A value substituted into `pattern` is escaped and matches itself. Of
+  the characters the value allowlist admits, only `.` is
+  regex-significant at top level; `-` and `:` become significant inside a
+  character class the author opened, and whitespace under `(?x)`. So
+  escaping costs almost nothing an author could have reached for, and a
+  dot is a version number or a session name far more often than it is a
+  wildcard. `regex::escape` leaves `:` and whitespace alone, so both are
+  escaped explicitly — the second matters because free-spacing mode
+  would otherwise make a value stop matching itself and start matching
+  something wider. One behaviour
+  changes for an existing template: a pattern containing a `{{KEY}}`
+  reference used to be rejected at compile time as an invalid regex,
+  because a raw `{{KEY}}` is not one. It now compiles, with references
+  stood in for while the pattern is checked — an authored regex that is
+  genuinely malformed is still refused.
+
+  Because the value does not exist at compile time, two run-time cases
+  are reported as a gate error with the reason rather than as a plain
+  mismatch: a `key` that resolves to something the context store will not
+  accept, and a `pattern` that resolves to empty. The second matters most
+  — an empty regex matches every input, so without the guard a gate whose
+  pattern was a single reference to an unset variable would pass on
+  content it was written to reject. That is the opposite of the symptom
+  this issue reports, and the more dangerous direction.
+
+  A `children-complete` gate's `name_filter` remains unsubstituted; that
+  is koto#224. Whether the value allowlist and the context-key rules
+  should converge is koto#227.
+  Closes koto#222.
 
 - **`{{SESSION_NAME}}` and `{{SESSION_DIR}}` now resolve inside a
   `default_action` command.** Both reached `sh -c` as literal text while

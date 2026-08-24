@@ -2,8 +2,9 @@
 //!
 //! Replaces `{{KEY}}` tokens with values from a variable map. `handle_next` uses
 //! it to inject `SESSION_DIR` and `SESSION_NAME` into every string a tick
-//! substitutes -- directives and details, gate commands, and a `default_action`
-//! command and its `working_dir` -- before they reach the shell or JSON
+//! substitutes -- directives and details, a gate's `command`, `key` and
+//! `pattern`, and a `default_action` command and its `working_dir` -- before
+//! they reach the shell, the context store, the regex engine, or JSON
 //! serialization. `handle_status` uses it on the same directive and details, so
 //! phase retrieval matches what `koto next` renders.
 //!
@@ -23,11 +24,36 @@ pub const RESERVED_VARIABLE_NAMES: &[&str] = &["SESSION_DIR", "SESSION_NAME"];
 /// Iterates over the map and performs a sequential `str::replace` for each
 /// entry. Tokens that don't appear in `input` are silently ignored; tokens
 /// in `input` whose keys are absent from `vars` are left as-is.
+///
+/// [`substitute_vars_regex_literal`] is a second copy of this loop for the one
+/// input the regex engine compiles. Change how a token is matched here and it
+/// needs changing there too.
 pub fn substitute_vars(input: &str, vars: &HashMap<String, String>) -> String {
     let mut result = input.to_string();
     for (key, value) in vars {
         let token = format!("{{{{{}}}}}", key);
         result = result.replace(&token, value);
+    }
+    result
+}
+
+/// Like [`substitute_vars`], but for an `input` the regex engine will compile --
+/// a `context-matches` gate's `pattern` is the one in the tree.
+///
+/// Each value is escaped so it matches itself. Both names need it. A session
+/// name may contain a dot (`validate_workflow_name`), and `SESSION_DIR` is a
+/// filesystem path built from the user's koto root, so it can hold characters
+/// the declared-variable allowlist never has to consider -- a `+` or a paren in
+/// a home directory would otherwise be read as a quantifier or a group
+/// (Issue #222).
+pub fn substitute_vars_regex_literal(input: &str, vars: &HashMap<String, String>) -> String {
+    let mut result = input.to_string();
+    for (key, value) in vars {
+        let token = format!("{{{{{}}}}}", key);
+        result = result.replace(
+            &token,
+            &crate::engine::substitute::escape_value_for_pattern(value),
+        );
     }
     result
 }
@@ -111,5 +137,65 @@ mod tests {
     #[test]
     fn reserved_variable_names_includes_session_dir() {
         assert!(RESERVED_VARIABLE_NAMES.contains(&"SESSION_DIR"));
+    }
+
+    #[test]
+    fn regex_literal_escapes_the_value_not_the_pattern() {
+        // A session name may hold a dot, and a session directory is a path
+        // built from the user's home, so either can carry a character the regex
+        // engine would otherwise read as structure (Issue #222).
+        let mut vars = HashMap::new();
+        vars.insert("SESSION_NAME".to_string(), "probe.one".to_string());
+
+        let out = substitute_vars_regex_literal("^saw {{SESSION_NAME}}$", &vars);
+        assert_eq!(out, r"^saw probe\.one$");
+
+        // The anchors the author wrote still anchor, and the escaped dot only
+        // matches a dot.
+        let re = regex::Regex::new(&out).unwrap();
+        assert!(re.is_match("saw probe.one"));
+        assert!(!re.is_match("saw probeXone"));
+    }
+
+    #[test]
+    fn regex_literal_closes_the_two_gaps_regex_escape_leaves_open() {
+        // Found by probing rather than by reading `regex::escape`'s docs, and
+        // both need the author to have opened the shape -- which is why they are
+        // pinned here rather than left as a caveat in a comment.
+        let mut vars = HashMap::new();
+
+        // A colon can complete a POSIX class name inside a class the author
+        // opened: `[[{{V}}digit:]]` would become `[[:digit:]]`.
+        vars.insert("SESSION_NAME".to_string(), ":".to_string());
+        let out = substitute_vars_regex_literal("^[[{{SESSION_NAME}}digit:]]+$", &vars);
+        let re = regex::Regex::new(&out).unwrap();
+        assert!(
+            !re.is_match("123"),
+            "a value must not be able to supply a character class; got {out}"
+        );
+
+        // Whitespace is discarded under `(?x)`, so an unescaped space makes the
+        // value stop matching itself and start matching something wider.
+        vars.insert("SESSION_NAME".to_string(), "a b".to_string());
+        let out = substitute_vars_regex_literal("(?x)^{{SESSION_NAME}}$", &vars);
+        let re = regex::Regex::new(&out).unwrap();
+        assert!(
+            re.is_match("a b"),
+            "the value should match itself; got {out}"
+        );
+        assert!(
+            !re.is_match("ab"),
+            "free-spacing mode must not widen the value; got {out}"
+        );
+    }
+
+    #[test]
+    fn regex_literal_leaves_a_pattern_without_tokens_alone() {
+        let mut vars = HashMap::new();
+        vars.insert("SESSION_NAME".to_string(), "probe.one".to_string());
+        assert_eq!(
+            substitute_vars_regex_literal(r"status:\s+PASS", &vars),
+            r"status:\s+PASS"
+        );
     }
 }

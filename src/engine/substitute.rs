@@ -110,6 +110,106 @@ impl VariableOverlay {
     }
 }
 
+/// How a resolved value is written into the string being substituted.
+///
+/// The form follows what the surrounding string is about to be handed to, not
+/// what the value looks like, because the consumer is what decides whether a
+/// character in the value is read as itself. This is the one place the whole
+/// argument is written down; the call-site helpers point here.
+///
+/// The three are not as uniform as that reads, and the difference matters to
+/// anyone adding a fourth. Each variant settles two independent things -- what
+/// an empty value renders as, and what a non-empty one is transformed into --
+/// and no variant so far needs both. `Plain` is identity on both. `RegexLiteral`
+/// escapes and leaves the empty case alone. `ShellWord` is the odd one: its
+/// non-empty case falls through to `Plain`'s arm, and the whole variant exists
+/// for its empty case, which is decided by looking at the characters on either
+/// side of the reference rather than at the value. So a fourth *escaping* form
+/// slots in beside `RegexLiteral` additively, while a form needing both cells
+/// filled has to be placed in the right arm of `substitute_inner`'s match --
+/// which is ordered, and which nothing here would catch getting wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueForm {
+    /// Verbatim. Directives, details, an action's `working_dir`, and a context
+    /// gate's `key` -- none of them are parsed further, so a value means itself
+    /// already. An empty value renders as nothing, which is why
+    /// `key: "{{PREFIX}}note"` with an empty prefix asks the context store for
+    /// `note` rather than for `''note`.
+    Plain,
+    /// Verbatim, except that an empty value becomes an explicit `''` so an
+    /// unquoted `--flag {{VAR}}` stays a well-formed argument (Issue #186).
+    /// For strings that reach `sh -c`.
+    ShellWord,
+    /// Escaped, so the value contributes literal characters and nothing else.
+    /// For a string the regex engine compiles -- a `context-matches` gate's
+    /// `pattern` is the only one a tick substitutes (Issue #222).
+    ///
+    /// Escaping loses almost no expressive power, because [`VALUE_PATTERN`] has
+    /// already spent it. A value can carry no anchor, group, alternation or
+    /// quantifier into a pattern under either reading: not one of
+    /// `^ $ ( ) [ ] * + ? | \` is in the set. What it can carry is narrow, and
+    /// listing it is the whole of what the escape decides -- `.` as a wildcard,
+    /// `-` as a range operator inside a class the author opened, `:` as the
+    /// delimiter of a POSIX class name, whitespace under `(?x)`, and an
+    /// alphanumeric as a range endpoint or the body of a class name. Every one
+    /// of those is far more often an accident than an intent: a `.` is a version
+    /// number or a session name, and `validate_workflow_name` permits one, so
+    /// `{{SESSION_NAME}}` scoping a pattern would otherwise match sessions it
+    /// was written to exclude. [`escape_value_for_pattern`] closes all of them,
+    /// including the two `regex::escape` leaves alone. The cost is real but
+    /// small -- `[{{CHARS}}]` with `CHARS` of `a-z` used to build a range and
+    /// now matches those three characters literally.
+    ///
+    /// Two consequences a maintainer needs before touching this. The value is
+    /// not wrapped in a group, so a quantifier written immediately after a
+    /// reference binds to the value's last character: `{{TAG}}?` with a `TAG` of
+    /// `v1` is `v1?`, not "optionally `v1`". Grouping would fix that and break
+    /// the character-class case above, which is the more defensible of the two
+    /// to keep working. And the escape is load-bearing outside this module --
+    /// see the warning on [`Variables::substitute_regex_literal_with`].
+    RegexLiteral,
+}
+
+/// Render `value` so a regex reads every character in it as itself.
+///
+/// `regex::escape` is most of this, and would be all of it if the only thing
+/// that mattered were the metacharacter set. Two characters it deliberately
+/// leaves alone can still reach a pattern's structure, and both were found by
+/// probing rather than by reading the escape's documentation:
+///
+/// - `:` delimits a POSIX class name, so a value of `:` completes
+///   `[[{{V}}digit:]]` into `[[:digit:]]` and the value contributes a character
+///   class rather than a literal.
+/// - whitespace is discarded under `(?x)`, so `(?x)^{{V}}$` with a `V` of `a b`
+///   stops matching `a b` and starts matching `ab`. That is the widening
+///   direction -- the gate rejects the value it was scoped to and accepts a
+///   string nobody wrote -- which is the exact hazard escaping exists to close.
+///
+/// Both need the author to have opened the shape (`[[`, or `(?x)`), so neither
+/// is likely. They are closed anyway, because "the value means itself" is worth
+/// being true rather than nearly true: a caveat is something the next author has
+/// to know, and this one would have lived only in a comment.
+///
+/// `\x{..}` rather than a backslash escape because it is unambiguous in all
+/// three positions a value can land in -- top level, inside a character class
+/// the author opened, and under `(?x)`.
+pub fn escape_value_for_pattern(value: &str) -> String {
+    let escaped = regex::escape(value);
+    if !escaped.chars().any(|c| c == ':' || c.is_whitespace()) {
+        return escaped;
+    }
+    escaped
+        .chars()
+        .map(|c| {
+            if c == ':' || c.is_whitespace() {
+                format!("\\x{{{:x}}}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Error returned when a variable value fails validation.
 #[derive(Debug)]
 pub struct SubstitutionError {
@@ -185,7 +285,7 @@ impl Variables {
     /// depth: a missing variable is a user or template error, not an internal
     /// invariant break that should crash with a backtrace (Issue #184).
     pub fn substitute(&self, input: &str) -> String {
-        self.substitute_inner(input, false, None)
+        self.substitute_inner(input, ValueForm::Plain, None)
     }
 
     /// Like [`substitute`](Self::substitute), but consults a per-tick overlay
@@ -199,7 +299,7 @@ impl Variables {
     /// pass, a value that itself contains a `{{...}}` token is never
     /// re-expanded.
     pub fn substitute_with(&self, input: &str, overlay: &VariableOverlay) -> String {
-        self.substitute_inner(input, false, Some(overlay))
+        self.substitute_inner(input, ValueForm::Plain, Some(overlay))
     }
 
     /// Like [`substitute`](Self::substitute), but safe for values that land in a
@@ -218,20 +318,47 @@ impl Variables {
     /// does: quoting a value that may contain spaces stays the template author's
     /// responsibility (Issue #180), so this method changes nothing for them.
     pub fn substitute_command(&self, input: &str) -> String {
-        self.substitute_inner(input, true, None)
+        self.substitute_inner(input, ValueForm::ShellWord, None)
     }
 
     /// Like [`substitute_command`](Self::substitute_command), but consults a
     /// per-tick overlay before the bindings read from the log. Same lookup
     /// order as [`substitute_with`](Self::substitute_with).
     pub fn substitute_command_with(&self, input: &str, overlay: &VariableOverlay) -> String {
-        self.substitute_inner(input, true, Some(overlay))
+        self.substitute_inner(input, ValueForm::ShellWord, Some(overlay))
+    }
+
+    /// Like [`substitute_with`](Self::substitute_with), but for a string that is
+    /// compiled as a regex -- a `context-matches` gate's `pattern` is the one in
+    /// the tree.
+    ///
+    /// Each resolved value is escaped, so it contributes literal characters and
+    /// nothing else. The surrounding pattern is untouched: anchors, classes and
+    /// quantifiers the author wrote still mean what they say, and a pattern
+    /// holding no `{{KEY}}` reference comes back byte-identical. Why escaping
+    /// rather than raw substitution, and what it costs, is argued once on
+    /// [`ValueForm::RegexLiteral`].
+    ///
+    /// **The escape is load-bearing outside this module, and weakening it is not
+    /// a local change.** `CompiledTemplate::validate` checks that a `pattern` is
+    /// a valid regex before any value exists, by compiling it with each
+    /// reference stood in for by one literal character
+    /// (`pattern_with_refs_as_literals` in `src/template/types.rs`). That check
+    /// is sound only because an escaped value contributes literal characters and
+    /// nothing else, so one placeholder stands in for it faithfully. Substitute
+    /// raw and the check becomes one a value can defeat: a pattern that compiles
+    /// at `koto init` and fails at the gate, or -- worse -- a value that quietly
+    /// widens a narrow pattern. The unit tests that pin the escape fail if it is
+    /// removed, but they read as "escaping changed", so they will not tell you
+    /// this. Revisit the compile-time check in the same breath.
+    pub fn substitute_regex_literal_with(&self, input: &str, overlay: &VariableOverlay) -> String {
+        self.substitute_inner(input, ValueForm::RegexLiteral, Some(overlay))
     }
 
     fn substitute_inner(
         &self,
         input: &str,
-        shell_safe: bool,
+        form: ValueForm,
         overlay: Option<&VariableOverlay>,
     ) -> String {
         let re = Regex::new(VAR_REF_PATTERN).expect("VAR_REF_PATTERN is a valid regex");
@@ -253,7 +380,7 @@ impl Variables {
                 .or_else(|| self.vars.get(key).cloned());
 
             match resolved.as_deref() {
-                Some(value) if shell_safe && value.is_empty() => {
+                Some(value) if form == ValueForm::ShellWord && value.is_empty() => {
                     // Empty value in a shell command. Emit an explicit empty
                     // argument so the token stays a distinct, empty word --
                     // unless the author already wrapped the reference in a
@@ -267,10 +394,22 @@ impl Variables {
                         result.push_str("''");
                     }
                 }
+                Some(value) if form == ValueForm::RegexLiteral => {
+                    // Not only so the value means itself: the compiler's
+                    // regex check on a `pattern` stands each reference in for
+                    // one literal character, which is faithful only while this
+                    // escape holds. See `substitute_regex_literal_with`.
+                    result.push_str(&escape_value_for_pattern(value))
+                }
                 Some(value) => result.push_str(value),
                 None => {
                     // Undefined reference: pass the literal token through rather
-                    // than panic (Issue #184). See the method docs.
+                    // than panic (Issue #184). See the method docs. Under
+                    // `RegexLiteral` that token is not a valid regex, so the
+                    // gate reports `invalid regex pattern` instead of quietly
+                    // failing to match -- which is the louder of the two, and
+                    // the reason `pattern` was the better-off half before
+                    // Issue #222.
                     result.push_str(whole_match.as_str());
                 }
             }

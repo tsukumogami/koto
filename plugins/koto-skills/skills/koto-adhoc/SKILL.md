@@ -121,7 +121,7 @@ A workflow that compiles isn't automatically a good workflow. Run your decomposi
 - Add a gate at a **real verification boundary** — a point where the workflow must not proceed until something is objectively true (tests pass, a file exists, a service is reachable). The gate is the machine checking, not you asserting.
 - Don't gate on things only you can judge ("the code looks clean"). That's an `accepts` evidence field with a `when` route, not a gate.
 - Every gate needs `gates.<name>.<field>` routing on the same state's transitions. A gate with no routing is rejected on the strict path.
-- Prefer `context-exists` / `context-matches` gates over `command` gates when checking a path or file that comes from a variable — they don't invoke a shell and avoid injection.
+- Prefer `context-exists` / `context-matches` gates over `command` gates when checking a path or file that comes from a variable — they don't invoke a shell and avoid injection. Their `key` and `pattern` resolve `{{KEY}}` references, so `key: "{{SESSION_NAME}}-note"` finds the key an action beside it stored under the same reference. A value substituted into `pattern` is escaped and matches itself, so put the regex structure in the pattern and let the variable carry the value.
 
 **When to let koto run the command**
 

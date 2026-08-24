@@ -73,7 +73,7 @@ Initializes a new workflow. Provide the definition one of two ways:
 - Exit 1: a `--from-stdin` definition that fails strict validation. No session is created, the process exits non-zero, and the error **names the failing element** (state / transition / gate) — for example `state "start" references undefined transition target "nowhere"` — so you can correct the definition and re-pipe it.
 
 **Notes:**
-- `--var` values are validated against an allowlist because a substituted `{{KEY}}` can land in a gate command (run via `sh -c`) or an agent instruction. Allowed characters: letters, digits, `. _ - /`, `:`, `@`, and spaces. This covers structured data values such as Gmail filters (`newer_than:90d`, `from:user@example.com`) and names with spaces (a calendar title). Shell metacharacters -- `;` `|` `&` `$` `(` `)` `<` `>` `*` `?`, quotes, backticks, and newlines -- are **rejected** so a value cannot inject a command. A space is allowed but is not shell-quoted for you: when a value may contain spaces, quote the reference in the template (e.g. `--calendar "{{CALENDAR}}"`) so it stays a single argument. An empty value (an optional variable left unset, or one with an empty default) is safe unquoted: `--flag {{VAR}}` renders `--flag ''` rather than dropping the token, so the next flag isn't consumed as the value.
+- `--var` values are validated against an allowlist because a substituted `{{KEY}}` can land in a gate command (run via `sh -c`), an agent instruction, a context key, or a `context-matches` regex. Allowed characters: letters, digits, `. _ - /`, `:`, `@`, and spaces. This covers structured data values such as Gmail filters (`newer_than:90d`, `from:user@example.com`) and names with spaces (a calendar title). Shell metacharacters -- `;` `|` `&` `$` `(` `)` `<` `>` `*` `?`, quotes, backticks, and newlines -- are **rejected** so a value cannot inject a command. A space is allowed but is not shell-quoted for you: when a value may contain spaces, quote the reference in the template (e.g. `--calendar "{{CALENDAR}}"`) so it stays a single argument. An empty value (an optional variable left unset, or one with an empty default) is safe unquoted: `--flag {{VAR}}` renders `--flag ''` rather than dropping the token, so the next flag isn't consumed as the value.
 - Reserved variable names `SESSION_DIR` and `SESSION_NAME` cannot be declared in templates. They are injected automatically. A state's `capture_stdout_as` name is also reserved against them, and against every other state's capture name — the compiler rejects a collision.
 - The session records an **execution anchor** at init: the canonical directory `koto init` ran in, or `--execution-dir` when given. Every later `koto next` must run there or beneath it, and every gate and action of an accepted tick runs at the anchor itself. A child created with `--parent` copies the parent's recorded anchor rather than taking the spawning process's directory, which keeps a whole workflow tree pointed at one checkout. See the `koto next` section below.
 - If a `--template` source uses legacy-mode gates (no `gates.*` when-clause routing), `koto init` emits a warning to **stderr** and still succeeds. The `--from-stdin` path is strict: a legacy gate is **rejected**, naming the offending state and gate.
@@ -902,7 +902,7 @@ Compiles a template source file to a cached JSON file and prints the cache path.
 
 ## Variable substitution
 
-Two variable tokens are available at runtime without any declaration, in every string koto substitutes: directives, details, gate commands, and a `default_action` command and its `working_dir`.
+Two variable tokens are available at runtime without any declaration, in every string koto substitutes: directives, details, a gate's `command`, `key` and `pattern`, and a `default_action` command and its `working_dir`.
 
 | Token | Value |
 |---|---|
@@ -910,6 +910,15 @@ Two variable tokens are available at runtime without any declaration, in every s
 | `{{SESSION_NAME}}` | The workflow name passed to `koto init` |
 
 User-defined variables declared in the template's `variables:` block and supplied via `koto init --var` use the same `{{KEY}}` syntax. Substitution is non-recursive.
+
+The form differs by what the string is handed to, which matters when you are reading a gate's evidence back. A gate `command` and a `default_action` command are shell-safe: an empty value renders as `''` so an unquoted `--flag {{VAR}}` stays well-formed. A context gate's `key` is a store key, so an empty value renders as nothing. A `context-matches` `pattern` is a regex, so each substituted value is escaped and matches itself -- a session named `probe.one` in a pattern matches `probe.one` and not `probeXone`.
+
+Two ways a reference can leave a context gate unusable, both reported as a gate `error` with the reason rather than as a plain mismatch:
+
+- The `key` resolves to something the context store will not accept -- empty, or not matching the key rules (each `/`-separated component starts with a letter or digit, then letters, digits, `.`, `_`, `-`). Note the value allowlist is wider than that: a space, `:` or `@` is a legal value and an illegal key.
+- The `pattern` resolves to an empty string. An empty regex matches everything, so the gate refuses rather than passing on any content at all.
+
+A `children-complete` gate's `name_filter` is the one gate field that does not substitute. Write that prefix literally.
 
 ---
 
