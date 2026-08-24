@@ -181,17 +181,20 @@ injection, not word splitting -- quote the reference when a value must stay a si
 command: mytool --calendar "{{CALENDAR}}"
 ```
 
-The two runtime names resolve here too. `{{SESSION_NAME}}` is the name the session was created
-under and `{{SESSION_DIR}}` is the absolute path to its directory, so an action can hand either
-to a command without the template knowing them in advance:
+The two runtime names resolve here too, but they arrive by a different route and the allowlist
+above does not apply to them. `{{SESSION_NAME}}` is the name the session was created under and
+`{{SESSION_DIR}}` is the absolute path to its directory; both are produced by the engine, not by
+a caller, and both are replaced in an earlier pass than the one that checks values. `SESSION_NAME`
+is constrained by the workflow-name rules, so it is safe unquoted. `SESSION_DIR` is not: it is
+built from the operator's home directory, which can contain a space. Quote it.
 
 ```yaml
-command: koto context add {{SESSION_NAME}} findings.md --from-file {{SESSION_DIR}}/findings.md
+command: koto context add {{SESSION_NAME}} findings.md --from-file "{{SESSION_DIR}}/findings.md"
 ```
 
-`working_dir` resolves them as well, but `{{SESSION_DIR}}` is not usable there: it resolves to an
-absolute path, and a `working_dir` must be relative so it can be resolved against the execution
-anchor. koto refuses the action and says so.
+`working_dir` resolves both names as well, but `{{SESSION_DIR}}` is not usable there: it resolves
+to an absolute path, and a `working_dir` must be relative so it can be resolved against the
+execution anchor. koto refuses the action and says so.
 
 ### One command the engine refuses: `koto next`
 

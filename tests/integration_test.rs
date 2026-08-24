@@ -2479,6 +2479,149 @@ All done.
 }
 
 #[test]
+fn session_dir_in_working_dir_is_refused_as_absolute() {
+    // {{SESSION_DIR}} resolves to an absolute path, and a working_dir has to be
+    // relative so it can be resolved against the execution anchor. Before the
+    // token resolved, this failed as a missing directory and said nothing about
+    // why; the refusal now names the reason.
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: action-abs-workdir
+version: "1.0"
+initial_state: start
+states:
+  start:
+    default_action:
+      command: 'pwd > where.txt'
+      working_dir: "{{SESSION_DIR}}"
+      fallback: "the action did not run"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Run the action.
+
+## done
+
+All done.
+"#;
+
+    init_workflow(dir.path(), "act-abs-wf", template);
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "act-abs-wf"])
+        .output()
+        .unwrap();
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+
+    let condition = json["blocking_conditions"]
+        .as_array()
+        .and_then(|c| c.first())
+        .expect("the action failure should be reported as a blocking condition");
+    let stderr = condition["output"]["stderr"].as_str().unwrap_or_default();
+
+    assert!(
+        stderr.contains("working_dir must be relative"),
+        "the refusal should name the reason, got: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("{{"),
+        "the refusal should report the resolved path, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn confirmation_response_reports_the_command_that_ran() {
+    // The response echo used to re-substitute the template text after the
+    // advancement loop, by which point the overlay held this state's own
+    // capture -- so a command referencing its own capture name was reported
+    // resolved when it had run unresolved. The executed string is carried out
+    // of the loop instead.
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: confirm-echo
+version: "1.0"
+initial_state: start
+states:
+  start:
+    default_action:
+      command: 'test -z "{{TOKEN}}" ; printf "sess-{{SESSION_NAME}}"'
+      capture_stdout_as: TOKEN
+      requires_confirmation: true
+      fallback: "the action did not run"
+    accepts:
+      confirmed:
+        type: enum
+        required: true
+        values: [yes]
+    transitions:
+      - target: done
+        when:
+          confirmed: yes
+  done:
+    terminal: true
+---
+
+## start
+
+Confirm the action.
+
+## done
+
+All done.
+"#;
+
+    init_workflow(dir.path(), "confirm-echo-wf", template);
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "confirm-echo-wf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "next should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    let echoed = json["action_output"]["command"].as_str().unwrap();
+
+    // The runtime name resolved before the command ran, so the echo carries it.
+    assert!(
+        echoed.contains("sess-confirm-echo-wf"),
+        "the echo should carry the resolved session name, got: {}",
+        echoed
+    );
+
+    let log = std::fs::read_to_string(session_state_path(dir.path(), "confirm-echo-wf")).unwrap();
+    let recorded = log
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("log line should be JSON"))
+        .find(|e| e["type"] == "default_action_executed")
+        .expect("the action should have recorded an execution event")["payload"]["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_eq!(
+        echoed, recorded,
+        "the echoed command should be the one the event log records as executed"
+    );
+}
+
+#[test]
 fn runtime_names_substituted_in_polling_gate_command() {
     // A polling action re-evaluates the state's gates from inside its own loop.
     // That copy of the substitution has to resolve the same names the loop's

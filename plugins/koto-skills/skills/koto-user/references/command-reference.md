@@ -902,7 +902,7 @@ Compiles a template source file to a cached JSON file and prints the cache path.
 
 ## Variable substitution
 
-Two variable tokens are available at runtime without any declaration, in every string koto substitutes: gate commands, `default_action` commands and their `working_dir`, state directives, and details text.
+Two variable tokens are available at runtime without any declaration, in every string koto substitutes: directives, details, gate commands, and a `default_action` command and its `working_dir`.
 
 | Token | Value |
 |---|---|

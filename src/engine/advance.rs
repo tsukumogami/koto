@@ -345,8 +345,14 @@ pub enum StopReason {
     /// Safety limit: exceeded 100 transitions in one invocation.
     ChainLimitReached,
     /// Action executed but requires user confirmation before continuing.
+    ///
+    /// `command` is the substituted string that ran, carried rather than
+    /// re-derived: by the time the caller builds its response the overlay holds
+    /// this state's own capture, so substituting the template text a second
+    /// time can produce a command that never executed (Issue #220).
     ActionRequiresConfirmation {
         state: String,
+        command: String,
         exit_code: i32,
         stdout: String,
         stderr: String,
@@ -670,6 +676,7 @@ where
                         advanced,
                         stop_reason: StopReason::ActionRequiresConfirmation {
                             state,
+                            command,
                             exit_code,
                             stdout,
                             stderr,
@@ -3544,11 +3551,13 @@ mod tests {
         match &result.stop_reason {
             StopReason::ActionRequiresConfirmation {
                 state,
+                command,
                 exit_code,
                 stdout,
                 ..
             } => {
                 assert_eq!(state, "confirm");
+                assert_eq!(command, "gh pr create");
                 assert_eq!(*exit_code, 0);
                 assert_eq!(stdout, "PR #42 created");
             }
