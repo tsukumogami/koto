@@ -617,7 +617,7 @@ Prints the absolute path of the session directory to stdout (plain text, not JSO
 /home/user/.koto/sessions/a1b2c3d4e5f6a7b8/my-workflow
 ```
 
-The path always ends with the session name as the last component. This is the same path that `{{SESSION_DIR}}` resolves to in gate commands, action commands, and state directives. Always exits 0 — the path is computed from the name, not read from disk.
+The path always ends with the session name as the last component. This is the same path that `{{SESSION_DIR}}` resolves to everywhere koto substitutes it (see Variable substitution below). Always exits 0 — the path is computed from the name, not read from disk.
 
 ---
 

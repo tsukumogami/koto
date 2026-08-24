@@ -2545,6 +2545,12 @@ fn confirmation_response_reports_the_command_that_ran() {
     // capture -- so a command referencing its own capture name was reported
     // resolved when it had run unresolved. The executed string is carried out
     // of the loop instead.
+    //
+    // The command deliberately keeps every `{{...}}` reference out of its
+    // stdout: the captured value has to satisfy the value allowlist, which
+    // rejects `{`, so a template whose capture carried an unresolved token
+    // would fail before the confirmation stop and this test would prove
+    // nothing about the echo.
     let dir = TempDir::new().unwrap();
     let template = r#"---
 name: confirm-echo
@@ -2553,7 +2559,7 @@ initial_state: start
 states:
   start:
     default_action:
-      command: 'test -z "{{TOKEN}}" ; printf "sess-{{SESSION_NAME}}"'
+      command: 'test -z "{{TOKEN}}{{SESSION_NAME}}" ; printf ok'
       capture_stdout_as: TOKEN
       requires_confirmation: true
       fallback: "the action did not run"
@@ -2599,7 +2605,7 @@ All done.
 
     // The runtime name resolved before the command ran, so the echo carries it.
     assert!(
-        echoed.contains("sess-confirm-echo-wf"),
+        echoed.contains("confirm-echo-wf"),
         "the echo should carry the resolved session name, got: {}",
         echoed
     );

@@ -4410,9 +4410,12 @@ fn handle_next(
                 .states
                 .get(state_name)
                 .map(|s| {
-                    // Same substitution the top-level gate closure performs, so
-                    // a gate re-evaluated inside the polling loop resolves the
-                    // names it resolves outside it.
+                    // Same helper and same order as the top-level gate closure,
+                    // so a gate re-evaluated inside the polling loop resolves
+                    // the names available at that point exactly as it does
+                    // outside it. The overlay still differs: this runs before
+                    // the action's own capture is delivered, so a gate naming
+                    // its own state's capture cannot see it here.
                     substitute_gate_commands(&s.gates, &runtime_vars, &variables, &overlay)
                 })
                 .unwrap_or_default();
@@ -7298,10 +7301,13 @@ Done.
     fn action_and_gate_commands_resolve_the_same_names() {
         // Issue #220: an action command skipped the runtime-name pass that gate
         // commands ran, so {{SESSION_NAME}} reached `sh -c` as a literal token
-        // while the same reference in a gate on the same tick resolved. Both
-        // now call `substitute_shell_command`, which makes the equality below a
-        // drift guard: it fails if either side stops going through the helper.
-        // The literal assertion is what pins the shared order.
+        // while the same reference in a gate on the same tick resolved.
+        //
+        // This calls the helper directly, so the equality below guards the gate
+        // side -- it fails if `substitute_gate_commands` stops delegating. The
+        // action call site is covered end-to-end by
+        // `runtime_names_substituted_in_default_action_command` in
+        // tests/integration_test.rs. The literal assertion pins the shared order.
         use crate::engine::substitute::{VariableOverlay, Variables};
         use crate::template::types::Gate;
 

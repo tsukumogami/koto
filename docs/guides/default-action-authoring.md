@@ -181,12 +181,17 @@ injection, not word splitting -- quote the reference when a value must stay a si
 command: mytool --calendar "{{CALENDAR}}"
 ```
 
-The two runtime names resolve here too, but they arrive by a different route and the allowlist
-above does not apply to them. `{{SESSION_NAME}}` is the name the session was created under and
-`{{SESSION_DIR}}` is the absolute path to its directory; both are produced by the engine, not by
-a caller, and both are replaced in an earlier pass than the one that checks values. `SESSION_NAME`
-is constrained by the workflow-name rules, so it is safe unquoted. `SESSION_DIR` is not: it is
-built from the operator's home directory, which can contain a space. Quote it.
+The two runtime names resolve here too, but the allowlist above does not apply to them. It is
+enforced on a declared variable when its value is bound at `koto init`; the runtime names are
+never bound that way, and are replaced by a separate pass that validates nothing.
+
+What makes them safe is validation at creation instead. `{{SESSION_NAME}}` is the session's own
+name, and a session name is checked when the session is made: a letter or digit, then letters,
+digits, and `. _ -` (an internally generated epoch-branch name may also carry a `~`). None of
+those are shell-special mid-word, so it is safe unquoted. `{{SESSION_DIR}}` is the absolute path
+to the session's directory, and nothing constrains the part above the session name -- it comes
+from the operator's home directory, or from `KOTO_SESSIONS_BASE`, either of which can contain a
+space. Quote it.
 
 ```yaml
 command: koto context add {{SESSION_NAME}} findings.md --from-file "{{SESSION_DIR}}/findings.md"
