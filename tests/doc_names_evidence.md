@@ -88,10 +88,10 @@ majority still holds.
 |---|---|---|
 | `koto query` | 4 | Named in two `///` doc comments in `src/engine/types.rs` and in two shipped `koto-user` skill files, one of them inside a bash fence presenting it as runnable. There is no `query` verb and never was; the event log is read from the session directory. |
 | `koto session info` | 1 | `RESUME_CONTEXT_PROMPT` in `src/engine/respawn.rs`, the text handed to every respawning agent, told it to read prior state via a verb that does not exist. The same sentence named `koto session list --parent`, a flag that lives on `session start`. Pinned by a byte-equality snapshot in `tests/respawn.rs`, which made it harder to fix, not easier to notice. |
-| `docs/designs/DESIGN-batch-child-spawning.md` | 3 | Cited from `src/engine/batch_validation.rs`, `src/cli/batch_view.rs`, and `src/cli/task_spawn_error.rs`. The document lives under `docs/designs/current/`. |
-| `docs/designs/DESIGN-native-workflows-render.md` | 1 | Cited from `src/workflows_surface/contract.rs`. Same missing `current/` segment. |
-| `docs/designs/DESIGN-koto-request-store.md` | 4 | Cited twice each from `docs/STABILITY.md` and `docs/workspace-layout.md`. No document by that name exists anywhere; the live one is `docs/designs/current/DESIGN-request-store-converge.md`. |
-| `plugins/koto-skills/skills/hello-koto` and five siblings | 12 | `docs/guides/custom-skill-authoring.md` opened by calling a skill "the reference implementation" and built its eval section on a harness — `eval.sh`, `evals/<case>/prompt.txt`, `skill_path.txt`, `patterns.txt` — that no longer exists. The real format is one `evals.json` per skill, run by `scripts/run-evals.sh`. |
+| the batch-child-spawning design, rooted at `docs/designs/` | 3 | Cited from `src/engine/batch_validation.rs`, `src/cli/batch_view.rs`, and `src/cli/task_spawn_error.rs`, each omitting the `current/` segment. |
+| the native-workflows-render design, rooted at `docs/designs/` | 1 | Cited from `src/workflows_surface/contract.rs`. Same missing segment. |
+| a request-store design that exists nowhere | 4 | Cited twice each from `docs/STABILITY.md` and `docs/workspace-layout.md`. No document by that name has ever existed; the live one is `docs/designs/current/DESIGN-request-store-converge.md`. |
+| an example skill directory and five siblings under `plugins/koto-skills/` | 12 | `docs/guides/custom-skill-authoring.md` opened by calling a skill "the reference implementation" and built its eval section on a harness — `eval.sh`, `evals/<case>/prompt.txt`, `skill_path.txt`, `patterns.txt` — that no longer exists. The real format is one `evals.json` per skill, run by `scripts/run-evals.sh`. |
 | `src/gate` | 1 | `CLAUDE.md`'s skill-maintenance table cited `src/gate/` as a directory. It is `src/gate.rs`, a file. |
 
 Two further defects in `CLAUDE.md` are **not** in the list above, because the
@@ -113,6 +113,13 @@ only in prose.
 
 Four records against a budget of fifteen, four intentional against a budget of
 five.
+
+Note on how this file names dead paths: it describes them rather than writing
+them as citations. `shirabe validate`'s FC20 check resolves repo-relative
+references in any changed file, so an earlier draft of this table -- which wrote
+the dead paths out in code font -- failed CI on exactly the defect class it was
+documenting. Describing them is not squeamishness; it is the same rule the
+check itself enforces.
 
 ### The promised record, and how it retired
 
