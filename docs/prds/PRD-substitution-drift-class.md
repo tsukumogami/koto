@@ -16,7 +16,8 @@ goals: |
   participate is enumerated once per owning struct, so the compiler's answer
   and the runtime's cannot disagree, and a field added later cannot land
   outside both.
-upstream: docs/briefs/BRIEF-substitution-drift-class.md
+absorbed:
+  - docs/briefs/BRIEF-substitution-drift-class.md
 motivating_context: |
   Four consecutive defects were this drift one field at a time. The most
   recent fix built the single enumeration for gate fields and left the
@@ -28,11 +29,46 @@ motivating_context: |
 
 Accepted
 
+Absorbed [BRIEF-substitution-drift-class](docs/briefs/BRIEF-substitution-drift-class.md); carried in Absorbed Brief.
+
 Requirements and acceptance criteria for closing the substitution-drift class.
 The two behavioural decisions -- what an empty resolved `name_filter` means,
 and whether `fallback` substitutes or refuses -- are settled here under
 Decisions and Trade-offs, because both are observable contract. How the
 enumeration is shaped in code is left to the design.
+
+## Absorbed Brief
+
+**Why this exists.** koto's compiler and its tick each decide for themselves
+which template fields resolve `{{KEY}}` references. When those two decisions
+disagree the author is told nothing at all, and the symptom surfaces far from
+the cause -- a gate that blocks forever, a context key spelled with braces, a
+pointer an agent cannot follow. Four defects in a row were that drift one
+field at a time, and the most recent fix built the single enumeration for gate
+fields and left the action-declaration half unbuilt. The two fields still open
+are exactly the ones that half would have covered, so fixing them individually
+would leave the shape that produced all four intact.
+
+**What should be different.** An author writing a reference into any template
+string field gets a definite answer while they can still change it: the
+reference resolves, or the compiler names the state and the field and refuses.
+A resolved value that means something dangerously different from what was
+written -- an empty prefix where the author asked for one fan-out -- is refused
+at the point of use rather than applied. And which fields participate is a
+property of the struct that owns them, written once, with a test that refuses
+a change wiring one half without the other.
+
+The journeys this covers are a gate author scoping a fan-out by the parent's
+own name, an author writing failure prose that points at the session
+directory, and a maintainer adding a substitutable field; they appear below as
+User Stories. The boundary the framing drew is carried in Requirements and in
+Out of Scope. Three in-repo precedents grounded it:
+`docs/designs/current/DESIGN-template-variable-substitution.md` for the
+substitution model,
+`docs/designs/current/DESIGN-gate-contract-compiler-validation.md` for what the
+compiler owes an author before a workflow runs, and
+`docs/designs/current/DESIGN-koto-runs-commands.md` for why `fallback` is
+spliced after substitution.
 
 ## Problem Statement
 
