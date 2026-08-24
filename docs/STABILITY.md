@@ -5,7 +5,7 @@ breaking changes. It is the operator- and integrator-facing artifact
 referenced by `#[stable]` doc-comment blocks throughout the source.
 
 The contract is the outcome of Decision 5 in
-`docs/designs/DESIGN-koto-request-store.md` (lines 626-749). Bunki BK2
+`docs/designs/current/DESIGN-request-store-converge.md` (lines 626-749). Bunki BK2
 and other external substrates import `koto::engine::types::*` and the
 four frozen `SessionBackend` methods listed below; this document is
 the durable record of what they can rely on.
@@ -328,5 +328,5 @@ attempting a downgrade.
 - `docs/workspace-layout.md` — operator catalog of request-store derived files
   (`_terminal_index.jsonl`, scan cursors, compaction lock, claim
   sidecars) and their safe-deletion semantics.
-- `docs/designs/DESIGN-koto-request-store.md` — full request-store design,
+- `docs/designs/current/DESIGN-request-store-converge.md` — full request-store design,
   Decision 5 (this contract's source of authority).

@@ -8,11 +8,11 @@ Workflow orchestration engine for AI coding agents. Enforces execution order thr
 
 ```
 koto/
-├── cmd/koto/        # CLI entry point
-├── src/             # Core library (engine, template, gate, CLI)
+├── src/             # Crate root: library plus the binary entry point
+│   ├── main.rs      # CLI entry point (a shim over src/cli)
 │   ├── engine/      # State machine and advance loop
 │   ├── template/    # Template parsing and compilation
-│   ├── gate/        # Gate evaluators (command, context-exists, context-matches)
+│   ├── gate.rs      # Gate evaluators (command, context-exists, context-matches)
 │   └── cli/         # CLI subcommands and JSON output types
 ├── plugins/         # Agent skill plugins
 │   └── koto-skills/ # koto-adhoc, koto-author, and koto-user skills
@@ -46,6 +46,22 @@ cargo clippy && cargo fmt --check
 - `wip/` must be empty before merging to main (CI enforces this)
 - Never add AI attribution or co-author lines to commits or PRs
 
+## Names must resolve
+
+`cargo test --test doc_names` checks that every `koto <verb>` and every
+repo-relative path written in code font, across `src/` and the user-facing
+docs and skills, refers to something that exists. Verbs resolve against the live
+clap tree, so nothing here is a list anyone maintains.
+
+It exists because v0.12.0 shipped an error message telling users to run
+`koto session rebind`, which does not exist, past fmt, clippy, the full suite,
+and CI. When it fires, the output names the token, where it is, and what to do.
+A name that is deliberately not built yet goes in `tests/doc_names.allow` with a
+reason and an issue -- deleting the check is not the remedy, and a record that
+stops matching is itself reported. `tests/doc_names.rs`'s header says what it
+deliberately ignores and why; `tests/doc_names_evidence.md` carries the proof
+that it catches the v0.12.0 case.
+
 ## koto-skills Plugin Maintenance
 
 Three skills in `plugins/koto-skills/skills/` guide agents authoring and running koto-backed workflows. They drift silently when koto changes without a corresponding skill update.
@@ -56,7 +72,7 @@ Three skills in `plugins/koto-skills/skills/` guide agents authoring and running
 | `koto-author` | `plugins/koto-skills/skills/koto-author/` | Guides agents writing koto templates |
 | `koto-user` | `plugins/koto-skills/skills/koto-user/` | Guides agents running koto-backed workflows |
 
-**After completing any source change in `src/` or `cmd/`, assess all three skills before closing the work:**
+**After completing any source change in `src/`, assess all three skills before closing the work:**
 
 1. **Broken contracts** -- read the diff and each skill, then ask: does anything the skill currently documents no longer match the code? Look for changed flag names, renamed fields, removed subcommands, altered response shapes, or behavior that works differently than described.
 
@@ -70,7 +86,7 @@ Source areas most likely to require skill updates:
 |------|---------------|
 | `src/cli/` -- subcommands, flags, JSON output types | all three |
 | `src/engine/` -- advance loop, action values, response schema | koto-user, koto-adhoc |
-| `src/gate/` -- gate types, structured output fields | all three |
+| `src/gate.rs` -- gate types, structured output fields | all three |
 | `src/template/` -- frontmatter fields, compiler errors/warnings | koto-author, koto-adhoc |
 
 ### Running skill evals

@@ -12,7 +12,7 @@ Two trees are authoritative and rebuild from nothing:
 history.
 
 Cross-references: `docs/STABILITY.md` for the public crate stability
-contract; `docs/designs/DESIGN-koto-request-store.md` for the full
+contract; `docs/designs/current/DESIGN-request-store-converge.md` for the full
 request-store design (Consequences > Mitigations, line 2223, is the source
 of authority for this document).
 
@@ -347,7 +347,7 @@ destroys the history it holds.
 
 - `docs/STABILITY.md` — public crate surface lockdown (Issue 19,
   Decision 5).
-- `docs/designs/DESIGN-koto-request-store.md` — full request-store design.
+- `docs/designs/current/DESIGN-request-store-converge.md` — full request-store design.
   Consequences > Mitigations (line 2223) is the source of
   authority for this document.
 - `docs/designs/current/DESIGN-request-lifecycle.md` — Decision 1, the source

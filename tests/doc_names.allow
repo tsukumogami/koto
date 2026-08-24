@@ -1,0 +1,34 @@
+# Names koto states deliberately, that tests/doc_names.rs would otherwise
+# report. Each record is deferred rather than suppressed.
+#
+# Format, tab-separated, six fields:
+#
+#   <kind>  <token>  <category>  <issue>  <witness>  <reason>
+#
+#   kind       command | path
+#   token      the normalized token, e.g. `session rebind` or `docs/foo.md`
+#   category   promised    -- a name meant to exist that does not yet
+#              intentional -- a name correct as written that will not be built
+#   issue      owner/repo#N on a promised record; `-` on an intentional one.
+#              A promised record without one is an error. An intentional record
+#              WITH one is also an error: a name some issue intends to create is
+#              promised, whatever its sentence says about it. That rule is the
+#              one half of the category split a machine cannot check, so it is
+#              stated here and checked by review.
+#   witness    `-` on a promised record. On an intentional one, a digest over
+#              the code spans it suppresses, or `?` to have the check print the
+#              digest to paste back. Adding an intentional record is therefore
+#              deliberately a two-pass operation.
+#   reason     free text, required, may contain tabs
+#
+# A record that stops matching anything is itself a finding, in both
+# categories. That is what stops this file rotting into permanent suppression:
+# the change that makes a record obsolete is the change that removes it.
+#
+# The budget is fifteen records and five intentional ones. If you are about to
+# exceed either, the thing to question is the finding, not the budget.
+#
+command	migrate	intentional	-	9588e0cd	docs/STABILITY.md commits koto to publishing a migration tool "as `koto migrate` or under a similar discoverable subcommand". The sentence is a forward commitment in a published contract, not a claim that the verb exists today. If a `migrate` subcommand ever ships, this record stops matching and must be removed.
+path	.github/workflows/check-templates.yml	intentional	-	0dcb77c1	docs/guides/template-freshness-ci.md tells the reader to add this workflow to THEIR repository; the sentence says "in your repo". It is not a citation of a file in this tree. `.github` is deliberately not an excluded leading segment, because excluding it would blind three live citations of koto's own workflow files to buy this one suppression.
+path	docs/diagrams	intentional	-	16f4660c	An output directory in an example workflow configuration in docs/guides/template-freshness-ci.md, created by the job the reader is being shown how to write. A destination, not a citation.
+path	docs/my-workflow.html	intentional	-	e552b3d0	The `--output` argument of an example `koto template export` invocation in docs/guides/cli-usage.md. A file the command creates, not one the guide claims exists.
