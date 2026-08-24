@@ -2318,7 +2318,7 @@ All done.
 // Issue 220: runtime names resolve inside a default_action, not just in gates
 // ---------------------------------------------------------------------------
 
-/// Read the single line an action wrote and fail with its contents on mismatch.
+/// Read what an action wrote, failing with the path when the file is not there.
 fn read_action_output(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("action should have written {}: {}", path.display(), e))
@@ -2423,9 +2423,15 @@ All done.
 #[test]
 fn runtime_names_substituted_in_default_action_working_dir() {
     // `working_dir` is validated against the same runtime names at compile
-    // time, so it has to resolve them at run time too. It keeps the plain
-    // substitution rather than the shell-safe one because it is a path, not a
-    // shell word.
+    // time, so it has to resolve them at run time too. It takes the plain
+    // substitution rather than the shell-safe one because it never reaches a
+    // shell.
+    //
+    // Note what this does NOT do: `working_dir` is resolved against the
+    // execution anchor, so `{{SESSION_NAME}}` names a sibling directory under
+    // the anchor that the test creates, not the session directory. Naming the
+    // session directory is `{{SESSION_DIR}}`, and that is refused as absolute --
+    // see `session_dir_in_working_dir_is_refused_as_absolute`.
     let dir = TempDir::new().unwrap();
     let template = r#"---
 name: action-runtime-workdir

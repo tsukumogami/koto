@@ -2985,18 +2985,19 @@ fn record_notice_delivery(backend: &dyn SessionBackend, name: &str, abandoned: &
     }
 }
 
-/// Substitute a plain string through the tick's variable lookup order.
+/// Substitute a string that is not handed to a shell.
 ///
 /// The order is fixed everywhere a variable resolves during a tick: runtime
 /// names (`SESSION_DIR`, `SESSION_NAME`) first, then the per-tick overlay, then
-/// the `WorkflowInitialized` bindings. It lives in one function so the sites
-/// that resolve prose and paths -- the response directive, the
-/// directed-transition directive, and an action's `working_dir` -- cannot drift
-/// apart, and so a value the tick produced for itself is not left out of any of
-/// them.
+/// the `WorkflowInitialized` bindings. Because each layer's value is written
+/// into the output of a single pass, a value that itself contains a `{{...}}`
+/// token is never re-expanded.
 ///
-/// [`substitute_shell_command`] is the sibling for a string that goes to
-/// `sh -c`; it differs only in how it renders an empty value.
+/// The only difference from [`substitute_shell_command`] is what an empty value
+/// renders as: that one emits `''` so an unquoted `--flag {{VAR}}` stays a
+/// well-formed argument (Issue #186), and this one emits nothing. So the choice
+/// between them is not prose-versus-path -- it is whether the result reaches
+/// `sh -c`. Directives, details and an action's `working_dir` do not.
 #[cfg(unix)]
 fn substitute_text(
     raw: &str,
@@ -3018,6 +3019,13 @@ fn substitute_text(
 /// command skipped the runtime pass, so an author who wrote
 /// `koto context add {{SESSION_NAME}} key` in an action got a session directory
 /// named with the literal token and an exit code of 0 (Issue #220).
+///
+/// That is not the whole of "a literal token reached `sh -c`". Only the two
+/// runtime names and delivered values resolve here: an undelivered capture name
+/// still passes through as its raw token, because the `first_unset_capture`
+/// guard that refuses one in a directive is not wired into the command path
+/// (Issue #221). A gate's `key` and `pattern` are not substituted at all
+/// (Issue #222).
 #[cfg(unix)]
 fn substitute_shell_command(
     raw: &str,
@@ -4413,9 +4421,11 @@ fn handle_next(
                     // Same helper and same order as the top-level gate closure,
                     // so a gate re-evaluated inside the polling loop resolves
                     // the names available at that point exactly as it does
-                    // outside it. The overlay still differs: this runs before
-                    // the action's own capture is delivered, so a gate naming
-                    // its own state's capture cannot see it here.
+                    // outside it. Two things still differ, both inherent to
+                    // running mid-action: the overlay does not yet hold this
+                    // action's own capture, and the evaluator below passes no
+                    // children_eval, so a children-complete gate is not
+                    // evaluable here.
                     substitute_gate_commands(&s.gates, &runtime_vars, &variables, &overlay)
                 })
                 .unwrap_or_default();
