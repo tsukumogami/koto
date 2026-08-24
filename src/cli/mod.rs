@@ -5948,6 +5948,52 @@ fn evaluate_children_complete(
 ) -> crate::gate::StructuredGateResult {
     use crate::gate::{GateOutcome, StructuredGateResult};
 
+    // A `name_filter` that resolved to nothing is not a filter that matches
+    // everything -- it is an author who asked for one fan-out and would silently
+    // get every child of this parent instead. That is the failing-open
+    // direction, and worse than the failing-closed symptom Issue #224 was filed
+    // about: a gate written to wait on the research children would pass on a
+    // set it was written to exclude.
+    //
+    // The compiler cannot catch this. It reads the authored string, and
+    // `name_filter: "{{PREFIX}}"` is not empty until `PREFIX` resolves to
+    // nothing, so a value that is only empty after substitution is this
+    // function's to catch -- the same split, for the same reason, as the empty
+    // `pattern` refusal in `evaluate_context_matches_gate`.
+    //
+    // It is also the last point at which the distinction survives. The value
+    // crosses into `build_children_complete_output` as `Option<&str>`, and
+    // there `Some("")` is a prefix every child name starts with, which is what
+    // `None` already means.
+    if matches!(gate.name_filter.as_deref(), Some("")) {
+        return StructuredGateResult {
+            outcome: GateOutcome::Error,
+            output: serde_json::json!({
+                "total": 0,
+                "completed": 0,
+                "pending": 0,
+                "success": 0,
+                "failed": 0,
+                "skipped": 0,
+                "blocked": 0,
+                "spawn_failed": 0,
+                "all_complete": false,
+                "all_success": false,
+                "any_failed": false,
+                "any_skipped": false,
+                "any_spawn_failed": false,
+                "needs_attention": false,
+                "children": [],
+                "error": "children-complete name_filter resolved to an empty string, \
+                          which would match every child of this parent rather than the \
+                          one fan-out the filter names; a {{KEY}} reference in the gate's \
+                          name_filter has no value\n  \
+                          remedy: give the variable a default, or omit name_filter \
+                          entirely if the gate really should watch every child",
+            }),
+        };
+    }
+
     // The returned bool is the converge pass-predicate: terminal
     // completion AND every non-skipped child's result is dereferenceable.
     // The gate is non-passing (GateBlocked) while any child is still
