@@ -77,10 +77,10 @@ The complete set of findings against this branch with `tests/doc_names.allow`
 emptied, classified. Reproduce it by deleting the records and re-running; the
 `(file, token)` set must match.
 
-Eleven genuine defects against six correct as written. Genuine defects
-outnumber, which is the bar — and not by a wide margin, so a reviewer who
-reclassifies one or two path entries should check whether the majority still
-holds.
+Eleven genuine defects against six correct as written, at the time of capture.
+Genuine defects outnumber, which is the bar — and not by a wide margin, so a
+reviewer who reclassifies one or two path entries should check whether the
+majority still holds.
 
 ### Genuine — fixed in this change
 
@@ -106,14 +106,42 @@ only in prose.
 
 | Token | Category | Why it stays |
 |---|---|---|
-| `koto session rebind` | promised | koto#215 owns the verb. Sixteen sites, one record. |
 | `koto migrate` | intentional | `docs/STABILITY.md` commits koto to publishing a migration tool "under a similar discoverable subcommand". A forward commitment, not a claim. |
 | `.github/workflows/check-templates.yml` | intentional | The guide tells the reader to add it to *their* repo; the sentence says "in your repo". |
 | `docs/diagrams` | intentional | An output directory an example workflow creates. |
 | `docs/my-workflow.html` | intentional | The `--output` argument of an example command. |
 
-Five records against a budget of fifteen, four intentional against a budget of
+Four records against a budget of fifteen, four intentional against a budget of
 five.
+
+### The promised record, and how it retired
+
+The list above was captured while `koto session rebind` did not exist. It was
+carried as a `promised` record against koto#215, sixteen sites under one entry,
+with a reason naming the four passages that state the verb does not exist.
+
+koto#215 landed as #218 while this branch was open, and v0.12.1 shipped the
+verb. On the rebase, the check said so:
+
+```
+FAIL: stale record `session rebind` -- the command now resolves
+  The record said: ... When it lands, this record goes stale AND four passages
+  that state the verb does not exist become false: docs/reference/error-codes.md,
+  plugins/koto-skills/skills/koto-user/SKILL.md, and that skill's
+  error-handling.md and command-reference.md references. Correct all four in the
+  same change that removes this record.
+```
+
+That is the whole mechanism exercised end to end, by accident, within a day of
+being written. The finding is not "a name is missing" but "a record is obsolete",
+and it carries forward the one thing the check cannot compute — which prose the
+landing of that verb also falsified. #218 had already corrected all four
+passages, so removing the record was the only action left.
+
+Worth keeping in view: the reason text is *displayed*, not consumed. Nothing
+verified that those four passages were fixed; the check only made it hard to
+remove the record without reading what it said. That raises the odds the prose
+is noticed. It does not ensure it.
 
 ## Runtime
 
