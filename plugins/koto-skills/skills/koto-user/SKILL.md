@@ -33,7 +33,7 @@ This skill is for koto-backed workflows only -- a session koto is already runnin
 
 ## Prerequisites
 
-- koto >= 0.12.1 must be installed and on PATH (`koto version` to verify)
+- koto >= 0.12.2 must be installed and on PATH (`koto version` to verify)
 - You need a compiled koto template (`.md` file with YAML frontmatter)
 
 If koto is not installed or the version is too old, install the latest release:
