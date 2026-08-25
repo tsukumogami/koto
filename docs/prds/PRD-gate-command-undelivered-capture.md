@@ -14,7 +14,8 @@ goals: |
   command is built. The stop is a typed authoring stop rather than a gate
   outcome, so no template can route past it. A gate reading a capture that has
   been delivered, or a declared variable, behaves exactly as it does today.
-upstream: docs/briefs/BRIEF-gate-command-undelivered-capture.md
+absorbed:
+  - docs/briefs/BRIEF-gate-command-undelivered-capture.md
 source_issue: 225
 ---
 
@@ -23,6 +24,51 @@ source_issue: 225
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-gate-command-undelivered-capture](docs/briefs/BRIEF-gate-command-undelivered-capture.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+A koto gate may name another state's captured output, and koto lets it: the
+reference is legal because a state that has already run may well have produced
+the value the gate wants to test. Whether that state HAS run is a fact about the
+tick, and nothing checks it. So the mistake this feature is about -- ordering a
+gate before the state that feeds it, or naming the wrong capture -- produces no
+error, no warning, and nothing in the recorded gate evidence that separates it
+from a gate that genuinely evaluated. It is invisible at the moment it matters
+and stays invisible afterwards.
+
+That silence is the problem, and it is worth closing because the same silence
+has been closed twice in neighbouring positions already. A directive reading an
+undelivered capture is refused; since koto#221 a `default_action`'s `command`
+and `working_dir` are too. An author who has learned that koto reports this
+mistake in one field finds it stays silent in the fields whose answer decides
+whether the workflow advances at all.
+
+What should be different for that author is small and specific. They find out on
+the tick it happens, from a message naming the capture and the state that would
+have delivered it, so the fix is readable without tracing references by hand.
+Nothing reaches a shell, a context store or a regex engine first. The guarantee
+does not weaken inside a polling action, where the same gate is resolved again on
+every interval. And a template that is correct today does not change: a delivered
+capture still resolves, on the tick that delivered it or an earlier one, and a
+declared variable still renders its binding.
+
+A gate is not simply the action case again, and two differences are why this was
+framed rather than patched. A gate is re-evaluated, in two positions on one tick,
+so whatever happens has to happen identically in both. And a gate is allowed to
+fail -- an ordinary blocked tick an author routes on, where an action failure is
+a stop -- which makes the response a real question rather than an obvious one.
+The Decisions and Trade-offs section below is where that question is settled.
+
+The boundary the framing settled on runs around the gate rather than around one
+of its fields. The command field is the reported case and the one that reaches
+`sh -c`, but koto already enumerates a gate's reference-carrying fields in one
+place, and singling out one of them re-creates the per-field drift that
+enumeration exists to end. What stays outside is what a gate's fields do with a
+value that genuinely resolved -- an empty pattern, an empty filter, a key the
+store will not accept each keep their own refusal -- along with the lookup order,
+the overlay, the three value forms, and anything the compiler accepts.
 
 ## Problem Statement
 
