@@ -4430,13 +4430,13 @@ fn handle_next(
             // runs once per state the loop reaches, so a later state's gate must
             // see what an earlier state in the same tick produced.
             let substituted = substitute_gate_fields(gates, &runtime_vars, &variables, &overlay);
-            evaluate_gates(
+            Ok(evaluate_gates(
                 &substituted,
                 &execution_dir,
                 Some(context_store),
                 Some(session_name),
                 Some(&children_eval),
-            )
+            ))
         };
 
     let integration_closure = |_name: &str| -> Result<serde_json::Value, IntegrationError> {
@@ -4820,6 +4820,48 @@ fn handle_next(
                     expects,
                     unassigned_children: unassigned_children.clone(),
                 },
+                StopReason::GateRefusedUnsetCapture {
+                    state: gate_state,
+                    gate,
+                    field,
+                    key,
+                    producer,
+                } => {
+                    // The same code and the same exit status as the action arm
+                    // below, because it is the same defect one field over: a
+                    // reference the compiler accepted, naming a value this run
+                    // has not produced. What differs is that this one names the
+                    // gate as well as the field, and says the gate did not run
+                    // -- the operator's next question after "which name" is
+                    // "did anything happen anyway", and for a gate the answer
+                    // has to cover a command that was never handed to `sh -c`.
+                    //
+                    // The same-state wording exists for the reason the action
+                    // arm's does. A polling action substitutes this state's
+                    // gates before its command finishes, so a gate reading the
+                    // capture that action delivers can never resolve there. The
+                    // general sentence would tell the operator the run has not
+                    // entered a state it is standing in, and would point at a
+                    // routing fix for a problem that is not a routing one.
+                    let message = if gate_state == producer {
+                        format!(
+                            "state '{}' has a gate '{}' whose {} reads {{{{{}}}}}, the name                              that same state's default_action delivers with capture_stdout_as;                              the value does not exist until the command has produced it, so                              the gate did not run",
+                            gate_state, gate, field, key
+                        )
+                    } else {
+                        format!(
+                            "state '{}' has a gate '{}' whose {} reads {{{{{}}}}}, which state                              '{}' delivers with capture_stdout_as; this run has not entered                              that state, so the value is unset and the gate did not run",
+                            gate_state, gate, field, key, producer
+                        )
+                    };
+                    let err = NextError {
+                        code: NextErrorCode::CaptureUnset,
+                        message,
+                        details: vec![],
+                    };
+                    let json = serde_json::json!({"error": err});
+                    exit_with_error_code(json, err.code.exit_code());
+                }
                 StopReason::ActionRefusedUnsetCapture {
                     state: action_state,
                     field,
