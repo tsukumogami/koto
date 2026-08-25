@@ -29,6 +29,16 @@ stopping the tick, or reporting the gate as errored -- and where in the call
 graph it lives are the downstream PRD's and DESIGN's to settle; this brief
 records that they are open, not which way they go.
 
+The Scope Boundary was edited in place after the downstream research went one
+level deeper than the framing conversation had. The first draft pushed a gate's
+`key`, `pattern` and `name_filter` out of scope on the reasoning that each
+already refuses a value that resolved to nothing. That reasoning does not cover
+an undelivered capture, which resolves to nothing at all and leaves the token
+in place: a `name_filter` carrying one is a non-empty prefix that matches no
+child, so the gate blocks forever with no diagnostic -- the symptom koto#224
+fixed for the literal case, arriving by a different road. The boundary now runs
+around the gate rather than around one of its fields.
+
 ## Problem Statement
 
 A koto template's gate can run a shell command, and that command may carry
@@ -139,8 +149,12 @@ that was working before this feature does not change behaviour because of it.
 
 **IN**
 
-- Gate commands that carry a `{{KEY}}` reference naming a `capture_stdout_as`
-  output no state has delivered at the point the gate is evaluated.
+- Gate fields that carry a `{{KEY}}` reference naming a `capture_stdout_as`
+  output no state has delivered at the point the gate is evaluated. The command
+  field is the reported case and the one that reaches `sh -c`; the boundary is
+  the gate because koto already enumerates a gate's reference-carrying fields in
+  one place, and singling out one of them re-creates the per-field drift that
+  enumeration exists to end.
 - Both positions where a gate's fields are resolved on a tick: the advance loop
   and the polling loop that re-evaluates a state's gates while a polling action
   runs. Whatever the response is, it is the same in both.
@@ -161,10 +175,11 @@ that was working before this feature does not change behaviour because of it.
   gate fields returns a map with no error channel, so a response either happens
   at the call sites or the helper's signature carries one. That is a design
   question about an existing interface.
-- **A gate's other fields.** `key`, `pattern` and `name_filter` reach the
-  context store and the regex engine rather than a shell, and each already has
-  its own refusal for a value that resolved to nothing. This brief is the
-  command field.
+- **What a gate's other fields do with a value that genuinely resolved.** An
+  empty `pattern`, an empty `name_filter` and a key the context store will not
+  accept each already have their own refusal, and those stay exactly as they
+  are. What this feature reaches is the case none of them covers: a reference
+  that resolved to nothing at all.
 - **Reworking variable scoping.** The lookup order, the overlay that carries a
   capture produced earlier in the same tick, and the three value forms are
   settled and stay settled. Only the response to an undelivered name is open.
