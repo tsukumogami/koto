@@ -3103,14 +3103,51 @@ fn substitute_regex_literal(
 /// whose filter resolved to nothing; `.as_deref().unwrap_or("")` anywhere on
 /// this path would erase that difference and with it the refusal that depends
 /// on it.
+///
+/// A capture name no state has delivered is refused rather than substituted, and
+/// that check is inside this function rather than at its callers for the reason
+/// the paragraph above gives about `key` and `pattern`: a check a caller can
+/// forget to run is the same defect as a field list a maintainer can forget to
+/// update. A gate that has come out of here is a gate whose references were
+/// checked, and a third caller cannot obtain one any other way (Issue #225).
+///
+/// Every field of every gate is checked before any gate is substituted. A
+/// refusal is a stop, so a half-substituted map is never useful, and doing the
+/// checking first is what makes "nothing ran before the refusal" a property of
+/// the control flow rather than something a reader has to verify.
+///
+/// The check reads `Gate::substitutable_fields` rather than naming `command`,
+/// so a gate's other three fields are covered by the same pass. That is not a
+/// widening for its own sake: a `name_filter` carrying an undelivered capture
+/// is a non-empty prefix no child name starts with, which blocks the gate
+/// forever with no diagnostic -- the symptom Issue #224 fixed for the literal
+/// case, arriving by a different road.
 #[cfg(unix)]
 fn substitute_gate_fields(
     gates: &std::collections::BTreeMap<String, crate::template::types::Gate>,
     runtime_vars: &std::collections::HashMap<String, String>,
     variables: &crate::engine::substitute::Variables,
     overlay: &crate::engine::substitute::VariableOverlay,
-) -> std::collections::BTreeMap<String, crate::template::types::Gate> {
-    gates
+    captures: &std::collections::BTreeMap<String, String>,
+) -> std::result::Result<
+    std::collections::BTreeMap<String, crate::template::types::Gate>,
+    crate::engine::substitute::GateCaptureRefusal,
+> {
+    for (name, gate) in gates {
+        for (field, raw) in gate.substitutable_fields() {
+            if let Some((key, producer)) =
+                crate::engine::substitute::first_unset_capture(raw, captures, variables, overlay)
+            {
+                return Err(crate::engine::substitute::GateCaptureRefusal {
+                    gate: name.clone(),
+                    field,
+                    key,
+                    producer,
+                });
+            }
+        }
+    }
+    Ok(gates
         .iter()
         .map(|(name, gate)| {
             let mut g = gate.clone();
@@ -3123,7 +3160,7 @@ fn substitute_gate_fields(
                 .map(|filter| substitute_plain(filter, runtime_vars, variables, overlay));
             (name.clone(), g)
         })
-        .collect()
+        .collect())
 }
 
 /// Resolve an action's substituted `working_dir` against the session's
@@ -4429,7 +4466,8 @@ fn handle_next(
             // substitutable gate field. The overlay matters because this closure
             // runs once per state the loop reaches, so a later state's gate must
             // see what an earlier state in the same tick produced.
-            let substituted = substitute_gate_fields(gates, &runtime_vars, &variables, &overlay);
+            let substituted =
+                substitute_gate_fields(gates, &runtime_vars, &variables, &overlay, &capture_names)?;
             Ok(evaluate_gates(
                 &substituted,
                 &execution_dir,
@@ -4531,7 +4569,7 @@ fn handle_next(
         let output = if let Some(polling) = &action.polling {
             // For polling, we need to evaluate gates inside the loop.
             // Look up the state's gates from the compiled template.
-            let state_gates = compiled
+            let state_gates = match compiled
                 .states
                 .get(state_name)
                 .map(|s| {
@@ -4543,9 +4581,38 @@ fn handle_next(
                     // the value does not exist until the command finishes. The
                     // evaluator below passes no `children_eval`, which is a
                     // choice: see the note there.
-                    substitute_gate_fields(&s.gates, &runtime_vars, &variables, &overlay)
+                    substitute_gate_fields(
+                        &s.gates,
+                        &runtime_vars,
+                        &variables,
+                        &overlay,
+                        &capture_names,
+                    )
                 })
-                .unwrap_or_default();
+                .transpose()
+            {
+                Ok(gates) => gates.unwrap_or_default(),
+                // The refusal arrives here, on the way into the action, because
+                // this is where a polling state's gates are resolved -- earlier
+                // than the gate block sees them, and before the command is
+                // spawned. It leaves as the same stop the gate block produces,
+                // so the two positions cannot report a reference differently
+                // (Issue #225).
+                //
+                // The inherent gap noted above is what makes this reachable for
+                // a gate reading the capture this very action delivers: the
+                // overlay cannot hold it yet, so the reference can never resolve
+                // at this position. The renderer says so in those terms rather
+                // than naming a state the run has not entered.
+                Err(refusal) => {
+                    return ActionResult::GateRefused {
+                        gate: refusal.gate,
+                        field: refusal.field,
+                        key: refusal.key,
+                        producer: refusal.producer,
+                    };
+                }
+            };
             execute_with_polling(
                 &command,
                 &wd,
@@ -4845,12 +4912,16 @@ fn handle_next(
                     // routing fix for a problem that is not a routing one.
                     let message = if gate_state == producer {
                         format!(
-                            "state '{}' has a gate '{}' whose {} reads {{{{{}}}}}, the name                              that same state's default_action delivers with capture_stdout_as;                              the value does not exist until the command has produced it, so                              the gate did not run",
+                            "state '{}' has a gate '{}' whose {} reads {{{{{}}}}}, the name that same \
+                             state's default_action delivers with capture_stdout_as; the value does \
+                             not exist until the command has produced it, so the gate did not run",
                             gate_state, gate, field, key
                         )
                     } else {
                         format!(
-                            "state '{}' has a gate '{}' whose {} reads {{{{{}}}}}, which state                              '{}' delivers with capture_stdout_as; this run has not entered                              that state, so the value is unset and the gate did not run",
+                            "state '{}' has a gate '{}' whose {} reads {{{{{}}}}}, which state '{}' \
+                             delivers with capture_stdout_as; this run has not entered that state, \
+                             so the value is unset and the gate did not run",
                             gate_state, gate, field, key, producer
                         )
                     };
@@ -6358,6 +6429,16 @@ fn handle_cancel(backend: &dyn SessionBackend, name: &str, cleanup: bool) -> Res
 mod tests {
     use super::*;
 
+    /// The empty capture map, for a fixture whose gates reference no capture.
+    ///
+    /// `first_unset_capture` returns `None` immediately on an empty map, so a
+    /// fixture that passes this is asserting it has no capture references
+    /// rather than opting out of the check.
+    #[cfg(unix)]
+    fn no_captures() -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::new()
+    }
+
     #[cfg(unix)]
     #[test]
     fn mark_truncated_marks_only_the_stream_that_was_cut() {
@@ -7552,7 +7633,9 @@ Done.
                 name_filter: None,
             },
         );
-        let substituted = substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay);
+        let substituted =
+            substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay, &no_captures())
+                .expect("no gate field in this fixture names a capture");
         assert_eq!(
             substituted.get("check").unwrap().command,
             "test -f /s/abc/v1.2.3 && git log fresh"
@@ -7614,11 +7697,13 @@ Done.
         );
 
         let as_action = substitute_shell_command(raw, &runtime_vars, &variables, &overlay);
-        let as_gate = substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay)
-            .get("check")
-            .unwrap()
-            .command
-            .clone();
+        let as_gate =
+            substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay, &no_captures())
+                .expect("no gate field in this fixture names a capture")
+                .get("check")
+                .unwrap()
+                .command
+                .clone();
 
         assert_eq!(as_action, as_gate);
         assert_eq!(
@@ -7688,7 +7773,9 @@ Done.
 
         let mut gates = BTreeMap::new();
         gates.insert("check".to_string(), authored);
-        let out = substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay);
+        let out =
+            substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay, &no_captures())
+                .expect("no gate field in this fixture names a capture");
         let substituted = out.get("check").unwrap();
 
         for (field, raw) in substituted.substitutable_fields() {
@@ -7836,7 +7923,9 @@ Done.
             },
         );
 
-        let out = substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay);
+        let out =
+            substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay, &no_captures())
+                .expect("no gate field in this fixture names a capture");
         let g = out.get("check").unwrap();
 
         // Shell-safe: an empty value becomes an explicit empty argument so the
@@ -7913,7 +8002,8 @@ Done.
             variables.substitute_command(&c)
         };
         assert_eq!(
-            substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay)
+            substitute_gate_fields(&gates, &runtime_vars, &variables, &overlay, &no_captures())
+                .expect("no gate field in this fixture names a capture")
                 .get("check")
                 .unwrap()
                 .command,
