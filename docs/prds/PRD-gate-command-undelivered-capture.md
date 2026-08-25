@@ -168,10 +168,17 @@ requirement is stated against that enumeration rather than against a list
 maintained here, so a field added to a gate later is covered by construction.
 
 **R2.** The refusal SHALL be a typed run-time stop, distinct from every gate
-outcome. It SHALL NOT be reported as a gate result, SHALL NOT appear in the
-`gates.*` evidence a transition's `when` clause resolves against, and SHALL NOT
-be reachable by a recorded gate override. A template MUST NOT be able to route a
-run past it.
+outcome. It SHALL NOT be reported as a gate result and SHALL NOT appear in the
+`gates.*` evidence a transition's `when` clause resolves against. A template MUST
+NOT be able to route a run past it.
+
+A recorded gate override is the one thing that gets past it, and that is correct
+rather than a hole in R2. An override means the operator has asserted the gate's
+outcome by hand, so the gate is never evaluated and its fields are never
+resolved: no token reaches a shell, a context store or a regex engine, which is
+the harm this feature exists to prevent. The requirement is that a *template*
+cannot route past the refusal, not that an operator cannot decline to run the
+gate at all.
 
 **R3.** The refusal SHALL exit with the same status and the same machine-readable
 reason koto already uses for an undelivered capture reaching a directive or a
