@@ -3040,9 +3040,9 @@ fn substitute_plain(
 /// named with the literal token and an exit code of 0 (Issue #220).
 ///
 /// That is not the whole of "a literal token reached `sh -c`". An undelivered
-/// capture name never reaches here from an action: the caller refuses it before
-/// substituting (Issue #221). A gate command is not guarded that way and still
-/// ships one to `sh -c` (Issue #225).
+/// capture name never reaches here at all: an action's caller refuses it before
+/// substituting (Issue #221), and so does a gate's, inside
+/// [`substitute_gate_fields`] (Issue #225).
 ///
 /// The runtime-name pass is the plain `substitute_vars` rather than a shell-word
 /// form, and that is deliberate rather than an oversight to fix: the shell-word

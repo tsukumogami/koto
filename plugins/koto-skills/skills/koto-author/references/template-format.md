@@ -688,6 +688,10 @@ Delivery fails three ways, all of them action failures with `failure_kind: "capt
 
 Reading a name the run never delivered stops the tick with the `capture_unset` error code rather than rendering an empty string or a raw `{{NAME}}` token. That covers a state's own action: a `{{NAME}}` in `command` or in `working_dir` is checked before either is substituted, so the token never reaches `sh -c` and nothing is spawned. It is a stop and not an action failure, so `fallback` prose is not delivered for it.
 
+It covers a state's gates the same way, across every field a gate substitutes — `command`, `key`, `pattern` and `name_filter`. Every field of every gate is checked before any of them is substituted, so nothing is handed to `sh -c`, no context key is read and no regex is compiled. It is a stop rather than a gate error for the reason it is a stop rather than an action failure: gate output is injected into the evidence map whatever the outcome, so a `when` clause could route past a gate error with the value still unset.
+
+One ordering follows from where the check sits, and it is worth knowing when you write a gate against a value the same state produces. A state's gates are resolved after its action has run, so a gate reading that action's own `capture_stdout_as` name resolves normally. Under a **polling** action it does not: the gates are resolved on the way in, before the command has finished, so the value cannot exist yet and the gate is refused. Write such a check into the state that consumes the value rather than the one that produces it.
+
 Lifetime: re-entering the producing state runs the command again and the later value wins; two states declaring the same name is a compile error; a `koto rewind` past the producing state **leaves the value in place**, because a rewind appends an event and truncates nothing; a captured value holding a `{{...}}` token is never re-expanded; and a capture is delivered on a tick that stops for confirmation as well as one that advances.
 
 ### skip_if — automatic transitions
