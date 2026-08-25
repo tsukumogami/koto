@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   A koto gate field may carry a `{{KEY}}` reference to another state's
   `capture_stdout_as` output. The compiler accepts it, but nothing checks at run
@@ -23,7 +23,7 @@ source_issue: 225
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-gate-command-undelivered-capture](docs/briefs/BRIEF-gate-command-undelivered-capture.md); carried in Absorbed Brief.
 
