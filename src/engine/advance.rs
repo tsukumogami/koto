@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::action::FailureKind;
 use crate::engine::persistence::derive_overrides;
-use crate::engine::substitute::VariableOverlay;
+use crate::engine::substitute::{GateCaptureRefusal, VariableOverlay};
 use crate::engine::types::{now_iso8601, Event, EventPayload};
 use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::template::types::{
@@ -91,6 +91,21 @@ pub enum ActionResult {
     /// unset (Issue #221).
     Refused {
         field: ActionField,
+        key: String,
+        producer: String,
+    },
+    /// The action did not run, because a `{{KEY}}` in one of this state's gate
+    /// fields names a capture no state has delivered on this run.
+    ///
+    /// A polling action's gates are substituted before its command is spawned,
+    /// so the refusal is raised on the way into the action rather than out of
+    /// it. It is a separate variant from [`Refused`](Self::Refused) because
+    /// [`ActionField`] means "a field of a `default_action`" and the renderer
+    /// for that variant writes a sentence about one; a gate refusal arriving
+    /// there would describe an action for a defect in a gate (Issue #225).
+    GateRefused {
+        gate: String,
+        field: &'static str,
         key: String,
         producer: String,
     },
@@ -409,6 +424,31 @@ pub enum StopReason {
         key: String,
         producer: String,
     },
+    /// A gate was refused before it was evaluated: a `{{KEY}}` in one of its
+    /// substitutable fields names a capture no state has delivered on this run.
+    ///
+    /// Reached from two arms, and that is the point. The gate block reaches it
+    /// when the evaluator refuses; the action block reaches it when a polling
+    /// action's gate set refuses on the way in. Both carry the same five values
+    /// and produce the same stop, so the advance loop and the polling loop
+    /// cannot disagree about a reference -- which is where Issue #220 found
+    /// them drifted.
+    ///
+    /// Deliberately not a [`GateBlocked`](Self::GateBlocked) result under the
+    /// refusing gate's own name. Gate output is injected into the evidence map
+    /// regardless of outcome so that `when` clauses can route on `gates.*`, and
+    /// a recorded override can force one to pass, so a routable refusal is one
+    /// a template could carry the run past with the value still unset. That is
+    /// the argument Issue #221 recorded for the action case, and gate
+    /// conditions are the routing surface rather than a single synthesized
+    /// condition (Issue #225).
+    GateRefusedUnsetCapture {
+        state: String,
+        gate: String,
+        field: &'static str,
+        key: String,
+        producer: String,
+    },
     /// SIGTERM or SIGINT received between iterations.
     SignalReceived,
     /// Conditional transitions exist but no evidence matches, and the state
@@ -518,7 +558,7 @@ where
     F: FnMut(&EventPayload) -> Result<(), String>,
     G: Fn(
         &BTreeMap<String, crate::template::types::Gate>,
-    ) -> BTreeMap<String, StructuredGateResult>,
+    ) -> Result<BTreeMap<String, StructuredGateResult>, GateCaptureRefusal>,
     I: Fn(&str) -> Result<serde_json::Value, IntegrationError>,
     A: Fn(&str, &ActionDecl, bool) -> ActionResult,
 {
@@ -678,6 +718,29 @@ where
                         },
                     });
                 }
+                ActionResult::GateRefused {
+                    gate,
+                    field,
+                    key,
+                    producer,
+                } => {
+                    // A polling action substitutes this state's gates on the
+                    // way in, so the refusal arrives before the command is
+                    // spawned. Same stop as the gate block's own arm, carrying
+                    // the same five values: the two positions meet here rather
+                    // than at two stops that could drift.
+                    return Ok(AdvanceResult {
+                        final_state: state.clone(),
+                        advanced,
+                        stop_reason: StopReason::GateRefusedUnsetCapture {
+                            state,
+                            gate,
+                            field,
+                            key,
+                            producer,
+                        },
+                    });
+                }
                 ActionResult::Failed {
                     command,
                     failure_kind,
@@ -819,7 +882,29 @@ where
 
             // Evaluate non-overridden gates and emit GateEvaluated events.
             if !gates_to_evaluate.is_empty() {
-                let evaluated = evaluate_gates(&gates_to_evaluate);
+                // The evaluator resolves the gate's fields before it runs
+                // anything, so a `{{KEY}}` naming an undelivered capture is
+                // refused here rather than reaching a shell, the context store
+                // or the regex engine. Stop where the refusal happened, before
+                // any `GateEvaluated` event is appended: nothing ran, so there
+                // is no gate result to report and nothing for a `when` clause
+                // to route on (Issue #225).
+                let evaluated = match evaluate_gates(&gates_to_evaluate) {
+                    Ok(results) => results,
+                    Err(refusal) => {
+                        return Ok(AdvanceResult {
+                            final_state: state.clone(),
+                            advanced,
+                            stop_reason: StopReason::GateRefusedUnsetCapture {
+                                state,
+                                gate: refusal.gate,
+                                field: refusal.field,
+                                key: refusal.key,
+                                producer: refusal.producer,
+                            },
+                        });
+                    }
+                };
                 for (gate_name, result) in &evaluated {
                     gate_evidence_map.insert(gate_name.clone(), result.output.clone());
                     let outcome_str = match result.outcome {
@@ -1333,8 +1418,8 @@ mod tests {
 
     fn noop_gates(
         _gates: &BTreeMap<String, crate::template::types::Gate>,
-    ) -> BTreeMap<String, StructuredGateResult> {
-        BTreeMap::new()
+    ) -> Result<BTreeMap<String, StructuredGateResult>, GateCaptureRefusal> {
+        Ok(BTreeMap::new())
     }
 
     fn unavailable_integration(_name: &str) -> Result<serde_json::Value, IntegrationError> {
@@ -2060,7 +2145,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let result = advance_until_stop(
@@ -2238,7 +2323,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let result = advance_until_stop(
@@ -2375,7 +2460,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let result = advance_until_stop(
@@ -2498,7 +2583,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let result = advance_until_stop(
@@ -2606,7 +2691,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let result = advance_until_stop(
@@ -2706,7 +2791,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let result = advance_until_stop(
@@ -2740,7 +2825,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let mut append2 = |_: &EventPayload| -> Result<(), String> { Ok(()) };
@@ -2777,7 +2862,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let mut append3 = |_: &EventPayload| -> Result<(), String> { Ok(()) };
@@ -2811,7 +2896,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let mut append4 = |_: &EventPayload| -> Result<(), String> { Ok(()) };
@@ -3717,7 +3802,7 @@ mod tests {
                     output: serde_json::json!({"exit_code": 0}),
                 },
             );
-            out
+            Ok(out)
         };
         let action = |_: &str, _: &ActionDecl, _: bool| -> ActionResult { result.clone() };
 
@@ -3990,7 +4075,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let result = advance_until_stop(
@@ -4273,7 +4358,7 @@ mod tests {
         // evaluate_gates should never be called for the overridden gate.
         let gate_eval = |_gates: &BTreeMap<String, Gate>| {
             // If called, this is a test failure (overridden gate should skip evaluate_gates).
-            BTreeMap::new()
+            Ok(BTreeMap::new())
         };
 
         let result = advance_until_stop(
@@ -4377,7 +4462,7 @@ mod tests {
                     );
                 }
             }
-            results
+            Ok(results)
         };
 
         let result = advance_until_stop(
@@ -4521,7 +4606,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let result = advance_until_stop(
@@ -4629,7 +4714,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let result = advance_until_stop(
@@ -4742,7 +4827,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let result = advance_until_stop(
@@ -4841,7 +4926,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let result = advance_until_stop(
@@ -4930,7 +5015,7 @@ mod tests {
                     },
                 );
             }
-            results
+            Ok(results)
         };
 
         let result = advance_until_stop(

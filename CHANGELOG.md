@@ -44,6 +44,47 @@ to `0.9.x`).
 
 ### Fixed
 
+- **A gate field that reads an undelivered capture is now refused instead of
+  handing the raw token to whatever the field feeds.** A `{{KEY}}` naming
+  another state's `capture_stdout_as` compiles inside a gate, and it should: a
+  state that has already run may well have produced the value the gate wants to
+  test. Nothing checked at run time that it had. When it had not, substitution
+  left the token in place and the literal `{{KEY}}` reached `sh -c`, the context
+  store or the regex engine. A gate that grepped for the value tested a string
+  nobody wrote and could pass; one that consumed it ran a command with a nonsense
+  argument and often exited 0; a `name_filter` became a prefix no child name
+  starts with, so the gate counted zero children and blocked forever with no
+  diagnostic at all. In every case the run carried on and nothing said the
+  reference was why.
+
+  Every field `Gate::substitutable_fields` enumerates is now checked before any
+  gate is substituted, so nothing is spawned, no context key is read and no
+  regex is compiled first. The run stops with `capture_unset` (exit 3), naming
+  the state, the gate, the field, the capture and the state that would have
+  delivered it. A gate on a state whose own polling action delivers the name gets
+  its own wording, because that value cannot exist while the command is still
+  running and the general sentence would report a state the run is standing in as
+  one it has not entered.
+
+  It is deliberately not a gate error, which is the shape a `pattern` or a
+  `name_filter` that resolves to empty gets. Those fire on a value that resolved
+  and turned out unusable, and a default fixes them. An undelivered capture
+  resolves to nothing at all and no run-time input fixes it -- the template's
+  state ordering is wrong. Reporting it as a gate outcome would put it in the
+  channel templates route on: gate output is injected into the evidence map
+  whatever the outcome, and a recorded override can force a gate to pass, so a
+  template could have carried the run past the defect with the value still unset.
+  That is the argument koto#221 recorded for the action case, and it is stronger
+  for a gate, where the conditions are the routing surface.
+
+  A delivered capture resolves exactly as before, whether it arrived on an
+  earlier tick or from an earlier state on the same one, and a gate reading the
+  capture its own state's non-polling action delivers still resolves -- the
+  action runs first. The empty-`pattern` and empty-`name_filter` refusals keep
+  their existing messages. Seven integration tests, four of which fail against
+  the previous release.
+  Closes koto#225.
+
 - **A `children-complete` gate's `name_filter` resolves `{{KEY}}` references,
   and a `default_action`'s `fallback` no longer accepts one in silence.**
   `name_filter` scopes a gate to one fan-out among several, and the natural way

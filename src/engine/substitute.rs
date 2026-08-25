@@ -468,6 +468,39 @@ pub fn first_unset_capture(
     None
 }
 
+/// A gate field whose `{{KEY}}` reference names a capture no state has
+/// delivered, and everything the operator needs to fix it bar the state.
+///
+/// Raised by `crate::cli::substitute_gate_fields`, which is the one place a
+/// tick turns a gate's authored fields into resolved ones. Both callers convert
+/// it into their own control-flow vocabulary and the engine converts both back
+/// into a single [`crate::engine::advance::StopReason`], so the advance loop and
+/// the polling loop cannot answer differently: there is one predicate, one error
+/// and one stop, and each path owns only the two lines between them
+/// (Issue #225).
+///
+/// The state is not a field. This type is raised by a helper that is handed a
+/// gate map and knows nothing about which state it belongs to; the engine adds
+/// the state, because the engine is what is standing in one.
+///
+/// `field` is `&'static str` rather than an enum because it comes straight from
+/// [`crate::template::types::Gate::substitutable_fields`], which already pairs
+/// each field's value with the name errors report it under. Nothing here
+/// invents a field name, and a field added to `Gate` later reaches this type
+/// through that accessor rather than through an enum someone has to remember to
+/// extend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateCaptureRefusal {
+    /// The gate whose field carried the reference.
+    pub gate: String,
+    /// The field within that gate, named as an author writes it.
+    pub field: &'static str,
+    /// The undelivered capture name.
+    pub key: String,
+    /// The state whose `capture_stdout_as` would have delivered it.
+    pub producer: String,
+}
+
 /// Validate a variable value against the allowlist regex.
 /// Exported for reuse by `koto init` validation (Issue 2).
 pub fn validate_value(key: &str, value: &str) -> Result<(), SubstitutionError> {
