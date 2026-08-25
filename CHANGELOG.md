@@ -44,6 +44,44 @@ to `0.9.x`).
 
 ### Fixed
 
+- **A `children-complete` gate's `name_filter` resolves `{{KEY}}` references,
+  and a `default_action`'s `fallback` no longer accepts one in silence.**
+  `name_filter` scopes a gate to one fan-out among several, and the natural way
+  to write that scope is against the parent's own name -- children spawned as
+  `{{SESSION_NAME}}.research.1`, a gate reading
+  `name_filter: "{{SESSION_NAME}}.research."`. The reference reached the gate
+  verbatim, no child name started with it, the gate counted zero children and
+  blocked, and the compile-time warning that catches a missing trailing dot
+  said nothing because the trailing dot was there. It now substitutes, in the
+  plain form -- a name prefix is neither a shell word nor a regex -- and an
+  undeclared reference is refused at compile time naming the gate and the
+  field. A `name_filter` that resolves to an empty string is refused at the
+  gate with a reason: an empty prefix does not narrow a gate, it removes the
+  filter, so a gate written to watch one fan-out would silently watch every
+  child of the parent. Declaring no `name_filter` still means "watch every
+  child" and is unaffected.
+
+  `fallback` is the opposite decision, deliberately. It is spliced onto a
+  failure response's directive after substitution has run, so the prose reaches
+  the agent as written; that is intended and documented on the field, and it
+  does not change. What changes is that an author who writes a `{{KEY}}` there
+  used to compile clean and find out from an agent that could not follow a
+  pointer to `{{SESSION_DIR}}`. The compiler now refuses the reference, names
+  the state and the field, and points at the directive, which does resolve one.
+  Any reference is refused, not only an undeclared one: the field is never
+  expanded, so a declared reference is exactly as undelivered.
+
+  Underneath both is the shape rather than the two fields. `Gate` already
+  enumerated its substitutable fields once, next to the struct, with the
+  compiler and the tick both reading that list. `ActionDecl` now has the same
+  thing, split in two because the promises differ: `substitutable_fields` for
+  `command` and `working_dir`, whose references resolve, and `literal_fields`
+  for `fallback`, whose references are refused. Every accessor destructures its
+  struct exhaustively, so a field added later cannot compile until someone says
+  which list it belongs to -- which is what turns four consecutive fixes of the
+  same drift into a compile error rather than a fifth. Seven integration tests,
+  five of which fail against the previous release.
+
 - **A `default_action` that reads an undelivered capture name is now
   refused instead of handing the raw token to `sh -c`.** A `{{KEY}}`
   naming another state's `capture_stdout_as` compiles inside

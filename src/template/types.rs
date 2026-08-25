@@ -232,25 +232,51 @@ impl Gate {
     ///
     /// One list, next to the struct that owns the fields, because two lists is
     /// the bug. The compiler validates references in exactly this set and
-    /// `substitute_gate_fields` rewrites exactly this set, and each of the three
+    /// `substitute_gate_fields` rewrites exactly this set, and each of the
     /// fixes before this one was an instance of those two sets disagreeing: a
     /// `default_action` command the compiler accepted and the runtime skipped
     /// (Issue #220), a gate `key` and `pattern` neither of them touched
-    /// (Issue #222), and `name_filter` on a `children-complete` gate, still in
-    /// neither (Issue #224).
+    /// (Issue #222), and `name_filter` on a `children-complete` gate, in
+    /// neither until Issue #224 put it here.
+    ///
+    /// `name_filter` is `Option<String>`, which is why this returns a `Vec`
+    /// rather than a fixed-size array: a field that is absent contributes no
+    /// entry, and there is no `String` to borrow a name from. A gate that does
+    /// not declare the field is unaffected by everything downstream of this
+    /// list, which is the distinction the empty-value refusal in
+    /// `evaluate_children_complete` depends on.
     ///
     /// Adding a field here is what wires it into compile-time validation;
     /// `every_field_the_compiler_validates_is_one_the_tick_substitutes` in
     /// `src/cli/mod.rs` then fails until the runtime side is wired too, so the
-    /// pair cannot drift apart silently again. `name_filter` is deliberately
-    /// absent until #224 decides what an empty substituted value means for a
-    /// prefix that currently means "no filter" when empty.
+    /// pair cannot drift apart silently again.
+    ///
+    /// The body destructures `self` exhaustively rather than reaching for the
+    /// fields it wants, so a field added to `Gate` stops this function
+    /// compiling until someone says whether it carries references. That is the
+    /// whole guarantee: an enumeration a maintainer can forget to update is
+    /// what the fixes above were each an instance of. Do not simplify the
+    /// pattern to `..`.
     pub fn substitutable_fields(&self) -> Vec<(&'static str, &str)> {
-        vec![
-            ("command", self.command.as_str()),
-            ("key", self.key.as_str()),
-            ("pattern", self.pattern.as_str()),
-        ]
+        let Self {
+            gate_type: _,
+            command,
+            timeout: _,
+            key,
+            pattern,
+            override_default: _,
+            completion: _,
+            name_filter,
+        } = self;
+        let mut fields = vec![
+            ("command", command.as_str()),
+            ("key", key.as_str()),
+            ("pattern", pattern.as_str()),
+        ];
+        if let Some(filter) = name_filter {
+            fields.push(("name_filter", filter.as_str()));
+        }
+        fields
     }
 }
 
@@ -293,6 +319,76 @@ pub struct ActionDecl {
     /// and nothing else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_stdout_as: Option<String>,
+}
+
+impl ActionDecl {
+    /// Every field of this action declaration that a tick substitutes `{{KEY}}`
+    /// references in, paired with the name errors report it under.
+    ///
+    /// The `Gate` counterpart above says why one list beats two, and this is
+    /// the same argument one struct over: the compiler validated `command` and
+    /// `working_dir` from two hand-written loops, and the field it validated
+    /// from neither -- `fallback` -- is Issue #228. A `default_action` command
+    /// the compiler accepted and the runtime skipped was Issue #220, on this
+    /// same struct.
+    ///
+    /// `fallback` is not here. It carries references and is refused them; see
+    /// [`ActionDecl::literal_fields`], which is the list that says so.
+    /// `capture_stdout_as` is in neither list: it declares a name rather than
+    /// carrying a reference, and the compiler checks it for collisions on its
+    /// own path.
+    ///
+    /// The body destructures `self` exhaustively for the reason
+    /// [`Gate::substitutable_fields`] gives. Do not simplify the pattern
+    /// to `..`.
+    pub fn substitutable_fields(&self) -> Vec<(&'static str, &str)> {
+        let Self {
+            command,
+            working_dir,
+            requires_confirmation: _,
+            polling: _,
+            fallback: _,
+            capture_stdout_as: _,
+        } = self;
+        vec![
+            ("command", command.as_str()),
+            ("working_dir", working_dir.as_str()),
+        ]
+    }
+
+    /// Every field of this action declaration that reaches its reader as
+    /// literal prose, paired with the name errors report it under.
+    ///
+    /// A field here promises the opposite of one in
+    /// [`ActionDecl::substitutable_fields`]: a `{{KEY}}` reference written into
+    /// it is refused at compile time rather than resolved at run time. The two
+    /// promises are why there are two lists instead of one list with a tag --
+    /// each carries its own compiler error and its own test.
+    ///
+    /// `fallback` is spliced onto a failure response's directive *after*
+    /// substitution has run, deliberately, so author prose is never exposed to
+    /// expansion. That behaviour is intended and documented on the field. What
+    /// was missing until Issue #228 was the other half: nothing told an author
+    /// that the reference they wrote would not resolve.
+    ///
+    /// The body destructures `self` exhaustively for the reason
+    /// [`Gate::substitutable_fields`] gives. Do not simplify the pattern
+    /// to `..`.
+    pub fn literal_fields(&self) -> Vec<(&'static str, &str)> {
+        let Self {
+            command: _,
+            working_dir: _,
+            requires_confirmation: _,
+            polling: _,
+            fallback,
+            capture_stdout_as: _,
+        } = self;
+        let mut fields = Vec::new();
+        if let Some(prose) = fallback {
+            fields.push(("fallback", prose.as_str()));
+        }
+        fields
+    }
 }
 
 /// Polling configuration for actions that need repeated execution.
@@ -1083,27 +1179,53 @@ impl CompiledTemplate {
                         state_name
                     ));
                 }
-                // Validate variable references in action command.
-                for ref_name in extract_refs(&action.command) {
-                    if !self.variables.contains_key(&ref_name)
-                        && !captures.contains_key(&ref_name)
-                        && !RUNTIME_VARIABLE_NAMES.contains(&ref_name.as_str())
-                    {
-                        return Err(format!(
-                            "state '{}': variable reference '{{{{{}}}}}' in default_action command is not declared in the template's variables block",
-                            state_name, ref_name
-                        ));
+                // Validate variable references in every substitutable action
+                // field.
+                //
+                // The field list comes from `ActionDecl::substitutable_fields`
+                // rather than being written out here, for the reason that
+                // accessor and its `Gate` counterpart both give: two lists is
+                // the bug. This was two hand-written loops, one per field,
+                // producing the same message twice -- and the field neither of
+                // them named, `fallback`, is what Issue #228 was about. The
+                // wording below is the wording those loops produced, now
+                // produced once.
+                for (field, raw) in action.substitutable_fields() {
+                    for ref_name in extract_refs(raw) {
+                        if !self.variables.contains_key(&ref_name)
+                            && !captures.contains_key(&ref_name)
+                            && !RUNTIME_VARIABLE_NAMES.contains(&ref_name.as_str())
+                        {
+                            return Err(format!(
+                                "state '{}': variable reference '{{{{{}}}}}' in default_action {} is not declared in the template's variables block",
+                                state_name, ref_name, field
+                            ));
+                        }
                     }
                 }
-                // Validate variable references in action working_dir.
-                for ref_name in extract_refs(&action.working_dir) {
-                    if !self.variables.contains_key(&ref_name)
-                        && !captures.contains_key(&ref_name)
-                        && !RUNTIME_VARIABLE_NAMES.contains(&ref_name.as_str())
-                    {
+                // Refuse a reference in a field that reaches its reader as
+                // literal prose (Issue #228).
+                //
+                // `fallback` is spliced onto a failure response's directive
+                // after substitution has run, deliberately, so author prose is
+                // never exposed to expansion. That is intended and documented
+                // on the field. What was missing was this: an author who wrote
+                // `{{SESSION_DIR}}` there compiled clean and the agent received
+                // the braces, in the same response whose directive resolved the
+                // same reference two lines below.
+                //
+                // Any reference is refused, not only an undeclared one. The
+                // field is never expanded, so a declared reference is exactly
+                // as undelivered as an undeclared one, and accepting the first
+                // would tell an author their reference is fine when it is not.
+                for (field, raw) in action.literal_fields() {
+                    if let Some(ref_name) = extract_refs(raw).into_iter().next() {
                         return Err(format!(
-                            "state '{}': variable reference '{{{{{}}}}}' in default_action working_dir is not declared in the template's variables block",
-                            state_name, ref_name
+                            "state '{}': variable reference '{{{{{}}}}}' in default_action {} is never expanded; \
+                             {} is spliced after variable substitution and reaches the agent as literal prose\n  \
+                             remedy: write the reference in the state's directive, which resolves it, and keep \
+                             {} to prose that reads correctly as written",
+                            state_name, ref_name, field, field, field
                         ));
                     }
                 }
@@ -1996,6 +2118,101 @@ mod tests {
     #[test]
     fn valid_minimal_template_passes() {
         minimal_template().validate(true).unwrap();
+    }
+
+    #[test]
+    fn every_literal_action_field_refuses_a_reference() {
+        // The guard for the promise `ActionDecl::literal_fields` makes.
+        //
+        // `substitutable_fields` promises a reference resolves and is guarded by
+        // `every_action_field_the_compiler_validates_is_one_the_tick_substitutes`
+        // in `src/cli/mod.rs`. This is the other half: a field on the literal
+        // list promises a reference is REFUSED, and without a test the list
+        // could name a field nothing checks -- which would relocate the silence
+        // Issue #228 was filed about rather than end it.
+        //
+        // The reference names a DECLARED variable on purpose. The refusal is
+        // about the field never being expanded, not about the name being
+        // unknown, so the case that would slip past a check written against
+        // undeclared names is exactly a template where the reference resolves
+        // everywhere else.
+        let probe = ActionDecl {
+            command: "false".to_string(),
+            working_dir: String::new(),
+            requires_confirmation: false,
+            polling: None,
+            fallback: Some("look in {{V}}".to_string()),
+            capture_stdout_as: None,
+        };
+        let named: Vec<&'static str> = probe.literal_fields().into_iter().map(|(f, _)| f).collect();
+        assert!(
+            !named.is_empty(),
+            "the fixture fills no field the accessor names, so this test would \
+             pass without checking anything"
+        );
+
+        for field in named {
+            let mut action = ActionDecl {
+                command: "false".to_string(),
+                working_dir: String::new(),
+                requires_confirmation: false,
+                polling: None,
+                fallback: None,
+                capture_stdout_as: None,
+            };
+            match field {
+                "fallback" => action.fallback = Some("look in {{V}}".to_string()),
+                other => panic!(
+                    "ActionDecl::literal_fields names {other:?}, which this test \
+                     has no fixture arm for. Add one, so the field is actually \
+                     exercised rather than silently skipped."
+                ),
+            }
+
+            let mut t = minimal_template();
+            t.variables.insert(
+                "V".to_string(),
+                VariableDecl {
+                    description: "a declared variable".to_string(),
+                    required: true,
+                    default: String::new(),
+                },
+            );
+            t.states.get_mut("start").unwrap().default_action = Some(action);
+
+            let err = t.validate(false).unwrap_err();
+            assert!(
+                err.contains(field) && err.contains("never expanded"),
+                "the refusal for {field:?} should name the field and say it is \
+                 never expanded; got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_reference_in_a_substitutable_action_field_is_accepted() {
+        // The companion to the test above, and the reason it is not enough on
+        // its own: a literal-field refusal written too broadly would refuse
+        // every reference in a `default_action`, which would break the fields
+        // that are supposed to resolve one.
+        let mut t = minimal_template();
+        t.variables.insert(
+            "V".to_string(),
+            VariableDecl {
+                description: "a declared variable".to_string(),
+                required: true,
+                default: String::new(),
+            },
+        );
+        t.states.get_mut("start").unwrap().default_action = Some(ActionDecl {
+            command: "echo {{V}}".to_string(),
+            working_dir: "sub/{{V}}".to_string(),
+            requires_confirmation: false,
+            polling: None,
+            fallback: Some("plain prose with no reference in it".to_string()),
+            capture_stdout_as: None,
+        });
+        t.validate(false).unwrap();
     }
 
     #[test]

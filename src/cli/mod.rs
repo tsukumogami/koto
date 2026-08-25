@@ -3091,8 +3091,18 @@ fn substitute_regex_literal(
 /// action storing `{{SESSION_NAME}}-note` and a `context-exists` gate reading
 /// `key: "{{SESSION_NAME}}-note"` sat in the same state and disagreed about what
 /// that reference meant, and the disagreement surfaced as a gate that would not
-/// pass. The one gate field still outside this is `name_filter`, on a
-/// `children-complete` gate (Issue #224).
+/// pass. `name_filter` was the last gate field outside this, and joined it in
+/// Issue #224.
+///
+/// `name_filter` takes the plain form and keeps its `Option`. Plain because a
+/// prefix is compared against child workflow names and nothing parses it
+/// further -- the shell form would render an empty value as `''`, two literal
+/// quote characters that no child name starts with, which turns a detectable
+/// empty into a silent no-match. Keeping the `Option` is what lets
+/// `evaluate_children_complete` tell a gate that declared no filter from one
+/// whose filter resolved to nothing; `.as_deref().unwrap_or("")` anywhere on
+/// this path would erase that difference and with it the refusal that depends
+/// on it.
 #[cfg(unix)]
 fn substitute_gate_fields(
     gates: &std::collections::BTreeMap<String, crate::template::types::Gate>,
@@ -3107,6 +3117,10 @@ fn substitute_gate_fields(
             g.command = substitute_shell_command(&g.command, runtime_vars, variables, overlay);
             g.key = substitute_plain(&g.key, runtime_vars, variables, overlay);
             g.pattern = substitute_regex_literal(&g.pattern, runtime_vars, variables, overlay);
+            g.name_filter = gate
+                .name_filter
+                .as_deref()
+                .map(|filter| substitute_plain(filter, runtime_vars, variables, overlay));
             (name.clone(), g)
         })
         .collect()
@@ -5951,6 +5965,52 @@ fn evaluate_children_complete(
 ) -> crate::gate::StructuredGateResult {
     use crate::gate::{GateOutcome, StructuredGateResult};
 
+    // A `name_filter` that resolved to nothing is not a filter that matches
+    // everything -- it is an author who asked for one fan-out and would silently
+    // get every child of this parent instead. That is the failing-open
+    // direction, and worse than the failing-closed symptom Issue #224 was filed
+    // about: a gate written to wait on the research children would pass on a
+    // set it was written to exclude.
+    //
+    // The compiler cannot catch this. It reads the authored string, and
+    // `name_filter: "{{PREFIX}}"` is not empty until `PREFIX` resolves to
+    // nothing, so a value that is only empty after substitution is this
+    // function's to catch -- the same split, for the same reason, as the empty
+    // `pattern` refusal in `evaluate_context_matches_gate`.
+    //
+    // It is also the last point at which the distinction survives. The value
+    // crosses into `build_children_complete_output` as `Option<&str>`, and
+    // there `Some("")` is a prefix every child name starts with, which is what
+    // `None` already means.
+    if matches!(gate.name_filter.as_deref(), Some("")) {
+        return StructuredGateResult {
+            outcome: GateOutcome::Error,
+            output: serde_json::json!({
+                "total": 0,
+                "completed": 0,
+                "pending": 0,
+                "success": 0,
+                "failed": 0,
+                "skipped": 0,
+                "blocked": 0,
+                "spawn_failed": 0,
+                "all_complete": false,
+                "all_success": false,
+                "any_failed": false,
+                "any_skipped": false,
+                "any_spawn_failed": false,
+                "needs_attention": false,
+                "children": [],
+                "error": "children-complete name_filter resolved to an empty string, \
+                          which would match every child of this parent rather than the \
+                          one fan-out the filter names; a {{KEY}} reference in the gate's \
+                          name_filter has no value\n  \
+                          remedy: give the variable a default, or omit name_filter \
+                          entirely if the gate really should watch every child",
+            }),
+        };
+    }
+
     // The returned bool is the converge pass-predicate: terminal
     // completion AND every non-skipped child's result is dereferenceable.
     // The gate is non-passing (GateBlocked) while any child is still
@@ -7568,7 +7628,12 @@ Done.
             pattern: "^{{TOKEN}}$".to_string(),
             override_default: None,
             completion: None,
-            name_filter: None,
+            // `Some`, not `None`: the accessor omits an absent field entirely,
+            // so a `None` here would leave `name_filter` unnamed and the
+            // assertion below would pass without ever looking at it. The
+            // staleness check cannot catch that -- it only walks fields the
+            // accessor names.
+            name_filter: Some("{{TOKEN}}.research.".to_string()),
         };
         for (field, raw) in authored.substitutable_fields() {
             assert!(
@@ -7594,6 +7659,86 @@ Done.
             assert!(
                 raw.contains("resolved"),
                 "gate field {field:?} should carry the resolved value; got {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_action_field_the_compiler_validates_is_one_the_tick_substitutes() {
+        // The `ActionDecl` sibling of the gate guard above, and it exists for
+        // the same reason one struct over: the compiler validates references in
+        // exactly the fields `ActionDecl::substitutable_fields` names, so a
+        // field that joins that list without the tick being wired would promise
+        // a resolution nothing delivers. That is the shape Issue #220 took on
+        // this very struct -- a `default_action` command the compiler accepted
+        // and the runtime skipped.
+        //
+        // The tick has no single helper for action fields the way it does for
+        // gates: `command` goes through the shell-safe form and `working_dir`
+        // through the plain one, at two call sites in the action closure. So
+        // this walks the accessor and routes each field through the form that
+        // closure uses, which is what makes a field added to the accessor and
+        // nowhere else fail here.
+        use crate::engine::substitute::{VariableOverlay, Variables};
+        use crate::template::types::ActionDecl;
+
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "/cache/abc.json".to_string(),
+                variables: std::collections::HashMap::from([(
+                    "TOKEN".to_string(),
+                    "resolved".to_string(),
+                )]),
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+        let variables = Variables::from_events(&events).unwrap();
+        let runtime_vars = std::collections::HashMap::new();
+        let overlay = VariableOverlay::new();
+
+        let authored = ActionDecl {
+            command: "echo {{TOKEN}}".to_string(),
+            working_dir: "sub/{{TOKEN}}".to_string(),
+            requires_confirmation: false,
+            polling: None,
+            fallback: None,
+            capture_stdout_as: None,
+        };
+        for (field, raw) in authored.substitutable_fields() {
+            assert!(
+                raw.contains("{{TOKEN}}"),
+                "this fixture is stale: the accessor names {field:?}, which it \
+                 does not fill with a reference, so the assertion below would \
+                 pass vacuously for that field"
+            );
+        }
+
+        for (field, raw) in authored.substitutable_fields() {
+            // The form the action closure uses for this field. A field added to
+            // the accessor with no arm here fails the match rather than being
+            // silently waved through.
+            let substituted = match field {
+                "command" => substitute_shell_command(raw, &runtime_vars, &variables, &overlay),
+                "working_dir" => substitute_plain(raw, &runtime_vars, &variables, &overlay),
+                other => panic!(
+                    "ActionDecl::substitutable_fields names {other:?}, which the \
+                     action closure has no substitution arm for. Wire it there, \
+                     then add the form here."
+                ),
+            };
+            assert!(
+                !substituted.contains("{{"),
+                "action field {field:?} is validated by the compiler but reached \
+                 the runtime with a raw token: {substituted:?}"
+            );
+            assert!(
+                substituted.contains("resolved"),
+                "action field {field:?} should carry the resolved value; got \
+                 {substituted:?}"
             );
         }
     }

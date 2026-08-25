@@ -924,7 +924,9 @@ Two ways a reference can leave a context gate unusable, both reported as a gate 
 - The `key` resolves to something the context store will not accept -- empty, or not matching the key rules (each `/`-separated component starts with a letter or digit, then letters, digits, `.`, `_`, `-`). Note the value allowlist is wider than that: a space, `:` or `@` is a legal value and an illegal key.
 - The `pattern` resolves to an empty string. An empty regex matches everything, so the gate refuses rather than passing on any content at all.
 
-A `children-complete` gate's `name_filter` is the one gate field that does not substitute. Write that prefix literally.
+A `children-complete` gate's `name_filter` substitutes too, in the plain form -- it is a name prefix, not a shell word or a regex. It has one failure of its own, reported the same way:
+
+- The `name_filter` resolves to an empty string. An empty prefix does not narrow the gate, it removes the filter, so a gate written to watch one fan-out would silently watch every child of the parent. The gate refuses rather than widening. A gate that declares no `name_filter` at all is unaffected -- that still means "watch every child", and is the way to ask for it.
 
 ---
 

@@ -153,7 +153,7 @@ states:
 |---|---|---|---|
 | `command` | Yes | string | The command line, passed to `sh -c` as a single string |
 | `capture_stdout_as` | No | string | A name this command's trimmed stdout is delivered under, readable by later states. See Part 3 |
-| `fallback` | No | string | Prose the agent reads when the action fails. Written as literal text -- it is spliced after variable substitution and is never expanded |
+| `fallback` | No | string | Prose the agent reads when the action fails. Written as literal text -- it is spliced after variable substitution and is never expanded, so a `{{KEY}}` reference in it is refused at compile time; put the reference in the state's directive instead |
 | `working_dir` | No | string | A **relative** path under the session's execution anchor. Absolute values are rejected |
 | `requires_confirmation` | No | bool | After a *successful* run, stop and ask the operator to confirm before transitioning |
 | `polling` | No | map | `interval_secs` and `timeout_secs`. Re-runs the command on an interval, re-evaluating the state's gates between runs, until they pass or `timeout_secs` expires |
