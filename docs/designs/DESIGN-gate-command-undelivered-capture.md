@@ -306,23 +306,31 @@ and the exit status stays 3, per PRD R3.
 
 ## Implementation Approach
 
-Three steps, each of which compiles and passes the suite on its own.
+Three steps, each of which compiles clean under `-D warnings` and passes the
+suite on its own.
 
-**Step 1 -- the helper and its type.** Add `GateCaptureRefusal`, change
-`substitute_gate_fields` to take the capture map and return `Result`, and update
-both production callers plus the helper's own unit tests in `src/cli/mod.rs` to
-unwrap the `Ok`. At the end of this step the check exists and refuses, but the
-two callers still `expect` the `Ok`, so behaviour is unchanged and no test moves.
-This isolates the mechanical churn from the behavioural change.
+**Step 1 -- the whole path, in one step.** `GateCaptureRefusal`;
+`substitute_gate_fields` takes the capture map, runs the check and returns
+`Result`; `StopReason::GateRefusedUnsetCapture` and `ActionResult::GateRefused`;
+the widened `G` bound and the engine's two arms; both callers converting the
+error into their own vocabulary; and the renderer arm with its two sentences.
 
-**Step 2 -- the two carriers and the stop.** Add
-`StopReason::GateRefusedUnsetCapture` and `ActionResult::GateRefused`; widen `G`
-to return a `Result` and add the engine's two arms; replace the `expect`s from
-step 1 with the real conversions. This is the step whose test churn is the ~38
-`advance_until_stop` call sites, and the compiler enumerates them.
+It is one step rather than the two it looks like, and the reason is worth stating
+because the obvious split does not work. Landing the signature and the check
+first, with the callers unwrapping, is not behaviour-neutral: a template that
+triggers the refusal would panic on the unwrap, which is worse than both the
+before and the after. Landing the engine-side vocabulary first instead leaves
+`GateCaptureRefusal` used in signatures and constructed nowhere, which
+`dead_code` refuses under `-D warnings`. Every seam through the middle of this
+change produces an intermediate state that is broken in one direction or the
+other, because the type, its producer and its consumers are one unit of meaning.
 
-**Step 3 -- the renderer and the regression tests.** Add the renderer arm with
-its two sentences, then the integration tests in
+What a reviewer is owed is still owed, and it is delivered at commit granularity
+inside the step: one commit for the mechanical bound change across the
+`advance_until_stop` call sites, one for the behavioural wiring. Two commits in
+one step read exactly as well as two steps and leave no broken tree between them.
+
+**Step 2 -- the regression tests.** The integration tests in
 `tests/gate_field_substitution_test.rs`: one per gate field for the refusal, the
 polling-parity pair, the two self-reference cases, and the no-regression set that
 pins a delivered capture, a declared variable, and the koto#230 empty-value
@@ -332,10 +340,11 @@ The failing-against-`main` evidence is collected against a detached worktree of
 `main` with the new test file copied in, not against a stash, and the failure text
 is recorded in the pull request.
 
-Documentation lands with step 3: the `CHANGELOG.md` entry under Unreleased /
-Fixed, the removal of the `#225` clause from the `substitute_shell_command` doc
-comment, and the assessment of the three skills under
-`plugins/koto-skills/skills/`.
+**Step 3 -- documentation.** The `CHANGELOG.md` entry under Unreleased / Fixed,
+the removal of the `#225` clause from the `substitute_shell_command` doc comment
+-- the same paragraph koto#221, koto#222 and koto#224 each edited in turn -- and
+the assessment of all three skills under `plugins/koto-skills/skills/`, recorded
+with its reason even where the answer is that nothing changes.
 
 ## Security Considerations
 
@@ -400,8 +409,11 @@ reasoning koto#221 recorded for the action case.
 
 ### Mitigations
 
-- Step 1 lands the churn with behaviour unchanged, so a reviewer can read the
-  mechanical diff and the behavioural diff separately.
+- Step 1 is two commits, the mechanical bound change and the behavioural wiring,
+  so a reviewer can read them separately without any intermediate tree being
+  broken. It is one step rather than two because every seam through the middle
+  leaves either a panic on the refusal path or a never-constructed type that
+  `dead_code` refuses.
 - The regression set pins both directions -- what must refuse and what must not
   change -- so an implementation that refuses too broadly fails as loudly as one
   that refuses too little.
