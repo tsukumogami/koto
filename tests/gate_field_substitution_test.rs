@@ -1636,3 +1636,499 @@ Done.
         "the directive itself still resolves its own reference; got {resp}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// an undelivered capture in a gate field (Issue #225)
+// ---------------------------------------------------------------------------
+
+/// Run `koto next` and return (exit status code, parsed JSON), for the cases
+/// where the exit status is part of what is being pinned.
+///
+/// `next` above unwraps the JSON and discards the status, which is right for a
+/// blocked tick and wrong for a refusal: the whole claim here is that the run
+/// stops with a particular code, and a helper that throws the code away cannot
+/// tell that from a gate that merely failed.
+fn next_with_status(dir: &Path, name: &str) -> (Option<i32>, Value) {
+    let output = koto_cmd(dir).args(["next", name]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "next should print one JSON object: {e}\nstdout={stdout}\nstderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    (output.status.code(), json)
+}
+
+/// The refusal's message, or a panic naming what came back instead.
+fn capture_unset_message(resp: &Value) -> String {
+    let err = resp
+        .get("error")
+        .unwrap_or_else(|| panic!("expected a capture_unset error; got {resp}"));
+    assert_eq!(
+        err["code"], "capture_unset",
+        "the gate refusal reuses the code a directive and an action already get for \
+         the same defect; got {resp}"
+    );
+    err["message"].as_str().unwrap_or_default().to_string()
+}
+
+/// A template whose first state gates on a capture a later state delivers.
+///
+/// `gate_body` is spliced under the gate's own name so one shape serves every
+/// field: the command case, and the three that reach the store or the regex
+/// engine rather than a shell.
+fn undelivered_capture_template(gate_body: &str) -> String {
+    format!(
+        r#"---
+name: gate-unset-capture
+version: "1.0"
+initial_state: s
+states:
+  s:
+    gates:
+      probe:
+{gate_body}
+    transitions:
+      - target: producer
+  producer:
+    default_action:
+      command: 'echo abc'
+      capture_stdout_as: TOKEN
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## s
+
+Probe.
+
+## producer
+
+Produce.
+
+## done
+
+Done.
+"#
+    )
+}
+
+/// The issue's own reproduction: a gate command reading a capture the run has
+/// not reached yet is refused, and the command does not run.
+///
+/// The side-effect file is the load-bearing half. A test that only checked the
+/// exit status would pass against an implementation that refused *after*
+/// handing the string to `sh -c`, which is the outcome the issue is about --
+/// the token reached the shell and the gate answered on text nobody wrote.
+#[test]
+fn a_gate_command_reading_an_undelivered_capture_is_refused_before_it_runs() {
+    let dir = TempDir::new().unwrap();
+    let template = undelivered_capture_template(
+        "        type: command\n        command: 'printf \"%s\" \"gate-{{TOKEN}}\" > gate-out.txt'",
+    );
+
+    init_workflow(dir.path(), "gprobe1", &template);
+    let (code, resp) = next_with_status(dir.path(), "gprobe1");
+
+    assert_eq!(code, Some(3), "the refusal exits 3; got {resp}");
+    let message = capture_unset_message(&resp);
+    for expected in ["'s'", "'probe'", "command", "{{TOKEN}}", "'producer'"] {
+        assert!(
+            message.contains(expected),
+            "the message must name the state, the gate, the field, the capture and \
+             the producing state; {expected} missing from {message:?}"
+        );
+    }
+    assert!(
+        !dir.path().join("gate-out.txt").exists(),
+        "nothing may run before the refusal, and the gate command had a side effect \
+         that proves whether it did"
+    );
+}
+
+/// The other three gate fields get the same refusal, rather than the unrelated
+/// errors they produce today.
+///
+/// Each of these already fails in some way, which is exactly why they are worth
+/// pinning: `name_filter` blocks on a zero-child count with no diagnostic at
+/// all, `pattern` reports an invalid regex, and `key` reports an unusable
+/// character. All three send the operator to fix a value when the template's
+/// state ordering is what is wrong.
+#[test]
+fn every_substitutable_gate_field_gets_the_same_refusal() {
+    // (field name as the message reports it, the gate body that carries it)
+    let cases = [
+        (
+            "key",
+            "        type: context-exists\n        key: \"{{TOKEN}}\"",
+        ),
+        (
+            "pattern",
+            "        type: context-matches\n        key: status\n        pattern: \"{{TOKEN}}\"",
+        ),
+        (
+            "name_filter",
+            "        type: children-complete\n        name_filter: \"{{TOKEN}}\"",
+        ),
+    ];
+
+    for (n, (field, gate_body)) in cases.iter().enumerate() {
+        let dir = TempDir::new().unwrap();
+        let template = undelivered_capture_template(gate_body);
+        let name = format!("fprobe{n}");
+
+        init_workflow(dir.path(), &name, &template);
+        let (code, resp) = next_with_status(dir.path(), &name);
+
+        assert_eq!(
+            code,
+            Some(3),
+            "case {field}: the refusal exits 3; got {resp}"
+        );
+        let message = capture_unset_message(&resp);
+        assert!(
+            message.contains(field),
+            "case {field}: the message must name the field that carried the \
+             reference; got {message:?}"
+        );
+        assert!(
+            message.contains("{{TOKEN}}") && message.contains("'producer'"),
+            "case {field}: the message must name the capture and the producing \
+             state; got {message:?}"
+        );
+    }
+}
+
+/// The polling loop refuses identically to the advance loop.
+///
+/// This is the position Issue #220 found the two paths drifted at, so it is
+/// pinned by running the same reference through a state whose action polls --
+/// where the gates are resolved on the way *into* the action rather than after
+/// it -- and asserting the same code and the same five values come back.
+#[test]
+fn the_polling_loop_refuses_an_undelivered_capture_as_the_advance_loop_does() {
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: gate-unset-capture-polling
+version: "1.0"
+initial_state: s
+states:
+  s:
+    default_action:
+      command: 'sleep 30'
+      polling:
+        interval_secs: 1
+        timeout_secs: 20
+    gates:
+      probe:
+        type: command
+        command: 'printf "%s" "gate-{{TOKEN}}" > gate-out.txt'
+    transitions:
+      - target: producer
+  producer:
+    default_action:
+      command: 'echo abc'
+      capture_stdout_as: TOKEN
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## s
+
+Poll.
+
+## producer
+
+Produce.
+
+## done
+
+Done.
+"#;
+
+    init_workflow(dir.path(), "pprobe1", template);
+    let (code, resp) = next_with_status(dir.path(), "pprobe1");
+
+    assert_eq!(
+        code,
+        Some(3),
+        "the polling position refuses with the same status as the advance \
+         position; got {resp}"
+    );
+    let message = capture_unset_message(&resp);
+    for expected in ["'s'", "'probe'", "command", "{{TOKEN}}", "'producer'"] {
+        assert!(
+            message.contains(expected),
+            "the polling refusal carries the same five values as the advance one; \
+             {expected} missing from {message:?}"
+        );
+    }
+    assert!(
+        !dir.path().join("gate-out.txt").exists(),
+        "the polling refusal happens before the action is spawned, so the gate \
+         command cannot have run either"
+    );
+}
+
+/// A gate reading the capture its own state's non-polling action delivers still
+/// resolves.
+///
+/// This is the case a check hoisted ahead of the action would break. The action
+/// runs first and the state's gates are evaluated afterwards, so by the time the
+/// gate is resolved the value exists -- and refusing it would be a false
+/// refusal on a template that works today.
+#[test]
+fn a_gate_reading_its_own_states_capture_still_resolves() {
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: gate-own-capture
+version: "1.0"
+initial_state: s
+states:
+  s:
+    default_action:
+      command: 'echo abc'
+      capture_stdout_as: TOKEN
+    gates:
+      probe:
+        type: command
+        command: 'test "{{TOKEN}}" = "abc"'
+    transitions:
+      - target: done
+        when:
+          gates.probe.exit_code: 0
+  done:
+    terminal: true
+---
+
+## s
+
+Produce and check.
+
+## done
+
+Done.
+"#;
+
+    init_workflow(dir.path(), "oprobe1", template);
+    let (code, resp) = next_with_status(dir.path(), "oprobe1");
+
+    assert_ne!(
+        code,
+        Some(3),
+        "the action delivers the value before the gate is resolved, so this must \
+         not refuse; got {resp}"
+    );
+    assert_eq!(
+        resp["state"], "done",
+        "the gate should resolve the value and pass; got {resp}"
+    );
+}
+
+/// The same gate under a polling action is refused, and says so in its own
+/// terms.
+///
+/// A polling action's gates are substituted before its command finishes, so the
+/// overlay cannot hold the capture that action delivers. The general sentence
+/// would tell the operator the run has not entered a state it is standing in,
+/// which is why the message is different here.
+#[test]
+fn a_polling_gate_reading_its_own_states_capture_says_so() {
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: gate-own-capture-polling
+version: "1.0"
+initial_state: s
+states:
+  s:
+    default_action:
+      command: 'sleep 30'
+      capture_stdout_as: TOKEN
+      polling:
+        interval_secs: 1
+        timeout_secs: 20
+    gates:
+      probe:
+        type: command
+        command: 'test "{{TOKEN}}" = "abc"'
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## s
+
+Poll.
+
+## done
+
+Done.
+"#;
+
+    init_workflow(dir.path(), "sprobe1", template);
+    let (code, resp) = next_with_status(dir.path(), "sprobe1");
+
+    assert_eq!(
+        code,
+        Some(3),
+        "this reference can never resolve; got {resp}"
+    );
+    let message = capture_unset_message(&resp);
+    assert!(
+        message.contains("that same state's default_action"),
+        "the message must say the gate reads the capture its own state delivers, \
+         rather than naming a state the run has not entered; got {message:?}"
+    );
+    assert!(
+        !message.contains("has not entered that state"),
+        "the general wording would be wrong here -- the run is standing in that \
+         state; got {message:?}"
+    );
+}
+
+/// A capture an earlier state delivered on this same tick resolves in a later
+/// state's gate.
+///
+/// The no-regression half. An implementation that refused every gate carrying a
+/// capture reference would pass every test above and fail this one.
+#[test]
+fn a_capture_delivered_earlier_in_the_same_tick_resolves_in_a_gate() {
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: gate-delivered-capture
+version: "1.0"
+initial_state: producer
+states:
+  producer:
+    default_action:
+      command: 'echo abc'
+      capture_stdout_as: TOKEN
+    transitions:
+      - target: s
+  s:
+    gates:
+      probe:
+        type: command
+        command: 'test "{{TOKEN}}" = "abc"'
+    transitions:
+      - target: done
+        when:
+          gates.probe.exit_code: 0
+  done:
+    terminal: true
+---
+
+## producer
+
+Produce.
+
+## s
+
+Check.
+
+## done
+
+Done.
+"#;
+
+    init_workflow(dir.path(), "dprobe1", template);
+    let (code, resp) = next_with_status(dir.path(), "dprobe1");
+
+    assert_ne!(
+        code,
+        Some(3),
+        "a delivered capture must still resolve; got {resp}"
+    );
+    assert_eq!(
+        resp["state"], "done",
+        "the gate should have resolved the value the earlier state produced on this \
+         same tick; got {resp}"
+    );
+}
+
+/// A capture delivered on an earlier tick resolves on a later one.
+///
+/// The same claim across a tick boundary, where the value arrives from the log's
+/// bindings rather than from the per-tick overlay. Both layers are consulted,
+/// and a fix that checked only one of them would pass the test above and fail
+/// this one.
+#[test]
+fn a_capture_delivered_on_an_earlier_tick_resolves_in_a_gate() {
+    let dir = TempDir::new().unwrap();
+    let template = r#"---
+name: gate-earlier-tick-capture
+version: "1.0"
+initial_state: producer
+states:
+  producer:
+    default_action:
+      command: 'echo abc'
+      capture_stdout_as: TOKEN
+    accepts:
+      ready:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: s
+        when:
+          ready: ok
+  s:
+    gates:
+      probe:
+        type: command
+        command: 'test "{{TOKEN}}" = "abc"'
+    transitions:
+      - target: done
+        when:
+          gates.probe.exit_code: 0
+  done:
+    terminal: true
+---
+
+## producer
+
+Produce.
+
+## s
+
+Check.
+
+## done
+
+Done.
+"#;
+
+    init_workflow(dir.path(), "tprobe1", template);
+    // First tick runs the action and stops for evidence, so the capture reaches
+    // the log rather than only the tick's own overlay.
+    let (first, first_resp) = next_with_status(dir.path(), "tprobe1");
+    assert_ne!(
+        first,
+        Some(3),
+        "the first tick must not refuse; got {first_resp}"
+    );
+
+    let output = koto_cmd(dir.path())
+        .args(["next", "tprobe1", "--with-data", r#"{"ready":"ok"}"#])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let resp: Value = serde_json::from_str(stdout.trim()).unwrap();
+
+    assert_ne!(
+        output.status.code(),
+        Some(3),
+        "a capture from an earlier tick must still resolve; got {resp}"
+    );
+    assert_eq!(
+        resp["state"], "done",
+        "the gate should have resolved the value the earlier tick produced; got {resp}"
+    );
+}
