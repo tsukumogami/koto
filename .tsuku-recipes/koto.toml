@@ -4,11 +4,29 @@ description = "Workflow orchestration engine for AI agents"
 homepage = "https://github.com/tsukumogami/koto"
 version_format = "semver"
 
+[version]
+github_repo = "tsukumogami/koto"
+tag_prefix = "v"
+
+# Every release publishes checksums.txt alongside the binaries (see the
+# "Generate checksums" step in .github/workflows/release.yml), so point the
+# download at it. The github_file action this recipe used before is more
+# compact, but it accepts no checksum parameter, which left tsuku hashing
+# whatever the release served at plan time with nothing upstream to compare
+# against. See tsukumogami/tsuku#2537 -- this can go back to github_file once
+# that action forwards a checksum source.
 [[steps]]
-action = "github_file"
-repo = "tsukumogami/koto"
-asset_pattern = "koto-{os}-{arch}"
-binary = "koto"
+action = "download"
+url = "https://github.com/tsukumogami/koto/releases/download/v{version}/koto-{os}-{arch}"
+checksum_url = "https://github.com/tsukumogami/koto/releases/download/v{version}/checksums.txt"
+
+[[steps]]
+action = "chmod"
+files = ["koto-{os}-{arch}"]
+
+[[steps]]
+action = "install_binaries"
+outputs = [{src = "koto-{os}-{arch}", dest = "bin/koto"}]
 
 [verify]
 command = "koto version"
