@@ -23,6 +23,7 @@ jobs:
       - name: Build koto
         run: cargo build --release
 
+      # Mirrored in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       - name: Compile all templates
         run: |
           failed=0
@@ -58,6 +59,7 @@ jobs:
       - name: Build koto
         run: cargo build --release
 
+      # Mirrored in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       - name: Test Stop hook with active workflow
         run: |
           # Create a mock state file in a session directory.
@@ -84,6 +86,7 @@ jobs:
             exit 1
           fi
 
+      # Mirrored in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       - name: Test Stop hook with no active workflow
         run: |
           # Use an empty sessions directory so no workflows are active.
@@ -109,6 +112,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Mirrored in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       - name: Validate plugin.json
         run: |
           PLUGIN_JSON="plugins/koto-skills/.claude-plugin/plugin.json"
@@ -129,6 +133,7 @@ jobs:
           }
           echo "PASS: plugin.json has required fields (name, version, skills)"
 
+      # Mirrored in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       - name: Validate marketplace.json
         run: |
           MARKETPLACE_JSON=".claude-plugin/marketplace.json"

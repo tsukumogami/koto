@@ -25,6 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Mirrored in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       - name: Verify no hooks.json in skill directories
         run: |
           failed=0
