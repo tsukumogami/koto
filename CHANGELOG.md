@@ -44,6 +44,32 @@ to `0.9.x`).
 
 ### Fixed
 
+- **`koto context add` and `koto context remove` refuse a session that has no
+  state log, instead of creating a log koto can't read.** Both verbs append an
+  event to the session's log, and neither checked that the log existed. The
+  context store created the session directory and the append created the log,
+  so a write to a batch child that was still `blocked`, to a session that had
+  finished and been cleaned up, or to a child a parent's `koto rewind` had moved
+  left a log whose first line was an event. From then on every command on that
+  session failed with `failed to parse header: missing field workflow`, the
+  session dropped out of `koto session list`, and a stranded batch child kept
+  its parent's batch from ever settling (koto#236). The same path produces the
+  one-line headerless log in koto#200.
+
+  Both verbs now exit 2 with `workflow '<name>' not found`, the same as
+  `koto status`, before anything is stored. That is a behavior change: a script
+  that added context before `koto init` used to get exit 0 and a corrupted
+  session, and now gets exit 2. Underneath the verbs, every append to a state
+  log refuses, and writes nothing, unless the log exists and its first line is a
+  header. So an empty log, or one that lost its header some other way, can't
+  gain a headerless event either, and the next event can no longer reuse
+  `seq: 1`. A log that already has no header reports `state log has no header`
+  instead of a parse error, and the error-code reference says how to clear one.
+
+  Eight integration tests, all of which fail against the previous release, and
+  five unit tests.
+  Closes koto#236 and koto#200.
+
 - **A gate field that reads an undelivered capture is now refused instead of
   handing the raw token to whatever the field feeds.** A `{{KEY}}` naming
   another state's `capture_stdout_as` compiles inside a gate, and it should: a
