@@ -34,7 +34,8 @@ on every `/work-on` run, so it stays short; the reasons are in its commit histor
   `plugins/koto-skills/hooks/*.sh`, `.claude/settings.json` -> no local check exists. Still run
   every other selected command; if one fails the outcome is failed, otherwise it is cannot-verify:
   no command here checks what these files do and most are not read by PR CI either, so the run
-  stops for a person to check them. (shirabe's schema has no form for such an entry yet: tsukumogami/shirabe#373.)
+  stops for a person to check them. (shirabe's schema has no form for such an entry yet:
+  tsukumogami/shirabe#373.)
 
 ### Default verification command (when no map entry matches; all must pass)
 
