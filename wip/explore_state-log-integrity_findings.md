@@ -125,3 +125,12 @@ scheduler repair that moves a headerless batch child's log aside (keeping
 
 Open: whether the cloud backend's pull-overwrite goes in this PR, and the
 exact write-lock deadline and error surface.
+
+Review (coordinator, round 1): truncation is ruled out for local rewrites and
+appends only. The cloud pull's `fs::write` and a crash mid-rewrite can leave an
+empty or headerless file, so the guard must be "the first line parses as a
+header", not "the file exists". The terminal-cleanup story for #200 stays
+INFERRED: in shirabe's work-on template only `blocking_escalate` reaches a
+terminal state.
+
+## Decision: Crystallize
