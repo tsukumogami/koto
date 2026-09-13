@@ -279,8 +279,9 @@ impl SessionBackend for LocalBackend {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                // Match append_header/append_event which create state
-                // files with mode 0600.
+                // Creating the state file is this function's job: appends
+                // refuse a log that isn't already there. Mode 0600 matches
+                // what `append_header` sets on a file it creates.
                 let perms = fs::Permissions::from_mode(0o600);
                 fs::set_permissions(tmp.path(), perms).map_err(SessionError::Io)?;
             }

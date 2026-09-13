@@ -1253,6 +1253,8 @@ where
         });
     };
 
+    // A request log's first line is a RequestHeader, not a session header,
+    // so the append checks it against that type.
     let outcome = append_event_idempotent_in::<RequestHeader>(
         &path,
         &pending.payload,

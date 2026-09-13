@@ -183,7 +183,7 @@ A state file whose first line is an event rather than a header says so:
 {"error":"state file corrupted: state log has no header: its first line is a `context_added` event (seq 1). The session was never initialized, or its log was recreated after the session was removed, and nothing in the log can rebuild it","command":"status"}
 ```
 
-Earlier releases could write such a log when `koto context add` targeted a session that had no log (koto#236). Nothing in it can be recovered, and koto refuses to append to it. To clear it, move the state file (`koto-<name>.state.jsonl`) out of the session directory and leave the `ctx/` directory in place. A batch child is then spawned again by its parent's scheduler; any other session can be started again with `koto init`.
+Earlier releases could write such a log when `koto context add` targeted a session that had no log (koto#236). Nothing in it can be recovered, and koto refuses to append to it. To clear it, move the state file (`koto-<name>.state.jsonl`) out of the session directory. Leave the `ctx/` directory in place, so the context already stored there survives. A batch child is then spawned again by its parent's scheduler; any other session can be started again with `koto init`. Under the cloud backend, remove the headerless copy from the remote store too, or the next read pulls it back down.
 
 **Template hash mismatch (exit code 3)** -- the compiled template on disk doesn't match the hash recorded at init time:
 

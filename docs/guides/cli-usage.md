@@ -456,7 +456,7 @@ koto context add <name> <key> --from-file <path>
 **Optional flags:**
 - `--from-file` -- Read content from the specified file instead of stdin.
 
-Exits 2 if the session has no state log (it was never initialized, or it has already finished and been cleaned up), and stores nothing. Exits non-zero if the input can't be read. Overwrites any existing content for the same key.
+Exits 2 if the session has no state log (it was never initialized, it's a batch child that is still `pending` or `blocked`, or it has already finished and been cleaned up), and stores nothing. Exits non-zero if the input can't be read. Overwrites any existing content for the same key.
 
 #### context get
 

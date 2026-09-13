@@ -1419,10 +1419,14 @@ pub fn run(app: App) -> Result<()> {
                     key,
                     from_file,
                 } => {
-                    // Only `init` creates a session's log. Refuse before the
-                    // store is touched, so a write to a session that hasn't
-                    // started, or that was cleaned up or moved by a rewind,
-                    // leaves nothing behind (koto#236).
+                    // A session's log is written only when the session is
+                    // created (init, session start, a batch spawn), never by
+                    // an append. Refuse before the store is touched, so a
+                    // write to a session that hasn't started, or that was
+                    // cleaned up or moved by a rewind, leaves nothing behind
+                    // (koto#236). Exit 2, as `status` does: the caller named
+                    // a session that isn't there. A log that exists but can't
+                    // be read is exit 3, reported by the handler.
                     if !backend.exists(&session) {
                         exit_with_error_code(
                             serde_json::json!({

@@ -272,8 +272,8 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
 ///
 /// Behavior depends on `hash`:
 ///
-/// - `None`: identical to [`append_event`]. The event is appended
-///   unconditionally; no hash field is written.
+/// - `None`: identical to [`append_event`]. The event is appended with no
+///   hash field, and the same header check applies.
 /// - `Some(h)`: scan the on-disk log for an event whose stored
 ///   `idempotency_hash` equals `h`.
 ///   - If found AND its payload bytes-equal the new payload, return
@@ -330,50 +330,53 @@ pub fn append_event_idempotent_in<H: LogHeader>(
     // are unaffected (advisory).
     let _guard = acquire_state_flock(path)?;
 
+    // Check the header first, and take the seq from the same read, so a log
+    // that is missing, empty or headerless is refused whether or not the
+    // scan below finds a prior event. Doing it after the scan would let an
+    // idempotent hit report success on a log no reader can parse.
+    let next_seq = next_seq_after_header::<H>(path)?;
+
     // Scan for a prior event with the same hash. Read line-by-line so
     // a malformed final line doesn't break the scan (mirrors
-    // `read_events` tolerance).
-    if path.exists() {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("failed to read state file {}: {}", path.display(), e))?;
-        // Skip the header line; events start at line 2 (1-indexed).
-        for line in content.lines().skip(1) {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+    // `read_events` tolerance). Line 1 is the header, checked above, so
+    // events start at line 2 (1-indexed).
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read state file {}: {}", path.display(), e))?;
+    for line in content.lines().skip(1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let prior_hash = parsed.get("idempotency_hash").and_then(|v| v.as_str());
+        if prior_hash != Some(h) {
+            continue;
+        }
+        let prior_seq = parsed
+            .get("seq")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("prior event missing seq"))?;
+        // Bytes-equal payload check (belt-and-suspenders).
+        let prior_payload = parsed
+            .get("payload")
+            .ok_or_else(|| anyhow::anyhow!("prior event missing payload"))?;
+        let new_payload_value =
+            serde_json::to_value(payload).expect("EventPayload is always serializable");
+        if prior_payload == &new_payload_value {
+            return Ok(AppendOutcome::Idempotent { seq: prior_seq });
+        } else {
+            return Err(EngineError::ConcurrentSubmissionConflict {
+                session_id: extract_session_id_from_path(path),
+                state_name: state_name.to_string(),
             }
-            let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let prior_hash = parsed.get("idempotency_hash").and_then(|v| v.as_str());
-            if prior_hash != Some(h) {
-                continue;
-            }
-            let prior_seq = parsed
-                .get("seq")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("prior event missing seq"))?;
-            // Bytes-equal payload check (belt-and-suspenders).
-            let prior_payload = parsed
-                .get("payload")
-                .ok_or_else(|| anyhow::anyhow!("prior event missing payload"))?;
-            let new_payload_value =
-                serde_json::to_value(payload).expect("EventPayload is always serializable");
-            if prior_payload == &new_payload_value {
-                return Ok(AppendOutcome::Idempotent { seq: prior_seq });
-            } else {
-                return Err(EngineError::ConcurrentSubmissionConflict {
-                    session_id: extract_session_id_from_path(path),
-                    state_name: state_name.to_string(),
-                }
-                .into());
-            }
+            .into());
         }
     }
 
     // No prior hash hit → append a new event with the hash stored.
-    let next_seq = next_seq_after_header::<H>(path)?;
     let event = Event {
         seq: next_seq,
         timestamp: timestamp.to_string(),
@@ -527,7 +530,7 @@ fn next_seq_after_header<H: LogHeader>(path: &Path) -> anyhow::Result<u64> {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(anyhow::anyhow!(
-                "state file {} does not exist; only init creates one, so nothing was appended",
+                "state file {} does not exist, so nothing was appended; a session's log is written when the session is created, never by an append",
                 path.display()
             ));
         }

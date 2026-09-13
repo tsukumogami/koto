@@ -65,6 +65,34 @@ and no other writer. Leave #171 open; closing it needs the user.
   but never emitted), whether `rewind` takes the tick lock, and whether writers
   should open through the locked directory fd.
 
+## What the #236 fix leaves open (from its scrutiny review)
+
+- The header check and the append are two steps. If a truncating writer (the
+  cloud `sync_pull_state` `fs::write`, or `rewrite_header_identity`) truncates
+  between them and then fails, the append can still leave a lone headerless
+  line, which is #200's shape. The write lock has to span the check and the
+  append.
+- `context add` reads the header, then `store.add`, then appends. If cleanup or
+  a rewind lands between those steps, `ctx/` content is left in a directory
+  with no log. The lock should be taken at the context-verb level so it covers
+  the header check, the store write and the append.
+- flock locks on two separate file handles conflict even within one process.
+  So a lock held by the verb has to be passed down to the backend's append,
+  not taken again inside it.
+- The `.audit.jsonl` fallback in `engine/claim.rs` (`coord_state_file_for`)
+  looks for `<coord>.state.jsonl` rather than `koto-<coord>.state.jsonl`, so it
+  always falls back. The header check now refuses that append. There's no
+  production caller yet; fix both before wiring the recovery up.
+
+## Three things the lock design has to settle (from the code review)
+
+- The context verbs check the header twice: once in the verb, once inside the
+  append. Under a lock held across both, one check is enough.
+- `acquire_state_flock` (the request store's inner lock on the log inode) and a
+  new sidecar lock would overlap. Decide whether the inner one goes.
+- The request store already takes `request.lock` and then `acquire_state_flock`,
+  so it locks twice per write today.
+
 ## Acceptance tests the design should require
 
 - Race rebind and anchor adoption against `context add`, not only plain
