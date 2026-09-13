@@ -4,8 +4,10 @@ koto's verification map for shirabe's `/work-on` definition-of-done gate. Schema
 `skills/work-on/references/verification-map.md` in the shirabe repo. The default runs only when
 no entry matches any changed file. The plugin checks mirror step bodies in `validate-plugins.yml`
 and `eval-plugins.yml`, which point back here: change both together. Checks PR CI does not run
-are marked. Paths no command here examines have their own entry at the end, which makes the
-gate cannot-verify rather than letting the default pass them. This file is `@`-imported on every
+are marked. Paths that carry behavior and that no command here examines have their own entry at
+the end, which makes the gate cannot-verify rather than letting the default pass them;
+`.claude/settings.json` and this file are knowingly left to the default, since halting every map
+edit would make the map painful to maintain. This file is `@`-imported on every
 `/work-on` run, so it stays short; the reasons are in its commit history.
 
 ## Verification map
@@ -26,12 +28,13 @@ gate cannot-verify rather than letting the default pass them. This file is `@`-i
   - `shirabe validate --visibility=public --lifecycle . --mode=draft` (not `ready`: an in-flight `/execute` chain keeps its PLAN, which the ready posture rejects)
 - `test/functional/**` -> `make -C test/functional test-functional` (not in PR CI: the Go feature suite)
 - `benches/**`, `Cargo.toml`, `Cargo.lock` -> `cargo bench --no-run` (not in PR CI: `cargo test` does not build bench targets)
-- `.tsuku-recipes/**` -> `tsuku validate .tsuku-recipes/koto.toml` (not in PR CI: CI's step calls `tsuku recipe validate`, a subcommand tsuku does not have, and skips)
+- `.tsuku-recipes/**` -> `tsuku validate .tsuku-recipes/koto.toml` (not in PR CI: CI's step calls `tsuku recipe validate`, a subcommand tsuku does not have, and skips; it checks structure only, so a download or checksum change passes it)
 - `.github/**` other than `.github/pull_request_template.md`, `install.sh`, `scripts/**` other than
   `scripts/check-evals-exist.sh`, `.release/**`, `.goreleaser.yaml`, `.cargo/**`,
   `plugins/koto-skills/hooks/*.sh` -> no local check exists. Still run every other selected
-  command; if one fails the outcome is failed, otherwise it is cannot-verify, because these files
-  are verified only by CI on the PR.
+  command; if one fails the outcome is failed, otherwise it is cannot-verify: no command here
+  reads these files and most are not read by PR CI either, so the run stops for a person to check
+  them.
 
 ### Default verification command (when no map entry matches; all must pass)
 
