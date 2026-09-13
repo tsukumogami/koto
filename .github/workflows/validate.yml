@@ -36,6 +36,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       - name: Run tests
         run: cargo test -- --test-threads=1
 
@@ -58,6 +59,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       - name: Run external-consumer stability tests
         run: cargo test -p koto-stability-tests -- --test-threads=1
 
@@ -73,6 +75,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       - name: Check formatting
         run: cargo fmt --check
 
@@ -88,6 +91,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       - name: Run clippy
         run: cargo clippy -- -D warnings
 

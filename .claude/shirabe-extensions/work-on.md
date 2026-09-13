@@ -4,11 +4,11 @@ koto's verification map for shirabe's `/work-on` definition-of-done gate. Schema
 `skills/work-on/references/verification-map.md` in the shirabe repo. The default runs only when
 no entry matches any changed file. The plugin checks copy step bodies from `validate-plugins.yml`
 and `eval-plugins.yml`, which point back here: change both together. Deliberate differences, and
-checks PR CI does not run, are marked. Paths that carry behavior and that no command here
-examines have their own entry at the end, which makes the gate cannot-verify rather than letting
-the default pass them; this file is knowingly left to the default, since halting every map edit
-would make the map painful to maintain. This file is `@`-imported
-on every `/work-on` run, so it stays short; the reasons are in its commit history.
+checks PR CI does not run, are marked. Paths that carry behavior where no command here checks
+what they do have their own entry at the end, which makes the gate cannot-verify rather than
+letting the default pass them; this file is knowingly left to the default, since halting every
+map edit would make the map painful to maintain. This file is `@`-imported on every `/work-on`
+run, so it stays short; the reasons are in its commit history.
 
 ## Verification map
 
@@ -39,7 +39,9 @@ on every `/work-on` run, so it stays short; the reasons are in its commit histor
 
 ### Default verification command (when no map entry matches; all must pass)
 
-The four checks `.github/workflows/validate.yml` runs on every PR; change them together.
+Four of the checks `.github/workflows/validate.yml` runs on every PR, which point back here;
+change both together. Its other jobs (audit, coverage, the tsuku install, cloud integration,
+leftover-artifact checks) are left out on purpose.
 
 - `cargo test -- --test-threads=1`
 - `cargo test -p koto-stability-tests -- --test-threads=1`
