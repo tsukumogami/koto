@@ -524,7 +524,9 @@ koto context remove <name> <key>
 **Idempotent:** removing a key that is not there succeeds. That shape is
 deliberate — the alternative would push every caller to probe with `context
 exists` first, and per the note above that probe still cannot tell "absent" from
-"unreadable", so the guard would silently skip keys it should have removed.
+"unreadable", so the guard would silently skip keys it should have removed. The
+session itself must exist: on a session with no state log, `context remove`
+exits 2 and changes nothing.
 
 The removal appends a `context_removed` event to the session's event log,
 mirroring the `context_added` event that `context add` writes. A workflow whose
