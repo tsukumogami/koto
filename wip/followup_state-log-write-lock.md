@@ -79,6 +79,16 @@ and no other writer. Leave #171 open; closing it needs the user.
 - flock locks on two separate file handles conflict even within one process.
   So a lock held by the verb has to be passed down to the backend's append,
   not taken again inside it.
+- On the idempotent append path, a log with a torn final line is now refused
+  before the hash scan runs, where a hash hit used to short-circuit past it.
+  Nothing in production reaches it (the request store repairs its tail first),
+  but a lock design that lets a writer repair under the lock should decide
+  whether the repair belongs before the header check.
+- `CloudBackend::exists` counts a session that lives only in S3 as present,
+  while the append now needs a local copy. `context add` survives that today
+  only because `handle_add`'s `read_header` pulls the remote copy first, and
+  a machine with no local directory still fails. Decide what "the log exists"
+  means for the cloud backend.
 - The `.audit.jsonl` fallback in `engine/claim.rs` (`coord_state_file_for`)
   looks for `<coord>.state.jsonl` rather than `koto-<coord>.state.jsonl`, so it
   always falls back. The header check now refuses that append. There's no

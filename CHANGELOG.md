@@ -67,7 +67,7 @@ to `0.9.x`).
   instead of a parse error, and the error-code reference says how to clear one.
 
   Eight integration tests, all of which fail against the previous release, and
-  five unit tests.
+  six unit tests.
   Closes koto#236 and koto#200.
 
 - **A gate field that reads an undelivered capture is now refused instead of
