@@ -3062,17 +3062,18 @@ fn auto_cleanup_graceful_on_missing_session_dir() {
 // Context subcommand tests
 // ---------------------------------------------------------------------------
 
-/// Helper: create a session directory (without a full workflow init) so context
-/// commands have somewhere to store files.
-fn create_session_dir(dir: &Path, name: &str) {
-    let session_dir = sessions_base(dir).join(name);
-    std::fs::create_dir_all(&session_dir).unwrap();
+/// Helper: initialize a minimal workflow so context commands have a session to
+/// write to. Context writes append to the session log, and `context add` and
+/// `context remove` refuse a session that has no log (koto#236), so a bare
+/// session directory is no longer enough.
+fn init_context_session(dir: &Path, name: &str) {
+    init_workflow(dir, name, minimal_template());
 }
 
 #[test]
 fn context_add_from_stdin_and_get_to_stdout() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     // Add content via stdin
     let output = koto_cmd(dir.path())
@@ -3098,7 +3099,7 @@ fn context_add_from_stdin_and_get_to_stdout() {
 #[test]
 fn context_add_from_file_and_get_to_file() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     let input_file = dir.path().join("input.txt");
     std::fs::write(&input_file, "file content here").unwrap();
@@ -3146,7 +3147,7 @@ fn context_add_from_file_and_get_to_file() {
 #[test]
 fn context_exists_returns_exit_0_when_present() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     // Add a key
     koto_cmd(dir.path())
@@ -3185,7 +3186,7 @@ fn context_exists_returns_exit_0_when_present() {
 #[test]
 fn context_exists_tells_an_unusable_key_from_an_absent_one() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     koto_cmd(dir.path())
         .args(["context", "add", "ctx-wf", "present.md"])
@@ -3253,7 +3254,7 @@ fn context_exists_tells_an_unusable_key_from_an_absent_one() {
 #[test]
 fn context_exists_returns_exit_1_when_missing() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     let output = koto_cmd(dir.path())
         .args(["context", "exists", "ctx-wf", "missing.md"])
@@ -3269,7 +3270,7 @@ fn context_exists_returns_exit_1_when_missing() {
 #[test]
 fn context_remove_deletes_a_present_key() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     koto_cmd(dir.path())
         .args(["context", "add", "ctx-wf", "scope.md"])
@@ -3302,7 +3303,7 @@ fn context_remove_deletes_a_present_key() {
 #[test]
 fn context_remove_drops_the_key_from_list() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     for key in ["a.md", "b.md"] {
         koto_cmd(dir.path())
@@ -3333,7 +3334,7 @@ fn context_remove_drops_the_key_from_list() {
 #[test]
 fn context_remove_is_idempotent_on_a_missing_key() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     // No add first. A delete verb that fails on an absent key would make every
     // caller probe before removing, and the probe cannot distinguish "absent"
@@ -3347,7 +3348,7 @@ fn context_remove_is_idempotent_on_a_missing_key() {
 #[test]
 fn context_remove_appends_a_context_removed_event() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     koto_cmd(dir.path())
         .args(["context", "add", "ctx-wf", "scope.md"])
@@ -3377,7 +3378,7 @@ fn context_remove_appends_a_context_removed_event() {
 #[test]
 fn context_list_returns_json_array() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     // Empty list
     let output = koto_cmd(dir.path())
@@ -3414,7 +3415,7 @@ fn context_list_returns_json_array() {
 #[test]
 fn context_list_with_prefix_filter() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     koto_cmd(dir.path())
         .args(["context", "add", "ctx-wf", "scope.md"])
@@ -3545,7 +3546,7 @@ fn context_add_event_seq_less_than_following_next_event() {
 #[test]
 fn context_get_missing_key_returns_error() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     let output = koto_cmd(dir.path())
         .args(["context", "get", "ctx-wf", "nonexistent.md"])
@@ -3561,7 +3562,7 @@ fn context_get_missing_key_returns_error() {
 #[test]
 fn context_add_rejects_invalid_key() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     let output = koto_cmd(dir.path())
         .args(["context", "add", "ctx-wf", "../escape.md"])
@@ -3578,7 +3579,7 @@ fn context_add_rejects_invalid_key() {
 #[test]
 fn context_add_overwrites_existing_key() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     koto_cmd(dir.path())
         .args(["context", "add", "ctx-wf", "scope.md"])
@@ -3602,7 +3603,7 @@ fn context_add_overwrites_existing_key() {
 #[test]
 fn context_hierarchical_keys_work() {
     let dir = TempDir::new().unwrap();
-    create_session_dir(dir.path(), "ctx-wf");
+    init_context_session(dir.path(), "ctx-wf");
 
     koto_cmd(dir.path())
         .args(["context", "add", "ctx-wf", "research/r1/lead-cli-ux.md"])

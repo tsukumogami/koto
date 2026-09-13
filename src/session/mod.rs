@@ -252,6 +252,11 @@ pub trait SessionBackend: Send + Sync {
     /// permitted in minor releases.
     ///
     /// Append an event to the state file.
+    ///
+    /// Fails, writing nothing, unless the log already exists and its first
+    /// line is a header. Creating a session's log belongs to
+    /// [`SessionBackend::init_state_file`]; an append that created one would
+    /// leave a log no reader can parse (koto#236).
     fn append_event(&self, id: &str, payload: &EventPayload, timestamp: &str)
         -> anyhow::Result<()>;
 

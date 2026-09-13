@@ -131,22 +131,34 @@ fn fsync_parent_dir(path: &Path) {
     }
 }
 
-/// Append one event to the state file, auto-assigning its seq number.
+/// Append one event to a session state file, auto-assigning its seq number.
 ///
 /// Reads the file to find the last event's seq (or 0 if no events yet),
-/// then appends with `max_seq + 1`. Creates the file with mode 0600 on
-/// unix if it doesn't exist. Calls `sync_data()` after every write.
+/// then appends with `max_seq + 1`. Calls `sync_data()` after every write.
+///
+/// Refuses, writing nothing, unless the file already exists and its first
+/// line is a session header. An append is never how a log comes into being:
+/// creating a session (init, session start, a batch spawn) writes the header
+/// and the first events together in one atomic file. An append that
+/// created the file, or extended one that had lost its header, would leave a
+/// log whose first line is an event, which every reader rejects from then on
+/// (koto#236, koto#200).
 pub fn append_event(path: &Path, payload: &EventPayload, timestamp: &str) -> anyhow::Result<u64> {
+    append_event_in::<StateFileHeader>(path, payload, timestamp)
+}
+
+/// Header-type-generic form of [`append_event`]: the first line must parse
+/// as an `H`.
+pub fn append_event_in<H: LogHeader>(
+    path: &Path,
+    payload: &EventPayload,
+    timestamp: &str,
+) -> anyhow::Result<u64> {
     debug_assert!(
         !matches!(payload, EventPayload::Unknown { .. }),
         "Unknown events must not be passed to append_event"
     );
-    // Determine the next seq by reading the current last seq.
-    let next_seq = if path.exists() {
-        read_last_seq(path)? + 1
-    } else {
-        1
-    };
+    let next_seq = next_seq_after_header::<H>(path)?;
 
     let event = Event {
         seq: next_seq,
@@ -156,16 +168,10 @@ pub fn append_event(path: &Path, payload: &EventPayload, timestamp: &str) -> any
         idempotency_hash: None,
     };
 
-    let mut opts = OpenOptions::new();
-    opts.create(true).append(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-
-    let mut file = opts
+    // No `create`: if the log disappeared since it was read, the open fails
+    // rather than starting a new, headerless one.
+    let mut file = OpenOptions::new()
+        .append(true)
         .open(path)
         .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
 
@@ -267,8 +273,8 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
 ///
 /// Behavior depends on `hash`:
 ///
-/// - `None`: identical to [`append_event`]. The event is appended
-///   unconditionally; no hash field is written.
+/// - `None`: identical to [`append_event`]. The event is appended with no
+///   hash field, and the same header check applies.
 /// - `Some(h)`: scan the on-disk log for an event whose stored
 ///   `idempotency_hash` equals `h`.
 ///   - If found AND its payload bytes-equal the new payload, return
@@ -296,6 +302,18 @@ pub fn append_event_idempotent(
     state_name: &str,
     hash: Option<&str>,
 ) -> anyhow::Result<AppendOutcome> {
+    append_event_idempotent_in::<StateFileHeader>(path, payload, timestamp, state_name, hash)
+}
+
+/// Header-type-generic form of [`append_event_idempotent`]. Like
+/// [`append_event_in`], it refuses a log whose first line isn't an `H`.
+pub fn append_event_idempotent_in<H: LogHeader>(
+    path: &Path,
+    payload: &EventPayload,
+    timestamp: &str,
+    state_name: &str,
+    hash: Option<&str>,
+) -> anyhow::Result<AppendOutcome> {
     debug_assert!(
         !matches!(payload, EventPayload::Unknown { .. }),
         "Unknown events must not be passed to append_event_idempotent"
@@ -303,7 +321,7 @@ pub fn append_event_idempotent(
 
     // No hash → fall back to the non-idempotent path.
     let Some(h) = hash else {
-        let seq = append_event(path, payload, timestamp)?;
+        let seq = append_event_in::<H>(path, payload, timestamp)?;
         return Ok(AppendOutcome::Written { seq });
     };
 
@@ -313,54 +331,56 @@ pub fn append_event_idempotent(
     // are unaffected (advisory).
     let _guard = acquire_state_flock(path)?;
 
-    // Scan for a prior event with the same hash. Read line-by-line so
-    // a malformed final line doesn't break the scan (mirrors
-    // `read_events` tolerance).
-    if path.exists() {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("failed to read state file {}: {}", path.display(), e))?;
-        // Skip the header line; events start at line 2 (1-indexed).
-        for line in content.lines().skip(1) {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+    // Check the header first, so a log that is missing, empty or headerless
+    // is refused whether or not the scan below finds a prior event. Doing it
+    // after the scan would let an idempotent hit report success on a log no
+    // reader can parse. This reads the whole file and the scan below reads it
+    // again; both reads happen under the lock taken above.
+    let next_seq = next_seq_after_header::<H>(path)?;
+
+    // Scan for a prior event with the same hash. A malformed line in the
+    // middle of the log is skipped, the way `read_events` skips it. A
+    // malformed *final* line is already fatal by this point: the header
+    // check above parses it to work out the next seq. Callers that expect a
+    // torn tail repair it before appending, as the request store does. Line
+    // 1 is the header, checked above, so events start at line 2 (1-indexed).
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read state file {}: {}", path.display(), e))?;
+    for line in content.lines().skip(1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let prior_hash = parsed.get("idempotency_hash").and_then(|v| v.as_str());
+        if prior_hash != Some(h) {
+            continue;
+        }
+        let prior_seq = parsed
+            .get("seq")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("prior event missing seq"))?;
+        // Bytes-equal payload check (belt-and-suspenders).
+        let prior_payload = parsed
+            .get("payload")
+            .ok_or_else(|| anyhow::anyhow!("prior event missing payload"))?;
+        let new_payload_value =
+            serde_json::to_value(payload).expect("EventPayload is always serializable");
+        if prior_payload == &new_payload_value {
+            return Ok(AppendOutcome::Idempotent { seq: prior_seq });
+        } else {
+            return Err(EngineError::ConcurrentSubmissionConflict {
+                session_id: extract_session_id_from_path(path),
+                state_name: state_name.to_string(),
             }
-            let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let prior_hash = parsed.get("idempotency_hash").and_then(|v| v.as_str());
-            if prior_hash != Some(h) {
-                continue;
-            }
-            let prior_seq = parsed
-                .get("seq")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("prior event missing seq"))?;
-            // Bytes-equal payload check (belt-and-suspenders).
-            let prior_payload = parsed
-                .get("payload")
-                .ok_or_else(|| anyhow::anyhow!("prior event missing payload"))?;
-            let new_payload_value =
-                serde_json::to_value(payload).expect("EventPayload is always serializable");
-            if prior_payload == &new_payload_value {
-                return Ok(AppendOutcome::Idempotent { seq: prior_seq });
-            } else {
-                return Err(EngineError::ConcurrentSubmissionConflict {
-                    session_id: extract_session_id_from_path(path),
-                    state_name: state_name.to_string(),
-                }
-                .into());
-            }
+            .into());
         }
     }
 
     // No prior hash hit → append a new event with the hash stored.
-    let next_seq = if path.exists() {
-        read_last_seq(path)? + 1
-    } else {
-        1
-    };
     let event = Event {
         seq: next_seq,
         timestamp: timestamp.to_string(),
@@ -369,14 +389,8 @@ pub fn append_event_idempotent(
         idempotency_hash: Some(h.to_string()),
     };
 
-    let mut opts = OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts
+    let mut file = OpenOptions::new()
+        .append(true)
         .open(path)
         .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
     let line = serde_json::to_string(&event)
@@ -398,23 +412,20 @@ pub fn append_event_idempotent(
 #[cfg(unix)]
 fn acquire_state_flock(path: &Path) -> anyhow::Result<std::fs::File> {
     use std::os::fd::AsRawFd;
-    // Open or create the state file (we need a valid fd to flock; the
-    // append_event_idempotent caller may be writing the very first
-    // event so we must tolerate non-existent paths).
-    let mut opts = OpenOptions::new();
-    opts.create(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let file = opts.open(path).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to open state file for lock {}: {}",
-            path.display(),
-            e
-        )
-    })?;
+    // Open without `create`: a log is created when its session is created,
+    // and a lock open that created the file would leave an empty log behind
+    // for the header check in `next_seq_after_header` to refuse.
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to open state file for lock {}: {}",
+                path.display(),
+                e
+            )
+        })?;
     let fd = file.as_raw_fd();
     let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
     if ret != 0 {
@@ -505,25 +516,59 @@ fn fsync_log_file(path: &Path) -> std::io::Result<()> {
     file.sync_all()
 }
 
-/// Read the last event's seq from the file. Returns 0 if no events exist.
+/// The seq the next event appended to `path` gets, refusing a log that has
+/// no header.
 ///
-/// Reads only the last non-empty non-header line's seq, since in a valid
-/// file seq equals line index. This avoids silently masking corruption
-/// where events appear out of order.
-fn read_last_seq(path: &Path) -> anyhow::Result<u64> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("failed to read state file {}: {}", path.display(), e))?;
+/// The file must exist and its first line must parse as an `H`. Checking
+/// the header, rather than skipping line 1 unseen, is what stops an append
+/// from ever producing a log koto can't read: a missing or empty file, or
+/// one whose first line is an event, is refused before anything is
+/// written. Skipping it unseen also made a headerless log hide its own
+/// first event, so the next append reused `seq: 1` (koto#236).
+///
+/// Reads only the last non-empty line's seq, since in a valid file seq
+/// equals line index. This avoids silently masking corruption where events
+/// appear out of order.
+fn next_seq_after_header<H: LogHeader>(path: &Path) -> anyhow::Result<u64> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow::anyhow!(
+                "state file {} does not exist, so nothing was appended; a session's log is written when the session is created, never by an append",
+                path.display()
+            ));
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "failed to read state file {}: {}",
+                path.display(),
+                e
+            ))
+        }
+    };
 
-    // Find the last non-empty line after the header.
-    let event_lines: Vec<&str> = content.lines().skip(1).collect();
-    let last_line = event_lines.iter().rev().find(|l| !l.trim().is_empty());
+    let mut lines = content.lines();
+    let first_line = lines.next().map(str::trim).unwrap_or("");
+    if first_line.is_empty() {
+        let problem = if content.trim().is_empty() {
+            "state file is empty"
+        } else {
+            "state file has empty first line"
+        };
+        return Err(EngineError::StateFileCorrupted(format!(
+            "{problem}, so nothing was appended to {}",
+            path.display()
+        ))
+        .into());
+    }
+    parse_header::<H>(first_line)?;
 
-    match last_line {
-        None => Ok(0),
+    match lines.rev().find(|l| !l.trim().is_empty()) {
+        None => Ok(1),
         Some(line) => {
             let val: serde_json::Value = serde_json::from_str(line.trim())
                 .map_err(|e| anyhow::anyhow!("failed to parse last event line: {}", e))?;
-            Ok(val.get("seq").and_then(|s| s.as_u64()).unwrap_or(0))
+            Ok(val.get("seq").and_then(|s| s.as_u64()).unwrap_or(0) + 1)
         }
     }
 }
@@ -569,7 +614,7 @@ pub fn read_header_only<H: LogHeader>(path: &Path) -> anyhow::Result<H> {
 /// through a replay.
 fn parse_header<H: LogHeader>(first_line: &str) -> anyhow::Result<H> {
     let header = serde_json::from_str::<H>(first_line)
-        .map_err(|e| EngineError::StateFileCorrupted(format!("failed to parse header: {}", e)))?;
+        .map_err(|e| EngineError::StateFileCorrupted(header_parse_failure(first_line, &e)))?;
     if header.schema_version() > H::max_supported_schema_version() {
         return Err(EngineError::IncompatibleSchemaVersion {
             found: header.schema_version(),
@@ -578,6 +623,28 @@ fn parse_header<H: LogHeader>(first_line: &str) -> anyhow::Result<H> {
         .into());
     }
     Ok(header)
+}
+
+/// Say why a first line isn't a header.
+///
+/// A first line that is itself an event is the shape an append to a
+/// missing log used to leave (koto#236, koto#200), and serde's "missing
+/// field `workflow`" doesn't tell anyone that. Every other failure keeps
+/// the serde message.
+fn header_parse_failure(first_line: &str, err: &serde_json::Error) -> String {
+    let event = serde_json::from_str::<serde_json::Value>(first_line)
+        .ok()
+        .filter(|v| v.get("seq").is_some() && v.get("type").is_some());
+    match event {
+        Some(v) => format!(
+            "state log has no header: its first line is a `{}` event (seq {}). \
+             The session was never initialized, or its log was recreated after the \
+             session was removed, and nothing in the log can rebuild it",
+            v["type"].as_str().unwrap_or("unknown"),
+            v["seq"]
+        ),
+        None => format!("failed to parse header: {}", err),
+    }
 }
 
 /// Read all events from the JSONL state file at `path`.
@@ -1765,6 +1832,143 @@ mod tests {
         assert_eq!(events[0].seq, 1);
         assert_eq!(events[1].seq, 2);
         assert_eq!(events[2].seq, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // append refuses a log that has no header (koto#236, koto#200)
+    // -----------------------------------------------------------------------
+
+    fn context_added(key: &str) -> EventPayload {
+        EventPayload::ContextAdded {
+            key: key.to_string(),
+            hash: "abc".to_string(),
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn append_event_refuses_a_missing_log_and_creates_nothing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("koto-missing.state.jsonl");
+
+        let err = append_event(&path, &context_added("a.md"), "2026-01-01T00:00:00Z").unwrap_err();
+
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
+        assert!(!path.exists(), "a refused append must not create the log");
+    }
+
+    #[test]
+    fn append_event_refuses_an_empty_log_and_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("koto-empty.state.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        let err = append_event(&path, &context_added("a.md"), "2026-01-01T00:00:00Z").unwrap_err();
+
+        assert!(
+            err.to_string().contains("state file is empty"),
+            "got: {err}"
+        );
+        assert!(
+            std::fs::read(&path).unwrap().is_empty(),
+            "a refused append must leave an empty log empty"
+        );
+    }
+
+    /// The #236 shape: a log whose first line is an event. Before the fix the
+    /// append skipped that line as if it were the header, wrote a second
+    /// `seq: 1`, and the log stayed unreadable.
+    #[test]
+    fn append_event_refuses_a_log_whose_first_line_is_an_event() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("koto-headerless.state.jsonl");
+        let line = serde_json::to_string(&make_event(1, context_added("a.md"))).unwrap();
+        let content = format!("{line}\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let err = append_event(&path, &context_added("b.md"), "2026-01-01T00:00:01Z").unwrap_err();
+
+        assert!(
+            err.to_string().contains("state log has no header"),
+            "got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            content,
+            "a refused append must leave the log byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn append_event_idempotent_refuses_a_missing_log_and_creates_nothing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("koto-missing.state.jsonl");
+
+        let result = append_event_idempotent(
+            &path,
+            &context_added("a.md"),
+            "2026-01-01T00:00:00Z",
+            "work",
+            Some("hash"),
+        );
+
+        assert!(result.is_err(), "an append to a missing log must fail");
+        assert!(
+            !path.exists(),
+            "neither the lock nor the append may create the log"
+        );
+    }
+
+    /// The case the header-before-scan ordering exists for. A headerless log
+    /// that already carries a matching idempotency hash used to short-circuit
+    /// into `Idempotent`, reporting success on a log no reader can parse.
+    /// Move the header check back below the scan and this test fails; the
+    /// missing-log tests would not, because they fail earlier at the open.
+    #[test]
+    fn append_event_idempotent_refuses_a_headerless_log_that_holds_a_matching_hash() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("koto-headerless.state.jsonl");
+        let payload = context_added("a.md");
+        let hash = "matching-hash";
+        let prior = Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: payload.type_name().to_string(),
+            payload: payload.clone(),
+            idempotency_hash: Some(hash.to_string()),
+        };
+        let content = format!("{}\n", serde_json::to_string(&prior).unwrap());
+        std::fs::write(&path, &content).unwrap();
+
+        let err =
+            append_event_idempotent(&path, &payload, "2026-01-01T00:00:01Z", "work", Some(hash))
+                .unwrap_err();
+
+        assert!(
+            err.to_string().contains("state log has no header"),
+            "the header check must run before the hash scan; got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            content,
+            "a refused append must leave the log unchanged"
+        );
+    }
+
+    #[test]
+    fn read_header_names_a_log_whose_first_line_is_an_event() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("koto-headerless.state.jsonl");
+        let line = serde_json::to_string(&make_event(1, context_added("a.md"))).unwrap();
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let err = read_header(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("state log has no header")
+                && err.contains("`context_added` event (seq 1)"),
+            "got: {err}"
+        );
     }
 
     // -----------------------------------------------------------------------

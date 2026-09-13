@@ -67,7 +67,7 @@ use crate::config::RequestStoreConfig;
 use crate::engine::atomic_fs::{atomic_create_rename, AtomicCreateError};
 use crate::engine::name_grammar::{name_regex, validate_member_name, MemberNameError};
 use crate::engine::persistence::{
-    self, append_event_idempotent, idempotency_hash, AppendOutcome, LogHeader,
+    self, append_event_idempotent_in, idempotency_hash, AppendOutcome, LogHeader,
 };
 use crate::engine::types::{
     CloseDisposition, Event, EventPayload, LegDeclaration, LegDisposition, LegResultSource,
@@ -1253,7 +1253,9 @@ where
         });
     };
 
-    let outcome = append_event_idempotent(
+    // A request log's first line is a RequestHeader, not a session header,
+    // so the append checks it against that type.
+    let outcome = append_event_idempotent_in::<RequestHeader>(
         &path,
         &pending.payload,
         &pending.timestamp,

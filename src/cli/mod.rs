@@ -1419,6 +1419,23 @@ pub fn run(app: App) -> Result<()> {
                     key,
                     from_file,
                 } => {
+                    // A session's log is written only when the session is
+                    // created (init, session start, a batch spawn), never by
+                    // an append. Refuse before the store is touched, so a
+                    // write to a session that hasn't started, or that was
+                    // cleaned up or moved by a rewind, leaves nothing behind
+                    // (koto#236). Exit 2, as `status` does: the caller named
+                    // a session that isn't there. A log that exists but can't
+                    // be read is exit 3, reported by the handler.
+                    if !backend.exists(&session) {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": format!("workflow '{}' not found", session),
+                                "command": "context add"
+                            }),
+                            EXIT_CALLER_ERROR,
+                        );
+                    }
                     if let Err(e) =
                         context::handle_add(store, &backend, &session, &key, from_file.as_deref())
                     {
@@ -1468,6 +1485,17 @@ pub fn run(app: App) -> Result<()> {
                     }
                 }
                 ContextCommand::Remove { session, key } => {
+                    // Same refusal as `add`: the removal appends an event, and
+                    // a session with no log must not gain a headerless one.
+                    if !backend.exists(&session) {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": format!("workflow '{}' not found", session),
+                                "command": "context remove"
+                            }),
+                            EXIT_CALLER_ERROR,
+                        );
+                    }
                     if let Err(e) = context::handle_remove(store, &backend, &session, &key) {
                         exit_with_error_code(
                             serde_json::json!({

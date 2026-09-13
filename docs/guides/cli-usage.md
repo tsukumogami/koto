@@ -456,7 +456,7 @@ koto context add <name> <key> --from-file <path>
 **Optional flags:**
 - `--from-file` -- Read content from the specified file instead of stdin.
 
-Exits non-zero if the session doesn't exist or the input can't be read. Overwrites any existing content for the same key.
+Exits 2 if the session has no state log (it was never initialized, it's a batch child that is still `pending` or `blocked`, or it has already finished and been cleaned up), and stores nothing. Exits non-zero if the input can't be read. Overwrites any existing content for the same key.
 
 #### context get
 
@@ -524,7 +524,9 @@ koto context remove <name> <key>
 **Idempotent:** removing a key that is not there succeeds. That shape is
 deliberate — the alternative would push every caller to probe with `context
 exists` first, and per the note above that probe still cannot tell "absent" from
-"unreadable", so the guard would silently skip keys it should have removed.
+"unreadable", so the guard would silently skip keys it should have removed. The
+session itself must exist: on a session with no state log, `context remove`
+exits 2 and changes nothing.
 
 The removal appends a `context_removed` event to the session's event log,
 mirroring the `context_added` event that `context add` writes. A workflow whose
