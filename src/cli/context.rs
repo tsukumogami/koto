@@ -20,6 +20,11 @@ pub fn handle_add(
     key: &str,
     from_file: Option<&str>,
 ) -> Result<()> {
+    // The append below refuses a log that has no header, but by then the
+    // store would already hold the content. Check the header first so a
+    // refused write stores nothing.
+    backend.read_header(session)?;
+
     let content = match from_file {
         Some(path) => {
             fs::read(path).map_err(|e| anyhow::anyhow!("failed to read file '{}': {}", path, e))?
@@ -139,6 +144,10 @@ pub fn handle_remove(
     session: &str,
     key: &str,
 ) -> Result<()> {
+    // As in `handle_add`: refuse a log with no header before the store
+    // changes, so a refused removal leaves the store as it was.
+    backend.read_header(session)?;
+
     store.remove(session, key)?;
 
     let event = EventPayload::ContextRemoved {

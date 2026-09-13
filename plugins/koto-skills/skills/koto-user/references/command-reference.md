@@ -779,7 +779,7 @@ Stores content under `<key>` in the session's context store. When `--from-file` 
 
 Keys are hierarchical path strings (e.g., `scope.md`, `research/r1/lead.md`). Keys must not start with `.` or contain `..`.
 
-No stdout on success. Exit 3 on infrastructure errors.
+No stdout on success. Exit 2 with `workflow '<session>' not found` if the session has no state log, and nothing is stored. That covers a name that was never initialized, a session that finished and was cleaned up, a child moved by its parent's `koto rewind`, and a batch child that is still `pending` or `blocked`. To give a batch child input before it starts, put it in the task entry's `vars`, or store it on the parent and read it from the child with `koto context get <parent> <key>`. Exit 3 on infrastructure errors, including a state log that exists but has no header.
 
 ---
 
@@ -841,7 +841,9 @@ Removes a key and its content from the session's context store, and appends a
 
 **Idempotent.** Removing a key that is not there succeeds. That is what lets you
 call it unconditionally, which is the correct usage — see the `exists` caveat
-above for why probing first is worse than not probing.
+above for why probing first is worse than not probing. The session itself must
+exist: on a session with no state log, `context remove` exits 2 with
+`workflow '<session>' not found`, the same as `context add`, and appends nothing.
 
 **This is the verb that makes a `context-exists` gate fail again.** Overwriting a
 key with `context add` leaves it present, so a state gated on `context-exists`

@@ -75,6 +75,8 @@ The canonical worker-dispatch filter:
 | `skipped` | Child terminal with `skipped_marker: true` (dependency failed). | always `false` (terminal) |
 | `spawn_failed` | Scheduler couldn't create the state file (compile error, collision, I/O). | always `false` |
 
+A `pending` or `blocked` child has no session yet, so `koto context add` against it exits 2 and stores nothing. To give a child input before it starts, put it in the task entry's `vars`, or store it on the parent and have the child read it with `koto context get <parent> <key>`. Once the child's `outcome` is `running`, `context add` works as it does for any session.
+
 ## `feedback.entries`: what happened to each submitted task
 
 `scheduler.feedback.entries` is keyed by short task name and carries exactly one outcome per submitted entry:

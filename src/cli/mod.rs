@@ -1419,6 +1419,19 @@ pub fn run(app: App) -> Result<()> {
                     key,
                     from_file,
                 } => {
+                    // Only `init` creates a session's log. Refuse before the
+                    // store is touched, so a write to a session that hasn't
+                    // started, or that was cleaned up or moved by a rewind,
+                    // leaves nothing behind (koto#236).
+                    if !backend.exists(&session) {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": format!("workflow '{}' not found", session),
+                                "command": "context add"
+                            }),
+                            EXIT_CALLER_ERROR,
+                        );
+                    }
                     if let Err(e) =
                         context::handle_add(store, &backend, &session, &key, from_file.as_deref())
                     {
@@ -1468,6 +1481,17 @@ pub fn run(app: App) -> Result<()> {
                     }
                 }
                 ContextCommand::Remove { session, key } => {
+                    // Same refusal as `add`: the removal appends an event, and
+                    // a session with no log must not gain a headerless one.
+                    if !backend.exists(&session) {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": format!("workflow '{}' not found", session),
+                                "command": "context remove"
+                            }),
+                            EXIT_CALLER_ERROR,
+                        );
+                    }
                     if let Err(e) = context::handle_remove(store, &backend, &session, &key) {
                         exit_with_error_code(
                             serde_json::json!({

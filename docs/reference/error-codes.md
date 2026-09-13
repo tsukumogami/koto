@@ -177,6 +177,14 @@ These still use the flat format and aren't domain errors:
 
 Inspect the file directly. The first line should be a header with `schema_version`, and each subsequent line should be a valid event with a monotonic `seq` number. A truncated final line (e.g., from a crash) is recovered automatically -- only interior corruption triggers this error.
 
+A state file whose first line is an event rather than a header says so:
+
+```json
+{"error":"state file corrupted: state log has no header: its first line is a `context_added` event (seq 1). The session was never initialized, or its log was recreated after the session was removed, and nothing in the log can rebuild it","command":"status"}
+```
+
+Earlier releases could write such a log when `koto context add` targeted a session that had no log (koto#236). Nothing in it can be recovered, and koto refuses to append to it. To clear it, move the state file (`koto-<name>.state.jsonl`) out of the session directory and leave the `ctx/` directory in place. A batch child is then spawned again by its parent's scheduler; any other session can be started again with `koto init`.
+
 **Template hash mismatch (exit code 3)** -- the compiled template on disk doesn't match the hash recorded at init time:
 
 ```json
@@ -208,6 +216,20 @@ Reinitialize the workflow to pick up the new template.
 ```json
 {"error":"workflow 'my-workflow' not found","command":"rewind"}
 ```
+
+---
+
+### context add and context remove
+
+**Workflow not found (exit code 2)** -- the session has no state log, so there is nothing to append the event to. That covers a name that was never initialized, a session removed by terminal cleanup, a child moved by its parent's `koto rewind`, and a batch child that is still `pending` or `blocked`. Nothing is written, not even the context content:
+
+```json
+{"error":"workflow 'parent.task-b' not found","command":"context add"}
+```
+
+Pick a session that has started. For a batch child, wait until its `outcome` is `running`, or pass the input through the task entry's `vars`.
+
+**Corrupt state file (exit code 3)** -- same as `next` above, including a log with no header. Nothing is written.
 
 ---
 
