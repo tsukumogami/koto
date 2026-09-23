@@ -14,7 +14,8 @@ goals: |
   answers whose recorded agreement clears a stated bar. Runs without opt-in,
   or with an unsure decider, behave exactly as today, and shirabe ships its
   first eligible decisions.
-upstream: docs/briefs/BRIEF-jev-decision-offload.md
+absorbed:
+  - docs/briefs/BRIEF-jev-decision-offload.md
 ---
 
 # PRD: Decisions koto can settle without the agent
@@ -22,6 +23,33 @@ upstream: docs/briefs/BRIEF-jev-decision-offload.md
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-jev-decision-offload](docs/briefs/BRIEF-jev-decision-offload.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+The feature was framed around a gap between what a workflow decision costs and
+what it needs. Many koto branches are narrow closed-set judgments over inputs
+koto already stores, yet every one costs the agent a turn and context, varies
+between runs, and leaves no record of how sure the call was. Template authors
+had no way to find out whether a cheaper typed decider could take a given
+decision without risking the run. That problem is this document's Problem
+Statement.
+
+The outcome it asked for is that an author declares a decision once. Agents
+then move past it once a decider has shown it agrees with them, or answer it
+exactly as today when there's no decider or the decider is unsure. Maintainers
+see every automatic decision and its agreement record. Those are this
+document's Goals and Success Measures.
+
+Four situations grounded it, and they survive as the User Stories: a shirabe
+maintainer declaring the residual drift judgment; an agent passing the
+issue-type decision without being asked; a koto maintainer promoting only the
+common answer after reading agreement; and an offline contributor with no key
+who must see ordinary prompts. The boundary it drew is the one Requirements and
+Out of Scope hold: decisions only, never text or gates, no standalone command,
+trust earned per answer rather than toggled per run, and prose-only skills left
+for later.
 
 ## Problem Statement
 
@@ -79,7 +107,7 @@ They're reported rather than release-gating:
 
 ## User Stories
 
-These carry the four journeys from the upstream BRIEF.
+These carry the four journeys summarized in Absorbed Brief.
 
 - As a **shirabe maintainer reshaping `/execute`'s drift check**, I want to
   declare the remaining judgment as a typed question with per-answer
