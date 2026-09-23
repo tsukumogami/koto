@@ -12,3 +12,7 @@
 - Payoff: context, wall-clock, consistency and cost all count; no single driver.
 - Surface: no standalone command. A decision is a step reached through `koto next`; koto executes it when a key exists, and otherwise hands it to the agent, which answers with evidence.
 - Include a devil's advocate analysis of the case for not doing this (added as a lead in round 1).
+- Posture: staged in koto. The decider is built inside `koto next`, shadow is the default mode, and auto is enabled per value once own-traffic concordance clears a bar. The shirabe reshaping proceeds in parallel. Chosen over full auto (unmeasured calibration) and over deferring the decider (gives up consistency and the per-item pre-screen wins).
+- Compiler floor: authors mark eligibility, but the compiler refuses classifier authority over gates, overrides, and irreversible or confirmation-guarded edges.
+- Deterministic "decisions" (batch_outcome, pause_decision, cascade_status, verification matching, panel aggregation, retry caps) move to gates regardless of the classifier.
+- Ready to crystallize after one round: the remaining gaps are design questions or need shadow data.
