@@ -36,7 +36,7 @@ with `model`, `state`, `questions`; auth via bearer token.
 Full source text is available to research agents at
 `/Users/danielgazineu/.claude/jobs/62282d0d/tmp/jev-doc.md` (not committed).
 
-Mode: `--auto` (the session runs under a goal and must not block on input).
+Mode: interactive. The run started in `--auto`, and the user switched to interactive once round 1 was underway.
 
 ## In Scope
 
@@ -92,3 +92,9 @@ Mode: `--auto` (the session runs under a goal and must not block on input).
    Can koto's session logs serve as a labeled dataset of past agent decisions?
    What would shadow mode, per-decision confidence thresholds, and concordance
    tracking look like?
+
+7. **What is the strongest case for not doing this?** (lead-devils-advocate)
+   Added by the user during round 1. Argue against embedding a hosted
+   classifier: are the savings real, does the reshaping alone capture the
+   value, what does a ~9% disagreement rate compound to, vendor maturity,
+   audience fit for an OSS tool, and cheaper alternatives.
