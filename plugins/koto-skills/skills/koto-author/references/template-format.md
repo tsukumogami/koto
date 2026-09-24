@@ -320,9 +320,24 @@ The field's `description` is the question. The block has three keys:
 
 Defaults are resolved at compile time. An answer with no `mode` is `shadow`, one with no `threshold` is `0.9`, and an input with no `max_bytes` gets `8192`. Writing a default explicitly compiles to the same thing as leaving it out.
 
-`mode` is one of `off`, `shadow`, `auto`, or `never`. `never` means the value can be asked about but never applied. `threshold` must be a number from 0.5 to 1.0 inclusive.
+`threshold` must be a number from 0.5 to 1.0 inclusive. On an enum the decider's winning value is the one with the highest probability (a tie counts as the escape), and its confidence is that probability. On a boolean, `true` wins when P(true) meets the `true` threshold and `false` wins when P(false) meets the `false` threshold; neither or both counts as the escape.
 
-For users who opt in, every consultation and every agent answer to a consultation koto didn't apply is appended to `~/.koto/_decider_ledger.jsonl`, keyed by the field's declaration hash. That ledger survives session cleanup and is the evidence for moving a value from `shadow` to `auto`. Changing a question, a value or escape description, or an input's `max_bytes` changes the hash, so evidence gathered under the old wording doesn't count toward the new one.
+`mode` is one of four values, set per answer:
+
+| Mode | What koto does with that answer |
+|------|---------------------------------|
+| `off` | Never consults for it. A state whose answers are all `off` is never consulted. |
+| `shadow` (default) | Consults and records the answer, never applies it. The agent answers as usual. |
+| `auto` | Applies the answer and advances past the state when it wins at or above its threshold and every other condition holds. Floor-checked. |
+| `never` | Like `shadow`, and marks the answer as one you don't intend to promote. Config can't make it act. |
+
+The template's mode is only a ceiling. For each answer koto uses the lowest of the user's global mode (`KOTO_DECIDER` or `decider.mode` in user config, default `off`), the project's `decider.mode` when set, and the template's mode, in the order `off` < `shadow` < `auto`. So a template never switches a decider on for anyone; users opt in themselves (see `docs/guides/decider-authoring.md`).
+
+**One question per state.** koto sends every declared field on a state in a single consultation, and applies an answer only when every declared field wins in `auto` at or above its threshold, none is the escape, and the combined answer matches exactly one conditional transition. A state with two questions gets help on neither unless both qualify, and the report needs `--field` to tell them apart. Put each question in its own state, with one declared field and any other field optional.
+
+For users who opt in, every consultation and every agent answer to a consultation koto didn't apply is appended to `~/.koto/_decider_ledger.jsonl`, keyed by the field's declaration hash. That ledger survives session cleanup and is the evidence for moving a value from `shadow` to `auto`.
+
+**The declaration hash.** The hash is computed per field from the question (the field's `description`), the values, every answer's `description`, the escape's value and description, and the inputs (each one's source, label, and `max_bytes`, in order). It leaves out every `mode` and `threshold`. That split is what makes promotion work: editing a value from `shadow` to `auto`, or tightening a threshold, keeps the evidence that justified the edit. Rewording a description, adding a value, or changing an input starts the evidence over, because the report treats the result as a new question with no history. Reordering `values` doesn't change the hash. Settle the wording before a template ships in `shadow`.
 
 A `context` input may use `{{VAR}}` references to declared variables or captures, and it has to be a key that some `context-exists` or `context-matches` gate in the template checks. The compiler can't see what a `default_action` writes, so the usual pattern is for the state that produces the key to gate on it:
 
@@ -342,6 +357,8 @@ gather:
 
 Neither kind of input can use a runtime name like `SESSION_NAME` or `SESSION_DIR`, and no input can read an environment variable or a file.
 
+`max_bytes` is a budget, not a truncation point. If an unset context key or an input over its budget means the inputs can't be assembled, koto doesn't call the provider: it records the consultation as `input_unavailable` and the state stops for the agent as usual. Size each budget to the real content.
+
 The compiler refuses a declaration that breaks any of these rules, with an `E-DECIDER-*` code naming the state, the field, and the value where there is one:
 
 - the block sits on a `string`, `number`, or `tasks` field (`E-DECIDER-FIELD-TYPE`);
@@ -355,6 +372,39 @@ The compiler refuses a declaration that breaks any of these rules, with an `E-DE
 
 **The floor.** An answer in `auto` can't take a transition that targets a terminal state, targets a state whose `default_action` has `requires_confirmation: true`, or has a `when` clause that also tests a `gates.*` key. The compiler checks every transition whose `when` tests the field at that value, and it counts `"true"` and `true` alike on a boolean. A violation fails with `E-DECIDER-FLOOR` naming the target state and the rule. Nothing in the template relaxes it, and `--allow-legacy-gates` doesn't either. The only way past it is to take the answer out of `auto`. `shadow`, `never`, and `off` answers aren't floor-checked.
 
+A rejected `auto`, worked through. This state routes `duplicate` straight to a terminal state:
+
+```yaml
+dedupe:
+  accepts:
+    verdict:
+      type: enum
+      values: [duplicate, new]
+      required: true
+      description: Does this issue repeat one that's already open?
+      decider:
+        answers:
+          duplicate: {description: "Asks for the same change as an open issue.", mode: auto}
+          new:       {description: "Asks for something no open issue covers.", mode: auto}
+        escape: {value: unclear, description: "Can't tell from the text."}
+        inputs:
+          - {context: issue.md, label: issue}
+  transitions:
+    - target: closed      # closed is terminal: true
+      when:
+        verdict: duplicate
+    - target: work
+      when:
+        verdict: new
+```
+
+```
+E-DECIDER-FLOOR: state "dedupe" field "verdict" value "duplicate": mode auto is not allowed on the transition to "closed": the target is a terminal state
+  remedy: set this value's mode to shadow or never; an auto answer can't route to a terminal state, to a state whose default_action requires confirmation, or along a when clause that tests a gate
+```
+
+Setting `duplicate` to `never` (or `shadow`) makes it compile; `new` can stay `auto` because `work` isn't terminal. If you want `duplicate` promotable later, route it through a non-terminal state that does the closing instead of straight to `closed`.
+
 At run time koto checks the floor again on the one transition an answer actually matched, so a route the compiler couldn't tie to the field (one that reaches it only through an `evidence.<field>: present` or `vars.*` key) still can't carry an `auto` answer to a terminal state, a confirmation-guarded state, or along a `gates.*` test. Such an answer is recorded and not applied. An `auto` answer also applies only when every declared field on the state qualifies, none is the escape, and exactly one conditional transition matches.
 
 Keys inside the block are strict, so a typo like `thresold:` fails compilation and names the key. The field's own keys stay lenient.
@@ -362,6 +412,33 @@ Keys inside the block are strict, so a typo like `thresold:` fails compilation a
 A declared field adds `description` and `value_descriptions` to its `expects` entry in `koto next` and `koto status`. The escape never appears there, and submitting it as evidence is rejected like any other value outside `values`. A template with no `decider` block compiles exactly as before and keeps its `template_hash`.
 
 See `docs/reference/error-codes.md` for each `E-DECIDER-*` message.
+
+#### Promoting an answer to `auto`
+
+Every answer ships in `shadow` or `never`. Don't write `auto` into a new declaration: there's no evidence yet that the decider gets it right. Promotion is a human edit, made after the evidence is in:
+
+1. Ship the template with every answer in `shadow` (or `never` for answers you won't promote). Opted-in users' ledgers collect paired observations: what the decider said, and what the agent then chose.
+2. Write a golden fixture file, one JSON object per line: `{"id": "k1", "inputs": {"issue": "..."}, "expected": "duplicate"}`. `inputs` maps each declared input label to its text; `expected` is a value, the escape, or JSON `true`/`false` on a boolean.
+3. Run `koto decider report --fixtures <file> --template <template> --state <state>` (add `--field <field>` when the state declares more than one) as an opted-in user. It runs every case through the same request and evaluation code the runtime uses, reads the ledger, and marks each value promotion-eligible or not, naming each condition that failed.
+4. Only for a value the report marks eligible, change that answer's `mode` to `auto`, recompile (the floor still applies), and send the edit for review.
+
+A value is eligible when all of these hold:
+
+- at least 10 fixture cases are labelled with it and at least 40 in total (the escape needs none; a boolean needs 10 each for `true` and `false`), and every case got an answer;
+- no false positives: no case labelled with another value was answered with this value at or above its threshold;
+- macro recall across the values beats always guessing the most frequent label (the majority baseline);
+- the ledger holds at least 30 paired observations under the current declaration hash, with at most one disagreement where the decider chose this value;
+- the run and the counted consultations used the default endpoint, unless `--include-custom-endpoints` is passed.
+
+The report never changes a mode. It reads the ledger and prints; the edit to `mode` is always yours. `docs/guides/decider-authoring.md` walks the same workflow for a human reader, and `docs/guides/cli-usage.md` has the report's full output and exit codes.
+
+#### Choosing what to declare and promote
+
+The decider sends declared inputs to a third party and, in `auto`, lets its answer route the workflow. Three rules follow:
+
+- **`auto` only on answers whose wrong outcome costs a reversible step.** A misroute someone can walk back (a rewind, a later review state) is acceptable. An answer that leads toward anything a user can't undo isn't, even where the floor doesn't catch it structurally.
+- **Inputs carrying externally authored text are weaker promotion candidates.** An issue body, a PR description, or a comment can hold text written to steer the provider. In `shadow` and `never` the worst case is misleading evaluation data; in `auto` a steered answer picks a route. Agreement with agents isn't evidence against this, because both read the same text. Prefer inputs your own tooling computed, like a list of changed paths or a derived fact.
+- **Declare the narrowest context key that answers the question.** Opted-in users send each declared input, up to its budget, to a third-party provider, and opting in covers every template they run. If the question needs an issue's title and summary, have an earlier state store just those under their own key rather than pointing at the whole thread.
 
 ## Layer 3: Advanced features
 

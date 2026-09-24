@@ -895,7 +895,18 @@ koto config list                 # Print merged config as TOML
 koto config list --json          # Print merged config as JSON
 ```
 
-Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `workflows.native`.
+Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `workflows.native`, `decider.mode`, `decider.api_key`, `decider.endpoint`, `decider.timeout_ms`.
+
+The `[decider]` keys opt the user in to consulting a decider on declared template fields. It's off by default, and it's the user's choice, not the agent's: don't set these keys unless the user asks you to.
+
+| Key | Values | Default | Project config |
+|-----|--------|---------|----------------|
+| `decider.mode` | `off`, `shadow`, `auto` (`never` is template-only and refused) | `off` | yes, but it can only lower the mode: the lower of the user and project modes applies |
+| `decider.api_key` | the provider API key | unset | no, user config only (`--user`) or `KOTO_DECIDER_API_KEY` |
+| `decider.endpoint` | an `https` URL; plain `http` only for 127.0.0.0/8, `::1`, or `localhost` | `https://api.typesafe.ai/v1/systemone` | no, user config only or `KOTO_DECIDER_ENDPOINT` |
+| `decider.timeout_ms` | 1 to 10000 | `2000` | no, user config only |
+
+`decider.api_key` is user-config-only, and `koto config get decider.api_key` and `koto config list` show it as `<set>`, never the key itself. `KOTO_DECIDER` overrides the user mode. A key alone opts nobody in: the effective mode must also be `shadow` or `auto`, and the key is sent only to an endpoint from the same place (both env or both user config) or to the default. koto ignores `api_key`, `endpoint`, and `timeout_ms` in a project `.koto/config.toml` and warns.
 
 ---
 
@@ -911,6 +922,20 @@ Read-only. Reports how often the decider agreed with agents, read from the decid
 Per question (state, field, and declaration hash) it prints consultations by outcome, paired observations, per-value recall, coverage, and disagreements, a confusion matrix, fallback and error rates, latency p50/p95, agent stops removed, and directive bytes not delivered. `--state` limits the output to one state.
 
 With `--fixtures` it runs a JSON Lines golden set (`{"id", "inputs": {label: text}, "expected"}` per line) through the runtime's own request and evaluation code and marks each value `eligible` or `ineligible`, naming every condition that failed: at least 10 cases per value and 40 in total, every case answered, no confident false positive, macro recall above the majority baseline, at least 30 paired ledger observations under the current declaration hash, and at most one disagreement where the decider chose the value. A fixture run needs an opted-in decider and network access. Runs and consultations against a custom endpoint (user config or `KOTO_DECIDER_ENDPOINT`) count toward eligibility only with `--include-custom-endpoints`.
+
+Flags:
+
+| Flag | Meaning |
+|------|---------|
+| `--ledger <path>` | Ledger to read instead of `~/.koto/_decider_ledger.jsonl` |
+| `--state <state>` | Report only questions on this state; with `--fixtures`, the state whose declaration the fixtures exercise |
+| `--json` | Print JSON instead of a table |
+| `--include-custom-endpoints` | Count consultations and fixture runs against a user-config or env endpoint toward eligibility |
+| `--fixtures <path>` | Run this JSON Lines fixture set and judge promotion eligibility; needs `--template` and `--state` |
+| `--template <path>` | Template source whose declaration the fixtures exercise; only with `--fixtures` |
+| `--field <field>` | The declared field to exercise when the state declares more than one; only with `--fixtures` |
+
+**`--fixtures` requires opt-in.** A fixture run sends every case to the configured decider, so it needs an opted-in user: an effective mode of `shadow` or `auto`, an API key, and an endpoint from the key's own layer or the default. Without that it prints `fixture runs need an opted-in decider`, sends nothing, and exits 2. The ledger report alone (no `--fixtures`) needs no opt-in and no network.
 
 `--json` output has the top-level keys `ledger`, `header`, `questions`, and `fixtures`; each question carries `values`, `confusion`, `rates`, `latency_ms`, `success_measures`, and `flags`.
 

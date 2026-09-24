@@ -137,7 +137,14 @@ A field whose template declares a `decider` block carries two more keys in its
 
 - `description` is the question the field answers.
 - `value_descriptions` has one key per entry in `values`, saying what that value
-  means. On a `boolean` field its keys are `"true"` and `"false"`.
+  means. On a `boolean` field its keys are `"true"` and `"false"`. Read it when
+  choosing a value.
+- Submit one of `values` as usual. Neither key adds a value you can submit. The
+  template's escape value (the decider's "can't tell" answer) never appears here,
+  and submitting it is rejected like any other value outside `values`.
+- Fields without a declaration are unchanged: both keys are absent, even when the
+  template gives the field a description, and the entry is exactly what it was
+  before declarations existed.
 
 When the user running koto has opted in to a decider, koto may answer a declared
 state itself instead of stopping there. You don't see a response for that state
@@ -145,16 +152,14 @@ at all: the `koto next` you ran returns the next stop, with `advanced: true`, in
 the same shape as any other response. Nothing new appears in the response, so
 keep dispatching on `action`. If koto consulted the decider but didn't apply its
 answer, you get the ordinary `evidence_required` for the declared state and
-submit evidence as usual; your evidence always wins over the decider's.
+submit evidence as usual. The decider's answer is never shown to you, and your
+evidence always wins over it.
 
 koto records each consultation, and the declared fields of the evidence you
 then submit, in the user's decider ledger (`~/.koto/_decider_ledger.jsonl`), so
 the template's author can compare the decider's answers with yours. A
 `warning: decider ledger write failed (...)` line on stderr means that record
 was lost; the response and exit code are unaffected, so carry on.
-- Submit one of `values` as usual. Neither key adds a value you can submit.
-- Both keys are absent on every other field, even one whose template gives it a
-  description.
 
 ---
 
