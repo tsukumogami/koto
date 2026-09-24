@@ -309,14 +309,41 @@ pub fn decode_response(
     })
 }
 
-/// The model string to record: control characters stripped, trimmed, and
-/// capped at [`MAX_MODEL_CHARS`]. Missing, non-string, or empty after
-/// cleaning is [`UNKNOWN_MODEL`].
+/// Whether `c` is an invisible formatting character that can make a
+/// printed string read differently from its bytes: bidi embeddings,
+/// overrides, isolates, and marks (U+202A-U+202E, U+2066-U+2069,
+/// U+200E/U+200F, U+061C), zero-width characters and joiners, invisible
+/// operators, the byte-order mark, the soft hyphen, the Mongolian vowel
+/// separator, interlinear annotation marks, and tag characters.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// The model string to record: control characters and invisible format
+/// characters (bidi overrides and the like) stripped, trimmed, and capped
+/// at [`MAX_MODEL_CHARS`]. Missing, non-string, or empty after cleaning is
+/// [`UNKNOWN_MODEL`].
 pub fn sanitize_model(raw: Option<&Value>) -> String {
     let Some(s) = raw.and_then(Value::as_str) else {
         return UNKNOWN_MODEL.to_string();
     };
-    let stripped: String = s.chars().filter(|c| !c.is_control()).collect();
+    let stripped: String = s
+        .chars()
+        .filter(|c| !c.is_control() && !is_invisible_format(*c))
+        .collect();
     let capped: String = stripped.trim().chars().take(MAX_MODEL_CHARS).collect();
     let cleaned = capped.trim_end();
     if cleaned.is_empty() {
@@ -468,6 +495,42 @@ mod tests {
         assert!(got.starts_with("[31mjev-x"));
         assert!(!got.chars().any(|c| c.is_control()));
         assert_eq!(got.chars().count(), MAX_MODEL_CHARS);
+    }
+
+    #[test]
+    fn model_loses_bidi_and_invisible_format_characters() {
+        let named = [
+            '\u{202A}',
+            '\u{202B}',
+            '\u{202C}',
+            '\u{202D}',
+            '\u{202E}',
+            '\u{2066}',
+            '\u{2067}',
+            '\u{2068}',
+            '\u{2069}',
+            '\u{200E}',
+            '\u{200F}',
+            '\u{061C}',
+            '\u{200B}',
+            '\u{200D}',
+            '\u{2060}',
+            '\u{FEFF}',
+            '\u{00AD}',
+            '\u{E0041}',
+        ];
+        for c in named {
+            let got = sanitize_model(Some(&json!(format!("jev{}-1.2", c))));
+            assert_eq!(got, "jev-1.2", "U+{:04X}", c as u32);
+        }
+        // An override that would make "jev-1.2" display as "2.1-vej".
+        let got = sanitize_model(Some(&json!("\u{202E}jev-1.2\u{202C}")));
+        assert_eq!(got, "jev-1.2");
+        // Only invisible characters left: unknown.
+        let got = sanitize_model(Some(&json!("\u{2066}\u{200F}\u{2069}")));
+        assert_eq!(got, "unknown");
+        // Visible non-ASCII survives.
+        assert_eq!(sanitize_model(Some(&json!("jév-ü"))), "jév-ü");
     }
 
     #[test]
