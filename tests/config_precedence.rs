@@ -22,6 +22,10 @@ fn koto_cmd(home_dir: &Path, cwd_dir: &Path) -> Command {
     for k in REQUEST_STORE_ENV_KEYS {
         cmd.env_remove(k);
     }
+    // Same for the decider overrides, so the file layers are what's tested.
+    cmd.env_remove("KOTO_DECIDER");
+    cmd.env_remove("KOTO_DECIDER_API_KEY");
+    cmd.env_remove("KOTO_DECIDER_ENDPOINT");
     cmd
 }
 

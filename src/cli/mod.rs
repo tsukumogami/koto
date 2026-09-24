@@ -1704,7 +1704,7 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
                 let mut doc = config::resolve::load_toml_value(&path)?;
                 config::set_value_in_toml(&mut doc, &key, &value)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
-                config::resolve::write_toml_value(&path, &doc)?;
+                config::resolve::write_user_toml_value(&path, &doc)?;
             } else {
                 config::validate::validate_project_key(&key)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1723,7 +1723,7 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
                 let mut doc = config::resolve::load_toml_value(&path)?;
                 config::unset_value_in_toml(&mut doc, &key)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
-                config::resolve::write_toml_value(&path, &doc)?;
+                config::resolve::write_user_toml_value(&path, &doc)?;
             } else {
                 let path = config::resolve::project_config_path();
                 let mut doc = config::resolve::load_toml_value(&path)?;

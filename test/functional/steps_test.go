@@ -195,9 +195,12 @@ func iRun(command string) error {
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Dir = sc.tempDir
 	// Set HOME to temp dir so .koto cache is local.
+	// KOTO_DECIDER=off comes after os.Environ() so it overrides a value the
+	// developer exported: the suite must never consult a real decider.
 	cmd.Env = append(os.Environ(),
 		"HOME="+sc.tempDir,
 		"XDG_CACHE_HOME="+filepath.Join(sc.tempDir, ".cache"),
+		"KOTO_DECIDER=off",
 	)
 
 	var stdout, stderr strings.Builder
