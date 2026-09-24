@@ -224,6 +224,19 @@ pub struct Gate {
     /// only research children, not all children).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_filter: Option<String>,
+    /// Whether `koto overrides record` may force this gate. Defaults to `true`.
+    ///
+    /// A gate declared `overridable: false` refuses every override at record
+    /// time, with or without `--with-data`, and the advance loop ignores any
+    /// `GateOverrideRecorded` event for it (one written by an older koto or
+    /// appended by hand), evaluating the gate for real instead. Use it for
+    /// gates whose output decides progress that nothing downstream re-checks.
+    ///
+    /// Omitted from the compiled JSON when `true`, so a template that does
+    /// not use the field compiles byte-identical to before and existing
+    /// sessions' template hashes stay valid.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub overridable: bool,
 }
 
 impl Gate {
@@ -267,6 +280,7 @@ impl Gate {
             override_default: _,
             completion: _,
             name_filter,
+            overridable: _,
         } = self;
         let mut fields = vec![
             ("command", command.as_str()),
@@ -400,6 +414,14 @@ pub struct PollingConfig {
 
 fn is_false(b: &bool) -> bool {
     !b
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -2230,6 +2252,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -2252,6 +2275,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -2275,6 +2299,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let mut when = BTreeMap::new();
@@ -2358,6 +2383,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let mut when = BTreeMap::new();
@@ -2388,6 +2414,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -2855,6 +2882,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         t.validate(false).unwrap();
@@ -2906,6 +2934,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -2941,6 +2970,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         t.validate(false).unwrap();
@@ -2961,6 +2991,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -2988,6 +3019,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         t.validate(false).unwrap();
@@ -3017,6 +3049,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3157,6 +3190,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3182,6 +3216,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3227,6 +3262,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3256,6 +3292,7 @@ mod tests {
                     override_default: None,
                     completion: None,
                     name_filter: None,
+                    overridable: true,
                 },
             );
             let err = t.validate(true).unwrap_err();
@@ -3295,6 +3332,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         state.transitions = vec![Transition {
@@ -3699,6 +3737,7 @@ command: "./check.sh"
             override_default,
             completion: None,
             name_filter: None,
+            overridable: true,
         }
     }
 
@@ -3712,6 +3751,7 @@ command: "./check.sh"
             override_default,
             completion: None,
             name_filter: None,
+            overridable: true,
         }
     }
 
@@ -3725,6 +3765,7 @@ command: "./check.sh"
             override_default,
             completion: None,
             name_filter: None,
+            overridable: true,
         }
     }
 
@@ -3915,6 +3956,7 @@ command: "./check.sh"
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         t
@@ -4042,6 +4084,7 @@ command: "./check.sh"
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let mut when = BTreeMap::new();
@@ -4072,6 +4115,7 @@ command: "./check.sh"
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let mut when = BTreeMap::new();
@@ -4135,6 +4179,7 @@ command: "./check.sh"
                 override_default,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -4257,6 +4302,7 @@ command: "./check.sh"
                 override_default: None, // no override_default; builtin used
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let mut when_a = BTreeMap::new();
@@ -4312,6 +4358,7 @@ command: "./check.sh"
                 override_default: Some(serde_json::json!({"exit_code": 0, "error": ""})),
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let mut accepts = BTreeMap::new();
@@ -4364,6 +4411,7 @@ command: "./check.sh"
                 override_default: Some(serde_json::json!({"exit_code": 0})),
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         // Dead-end transitions (would trigger D4 if D2 didn't block first).
@@ -4453,6 +4501,7 @@ command: "./check.sh"
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         t
@@ -4750,6 +4799,7 @@ command: "./check.sh"
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();
@@ -4926,6 +4976,7 @@ command: "./check.sh"
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();

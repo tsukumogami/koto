@@ -862,7 +862,16 @@ where
                 BTreeMap::new();
 
             for (gate_name, gate_def) in &template_state.gates {
-                if let Some(override_applied) = epoch_overrides.get(gate_name) {
+                // A gate declared `overridable: false` ignores any override
+                // record in the log -- one written by an older koto, or
+                // appended by hand -- and is evaluated for real, so the
+                // override value never reaches `gates.<name>.*` routing.
+                let active_override = if gate_def.overridable {
+                    epoch_overrides.get(gate_name)
+                } else {
+                    None
+                };
+                if let Some(override_applied) = active_override {
                     // Gate has an active override: inject the override value and a
                     // synthetic Passed result without calling evaluate_gates.
                     gate_evidence_map.insert(gate_name.clone(), override_applied.clone());
@@ -2110,6 +2119,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -2285,6 +2295,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -2379,6 +2390,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -2502,6 +2514,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -2626,6 +2639,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -2736,6 +2750,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -3871,6 +3886,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -3906,6 +3922,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -4035,6 +4052,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -4268,6 +4286,7 @@ mod tests {
             override_default: None,
             completion: None,
             name_filter: None,
+            overridable: true,
         }
     }
 
@@ -4517,6 +4536,201 @@ mod tests {
         );
     }
 
+    // A gate declared `overridable: false` ignores an override record already
+    // in the log (written by an older koto, or appended by hand): the gate is
+    // evaluated for real, a GateEvaluated event is emitted, and the real
+    // output -- not the override value -- drives `gates.<name>.*` routing.
+    #[test]
+    fn non_overridable_gate_ignores_logged_override_and_routes_on_real_output() {
+        use crate::template::types::Gate;
+
+        // The override claims exit_code 0, which would route to "merged".
+        let override_val = serde_json::json!({"exit_code": 0, "error": ""});
+        let all_events = override_events("route", "verdict", override_val);
+
+        let mut gate = make_gate_def("command");
+        gate.command = "exit 1".to_string();
+        gate.overridable = false;
+        let mut gates = BTreeMap::new();
+        gates.insert("verdict".to_string(), gate);
+
+        let terminal = |directive: &str| TemplateState {
+            directive: directive.to_string(),
+            details: String::new(),
+            transitions: vec![],
+            terminal: true,
+            gates: BTreeMap::new(),
+            accepts: None,
+            integration: None,
+            default_action: None,
+            materialize_children: None,
+            failure: false,
+            skipped_marker: false,
+            skip_if: None,
+        };
+        let template = make_template(vec![
+            (
+                "route",
+                TemplateState {
+                    directive: "Route.".to_string(),
+                    details: String::new(),
+                    transitions: vec![
+                        conditional(
+                            "merged",
+                            vec![("gates.verdict.exit_code", serde_json::json!(0))],
+                        ),
+                        conditional(
+                            "waiting",
+                            vec![("gates.verdict.exit_code", serde_json::json!(1))],
+                        ),
+                    ],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: None,
+                },
+            ),
+            ("merged", terminal("Merged.")),
+            ("waiting", terminal("Waiting.")),
+        ]);
+
+        let mut appended: Vec<EventPayload> = Vec::new();
+        let mut append = |payload: &EventPayload| -> Result<(), String> {
+            appended.push(payload.clone());
+            Ok(())
+        };
+        let shutdown = AtomicBool::new(false);
+
+        let evaluated_names = std::cell::RefCell::new(Vec::<String>::new());
+        let gate_eval = |gates: &BTreeMap<String, Gate>| {
+            let mut out = BTreeMap::new();
+            for name in gates.keys() {
+                evaluated_names.borrow_mut().push(name.clone());
+                out.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Failed,
+                        output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    },
+                );
+            }
+            Ok(out)
+        };
+
+        let result = advance_until_stop(
+            "route",
+            &template,
+            &BTreeMap::new(),
+            &all_events,
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &VariableOverlay::new(),
+            &shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(
+            evaluated_names.borrow().as_slice(),
+            ["verdict".to_string()],
+            "the non-overridable gate must go through evaluate_gates"
+        );
+        assert_eq!(
+            result.final_state, "waiting",
+            "the real gate output (exit_code 1) must drive routing, not the override"
+        );
+        let evaluated = appended.iter().any(|p| {
+            matches!(p, EventPayload::GateEvaluated { gate, output, .. }
+                if gate == "verdict" && output["exit_code"] == 1)
+        });
+        assert!(
+            evaluated,
+            "a GateEvaluated event must be emitted for the gate"
+        );
+    }
+
+    // The same log on an overridable gate still applies the override: the
+    // defense only engages for gates that opt out.
+    #[test]
+    fn overridable_gate_still_applies_logged_override() {
+        use crate::template::types::Gate;
+
+        let override_val = serde_json::json!({"exit_code": 0, "error": ""});
+        let all_events = override_events("route", "verdict", override_val);
+
+        let mut gates = BTreeMap::new();
+        gates.insert("verdict".to_string(), make_gate_def("command"));
+        let terminal = |directive: &str| TemplateState {
+            directive: directive.to_string(),
+            details: String::new(),
+            transitions: vec![],
+            terminal: true,
+            gates: BTreeMap::new(),
+            accepts: None,
+            integration: None,
+            default_action: None,
+            materialize_children: None,
+            failure: false,
+            skipped_marker: false,
+            skip_if: None,
+        };
+        let template = make_template(vec![
+            (
+                "route",
+                TemplateState {
+                    directive: "Route.".to_string(),
+                    details: String::new(),
+                    transitions: vec![
+                        conditional(
+                            "merged",
+                            vec![("gates.verdict.exit_code", serde_json::json!(0))],
+                        ),
+                        conditional(
+                            "waiting",
+                            vec![("gates.verdict.exit_code", serde_json::json!(1))],
+                        ),
+                    ],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: None,
+                },
+            ),
+            ("merged", terminal("Merged.")),
+            ("waiting", terminal("Waiting.")),
+        ]);
+
+        let mut append = |_p: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+        let gate_eval = |_gates: &BTreeMap<String, Gate>| Ok(BTreeMap::new());
+
+        let result = advance_until_stop(
+            "route",
+            &template,
+            &BTreeMap::new(),
+            &all_events,
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &VariableOverlay::new(),
+            &shutdown,
+        )
+        .unwrap();
+        assert_eq!(result.final_state, "merged");
+    }
+
     // Test 3: one command gate, no active override, evaluation returns non-passing.
     // The blocking condition in GateBlocked must have agent_actionable checked
     // via blocking_conditions_from_gates (tested in next_types.rs). This test
@@ -4537,6 +4751,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -4659,6 +4874,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -4758,6 +4974,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -4882,6 +5099,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -4968,6 +5186,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 

@@ -831,9 +831,9 @@ pub struct BlockingCondition {
     /// something) for all other gate types.
     #[serde(default = "default_category")]
     pub category: String,
-    // False until Feature 2 (override mechanism) lands. Feature 2 sets this
-    // true when the gate has an override_default, signaling the agent can call
-    // `koto overrides record` to substitute gate output with the default.
+    // True when the gate accepts overrides and has a default to apply,
+    // signaling the agent can call `koto overrides record` to substitute gate
+    // output. Always false for a gate declared `overridable: false`.
     pub agent_actionable: bool,
     pub output: serde_json::Value,
 }
@@ -873,9 +873,10 @@ pub struct ErrorDetail {
 /// Passed gates are excluded. Each non-passing gate produces a `BlockingCondition`
 /// with `condition_type` taken from the gate definition (falling back to `"command"`
 /// when the gate name is not found in `gate_defs`), and `output` from the structured
-/// gate result. `agent_actionable` is set to `true` when the gate has either an
-/// instance-level `override_default` or a built-in default for its gate type, signaling
-/// that the agent can call `koto overrides record` to substitute the gate output.
+/// gate result. `agent_actionable` is set to `true` when the gate accepts overrides
+/// and has either an instance-level `override_default` or a built-in default for its
+/// gate type, signaling that the agent can call `koto overrides record` to substitute
+/// the gate output. A gate declared `overridable: false` is never agent-actionable.
 ///
 /// The reserved `__action__` name is not a gate: it carries a failed
 /// `default_action` through this same list (DESIGN-koto-runs-commands.md
@@ -911,9 +912,15 @@ pub fn blocking_conditions_from_gates(
                 .map(|g| g.gate_type.clone())
                 .unwrap_or_else(|| "command".to_string());
             let category = crate::gate::gate_blocking_category(&condition_type).to_string();
+            // An override is the action this flag advertises, so a gate that
+            // refuses overrides is never agent-actionable, whatever its defaults.
             let agent_actionable = gate_defs
                 .get(name)
-                .map(|g| g.override_default.is_some() || built_in_default(&g.gate_type).is_some())
+                .map(|g| {
+                    g.overridable
+                        && (g.override_default.is_some()
+                            || built_in_default(&g.gate_type).is_some())
+                })
                 .unwrap_or(false);
             Some(BlockingCondition {
                 name: name.clone(),
@@ -1897,6 +1904,7 @@ mod tests {
             override_default: None,
             completion: None,
             name_filter: None,
+            overridable: true,
         }
     }
 
@@ -1910,6 +1918,7 @@ mod tests {
             override_default: None,
             completion: None,
             name_filter: None,
+            overridable: true,
         }
     }
 
@@ -2197,6 +2206,7 @@ mod tests {
                 override_default: Some(serde_json::json!({"result": "ok"})),
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -2205,6 +2215,47 @@ mod tests {
         assert!(
             conditions[0].agent_actionable,
             "gate with instance override_default must have agent_actionable true"
+        );
+    }
+
+    #[test]
+    fn agent_actionable_false_for_non_overridable_gate() {
+        // A failing command gate has a built-in default, but it refuses
+        // overrides, so there is nothing for the agent to do with it.
+        let mut gate_results = BTreeMap::new();
+        for name in ["locked", "open"] {
+            gate_results.insert(
+                name.to_string(),
+                StructuredGateResult {
+                    outcome: GateOutcome::Failed,
+                    output: serde_json::json!({"exit_code": 1, "error": ""}),
+                },
+            );
+        }
+        let gate = |overridable: bool| Gate {
+            gate_type: "command".to_string(),
+            command: "exit 1".to_string(),
+            timeout: 0,
+            key: String::new(),
+            pattern: String::new(),
+            override_default: None,
+            completion: None,
+            name_filter: None,
+            overridable,
+        };
+        let mut gate_defs = BTreeMap::new();
+        gate_defs.insert("locked".to_string(), gate(false));
+        gate_defs.insert("open".to_string(), gate(true));
+
+        let conditions = blocking_conditions_from_gates(&gate_results, &gate_defs);
+        let by_name: BTreeMap<_, _> = conditions.iter().map(|c| (c.name.as_str(), c)).collect();
+        assert!(
+            !by_name["locked"].agent_actionable,
+            "a non-overridable gate must report agent_actionable false"
+        );
+        assert!(
+            by_name["open"].agent_actionable,
+            "an overridable gate with a default keeps agent_actionable true"
         );
     }
 
@@ -2232,6 +2283,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 

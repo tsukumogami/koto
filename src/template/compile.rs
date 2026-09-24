@@ -150,7 +150,32 @@ struct SourceGate {
     completion: Option<String>,
     #[serde(default)]
     name_filter: Option<String>,
+    /// Kept as a raw YAML value so `compile_gate` can reject anything but a
+    /// boolean with an error that names the state and gate.
+    #[serde(default)]
+    overridable: Option<serde_yaml_ng::Value>,
+    /// Every key the fields above don't name. `SourceState` uses
+    /// `deny_unknown_fields`, but serde's error for it surfaces only as the
+    /// outer "failed to parse front-matter" context, which names neither the
+    /// state nor the gate. Collecting the leftovers lets `compile_gate` refuse
+    /// them with an error that does, so a misspelled `overrideable: false`
+    /// can't compile and quietly leave the gate overridable.
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde_yaml_ng::Value>,
 }
+
+/// The keys a gate declaration may carry, listed in unknown-key errors.
+const SOURCE_GATE_KEYS: &[&str] = &[
+    "type",
+    "command",
+    "timeout",
+    "key",
+    "pattern",
+    "override_default",
+    "completion",
+    "name_filter",
+    "overridable",
+];
 
 /// Compile a YAML/Markdown template source file to a FormatVersion=1 CompiledTemplate.
 ///
@@ -483,6 +508,35 @@ fn child_has_reachable_skipped_marker(child: &CompiledTemplate) -> bool {
 }
 
 fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyhow::Result<Gate> {
+    if let Some(unknown_key) = source.unknown.keys().next() {
+        return Err(anyhow!(
+            "state {:?} gate {:?}: unknown key {:?}; a gate accepts only: {}",
+            state_name,
+            gate_name,
+            unknown_key,
+            SOURCE_GATE_KEYS.join(", ")
+        ));
+    }
+    let overridable = match &source.overridable {
+        None => true,
+        Some(serde_yaml_ng::Value::Bool(b)) => *b,
+        Some(other) => {
+            return Err(anyhow!(
+                "state {:?} gate {:?}: overridable must be a boolean (true or false), found {}",
+                state_name,
+                gate_name,
+                serde_json::to_string(other).unwrap_or_else(|_| format!("{:?}", other))
+            ));
+        }
+    };
+    if !overridable && source.override_default.is_some() {
+        return Err(anyhow!(
+            "state {:?} gate {:?}: override_default is declared on a gate with overridable: false; \
+             no override can ever apply it. Remove override_default, or make the gate overridable",
+            state_name,
+            gate_name
+        ));
+    }
     match source.gate_type.as_str() {
         GATE_TYPE_COMMAND => {
             if source.command.is_empty() {
@@ -501,6 +555,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 override_default: source.override_default.clone(),
                 completion: None,
                 name_filter: None,
+                overridable,
             })
         }
         GATE_TYPE_CONTEXT_EXISTS => {
@@ -520,6 +575,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 override_default: source.override_default.clone(),
                 completion: None,
                 name_filter: None,
+                overridable,
             })
         }
         GATE_TYPE_CONTEXT_MATCHES => {
@@ -546,6 +602,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 override_default: source.override_default.clone(),
                 completion: None,
                 name_filter: None,
+                overridable,
             })
         }
         GATE_TYPE_CHILDREN_COMPLETE => {
@@ -581,6 +638,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 override_default: source.override_default.clone(),
                 completion: source.completion.clone(),
                 name_filter: source.name_filter.clone(),
+                overridable,
             })
         }
         other => Err(anyhow!(
@@ -2182,5 +2240,126 @@ Done.
         let f = write_temp(src);
         // W-SKIP-GATE-ABSENT is a warning, not an error — compile succeeds.
         compile(f.path(), true).expect("W-SKIP-GATE-ABSENT should warn but not fail compilation");
+    }
+
+    // -----------------------------------------------------------------
+    // overridable: false on gates
+    // -----------------------------------------------------------------
+
+    /// A one-state template whose `check` state declares the given gate
+    /// body (already indented to sit under `gates: g:`).
+    fn gate_template(gate_body: &str) -> String {
+        format!(
+            "---\nname: ov\nversion: \"1.0\"\ninitial_state: check\nstates:\n  check:\n    gates:\n      g:\n{}    transitions:\n      - target: done\n  done:\n    terminal: true\n---\n\n## check\n\nCheck.\n\n## done\n\nDone.\n",
+            gate_body
+        )
+    }
+
+    fn compile_err(src: &str) -> String {
+        let f = write_temp(src);
+        compile(f.path(), false)
+            .expect_err("template should fail to compile")
+            .to_string()
+    }
+
+    #[test]
+    fn overridable_false_compiles_on_every_gate_type() {
+        let bodies = [
+            "        type: command\n        command: \"true\"\n",
+            "        type: context-exists\n        key: some.key\n",
+            "        type: context-matches\n        key: some.key\n        pattern: \"^ok$\"\n",
+            "        type: children-complete\n",
+        ];
+        for body in bodies {
+            let src = gate_template(&format!("{}        overridable: false\n", body));
+            let f = write_temp(&src);
+            let compiled = compile(f.path(), false)
+                .unwrap_or_else(|e| panic!("gate {:?} should compile: {}", body, e));
+            let gate = &compiled.states["check"].gates["g"];
+            assert!(
+                !gate.overridable,
+                "gate {:?} should be non-overridable",
+                body
+            );
+            let json = serde_json::to_value(gate).unwrap();
+            assert_eq!(json["overridable"], serde_json::json!(false));
+        }
+    }
+
+    #[test]
+    fn overridable_defaults_to_true_and_is_omitted_from_json() {
+        let src = gate_template("        type: command\n        command: \"true\"\n");
+        let f = write_temp(&src);
+        let compiled = compile(f.path(), false).unwrap();
+        let gate = &compiled.states["check"].gates["g"];
+        assert!(gate.overridable);
+        let json = serde_json::to_value(gate).unwrap();
+        assert!(json.get("overridable").is_none(), "got {}", json);
+
+        let explicit = gate_template(
+            "        type: command\n        command: \"true\"\n        overridable: true\n",
+        );
+        let f = write_temp(&explicit);
+        let compiled_explicit = compile(f.path(), false).unwrap();
+        assert_eq!(
+            serde_json::to_string_pretty(&compiled_explicit).unwrap(),
+            serde_json::to_string_pretty(&compiled).unwrap(),
+            "overridable: true must compile byte-identical to omitting it"
+        );
+    }
+
+    #[test]
+    fn misspelled_overridable_key_is_rejected_naming_state_gate_and_key() {
+        let err = compile_err(&gate_template(
+            "        type: command\n        command: \"true\"\n        overrideable: false\n",
+        ));
+        assert!(err.contains("\"check\""), "state missing: {}", err);
+        assert!(err.contains("\"g\""), "gate missing: {}", err);
+        assert!(err.contains("\"overrideable\""), "key missing: {}", err);
+        assert!(err.contains("unknown key"), "{}", err);
+    }
+
+    #[test]
+    fn overridable_rejects_non_boolean_values() {
+        for value in ["\"no\"", "no", "\"false\"", "0", "[false]"] {
+            let err = compile_err(&gate_template(&format!(
+                "        type: command\n        command: \"true\"\n        overridable: {}\n",
+                value
+            )));
+            assert!(
+                err.contains("overridable must be a boolean"),
+                "value {} gave: {}",
+                value,
+                err
+            );
+            assert!(
+                err.contains("\"check\"") && err.contains("\"g\""),
+                "{}",
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn override_default_on_non_overridable_gate_is_rejected() {
+        let err = compile_err(&gate_template(
+            "        type: command\n        command: \"true\"\n        overridable: false\n        override_default:\n          exit_code: 0\n          error: \"\"\n",
+        ));
+        assert!(err.contains("override_default"), "{}", err);
+        assert!(err.contains("overridable: false"), "{}", err);
+        assert!(
+            err.contains("\"check\"") && err.contains("\"g\""),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn override_default_on_overridable_gate_still_compiles() {
+        let src = gate_template(
+            "        type: command\n        command: \"true\"\n        overridable: true\n        override_default:\n          exit_code: 0\n          error: \"\"\n",
+        );
+        let f = write_temp(&src);
+        compile(f.path(), false).expect("override_default on an overridable gate is fine");
     }
 }
