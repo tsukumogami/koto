@@ -136,6 +136,11 @@ A workflow that compiles isn't automatically a good workflow. Run your decomposi
 - Introduce a branch only where you'll genuinely make a different decision and the downstream work differs. Branches that reconverge immediately with identical work are noise.
 - Branch on submitted evidence (an `accepts` field + `when` clauses), and keep the conditions mutually exclusive — the compiler rejects overlapping routes.
 
+**No `decider` blocks**
+
+- Don't declare a `decider` block on an ad hoc field. A declaration only pays off over many runs: every answer ships in `shadow`, and it takes a golden fixture set plus dozens of recorded runs under one unchanged declaration before `koto decider report` can mark an answer eligible for `auto`. A one-off definition never gets there, and for a user who has opted in it would just send your inputs to a third-party provider for nothing. You're the one answering the question anyway: submit the evidence yourself.
+- If a closed question in your workflow looks like one a decider could answer, that's a sign the workflow is worth keeping. Make it a durable template with **koto-author**, which covers declarations and promotion (see [Repeated authoring](#repeated-authoring-switch-to-koto-author)).
+
 ## Worked examples
 
 Both definitions below compile under the strict `--from-stdin` path and start a session.

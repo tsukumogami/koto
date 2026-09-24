@@ -405,6 +405,7 @@ pub fn handle_retry_failed(
         state: parent_current_state.to_string(),
         fields: submission_fields,
         submitter_cwd: submitter_cwd.clone(),
+        source: None,
     };
     backend
         .append_event(parent_name, &parent_submit, &now_iso8601())
@@ -423,6 +424,7 @@ pub fn handle_retry_failed(
         state: parent_current_state.to_string(),
         fields: clearing_fields,
         submitter_cwd,
+        source: None,
     };
     backend
         .append_event(parent_name, &clearing, &now_iso8601())

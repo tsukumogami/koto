@@ -5839,6 +5839,11 @@ fn koto_config_cmd(dir: &Path, home: &Path) -> Command {
     // Prevent env vars from interfering unless explicitly set in the test.
     cmd.env_remove("AWS_ACCESS_KEY_ID");
     cmd.env_remove("AWS_SECRET_ACCESS_KEY");
+    // The user-config layer is under test: drop the decider env overrides
+    // (cargo forces KOTO_DECIDER=off for every test process).
+    cmd.env_remove("KOTO_DECIDER");
+    cmd.env_remove("KOTO_DECIDER_API_KEY");
+    cmd.env_remove("KOTO_DECIDER_ENDPOINT");
     cmd
 }
 

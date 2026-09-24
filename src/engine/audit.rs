@@ -399,6 +399,7 @@ mod tests {
             state: ABANDON_NOTICE_STATE.to_string(),
             fields,
             submitter_cwd: None,
+            source: None,
         };
         let s = serde_json::to_string(&payload).unwrap();
         let parsed: EventPayload = serde_json::from_str(&s).unwrap();
@@ -447,6 +448,7 @@ mod tests {
             state: "dispatch".to_string(),
             fields,
             submitter_cwd: None,
+            source: None,
         };
         let s = serde_json::to_string(&payload).unwrap();
         let parsed: EventPayload = serde_json::from_str(&s).unwrap();
@@ -463,6 +465,7 @@ mod tests {
             state: "dispatch".to_string(),
             fields,
             submitter_cwd: None,
+            source: None,
         };
         let s = serde_json::to_string(&payload).unwrap();
         let parsed: EventPayload = serde_json::from_str(&s).unwrap();
@@ -487,6 +490,7 @@ mod tests {
             state: "wake".to_string(),
             fields,
             submitter_cwd: None,
+            source: None,
         };
         let s = serde_json::to_string(&payload).unwrap();
         let parsed: EventPayload = serde_json::from_str(&s).unwrap();
@@ -514,6 +518,7 @@ mod tests {
             state: "respawn".to_string(),
             fields,
             submitter_cwd: None,
+            source: None,
         };
         let s = serde_json::to_string(&payload).unwrap();
         let parsed: EventPayload = serde_json::from_str(&s).unwrap();

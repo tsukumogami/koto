@@ -32,6 +32,7 @@ fn evidence_event(seq: u64, fields: HashMap<String, serde_json::Value>) -> Event
         state: "dispatch".to_string(),
         fields,
         submitter_cwd: None,
+        source: None,
     };
     Event {
         seq,

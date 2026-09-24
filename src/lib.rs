@@ -4,6 +4,7 @@ pub mod buildinfo;
 pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod decider;
 pub mod discover;
 pub mod engine;
 pub mod export;

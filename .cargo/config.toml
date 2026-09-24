@@ -1,0 +1,9 @@
+# Test isolation for the opt-in decider.
+#
+# `force = true` makes this value win over a KOTO_DECIDER exported in the
+# developer's shell, so `cargo test` (and every child process a test spawns)
+# can never consult a real decider with a real key. Tests that need the
+# decider on set KOTO_DECIDER on their own Command.
+# tests/decider_harness_guard.rs fails loudly if this stops taking effect.
+[env]
+KOTO_DECIDER = { value = "off", force = true }

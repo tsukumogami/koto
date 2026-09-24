@@ -107,6 +107,10 @@ events:
         type: string
         required: false
         nullable: true
+      source:
+        type: string
+        required: false
+        nullable: true
 
   workflow_cancelled:
     tier: 1
@@ -291,6 +295,46 @@ events:
         nullable: true
       to:
         type: string
+        required: true
+
+  decider_consulted:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      visit_seq:
+        type: integer
+        required: true
+      provider:
+        type: string
+        required: true
+      model:
+        type: string
+        required: true
+      input_sha256:
+        type: string
+        required: false
+        nullable: true
+      outcome:
+        type: string
+        required: true
+        enum: ["applied", "not_applied", "input_unavailable", "error"]
+      error_class:
+        type: string
+        required: false
+        nullable: true
+      latency_ms:
+        type: integer
+        required: true
+      directive_bytes:
+        type: integer
+        required: true
+      endpoint_origin:
+        type: string
+        required: false
+      fields:
+        type: object
         required: true
 
   scheduler_ran:
@@ -550,6 +594,7 @@ Records what an agent submitted for a state.
 | `state` | string | Yes | State the evidence was submitted for. |
 | `fields` | object | Yes | Agent-provided key-value evidence. Values are arbitrary JSON. |
 | `submitter_cwd` | string | No | Working directory of the submitting process. Used internally by the batch scheduler. Consumers MAY ignore this field. |
+| `source` | string | No | Who produced the evidence when it wasn't the agent. `"decider"` marks an answer koto applied from an opted-in decider; absent means the agent submitted it. Only koto sets it: a `source` key in `--with-data` lands in `fields`. Consumers MUST tolerate values they don't recognize. |
 
 ---
 
@@ -980,6 +1025,70 @@ bound to writes nothing, so consecutive events always differ.
 
 The event is appended before the header field is written, the same ordering
 `execution_anchor_adopted` uses and for the same reason.
+
+---
+
+#### `decider_consulted`
+
+Records one consultation of an opted-in decider: koto asked a typed decision
+model to answer a state's declared fields instead of stopping for the agent's
+evidence. It appears only for users who opted in, only on states whose
+template declares a `decider` block, and at most once per visit to a state.
+
+```json
+{
+  "type": "decider_consulted",
+  "payload": {
+    "state": "review",
+    "visit_seq": 4,
+    "provider": "jev",
+    "model": "jev-1.2.3",
+    "input_sha256": "3b1f...e09a",
+    "outcome": "not_applied",
+    "latency_ms": 212,
+    "directive_bytes": 318,
+    "endpoint_origin": "default",
+    "fields": {
+      "verdict": {
+        "declaration_hash": "9c2d...71f0",
+        "modes": {"proceed": "shadow", "exit": "never"},
+        "probabilities": {"proceed": 0.95, "exit": 0.03, "unclear": 0.02},
+        "winning": "proceed",
+        "confidence": 0.95,
+        "threshold": 0.9,
+        "at_threshold": true,
+        "outcome": "shadow"
+      }
+    }
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `state` | string | Yes | The state consulted. |
+| `visit_seq` | integer | Yes | The `seq` of the event that began this visit to the state. A visit is consulted at most once. |
+| `provider` | string | Yes | The provider name, such as `"jev"`. |
+| `model` | string | Yes | The model build the provider reported, or `"unknown"`. |
+| `input_sha256` | string | No | SHA-256 of the assembled inputs. Absent when they couldn't be assembled. |
+| `outcome` | string | Yes | `"applied"`, `"not_applied"`, `"input_unavailable"`, or `"error"`. |
+| `error_class` | string | No | How the provider call failed, present only with `"error"`. Consumers MUST tolerate values they don't recognize. |
+| `latency_ms` | integer | Yes | Wall time of the provider call. |
+| `directive_bytes` | integer | Yes | Byte length of the directive and details the agent would have received for this state. |
+| `endpoint_origin` | string | No | Where the endpoint came from: `"default"`, `"user"`, or `"env"`. |
+| `fields` | object | Yes | Keyed by declared field. Each holds its `declaration_hash`, the effective `modes`, `probabilities` rounded to four places (absent when there was no usable answer), `winning`, `confidence`, `threshold`, `at_threshold`, and a per-field `outcome`. |
+
+The event carries no input content and no credentials: inputs appear only as
+`input_sha256`, and the API key, the response body, and error text are never
+recorded.
+
+An `applied` outcome is always followed by an `evidence_submitted` with
+`source: "decider"` carrying the answer, then a `transitioned` out of the
+state. Any other outcome leaves the state waiting for the agent, exactly as it
+would for a user who hadn't opted in.
+
+koto also appends each consultation to `~/.koto/_decider_ledger.jsonl`, which
+outlives the session log; see `docs/workspace-layout.md`.
 
 ---
 

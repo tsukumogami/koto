@@ -106,6 +106,36 @@
         "The response gives the engine-runnable rule as the reason: a successful `gh pr create` is itself the irreversible, externally visible event and nothing arriving later can un-fire it (not merely that the command is 'risky', 'important', or 'needs review')",
         "The response does NOT offer `requires_confirmation`, a gate, or a future koto release as a way to make `gh pr create` engine-runnable"
       ]
+    },
+    {
+      "id": 9,
+      "name": "decider-declaration-ships-in-shadow",
+      "prompt": "I have a koto template for triaging incoming issues. The `fetch` state stores the issue text under the `issue.md` context key and gates on it with a `context-exists` gate. Next is `classify`, where the agent picks `kind`: `bug` routes to `reproduce`, `feature` routes to `design`, and `question` routes to `answered`, which is `terminal: true`. I want a decider to be able to answer `kind` from the issue text instead of the agent. I'm confident about `feature` and `question`, so set both of those to `auto` so koto applies them right away. Write the YAML for the `classify` state.",
+      "expected_output": "Agent writes a `decider` block inside the `kind` field: the field's `description` is the question, `answers` has one entry per value (`bug`, `feature`, `question`), each with a `description`, an `escape` with a value that is not in `values` (e.g. `unclear`) and its own description, and `inputs` naming `context: issue.md` with a label. It does not ship any answer in `auto`: every answer is `shadow` (the default) or `never`, and it explains that promotion to `auto` is a later edit to `mode` made only after `koto decider report --fixtures ... --template ... --state classify` marks the value eligible. It also explains that `question` could never be `auto` as routed, because its transition targets a terminal state and the compiler rejects that with `E-DECIDER-FLOOR`. No `when` clause routes on the escape value.",
+      "files": [],
+      "assertions": [
+        "The `kind` field is an `enum` with `values` [bug, feature, question], a non-empty field `description` phrased as the question, and a `decider` block nested inside the field (not at state level)",
+        "`answers` has exactly one entry for each of `bug`, `feature`, and `question`, and each entry has a `description`",
+        "The block declares an `escape` with a `value` that is NOT one of `bug`, `feature`, or `question`, plus a `description`, and no transition's `when` clause tests `kind` at the escape value",
+        "`inputs` includes an entry with `context: issue.md` and a `label`",
+        "No answer is written with `mode: auto`; every answer is left at the default `shadow` or set to `shadow` or `never`, and the response explains that values ship in `shadow`/`never` and are promoted later by editing `mode`",
+        "The response names `koto decider report` with `--fixtures` as the step that decides whether a value is eligible for `auto`, and says the report itself does not change the mode",
+        "The response explains that `question` can't be `auto` while it routes to the terminal `answered` state, naming the floor rule or `E-DECIDER-FLOOR`"
+      ]
+    },
+    {
+      "id": 10,
+      "name": "decider-declaration-hash-rewording",
+      "prompt": "Our koto template declares a decider on the `verdict` field of its `review` state. It has shipped for two months with every answer in `shadow`, and `koto decider report` now marks `proceed` as promotion-eligible. Before I flip `proceed` to `auto`, I'd like to reword the description of `exit` so it reads better, and bump the `proceed` threshold from 0.9 to 0.95. Does the order of those edits matter? Will any of them throw away the evidence we collected?",
+      "expected_output": "Agent explains the declaration hash: it covers the question, the values, the value and escape descriptions, and the inputs, but not modes or thresholds. Changing `proceed` to `auto` and raising its threshold keep the existing evidence. Rewording the `exit` description changes the hash, so the report treats the result as a new question with no paired observations, and `proceed` would no longer be eligible under the new hash. The recommendation is to promote (and change the threshold) without rewording, or accept that rewording restarts evidence collection in shadow.",
+      "files": [],
+      "assertions": [
+        "The response states that changing a value's `mode` does not change the declaration hash, so promoting `proceed` keeps the collected evidence",
+        "The response states that changing a `threshold` does not change the declaration hash",
+        "The response states that rewording the `exit` description DOES change the declaration hash, so the ledger evidence no longer counts toward the new declaration",
+        "The response concludes that rewording would make `proceed` lose its eligibility (the paired-observation count starts over), and recommends not rewording before promotion or accepting a fresh round in shadow",
+        "The response does NOT claim that the report or koto changes the mode automatically once a value is eligible"
+      ]
     }
   ]
 }

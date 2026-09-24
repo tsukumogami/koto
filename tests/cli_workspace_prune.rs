@@ -579,6 +579,40 @@ fn unrelated_sessions_untouched() {
     );
 }
 
+/// The decider ledger lives next to the session tree, not in it, and prune
+/// only removes session directories: its bytes survive a prune untouched.
+#[test]
+fn prune_leaves_the_decider_ledger_unchanged() {
+    let dir = TempDir::new().unwrap();
+    init_workflow(dir.path(), "p1", terminal_at_init_template());
+    init_child_workflow(dir.path(), "p1", "c1", terminal_at_init_template());
+
+    let koto_root = dir.path().join(".koto");
+    std::fs::create_dir_all(&koto_root).unwrap();
+    let ledger = koto_root.join("_decider_ledger.jsonl");
+    let planted = concat!(
+        r#"{"kind":"consulted","v":1,"at":"2026-01-01T00:00:00.000Z","session":"c1","session_id":"u1","state":"review","visit_seq":2,"provider":"jev","model":"m","outcome":"not_applied","latency_ms":5,"directive_bytes":10,"endpoint_origin":"default","fields":{}}"#,
+        "\n",
+        r#"{"kind":"answered","v":1,"at":"2026-01-01T00:00:01.000Z","session":"c1","session_id":"u1","state":"review","visit_seq":2,"values":{"verdict":"exit"}}"#,
+        "\n",
+    );
+    std::fs::write(&ledger, planted).unwrap();
+
+    let out = koto_cmd(dir.path())
+        .args(["workspace", "prune", "--root", "p1", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "prune failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!session_dir(dir.path(), "p1").exists());
+    assert!(!session_dir(dir.path(), "c1").exists());
+    assert_eq!(std::fs::read(&ledger).unwrap(), planted.as_bytes());
+}
+
 // ---------------------------------------------------------------------------
 // --root validation (parse-time)
 // ---------------------------------------------------------------------------

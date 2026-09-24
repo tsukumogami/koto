@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::action::FailureKind;
+use crate::engine::decider::{consult_at_stop, DeciderPort, StopContext, StopOutcome};
 use crate::engine::persistence::derive_overrides;
 use crate::engine::substitute::{GateCaptureRefusal, VariableOverlay};
 use crate::engine::types::{now_iso8601, Event, EventPayload};
@@ -562,6 +563,55 @@ where
     I: Fn(&str) -> Result<serde_json::Value, IntegrationError>,
     A: Fn(&str, &ActionDecl, bool) -> ActionResult,
 {
+    advance_until_stop_with_decider(
+        current_state,
+        template,
+        evidence,
+        all_events,
+        append_event,
+        evaluate_gates,
+        invoke_integration,
+        execute_action,
+        overlay,
+        shutdown,
+        None,
+    )
+}
+
+/// [`advance_until_stop`] with an optional decider.
+///
+/// With `decider: None` this is exactly `advance_until_stop`. With a port,
+/// a state that would stop for evidence (step 8's `NeedsEvidence` arm with
+/// an `accepts` block) and declares a `decider` is offered to the port
+/// first; see [`crate::engine::decider`] for the eligibility rules, the
+/// cap of [`crate::engine::decider::MAX_CONSULTATIONS_PER_CALL`] per call,
+/// and when an answer applies. An applied answer appends its evidence and
+/// takes the transition like any other; anything else stops exactly as the
+/// opted-out loop would.
+#[allow(clippy::too_many_arguments)]
+pub fn advance_until_stop_with_decider<F, G, I, A>(
+    current_state: &str,
+    template: &CompiledTemplate,
+    evidence: &BTreeMap<String, serde_json::Value>,
+    all_events: &[Event],
+    append_event: &mut F,
+    evaluate_gates: &G,
+    invoke_integration: &I,
+    execute_action: &A,
+    overlay: &VariableOverlay,
+    shutdown: &AtomicBool,
+    mut decider: Option<&mut dyn DeciderPort>,
+) -> Result<AdvanceResult, AdvanceError>
+where
+    F: FnMut(&EventPayload) -> Result<(), String>,
+    G: Fn(
+        &BTreeMap<String, crate::template::types::Gate>,
+    ) -> Result<BTreeMap<String, StructuredGateResult>, GateCaptureRefusal>,
+    I: Fn(&str) -> Result<serde_json::Value, IntegrationError>,
+    A: Fn(&str, &ActionDecl, bool) -> ActionResult,
+{
+    // Consultations made by this call, capped per call.
+    let mut consultations: usize = 0;
     let mut visited = HashSet::new();
     let mut state = current_state.to_string();
     let mut advanced = false;
@@ -1074,34 +1124,55 @@ where
             &workflow_variables,
         ) {
             TransitionResolution::Resolved(target) => {
-                // Check for cycle before transitioning
-                if visited.contains(&target) {
-                    return Ok(AdvanceResult {
-                        final_state: state,
-                        advanced,
-                        stop_reason: StopReason::CycleDetected { state: target },
-                    });
+                if let Some(stop) = take_transition(
+                    append_event,
+                    &mut state,
+                    target,
+                    &mut visited,
+                    &mut advanced,
+                    &mut transition_count,
+                    &mut current_evidence,
+                    &mut fresh_evidence,
+                )? {
+                    return Ok(stop);
                 }
-
-                // Append transitioned event
-                let payload = EventPayload::Transitioned {
-                    from: Some(state.clone()),
-                    to: target.clone(),
-                    condition_type: "auto".to_string(),
-                    skip_if_matched: None,
-                };
-                append_event(&payload).map_err(AdvanceError::PersistenceError)?;
-
-                visited.insert(target.clone());
-                state = target;
-                advanced = true;
-                transition_count += 1;
-                // Fresh epoch: auto-advanced states have no evidence
-                current_evidence = BTreeMap::new();
-                fresh_evidence = false;
             }
             TransitionResolution::NeedsEvidence => {
                 if template_state.accepts.is_some() {
+                    // The state would stop for evidence here. Offer it to
+                    // the decider first, when one was supplied.
+                    if let Some(port) = decider.as_deref_mut() {
+                        let ctx = StopContext {
+                            state: &state,
+                            template,
+                            template_state,
+                            agent_evidence: &current_evidence,
+                            gates_failed,
+                            evidence_value: &evidence_value,
+                            variables: &workflow_variables,
+                            visited: &visited,
+                        };
+                        if let StopOutcome::Apply { target, guard } =
+                            consult_at_stop(port, &ctx, &mut consultations, append_event)?
+                        {
+                            let stop = take_transition(
+                                append_event,
+                                &mut state,
+                                target,
+                                &mut visited,
+                                &mut advanced,
+                                &mut transition_count,
+                                &mut current_evidence,
+                                &mut fresh_evidence,
+                            );
+                            // Released only after the transition is durable.
+                            drop(guard);
+                            if let Some(stop) = stop? {
+                                return Ok(stop);
+                            }
+                            continue;
+                        }
+                    }
                     return Ok(AdvanceResult {
                         final_state: state,
                         advanced,
@@ -1138,6 +1209,54 @@ where
             }
         }
     }
+}
+
+/// Take an `auto` transition from `state` to `target`: the bookkeeping the
+/// `Resolved` arm and an applied decider answer share.
+///
+/// Refuses a target already visited in this call (returns the
+/// `CycleDetected` stop, before writing anything), appends the
+/// `transitioned` event with `condition_type: "auto"`, records the visit,
+/// counts the transition, and starts the next state with no evidence.
+#[allow(clippy::too_many_arguments)]
+fn take_transition<F>(
+    append_event: &mut F,
+    state: &mut String,
+    target: String,
+    visited: &mut HashSet<String>,
+    advanced: &mut bool,
+    transition_count: &mut usize,
+    current_evidence: &mut BTreeMap<String, serde_json::Value>,
+    fresh_evidence: &mut bool,
+) -> Result<Option<AdvanceResult>, AdvanceError>
+where
+    F: FnMut(&EventPayload) -> Result<(), String>,
+{
+    // Check for cycle before transitioning.
+    if visited.contains(&target) {
+        return Ok(Some(AdvanceResult {
+            final_state: state.clone(),
+            advanced: *advanced,
+            stop_reason: StopReason::CycleDetected { state: target },
+        }));
+    }
+
+    let payload = EventPayload::Transitioned {
+        from: Some(state.clone()),
+        to: target.clone(),
+        condition_type: "auto".to_string(),
+        skip_if_matched: None,
+    };
+    append_event(&payload).map_err(AdvanceError::PersistenceError)?;
+
+    visited.insert(target.clone());
+    *state = target;
+    *advanced = true;
+    *transition_count += 1;
+    // Fresh epoch: auto-advanced states have no evidence.
+    *current_evidence = BTreeMap::new();
+    *fresh_evidence = false;
+    Ok(None)
 }
 
 /// Traverse a nested `serde_json::Value` using a dot-separated path.
@@ -1243,53 +1362,14 @@ pub fn resolve_transition(
         return TransitionResolution::NoTransitions;
     }
 
-    let mut conditional_matches: Vec<String> = Vec::new();
-    let mut unconditional_target: Option<String> = None;
-    let mut has_conditional = false;
-
-    let evidence_prefix = format!("{}.", EVIDENCE_NAMESPACE);
-    let vars_prefix = format!("{}.", VARS_NAMESPACE);
-    for transition in &template_state.transitions {
-        match &transition.when {
-            Some(conditions) => {
-                has_conditional = true;
-                let all_match = conditions.iter().all(|(field, expected)| {
-                    // Issue #11: `evidence.<field>: present` matches when the
-                    // agent-submitted evidence map contains `<field>` as a
-                    // top-level key. The resolver's evidence map is built from
-                    // the events since the last Transitioned event, so this
-                    // reflects "any event since the last state transition".
-                    if is_present_matcher(expected) && field.starts_with(&evidence_prefix) {
-                        let inner = &field[evidence_prefix.len()..];
-                        return !inner.is_empty()
-                            && evidence
-                                .as_object()
-                                .is_some_and(|obj| obj.contains_key(inner));
-                    }
-                    // Issue #141: `vars.<name>: {is_set: bool}` checks whether
-                    // a template variable was provided at init time with a
-                    // non-empty value.
-                    if field.starts_with(&vars_prefix) {
-                        if let Some(expected_set) = is_is_set_matcher(expected) {
-                            let var_name = &field[vars_prefix.len()..];
-                            let is_set = variables
-                                .get(var_name)
-                                .map(|v| !v.is_empty())
-                                .unwrap_or(false);
-                            return is_set == expected_set;
-                        }
-                    }
-                    resolve_value(evidence, field) == Some(expected)
-                });
-                if all_match {
-                    conditional_matches.push(transition.target.clone());
-                }
-            }
-            None => {
-                unconditional_target = Some(transition.target.clone());
-            }
-        }
-    }
+    let conditional_matches = conditional_matches(template_state, evidence, variables);
+    let has_conditional = template_state.transitions.iter().any(|t| t.when.is_some());
+    let unconditional_target: Option<String> = template_state
+        .transitions
+        .iter()
+        .filter(|t| t.when.is_none())
+        .map(|t| t.target.clone())
+        .next_back();
 
     match conditional_matches.len() {
         1 => TransitionResolution::Resolved(conditional_matches.into_iter().next().unwrap()),
@@ -1318,6 +1398,72 @@ pub fn resolve_transition(
             }
         }
     }
+}
+
+/// Targets of every conditional transition (one with a `when`) whose
+/// conditions all match `evidence` and `variables`, in declaration order.
+///
+/// The unconditional fallback is never included, which is the point:
+/// [`resolve_transition`] returns `Resolved` for a fallback too, so a
+/// caller that needs to know whether evidence itself picked a route (the
+/// decider arm) asks here instead.
+pub fn conditional_matches(
+    template_state: &TemplateState,
+    evidence: &serde_json::Value,
+    variables: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    conditional_match_indices(template_state, evidence, variables)
+        .into_iter()
+        .map(|i| template_state.transitions[i].target.clone())
+        .collect()
+}
+
+/// [`conditional_matches`] as indices into `template_state.transitions`, so
+/// a caller can inspect the matched transition itself.
+pub(crate) fn conditional_match_indices(
+    template_state: &TemplateState,
+    evidence: &serde_json::Value,
+    variables: &std::collections::HashMap<String, String>,
+) -> Vec<usize> {
+    let mut matches: Vec<usize> = Vec::new();
+    let evidence_prefix = format!("{}.", EVIDENCE_NAMESPACE);
+    let vars_prefix = format!("{}.", VARS_NAMESPACE);
+    for (index, transition) in template_state.transitions.iter().enumerate() {
+        if let Some(conditions) = &transition.when {
+            let all_match = conditions.iter().all(|(field, expected)| {
+                // Issue #11: `evidence.<field>: present` matches when the
+                // agent-submitted evidence map contains `<field>` as a
+                // top-level key. The resolver's evidence map is built from
+                // the events since the last Transitioned event, so this
+                // reflects "any event since the last state transition".
+                if is_present_matcher(expected) && field.starts_with(&evidence_prefix) {
+                    let inner = &field[evidence_prefix.len()..];
+                    return !inner.is_empty()
+                        && evidence
+                            .as_object()
+                            .is_some_and(|obj| obj.contains_key(inner));
+                }
+                // Issue #141: `vars.<name>: {is_set: bool}` checks whether
+                // a template variable was provided at init time with a
+                // non-empty value.
+                if field.starts_with(&vars_prefix) {
+                    if let Some(expected_set) = is_is_set_matcher(expected) {
+                        let var_name = &field[vars_prefix.len()..];
+                        let is_set = variables
+                            .get(var_name)
+                            .map(|v| !v.is_empty())
+                            .unwrap_or(false);
+                        return is_set == expected_set;
+                    }
+                }
+                resolve_value(evidence, field) == Some(expected)
+            });
+            if all_match {
+                matches.push(index);
+            }
+        }
+    }
+    matches
 }
 
 /// Merge evidence from the current epoch's `evidence_submitted` events.
@@ -1390,6 +1536,7 @@ mod tests {
                     required: true,
                     values: vec![],
                     description: String::new(),
+                    decider: None,
                 },
             );
         }
@@ -1450,6 +1597,31 @@ mod tests {
         assert_eq!(
             resolve_transition(&state, &evidence, false, true, &HashMap::new()),
             TransitionResolution::Resolved("next".to_string())
+        );
+    }
+
+    #[test]
+    fn conditional_matches_excludes_the_unconditional_fallback() {
+        let state = make_state(vec![
+            conditional("approved", vec![("decision", serde_json::json!("approve"))]),
+            unconditional("fallback"),
+        ]);
+        let mut m = BTreeMap::new();
+        m.insert("decision".to_string(), serde_json::json!("reject"));
+        let evidence = as_evidence(m);
+        // resolve_transition takes the fallback...
+        assert_eq!(
+            resolve_transition(&state, &evidence, false, true, &HashMap::new()),
+            TransitionResolution::Resolved("fallback".to_string())
+        );
+        // ...but no conditional transition matched.
+        assert!(conditional_matches(&state, &evidence, &HashMap::new()).is_empty());
+
+        let mut m = BTreeMap::new();
+        m.insert("decision".to_string(), serde_json::json!("approve"));
+        assert_eq!(
+            conditional_matches(&state, &as_evidence(m), &HashMap::new()),
+            vec!["approved".to_string()]
         );
     }
 
@@ -1899,6 +2071,7 @@ mod tests {
                         m
                     },
                     submitter_cwd: None,
+                    source: None,
                 },
                 idempotency_hash: None,
             },
@@ -1914,6 +2087,7 @@ mod tests {
                         m
                     },
                     submitter_cwd: None,
+                    source: None,
                 },
                 idempotency_hash: None,
             },
@@ -1938,6 +2112,7 @@ mod tests {
                         m
                     },
                     submitter_cwd: None,
+                    source: None,
                 },
                 idempotency_hash: None,
             },
@@ -1953,6 +2128,7 @@ mod tests {
                         m
                     },
                     submitter_cwd: None,
+                    source: None,
                 },
                 idempotency_hash: None,
             },
@@ -2136,7 +2312,7 @@ mod tests {
 
         let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {
@@ -2314,7 +2490,7 @@ mod tests {
 
         let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {
@@ -2451,7 +2627,7 @@ mod tests {
         // Gate evaluator returns passing gate with exit_code 0.
         let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {
@@ -2574,7 +2750,7 @@ mod tests {
         // Gate evaluator returns a failing gate with exit_code 1.
         let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {
@@ -2682,7 +2858,7 @@ mod tests {
 
         let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {
@@ -2782,7 +2958,7 @@ mod tests {
         // Passing gate: outcome Passed -- any_failed should be false.
         let passing_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {
@@ -2816,7 +2992,7 @@ mod tests {
         // Failing gate: outcome Failed -- any_failed should be true.
         let failing_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {
@@ -2853,7 +3029,7 @@ mod tests {
         // TimedOut gate: outcome TimedOut also contributes to any_failed.
         let timeout_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {
@@ -2887,7 +3063,7 @@ mod tests {
         // Error gate: outcome Error also contributes to any_failed.
         let error_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {
@@ -4066,7 +4242,7 @@ mod tests {
 
         let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {
@@ -4451,7 +4627,7 @@ mod tests {
         // Only "lint" gate is evaluated; "ci" is overridden.
         let gate_eval = |gates: &BTreeMap<String, Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 if name == "lint" {
                     results.insert(
                         name.clone(),
@@ -4597,7 +4773,7 @@ mod tests {
 
         let gate_eval = |gates: &BTreeMap<String, Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {
@@ -4705,7 +4881,7 @@ mod tests {
         // evaluate_gates would make the gate fail if called, but it shouldn't be.
         let gate_eval = |gates: &BTreeMap<String, Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {
@@ -4818,7 +4994,7 @@ mod tests {
         // Gate evaluator returns an Error outcome for the unknown type.
         let gate_eval = |gates: &BTreeMap<String, Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {
@@ -4917,7 +5093,7 @@ mod tests {
         // Gate always passes.
         let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {
@@ -5006,7 +5182,7 @@ mod tests {
         // Gate always passes with structured output.
         let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
             let mut results = BTreeMap::new();
-            for (name, _) in gates {
+            for name in gates.keys() {
                 results.insert(
                     name.clone(),
                     StructuredGateResult {

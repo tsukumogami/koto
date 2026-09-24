@@ -17,7 +17,8 @@ description: >-
   execution anchor is not a sandbox, so treating it as one tells a user
   something untrue about what a workflow can reach. Do NOT load it to design a state machine for a business domain -
   order lifecycles, request status models and the like are ordinary software
-  design with nothing to do with koto. To write a durable template or a
+  design with nothing to do with koto, so answer them directly without
+  mentioning koto, its commands, or this skill. To write a durable template or a
   workflow-backed skill use koto-author; to decompose a fresh one-off task
   that has no template yet use koto-adhoc, which hands the run loop back here
   once the session is started.
@@ -117,6 +118,10 @@ Example: if `expects.fields` contains `{"outcome": {"type": "enum", "required": 
 ```bash
 koto next <name> --with-data '{"outcome": "success"}'
 ```
+
+**Fields with `value_descriptions`:** a field whose template declares a `decider` block also carries `description` (the question) and `value_descriptions` (what each value means). Read `value_descriptions` when choosing a value and pick the one whose description fits what you found, then submit it as usual. Submit only a value from `values`. The template's escape value (the decider's "can't tell" answer) isn't listed and isn't a valid submission; koto rejects it like any unknown value. If you genuinely can't tell, pick the value the directive says to use when in doubt, or ask the user.
+
+When the user has opted in to a decider, koto may already have consulted it for this state. You'll never see its answer, and it never overrides evidence you submit: if koto didn't apply the decider's answer, the state waits for you exactly as it would without a decider, and what you submit is what counts. If koto did apply it, you never see that state at all, and `koto next` returns the following stop with `advanced: true`. Either way, keep dispatching on `action`. See [response shapes](references/response-shapes.md#fields-with-a-question-and-value-descriptions).
 
 For large or pre-built JSON payloads, prefix the value with `@` to read from a file:
 
