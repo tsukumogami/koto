@@ -374,6 +374,7 @@ mod tests {
             override_default: None,
             completion: None,
             name_filter: None,
+            overridable: true,
         }
     }
 
@@ -648,6 +649,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -674,6 +676,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -698,6 +701,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -728,6 +732,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -759,6 +764,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -785,6 +791,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -808,6 +815,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -834,6 +842,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -1027,6 +1036,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         gates.insert(
@@ -1040,6 +1050,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         gates.insert(
@@ -1053,6 +1064,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 

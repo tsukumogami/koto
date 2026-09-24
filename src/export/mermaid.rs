@@ -319,6 +319,7 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let output = to_mermaid(&t);
@@ -357,6 +358,7 @@ mod tests {
                             override_default: None,
                             completion: None,
                             name_filter: None,
+                            overridable: true,
                         },
                     );
                     g

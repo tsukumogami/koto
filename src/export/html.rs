@@ -88,6 +88,7 @@ mod tests {
                             override_default: None,
                             completion: None,
                             name_filter: None,
+                            overridable: true,
                         },
                     );
                     g

@@ -526,6 +526,42 @@ The resolved values are recorded on the transition's own event in the session lo
 
 A command gate's output is only `exit_code` and `error`, so a gate path can't carry what a script printed. To get a script's output into context, have a `default_action` run `koto context add`.
 
+### Gates that refuse overrides
+
+By default an agent can force any gate with `koto overrides record`, which logs a rationale and substitutes the gate's output (from `--with-data`, the gate's `override_default`, or the gate type's built-in default) for the next `koto next`. That is the right escape hatch for most gates: a flaky check, a condition a human confirmed by hand.
+
+Some gates shouldn't have one. Declare `overridable: false` on a gate whose output decides something nothing downstream re-checks: whether to merge, whether a run counts as done, which report a parent receives. It works on every gate type:
+
+```yaml
+states:
+  merge_decide:
+    default_action:
+      command: "./merge-verdict.sh"   # writes merge.verdict to context
+    gates:
+      verdict:
+        type: context-matches
+        key: merge.verdict
+        pattern: "^ready$"
+        overridable: false
+    transitions:
+      - target: merge
+        when:
+          gates.verdict.matches: true
+      - target: wait
+        when:
+          gates.verdict.matches: false
+```
+
+With the flag set:
+
+- `koto overrides record` on the gate exits 2 with the typed code `gate_not_overridable`, whatever `--with-data` holds, and appends nothing to the state log.
+- The gate reports `agent_actionable: false` in `blocking_conditions`, so an agent reading the response isn't told to override it.
+- If the log already holds an override for the gate (written by an older koto, or by hand), `koto next` ignores it and evaluates the gate for real.
+
+A good rule: a gate that routes on a context key your own `default_action` script wrote should be `overridable: false`, because otherwise an override lets the agent supply the value the script exists to produce. Leave gates that only guard against a transient failure overridable, so a stuck run has a logged way forward.
+
+The compiler holds you to the declaration. `overridable` accepts only `true` or `false` (`"no"` is an error), `override_default` on a gate with `overridable: false` is an error because nothing could ever apply it, and an unknown key on a gate, such as the misspelling `overrideable`, fails `koto template compile` with an error naming the state, the gate, and the key.
+
 ### Updating your SKILL.md
 
 When your template uses content-aware gates, update the SKILL.md to instruct the agent to submit content through `koto context add` rather than writing files to `{{SESSION_DIR}}`. The evidence keys section should document the expected content keys and their purpose.

@@ -332,7 +332,8 @@ The state has a failed gate that is not actionable. The agent cannot override it
 
 **Decision points:**
 - `agent_actionable: false` — the gate has no `override_default` and no built-in default
-  for its type. The agent cannot call `koto overrides record` to resolve this.
+  for its type, or the template declares it `overridable: false`. The agent cannot call
+  `koto overrides record` to resolve this.
 - The right action is to report the blocking condition to the user. The directive text
   typically explains what external action is required.
 - Do not retry `koto next` in a loop — the condition is externally controlled and will

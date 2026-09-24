@@ -1,0 +1,27 @@
+{
+  "format_version": 1,
+  "name": "context-gate",
+  "version": "1.0",
+  "description": "Demonstrates context-exists gate with structured output in blocking_conditions",
+  "initial_state": "check",
+  "states": {
+    "check": {
+      "directive": "Check that required_key exists in the context. Gate blocks if the key is absent.",
+      "transitions": [
+        {
+          "target": "done"
+        }
+      ],
+      "gates": {
+        "ctx_check": {
+          "type": "context-exists",
+          "key": "required_key"
+        }
+      }
+    },
+    "done": {
+      "directive": "Context gate workflow complete.",
+      "terminal": true
+    }
+  }
+}

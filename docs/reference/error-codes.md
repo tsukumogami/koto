@@ -251,6 +251,29 @@ field. Exits 0 and 1 print nothing; only this case produces a body.
 
 ---
 
+### overrides record
+
+Most `overrides record` errors use the flat format: an unknown gate, invalid
+`--with-data` JSON, a payload over the size limit, or a gate with no default to
+apply. One condition carries a typed code.
+
+**`gate_not_overridable` (exit code 2)** -- the gate is declared
+`overridable: false` in the template, so no override can force it. The refusal
+comes before `--with-data` is read or parsed, so it is the same with no payload,
+an inline payload, an `@file.json` payload, or one that wouldn't parse. Nothing is
+appended to the state log:
+
+```json
+{"error":{"code":"gate_not_overridable","message":"gate 'merge_route' in state 'merge_decide' is declared overridable: false and cannot be overridden; satisfy the gate itself, then run koto next","gate":"merge_route","state":"merge_decide"},"command":"overrides record"}
+```
+
+Satisfy the gate's real condition and call `koto next`; the gate is evaluated
+for real on every tick. The same gate reports `agent_actionable: false` in
+`blocking_conditions`. An override for such a gate that is already in the log
+(written by an older koto, or by hand) is ignored at evaluation time.
+
+---
+
 ### template compile
 
 **Compilation failed** — invalid YAML, missing required fields, or unknown gate type:

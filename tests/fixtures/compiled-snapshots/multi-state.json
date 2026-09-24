@@ -1,0 +1,81 @@
+{
+  "format_version": 1,
+  "name": "multi-state",
+  "version": "1.0",
+  "description": "Tests full workflow pattern with multiple states",
+  "initial_state": "entry",
+  "states": {
+    "done": {
+      "directive": "Multi-state workflow complete.",
+      "terminal": true
+    },
+    "entry": {
+      "directive": "Choose a route: setup or work.",
+      "transitions": [
+        {
+          "target": "setup",
+          "when": {
+            "route": "setup"
+          }
+        },
+        {
+          "target": "work",
+          "when": {
+            "route": "work"
+          }
+        }
+      ],
+      "accepts": {
+        "route": {
+          "field_type": "enum",
+          "required": true,
+          "values": [
+            "setup",
+            "work"
+          ]
+        }
+      }
+    },
+    "setup": {
+      "directive": "Verify configuration exists. Gate checks for wip/config.txt.",
+      "transitions": [
+        {
+          "target": "work"
+        }
+      ],
+      "gates": {
+        "config_exists": {
+          "type": "command",
+          "command": "test -f wip/config.txt"
+        }
+      },
+      "accepts": {
+        "status": {
+          "field_type": "enum",
+          "required": true,
+          "values": [
+            "completed",
+            "override"
+          ]
+        }
+      }
+    },
+    "work": {
+      "directive": "Do the main work.",
+      "transitions": [
+        {
+          "target": "done"
+        }
+      ],
+      "accepts": {
+        "status": {
+          "field_type": "enum",
+          "required": true,
+          "values": [
+            "completed"
+          ]
+        }
+      }
+    }
+  }
+}

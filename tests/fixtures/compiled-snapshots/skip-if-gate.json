@@ -1,0 +1,30 @@
+{
+  "format_version": 1,
+  "name": "skip-if-gate",
+  "version": "1.0",
+  "description": "Gate-backed skip_if fires when context-exists gate passes",
+  "initial_state": "check",
+  "states": {
+    "check": {
+      "directive": "Gate checks for ctx_flag in the context store. When it exists, skip_if fires\nand the state auto-advances to done.",
+      "transitions": [
+        {
+          "target": "done"
+        }
+      ],
+      "gates": {
+        "ctx_check": {
+          "type": "context-exists",
+          "key": "ctx_flag"
+        }
+      },
+      "skip_if": {
+        "gates.ctx_check.exists": true
+      }
+    },
+    "done": {
+      "directive": "Terminal state.",
+      "terminal": true
+    }
+  }
+}

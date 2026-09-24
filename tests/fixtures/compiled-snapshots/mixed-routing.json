@@ -1,0 +1,58 @@
+{
+  "format_version": 1,
+  "name": "mixed-routing",
+  "version": "1.0",
+  "description": "Routes based on both gates.* output and agent evidence in the same when clause",
+  "initial_state": "check",
+  "states": {
+    "approved": {
+      "directive": "Lint passed and decision approved.",
+      "terminal": true
+    },
+    "check": {
+      "directive": "Run lint gate and wait for agent decision. Both must match for the approved route.",
+      "transitions": [
+        {
+          "target": "approved",
+          "when": {
+            "decision": "approve",
+            "gates.lint.exit_code": 0
+          }
+        },
+        {
+          "target": "rejected",
+          "when": {
+            "decision": "reject"
+          }
+        },
+        {
+          "target": "done"
+        }
+      ],
+      "gates": {
+        "lint": {
+          "type": "command",
+          "command": "exit 0"
+        }
+      },
+      "accepts": {
+        "decision": {
+          "field_type": "enum",
+          "required": true,
+          "values": [
+            "approve",
+            "reject"
+          ]
+        }
+      }
+    },
+    "done": {
+      "directive": "Fallback complete.",
+      "terminal": true
+    },
+    "rejected": {
+      "directive": "Decision rejected.",
+      "terminal": true
+    }
+  }
+}

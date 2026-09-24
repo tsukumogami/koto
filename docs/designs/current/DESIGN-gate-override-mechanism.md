@@ -783,6 +783,27 @@ the current state. A rewind starts a new epoch, making prior overrides invisible
 `derive_overrides`. A previous visit to the same state can't leak overrides into the current
 visit because both the epoch boundary and the `state` field filter must match.
 
+### Gates that opt out of overrides
+
+**Amendment: a gate can refuse overrides.** This design made every gate overridable, which
+means one `koto overrides record` on a gate can drive any `when` arm that gate routes, including
+arms nothing downstream re-checks. A gate can now declare `overridable: false` (a boolean,
+default `true`; omitted from the compiled JSON when `true`, so existing templates and their
+hashes are unchanged). For such a gate:
+
+- `koto overrides record` exits 2 with the typed code `gate_not_overridable` and appends
+  nothing. The check runs before `--with-data` is resolved or parsed, so no payload, valid or
+  not, changes the outcome.
+- The advance loop ignores any `GateOverrideRecorded` event for the gate that is already in the
+  log (written by an older koto, or by hand) and evaluates the gate through `evaluate_gates`,
+  emitting `GateEvaluated` as for any other gate.
+- `blocking_conditions` reports the gate with `agent_actionable: false`.
+
+The compiler rejects `override_default` on a non-overridable gate, since nothing could ever
+apply it, and rejects unknown keys on a gate so that a misspelled `overrideable: false` can't
+compile and silently leave the gate overridable. Every other gate keeps the behavior described
+above, with its overrides logged as before.
+
 ## Consequences
 
 ### Positive

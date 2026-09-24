@@ -570,7 +570,28 @@ koto overrides list <session-name>
 
 `--rationale` is required. `--with-data` is optional. The override is epoch-scoped -- it applies until the next state transition and is then superseded. The override is recorded in the session event log and appears in `koto overrides list` output even after a rewind.
 
-In `koto next` responses, `blocking_conditions[].agent_actionable` is `true` for all four built-in gate types, signaling that `koto overrides record` is available.
+In `koto next` responses, `blocking_conditions[].agent_actionable` is `true` for all four built-in gate types, signaling that `koto overrides record` is available -- unless the gate is declared `overridable: false`.
+
+### `overridable: false` on gate declarations
+
+Declare `overridable: false` on a gate that must never be forced: one whose output decides progress, a merge, or a report that nothing downstream re-checks. The rule of thumb: a gate that routes on a context key your own `default_action` script wrote should be non-overridable, or an override lets the agent supply the value the script exists to produce. It works on every gate type.
+
+```yaml
+gates:
+  verdict:
+    type: context-matches
+    key: merge.verdict
+    pattern: "^ready$"
+    overridable: false
+```
+
+For such a gate, `koto overrides record` exits 2 with the typed code `gate_not_overridable` whatever `--with-data` holds, and appends nothing; `blocking_conditions[].agent_actionable` is `false`; and `koto next` ignores any override already in the log for it and evaluates the gate for real.
+
+The field defaults to `true` and is omitted from the compiled JSON when `true`. Compile errors:
+
+- `overridable` that isn't a YAML boolean (`overridable: "no"`, `overridable: no`).
+- `override_default` on a gate with `overridable: false` -- no override could ever apply it.
+- Any unknown key on a gate (for example the misspelling `overrideable`), named with its state and gate.
 
 ### Combining gates and evidence routing
 

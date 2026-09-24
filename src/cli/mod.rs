@@ -7692,6 +7692,7 @@ Done.
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let substituted =
@@ -7754,6 +7755,7 @@ Done.
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -7822,6 +7824,7 @@ Done.
             // staleness check cannot catch that -- it only walks fields the
             // accessor names.
             name_filter: Some("{{TOKEN}}.research.".to_string()),
+            overridable: true,
         };
         for (field, raw) in authored.substitutable_fields() {
             assert!(
@@ -7981,6 +7984,7 @@ Done.
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
 
@@ -8056,6 +8060,7 @@ Done.
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
             },
         );
         let expected_command = {
