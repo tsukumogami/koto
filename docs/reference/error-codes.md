@@ -46,6 +46,24 @@ Run `koto template compile <path>` to see the full compilation error.
 
 The `error` text for duplicate and unknown keys, and for an allowlist failure, is unchanged from earlier releases. A malformed `--var` (no `=`, or an empty key) and a missing required variable are also exit 2, with no `code`.
 
+**Entry-flag refusals** — `--vars-file`, `--attach-live`, `--replace-terminal` and `--koto-leg` (see the [CLI usage guide](../guides/cli-usage.md#entry-flags)) add these codes, all exit 2 and all with nothing written:
+
+| Code | Meaning | Extra fields |
+|------|---------|--------------|
+| `invalid_usage` | An unusable flag combination (`--vars-file` with `--var`; an entry flag with `--from-stdin` or `--parent`) or a malformed `--koto-leg`. | |
+| `invalid_vars_file` | The vars file is missing, a symlink, not a regular file, over 64 KiB, or not a JSON list of string pairs. | |
+| `session_live` | `--replace-terminal` without `--attach-live` found a running session. | `state` |
+| `session_terminal` | `--attach-live` without `--replace-terminal` found a finished session. | `state` |
+| `template_mismatch` | `--attach-live` found a session built from another template file. | `recorded`, `requested` |
+| `origin_mismatch` | `--attach-live` found a session from another worktree or session store, or one with no origin record. | `recorded`, `requested` |
+| `var_mismatch` | An explicitly passed non-`rebind` variable differs from the session's recorded value. | `var`, `recorded`, `requested` |
+
+Under `--koto-leg`, the leg checks `koto request attach` makes refuse with the same codes as that verb (`request_closed`, `leg_abandoned`, `input_mismatch`, and the rest in [Request errors](#request-errors)), in this flat `init` envelope with an optional `details` list; a lost bind race can also end in `lock_contention` (exit 1). On the entry-flag path a template that doesn't resolve or compile carries its kind as a code too (`template_not_found`, `template_compile_failed`, exit 1).
+
+```json
+{"error":"variable \"INTENT_FLAG\" is fixed for this session: recorded \"stop\", requested \"continue\"","command":"init","code":"var_mismatch","var":"INTENT_FLAG","recorded":"stop","requested":"continue"}
+```
+
 ---
 
 ### next

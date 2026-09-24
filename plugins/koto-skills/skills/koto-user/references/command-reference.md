@@ -47,6 +47,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 ```
 koto init <name> --template <path> [--parent <parent-name>] [--var KEY=VALUE ...] [--execution-dir <path>]
 koto init <name> --from-stdin [--var KEY=VALUE ...] [--execution-dir <path>]
+koto init <name> --template <path> --vars-file <file> [--attach-live] [--replace-terminal] [--koto-leg <request-id>:<leg>]
 ```
 
 Initializes a new workflow. Provide the definition one of two ways:
@@ -62,6 +63,12 @@ Initializes a new workflow. Provide the definition one of two ways:
 | `--parent <parent-name>` | No | Link this workflow as a child of an existing parent workflow. Fails if the parent doesn't exist. Not available with `--from-stdin`. |
 | `--var KEY=VALUE` | No | Set a template variable. Repeatable. Required variables must be supplied; unknown keys are rejected. VALUE is checked against an allowlist (see Notes). |
 | `--execution-dir <path>` | No | Bind the session's execution anchor to this directory instead of the one `koto init` ran in. Canonicalized at init time; a path that doesn't resolve is an error. |
+| `--vars-file <file>` | No | Read variables from a JSON list of `["KEY", "VALUE"]` string pairs (regular file, not a symlink, at most 64 KiB). A repeated key is refused as `duplicate_var`. Variables are validated before the name is looked up. Can't be combined with `--var`; a bad file is `invalid_vars_file`. |
+| `--replace-terminal` | No | If a finished session (terminal or cancelled) has the name, remove it and start fresh; the output carries `replaced_result`. A running session is refused with `session_live`. |
+| `--attach-live` | No | If a running session has the name, attach to it when its template file name, origin record (anchor and session store) and every explicitly passed non-`rebind` variable match (`template_mismatch`, `origin_mismatch`, `var_mismatch` otherwise), then re-apply its `rebind: true` variables. A finished session is refused with `session_terminal` unless `--replace-terminal` is also given. |
+| `--koto-leg <request-id>:<leg>` | No | Attach the resulting session to a request leg in the same call, with every `koto request attach` check. Any refusal is recorded on an open, unbound leg as `result_source: refused`. |
+
+**Entry flags.** With `--vars-file` or any entry flag, the output adds `"outcome": "created" | "attached" | "replaced"` (plus `rebound` on an attach, `replaced_state`/`replaced_result` on a replace, and `leg` under `--koto-leg`). Every check runs before any write, so a refusal changes nothing, and rebind variables are re-applied only after the leg bind succeeds. Without `--attach-live`/`--replace-terminal` an existing name is still "already exists" (exit 1). The entry flags are rejected with `--from-stdin` and `--parent`. Branch on `code`, never on the message.
 
 **Success output:**
 ```json

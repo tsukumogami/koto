@@ -317,6 +317,23 @@ If the session is interrupted mid-workflow:
 
 The koto-skills plugin includes a Stop hook that reminds the agent about active workflows when a session ends.
 
+#### Entering the same session on every invocation
+
+A skill whose session has a stable name (`scope-<topic>`, say) can skip the read-then-decide dance by letting koto decide in one call:
+
+    koto init scope-<topic> --template <path>/scope.md --vars-file <file> --attach-live --replace-terminal
+
+Write the variables to `<file>` as a JSON list of `["KEY", "VALUE"]` pairs (with `jq`, never by string concatenation) and branch on the four outcomes:
+
+- `"outcome": "created"`: no session had the name, and koto made one.
+- `"outcome": "attached"`: a running session had it. koto checked that it was built from a template file of the same name, that its origin record (the directory it runs in and the session store holding it) matches this invocation's, and that every non-`rebind` variable you passed equals its recorded value. Your `rebind: true` variables were re-applied from this call, and `rebound` lists what changed.
+- `"outcome": "replaced"`: a finished session had it. koto removed it and started a fresh one; `replaced_result` holds the old session's result, which the skill may report.
+- A refusal: a non-zero exit (2 for everything the caller can fix) and a typed `code`. The ones a skill usually renders are `invalid_var`, `duplicate_var` and `unknown_var` (a bad argument, before any session exists), `var_mismatch` (a running session was started with a different fixed value; `var`, `recorded` and `requested` say which), `template_mismatch` (the running session was built from another template), and `origin_mismatch` (a session with this name belongs to another worktree or store, or predates origin records). A refusal changes nothing.
+
+Every new session records its origin record, so `origin_mismatch` is how a skill learns that the name is taken elsewhere on the machine; nothing else prints the record. Sessions started by a koto release older than the record have none and are refused at `--attach-live` until they finish or are removed with `koto session cleanup <name>`.
+
+When the run answers a request leg, add `--koto-leg <request-id>:<leg>`. koto attaches the session to the leg in the same step, with every check `koto request attach` makes, and all of them run before the session is created, replaced or rebound, so a stale invocation naming a leg it no longer owns can't change a rebind variable. Any refusal, argument errors included, is recorded on the leg as `result_source: refused` with a payload `{"outcome": "refused", "reason", "var", "recorded", "requested"}` whenever the leg is still open and unbound, so whoever waits on the leg reads the refusal instead of waiting. `reason` is `invalid-var:<V>`, `duplicate-var:<V>`, `unknown-var:<V>`, `var-mismatch:<V>`, `template-mismatch`, `origin-mismatch`, or another refusal's code in kebab case. The [CLI usage guide](cli-usage.md#entry-flags) has the full contract.
+
 ## Placing your skill
 
 There are two ways to deploy a skill, depending on who needs it.

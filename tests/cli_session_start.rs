@@ -32,6 +32,7 @@ fn init_parent_backend(dir: &std::path::Path, parent: &str) -> LocalBackend {
         parent_workflow: None,
         template_source_dir: None,
         template_source_file: None,
+        origin: None,
         execution_dir: None,
         session_id: "parent-session-uuid".to_string(),
         intent: None,

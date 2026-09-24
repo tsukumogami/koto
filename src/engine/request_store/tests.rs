@@ -1767,6 +1767,36 @@ fn a_root_attach_records_self_and_the_template_identity() {
 }
 
 #[test]
+fn precheck_attach_agrees_with_attach_and_writes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed_scope(root);
+    let before = log_bytes(root, &id);
+
+    // Admitted, not yet bound: `false`, and nothing written.
+    let ok = attach_req(root_session("scope-t1", "scope.md"));
+    assert!(!precheck_attach(root, &id, &ok).expect("admitted"));
+    // Refused the way attach refuses it.
+    let err = precheck_attach(root, &id, &attach_req(root_session("s", "other.md"))).unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::TemplateMismatch { .. }),
+        "{err}"
+    );
+    assert_eq!(log_bytes(root, &id), before);
+
+    // Once bound to this session: `true`, a no-op attach.
+    attach_leg(root, &id, &ok).expect("attach");
+    assert!(precheck_attach(root, &id, &ok).expect("already bound"));
+    // Bound to another session: refused.
+    let err =
+        precheck_attach(root, &id, &attach_req(root_session("other", "scope.md"))).unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::LegBoundToDifferentChild { .. }),
+        "{err}"
+    );
+}
+
+#[test]
 fn attach_refusals_are_typed_and_write_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();

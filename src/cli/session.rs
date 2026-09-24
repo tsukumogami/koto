@@ -312,6 +312,7 @@ pub fn handle_start(
         parent_workflow: Some(validated_parent.as_str().to_string()),
         template_source_dir: None,
         template_source_file: None,
+        origin: None,
         execution_dir: None,
         session_id: generate_session_id(),
         intent: None,
@@ -580,6 +581,13 @@ pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>)
     let state_path = backend.session_dir(name).join(state_file_name(name));
     let recorded = target.clone();
     rewrite_header_atomically(&state_path, |mut h| {
+        // The origin record moves with an explicit, audited rebind, so
+        // `koto init --attach-live` from the new checkout still finds
+        // its own session. A session with no origin record gets none:
+        // nothing backfills one.
+        if let Some(origin) = h.origin.as_mut() {
+            origin.anchor = recorded.clone();
+        }
         h.execution_dir = Some(recorded);
         h
     })?;
