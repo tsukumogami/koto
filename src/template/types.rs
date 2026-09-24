@@ -66,7 +66,12 @@ pub struct CompiledTemplate {
 }
 
 /// A variable declaration in a compiled template.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// `values`, `pattern`, and `rebind` are skipped when unset, so a template
+/// that declares none of them compiles to the same JSON (and so the same
+/// template hash) as it did before they existed. The constraint checks live
+/// in `src/template/variables.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct VariableDecl {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
@@ -74,6 +79,17 @@ pub struct VariableDecl {
     pub required: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub default: String,
+    /// Closed set of accepted values. Mutually exclusive with `pattern`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+    /// Regular expression (`regex` crate syntax) a value must match in full;
+    /// applied as `^(?:<pattern>)$`. Mutually exclusive with `values`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pattern: String,
+    /// Whether the variable is re-applied from each invocation when a live
+    /// session is attached. Non-rebind variables are fixed at `koto init`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rebind: bool,
 }
 
 /// A state declaration in a compiled template.
@@ -2176,6 +2192,7 @@ mod tests {
                     description: "a declared variable".to_string(),
                     required: true,
                     default: String::new(),
+                    ..Default::default()
                 },
             );
             t.states.get_mut("start").unwrap().default_action = Some(action);
@@ -2202,6 +2219,7 @@ mod tests {
                 description: "a declared variable".to_string(),
                 required: true,
                 default: String::new(),
+                ..Default::default()
             },
         );
         t.states.get_mut("start").unwrap().default_action = Some(ActionDecl {
@@ -2884,6 +2902,7 @@ mod tests {
                 description: String::new(),
                 required: true,
                 default: String::new(),
+                ..Default::default()
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -2927,6 +2946,7 @@ mod tests {
                 description: String::new(),
                 required: false,
                 default: "main".to_string(),
+                ..Default::default()
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -3072,6 +3092,7 @@ mod tests {
                 description: "the branch".to_string(),
                 required: false,
                 default: String::new(),
+                ..Default::default()
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3281,6 +3302,7 @@ mod tests {
                 description: "scopes the key".to_string(),
                 required: true,
                 default: String::new(),
+                ..Default::default()
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -3451,6 +3473,7 @@ mod tests {
                 description: String::new(),
                 required: false,
                 default: "main".to_string(),
+                ..Default::default()
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -5451,6 +5474,7 @@ command: "./check.sh"
                 description: String::new(),
                 required: false,
                 default: String::new(),
+                ..Default::default()
             },
         );
         t

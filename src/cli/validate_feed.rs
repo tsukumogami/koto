@@ -351,6 +351,19 @@ Body text.
         assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
     }
 
+    /// A `variables_rebound` event, as the rebind primitive writes it,
+    /// validates clean against the shipped contract.
+    #[test]
+    fn shipped_spec_accepts_variables_rebound() {
+        let log = write_temp(&format!(
+            "{}\n{}\n",
+            anchored_header_line(),
+            r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"variables_rebound","payload":{"variables":{"MERGE":"true"}}}"#,
+        ));
+        let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+        assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
+    }
+
     /// Acceptance alone would prove nothing: the validator skips event types it
     /// does not recognize, so an unregistered event passes silently. Feeding a
     /// malformed instance of each new event is what shows the contract declares
@@ -365,6 +378,10 @@ Body text.
             (
                 "variable_captured",
                 r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"variable_captured","payload":{"key":"BRANCH"}}"#,
+            ),
+            (
+                "variables_rebound",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"variables_rebound","payload":{}}"#,
             ),
             (
                 "execution_anchor_rebound",

@@ -28,7 +28,15 @@ struct SourceFrontmatter {
     states: HashMap<String, SourceState>,
 }
 
+/// YAML front-matter view of a variable declaration.
+///
+/// `deny_unknown_fields` so a misspelled constraint (`valuez:`) fails
+/// compilation instead of being dropped, which would leave the variable
+/// unconstrained without anyone noticing. `values` and `pattern` are
+/// `Option` so an explicitly empty declaration is told apart from an omitted
+/// one and refused.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct SourceVariable {
     #[serde(default)]
     description: String,
@@ -36,6 +44,12 @@ struct SourceVariable {
     required: bool,
     #[serde(default)]
     default: String,
+    #[serde(default)]
+    values: Option<Vec<String>>,
+    #[serde(default)]
+    pattern: Option<String>,
+    #[serde(default)]
+    rebind: bool,
 }
 
 /// YAML front-matter view of a single state.
@@ -165,8 +179,10 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
         anyhow!("invalid YAML: template must begin with YAML front-matter delimited by '---'")
     })?;
 
+    // The parser's own message is kept: it is what names an unknown or
+    // mistyped key (for example `variables.X: unknown field ...`).
     let fm: SourceFrontmatter = serde_yaml_ng::from_str(frontmatter_str)
-        .with_context(|| "invalid YAML: failed to parse front-matter")?;
+        .map_err(|e| anyhow!("invalid YAML: failed to parse front-matter: {}", e))?;
 
     // Validate required front-matter fields.
     if fm.name.is_empty() {
@@ -310,21 +326,26 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
         ));
     }
 
-    // Build compiled variables.
-    let variables: BTreeMap<String, VariableDecl> = fm
-        .variables
-        .into_iter()
-        .map(|(k, v)| {
-            (
-                k,
-                VariableDecl {
-                    description: v.description,
-                    required: v.required,
-                    default: v.default,
-                },
-            )
-        })
-        .collect();
+    // Build compiled variables, refusing an incoherent constraint.
+    let mut variables: BTreeMap<String, VariableDecl> = BTreeMap::new();
+    for (k, v) in fm.variables {
+        if matches!(&v.values, Some(list) if list.is_empty()) {
+            return Err(anyhow!("variable {:?}: values: must not be empty", k));
+        }
+        if matches!(&v.pattern, Some(p) if p.is_empty()) {
+            return Err(anyhow!("variable {:?}: pattern: must not be empty", k));
+        }
+        let decl = VariableDecl {
+            description: v.description,
+            required: v.required,
+            default: v.default,
+            values: v.values.unwrap_or_default(),
+            pattern: v.pattern.unwrap_or_default(),
+            rebind: v.rebind,
+        };
+        decl.validate_declaration(&k).map_err(|e| anyhow!(e))?;
+        variables.insert(k, decl);
+    }
 
     let template = CompiledTemplate {
         format_version: 1,
@@ -709,6 +730,160 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
+    }
+
+    // -----------------------------------------------------------------------
+    // Variable declarations: values:, pattern:, rebind:
+    // -----------------------------------------------------------------------
+
+    mod variable_constraints {
+        use super::*;
+
+        /// The compiled JSON of existing fixtures, captured before `values:`,
+        /// `pattern:`, and `rebind:` existed. A template that declares none of
+        /// them must compile to the same bytes, or every existing session's
+        /// template hash stops matching its cache entry.
+        #[test]
+        fn compile_output_is_unchanged_for_templates_without_constraints() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            for name in ["hello-koto", "skip-if-vars"] {
+                let source = root
+                    .join("test/functional/fixtures/templates")
+                    .join(format!("{name}.md"));
+                let snapshot = root
+                    .join("tests/fixtures/compile-snapshot")
+                    .join(format!("{name}.json"));
+                let compiled = compile(&source, false).unwrap();
+                let json = serde_json::to_string_pretty(&compiled).unwrap();
+                if std::env::var_os("KOTO_UPDATE_COMPILE_SNAPSHOT").is_some() {
+                    std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+                    std::fs::write(&snapshot, &json).unwrap();
+                }
+                let expected = std::fs::read_to_string(&snapshot).unwrap();
+                assert_eq!(json, expected, "compiled output of {name} changed");
+            }
+        }
+
+        /// A one-state template whose only variable is declared by `decl`
+        /// (YAML lines indented under the variable name).
+        fn template_with_variable(decl: &str) -> String {
+            format!(
+                "---\nname: t\nversion: \"1.0\"\ninitial_state: done\nvariables:\n  X:\n{}\nstates:\n  done:\n    terminal: true\n---\n\n## done\n\nDone {{{{X}}}}.\n",
+                decl.lines()
+                    .map(|l| format!("    {}", l))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        }
+
+        fn compile_decl(decl: &str) -> anyhow::Result<CompiledTemplate> {
+            let f = write_temp(&template_with_variable(decl));
+            compile(f.path(), true)
+        }
+
+        fn compile_err(decl: &str) -> String {
+            match compile_decl(decl) {
+                Ok(_) => panic!("declaration should be refused:\n{decl}"),
+                Err(e) => e.to_string(),
+            }
+        }
+
+        #[test]
+        fn declared_constraints_reach_the_compiled_template() {
+            let t = compile_decl("values: [yes, no]\ndefault: \"no\"\nrebind: true").unwrap();
+            let x = &t.variables["X"];
+            assert_eq!(x.values, vec!["yes".to_string(), "no".to_string()]);
+            assert!(x.rebind);
+            let t = compile_decl("pattern: \"[a-z]+\"\nrequired: true").unwrap();
+            assert_eq!(t.variables["X"].pattern, "[a-z]+");
+        }
+
+        #[test]
+        fn an_unknown_key_is_refused_naming_the_variable_and_key() {
+            let err = compile_err("valuez: [a]");
+            assert!(err.contains("X"), "{err}");
+            assert!(err.contains("valuez"), "{err}");
+        }
+
+        #[test]
+        fn values_and_pattern_together_are_refused() {
+            let err = compile_err("values: [a]\npattern: \"a\"\nrequired: true");
+            assert!(
+                err.contains("\"X\"") && err.contains("at most one"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn an_empty_values_list_is_refused() {
+            let err = compile_err("values: []\nrequired: true");
+            assert!(
+                err.contains("\"X\"") && err.contains("must not be empty"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn a_values_entry_outside_the_allowlist_is_refused() {
+            let err = compile_err("values: [ok, \"a;b\"]\nrequired: true");
+            assert!(err.contains("\"X\"") && err.contains("a;b"), "{err}");
+        }
+
+        #[test]
+        fn an_invalid_pattern_is_refused() {
+            let err = compile_err("pattern: \"[a-\"\nrequired: true");
+            assert!(
+                err.contains("\"X\"") && err.contains("not a valid regular expression"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn a_lookaround_pattern_is_refused() {
+            let err = compile_err("pattern: \"(?=a)a\"\nrequired: true");
+            assert!(err.contains("\"X\""), "{err}");
+        }
+
+        #[test]
+        fn a_pattern_matches_the_whole_value() {
+            let t = compile_decl("pattern: \"[a-z]+\"\nrequired: true").unwrap();
+            let x = &t.variables["X"];
+            assert!(x.satisfies_constraint("abc"));
+            assert!(!x.satisfies_constraint("abc-1"));
+        }
+
+        #[test]
+        fn a_default_outside_the_constraint_is_refused() {
+            let err = compile_err("values: [\"yes\", \"no\"]\ndefault: maybe");
+            assert!(err.contains("\"X\""), "{err}");
+            assert!(err.contains("maybe"), "{err}");
+            assert!(err.contains("values:[yes,no]"), "{err}");
+        }
+
+        #[test]
+        fn an_optional_variable_whose_constraint_rejects_empty_needs_a_default() {
+            let err = compile_err("values: [\"yes\", \"no\"]");
+            assert!(err.contains("\"X\"") && err.contains("optional"), "{err}");
+            // A constraint admitting the empty value compiles without one.
+            compile_decl("pattern: \"([1-9]|[1-4][0-9]|50)?\"").unwrap();
+            // So does a required variable, which is never materialized empty.
+            compile_decl("values: [\"yes\", \"no\"]\nrequired: true").unwrap();
+        }
+
+        #[test]
+        fn rebind_accepts_only_a_boolean() {
+            let err = compile_err("rebind: \"yes\"");
+            assert!(err.contains("rebind"), "{err}");
+            compile_decl("rebind: true").unwrap();
+        }
+
+        #[test]
+        fn a_capture_cannot_write_a_declared_rebind_variable() {
+            let src = "---\nname: t\nversion: \"1.0\"\ninitial_state: work\nvariables:\n  MERGE:\n    values: [\"true\", \"false\"]\n    default: \"false\"\n    rebind: true\nstates:\n  work:\n    default_action:\n      command: \"echo true\"\n      capture_stdout_as: MERGE\n    transitions:\n      - target: done\n  done:\n    terminal: true\n---\n\n## work\n\nWork.\n\n## done\n\nDone.\n";
+            let f = write_temp(src);
+            let err = compile(f.path(), true).unwrap_err().to_string();
+            assert!(err.contains("MERGE") && err.contains("collides"), "{err}");
+        }
     }
 
     /// Write a parent template source to `<dir>/<parent_file>` alongside a

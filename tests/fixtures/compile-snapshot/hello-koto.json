@@ -1,0 +1,42 @@
+{
+  "format_version": 1,
+  "name": "hello-koto",
+  "version": "1.0",
+  "description": "Minimal greet-a-spirit workflow used as a smoke-test fixture",
+  "initial_state": "awakening",
+  "variables": {
+    "SPIRIT_NAME": {
+      "description": "Name of the spirit to greet",
+      "required": true
+    }
+  },
+  "states": {
+    "awakening": {
+      "directive": "Greet the spirit {{SPIRIT_NAME}} by writing a greeting to `wip/spirit-greeting.txt`. When the file exists, the workflow advances to its terminal state.",
+      "transitions": [
+        {
+          "target": "eternal",
+          "when": {
+            "gates.spirit_greeting.exit_code": 0
+          }
+        }
+      ],
+      "gates": {
+        "spirit_greeting": {
+          "type": "command",
+          "command": "test -f wip/spirit-greeting.txt"
+        }
+      },
+      "accepts": {
+        "acknowledgement": {
+          "field_type": "string",
+          "required": false
+        }
+      }
+    },
+    "eternal": {
+      "directive": "The spirit {{SPIRIT_NAME}} has been greeted. The workflow is complete.",
+      "terminal": true
+    }
+  }
+}

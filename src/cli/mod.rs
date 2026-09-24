@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::engine::substitute::validate_value;
+use crate::engine::variables::{check_value, VarError};
 use crate::template::types::VariableDecl;
 
 use crate::buildinfo;
@@ -819,37 +819,44 @@ pub(crate) fn build_local_backend() -> Result<LocalBackend> {
 /// Validate and resolve `--var KEY=VALUE` arguments against the template's
 /// variable declarations. Returns a map of resolved variable bindings ready
 /// for storage in the WorkflowInitialized event.
+///
+/// Every resolved value -- passed, defaulted, or materialized empty -- is
+/// checked against its declaration's `values:` or `pattern:` and against the
+/// allowlist. Refusals are typed ([`VarError`]); their `Display` text is the
+/// message callers have always matched on.
 pub(crate) fn resolve_variables(
     raw_vars: &[String],
     declarations: &BTreeMap<String, VariableDecl>,
-) -> std::result::Result<HashMap<String, String>, String> {
+) -> std::result::Result<HashMap<String, String>, VarError> {
     let mut provided: HashMap<String, String> = HashMap::new();
 
     // 1. Parse each --var string and reject duplicates.
     for entry in raw_vars {
-        let eq_pos = entry
-            .find('=')
-            .ok_or_else(|| format!("invalid --var format {:?}: expected KEY=VALUE", entry))?;
+        let eq_pos = entry.find('=').ok_or_else(|| VarError::Malformed {
+            entry: entry.clone(),
+            reason: "expected KEY=VALUE".to_string(),
+        })?;
         let key = &entry[..eq_pos];
         let value = &entry[eq_pos + 1..];
 
         if key.is_empty() {
-            return Err(format!(
-                "invalid --var format {:?}: key must not be empty",
-                entry
-            ));
+            return Err(VarError::Malformed {
+                entry: entry.clone(),
+                reason: "key must not be empty".to_string(),
+            });
         }
 
         if provided.contains_key(key) {
-            return Err(format!("duplicate --var key {:?}", key));
+            return Err(VarError::Duplicate {
+                var: key.to_string(),
+            });
         }
 
         // Reject keys not declared in the template.
         if !declarations.contains_key(key) {
-            return Err(format!(
-                "unknown variable {:?}: not declared in template",
-                key
-            ));
+            return Err(VarError::Unknown {
+                var: key.to_string(),
+            });
         }
 
         provided.insert(key.to_string(), value.to_string());
@@ -863,22 +870,20 @@ pub(crate) fn resolve_variables(
         } else if !decl.default.is_empty() {
             decl.default.clone()
         } else if decl.required {
-            return Err(format!(
-                "missing required variable {:?}: provide --var {}=VALUE",
-                key, key
-            ));
+            return Err(VarError::Missing { var: key.clone() });
         } else {
             // Optional, not provided, and either no default or an explicit empty
             // default: materialize an empty binding rather than skipping the
             // variable. Every declared variable then resolves at substitution
             // time, so a `{{KEY}}` reference yields "" instead of an undefined
             // reference (Issue #184). The empty value still passes through
-            // validate_value below, preserving the #180 allowlist guarantee.
+            // the checks below, preserving the #180 allowlist guarantee.
             String::new()
         };
 
-        // 3. Validate the value against the allowlist.
-        validate_value(key, &value).map_err(|e| e.to_string())?;
+        // 3. Validate the value against its declared constraint and the
+        //    allowlist.
+        check_value(key, decl, &value)?;
 
         resolved.insert(key.clone(), value);
     }
@@ -1972,7 +1977,7 @@ fn handle_init(
                     && err
                         .message
                         .starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "error": if is_var_error {
                         err.message
                             .strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
@@ -1983,6 +1988,11 @@ fn handle_init(
                     },
                     "command": "init"
                 });
+                // A typed refusal (`invalid_var`, `duplicate_var`,
+                // `unknown_var`) adds its code and fields beside `error`.
+                if let (Some(var_error), Some(obj)) = (&err.var_error, body.as_object_mut()) {
+                    obj.extend(var_error.fields());
+                }
                 if is_var_error {
                     exit_with_error_code(body, 2);
                 } else {
@@ -2092,7 +2102,7 @@ fn handle_init_inline(
         // the same way the file path does.
         let msg = e.to_string();
         let is_var_error = msg.starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "error": if is_var_error {
                 msg.strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
                     .unwrap_or(&msg)
@@ -2102,6 +2112,9 @@ fn handle_init_inline(
             },
             "command": "init"
         });
+        if let (Some(var_error), Some(obj)) = (e.downcast_ref::<VarError>(), body.as_object_mut()) {
+            obj.extend(var_error.fields());
+        }
         if is_var_error {
             exit_with_error_code(body, 2);
         } else {
@@ -7490,6 +7503,7 @@ Done.
             description: String::new(),
             required,
             default: default.to_string(),
+            ..Default::default()
         }
     }
 
@@ -7547,10 +7561,115 @@ Done.
         let err = resolve_variables(&[], &decls).unwrap_err();
 
         assert!(
-            err.contains("missing required variable"),
+            err.to_string().contains("missing required variable"),
             "unexpected error: {}",
             err
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_variables: values:, pattern:, and typed refusals
+    // -----------------------------------------------------------------------
+
+    fn constrained(values: &[&str], pattern: &str, default: &str) -> VariableDecl {
+        VariableDecl {
+            default: default.to_string(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+            pattern: pattern.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn intent_decls() -> BTreeMap<String, VariableDecl> {
+        let mut decls = BTreeMap::new();
+        decls.insert(
+            "INTENT_FLAG".to_string(),
+            constrained(&[], "^(continue|stop)?$", ""),
+        );
+        decls
+    }
+
+    #[test]
+    fn resolve_variables_refuses_a_value_failing_its_pattern() {
+        let err =
+            resolve_variables(&["INTENT_FLAG=maybe".to_string()], &intent_decls()).unwrap_err();
+        assert_eq!(err.code(), Some("invalid_var"));
+        let fields = err.fields();
+        assert_eq!(fields["var"], "INTENT_FLAG");
+        assert_eq!(fields["value"], "maybe");
+        assert_eq!(fields["constraint"], "pattern:^(continue|stop)?$");
+    }
+
+    #[test]
+    fn resolve_variables_accepts_a_value_satisfying_its_pattern() {
+        let resolved =
+            resolve_variables(&["INTENT_FLAG=continue".to_string()], &intent_decls()).unwrap();
+        assert_eq!(resolved["INTENT_FLAG"], "continue");
+    }
+
+    #[test]
+    fn resolve_variables_defaults_a_constrained_variable_that_is_not_passed() {
+        let resolved = resolve_variables(&[], &intent_decls()).unwrap();
+        assert_eq!(resolved["INTENT_FLAG"], "");
+    }
+
+    #[test]
+    fn resolve_variables_refuses_a_value_outside_its_values() {
+        let mut decls = BTreeMap::new();
+        decls.insert(
+            "MERGE".to_string(),
+            constrained(&["true", "false"], "", "false"),
+        );
+        let err = resolve_variables(&["MERGE=yes".to_string()], &decls).unwrap_err();
+        assert_eq!(err.code(), Some("invalid_var"));
+        assert_eq!(err.fields()["constraint"], "values:[true,false]");
+        assert_eq!(
+            resolve_variables(&["MERGE=true".to_string()], &decls).unwrap()["MERGE"],
+            "true"
+        );
+    }
+
+    #[test]
+    fn resolve_variables_reports_an_allowlist_failure_as_invalid_var() {
+        let mut decls = BTreeMap::new();
+        decls.insert("TOPIC".to_string(), var_decl(false, ""));
+        let err = resolve_variables(&["TOPIC=a;b".to_string()], &decls).unwrap_err();
+        assert_eq!(err.code(), Some("invalid_var"));
+        assert_eq!(err.fields()["constraint"], "allowlist");
+        // The message is the allowlist wording callers already match on.
+        assert!(err.to_string().contains("not allowed by the value pattern"));
+    }
+
+    #[test]
+    fn resolve_variables_duplicate_and_unknown_keep_their_messages() {
+        let decls = intent_decls();
+        let dup = resolve_variables(
+            &[
+                "INTENT_FLAG=stop".to_string(),
+                "INTENT_FLAG=stop".to_string(),
+            ],
+            &decls,
+        )
+        .unwrap_err();
+        assert_eq!(dup.code(), Some("duplicate_var"));
+        assert_eq!(dup.fields()["var"], "INTENT_FLAG");
+        assert_eq!(dup.to_string(), "duplicate --var key \"INTENT_FLAG\"");
+
+        let unknown = resolve_variables(&["NOPE=1".to_string()], &decls).unwrap_err();
+        assert_eq!(unknown.code(), Some("unknown_var"));
+        assert_eq!(unknown.fields()["var"], "NOPE");
+        assert_eq!(
+            unknown.to_string(),
+            "unknown variable \"NOPE\": not declared in template"
+        );
+    }
+
+    #[test]
+    fn resolve_variables_malformed_and_missing_carry_no_code() {
+        let err = resolve_variables(&["NOEQUALS".to_string()], &intent_decls()).unwrap_err();
+        assert_eq!(err.code(), None);
+        assert!(err.fields().is_empty());
+        assert!(err.to_string().contains("expected KEY=VALUE"));
     }
 
     #[test]
