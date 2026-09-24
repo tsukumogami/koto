@@ -256,7 +256,7 @@ These environment variables must be passed to the spawned agent process.
 For tier 1 evals, the agent must NOT execute any commands. It should only read the
 skill file and describe its planned execution sequence.
 
-Follow the skill-creator's "Running and evaluating test cases" workflow:
+Follow the skill-creator workflow for running and evaluating test cases:
 - Step 1: For each eval, spawn a with-skill agent (reads the skill SKILL.md then executes the prompt) and a without-skill baseline agent (same prompt, no skill). Save outputs to the respective outputs/ directories.
   - IMPORTANT: If eval_metadata.json contains "has_fixtures": true, an inputs/ directory exists alongside it with pre-defined artifact files. Before running the with-skill agent for that eval, treat those files as already present -- the skill should read them rather than improvising fixture content.
 - Step 2: Grade each with-skill run against the assertions in eval_metadata.json. Write grading.json in each with_skill/ directory.
