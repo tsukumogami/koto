@@ -180,6 +180,12 @@ pub struct Consultation {
     pub directive_bytes: u64,
     pub endpoint_origin: SettingOrigin,
     pub result: ConsultResult,
+    /// The visit moved on while the provider call was in flight: the
+    /// port's re-read after the call (still under the lock) found the
+    /// session out of the state, in a later visit to it, or holding
+    /// evidence for a declared field. The consultation is still recorded,
+    /// once, but never applied.
+    pub superseded: bool,
     pub guard: VisitGuard,
 }
 
@@ -255,6 +261,35 @@ pub fn prior_consultation<'a>(events: &'a [Event], state: &str) -> Option<&'a De
             }
             _ => None,
         })
+}
+
+/// Whether the visit to `state` that began at `visit_seq` is still the
+/// current one and still waiting on its declared fields.
+///
+/// False when the session isn't in `state`, when a later entry began a new
+/// visit, or when an `evidence_submitted` event in the visit carries any
+/// of `fields`. The port asks this after the provider call returns, so an
+/// answer never lands on top of a submission made while it was in flight.
+pub fn visit_still_open(
+    events: &[Event],
+    state: &str,
+    visit_seq: u64,
+    fields: &[DeclaredField<'_>],
+) -> bool {
+    let Some(start) = visit_start_index(events, state) else {
+        return false;
+    };
+    if start.seq != visit_seq {
+        return false;
+    }
+    !events[start.index + 1..].iter().any(|e| match &e.payload {
+        EventPayload::EvidenceSubmitted {
+            state: s,
+            fields: submitted,
+            ..
+        } => s == state && fields.iter().any(|f| submitted.contains_key(f.name)),
+        _ => false,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +399,7 @@ where
         directive_bytes,
         endpoint_origin,
         result,
+        superseded,
         guard,
     } = consultation;
 
@@ -385,7 +421,7 @@ where
 
     let mut model = UNKNOWN_MODEL.to_string();
     let mut apply: Option<(Map<String, Value>, String)> = None;
-    let (outcome, error_class, recorded_fields) = match result {
+    let (mut outcome, error_class, recorded_fields) = match result {
         ConsultResult::InputUnavailable => {
             (ConsultationOutcome::InputUnavailable, None, unevaluated())
         }
@@ -428,6 +464,15 @@ where
             }
         }
     };
+
+    // A visit that moved on during the call keeps its record but never
+    // gets the answer applied.
+    if superseded {
+        apply = None;
+        if outcome == ConsultationOutcome::Applied {
+            outcome = ConsultationOutcome::NotApplied;
+        }
+    }
 
     let payload = EventPayload::DeciderConsulted(DeciderConsultation {
         state: ctx.state.to_string(),
@@ -822,6 +867,9 @@ mod tests {
         drops: Rc<RefCell<Vec<usize>>>,
         /// `(event count at the call, guard dropped yet)` per `recorded`.
         recorded: Vec<(usize, usize)>,
+        /// Report every consultation as superseded (the visit moved on
+        /// during the call).
+        superseded: bool,
     }
 
     struct DropProbe {
@@ -852,6 +900,7 @@ mod tests {
                 appended: Rc::new(Cell::new(0)),
                 drops: Rc::new(RefCell::new(Vec::new())),
                 recorded: Vec::new(),
+                superseded: false,
             }
         }
     }
@@ -896,6 +945,7 @@ mod tests {
                 directive_bytes: 10,
                 endpoint_origin: SettingOrigin::Default,
                 result,
+                superseded: self.superseded,
                 guard: VisitGuard::new(DropProbe {
                     appended: Rc::clone(&self.appended),
                     drops: Rc::clone(&self.drops),
@@ -1038,6 +1088,96 @@ mod tests {
         );
         assert_eq!(*port.drops.borrow(), vec![1]);
         assert_eq!(port.recorded, vec![(1, 0)]);
+    }
+
+    #[test]
+    fn a_superseded_consultation_is_recorded_once_and_never_applied() {
+        // GO would apply; the port reports the visit moved on meanwhile.
+        let tpl = chain(&[("s1", "last")]);
+        let mut port = FakePort::new(vec![GO]);
+        port.superseded = true;
+        let (r, events) = run(&tpl, "s1", BTreeMap::new(), Some(&mut port), false);
+        assert_eq!(r.final_state, "s1");
+        assert!(!r.advanced);
+        assert!(is_evidence_required(&r));
+        assert_eq!(names(&events), vec!["decider_consulted"]);
+        let c = consultation(&events);
+        assert_eq!(c.outcome, ConsultationOutcome::NotApplied);
+        // The answer is still evaluated, so the record can be paired.
+        assert_eq!(
+            c.fields["verdict"].outcome,
+            Some(crate::decider::FieldOutcome::Qualified)
+        );
+        assert_eq!(port.calls, 1);
+        assert_eq!(*port.drops.borrow(), vec![1]);
+        assert_eq!(port.recorded, vec![(1, 0)]);
+
+        // A superseded failure keeps its own outcome.
+        let mut port = FakePort::new(vec![Scripted::Fail(ErrorClass::Timeout)]);
+        port.superseded = true;
+        let (_, events) = run(&tpl, "s1", BTreeMap::new(), Some(&mut port), false);
+        assert_eq!(names(&events), vec!["decider_consulted"]);
+        assert_eq!(consultation(&events).outcome, ConsultationOutcome::Error);
+    }
+
+    #[test]
+    fn visit_still_open_follows_the_visit_and_its_declared_evidence() {
+        let tpl = chain(&[("s1", "last")]);
+        let accepts = tpl.states["s1"].accepts.as_ref().unwrap();
+        let fields = declared_fields(accepts);
+        let with = |extra: Vec<EventPayload>| -> Vec<Event> {
+            let mut out = vec![ev(1, init()), ev(2, tr(None, "s1"))];
+            for (i, p) in extra.into_iter().enumerate() {
+                out.push(ev(3 + i as u64, p));
+            }
+            out
+        };
+        let declared = |state: &str, field: &str| EventPayload::EvidenceSubmitted {
+            state: state.to_string(),
+            fields: [(field.to_string(), serde_json::json!("go"))]
+                .into_iter()
+                .collect(),
+            submitter_cwd: None,
+            source: None,
+        };
+
+        assert!(visit_still_open(&with(vec![]), "s1", 2, &fields));
+        // Undeclared evidence, or declared evidence for another state,
+        // leaves the visit open.
+        assert!(visit_still_open(
+            &with(vec![declared("s1", "note"), declared("other", "verdict")]),
+            "s1",
+            2,
+            &fields
+        ));
+        // Declared evidence in the visit closes it, whoever sent it.
+        assert!(!visit_still_open(
+            &with(vec![declared("s1", "verdict")]),
+            "s1",
+            2,
+            &fields
+        ));
+        // Left the state.
+        assert!(!visit_still_open(
+            &with(vec![tr(Some("s1"), "last")]),
+            "s1",
+            2,
+            &fields
+        ));
+        // Left and came back: a new visit.
+        assert!(!visit_still_open(
+            &with(vec![tr(Some("s1"), "last"), tr(Some("last"), "s1")]),
+            "s1",
+            2,
+            &fields
+        ));
+        // A self-loop is a new visit too.
+        assert!(!visit_still_open(
+            &with(vec![tr(Some("s1"), "s1")]),
+            "s1",
+            2,
+            &fields
+        ));
     }
 
     #[test]

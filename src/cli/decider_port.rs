@@ -15,6 +15,11 @@
 //!    runner in `koto decider report` enters at the same seam), then calls
 //!    the provider and times it.
 //!
+//! 6. after the call returns, still under the lock, re-reads the log the
+//!    same way and marks the consultation `superseded` if the session left
+//!    the visit or it now holds evidence for a declared field, so the
+//!    engine records it as `not_applied` and applies nothing.
+//!
 //! When the engine reports the `decider_consulted` append through
 //! [`DeciderPort::recorded`], the port writes the ledger's `consulted`
 //! record, still under the lock.
@@ -36,8 +41,8 @@ use crate::decider::record::ConsultationOutcome;
 use crate::decider::request::{build_request, AssembledInputs, DeclaredField};
 use crate::decider::types::{Decider, LabelledInput, SettingOrigin};
 use crate::engine::decider::{
-    prior_consultation, visit_start_index, ConsultReply, ConsultRequest, ConsultResult,
-    Consultation, DeciderPolicy, DeciderPort, VisitGuard,
+    prior_consultation, visit_start_index, visit_still_open, ConsultReply, ConsultRequest,
+    ConsultResult, Consultation, DeciderPolicy, DeciderPort, VisitGuard,
 };
 use crate::engine::persistence::instructions_delivered_this_window;
 use crate::engine::substitute::bindings_from_events;
@@ -226,6 +231,7 @@ impl<'a> CliDeciderPort<'a> {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn consulted(
         &self,
         visit_seq: u64,
@@ -233,6 +239,7 @@ impl<'a> CliDeciderPort<'a> {
         latency_ms: u64,
         directive_bytes: u64,
         result: ConsultResult,
+        superseded: bool,
         guard: VisitGuard,
     ) -> ConsultReply {
         ConsultReply::Consulted(Box::new(Consultation {
@@ -243,8 +250,19 @@ impl<'a> CliDeciderPort<'a> {
             directive_bytes,
             endpoint_origin: self.endpoint_origin,
             result,
+            superseded,
             guard,
         }))
+    }
+
+    /// Re-read the local log, as before the call, and say whether the visit
+    /// that began at `visit_seq` is still open for `req`'s fields. A log
+    /// that can't be read counts as moved on: nothing is applied blind.
+    fn still_open(&self, req: &ConsultRequest<'_>, visit_seq: u64) -> bool {
+        match self.backend.read_events_local(&self.session) {
+            Ok((_, events)) => visit_still_open(&events, req.state, visit_seq, req.fields),
+            Err(_) => false,
+        }
     }
 }
 
@@ -340,6 +358,7 @@ impl DeciderPort for CliDeciderPort<'_> {
                 0,
                 directive_bytes,
                 ConsultResult::InputUnavailable,
+                false,
                 guard,
             );
         };
@@ -352,12 +371,17 @@ impl DeciderPort for CliDeciderPort<'_> {
             Ok(response) => ConsultResult::Answered(response),
             Err(e) => ConsultResult::Failed(e.class),
         };
+        // The call ran without the state file locked, so an agent's
+        // `koto next --with-data` may have moved the session meanwhile.
+        // Still under `decider.lock`, look again before anything applies.
+        let superseded = !self.still_open(req, start.seq);
         self.consulted(
             start.seq,
             Some(sha),
             latency_ms,
             directive_bytes,
             result,
+            superseded,
             guard,
         )
     }
@@ -709,6 +733,93 @@ d
         let mut p = port(&backend, &decider);
         assert!(matches!(consult(&mut p, &tpl), ConsultReply::Skipped));
         assert_eq!(decider.calls(), 0);
+    }
+
+    /// A decider that, while "in flight", appends `moves` to the session
+    /// log the way a concurrent `koto next --with-data` would, then answers.
+    struct MovesDuringCall {
+        backend: LocalBackend,
+        moves: Vec<EventPayload>,
+    }
+
+    impl Decider for MovesDuringCall {
+        fn provider(&self) -> &str {
+            "fake"
+        }
+        fn decide(&self, _req: &DecisionRequest) -> Result<DecisionResponse, DeciderError> {
+            for m in &self.moves {
+                self.backend
+                    .append_event("wf", m, "2026-01-01T00:00:05Z")
+                    .unwrap();
+            }
+            Ok(answer())
+        }
+    }
+
+    fn moving_port<'a>(
+        backend: &'a LocalBackend,
+        tmp: &std::path::Path,
+        moves: Vec<EventPayload>,
+    ) -> CliDeciderPort<'a> {
+        let settings = default_endpoint_settings();
+        CliDeciderPort::new(
+            backend,
+            backend,
+            "wf",
+            Box::new(MovesDuringCall {
+                backend: LocalBackend::with_base_dir(tmp.to_path_buf()),
+                moves,
+            }),
+            DeciderPolicy::from_settings(&settings),
+            settings.endpoint_origin(),
+            Box::new(|s: &str| s.to_string()),
+            false,
+        )
+    }
+
+    #[test]
+    fn a_visit_that_moves_during_the_call_is_superseded() {
+        let agent_evidence = |field: &str| EventPayload::EvidenceSubmitted {
+            state: "review".to_string(),
+            fields: [(field.to_string(), serde_json::json!("exit"))]
+                .into_iter()
+                .collect(),
+            submitter_cwd: None,
+            source: None,
+        };
+        let left = EventPayload::Transitioned {
+            from: Some("review".to_string()),
+            to: "done".to_string(),
+            condition_type: "auto".to_string(),
+            skip_if_matched: None,
+        };
+        let cases: Vec<(&str, Vec<EventPayload>, bool)> = vec![
+            ("nothing moved", vec![], false),
+            ("undeclared evidence", vec![agent_evidence("notes")], false),
+            ("declared evidence", vec![agent_evidence("verdict")], true),
+            (
+                "evidence and a transition",
+                vec![agent_evidence("verdict"), left.clone()],
+                true,
+            ),
+            ("left the state", vec![left], true),
+        ];
+        let tpl = compiled();
+        for (name, moves, want) in cases {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let backend = session(tmp.path(), "s");
+            let mut p = moving_port(&backend, tmp.path(), moves);
+            let ConsultReply::Consulted(c) = consult(&mut p, &tpl) else {
+                panic!("{}: expected a consultation", name);
+            };
+            assert_eq!(c.superseded, want, "{}", name);
+            assert_eq!(c.visit_seq, 2, "{}", name);
+            assert!(matches!(c.result, ConsultResult::Answered(_)), "{}", name);
+            // The lock is still held by the returned guard.
+            let decider = Arc::new(ScriptedDecider::new());
+            let mut other = port(&backend, &decider);
+            assert!(matches!(consult(&mut other, &tpl), ConsultReply::Skipped));
+        }
     }
 
     fn consultation_at(

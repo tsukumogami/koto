@@ -503,6 +503,76 @@ fn the_lock_fails_fast_and_the_loser_records_nothing() {
     assert_eq!(h.consultations().len(), 1);
 }
 
+#[test]
+fn a_submission_during_the_call_wins_and_the_answer_is_not_applied() {
+    let h = ready(&standard("auto", "auto"), vec![]);
+    // Reach review with the decider off, so the visit is open and
+    // unconsulted.
+    assert_eq!(json_out(&h.next_mode("off"))["state"], "review");
+    h.user_config("[decider]\ntimeout_ms = 10000\n");
+    // An answer that would apply `proceed`, held until the agent is done.
+    h.stub.push(go().hold());
+
+    let mut first = h.koto_mode("auto");
+    first
+        .args(["next", WF])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let first = first.spawn().unwrap();
+    assert!(
+        h.stub.wait_for_requests(1, Duration::from_secs(10)),
+        "the first tick never reached the stub"
+    );
+
+    // The agent submits while the call is in flight.
+    let mut agent = h.koto();
+    agent.args(["next", WF, "--with-data", r#"{"verdict": "exit"}"#]);
+    let agent = agent.output().unwrap();
+    assert!(agent.status.success(), "{}", describe(&agent));
+    assert_eq!(json_out(&agent)["state"], "rethink");
+
+    h.stub.release();
+    let first = first.wait_with_output().unwrap();
+    assert!(first.status.success(), "{}", describe(&first));
+    assert_eq!(h.stub.request_count(), 1);
+
+    // Counted once, as not_applied, and nothing stacked on the agent's move.
+    let c = h.consultations();
+    assert_eq!(c.len(), 1, "{:?}", c);
+    assert_eq!(c[0]["outcome"], "not_applied");
+    let evidence = h.events_of("evidence_submitted");
+    assert!(
+        evidence.iter().all(|e| e["payload"]["source"] != "decider"),
+        "{:?}",
+        evidence
+    );
+    let tail: Vec<(String, String)> = h
+        .events()
+        .iter()
+        .skip_while(|e| e["type"] != "evidence_submitted")
+        .map(|e| {
+            (
+                e["type"].as_str().unwrap().to_string(),
+                e["payload"]["to"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        tail,
+        vec![
+            ("evidence_submitted".to_string(), String::new()),
+            ("transitioned".to_string(), "rethink".to_string()),
+            ("decider_consulted".to_string(), String::new()),
+        ],
+        "{}",
+        h.raw_log()
+    );
+
+    // The session is where the agent put it.
+    let out = h.next(h.koto());
+    assert_eq!(json_out(&out)["state"], "rethink", "{}", describe(&out));
+}
+
 const BATCH_PARENT: &str = r#"---
 name: batch-consult
 version: "1.0"
