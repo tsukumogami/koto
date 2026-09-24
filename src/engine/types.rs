@@ -306,6 +306,22 @@ pub struct StateFileHeader {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_name: Option<String>,
 
+    /// File name of the source template `koto init` compiled this
+    /// session from (for example `scope.md`), without its directory.
+    ///
+    /// Part of the session's template identity, which `koto request
+    /// attach` compares against the template a request leg names.
+    /// `WorkflowInitialized.template_path` can't serve here: it records
+    /// the compiled artifact (`<sha256>.json`), not the source.
+    ///
+    /// `None` for `--from-stdin` sessions, which have no template file,
+    /// and for state files written before this field existed; both are
+    /// refused by a leg attach rather than guessed at.
+    ///
+    /// Additive field: omitted when None, defaults to None on old state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_source_file: Option<String>,
+
     // ===== Request-store fields (Decision 1) =====
     //
     // The seven additive + four reserved fields below land the
@@ -833,6 +849,16 @@ pub enum EventPayload {
         dispatch_epoch: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         issued_by: Option<String>,
+        /// `Some(SelfAttached)` when a root session bound itself through
+        /// `koto request attach`. Absent on a coordinator's bind of a
+        /// dispatched child. Additive: pre-existing logs replay as
+        /// absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach: Option<LegAttach>,
+        /// The self-attached session's template identity, recorded so a
+        /// reader can tell which template answered the leg. Additive.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        template: Option<TemplateIdentity>,
     },
     /// A mid-flight progress append on a leg
     /// (wire `type: "request.leg_progress"`).
@@ -1015,26 +1041,113 @@ impl WorkflowResult {
 pub struct LegDeclaration {
     /// Role identifier an assigning coordinator matches against.
     pub role: String,
-    /// Template the bound child is materialized from.
-    pub template: String,
+    /// Template the bound child is materialized from: one name, or a
+    /// short list of names any of which the leg accepts.
+    pub template: LegTemplates,
     /// The individual ask for this leg.
     pub inputs: serde_json::Value,
 }
 
+/// Most entries a leg's `template` list may carry.
+///
+/// A leg names the handful of templates that may answer it (`/execute`'s
+/// two modes, say); a long list would be a leg that accepts anything,
+/// which defeats the check.
+pub const MAX_LEG_TEMPLATES: usize = 8;
+
+/// The template, or templates, a leg names.
+///
+/// Untagged so the single-string form serializes exactly as it did
+/// before lists existed: a request log written by an older koto
+/// replays unchanged, and a single-template leg reads back byte-equal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum LegTemplates {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl LegTemplates {
+    /// Every entry, in declaration order.
+    pub fn entries(&self) -> Vec<&str> {
+        match self {
+            LegTemplates::One(s) => vec![s.as_str()],
+            LegTemplates::Many(list) => list.iter().map(String::as_str).collect(),
+        }
+    }
+
+    /// Whether a session with this template identity may attach to the
+    /// leg.
+    ///
+    /// **The matching rule.** An entry matches when it equals the
+    /// identity's `source` — the file name of the template `koto init`
+    /// compiled the session from, such as `scope.md` — exactly and
+    /// case-sensitively. The compiled `name` and the `hash` are recorded
+    /// on the bind event for audit and are never compared: a throwaway
+    /// template can copy any `name:` it likes, and a hash would pin one
+    /// revision of a template that legitimately changes between
+    /// releases. A session with no source file (`--from-stdin`, or one
+    /// created before koto recorded the file name) has no identity and
+    /// matches nothing (DESIGN-request-lifecycle.md, root attach
+    /// amendment).
+    pub fn admits(&self, identity: Option<&TemplateIdentity>) -> bool {
+        let Some(identity) = identity else {
+            return false;
+        };
+        self.entries().iter().any(|entry| *entry == identity.source)
+    }
+}
+
+impl From<&str> for LegTemplates {
+    fn from(value: &str) -> Self {
+        LegTemplates::One(value.to_string())
+    }
+}
+
+/// Who performed a leg's bind, recorded on the bind event.
+///
+/// Absent on a coordinator's `bind` of a dispatched child, which is the
+/// shape every pre-existing request log carries. `SelfAttached`
+/// (wire `"self"`) is a root session binding itself through `koto
+/// request attach`: such a leg has no dispatch epoch to fence against,
+/// so the fenced verbs are refused on it outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LegAttach {
+    #[serde(rename = "self")]
+    SelfAttached,
+}
+
+/// The template identity of a session that attached itself to a leg.
+///
+/// Which field [`LegTemplates::admits`] compares is stated there, once.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TemplateIdentity {
+    /// The compiled template's `name`, when it declares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// SHA-256 of the compiled template, from the session's header.
+    pub hash: String,
+    /// File name of the source template the session was compiled from.
+    pub source: String,
+}
+
 /// Which path recorded a leg's result.
 ///
-/// Serialized as snake_case (`"promoted"`, `"explicit"`). `Promoted`
-/// means a bound child's terminal tick carried its own
+/// Serialized as snake_case (`"promoted"`, `"explicit"`, `"refused"`).
+/// `Promoted` means a bound child's terminal tick carried its own
 /// [`WorkflowResult`] onto the leg with no extra action; `Explicit`
 /// means the leg had no bound child and its creator recorded the result
-/// directly. The distinction is recorded rather than derived so a later
-/// change to which paths may resolve a leg cannot make existing events
-/// retroactively ambiguous.
+/// directly; `Refused` means koto refused the session that was to answer
+/// the leg and recorded the refusal itself, which only
+/// `request_store::record_refusal` can write. The distinction is
+/// recorded rather than derived so a later change to which paths may
+/// resolve a leg cannot make existing events retroactively ambiguous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LegResultSource {
     Promoted,
     Explicit,
+    Refused,
 }
 
 /// How a request ended.
@@ -1486,6 +1599,8 @@ impl<'de> Deserialize<'de> for Event {
                     child_session_id: p.child_session_id,
                     dispatch_epoch: p.dispatch_epoch,
                     issued_by: p.issued_by,
+                    attach: p.attach,
+                    template: p.template,
                 }
             }
             "request.leg_progress" => {
@@ -1746,6 +1861,10 @@ struct RequestLegBoundPayload {
     dispatch_epoch: Option<u32>,
     #[serde(default)]
     issued_by: Option<String>,
+    #[serde(default)]
+    attach: Option<LegAttach>,
+    #[serde(default)]
+    template: Option<TemplateIdentity>,
 }
 
 #[derive(Deserialize)]
@@ -1917,6 +2036,7 @@ mod tests {
             created_at: "2026-03-15T14:30:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1948,6 +2068,7 @@ mod tests {
             created_at: "2026-03-15T14:30:00Z".to_string(),
             parent_workflow: Some("parent-wf".to_string()),
             template_source_dir: None,
+            template_source_file: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1991,6 +2112,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: Some(PathBuf::from("/abs/templates")),
+            template_source_file: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -2027,6 +2149,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -2061,6 +2184,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -2719,6 +2843,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00.000Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
             execution_dir: None,
             session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             intent: None,
@@ -3398,7 +3523,7 @@ mod tests {
             "reviewer-b".to_string(),
             LegDeclaration {
                 role: "security".to_string(),
-                template: "review.md".to_string(),
+                template: "review.md".into(),
                 inputs: serde_json::json!({"focus": "authz"}),
             },
         );
@@ -3406,7 +3531,7 @@ mod tests {
             "reviewer-a".to_string(),
             LegDeclaration {
                 role: "correctness".to_string(),
-                template: "review.md".to_string(),
+                template: "review.md".into(),
                 inputs: serde_json::json!({"focus": "logic"}),
             },
         );
@@ -3433,6 +3558,8 @@ mod tests {
                     child_session_id: "child-1".to_string(),
                     dispatch_epoch: Some(0),
                     issued_by: None,
+                    attach: None,
+                    template: None,
                 },
                 "request.leg_bound",
             ),
@@ -3650,6 +3777,8 @@ mod tests {
                 child_session_id: "parent.reviewer-a".to_string(),
                 dispatch_epoch: Some(2),
                 issued_by: Some("coord".to_string()),
+                attach: None,
+                template: None,
             },
         );
         let back: Event = serde_json::from_str(&serde_json::to_string(&bound).unwrap()).unwrap();

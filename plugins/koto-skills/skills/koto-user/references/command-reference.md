@@ -26,6 +26,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session resolve` | Runner — cloud backend only |
 | `koto status` | Runner — primary |
 | `koto request create/bind/get/wait/list` | Runner — coordinator |
+| `koto request attach` | Runner — whoever starts a root session on a requester's behalf |
 | `koto request progress/resolve/abandon` | Runner — coordinator and delegate |
 | `koto request abandon-request/close` | Runner — coordinator |
 | `koto context add` | Runner — primary |
@@ -381,12 +382,13 @@ The key is absent when the session isn't bound to a leg. It never carries `dispa
 
 ## koto request
 
-Ten subcommands over the request store — the durable record of what a coordinator asked for and what came back. See the skill's "Requests and legs" section for when to use it; this section is the flag surface.
+Eleven subcommands over the request store — the durable record of what a coordinator asked for and what came back. See the skill's "Requests and legs" section for when to use it; this section is the flag surface.
 
 ```
 koto request create   [--with-data '{"legs":[…],"inputs":{…}}' | --role R --template T --inputs J]
                       --requested-by ID --coordinator-of-record ID
 koto request bind     <request-id> <leg> --child SESSION_ID [--dispatch-epoch N] [--issued-by ID]
+koto request attach   <request-id> <leg> --session SESSION_ID [--issued-by ID]
 koto request get      <request-id>
 koto request wait     <request-id> (--leg NAME | --all-legs | --closed | --resolved-count N)
                       --timeout-secs N [--interval-secs N]
@@ -398,7 +400,7 @@ koto request abandon-request <request-id> --rationale TEXT [--issued-by ID]
 koto request close    <request-id> [--issued-by ID]
 ```
 
-`--cli-contract MAJOR.MINOR` is accepted on every subcommand and validated before any I/O, so a mismatch has no side effect. This build serves `1.0`; an older minor is served, a newer minor or a different major is refused.
+`--cli-contract MAJOR.MINOR` is accepted on every subcommand and validated before any I/O, so a mismatch has no side effect. This build serves `1.1`; an older minor is served, a newer minor or a different major is refused.
 
 Output is JSON on stdout unconditionally — there is no format flag.
 
@@ -433,7 +435,7 @@ Every subcommand except `list` prints the same object:
     }
   },
   "written": true,
-  "cli_contract": {"major": 1, "minor": 0}
+  "cli_contract": {"major": 1, "minor": 1}
 }
 ```
 
@@ -446,7 +448,10 @@ Every subcommand except `list` prints the same object:
 | `inputs` | The request-level shared context recorded at `create`. Omitted when none was supplied. |
 | `legs` | Keyed by leg name, in name order — that ordering is what makes two `get` calls byte-equal. |
 | `legs[*].disposition` | `open`, `resolved`, or `abandoned`. |
-| `legs[*].result_source` | `promoted` (from the bound child's terminal tick) or `explicit` (recorded through `resolve`). |
+| `legs[*].result_source` | `promoted` (from the bound session's terminal tick), `explicit` (recorded through `resolve`), or `refused` (koto refused the session that was to answer the leg and recorded why; no command writes this). |
+| `legs[*].attach` | `"self"` when a root session attached itself through `attach`. Omitted otherwise. |
+| `legs[*].bound_template` | For a self-attached leg, the session's template identity: `name`, `hash`, and `source` (the template's file name). Omitted otherwise. |
+| `legs[*].declaration.template` | One template name, or a list of up to eight any of which may answer the leg. |
 | `written` | Present on mutating verbs only, so you can tell a real append from a no-op success — a rebind to the child the leg already has, a re-abandon, or a retry the idempotency hash recognized. Absent on reads, which keeps `get` byte-stable. |
 | `cli_contract` | Two integers, never a string — `"1.10"` sorts below `"1.9"` as a string, and that mistake is unavailable here. |
 
@@ -465,6 +470,12 @@ The generated id is `req-` plus a v4 UUID, printed in the envelope. Creation is 
 Three checks run against the child before the append: the child's session must be readable (`child_not_found`), its header must satisfy the dispatch fence — a `--parent` child started with `--needs-agent` (`child_not_fenceable`) — and it must not already point at a different request-and-leg pair (`child_bound_to_different_leg`). Rebinding the same leg to the same child succeeds and reports `written: false`.
 
 The epoch recorded on the bind event is read from the child's header, not from your flag; passing `--dispatch-epoch` here asserts a value and is rejected if it disagrees. After the bind is durable, koto writes a pointer into the child's session directory so the child can read its own leg back. A failed pointer write warns and does not fail the bind — re-run `bind` to repair it.
+
+### attach
+
+`attach` lets a **root session** (one started without `--parent`) bind itself to a leg it will answer, typically a stable `--no-cleanup` session run on a requester's behalf. It has no dispatch epoch, so koto checks instead, all before any write: the request and leg are open; the session isn't terminal or cancelled (`session_terminal`); the session's template file name is one the leg's `template` names (`template_mismatch`; a `--from-stdin` session has none); each key in the leg's `inputs` is a variable the template declares and, unless it's `rebind: true`, equals the session's recorded value (`input_mismatch`); the leg is unbound or already bound to this session (a no-op, `written: false`); and the session isn't answering another live leg — it moves only when its old leg was abandoned or its old request closed (`child_bound_to_different_leg`).
+
+On a self-attached leg, `progress`, `resolve`, and `abandon` are refused with `self_attached_leg` whatever `--dispatch-epoch` says. The result arrives when the session reaches a terminal state, including under `koto next --no-cleanup`. `abandon-request` and `close` still work. A dispatched child passed to `attach` is bound exactly as `bind` binds it; any other child is refused with `child_not_fenceable`.
 
 ### wait
 

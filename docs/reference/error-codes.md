@@ -399,7 +399,7 @@ All batch validation runs pre-append — rejected submissions leave no events on
 
 ## Request errors
 
-Every subcommand under `koto request` — `create`, `bind`, `get`, `wait`, `list`, `progress`, `resolve`, `abandon`, `abandon-request`, and `close` — reports failure through one nested envelope, the same shape `koto next`'s domain errors use:
+Every subcommand under `koto request` — `create`, `bind`, `attach`, `get`, `wait`, `list`, `progress`, `resolve`, `abandon`, `abandon-request`, and `close` — reports failure through one nested envelope, the same shape `koto next`'s domain errors use:
 
 ```json
 {
@@ -423,7 +423,7 @@ The code set is closed. A consumer that had to match on `message` to tell "this 
 | `request_not_found` | 2 | No request record exists at that identifier. |
 | `leg_not_found` | 2 | The request has no leg by that name. |
 | `invalid_identifier` | 2 | A request id, leg name, session id, or coordinator id failed its grammar. Never worth retrying. |
-| `invalid_submission` | 2 | A flag payload was malformed, or the flag combination was — `--with-data` together with the `--role`/`--template`/`--inputs` triple, a creation payload with no legs, a duplicate leg name, a value that isn't a JSON object. |
+| `invalid_submission` | 2 | A flag payload was malformed, or the flag combination was — `--with-data` together with the `--role`/`--template`/`--inputs` triple, a creation payload with no legs, a duplicate leg name, a leg `template` list that is empty, longer than eight, or carries an empty entry, a value that isn't a JSON object. |
 | `contract_mismatch` | 2 | `--cli-contract` named a contract this build doesn't serve. Checked before any read or write, so a mismatch has no side effect. |
 | `request_closed` | 2 | A leg mutation, or a second `close`, on a closed request. |
 | `leg_already_resolved` | 2 | A second result, or any mutation, on a leg that already answered. |
@@ -431,8 +431,12 @@ The code set is closed. A consumer that had to match on `message` to tell "this 
 | `leg_bound_to_different_child` | 2 | A rebind that would point an already-bound leg at a different child. Rebinding to the same child is an idempotent success, not this. |
 | `explicit_resolve_on_bound_leg` | 2 | `resolve` on a bound leg. A bound leg's result is promoted from its child's terminal tick; accepting an explicit one here would block the real one. |
 | `child_not_found` | 2 | `bind` named a child whose session could not be read. |
-| `child_not_fenceable` | 2 | `bind` named a child whose header does not satisfy the dispatch-fence predicate. Binding it would produce a leg that could never be fenced, so the bind is refused instead. |
-| `child_bound_to_different_leg` | 2 | `bind` named a child that already points at a different request-and-leg pair. A child fulfils at most one leg, and this is the only place that can be checked — the lock is per-request, so two binds in different requests never serialize against each other. |
+| `child_not_fenceable` | 2 | `bind` named a child whose header does not satisfy the dispatch-fence predicate, or `attach` named a session that is neither a dispatched child nor a root. Binding it would produce a leg that could never be fenced, so the bind is refused instead. A root session (no parent workflow) attaches through `attach`. |
+| `child_bound_to_different_leg` | 2 | `bind` or `attach` named a session that already points at a different request-and-leg pair. A child fulfils at most one leg, and this is the only place that can be checked — the lock is per-request, so two binds in different requests never serialize against each other. `attach` re-points a root session only when its old leg was abandoned or its old request closed. |
+| `template_mismatch` | 2 | `attach` named a root session built from a template the leg's `template` doesn't name, compared by the source template's file name. A session with no template file (`--from-stdin`) matches nothing. |
+| `input_mismatch` | 2 | `attach` named a root session whose recorded value for one of the leg's `inputs` differs, or whose template doesn't declare that input. `rebind: true` variables aren't compared. `details` names the key and both values. |
+| `session_terminal` | 2 | `attach` named a session at a terminal state, or a cancelled one. |
+| `self_attached_leg` | 2 | `progress`, `resolve`, or leg-scoped `abandon` on a leg a root session attached itself to. Refused whatever `--dispatch-epoch` says: the leg's result arrives only by promotion from that session's terminal tick. `abandon-request` and `close` still work. |
 | `request_id_collision` | 2 | The generated identifier already had a record on disk. |
 | `idempotency_conflict` | 2 | A retry presented a known idempotency hash with a different payload, so it isn't the same logical write. |
 | `bound_exceeded` | 2 | One of the bounds below rejected the call. `details` names the dimension. |

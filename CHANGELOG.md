@@ -56,6 +56,30 @@ to `0.9.x`).
   and the parent's `ChildCompleted`. A terminal without a map reports exactly
   what it did before.
 
+- **`koto request attach` lets a root session answer a request leg.** Only a
+  dispatched child could bind a leg, because the dispatch epoch was the only
+  thing fencing it, so a workflow that runs another workflow as a stable root
+  session had no way to have that session's result recorded against its
+  request. `koto request attach <request> <leg> --session <name>` admits a
+  root session in place of the epoch with checks that all run before any
+  write, the ones that read the request inside its lock: the session isn't
+  terminal or cancelled (`session_terminal`), it was built from a template
+  file the leg names (`template_mismatch`), its non-`rebind` variables equal
+  the leg's `inputs` (`input_mismatch`), the leg is open and unbound or
+  already bound to it (a no-op), and it isn't answering another live leg
+  (it moves only when its old leg was abandoned or its old request closed).
+  The bind event records `attach: self` and the session's template identity,
+  shown on the leg as `attach` and `bound_template`. On a self-attached leg
+  `progress`, `resolve` and leg-scoped `abandon` are refused with
+  `self_attached_leg` whatever `--dispatch-epoch` says; the result arrives by
+  promotion from the session's terminal tick, including under
+  `--no-cleanup`. A leg's `template` may now be a list of up to eight names,
+  the leg view gains the `refused` result source (written only by koto's own
+  refusal write, never by `resolve`), and `koto init` records the source
+  template's file name on the session header as `template_source_file`. The
+  request contract moves to 1.1; a dispatched child passed to `attach`
+  binds exactly as `bind` binds it, and `bind` is unchanged.
+
 - **Template variables can declare `values:`, `pattern:`, and `rebind: true`.**
   A variable used to accept anything the character allowlist allowed, so a
   skill that needed `--intent` to be `continue` or `stop` had to check it in

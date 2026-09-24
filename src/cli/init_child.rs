@@ -560,6 +560,12 @@ fn init_child_core(
         created_at: ts.clone(),
         parent_workflow: parent_name.map(|s| s.to_string()),
         template_source_dir,
+        // The source file's name, for the template identity a request
+        // leg attach compares against (DESIGN-request-lifecycle.md,
+        // root attach amendment).
+        template_source_file: template_path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned()),
         execution_dir,
         session_id: generate_session_id(),
         intent: None,
@@ -737,6 +743,7 @@ pub fn init_inline_into_session(
         // The compiled artifact lives in the session dir, not a source
         // tree, so there is no parent source dir for the batch resolver.
         template_source_dir: None,
+        template_source_file: None,
         // An inline session is always top-level (`--from-stdin`
         // rejects `--parent`), so there is no parent anchor to copy.
         execution_dir: resolve_execution_dir(backend, None, execution_dir_override),
@@ -974,6 +981,7 @@ Done.
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
             execution_dir,
             session_id: String::new(),
             intent: None,
