@@ -171,7 +171,7 @@ The overridden gate is now treated as passed.
 
 For `children-complete` gates, the override pretends all children are done. The default value mirrors the extended gate output schema: all aggregate counters are zero, `all_complete` and `all_success` are `true`, the `any_*` and `needs_attention` booleans are `false`, and `children` is empty. Use this when you know children are finished but the gate hasn't picked it up, or when you need to proceed regardless.
 
-When `agent_actionable` is `false`, the gate has no override mechanism. Don't call `koto overrides record` for it — the command will fail. Escalate to the user instead.
+When `agent_actionable` is `false`, the gate has no override mechanism — either it has no default, or the template declares it `overridable: false`. Don't call `koto overrides record` for it — the command will fail (for a non-overridable gate, with exit 2 and `error.code: "gate_not_overridable"`, even with `--with-data`). Escalate to the user instead.
 
 ## When a default action fails
 

@@ -516,6 +516,7 @@ Records an override for a blocked gate so that the next `koto next` call treats 
 
 **Error cases:**
 - Exit 2: gate not found in current state, no override value available, workflow not found
+- Exit 2, `error.code: "gate_not_overridable"`: the template declares the gate `overridable: false`. The refusal happens whatever `--with-data` holds and nothing is recorded; satisfy the gate itself or escalate to the user. Such a gate always shows `agent_actionable: false`.
 - Exit 3: template hash mismatch, corrupt state file
 
 ---

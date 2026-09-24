@@ -302,7 +302,9 @@ koto overrides record my-workflow --gate ci_check --rationale "verified manually
 After recording the override, the next `koto next` call treats that gate as passed.
 
 **When `agent_actionable: false`:**
-The gate has no override default. The agent cannot resolve this condition. The right
+The gate has no override default, or the template declares it `overridable: false`
+(recording an override then exits 2 with `error.code: "gate_not_overridable"`). The agent
+cannot resolve this condition. The right
 response is to surface the blocking condition to the user with enough context for them
 to act:
 

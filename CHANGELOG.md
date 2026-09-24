@@ -10,6 +10,23 @@ to `0.9.x`).
 
 ### Added
 
+- **A gate can refuse overrides with `overridable: false`.** Until now any
+  gate could be forced with `koto overrides record`, so one override on a gate
+  that decides a merge or a report could drive any arm it routes, including
+  arms nothing re-checks. A gate declared `overridable: false` (any gate type)
+  now refuses the override with exit 2 and the typed code
+  `gate_not_overridable`, with or without `--with-data`, and appends nothing;
+  it reports `agent_actionable: false`; and `koto next` ignores any override
+  for it already in the log and evaluates the gate for real. The field
+  defaults to `true` and is omitted from the compiled JSON when `true`, so
+  existing templates compile byte-identical and existing sessions' template
+  hashes stay valid. Declaring `override_default` on a non-overridable gate is
+  a compile error, as is an `overridable` value that isn't a boolean.
+  Compatibility note: a gate declaration now rejects unknown keys, naming the
+  state, gate, and key, so a misspelled `overrideable: false` can't compile
+  and leave the gate overridable. A template that carried a stray key on a
+  gate compiled before and fails now.
+
 - **`koto session rebind` moves a session whose checkout moved.** Execution
   anchoring shipped in 0.12.0 with the enforcement but not the repair: both
   refusals told the user to run `koto session rebind <session> --to <dir>`,
