@@ -318,6 +318,22 @@ The field's `description` is the question. The block has three keys:
 | `escape` | Enum fields only, and required there: `{value, description}`. The value the decider gives when the question can't be judged. It must not be in `values`, and no `when` clause may route on it. A boolean field takes no escape. |
 | `inputs` | At least one entry. Each names exactly one of `context: <key>` (a context-store key) or `var: <NAME>` (a declared variable or a `capture_stdout_as` name), plus a `label` that's unique within the field and an optional `max_bytes`. |
 
+A boolean field declares `true` and `false` answers and no escape:
+
+```yaml
+accepts:
+  needs_design:
+    type: boolean
+    required: true
+    description: Does this change need a design document before anyone implements it?
+    decider:
+      answers:
+        true:  {description: "Touches several components, changes a public interface, or leaves open questions."}
+        false: {description: "A contained change whose implementation is obvious from the issue.", threshold: 0.95}
+      inputs:
+        - {context: issue.md, label: issue, max_bytes: 6000}
+```
+
 Defaults are resolved at compile time. An answer with no `mode` is `shadow`, one with no `threshold` is `0.9`, and an input with no `max_bytes` gets `8192`. Writing a default explicitly compiles to the same thing as leaving it out.
 
 `threshold` must be a number from 0.5 to 1.0 inclusive. On an enum the decider's winning value is the one with the highest probability (a tie counts as the escape), and its confidence is that probability. On a boolean, `true` wins when P(true) meets the `true` threshold and `false` wins when P(false) meets the `false` threshold; neither or both counts as the escape.
