@@ -413,6 +413,7 @@ mod tests {
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
 
@@ -481,6 +482,7 @@ mod tests {
                 required: true,
                 values: vec!["proceed".to_string(), "escalate".to_string()],
                 description: String::new(),
+                decider: None,
             },
         );
 
@@ -528,6 +530,7 @@ mod tests {
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
 
@@ -629,6 +632,7 @@ mod tests {
                     "blocked".to_string(),
                 ],
                 description: String::new(),
+                decider: None,
             },
         );
 
@@ -701,6 +705,7 @@ mod tests {
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
 
@@ -743,6 +748,7 @@ mod tests {
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
 
@@ -796,6 +802,7 @@ mod tests {
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
 

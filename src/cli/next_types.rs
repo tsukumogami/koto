@@ -805,6 +805,16 @@ pub struct ExpectsFieldSchema {
     pub values: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item_schema: Option<serde_json::Value>,
+    /// The field's question. Set only for a field with a `decider` block, so
+    /// every other field serializes exactly as it did before the block
+    /// existed, even when its template gives it a description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// One entry per value (`"true"` and `"false"` for a boolean), each the
+    /// answer's description. Set only for a field with a `decider` block. The
+    /// escape value never appears here, as it never appears in `values`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_descriptions: Option<BTreeMap<String, String>>,
 }
 
 /// A transition option surfaced to the agent.
@@ -998,6 +1008,23 @@ pub fn derive_expects(state: &TemplateState) -> Option<ExpectsSchema> {
             } else {
                 None
             };
+            // A declared field carries its question and one description per
+            // value. The answers map is keyed by exactly the field's values
+            // (validation guarantees it), so the escape, which lives apart
+            // from the answers, can't leak in.
+            let (description, value_descriptions) = match &schema.decider {
+                Some(decider) => (
+                    Some(schema.description.clone()),
+                    Some(
+                        decider
+                            .answers
+                            .iter()
+                            .map(|(value, answer)| (value.clone(), answer.description.clone()))
+                            .collect(),
+                    ),
+                ),
+                None => (None, None),
+            };
             (
                 name.clone(),
                 ExpectsFieldSchema {
@@ -1005,6 +1032,8 @@ pub fn derive_expects(state: &TemplateState) -> Option<ExpectsSchema> {
                     required: schema.required,
                     values: schema.values.clone(),
                     item_schema,
+                    description,
+                    value_descriptions,
                 },
             )
         })
@@ -1100,6 +1129,8 @@ mod tests {
                 required: true,
                 values: vec!["proceed".to_string(), "escalate".to_string()],
                 item_schema: None,
+                description: None,
+                value_descriptions: None,
             },
         );
 
@@ -1163,6 +1194,8 @@ mod tests {
                 required: false,
                 values: vec![],
                 item_schema: None,
+                description: None,
+                value_descriptions: None,
             },
         );
 
@@ -1283,6 +1316,8 @@ mod tests {
                 required: true,
                 values: vec![],
                 item_schema: None,
+                description: None,
+                value_descriptions: None,
             },
         );
 
@@ -1348,6 +1383,8 @@ mod tests {
                 required: true,
                 values: vec![],
                 item_schema: None,
+                description: None,
+                value_descriptions: None,
             },
         );
 
@@ -1666,6 +1703,8 @@ mod tests {
             required: true,
             values: vec![],
             item_schema: None,
+            description: None,
+            value_descriptions: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&schema).unwrap();
@@ -1684,6 +1723,8 @@ mod tests {
             required: true,
             values: vec!["a".to_string(), "b".to_string()],
             item_schema: None,
+            description: None,
+            value_descriptions: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&schema).unwrap();
@@ -1783,6 +1824,7 @@ mod tests {
                 required: true,
                 values: vec!["proceed".to_string(), "escalate".to_string()],
                 description: String::new(),
+                decider: None,
             },
         );
         accepts.insert(
@@ -1792,6 +1834,7 @@ mod tests {
                 required: false,
                 values: vec![],
                 description: "Optional notes".to_string(),
+                decider: None,
             },
         );
 
@@ -1861,6 +1904,7 @@ mod tests {
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
 
@@ -2123,6 +2167,7 @@ mod tests {
                 required: true,
                 values: vec!["a".to_string(), "b".to_string()],
                 description: String::new(),
+                decider: None,
             },
         );
 
@@ -2258,6 +2303,7 @@ mod tests {
                 required,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         accepts
@@ -2356,6 +2402,7 @@ mod tests {
                 required: false,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         let state = make_template_state(Some(accepts), vec![]);

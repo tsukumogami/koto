@@ -46,6 +46,7 @@ mod tests {
                 required: true,
                 values: vec!["build".to_string(), "investigate".to_string()],
                 description: String::new(),
+                decider: None,
             },
         );
 

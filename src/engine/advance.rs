@@ -1390,6 +1390,7 @@ mod tests {
                     required: true,
                     values: vec![],
                     description: String::new(),
+                    decider: None,
                 },
             );
         }
