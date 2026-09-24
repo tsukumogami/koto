@@ -2520,6 +2520,101 @@ fn synthesize_workflow_result(
     }
 }
 
+/// Resolve the result a session reports from the terminal it stands in.
+///
+/// `status` and `summary` come from [`synthesize_workflow_result`] either
+/// way. When the terminal declares a `result:` map, the resolved map *is*
+/// the payload -- terminal evidence fields are not merged into it -- so a
+/// reader routes on exactly the keys the template declared. Without a map
+/// the evidence-derived payload stands unchanged.
+///
+/// `{{VAR}}` resolves through the runtime names and the bindings folded
+/// from `events`; `${context.<key>}` reads the session's context store.
+/// See [`crate::engine::terminal_result::resolve_result_map`] for how an
+/// unresolved reference is reported.
+#[cfg(unix)]
+fn resolve_terminal_result(
+    backend: &dyn SessionBackend,
+    context_store: &dyn ContextStore,
+    name: &str,
+    compiled: &CompiledTemplate,
+    final_state: &str,
+    events: &[Event],
+) -> WorkflowResult {
+    let outcome = project_terminal_outcome(compiled, final_state);
+    let mut result = synthesize_workflow_result(outcome, final_state, events);
+    if let Some(declared) = compiled
+        .states
+        .get(final_state)
+        .and_then(|s| s.result.as_ref())
+    {
+        let mut runtime_vars = std::collections::HashMap::new();
+        runtime_vars.insert(
+            "SESSION_DIR".to_string(),
+            backend.session_dir(name).to_string_lossy().to_string(),
+        );
+        runtime_vars.insert("SESSION_NAME".to_string(), name.to_string());
+        let bindings = crate::engine::substitute::bindings_from_events(events);
+        result.payload = Some(crate::engine::terminal_result::resolve_result_map(
+            declared,
+            crate::engine::terminal_result::var_lookup(&runtime_vars, &bindings),
+            |key| context_store.get(name, key).ok(),
+        ));
+    }
+    result
+}
+
+/// The result a terminal tick reports, and whether the session's own log
+/// already records it.
+#[cfg(unix)]
+struct TerminalRecord {
+    result: WorkflowResult,
+    /// True when a `request_store.result` for this arrival at the terminal
+    /// is already on the log -- a parked session ticked again. The record
+    /// is then returned as-is and not appended a second time.
+    already_recorded: bool,
+}
+
+/// Find or resolve the result for a session standing in a terminal state.
+///
+/// Reads the log fresh, so a result resolved here reflects everything the
+/// current tick appended. When this arrival already carries a recorded
+/// result, that record wins: the map is resolved once, on the first
+/// terminal tick, and a context write after it changes nothing the session
+/// reports.
+#[cfg(unix)]
+fn terminal_record(
+    backend: &dyn SessionBackend,
+    context_store: &dyn ContextStore,
+    name: &str,
+    compiled: &CompiledTemplate,
+    final_state: &str,
+) -> TerminalRecord {
+    let events = backend
+        .read_events(name)
+        .map(|(_, ev)| ev)
+        .unwrap_or_default();
+    if let Some(result) =
+        crate::engine::terminal_result::recorded_result_for_current_arrival(&events)
+    {
+        return TerminalRecord {
+            result,
+            already_recorded: true,
+        };
+    }
+    TerminalRecord {
+        result: resolve_terminal_result(
+            backend,
+            context_store,
+            name,
+            compiled,
+            final_state,
+            &events,
+        ),
+        already_recorded: false,
+    }
+}
+
 /// Issue #134: append a `ChildCompleted` event to the parent's log just
 /// before a child session's auto-cleanup runs.
 ///
@@ -2657,9 +2752,12 @@ fn append_terminal_index_for_session(
 /// Everything a session does on the tick that lands it in a terminal
 /// state, in the order DESIGN-request-lifecycle.md Decision 6 fixes:
 ///
-/// 1. Synthesize the [`WorkflowResult`] envelope once, so the three
-///    writes below cannot disagree about what the child answered.
-/// 2. Append `request_store.result` to the child's own log.
+/// 1. Resolve the [`WorkflowResult`] envelope once, so the writes below
+///    cannot disagree about what the child answered. The caller does this
+///    through [`terminal_record`] before printing, because the terminal
+///    `koto next` response carries the same envelope.
+/// 2. Append `request_store.result` to the child's own log, once per
+///    arrival at the terminal.
 /// 3. **Promote** the envelope onto the bound leg's request log.
 /// 4. Write the terminal-index entry carrying the done-bit from 2.
 /// 5. Append `ChildCompleted` to the parent's log.
@@ -2678,20 +2776,19 @@ fn append_terminal_index_for_session(
 /// child's result, the index entry and the parent event, then deletes
 /// the session while the leg stays open forever.
 ///
-/// **Why it re-reads.** The directed path's caller holds a
-/// pre-transition event list. Synthesizing a result from it would
-/// compute the child's answer from a stale log, so the re-read happens
-/// here rather than at either call site.
-///
-/// **Why only step 3 is hoisted out of the cleanup guard.** An
-/// already-terminal session ticked again returns immediately from the
-/// advance loop, so under `--no-cleanup` this block runs on every tick.
-/// Hoisting all four writes would append another child-log result,
-/// another index entry and another parent event per tick, unbounded, on
-/// a deliberately parked session — and existing tests are built on a
-/// parked terminal child *not* emitting the parent event. So promotion
-/// alone is hoisted, gated on the leg having no result yet, which makes
-/// a repeat tick a silent no-op rather than a warning per tick.
+/// **Why steps 2 and 3 run under `--no-cleanup`.** An already-terminal
+/// session ticked again returns immediately from the advance loop, so
+/// under `--no-cleanup` this block runs on every tick. For a terminal that
+/// declares a `result:` map, the child-log record is what pins the
+/// resolved map for a parked session (`koto status`, a later tick), and it
+/// is keyed on the arrival: once [`terminal_record`] finds it on the log,
+/// `already_recorded` is set and nothing is appended again. A terminal
+/// without a map records nothing while parked, as before. Promotion is
+/// gated on the leg having no result yet, which makes a repeat tick a
+/// silent no-op. The index entry
+/// and the parent event stay under the cleanup guard -- appending those
+/// per tick would be unbounded, and existing tests are built on a parked
+/// terminal child *not* emitting the parent event.
 #[cfg(unix)]
 fn finish_terminal_tick(
     backend: &dyn SessionBackend,
@@ -2700,43 +2797,36 @@ fn finish_terminal_tick(
     compiled: &CompiledTemplate,
     final_state: &str,
     no_cleanup: bool,
+    record: &TerminalRecord,
 ) {
-    // One `open` on a path almost no session has. Reading it before the
-    // events keeps a parked `--no-cleanup` tick on an unbound session
-    // from paying for a log re-read it has no use for.
     let pointer = crate::engine::leg_pointer::read_pointer_best_effort(&backend.session_dir(name));
-    if no_cleanup && pointer.is_none() {
-        return;
-    }
+    let result = &record.result;
 
-    // Re-read so the synthesized result reflects everything this tick
-    // appended, and so the index classifier sees a mid-tick
-    // `WorkflowCancelled`.
-    let post_events = backend
-        .read_events(name)
-        .map(|(_, ev)| ev)
-        .unwrap_or_default();
-    let outcome = project_terminal_outcome(compiled, final_state);
-    let result = synthesize_workflow_result(outcome, final_state, &post_events);
+    // Step 2, the child's own log. The done-bit below means "a durable
+    // result is readable", which an earlier tick's record satisfies too.
+    //
+    // A parked session records only when its terminal declares a result
+    // map: that record is what pins the resolved map against later context
+    // writes. A terminal without one keeps its pre-existing behaviour of
+    // recording nothing while parked, because a recorded result is what
+    // the `children-complete` converge read treats as a finished child,
+    // and existing workflows park children on exactly that distinction.
+    let declares_result = compiled
+        .states
+        .get(final_state)
+        .is_some_and(|s| s.result.is_some());
+    let has_result = record.already_recorded
+        || ((!no_cleanup || declares_result)
+            && append_request_store_result_to_child(backend, name, result));
 
-    // Step 3, the child's own log. Stays under the cleanup guard: a
-    // parked session ticked repeatedly would otherwise append one of
-    // these per tick, unbounded.
-    let has_result = if no_cleanup {
-        false
-    } else {
-        append_request_store_result_to_child(backend, name, &result)
-    };
-
-    // Step 2 of the promotion ordering, and the one step hoisted out of
-    // the cleanup guard: a parked terminal session still resolves its
-    // leg, because the requester waiting on it has no way to know the
-    // session was parked. It sits after the child-log append so the
-    // result is already durable somewhere the child owns, and before the
-    // index write so a crash between them cannot leave a permanently
-    // skipped session with a forever-open leg.
+    // Step 3: a parked terminal session still resolves its leg, because
+    // the requester waiting on it has no way to know the session was
+    // parked. It sits after the child-log append so the result is already
+    // durable somewhere the child owns, and before the index write so a
+    // crash between them cannot leave a permanently skipped session with
+    // a forever-open leg.
     let defer_for_promotion = match &pointer {
-        Some(pointer) => promote_leg_result(pointer, &result),
+        Some(pointer) => promote_leg_result(pointer, result),
         None => false,
     };
 
@@ -2744,9 +2834,14 @@ fn finish_terminal_tick(
         return;
     }
 
+    // Re-read so the index classifier sees a mid-tick `WorkflowCancelled`.
+    let post_events = backend
+        .read_events(name)
+        .map(|(_, ev)| ev)
+        .unwrap_or_default();
     append_terminal_index_for_session(backend, name, &post_events, has_result);
     let append_result =
-        append_child_completed_to_parent(backend, name, header, compiled, final_state, &result);
+        append_child_completed_to_parent(backend, name, header, compiled, final_state, result);
     let defer_for_parent = matches!(append_result, ChildCompletedAppend::AppendFailed);
     if !defer_for_parent && !defer_for_promotion {
         if let Err(e) = backend.cleanup(name) {
@@ -3997,6 +4092,24 @@ fn handle_next(
                     }
                     None => resp,
                 };
+                // The terminal result rides the response, so it is found or
+                // resolved before printing and the same record is handed to
+                // the completion block below.
+                let terminal = if target_template_state.terminal {
+                    Some(terminal_record(
+                        backend,
+                        context_store,
+                        &name,
+                        &compiled,
+                        target,
+                    ))
+                } else {
+                    None
+                };
+                let resp = match &terminal {
+                    Some(record) => resp.with_terminal_result(record.result.clone()),
+                    None => resp,
+                };
                 println!("{}", serde_json::to_string(&resp)?);
                 // The delivery record is appended only after printing --
                 // see the natural-advancement path for the crash-
@@ -4015,9 +4128,12 @@ fn handle_next(
                     }
                 }
                 // Auto-cleanup after output when reaching a terminal state.
-                if let next_types::NextResponse::Terminal {
-                    state: final_state, ..
-                } = &resp
+                if let (
+                    next_types::NextResponse::Terminal {
+                        state: final_state, ..
+                    },
+                    Some(record),
+                ) = (&resp, &terminal)
                 {
                     finish_terminal_tick(
                         backend,
@@ -4026,6 +4142,7 @@ fn handle_next(
                         &compiled,
                         final_state,
                         no_cleanup,
+                        record,
                     );
                 }
                 std::process::exit(0);
@@ -4803,6 +4920,7 @@ fn handle_next(
                     state: final_state.clone(),
                     advanced,
                     unassigned_children: unassigned_children.clone(),
+                    result: None,
                 },
                 StopReason::GateBlocked(gate_results) => {
                     let blocking =
@@ -5040,6 +5158,7 @@ fn handle_next(
                             state: final_state.clone(),
                             advanced,
                             unassigned_children: unassigned_children.clone(),
+                            result: None,
                         }
                     } else if let Some(ref es) = expects {
                         NextResponse::EvidenceRequired {
@@ -5333,6 +5452,25 @@ fn handle_next(
                 }
             }
 
+            // The terminal result rides the response, so it is found or
+            // resolved before printing and the same record is handed to
+            // the completion block after it.
+            let terminal = if matches!(resp, NextResponse::Terminal { .. }) {
+                Some(terminal_record(
+                    backend,
+                    context_store,
+                    &name,
+                    &compiled,
+                    final_state,
+                ))
+            } else {
+                None
+            };
+            let resp = match &terminal {
+                Some(record) => resp.with_terminal_result(record.result.clone()),
+                None => resp,
+            };
+
             // Emit the response JSON. When the scheduler ran, splice
             // a `scheduler` sibling key onto the envelope so callers
             // observe it alongside the advance-loop response. Issue
@@ -5470,11 +5608,22 @@ fn handle_next(
                 }
             }
             // Auto-cleanup after output when reaching a terminal state.
-            if let NextResponse::Terminal {
-                state: final_state, ..
-            } = &resp
+            if let (
+                NextResponse::Terminal {
+                    state: final_state, ..
+                },
+                Some(record),
+            ) = (&resp, &terminal)
             {
-                finish_terminal_tick(backend, &name, &header, &compiled, final_state, no_cleanup);
+                finish_terminal_tick(
+                    backend,
+                    &name,
+                    &header,
+                    &compiled,
+                    final_state,
+                    no_cleanup,
+                    record,
+                );
             }
             std::process::exit(0);
         }
@@ -5975,6 +6124,30 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
                 response["expects"] = serde_json::to_value(&expects)?;
             }
         }
+    }
+
+    // Optional `result` -- present exactly when the session stands in a
+    // terminal state. The recorded result for this arrival is what the
+    // terminal tick reported, so it is returned as-is: a context write
+    // after the terminal does not change it. A terminal session with no
+    // record -- a parked terminal that declares no `result:` map, or one
+    // that reached its terminal before results were recorded -- gets the
+    // result resolved now, read-only; nothing is appended.
+    #[cfg(unix)]
+    if is_terminal {
+        let result =
+            match crate::engine::terminal_result::recorded_result_for_current_arrival(&events) {
+                Some(r) => r,
+                None => resolve_terminal_result(
+                    backend,
+                    backend,
+                    name,
+                    &compiled,
+                    &machine_state.current_state,
+                    &events,
+                ),
+            };
+        response["result"] = serde_json::to_value(&result)?;
     }
 
     // Optional `batch` section — populated when the parent is

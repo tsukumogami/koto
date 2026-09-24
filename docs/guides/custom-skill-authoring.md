@@ -478,6 +478,58 @@ Single-segment paths like `decision: proceed` still work for agent-submitted evi
 
 When your template uses content-aware gates, update the SKILL.md to instruct the agent to submit content through `koto context add` rather than writing files to `{{SESSION_DIR}}`. The evidence keys section should document the expected content keys and their purpose.
 
+## Terminal results
+
+When a workflow finishes, koto records a result: a `status` (`success`, `failure` or `skipped`, from the terminal's `failure` and `skipped_marker` flags), a one-line `summary`, and an optional structured `payload`. A terminal state can declare what goes in that payload with a `result:` map, so the outcome a caller routes on comes from the template instead of from text the agent composes.
+
+```yaml
+states:
+  done_error:
+    terminal: true
+    failure: true
+    result:
+      outcome: error
+      step: "${context.step}"
+      pr: "${context.home_pr}"
+      topic: "{{TOPIC}}"
+      state: "merge-state:${context.state}"
+```
+
+Each value is a string built from three forms, which can be mixed within one value:
+
+| Form | Resolves to |
+|------|-------------|
+| literal text | itself |
+| `{{VAR}}` | the session's value for a declared variable (or a runtime name such as `SESSION_NAME`) |
+| `${context.<key>}` | the content stored under `<key>` with `koto context add`, read as UTF-8 |
+
+The rules the compiler enforces:
+
+- `result:` is only allowed on a terminal state.
+- A map holds at most 32 keys. Keys follow the context-key grammar (letters, digits, `.`, `_`, `-`, with `/` between components).
+- `missing` is reserved and can't be declared (see below).
+- Values must be strings. A number or boolean is taken as its text; a nested mapping or a list is an error.
+- A `{{VAR}}` must name a declared variable, and a `${context.<key>}` must name a valid context key. No other `${...}` form is allowed here: `${evidence.x}` or `${gates.g.x}` fails compilation. To report something a gate or evidence produced, write it to the context store first and reference it as `${context.<key>}`.
+
+**When it resolves.** koto resolves the map once, on the tick that lands the session in the terminal state, and records the result on the session's own log. Every later read returns that recorded value, so writing to a context key after the terminal doesn't change what the session reported. Resolution is single-pass: a value that itself contains `{{X}}` or `${context.y}` is copied literally, not expanded again.
+
+**Unresolved references.** A `${context.<key>}` whose key doesn't exist, or whose content isn't valid UTF-8, resolves to the empty string, and the result key it sits in is listed in a `missing` array inside the payload. `missing` is present only when something didn't resolve. The terminal tick still succeeds; check `missing` if a caller depends on a key.
+
+```json
+{"status": "failure", "summary": "failed at done_error",
+ "payload": {"outcome": "error", "step": "scope:push", "pr": "", "topic": "my-topic",
+             "state": "merge-state:open", "missing": ["pr"]}}
+```
+
+**It replaces the evidence-derived payload.** Without a `result:` map, the payload is the evidence fields submitted on the terminal state, as it always was. With one, the payload is exactly the resolved map; terminal evidence fields aren't merged in. `status` and `summary` are derived the same way either way.
+
+**Where the result appears.** The same value is carried everywhere a result goes:
+
+- the `result` field of the `koto next` response that reaches the terminal (`"action": "done"`), and of every later tick on a session kept with `--no-cleanup`;
+- the `result` field of `koto status` on a session standing in a terminal state (a non-terminal session's status has no `result`);
+- the result of a request leg the session is bound to (`koto request get`);
+- the `result` of the `ChildCompleted` event appended to a parent workflow's log when a child finishes.
+
 ## Testing your skill
 
 ### Validate with the CI pipeline

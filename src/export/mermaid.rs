@@ -110,6 +110,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -127,6 +128,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         CompiledTemplate {
@@ -184,6 +186,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let t = CompiledTemplate {
@@ -242,6 +245,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -259,6 +263,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -276,6 +281,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
 
@@ -364,6 +370,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
 
@@ -396,6 +403,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -416,6 +424,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -436,6 +445,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -453,6 +463,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
 

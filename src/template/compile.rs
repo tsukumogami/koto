@@ -67,6 +67,11 @@ struct SourceState {
     skipped_marker: bool,
     #[serde(default)]
     skip_if: Option<HashMap<String, serde_json::Value>>,
+    /// A terminal state's declared result. Values stay YAML values here so
+    /// a mapping or sequence can be reported by name rather than as a serde
+    /// type error; scalars are converted to strings in `compile`.
+    #[serde(default)]
+    result: Option<BTreeMap<String, serde_yaml_ng::Value>>,
 }
 
 /// YAML front-matter view of a `materialize_children` hook.
@@ -270,6 +275,11 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
                 .as_ref()
                 .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
 
+        let compiled_result = match &source_state.result {
+            Some(map) => Some(compile_result_map(state_name, map)?),
+            None => None,
+        };
+
         compiled_states.insert(
             state_name.clone(),
             TemplateState {
@@ -285,6 +295,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
                 failure: source_state.failure,
                 skipped_marker: source_state.skipped_marker,
                 skip_if: compiled_skip_if,
+                result: compiled_result,
             },
         );
     }
@@ -348,6 +359,47 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
     validate_default_template_references(&template, source_path)?;
 
     Ok(template)
+}
+
+/// Convert a source `result:` map to its compiled form.
+///
+/// A value must be a scalar. Strings are taken as written; a number or a
+/// boolean is a literal and is taken in its YAML text form, so `pr: 12`
+/// and `pr: "12"` compile alike. A mapping, a sequence, or an empty value
+/// fails, because a result is a flat map of strings that a reader routes
+/// on without knowing the template. The rest of the grammar is checked in
+/// [`crate::template::result_map::validate_result_map`] during `validate`.
+fn compile_result_map(
+    state_name: &str,
+    source: &BTreeMap<String, serde_yaml_ng::Value>,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    use serde_yaml_ng::Value;
+    let mut out = BTreeMap::new();
+    for (key, value) in source {
+        let text = match value {
+            Value::String(s) => s.clone(),
+            Value::Bool(b) => b.to_string(),
+            Value::Number(n) => n.to_string(),
+            other => {
+                let kind = match other {
+                    Value::Mapping(_) => "a mapping",
+                    Value::Sequence(_) => "a sequence",
+                    Value::Null => "empty",
+                    _ => "not a string",
+                };
+                return Err(anyhow!(
+                    "state {:?}: result key {:?} is {}; a result value must be a string\n  \
+                     remedy: write the value as a string holding literal text, {{{{VAR}}}}, \
+                     or ${{context.<key>}}",
+                    state_name,
+                    key,
+                    kind
+                ));
+            }
+        };
+        out.insert(key.clone(), text);
+    }
+    Ok(out)
 }
 
 /// E9 resolution + F5 warning.

@@ -312,7 +312,7 @@ Check where a child is without side effects:
 koto status <child-name>
 ```
 
-Returns `name`, `current_state`, `template_path`, `template_hash`, and `is_terminal`, plus a `leg` object when the session is bound to a request leg. No gates are evaluated, no state changes happen.
+Returns `name`, `current_state`, `template_path`, `template_hash`, and `is_terminal`, plus a `leg` object when the session is bound to a request leg, and a `result` object (the recorded `status`, `summary`, and `payload`) when the session is in a terminal state. No gates are evaluated, no state changes happen.
 
 Read a child's stored results:
 

@@ -1357,6 +1357,7 @@ mod tests {
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         }
     }
 
@@ -2006,6 +2007,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2023,6 +2025,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2043,6 +2046,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2060,6 +2064,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -2128,6 +2133,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -2187,6 +2193,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -2236,6 +2243,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -2306,6 +2314,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -2407,6 +2416,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2424,6 +2434,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2441,6 +2452,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -2530,6 +2542,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2547,6 +2560,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2564,6 +2578,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -2652,6 +2667,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2669,6 +2685,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -2755,6 +2772,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2772,6 +2790,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -2940,6 +2959,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2957,6 +2977,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -3007,6 +3028,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -3064,6 +3086,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ));
         }
@@ -3083,6 +3106,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         ));
 
@@ -3125,6 +3149,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -3168,6 +3193,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -3185,6 +3211,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -3202,6 +3229,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -3249,6 +3277,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -3266,6 +3295,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -3283,6 +3313,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -3408,6 +3439,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )])
     }
@@ -3518,6 +3550,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
         let appended = std::cell::RefCell::new(Vec::new());
@@ -3574,6 +3607,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -3632,6 +3666,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -3677,6 +3712,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -3763,6 +3799,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -3780,6 +3817,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ])
@@ -4053,6 +4091,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -4116,6 +4155,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -4133,6 +4173,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -4195,6 +4236,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -4212,6 +4254,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -4327,6 +4370,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -4344,6 +4388,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -4420,6 +4465,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -4437,6 +4483,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -4556,6 +4603,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -4573,6 +4621,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -4678,6 +4727,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -4695,6 +4745,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -4777,6 +4828,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -4794,6 +4846,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -4902,6 +4955,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             ("complete", {
@@ -4991,6 +5045,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             ("complete", {
@@ -5150,6 +5205,7 @@ mod tests {
                         m.insert("vars.SKIP".to_string(), serde_json::json!({"is_set": true}));
                         Some(m)
                     },
+                    result: None,
                 },
             ),
             (
@@ -5167,6 +5223,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -5262,6 +5319,7 @@ mod tests {
                         m.insert("vars.SKIP".to_string(), serde_json::json!({"is_set": true}));
                         Some(m)
                     },
+                    result: None,
                 },
             ),
             (
@@ -5279,6 +5337,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);

@@ -123,6 +123,14 @@ pub struct TemplateState {
     /// evidence. Uses the same dot-path syntax as `when` clauses on transitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_if: Option<BTreeMap<String, serde_json::Value>>,
+    /// The declared result of a terminal state: a flat map from key to a
+    /// string value holding literal text, `{{VAR}}`, or `${context.<key>}`.
+    /// When present, koto resolves it once on the terminal tick and it
+    /// becomes the `WorkflowResult`'s `payload` in place of the
+    /// evidence-derived one. Meaningful only when `terminal` is true; the
+    /// grammar lives in [`crate::template::result_map`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<BTreeMap<String, String>>,
 }
 
 /// Template-level declaration that a state fans out child workflows from an
@@ -1102,6 +1110,20 @@ impl CompiledTemplate {
 
             // Validate evidence routing rules on transitions (D3 included).
             self.validate_evidence_routing(state_name, state, &captures)?;
+
+            // Validate a declared terminal result map.
+            if let Some(result) = &state.result {
+                crate::template::result_map::validate_result_map(
+                    state_name,
+                    state.terminal,
+                    result,
+                    |name| {
+                        self.variables.contains_key(name)
+                            || captures.contains_key(name)
+                            || RUNTIME_VARIABLE_NAMES.contains(&name)
+                    },
+                )?;
+            }
 
             // Validate variable references in directives.
             for ref_name in extract_refs(&state.directive) {
@@ -2085,6 +2107,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -2102,6 +2125,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         CompiledTemplate {
@@ -2420,6 +2444,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         assert!(
@@ -2576,6 +2601,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -2638,6 +2664,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -2691,6 +2718,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -2742,6 +2770,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -4172,6 +4201,7 @@ command: "./check.sh"
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         t
@@ -4288,6 +4318,7 @@ command: "./check.sh"
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4402,6 +4433,7 @@ command: "./check.sh"
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4687,6 +4719,7 @@ command: "./check.sh"
             failure: true,
             skipped_marker: true,
             skip_if: None,
+            result: None,
             ..TemplateState::default()
         };
         let json = serde_json::to_value(&state).unwrap();
@@ -4774,6 +4807,7 @@ command: "./check.sh"
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         let done = TemplateState {
             directive: "Done.".to_string(),
@@ -4788,6 +4822,7 @@ command: "./check.sh"
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         let mut states = BTreeMap::new();
         states.insert("plan".to_string(), plan);
@@ -4953,6 +4988,7 @@ command: "./check.sh"
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         t.states.insert("plan2".to_string(), plan2);
         let err = t.validate(true).unwrap_err();
@@ -5077,6 +5113,7 @@ command: "./check.sh"
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         t.states.insert("blocked".to_string(), blocked);
         let warnings = t.collect_materialize_children_warnings();
@@ -5105,6 +5142,7 @@ command: "./check.sh"
             failure: true,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();
@@ -5176,6 +5214,7 @@ command: "./check.sh"
             failure: true,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();
@@ -5212,6 +5251,7 @@ command: "./check.sh"
             failure: true,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();

@@ -171,7 +171,7 @@
             "--with-data",
             "{\"loop_again\":\"no\"}"
           ],
-          "stdout": "{\"action\":\"done\",\"advanced\":true,\"error\":null,\"expects\":null,\"state\":\"done\",\"unassigned_children\":[]}\n"
+          "stdout": "{\"action\":\"done\",\"advanced\":true,\"error\":null,\"expects\":null,\"result\":{\"status\":\"success\",\"summary\":\"completed at done\"},\"state\":\"done\",\"unassigned_children\":[]}\n"
         }
       ]
     },

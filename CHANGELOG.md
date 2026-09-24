@@ -10,6 +10,19 @@ to `0.9.x`).
 
 ### Added
 
+- **A terminal state can declare the result it reports.** A workflow's result
+  used to carry whatever evidence was submitted on its terminal state, so the
+  outcome a caller routed on was text an agent composed. A terminal state may
+  now declare `result:`, a map of up to 32 keys whose values mix literal text,
+  `{{VAR}}` and `${context.<key>}`. koto resolves it once, on the tick that
+  lands in the terminal, and it becomes the result's `payload`; a key whose
+  context reference does not resolve comes through empty and is listed in
+  `payload.missing`. The result now also rides the terminal `koto next`
+  response and `koto status` on a terminal session, as a new `result` field,
+  alongside the places it already went: the child's log, a bound request leg,
+  and the parent's `ChildCompleted`. A terminal without a map reports exactly
+  what it did before.
+
 - **`koto session rebind` moves a session whose checkout moved.** Execution
   anchoring shipped in 0.12.0 with the enforcement but not the repair: both
   refusals told the user to run `koto session rebind <session> --to <dir>`,
