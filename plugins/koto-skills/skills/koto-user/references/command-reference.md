@@ -34,6 +34,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto context remove` | Runner — primary |
 | `koto context list` | Runner — primary |
 | `koto config get/set/unset/list` | Runner — setup only |
+| `koto decider report` | Maintainer — decider promotion |
 | `koto template compile` | Author (brief mention) |
 | `koto template validate` | Author only |
 | `koto template export` | Author only |
@@ -895,6 +896,25 @@ koto config list --json          # Print merged config as JSON
 ```
 
 Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `workflows.native`.
+
+---
+
+## koto decider report
+
+```
+koto decider report [--ledger <path>] [--state <state>] [--json] [--include-custom-endpoints]
+koto decider report --fixtures <path> --template <path> --state <state> [--field <field>] [--json] [--include-custom-endpoints]
+```
+
+Read-only. Reports how often the decider agreed with agents, read from the decider ledger (`~/.koto/_decider_ledger.jsonl` unless `--ledger` names another file; a missing ledger is an empty report). An agent running a workflow doesn't need it; a maintainer uses it to decide whether a value can move from `shadow` to `auto`. It never changes a mode.
+
+Per question (state, field, and declaration hash) it prints consultations by outcome, paired observations, per-value recall, coverage, and disagreements, a confusion matrix, fallback and error rates, latency p50/p95, agent stops removed, and directive bytes not delivered. `--state` limits the output to one state.
+
+With `--fixtures` it runs a JSON Lines golden set (`{"id", "inputs": {label: text}, "expected"}` per line) through the runtime's own request and evaluation code and marks each value `eligible` or `ineligible`, naming every condition that failed: at least 10 cases per value and 40 in total, every case answered, no confident false positive, macro recall above the majority baseline, at least 30 paired ledger observations under the current declaration hash, and at most one disagreement where the decider chose the value. A fixture run needs an opted-in decider and network access. Runs and consultations against a custom endpoint (user config or `KOTO_DECIDER_ENDPOINT`) count toward eligibility only with `--include-custom-endpoints`.
+
+`--json` output has the top-level keys `ledger`, `header`, `questions`, and `fixtures`; each question carries `values`, `confusion`, `rates`, `latency_ms`, `success_measures`, and `flags`.
+
+**Exit codes:** 0 when the report printed, eligible or not; 2 for a rejected flag combination, a fixture run without opt-in, a bad template, state, field, or fixture line, or an endpoint that refuses the connection or the key; 3 when the ledger exists but can't be read.
 
 ---
 

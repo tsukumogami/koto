@@ -12,6 +12,8 @@
 //!   depends only on these.
 //! - `jev`, `http`: the Jev client and its bounded transport.
 //! - `ledger`: the append-only `_decider_ledger.jsonl` writers.
+//! - `report`: the ledger reader, the metrics, the fixture runner, and
+//!   promotion eligibility behind `koto decider report`.
 //! - [`build_decider`]: the only production constructor of a provider.
 
 pub mod evaluate;
@@ -21,12 +23,16 @@ pub mod http;
 pub mod jev;
 pub mod ledger;
 pub mod record;
+pub mod report;
 pub mod request;
 pub mod types;
 
 pub use evaluate::{evaluate, EffectiveModes, Evaluation, FieldEvaluation, FieldOutcome};
 pub use record::{ConsultationOutcome, DeciderConsultation, FieldConsultation};
-pub use request::{build_request, declared_fields, BuildRequestError, DeclaredField, DeclaredKind};
+pub use request::{
+    build_request, declared_fields, AssembledInputs, BuildRequestError, DeclaredField,
+    DeclaredKind, InputTextError,
+};
 pub use types::{
     Answer, AnswerOption, ApiKey, Decider, DeciderError, DecisionRequest, DecisionResponse,
     ErrorClass, GlobalMode, LabelledInput, Question, QuestionKind, SettingOrigin,

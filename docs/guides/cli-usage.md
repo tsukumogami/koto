@@ -865,6 +865,51 @@ koto dashboard --once my-workflow
 koto dashboard --interval 200
 ```
 
+### decider report
+
+Reads the decider ledger and reports, per question and per value, how often the decider agreed with agents. With `--fixtures` it also runs a golden fixture set against the configured decider and marks each value promotion-eligible or not. The command only reads: it never changes a mode, never writes the ledger or a session log, and compiles the template in memory without touching the compile cache.
+
+```bash
+koto decider report [--ledger <path>] [--state <state>] [--json] [--include-custom-endpoints]
+koto decider report --fixtures <path> --template <path> --state <state> [--field <field>] [--json] [--include-custom-endpoints]
+```
+
+**Optional flags:**
+- `--ledger <path>` -- Ledger to read. Defaults to `_decider_ledger.jsonl` in the koto home directory (`~/.koto/_decider_ledger.jsonl`, resolved from `HOME`). A missing ledger is an empty report, not an error.
+- `--state <state>` -- Report only questions on this state, in the table and in JSON. With `--fixtures`, it's also the state whose declaration the fixtures exercise.
+- `--json` -- Print the report as JSON instead of a table.
+- `--include-custom-endpoints` -- Count consultations and fixture runs sent to a user-config or `KOTO_DECIDER_ENDPOINT` endpoint toward promotion eligibility. Without it, only the default endpoint counts, so stub and redirected runs can't reach the bar. Metrics include custom-endpoint consultations either way.
+- `--fixtures <path>` -- Run this JSON Lines fixture set and judge promotion eligibility. Needs `--template` and `--state`.
+- `--template <path>` -- Template source whose declaration the fixtures exercise. Only valid with `--fixtures`.
+- `--field <field>` -- The declared field to exercise when the state declares more than one. Only valid with `--fixtures`.
+
+**What the ledger report shows.** A question is one state, field, and declaration hash; changing a declaration's question, values, descriptions, or inputs starts a new question, while changing a mode or threshold doesn't. For each question the report shows consultations by outcome, paired observations (a consultation and the agent's later answer for the same visit), and per value: paired count, recall, coverage, and disagreements where the decider picked that value at or above threshold and the agent chose another. It also shows a confusion matrix (rows are the agent's values; columns are the decider's confident value, `below_threshold`, `escape`, and `no_answer`), the disagreeing visits, fallback and error rates (errors broken down by `error_class`), latency p50 and p95 (nearest rank, leaving out `input_unavailable` consultations), agent stops removed, and directive bytes not delivered. Coverage uses well-formed answers (`applied` and `not_applied`) as its denominator, and the table prints the share over all consultations beside it. A question with at least 30 consultations that had a value in `auto`, whose coverage over those is below 30%, carries a `low_coverage` flag.
+
+The header counts ledger lines, skipped malformed lines, lines of an unknown kind, duplicate consultations, orphaned answers, consultations with no session id (counted but never paired), and consultations from a custom endpoint along with how many of those are excluded from eligibility.
+
+**Fixture file.** One JSON object per line with `inputs` (each declared input label mapped to its text), `expected` (a declared value, the escape, or a JSON `true`/`false` for a boolean field), and an optional `id`. Every line is checked before anything is sent: an unknown key, an undeclared `expected`, a missing or extra input label, or an input over its `max_bytes` stops the run with the line number. Each case goes through the same request building, provider client, and evaluation the runtime uses, and nothing it does is recorded.
+
+**Opt-in and network.** A fixture run needs an opted-in decider: an effective mode of `shadow` or `auto` (a project `.koto/config.toml` can only lower it), an API key, and an endpoint from the key's own layer or the default. Without that, the command says fixture runs need an opted-in decider and sends nothing. A refused connection or a rejected key stops the run. A timeout or an unusable answer on one case records that case as `no_answer` and the run continues.
+
+**Eligibility conditions.** A value is `eligible` when all of these hold, and otherwise the output names each condition that failed:
+- at least 10 fixture cases labelled with the value (the escape needs none; a boolean needs 10 each for `true` and `false`);
+- at least 40 fixture cases in total, escape-labelled cases included;
+- every fixture case got an answer (one `no_answer` makes every value ineligible);
+- no fixture labelled otherwise is answered with the value at or above its threshold;
+- macro recall exceeds always choosing the most frequent label (that baseline is 0 when the escape is the most frequent label);
+- at least 30 paired observations under the current declaration hash;
+- at most 1 ledger disagreement where the decider chose the value;
+- the fixture run used the default endpoint, unless `--include-custom-endpoints` is passed.
+
+A value the template marks `never` is still judged and is shown with a `(template: never)` note.
+
+**JSON output.** The top-level keys are `ledger`, `header`, `questions`, and `fixtures` (`null` without `--fixtures`). Each question carries `values`, `confusion`, `rates`, `latency_ms`, `success_measures`, and `flags`. The `fixtures` object carries the declaration hash, the case results, `macro_recall`, `majority_baseline`, and per-value `eligible`, `status`, `conditions`, and `reasons`.
+
+**Exit codes:**
+- `0` -- The report printed, whether or not any value is eligible.
+- `2` -- A caller problem: a flag combination clap rejects, a fixture run without an opted-in decider, a template that doesn't compile, a state with no declared field (or several and no `--field`), a bad fixture line, or an endpoint the run can't reach or that rejects the key.
+- `3` -- The ledger exists but can't be read.
+
 ### version
 
 Prints version information as JSON.

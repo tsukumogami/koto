@@ -6,6 +6,7 @@ pub mod dashboard;
 pub mod dashboard_data;
 pub mod dashboard_render;
 pub mod dashboard_state;
+pub mod decider;
 pub mod decider_port;
 pub mod init_child;
 pub mod next;
@@ -267,6 +268,12 @@ pub enum Command {
     Config {
         #[command(subcommand)]
         subcommand: ConfigCommand,
+    },
+
+    /// Decider ledger report and promotion eligibility
+    Decider {
+        #[command(subcommand)]
+        subcommand: decider::DeciderCommand,
     },
 
     /// Workspace-level reclaim and maintenance verbs
@@ -1661,6 +1668,7 @@ pub fn run(app: App) -> Result<()> {
             }
         }
         Command::Config { subcommand } => handle_config(subcommand),
+        Command::Decider { subcommand } => decider::handle(subcommand),
         Command::Workspace { subcommand } => {
             let backend = build_backend()?;
             match subcommand {

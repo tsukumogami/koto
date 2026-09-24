@@ -31,7 +31,8 @@
 //! text: [`DeciderConsultation`] holds none, and an `answered` record
 //! holds only the values the agent submitted for declared fields.
 //!
-//! This module holds the writers. Reading the ledger belongs to the report.
+//! This module holds the writers. Reading the ledger belongs to
+//! [`super::report`], behind `koto decider report`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
