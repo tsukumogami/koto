@@ -5408,6 +5408,7 @@ command: "./check.sh"
             failure: true,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         t.states.insert("failed".to_string(), failed);
         for (name, assign) in ["a", "b"].iter().zip(assigns) {
@@ -5434,6 +5435,7 @@ command: "./check.sh"
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             );
         }

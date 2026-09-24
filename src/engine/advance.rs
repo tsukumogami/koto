@@ -4697,6 +4697,7 @@ mod tests {
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         let template = make_template(vec![
             (
@@ -4723,6 +4724,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             ("merged", terminal("Merged.")),
@@ -4809,6 +4811,7 @@ mod tests {
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         let template = make_template(vec![
             (
@@ -4835,6 +4838,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             ("merged", terminal("Merged.")),
