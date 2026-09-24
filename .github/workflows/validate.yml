@@ -95,6 +95,40 @@ jobs:
       - name: Run clippy
         run: cargo clippy -- -D warnings
 
+  decider-checks:
+    # The decider must not pull an async HTTP stack or a second attohttpc
+    # into the build, and its provider-neutral files must stay free of I/O
+    # and of Jev's wire vocabulary.
+    name: Decider Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the dependency tree for async HTTP stacks
+        run: |
+          set -euo pipefail
+          banned="$(cargo tree --workspace -e normal,build,dev --prefix none \
+            | awk '{print $1}' | grep -E '^(tokio|hyper|reqwest|ureq)(-.*)?$' | sort -u || true)"
+          if [ -n "$banned" ]; then
+            echo "::error::cargo tree lists an async HTTP stack: $(echo $banned)"
+            exit 1
+          fi
+          atto="$(cargo tree --workspace -d -e normal,build,dev --depth 0 --prefix none \
+            | grep -cE '^attohttpc v' || true)"
+          if [ "$atto" -gt 1 ]; then
+            echo "::error::cargo tree -d lists more than one attohttpc"
+            cargo tree --workspace -d -i attohttpc || true
+            exit 1
+          fi
+          echo "PASS: no tokio, hyper, reqwest, or ureq; one attohttpc"
+
+      - name: Check decider module purity
+        run: bash scripts/check-decider-purity.sh
+
   audit:
     name: Audit
     runs-on: ubuntu-latest
@@ -190,7 +224,7 @@ jobs:
 
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, stability-tests, fmt, clippy, audit, tsuku-distributed-install, cloud-integration]
+    needs: [check-artifacts, unit-tests, stability-tests, fmt, clippy, decider-checks, audit, tsuku-distributed-install, cloud-integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -201,6 +235,7 @@ jobs:
              [ "${{ needs.stability-tests.result }}" = "failure" ] || \
              [ "${{ needs.fmt.result }}" = "failure" ] || \
              [ "${{ needs.clippy.result }}" = "failure" ] || \
+             [ "${{ needs.decider-checks.result }}" = "failure" ] || \
              [ "${{ needs.audit.result }}" = "failure" ] || \
              [ "${{ needs.cloud-integration.result }}" = "failure" ] || \
              [ "${{ needs.tsuku-distributed-install.result }}" = "failure" ]; then

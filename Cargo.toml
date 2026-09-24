@@ -42,6 +42,9 @@ url = "2.5"
 anyhow = "1"
 tempfile = "3"
 rust-s3 = { version = "0.37", default-features = false, features = ["sync-rustls-tls", "fail-on-err"] }
+# HTTP client for the decider. Declared at the version and features rust-s3
+# already enables, so the dependency graph gains no crate.
+attohttpc = { version = "0.30", default-features = false, features = ["tls-rustls-webpki-roots", "json"] }
 ratatui = "0.29"
 crossterm = "0.28"
 
