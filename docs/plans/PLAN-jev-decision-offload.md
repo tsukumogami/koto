@@ -4,7 +4,7 @@ status: Active
 execution_mode: coordinated
 upstream: docs/designs/DESIGN-jev-decision-offload.md
 milestone: "Decisions koto can settle without the agent"
-issue_count: 14
+issue_count: 13
 split_rationale: |
   Hard Constraint. The work spans tsukumogami/koto and tsukumogami/shirabe,
   and shirabe's decider declarations must be validated by a published koto
@@ -21,7 +21,7 @@ split_rationale: |
 Active
 
 Work items are local to this PLAN (no GitHub issues are filed). Issues are
-numbered `#1`-`#14` here and in the Implementation Issues table.
+numbered `#1`-`#13` here and in the Implementation Issues table.
 
 ## Scope Summary
 
@@ -57,13 +57,6 @@ ledger and `koto decider report`, and reshape shirabe's `/work-on` and
   terminal tick), so #5 follows #4's event. #6 joins the ledger and runs
   fixtures through #3's code, and #7 documents the finished surface (the
   `doc_names` check requires the verb to exist first).
-- **Live validation before the release (#14).** Every other test runs
-  against a stub written from our reading of the Jev docs, and those docs
-  disagree with themselves (the quickstart's example response omits
-  `probabilities`, which the API reference lists and Decision 3 depends on).
-  #14 runs the client and an example workflow against the real API behind a
-  feature flag and a repository secret, after #3, #4 and #6 exist, and the
-  release gate requires it green on the tagged commit.
 - **koto compatibility proof inside the koto PR (#8).** R27's old-binary
   guarantee is proven before any release, so the release gate that shirabe's
   declarations wait on already implies it.
@@ -76,7 +69,7 @@ ledger and `koto decider report`, and reshape shirabe's `/work-on` and
   that compiles and checks them is released, so #13 waits on the
   `koto-release` gate as well as #9, #11 and #12.
 
-Delivery: three PRs (`pr-koto-default`: #1-#8 and #14; `pr-shirabe-deterministic`:
+Delivery: three PRs (`pr-koto-default`: #1-#8; `pr-shirabe-deterministic`:
 #9-#12; `pr-shirabe-declarations`: #13), plus the coordination PR (the koto
 docs branch carrying the PRD, DESIGN and this PLAN), which merges last.
 
@@ -639,6 +632,7 @@ Downstream deliverables:
 
 **Acceptance Criteria**:
 
+- [ ] The guide states plainly that the Jev client has so far been verified only against a stub built from the published API docs, not against the live API, and that live validation is a pending follow-up.
 - [ ] `plugins/koto-skills/skills/koto-author/references/template-format.md` gains a decider section placed after `### The accepts block` that covers: the full `decider` block syntax for enum and boolean fields, every default, the four modes and what each does (`off`, `shadow`, `auto`, `never`), the escape (required on enums, refused on booleans, never listed in `values` or tested in a `when`), input sources and byte budgets, the one-question-per-state rule, and the floor rule with the `E-DECIDER-FLOOR` code and a worked example of a rejected `auto`.
 - [ ] The koto-author material states which parts of a declaration feed the declaration hash (question, values, value and escape descriptions, escape, inputs) and which don't (modes, thresholds), and why that matters: promoting a value keeps its evidence, but rewording a description starts the evidence over.
 - [ ] The koto-author material explains promotion: every value ships in `shadow` or `never`, a maintainer runs `koto decider report` (with `--fixtures`, `--template`, `--state`) against a golden fixture file, and moves a value to `auto` by editing its `mode` only when the report marks it promotion-eligible. It lists the eligibility bar in plain terms (at least 10 fixture cases per value and 40 in total, no false positives for that value, macro recall above the majority baseline, at least 30 paired ledger observations with at most one disagreement) and says the report never changes a mode.
@@ -959,45 +953,6 @@ Compatibility and compile:
 
 **Type**: code
 
-### Issue 14: test(decider): verify the Jev client and a decider workflow against the live API
-
-**Goal**: Prove the koto decider works against the real Jev API, not just the stub: a feature-gated live test suite exercises the client and a small example workflow end to end, and a CI job with a repository secret runs it on trusted triggers so a koto release is never cut on a client that only agrees with the stub.
-
-**Repo**: `tsukumogami/koto` (PR group `default`); **Complexity**: testable
-
-**Acceptance Criteria**:
-
-**Prerequisite (outside the code)**
-
-- [ ] A `KOTO_DECIDER_API_KEY` GitHub Actions secret exists on `tsukumogami/koto`, holding a key created at `console.typesafe.ai`, and the maintainer has confirmed it answers a one-question request at `https://api.typesafe.ai/v1/systemone`. The PR description states the secret's owner and where it's rotated.
-
-**Example workflow**
-
-- [ ] A template at `test/fixtures/decider-live/decider-live.md` declares, in one state, one enum field (three values plus an escape; one value `auto` at threshold 0.8 on a non-terminal, gate-free route; the others `shadow` or `never`), and in a separate later state one boolean field with both values `auto`. Each field reads a context key the template gates on. It compiles with the new koto and passes the R5/R6 rules from <<ISSUE:1>>.
-- [ ] Input fixtures beside it cover: an input whose answer is unambiguous for the `auto` value, an input that should land on another value, and an input designed to be ambiguous.
-
-**Live test suite**
-
-- [ ] The live tests sit behind a cargo feature (`decider-live-tests`), so a plain `cargo test` never compiles or runs them. With the feature on but no `KOTO_DECIDER_API_KEY` they fail with a message naming the missing variable rather than passing silently. `validate.yml`'s coverage job stops using `--all-features` and lists its features explicitly, leaving `decider-live-tests` out, and no job triggered by `pull_request` enables that feature.
-- [ ] Client-level: one request with an enum question and a boolean question to the real endpoint returns answers that `src/decider/jev.rs` parses without a `malformed` or `mismatched` error. Every choice answer carries `probabilities` over all declared values plus the escape, summing to within 0.01 of 1. The recorded model string is non-empty and not `unknown`.
-- [ ] If the live API's response shape differs from what <<ISSUE:3>> implemented (for example, `probabilities` missing or nested differently), the test fails with the observed shape, and this issue's PR updates `src/decider/jev.rs`, its stub fixtures, and the DESIGN's Decision 3 text to match the real API before merging.
-- [ ] An invalid key produces `http_status` 401 handling: `koto next` returns the opted-out response, prints the fixed 401 warning once, and the key string never appears in stdout, stderr, the session log, or the ledger.
-- [ ] Workflow end to end, with `HOME` set to a temp dir, and `KOTO_DECIDER=auto` and the secret key set explicitly on each spawned `koto` command (overriding the forced `off` from `.cargo/config.toml`): for every consultation, the run is applied if and only if every field's recorded outcome is `qualified`. When applied, the log shows `decider_consulted` with outcome `applied`, then `source: "decider"` evidence, then `transitioned`, with no `evidence_required` response. When not applied, the agent-facing response equals the `KOTO_DECIDER=off` response. Every consultation leaves exactly one `consulted` ledger record. The test does not assert which value the model picks, and fails, printing each field's recorded probabilities and confidence, if no consultation in the run was applied.
-- [ ] If any consultation records `error_class` `timeout`, `connect`, or `http_status` with 429, 529 or another 5xx, the test fails with a message saying the provider was unavailable and naming the status, instead of failing a behavioral assertion.
-- [ ] The same end-to-end run with `KOTO_DECIDER=shadow` never applies an answer and produces responses identical to `KOTO_DECIDER=off`.
-- [ ] `koto decider report --fixtures` over the example's fixture file (a small set, below eligibility size) completes against the live API with exit 0 and prints per-value results, and reports the set as too small for eligibility rather than marking anything eligible.
-- [ ] The suite counts its provider requests (`decider_consulted` events plus direct client calls plus fixture cases) and fails if a run exceeds 20. The example's fixture file has at most 6 cases.
-
-**CI job**
-
-- [ ] A workflow (for example `.github/workflows/decider-live.yml`) runs the live suite on `push` to `main`, on a nightly `schedule`, and on `workflow_dispatch`, and never on `pull_request` or `pull_request_target`, so fork PRs can't reach the secret.
-- [ ] The job reads the key only from `secrets.KOTO_DECIDER_API_KEY`, passes it to the test process alone, and fails (not skips) when the secret is empty on its trusted triggers.
-- [ ] `release.yml` gains a job that runs the live suite on the pushed tag with `secrets.KOTO_DECIDER_API_KEY` (tag pushes aren't reachable from forks), and the job that publishes the GitHub release declares `needs:` on it, so a tag whose live run fails produces no release.
-
-**Dependencies**: <<ISSUE:3>>, <<ISSUE:4>>, <<ISSUE:6>>
-
-**Type**: code
-
 ## Implementation Issues
 
 ### Milestone: Decisions koto can settle without the agent
@@ -1043,9 +998,6 @@ Compatibility and compile:
 | [#13: feat(shirabe): declare three decider-eligible decisions with golden fixtures](#issue-13-featshirabe-declare-three-decider-eligible-decisions-with-golden-fixtures) | [#9](#issue-9-featexecute-compute-upstream-drift-facts-before-the-rebase), [#11](#issue-11-featwork-on-record-changed-paths-and-route-issue-type-in-one-state), [#12](#issue-12-cishirabe-check-changed-templates-against-the-koto-v0122-floor) | testable |
 | ^_Repo: tsukumogami/shirabe \| Group: declarations_ | | |
 | _Declares `plan_validation`, `issue_type_routing`, and `worktree_discipline_check` in shadow or never with golden fixtures, once a koto release containing issue 1-issue 8 exists._ | | |
-| [#14: test(decider): verify the Jev client and a decider workflow against the live API](#issue-14-testdecider-verify-the-jev-client-and-a-decider-workflow-against-the-live-api) | [#3](#issue-3-featdecider-add-provider-neutral-decider-types-and-the-jev-client), [#4](#issue-4-featengine-consult-the-decider-when-a-state-would-stop-for-evidence), [#6](#issue-6-featcli-add-koto-decider-report-with-promotion-eligibility-and-fixtures) | testable |
-| ^_Repo: tsukumogami/koto \| Group: default_ | | |
-| _Runs issue 3's client and an example declared workflow against the real Jev API behind a cargo feature and a repository secret, on trusted CI triggers only, and makes a green run on the tagged commit a release requirement._ | | |
 | ^_Gate: koto-release \| After: pr-koto-default \| Before: pr-shirabe-declarations_ | | |
 
 ## Dependency Graph
@@ -1061,7 +1013,6 @@ graph TD
         I6["#6: koto decider report"]
         I7["#7: koto-skills docs"]
         I8["#8: v0.12.2 compatibility CI"]
-        I14["#14: live Jev validation"]
     end
     G1{{"koto-release gate"}}
     subgraph shirabeA["tsukumogami/shirabe (pr-shirabe-deterministic)"]
@@ -1084,10 +1035,6 @@ graph TD
     I1 --> I8
     I4 --> I8
     I8 --> G1
-    I3 --> I14
-    I4 --> I14
-    I6 --> I14
-    I14 --> G1
     I7 --> G1
     I9 --> I12
     I10 --> I12
@@ -1108,7 +1055,7 @@ graph TD
     classDef tracksPlan fill:#FFE0B2,stroke:#F57C00,color:#000
 
     class I1,I2,I9,I10,I11 ready
-    class I3,I4,I5,I6,I7,I8,I12,I13,I14 blocked
+    class I3,I4,I5,I6,I7,I8,I12,I13 blocked
 ```
 
 **Legend**: Green = done, Blue = ready, Yellow = blocked
@@ -1124,11 +1071,10 @@ The hexagon node is the non-PR `koto-release` gate.
 
 - Start immediately: #1 and #2 (koto), and #9, #10, #11 (shirabe).
 - After #1 and #2: #3. After #3: #4. After #4: #5 and #8 in parallel.
-- After #6: #14 (live validation), in parallel with #7.
 - `pr-shirabe-deterministic` (#9-#12) proceeds entirely in parallel with the
   koto PR and can merge first.
 
 **Merge order:** `pr-koto-default` and `pr-shirabe-deterministic` in either
 order; then the `koto-release` gate (a published koto release whose tag
-contains the koto PR's merge commit and has a green `decider-live` run); then `pr-shirabe-declarations`; the
+contains the koto PR's merge commit); then `pr-shirabe-declarations`; the
 coordination PR merges last.

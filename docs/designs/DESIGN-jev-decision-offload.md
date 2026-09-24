@@ -644,9 +644,6 @@ src/config/{mod,resolve,validate}.rs  [decider] table, merge_decider, resolve_de
 .cargo/config.toml             KOTO_DECIDER=off for tests
 .github/workflows/validate.yml cargo tree check (no tokio/hyper/reqwest/ureq);
                                v0.12.2 log-read + boolean compat job
-.github/workflows/decider-live.yml  live Jev suite (feature decider-live-tests),
-                               trusted triggers only, repository secret
-test/fixtures/decider-live/    example declared workflow + inputs for the live suite
 docs/reference/session-feed.md decider_consulted (tier 2)
 plugins/koto-skills/*          koto-author, koto-user, koto-adhoc guidance + evals
 
@@ -793,13 +790,6 @@ Deliverables:
 - The `validate.yml` job that reads a `decider_consulted` log with koto
   v0.12.2 and runs the boolean-declaration compatibility fixture, installing
   through the pinned installer.
-- A live validation suite behind the `decider-live-tests` cargo feature that
-  runs the Jev client and an example declared workflow against the real API,
-  and a `decider-live.yml` job that runs it on pushes to main, nightly, and on
-  manual dispatch with the `KOTO_DECIDER_API_KEY` repository secret. Every
-  other test uses a stub built from the published docs, which disagree with
-  each other on whether `choice` answers carry `probabilities`, so a release
-  requires this job green on the tagged commit.
 
 ### Phase 6: Deterministic shirabe moves (shirabe PR A, any time)
 
@@ -947,15 +937,6 @@ pinned koto commit and fails if no checksum tool is available. shirabe's
 fixture check makes no network call, so a fork's pull request can't spend a
 real key.
 
-**The live validation job.** One job does hold a real key: `decider-live.yml`
-reads `secrets.KOTO_DECIDER_API_KEY` and runs only on pushes to `main`, on a
-schedule, and on manual dispatch, never on `pull_request` or
-`pull_request_target`, so code from a fork never runs with the secret. The key
-is passed to the test process alone, the suite caps itself at 20 provider
-requests per run, and the same redaction rules apply: the key never appears in
-logs, the ledger, or test output. The tag-push release job runs the same suite, and publishing waits on it. The key is scoped to CI and rotated at the
-provider's console by the maintainer who owns the secret.
-
 **Existing issue, filed separately.** A checked-in `.koto/config.toml` can
 already set cloud-sync endpoint and credential keys, because the project-key
 allowlist is enforced only by `koto config set`, not at load. This design fixes
@@ -992,7 +973,19 @@ own issue, because it changes existing behavior outside this feature.
 - The drift prefilter can route to `none` when a PLAN names its code only in
   unquoted prose.
 
+- The Jev client is verified only against a stub written from the published
+  API docs, and those docs disagree with each other on whether `choice`
+  answers carry `probabilities`, which evaluation depends on. A live
+  validation suite (the client plus an example declared workflow, behind a
+  `decider-live-tests` feature and a CI secret, gating releases) is deferred
+  because the provider isn't taking new signups. Until it runs, the decider
+  is unverified against the real API.
+
 ### Mitigations
+
+- The live validation suite is the first follow-up once a key can be obtained.
+  Until then, the guide marks the client as stub-verified, and no shirabe value
+  ships in `auto`, so an unverified client can't settle a real decision.
 
 - The module boundaries (template, decider, engine, cli port) keep each piece
   small and independently testable. Every behavior has a stub-based
