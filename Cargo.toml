@@ -36,6 +36,9 @@ regex = "1"
 opener = "0.7"
 thiserror = "1"
 toml = "0.8"
+# Endpoint parsing for the decider config. Declared at the 2.5 line that is
+# already in the lockfile through rust-s3, so no crate is added.
+url = "2.5"
 anyhow = "1"
 tempfile = "3"
 rust-s3 = { version = "0.37", default-features = false, features = ["sync-rustls-tls", "fail-on-err"] }
