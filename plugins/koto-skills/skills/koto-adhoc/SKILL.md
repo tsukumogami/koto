@@ -44,7 +44,7 @@ Don't reach for it when:
 
 ## Prerequisites
 
-- koto >= 0.12.3 must be installed and on PATH (`koto version` to verify).
+- koto >= 0.13.0 must be installed and on PATH (`koto version` to verify).
 
 If koto is not installed or the version is too old, install the latest release:
 
