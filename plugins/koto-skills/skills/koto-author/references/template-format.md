@@ -793,6 +793,27 @@ states:
 
 When the engine fires a `skip_if` transition, it immediately re-evaluates the new state. If that state also has a matching `skip_if`, the engine advances again — all within the same `koto next` call. The response always reflects the final landing state. `advanced: true` appears in the response whenever at least one `skip_if` fired during the call.
 
+### `context_assignments` — context writes on a transition
+
+A transition can write context keys when it fires. Values are literals, `{{VAR}}`, `${evidence.<field>}`, or `${gates.<gate>.<path>}`, and references can sit inside a string literal:
+
+```yaml
+transitions:
+  - target: done_blocked
+    when:
+      status: blocked
+    context_assignments:
+      outcome: blocked
+      failure_reason: "blocked: ${evidence.detail}"
+      ci_exit: "${gates.ci.exit_code}"
+```
+
+Compile-time rules: keys must be usable context keys; values must be strings (numbers and booleans are written as text, mappings and lists are errors); `${evidence.<field>}` must name an `accepts` field of the source state; `${gates.<gate>...}` must name a gate on the source state; `{{VAR}}` must be a declared variable or capture; any other `${...}` (for example `${context.key}`) is an error.
+
+Runtime rules: only the edge that fires writes. It writes on every kind of transition: evidence-resolved, gate-resolved auto-advance, and `skip_if`. An evidence field not submitted, or a gate path absent from that tick's output, resolves to `""` and the transition still happens. A gate path walks any nesting (`${gates.leg.payload.pr}`). Values are stored as resolved and never expanded again. A later write to the same key replaces the earlier one. The values are recorded on the `transitioned` event, and a failed store write is restored from the log on the next `koto context get`, `koto context exists`, or context gate.
+
+A command gate's output is only `exit_code` and `error`. To put what a script printed into context, have a `default_action` run `koto context add`.
+
 ### Self-loops
 
 A transition whose target is its own state creates a retry loop. The agent (or the engine via gate routing) stays in the state until conditions change:
@@ -1007,6 +1028,8 @@ The compiler enforces:
 ### `deny_unknown_fields` narrowed to source templates
 
 `#[serde(deny_unknown_fields)]` applies only to `SourceState` (the YAML-frontmatter surface). Compiled template JSON files no longer reject unknown fields, so adding a new compiled-template field in a release doesn't brick state files created by earlier versions. Template authors still get strict rejection at compile time.
+
+Transitions are strict too: a key other than `target`, `when` and `context_assignments` on a transition fails compilation with a message naming the state, the target and the field. Before koto#204 such keys were dropped silently.
 
 ### Compile and runtime rule vocabulary
 

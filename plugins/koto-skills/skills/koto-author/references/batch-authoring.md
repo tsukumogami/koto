@@ -84,11 +84,22 @@ W4 and F5 are the two rules most likely to bite first-time batch authors. W4 pre
 
 When a worker enters a terminal state with `failure: true`, the parent's batch view exposes a per-child `reason`. That reason comes from one of three places, in priority order:
 
-1. The `failure_reason` context key written by the terminal state's `accepts` block (this check is what W5 verifies today).
+1. The `failure_reason` context key written by the terminal state's `accepts` block.
 2. A `default_action` that writes `failure_reason`.
 3. A `context_assignments` entry on a transition into the terminal state.
 
-Without any of these, the reason falls back to the state name, and the parent sees `reason_source: "state_name"` instead of `reason_source: "failure_reason"`. W5 warns at compile time when no path writing `failure_reason` is declared, so the author notices before the first failed run.
+Without any of these, the reason falls back to the state name, and the parent sees `reason_source: "state_name"` instead of `reason_source: "failure_reason"`. W5 warns at compile time when no path writing `failure_reason` is declared, so the author notices before the first failed run. It checks (1) and (3); for (3) every transition into the terminal must assign `failure_reason`, since one edge that doesn't reaches the terminal with no reason. A `default_action` write (2) isn't detected, so a template relying on it still sees W5.
+
+The assignment form looks like this:
+
+```yaml
+transitions:
+  - target: done_blocked
+    when:
+      status: blocked
+    context_assignments:
+      failure_reason: "blocked: ${evidence.detail}"
+```
 
 The simplest satisfying pattern is to accept `failure_reason` as an evidence field on the failure state:
 

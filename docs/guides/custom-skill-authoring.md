@@ -474,6 +474,58 @@ transitions:
 
 Single-segment paths like `decision: proceed` still work for agent-submitted evidence. Dot-path traversal (`gates.ci_check.exit_code`) is for gate output fields injected by the engine.
 
+### Writing context from a transition
+
+A transition can write context keys itself when it fires, through `context_assignments`. It's a map of context key to a string value:
+
+```yaml
+states:
+  review:
+    accepts:
+      verdict:
+        type: enum
+        values: [approve, block]
+        required: true
+      detail:
+        type: string
+    gates:
+      ci:
+        type: command
+        command: "make test"
+    transitions:
+      - target: done
+        when:
+          verdict: approve
+          gates.ci.exit_code: 0
+        context_assignments:
+          outcome: landed
+          topic: "{{TOPIC}}"
+          ci_exit: "${gates.ci.exit_code}"
+      - target: done_blocked
+        when:
+          verdict: block
+        context_assignments:
+          outcome: blocked
+          failure_reason: "review blocked: ${evidence.detail}"
+```
+
+A value takes four forms, and references may sit inside a string literal as `failure_reason` does above:
+
+| Form | Resolves to |
+|------|-------------|
+| a literal (`landed`) | itself |
+| `{{VAR}}` | the session's variable, including a `capture_stdout_as` value delivered earlier in the same `koto next` |
+| `${evidence.<field>}` | the value submitted for `<field>` in the evidence that drove the transition |
+| `${gates.<gate>.<path>}` | a dot path into the gate's structured output for that tick; it walks any nesting, so it works for every gate type |
+
+The compiler checks every assignment. Each key must be a usable context key (letters, digits, `.`, `_`, `-`, and `/` between components). A value must be a string; numbers and booleans are written as text, and a mapping or a list is an error. `${evidence.<field>}` must name a field in the state's `accepts` block, `${gates.<gate>...}` must name a gate declared on the state, and `{{VAR}}` must name a declared variable or capture. Any other `${...}`, such as `${context.key}`, is refused. So is any key on a transition other than `target`, `when` and `context_assignments`: a typo like `context_assignment:` fails compilation instead of being ignored.
+
+At run time only the edge that fires writes anything. An evidence field that wasn't submitted, or a gate path that isn't in that tick's output, resolves to the empty string and the transition still happens. Resolved values are stored exactly as resolved: a submitted value that contains `{{X}}` or `${context.y}` is written literally, never expanded a second time. A later write to the same key, whether from another transition or `koto context add`, replaces the earlier value.
+
+The resolved values are recorded on the transition's own event in the session log, so a transition and its assignments can't be separated by a crash. If writing them to the context store fails after that, the next `koto context get`, `koto context exists`, or context gate restores them from the log.
+
+A command gate's output is only `exit_code` and `error`, so a gate path can't carry what a script printed. To get a script's output into context, have a `default_action` run `koto context add`.
+
 ### Updating your SKILL.md
 
 When your template uses content-aware gates, update the SKILL.md to instruct the agent to submit content through `koto context add` rather than writing files to `{{SESSION_DIR}}`. The evidence keys section should document the expected content keys and their purpose.
