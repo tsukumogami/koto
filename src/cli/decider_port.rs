@@ -10,8 +10,10 @@
 //!    header's `session_id`;
 //! 3. derives the visit's seq and re-checks for a prior consultation;
 //! 4. assembles each declared input from the context store or the
-//!    variable bindings, within its byte budget;
-//! 5. calls the provider and times it.
+//!    variable bindings, within its byte budget, into [`AssembledInputs`];
+//! 5. builds the request from those with `build_request` (the fixture
+//!    runner in `koto decider report` enters at the same seam), then calls
+//!    the provider and times it.
 //!
 //! When the engine reports the `decider_consulted` append through
 //! [`DeciderPort::recorded`], the port writes the ledger's `consulted`
@@ -31,7 +33,7 @@ use sha2::{Digest, Sha256};
 
 use crate::decider::ledger::{append_or_warn, LedgerRecord};
 use crate::decider::record::ConsultationOutcome;
-use crate::decider::request::{build_request, DeclaredField};
+use crate::decider::request::{build_request, AssembledInputs, DeclaredField};
 use crate::decider::types::{Decider, LabelledInput, SettingOrigin};
 use crate::engine::decider::{
     prior_consultation, visit_start_index, ConsultReply, ConsultRequest, ConsultResult,
@@ -189,12 +191,12 @@ impl<'a> CliDeciderPort<'a> {
         &self,
         fields: &[DeclaredField<'_>],
         events: &[Event],
-    ) -> Result<BTreeMap<String, String>, InputUnavailable> {
+    ) -> Result<AssembledInputs, InputUnavailable> {
         let bindings = bindings_from_events(events);
-        let mut out = BTreeMap::new();
+        let mut out = AssembledInputs::new();
         for field in fields {
             for input in &field.decider.inputs {
-                if out.contains_key(&input.label) {
+                if out.contains(&input.label) {
                     continue;
                 }
                 let budget = input.max_bytes as usize;
@@ -218,7 +220,7 @@ impl<'a> CliDeciderPort<'a> {
                         value.clone()
                     }
                 };
-                out.insert(input.label.clone(), content);
+                out.insert(input.label.as_str(), content);
             }
         }
         Ok(out)
@@ -330,7 +332,7 @@ impl DeciderPort for CliDeciderPort<'_> {
         let request = self
             .assemble_inputs(req.fields, &events)
             .ok()
-            .and_then(|inputs| build_request(req.fields, &inputs).ok());
+            .and_then(|inputs| build_request(req.fields, inputs.as_map()).ok());
         let Some(request) = request else {
             return self.consulted(
                 start.seq,

@@ -98,6 +98,113 @@ impl fmt::Display for BuildRequestError {
 
 impl std::error::Error for BuildRequestError {}
 
+/// Input contents keyed by label: the seam between assembling a
+/// consultation's inputs and building its request.
+///
+/// The runtime assembles one from the context store and the variable
+/// bindings; the fixture runner builds one from a fixture line's texts
+/// with [`AssembledInputs::from_texts`]. Either way [`build_request`]
+/// sees the same map, so both send the same request for the same texts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AssembledInputs(BTreeMap<String, String>);
+
+impl AssembledInputs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `content` under `label`.
+    pub fn insert(&mut self, label: impl Into<String>, content: impl Into<String>) {
+        self.0.insert(label.into(), content.into());
+    }
+
+    pub fn contains(&self, label: &str) -> bool {
+        self.0.contains_key(label)
+    }
+
+    /// The label-to-content map [`build_request`] takes.
+    pub fn as_map(&self) -> &BTreeMap<String, String> {
+        &self.0
+    }
+
+    /// Inputs supplied as texts by label, checked against `fields`' declared
+    /// inputs: every declared label present, no other label, and each text
+    /// within its label's `max_bytes`.
+    pub fn from_texts(
+        fields: &[DeclaredField<'_>],
+        texts: BTreeMap<String, String>,
+    ) -> Result<Self, InputTextError> {
+        let mut budgets: Vec<(&str, u32)> = Vec::new();
+        for field in fields {
+            for input in &field.decider.inputs {
+                if !budgets.iter().any(|(l, _)| *l == input.label) {
+                    budgets.push((&input.label, input.max_bytes));
+                }
+            }
+        }
+        if let Some(extra) = texts.keys().find(|k| !budgets.iter().any(|(l, _)| l == k)) {
+            return Err(InputTextError::Extra {
+                label: extra.clone(),
+            });
+        }
+        for (label, max_bytes) in &budgets {
+            let Some(text) = texts.get(*label) else {
+                return Err(InputTextError::Missing {
+                    label: label.to_string(),
+                });
+            };
+            if text.len() > *max_bytes as usize {
+                return Err(InputTextError::OverBudget {
+                    label: label.to_string(),
+                    bytes: text.len(),
+                    max_bytes: *max_bytes,
+                });
+            }
+        }
+        Ok(AssembledInputs(texts))
+    }
+}
+
+/// Why supplied input texts don't match a declaration. Never carries
+/// input content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputTextError {
+    /// A declared label has no text.
+    Missing { label: String },
+    /// A label the declaration doesn't read.
+    Extra { label: String },
+    /// A text over its label's `max_bytes`.
+    OverBudget {
+        label: String,
+        bytes: usize,
+        max_bytes: u32,
+    },
+}
+
+impl fmt::Display for InputTextError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InputTextError::Missing { label } => {
+                write!(f, "input label {:?} is declared but missing", label)
+            }
+            InputTextError::Extra { label } => {
+                write!(f, "input label {:?} is not declared", label)
+            }
+            InputTextError::OverBudget {
+                label,
+                bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "input {:?} is {} bytes, over its max_bytes of {}",
+                label, bytes, max_bytes
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InputTextError {}
+
 /// Build the request for one consultation.
 ///
 /// `fields` are the state's declared fields in declaration order (see
@@ -390,6 +497,61 @@ mod tests {
         assert_eq!(
             build_request(&[], &inputs()).unwrap_err(),
             BuildRequestError::NoFields
+        );
+    }
+
+    #[test]
+    fn texts_must_match_the_declared_labels_and_budgets() {
+        let schema = enum_schema(DeciderMode::Shadow);
+        let fields = vec![DeclaredField::from_schema("verdict", &schema).unwrap()];
+        let texts = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+
+        let ok =
+            AssembledInputs::from_texts(&fields, texts(&[("outline_item", "o"), ("plan", "p")]))
+                .unwrap();
+        assert_eq!(
+            build_request(&fields, ok.as_map()).unwrap(),
+            build_request(&fields, &texts(&[("outline_item", "o"), ("plan", "p")])).unwrap()
+        );
+
+        assert_eq!(
+            AssembledInputs::from_texts(&fields, texts(&[("outline_item", "o")])).unwrap_err(),
+            InputTextError::Missing {
+                label: "plan".to_string()
+            }
+        );
+        assert_eq!(
+            AssembledInputs::from_texts(
+                &fields,
+                texts(&[("outline_item", "o"), ("plan", "p"), ("x", "y")])
+            )
+            .unwrap_err(),
+            InputTextError::Extra {
+                label: "x".to_string()
+            }
+        );
+
+        let mut small = enum_schema(DeciderMode::Shadow);
+        small.decider.as_mut().unwrap().inputs[1].max_bytes = 3;
+        let fields = vec![DeclaredField::from_schema("verdict", &small).unwrap()];
+        assert!(AssembledInputs::from_texts(
+            &fields,
+            texts(&[("outline_item", "o"), ("plan", "abc")])
+        )
+        .is_ok());
+        assert_eq!(
+            AssembledInputs::from_texts(&fields, texts(&[("outline_item", "o"), ("plan", "abcd")]))
+                .unwrap_err(),
+            InputTextError::OverBudget {
+                label: "plan".to_string(),
+                bytes: 4,
+                max_bytes: 3
+            }
         );
     }
 
