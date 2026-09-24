@@ -784,6 +784,7 @@ mod tests {
         // With no config files, we get defaults.
         // Run in a temp dir and override HOME to avoid picking up real user/project config.
         let tmp = TempDir::new().unwrap();
+        let _lock = process_env_lock();
         let _guard = SetCwd::new(tmp.path());
         let _home_guard = SetEnv::new("HOME", tmp.path().to_str().unwrap());
 
@@ -922,6 +923,7 @@ mod tests {
     #[test]
     fn test_env_var_override() {
         let tmp = TempDir::new().unwrap();
+        let _lock = process_env_lock();
         let _guard = SetCwd::new(tmp.path());
         let _home_guard = SetEnv::new("HOME", tmp.path().to_str().unwrap());
 
@@ -947,6 +949,7 @@ mod tests {
     #[test]
     fn test_project_config_overrides_user() {
         let tmp = TempDir::new().unwrap();
+        let _lock = process_env_lock();
         let _guard = SetCwd::new(tmp.path());
         let _home_guard = SetEnv::new("HOME", tmp.path().to_str().unwrap());
         env::remove_var("AWS_ACCESS_KEY_ID");
@@ -1504,6 +1507,14 @@ mod tests {
         write_user_toml_value(&path, &val).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// Serializes the tests that change the process-wide cwd and env.
+    /// Without it they race each other under the parallel test runner:
+    /// one test's `SetCwd` restore can land while another is mid-load.
+    fn process_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// RAII guard that sets an env var and restores the previous value on drop.
