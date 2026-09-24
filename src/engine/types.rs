@@ -759,6 +759,17 @@ pub enum EventPayload {
         key: String,
         value: String,
     },
+    /// An accepted attach re-applied the session's `rebind: true` variables
+    /// from the attaching invocation (`crate::engine::variables`).
+    ///
+    /// `variables` carries only the names whose value changed, with their new
+    /// values; [`crate::engine::substitute::bindings_from_events`] folds it in
+    /// event order, so the later of two rebinds wins. Additive: it does not
+    /// move `CURRENT_SCHEMA_VERSION`, and an older build lands it in
+    /// [`Unknown`](EventPayload::Unknown) and keeps reading the log.
+    VariablesRebound {
+        variables: BTreeMap<String, String>,
+    },
     /// Carries the auto-promoted [`WorkflowResult`] envelope on a child's
     /// own session log (wire `type: "request_store.result"`, in the
     /// reserved `request_store.*` namespace;
@@ -1155,6 +1166,7 @@ impl EventPayload {
             EventPayload::ExecutionAnchorAdopted { .. } => "execution_anchor_adopted",
             EventPayload::ExecutionAnchorRebound { .. } => "execution_anchor_rebound",
             EventPayload::VariableCaptured { .. } => "variable_captured",
+            EventPayload::VariablesRebound { .. } => "variables_rebound",
             EventPayload::RequestStoreResult { .. } => "request_store.result",
             EventPayload::RequestCreated { .. } => "request.created",
             EventPayload::RequestLegBound { .. } => "request.leg_bound",
@@ -1442,6 +1454,13 @@ impl<'de> Deserialize<'de> for Event {
                     value: p.value,
                 }
             }
+            "variables_rebound" => {
+                let p: VariablesReboundPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::VariablesRebound {
+                    variables: p.variables,
+                }
+            }
             "request_store.result" => {
                 let p: RequestStoreResultPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
@@ -1696,6 +1715,11 @@ struct ExecutionAnchorReboundPayload {
 struct VariableCapturedPayload {
     key: String,
     value: String,
+}
+
+#[derive(Deserialize)]
+struct VariablesReboundPayload {
+    variables: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -3040,6 +3064,22 @@ mod tests {
         let serialized = serde_json::to_string(&event).unwrap();
         assert!(serialized.contains("execution_anchor_rebound"));
         assert!(serialized.contains("/old/checkout"));
+    }
+
+    #[test]
+    fn variables_rebound_roundtrips_byte_for_byte() {
+        use super::{Event, EventPayload};
+        let json = r#"{"seq":7,"timestamp":"2026-01-01T00:00:00Z","type":"variables_rebound","payload":{"variables":{"MAX_ROUNDS":"5","MERGE":"true"}}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        match &event.payload {
+            EventPayload::VariablesRebound { variables } => {
+                assert_eq!(variables.get("MERGE").map(String::as_str), Some("true"));
+                assert_eq!(variables.len(), 2);
+            }
+            other => panic!("expected a variables_rebound payload, got {:?}", other),
+        }
+        assert_eq!(event.payload.type_name(), "variables_rebound");
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
     }
 
     #[test]

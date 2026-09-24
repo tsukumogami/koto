@@ -30,6 +30,22 @@ Rename the workflow or delete the existing state file.
 
 Run `koto template compile <path>` to see the full compilation error.
 
+**Variable refused (exit code 2)** — a `--var` value, a default, or an omitted optional variable's empty value was refused. No session is created. Three refusals carry a machine-readable `code` beside `error` and `command`, so a caller can branch without matching the message:
+
+| Code | Meaning | Extra fields |
+|------|---------|--------------|
+| `invalid_var` | The value fails the variable's declared `values:` or `pattern:`, or the character allowlist every value must pass. | `var`, `value`, `constraint` (`values:[a,b]`, `pattern:<re>`, or `allowlist`) |
+| `duplicate_var` | The same key was passed twice. | `var` |
+| `unknown_var` | The key isn't declared in the template. | `var` |
+
+```json
+{"error":"variable \"INTENT_FLAG\" value \"maybe\": does not satisfy pattern:^(continue|stop)?$","command":"init","code":"invalid_var","var":"INTENT_FLAG","value":"maybe","constraint":"pattern:^(continue|stop)?$"}
+{"error":"duplicate --var key \"MERGE\"","command":"init","code":"duplicate_var","var":"MERGE"}
+{"error":"unknown variable \"NOPE\": not declared in template","command":"init","code":"unknown_var","var":"NOPE"}
+```
+
+The `error` text for duplicate and unknown keys, and for an allowlist failure, is unchanged from earlier releases. A malformed `--var` (no `=`, or an empty key) and a missing required variable are also exit 2, with no `code`.
+
 ---
 
 ### next

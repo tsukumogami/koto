@@ -275,6 +275,13 @@ events:
         type: string
         required: true
 
+  variables_rebound:
+    tier: 2
+    fields:
+      variables:
+        type: object
+        required: true
+
   execution_anchor_adopted:
     tier: 2
     fields:
@@ -921,6 +928,39 @@ delivered its value at all. The consequence for a reader is that a confirmed
 action leaves exactly one `variable_captured` and one `default_action_executed`
 in the log — both on the tick that stopped for confirmation, neither on the tick
 that confirmed.
+
+---
+
+#### `variables_rebound`
+
+Records that an accepted attach to a live session re-applied the template's
+`rebind: true` variables from the attaching invocation. Variables are otherwise
+fixed by `workflow_initialized`; this event is the only way a declared variable
+changes afterwards, and nothing but an accepted attach writes it.
+
+```json
+{
+  "type": "variables_rebound",
+  "payload": {
+    "variables": {
+      "MERGE": "true"
+    }
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `variables` | object | Yes | The variables this attach changed, each mapped to its new value. A `rebind: true` variable whose value didn't change is left out, and an attach that changes nothing appends no event. |
+
+Consumers fold these in event order together with `workflow_initialized` and
+`variable_captured`: the later of two rebinds wins, and the new value is what
+the next tick substitutes and what `vars.*` conditions see. Every value has
+already passed the variable's declared constraint and the allowlist.
+
+The event is additive and doesn't change the state file's schema version. An
+older koto build reads it as an unknown event and keeps reading the log, though
+it won't apply the new values.
 
 ---
 

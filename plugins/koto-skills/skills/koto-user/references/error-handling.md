@@ -58,6 +58,12 @@ Fields:
 - `error` — human-readable error string
 - `command` — the subcommand name that failed
 
+`koto init` adds a machine-readable `code` when it refuses a `--var` (exit 2, no session created), so branch on the code rather than the message:
+
+- `invalid_var` — the value fails the variable's declared `values:` or `pattern:`, or the character allowlist. Carries `var`, `value`, and `constraint` (`values:[a,b]`, `pattern:<re>`, or `allowlist`). Pass a value the constraint accepts; don't retry the same one.
+- `duplicate_var` — the same key was passed twice. Carries `var`.
+- `unknown_var` — the template doesn't declare the key. Carries `var`.
+
 ---
 
 ## NextErrorCode table

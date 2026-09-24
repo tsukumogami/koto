@@ -505,7 +505,7 @@ fn init_child_core(
     })?;
 
     let variables =
-        crate::cli::resolve_variables(vars, &cached.compiled.variables).map_err(|msg| {
+        crate::cli::resolve_variables(vars, &cached.compiled.variables).map_err(|var_error| {
             // Variable resolution runs *after* a successful compile, so
             // the cache entry carries a valid resolved path. Plumb it
             // through to keep parity with other post-resolution failure
@@ -513,9 +513,10 @@ fn init_child_core(
             TaskSpawnError::new(
                 child_name,
                 SpawnErrorKind::TemplateCompileFailed,
-                format!("{}{}", VAR_RESOLUTION_MSG_PREFIX, msg),
+                format!("{}{}", VAR_RESOLUTION_MSG_PREFIX, var_error),
             )
             .with_path(cached.source_path.clone())
+            .with_var_error(var_error)
         })?;
 
     let initial_state = match override_initial_state {
@@ -702,8 +703,13 @@ pub fn init_inline_into_session(
         )
     })?;
 
-    let variables = crate::cli::resolve_variables(vars, &compiled.variables)
-        .map_err(|msg| anyhow::anyhow!("{}{}", VAR_RESOLUTION_MSG_PREFIX, msg))?;
+    // The typed refusal rides under the prefixed message so the caller can
+    // both classify it (by prefix) and read its code (by downcast).
+    let variables =
+        crate::cli::resolve_variables(vars, &compiled.variables).map_err(|var_error| {
+            let msg = format!("{}{}", VAR_RESOLUTION_MSG_PREFIX, var_error);
+            anyhow::Error::new(var_error).context(msg)
+        })?;
 
     // Record the artifact as a SESSION-RELATIVE path: just the filename.
     // derive_machine_state resolves it against the session dir at read

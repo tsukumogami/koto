@@ -44,6 +44,26 @@ Variables are declared at the root level and interpolated into directive text us
 
 An optional variable (`required: false`) that the caller omits resolves to its `default`, or to an empty string when no default is declared. Every declared variable is always materialized, so a `{{VARIABLE_NAME}}` reference never fails to resolve. When such a reference lands unquoted in a gate or action command (`--flag {{VAR}}`) and the value is empty, koto renders it as an explicit empty argument (`--flag ''`) so the command stays well-formed instead of dropping the token.
 
+#### Constraining a variable: `values:`, `pattern:`, `rebind:`
+
+A declaration can narrow what `koto init` accepts, so argument checking is a koto refusal rather than directive prose:
+
+```yaml
+variables:
+  INTENT_FLAG:
+    pattern: ^(continue|stop)?$      # whole-value match, regex crate syntax
+  MERGE:
+    values: ["true", "false"]        # closed set, exact match
+    default: "false"
+    rebind: true
+```
+
+- `values:` is a non-empty list; each entry must pass the value allowlist. `pattern:` is applied as `^(?:<pattern>)$`, so it always matches the whole value; the `regex` crate has no lookaround. Declare at most one of the two.
+- A non-empty `default` must satisfy the constraint. An optional variable with no default resolves to `""`, so its constraint must accept the empty string, or the template doesn't compile.
+- Unknown keys in a variable declaration are compile errors (`valuez:` is caught, not dropped), and `rebind` must be a YAML boolean.
+- A refused value makes `koto init` exit 2 with no session and `"code": "invalid_var"` plus `var`, `value`, and `constraint`. A repeated key is `duplicate_var` and an undeclared one `unknown_var`.
+- `rebind: true` marks a per-invocation setting (merge on/off, a round limit) rather than an identity variable. When a later invocation attaches to the live session through `koto init --attach-live`, koto re-applies every `rebind: true` variable from that invocation, falling back to the default, and records a `variables_rebound` event. Nothing else changes a declared variable after init, and a capture (`capture_stdout_as`) can't take a declared variable's name.
+
 Koto also provides two built-in variables that don't need to be declared. Both resolve everywhere a declared variable does: directives, details, a gate's `command`, `key` and `pattern`, and a `default_action` command and its `working_dir`.
 
 - `{{SESSION_NAME}}` -- the active session name

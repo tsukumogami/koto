@@ -26,5 +26,6 @@ pub mod template_source_status;
 pub mod terminal_index;
 pub mod terminal_result;
 pub mod types;
+pub mod variables;
 #[cfg(unix)]
 pub mod wake;
