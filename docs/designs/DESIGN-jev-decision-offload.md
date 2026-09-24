@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 problem: |
   koto hands every unresolved branch to the agent as `evidence_required`, even
   when the decision is one closed-set value over inputs koto already stores.
@@ -36,7 +36,7 @@ user_visible_surface: true
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
@@ -250,7 +250,7 @@ response and records nothing. On the cloud backend the appends still push to
 S3 while the lock is held. That's accepted, because the cloud backend already
 adds that latency to every mutating tick.
 
-Evaluation is pure code in a new `src/engine/decider.rs`. The winning value is
+Evaluation is pure code in `src/decider/evaluate.rs`, called by the engine arm in `src/engine/decider.rs`. The winning value is
 the argmax (a tie counts as the escape), or R2's rule for booleans.
 Confidence is the winning value's probability. Per-field outcomes are checked
 in order: escape, below threshold, never, shadow, qualified. An answer applies
