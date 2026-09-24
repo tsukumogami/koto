@@ -317,13 +317,12 @@ fn merge_config(target: &mut KotoConfig, source: &LoadedConfig) {
 
 /// The decision endpoint used when neither `KOTO_DECIDER_ENDPOINT` nor
 /// user `decider.endpoint` is set. This is the full URL of the decision
-/// call, not a base URL.
+/// call (a `POST`), not a base URL. `KOTO_DECIDER_ENDPOINT` or user
+/// `decider.endpoint` overrides it.
 ///
-/// Placeholder: the `.invalid` top-level domain is reserved and never
-/// resolves, so until the Jev client pins the provider's real decision
-/// URL here, a default-endpoint consultation fails closed with a connect
-/// error instead of sending a key to a host nobody controls.
-pub const DEFAULT_DECIDER_ENDPOINT: &str = "https://api.jev.invalid/v1/decide";
+/// Jev's decision endpoint, per <https://docs.typesafe.ai/introduction/quickstart>
+/// and <https://docs.typesafe.ai/api.md>.
+pub const DEFAULT_DECIDER_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 
 /// Env var that sets the global decider mode.
 pub const ENV_DECIDER_MODE: &str = "KOTO_DECIDER";
@@ -1477,6 +1476,10 @@ mod tests {
 
         #[test]
         fn default_endpoint_is_a_full_https_url() {
+            assert_eq!(
+                DEFAULT_DECIDER_ENDPOINT,
+                "https://api.typesafe.ai/v1/systemone"
+            );
             let u = Url::parse(DEFAULT_DECIDER_ENDPOINT).unwrap();
             assert_eq!(u.scheme(), "https");
             assert!(u.path().len() > 1, "a full decision URL, not a base");
