@@ -389,6 +389,8 @@ For a single leg there's a shorthand: `koto request create --role reviewer --tem
 
 `bind` only accepts a child started with `--needs-agent` under a parent — that's what makes the dispatch fence meaningful — and a child fulfils at most one leg. Rebinding the same leg to the same child is a no-op success; rebinding it elsewhere is rejected.
 
+A root session (no `--parent`) answers a leg by attaching itself: `koto request attach <request-id> <leg> --session <name>`. koto admits it only if the session isn't finished, was started from a template file the leg names, and its non-`rebind` variables match the leg's `inputs`. On a self-attached leg, `progress`, `resolve` and `abandon` are refused with `self_attached_leg`, epoch or not: the result arrives when the session reaches its terminal state, even under `koto next --no-cleanup`.
+
 Output is JSON on stdout, always, with no format flag. Every verb prints the same envelope: `request_id`, `request_state`, `close_disposition`, `leg_counts`, `revision`, `legs`, and `cli_contract`. Full flags and the response shape are in the [command reference](references/command-reference.md#koto-request); the closed error-code set and its exit statuses are in [error handling](references/error-handling.md#request-command-errors).
 
 ### Where you read a leg's result
