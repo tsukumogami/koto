@@ -8,7 +8,7 @@
 //!
 //! Layout:
 //!
-//! - `types`, `request`, `evaluate`: pure and provider-neutral. The engine
+//! - `types`, `request`, `evaluate`, `record`: pure and provider-neutral. The engine
 //!   depends only on these.
 //! - `jev`, `http`: the Jev client and its bounded transport.
 //! - [`build_decider`]: the only production constructor of a provider.
@@ -18,10 +18,12 @@ pub mod evaluate;
 pub mod fake;
 pub mod http;
 pub mod jev;
+pub mod record;
 pub mod request;
 pub mod types;
 
 pub use evaluate::{evaluate, EffectiveModes, Evaluation, FieldEvaluation, FieldOutcome};
+pub use record::{ConsultationOutcome, DeciderConsultation, FieldConsultation};
 pub use request::{build_request, declared_fields, BuildRequestError, DeclaredField, DeclaredKind};
 pub use types::{
     Answer, AnswerOption, ApiKey, Decider, DeciderError, DecisionRequest, DecisionResponse,

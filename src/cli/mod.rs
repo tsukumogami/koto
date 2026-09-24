@@ -6,6 +6,7 @@ pub mod dashboard;
 pub mod dashboard_data;
 pub mod dashboard_render;
 pub mod dashboard_state;
+pub mod decider_port;
 pub mod init_child;
 pub mod next;
 pub mod next_types;
@@ -3021,6 +3022,7 @@ fn record_notice_delivery(backend: &dyn SessionBackend, name: &str, abandoned: &
             &timestamp,
         ),
         submitter_cwd: None,
+        source: None,
     };
     if let Err(e) = backend.append_event(name, &payload, &timestamp) {
         // Losing the audit costs an operator the ability to tell "never
@@ -3314,8 +3316,8 @@ fn handle_next(
         NextResponse, RECOVERY_POINTER,
     };
     use crate::engine::advance::{
-        advance_until_stop, merge_epoch_evidence, ActionResult, AdvanceError, IntegrationError,
-        StopReason,
+        advance_until_stop_with_decider, merge_epoch_evidence, ActionResult, AdvanceError,
+        IntegrationError, StopReason,
     };
     use crate::engine::evidence::validate_evidence;
     use crate::engine::persistence::{derive_evidence, instructions_delivered_this_window};
@@ -3351,14 +3353,26 @@ fn handle_next(
     // any) on top of the file+env layers already merged by
     // load_config(). Emit the `[request_store.recursion]`
     // reserved-namespace warning at startup.
-    let request_store_cfg = {
+    //
+    // The decider settings come from the same load. Their warnings (an
+    // unrecognized `KOTO_DECIDER`, a key the project config may not set,
+    // and so on) are printed here, once per `koto next` invocation.
+    let (request_store_cfg, decider_settings) = {
         let base = crate::config::resolve::load_config().unwrap_or_default();
         crate::config::warn_if_request_store_recursion_reserved(&base);
         let cli_overrides = crate::config::resolve::RequestStoreOverrides {
             redelegation_cap,
             ..Default::default()
         };
-        crate::config::resolve::request_store_config(&base.request_store, &cli_overrides)
+        let (decider_settings, decider_warnings) =
+            crate::config::resolve::resolve_decider(&base.decider);
+        for w in &decider_warnings {
+            eprintln!("warning: {}", w);
+        }
+        (
+            crate::config::resolve::request_store_config(&base.request_store, &cli_overrides),
+            decider_settings,
+        )
     };
 
     // Issue 7: cursor GC fires on every coordinator tick boot so
@@ -4365,6 +4379,7 @@ fn handle_next(
                 state: current_state.clone(),
                 fields,
                 submitter_cwd,
+                source: None,
             };
             if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
                 let ne = NextError {
@@ -4718,7 +4733,31 @@ fn handle_next(
         }
     };
 
-    let result = advance_until_stop(
+    // The decider port. Built only when the user is opted in, and that is
+    // decided by `opted_in()` alone: no mode or key check here. Without a
+    // port the loop takes no lock, reads nothing extra, and makes no
+    // network call.
+    let render_for_decider =
+        |raw: &str| -> String { substitute_plain(raw, &runtime_vars, &variables, &overlay) };
+    let mut decider_port: Option<crate::cli::decider_port::CliDeciderPort<'_>> =
+        if decider_settings.opted_in() {
+            crate::decider::build_decider(&decider_settings).map(|provider| {
+                crate::cli::decider_port::CliDeciderPort::new(
+                    backend,
+                    context_store,
+                    &name,
+                    provider,
+                    crate::engine::decider::DeciderPolicy::from_settings(&decider_settings),
+                    decider_settings.endpoint_origin(),
+                    Box::new(render_for_decider),
+                    full,
+                )
+            })
+        } else {
+            None
+        };
+
+    let result = advance_until_stop_with_decider(
         current_state,
         &compiled,
         &evidence,
@@ -4729,7 +4768,11 @@ fn handle_next(
         &action_closure,
         &overlay,
         &shutdown,
+        decider_port
+            .as_mut()
+            .map(|p| p as &mut dyn crate::engine::decider::DeciderPort),
     );
+    drop(decider_port);
 
     // 8. Map AdvanceResult/AdvanceError to NextResponse/NextError and exit.
     match result {
@@ -7319,6 +7362,7 @@ Done.
                     .map(|(k, v)| (k.to_string(), v.clone()))
                     .collect(),
                 submitter_cwd: None,
+                source: None,
             },
             idempotency_hash: None,
         }

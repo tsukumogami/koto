@@ -82,7 +82,7 @@ impl GlobalMode {
 /// Recorded on each consultation as `endpoint_origin`, and used by the
 /// same-layer rule: a key is only sent to an endpoint from its own layer
 /// or to the built-in default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SettingOrigin {
     /// Built-in default (only meaningful for the endpoint).

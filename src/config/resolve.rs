@@ -434,6 +434,8 @@ where
 #[derive(Debug, Clone)]
 pub struct DeciderSettings {
     mode: GlobalMode,
+    user_mode: GlobalMode,
+    project_mode: Option<GlobalMode>,
     api_key: Option<ApiKey>,
     api_key_origin: SettingOrigin,
     endpoint: Option<Url>,
@@ -467,6 +469,18 @@ impl DeciderSettings {
     /// modes.
     pub fn mode(&self) -> GlobalMode {
         self.mode
+    }
+
+    /// The user-level mode (`KOTO_DECIDER` or user `decider.mode`), before
+    /// the project minimum. An unrecognized value is `off`.
+    pub fn user_mode(&self) -> GlobalMode {
+        self.user_mode
+    }
+
+    /// The project mode, or `None` when project config sets none. An
+    /// unrecognized value is `Some(Off)`.
+    pub fn project_mode(&self) -> Option<GlobalMode> {
+        self.project_mode
     }
 
     /// The API key, if one is configured.
@@ -574,17 +588,15 @@ pub fn resolve_decider(cfg: &DeciderConfig) -> (DeciderSettings, Vec<String>) {
         }),
     };
 
-    // Project minimum: can only lower.
-    let mode = match &cfg.project_mode {
-        None => global,
-        Some(raw) => match GlobalMode::parse(raw) {
-            Some(p) => global.min(p),
-            None => {
-                warnings.push(mode_warning("project config", raw));
-                GlobalMode::Off
-            }
-        },
-    };
+    // Project minimum: can only lower. The rule itself lives in
+    // `engine::decider::effective_mode`.
+    let project_mode = cfg.project_mode.as_ref().map(|raw| {
+        GlobalMode::parse(raw).unwrap_or_else(|| {
+            warnings.push(mode_warning("project config", raw));
+            GlobalMode::Off
+        })
+    });
+    let mode = crate::engine::decider::effective_global_mode(global, project_mode);
 
     // Timeout.
     let timeout_ms: u64 = match cfg.timeout_ms {
@@ -656,6 +668,8 @@ pub fn resolve_decider(cfg: &DeciderConfig) -> (DeciderSettings, Vec<String>) {
     (
         DeciderSettings {
             mode,
+            user_mode: global,
+            project_mode,
             api_key,
             api_key_origin,
             endpoint,
@@ -1235,7 +1249,7 @@ mod tests {
         }
 
         #[test]
-        fn effective_mode_is_minimum_of_global_and_project() {
+        fn resolved_mode_is_minimum_of_global_and_project() {
             let cases: &[(&str, Option<&str>, GlobalMode)] = &[
                 ("shadow", Some("auto"), GlobalMode::Shadow),
                 ("auto", Some("shadow"), GlobalMode::Shadow),

@@ -618,6 +618,7 @@ fn append_redelegated_audit(
         state: "request_store.redelegation".to_string(),
         fields,
         submitter_cwd: None,
+        source: None,
     };
     if let Some(parent) = coord_log.parent() {
         fs::create_dir_all(parent)
@@ -669,6 +670,7 @@ pub fn claim_and_dispatch(
         state: "request_store.dispatch".to_string(),
         fields,
         submitter_cwd: None,
+        source: None,
     };
     if let Some(parent) = coord_state_file.parent() {
         fs::create_dir_all(parent)

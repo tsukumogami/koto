@@ -7,6 +7,7 @@ pub mod batch_validation;
 pub mod caps;
 #[cfg(unix)]
 pub mod claim;
+pub mod decider;
 pub mod discovery;
 pub mod epoch;
 pub mod errors;

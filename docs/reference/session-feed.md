@@ -107,6 +107,10 @@ events:
         type: string
         required: false
         nullable: true
+      source:
+        type: string
+        required: false
+        nullable: true
 
   workflow_cancelled:
     tier: 1
@@ -550,6 +554,7 @@ Records what an agent submitted for a state.
 | `state` | string | Yes | State the evidence was submitted for. |
 | `fields` | object | Yes | Agent-provided key-value evidence. Values are arbitrary JSON. |
 | `submitter_cwd` | string | No | Working directory of the submitting process. Used internally by the batch scheduler. Consumers MAY ignore this field. |
+| `source` | string | No | Who produced the evidence when it wasn't the agent. `"decider"` marks an answer koto applied from an opted-in decider; absent means the agent submitted it. Only koto sets it: a `source` key in `--with-data` lands in `fields`. Consumers MUST tolerate values they don't recognize. |
 
 ---
 

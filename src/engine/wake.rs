@@ -331,6 +331,7 @@ fn emit_one_wake_batch(
         state: "request_store.wake".to_string(),
         fields,
         submitter_cwd: None,
+        source: None,
     };
     let timestamp = format_rfc3339_millis(now);
     append_event(coord_state_file, &payload, &timestamp)
@@ -694,6 +695,7 @@ mod tests {
                 state: "request_store.dispatch".into(),
                 fields,
                 submitter_cwd: None,
+                source: None,
             },
             idempotency_hash: None,
         }
@@ -737,6 +739,7 @@ mod tests {
                 state: "request_store.wake".into(),
                 fields,
                 submitter_cwd: None,
+                source: None,
             },
             idempotency_hash: None,
         }
@@ -902,6 +905,7 @@ mod tests {
                 state: "request_store.wake".into(),
                 fields: legacy_wake_fields,
                 submitter_cwd: None,
+                source: None,
             },
             idempotency_hash: None,
         };

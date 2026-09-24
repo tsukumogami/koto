@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Check the structural rules of src/decider/ that the compiler can't.
 #
-#  1. The provider-neutral files (types.rs, request.rs, evaluate.rs) do no
-#     I/O: they import nothing from std::net, std::fs, std::thread,
+#  1. The provider-neutral files (types.rs, request.rs, evaluate.rs,
+#     record.rs) do no I/O: they import nothing from std::net, std::fs, std::thread,
 #     std::time::Instant or SystemTime, or attohttpc. They also never
 #     mention Jev's wire vocabulary (the strings noul, criteria, "choice").
 #  2. build_decider gates on DeciderSettings::opted_in() and nothing else:
@@ -54,7 +54,7 @@ strip_tests() {
 
 # --- Rule 1: purity of the provider-neutral files --------------------------
 
-for name in types.rs request.rs evaluate.rs; do
+for name in types.rs request.rs evaluate.rs record.rs; do
     f="$DIR/$name"
     if [ ! -f "$f" ]; then
         fail "src/decider/$name is missing"
