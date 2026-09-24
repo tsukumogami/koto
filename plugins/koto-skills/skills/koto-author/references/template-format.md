@@ -353,6 +353,8 @@ The compiler refuses a declaration that breaks any of these rules, with an `E-DE
 
 **The floor.** An answer in `auto` can't take a transition that targets a terminal state, targets a state whose `default_action` has `requires_confirmation: true`, or has a `when` clause that also tests a `gates.*` key. The compiler checks every transition whose `when` tests the field at that value, and it counts `"true"` and `true` alike on a boolean. A violation fails with `E-DECIDER-FLOOR` naming the target state and the rule. Nothing in the template relaxes it, and `--allow-legacy-gates` doesn't either. The only way past it is to take the answer out of `auto`. `shadow`, `never`, and `off` answers aren't floor-checked.
 
+At run time koto checks the floor again on the one transition an answer actually matched, so a route the compiler couldn't tie to the field (one that reaches it only through an `evidence.<field>: present` or `vars.*` key) still can't carry an `auto` answer to a terminal state, a confirmation-guarded state, or along a `gates.*` test. Such an answer is recorded and not applied. An `auto` answer also applies only when every declared field on the state qualifies, none is the escape, and exactly one conditional transition matches.
+
 Keys inside the block are strict, so a typo like `thresold:` fails compilation and names the key. The field's own keys stay lenient.
 
 A declared field adds `description` and `value_descriptions` to its `expects` entry in `koto next` and `koto status`. The escape never appears there, and submitting it as evidence is rejected like any other value outside `values`. A template with no `decider` block compiles exactly as before and keeps its `template_hash`.

@@ -138,6 +138,14 @@ A field whose template declares a `decider` block carries two more keys in its
 - `description` is the question the field answers.
 - `value_descriptions` has one key per entry in `values`, saying what that value
   means. On a `boolean` field its keys are `"true"` and `"false"`.
+
+When the user running koto has opted in to a decider, koto may answer a declared
+state itself instead of stopping there. You don't see a response for that state
+at all: the `koto next` you ran returns the next stop, with `advanced: true`, in
+the same shape as any other response. Nothing new appears in the response, so
+keep dispatching on `action`. If koto consulted the decider but didn't apply its
+answer, you get the ordinary `evidence_required` for the declared state and
+submit evidence as usual; your evidence always wins over the decider's.
 - Submit one of `values` as usual. Neither key adds a value you can submit.
 - Both keys are absent on every other field, even one whose template gives it a
   description.
@@ -672,6 +680,11 @@ Several fields are conditionally absent rather than `null`. When writing code to
 - In the JSONL event log, `skip_if_matched` is absent on `Transitioned` events whose
   `condition_type` is not `"skip_if"`. Don't assume this field is present — check
   `condition_type` first.
+- In the JSONL event log, `source` on an `evidence_submitted` event is absent for
+  evidence an agent submitted and `"decider"` for an answer koto applied from an
+  opted-in decider. A `decider_consulted` event before it records the
+  consultation. You can't set `source` yourself: a `source` key in `--with-data`
+  is ordinary evidence data.
 
 ---
 
