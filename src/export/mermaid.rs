@@ -100,6 +100,7 @@ mod tests {
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 gates: BTreeMap::new(),
@@ -110,6 +111,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -127,6 +129,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         CompiledTemplate {
@@ -184,6 +187,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let t = CompiledTemplate {
@@ -227,10 +231,12 @@ mod tests {
                     Transition {
                         target: "implement".to_string(),
                         when: Some(when_build),
+                        context_assignments: Default::default(),
                     },
                     Transition {
                         target: "research".to_string(),
                         when: Some(when_investigate),
+                        context_assignments: Default::default(),
                     },
                 ],
                 terminal: false,
@@ -242,6 +248,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -259,6 +266,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -276,6 +284,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
 
@@ -316,6 +325,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let output = to_mermaid(&t);
@@ -338,6 +351,7 @@ mod tests {
                 transitions: vec![Transition {
                     target: "evaluate".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 gates: {
@@ -353,6 +367,10 @@ mod tests {
                             override_default: None,
                             completion: None,
                             name_filter: None,
+                            overridable: true,
+                            request: String::new(),
+                            leg: String::new(),
+                            expect: None,
                         },
                     );
                     g
@@ -364,6 +382,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
 
@@ -381,10 +400,12 @@ mod tests {
                     Transition {
                         target: "implement".to_string(),
                         when: Some(when_build),
+                        context_assignments: Default::default(),
                     },
                     Transition {
                         target: "research".to_string(),
                         when: Some(when_investigate),
+                        context_assignments: Default::default(),
                     },
                 ],
                 terminal: false,
@@ -396,6 +417,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -406,6 +428,7 @@ mod tests {
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 gates: BTreeMap::new(),
@@ -416,6 +439,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -426,6 +450,7 @@ mod tests {
                 transitions: vec![Transition {
                     target: "evaluate".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 gates: BTreeMap::new(),
@@ -436,6 +461,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -453,6 +479,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
 

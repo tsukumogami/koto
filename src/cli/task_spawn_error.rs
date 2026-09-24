@@ -311,6 +311,13 @@ pub struct TaskSpawnError {
     /// the source file did not exist in the first place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+
+    /// Typed variable refusal when variable resolution failed, so
+    /// `koto init` can report its `code` and fields. Not serialized: the
+    /// batch envelope keeps its shape, and `message` already names the
+    /// variable.
+    #[serde(skip)]
+    pub var_error: Option<crate::engine::variables::VarError>,
 }
 
 impl TaskSpawnError {
@@ -328,6 +335,7 @@ impl TaskSpawnError {
             template_source: None,
             compile_error: None,
             path: None,
+            var_error: None,
         }
     }
 
@@ -337,6 +345,12 @@ impl TaskSpawnError {
     /// struct with `..err`.
     pub fn with_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.path = Some(path.into());
+        self
+    }
+
+    /// Builder-style setter for the typed variable refusal.
+    pub fn with_var_error(mut self, var_error: crate::engine::variables::VarError) -> Self {
+        self.var_error = Some(var_error);
         self
     }
 }

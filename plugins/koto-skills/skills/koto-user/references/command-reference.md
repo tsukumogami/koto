@@ -26,6 +26,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session resolve` | Runner — cloud backend only |
 | `koto status` | Runner — primary |
 | `koto request create/bind/get/wait/list` | Runner — coordinator |
+| `koto request attach` | Runner — whoever starts a root session on a requester's behalf |
 | `koto request progress/resolve/abandon` | Runner — coordinator and delegate |
 | `koto request abandon-request/close` | Runner — coordinator |
 | `koto context add` | Runner — primary |
@@ -47,6 +48,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 ```
 koto init <name> --template <path> [--parent <parent-name>] [--var KEY=VALUE ...] [--execution-dir <path>]
 koto init <name> --from-stdin [--var KEY=VALUE ...] [--execution-dir <path>]
+koto init <name> --template <path> --vars-file <file> [--attach-live] [--replace-terminal] [--koto-leg <request-id>:<leg>]
 ```
 
 Initializes a new workflow. Provide the definition one of two ways:
@@ -62,6 +64,12 @@ Initializes a new workflow. Provide the definition one of two ways:
 | `--parent <parent-name>` | No | Link this workflow as a child of an existing parent workflow. Fails if the parent doesn't exist. Not available with `--from-stdin`. |
 | `--var KEY=VALUE` | No | Set a template variable. Repeatable. Required variables must be supplied; unknown keys are rejected. VALUE is checked against an allowlist (see Notes). |
 | `--execution-dir <path>` | No | Bind the session's execution anchor to this directory instead of the one `koto init` ran in. Canonicalized at init time; a path that doesn't resolve is an error. |
+| `--vars-file <file>` | No | Read variables from a JSON list of `["KEY", "VALUE"]` string pairs (regular file, not a symlink, at most 64 KiB). A repeated key is refused as `duplicate_var`. Variables are validated before the name is looked up. Can't be combined with `--var`; a bad file is `invalid_vars_file`. |
+| `--replace-terminal` | No | If a finished session (terminal or cancelled) has the name, remove it and start fresh; the output carries `replaced_result`. A running session is refused with `session_live`. |
+| `--attach-live` | No | If a running session has the name, attach to it when its template file name, origin record (anchor and session store) and every explicitly passed non-`rebind` variable match (`template_mismatch`, `origin_mismatch`, `var_mismatch` otherwise), then re-apply its `rebind: true` variables. A finished session is refused with `session_terminal` unless `--replace-terminal` is also given. |
+| `--koto-leg <request-id>:<leg>` | No | Attach the resulting session to a request leg in the same call, with every `koto request attach` check. Any refusal is recorded on an open, unbound leg as `result_source: refused`. |
+
+**Entry flags.** With `--vars-file` or any entry flag, the output adds `"outcome": "created" | "attached" | "replaced"` (plus `rebound` on an attach, `replaced_state`/`replaced_result` on a replace, and `leg` under `--koto-leg`). Every check runs before any write, so a refusal changes nothing, and rebind variables are re-applied only after the leg bind succeeds. Without `--attach-live`/`--replace-terminal` an existing name is still "already exists" (exit 1). The entry flags are rejected with `--from-stdin` and `--parent`. Branch on `code`, never on the message.
 
 **Success output:**
 ```json
@@ -335,6 +343,10 @@ so an agent that has lost everything else still learns it exists.
 Key presence:
 - `directive`, `details`, and `expects` are all **absent** together when
   `is_terminal` is `true` -- there is nothing to substitute for a terminal phase.
+- `result` is **present** exactly when `is_terminal` is `true`: the result the
+  terminal tick recorded (`status`, `summary`, optional `payload`), the same value
+  the terminal `koto next` response carried. A context write after the terminal
+  does not change it.
 - `details` is additionally absent (on its own) when the current phase declares
   no details content, even for a non-terminal phase.
 - Retrieving these keys takes no lock on the session -- including for a
@@ -378,12 +390,13 @@ The key is absent when the session isn't bound to a leg. It never carries `dispa
 
 ## koto request
 
-Ten subcommands over the request store — the durable record of what a coordinator asked for and what came back. See the skill's "Requests and legs" section for when to use it; this section is the flag surface.
+Eleven subcommands over the request store — the durable record of what a coordinator asked for and what came back. See the skill's "Requests and legs" section for when to use it; this section is the flag surface.
 
 ```
 koto request create   [--with-data '{"legs":[…],"inputs":{…}}' | --role R --template T --inputs J]
                       --requested-by ID --coordinator-of-record ID
 koto request bind     <request-id> <leg> --child SESSION_ID [--dispatch-epoch N] [--issued-by ID]
+koto request attach   <request-id> <leg> --session SESSION_ID [--issued-by ID]
 koto request get      <request-id>
 koto request wait     <request-id> (--leg NAME | --all-legs | --closed | --resolved-count N)
                       --timeout-secs N [--interval-secs N]
@@ -395,7 +408,7 @@ koto request abandon-request <request-id> --rationale TEXT [--issued-by ID]
 koto request close    <request-id> [--issued-by ID]
 ```
 
-`--cli-contract MAJOR.MINOR` is accepted on every subcommand and validated before any I/O, so a mismatch has no side effect. This build serves `1.0`; an older minor is served, a newer minor or a different major is refused.
+`--cli-contract MAJOR.MINOR` is accepted on every subcommand and validated before any I/O, so a mismatch has no side effect. This build serves `1.1`; an older minor is served, a newer minor or a different major is refused.
 
 Output is JSON on stdout unconditionally — there is no format flag.
 
@@ -430,7 +443,7 @@ Every subcommand except `list` prints the same object:
     }
   },
   "written": true,
-  "cli_contract": {"major": 1, "minor": 0}
+  "cli_contract": {"major": 1, "minor": 1}
 }
 ```
 
@@ -443,7 +456,11 @@ Every subcommand except `list` prints the same object:
 | `inputs` | The request-level shared context recorded at `create`. Omitted when none was supplied. |
 | `legs` | Keyed by leg name, in name order — that ordering is what makes two `get` calls byte-equal. |
 | `legs[*].disposition` | `open`, `resolved`, or `abandoned`. |
-| `legs[*].result_source` | `promoted` (from the bound child's terminal tick) or `explicit` (recorded through `resolve`). |
+| `legs[*].result_source` | `promoted` (from the bound session's terminal tick), `explicit` (recorded through `resolve`), or `refused` (koto refused the session that was to answer the leg and recorded why; no command writes this). |
+| `legs[*].result_final_state` | For a promoted result, the terminal state it came from. Omitted for explicit and refused results, and for results promoted by a koto that didn't record it. |
+| `legs[*].attach` | `"self"` when a root session attached itself through `attach`. Omitted otherwise. |
+| `legs[*].bound_template` | For a self-attached leg, the session's template identity: `name`, `hash`, and `source` (the template's file name). Omitted otherwise. |
+| `legs[*].declaration.template` | One template name, or a list of up to eight any of which may answer the leg. |
 | `written` | Present on mutating verbs only, so you can tell a real append from a no-op success — a rebind to the child the leg already has, a re-abandon, or a retry the idempotency hash recognized. Absent on reads, which keeps `get` byte-stable. |
 | `cli_contract` | Two integers, never a string — `"1.10"` sorts below `"1.9"` as a string, and that mistake is unavailable here. |
 
@@ -462,6 +479,12 @@ The generated id is `req-` plus a v4 UUID, printed in the envelope. Creation is 
 Three checks run against the child before the append: the child's session must be readable (`child_not_found`), its header must satisfy the dispatch fence — a `--parent` child started with `--needs-agent` (`child_not_fenceable`) — and it must not already point at a different request-and-leg pair (`child_bound_to_different_leg`). Rebinding the same leg to the same child succeeds and reports `written: false`.
 
 The epoch recorded on the bind event is read from the child's header, not from your flag; passing `--dispatch-epoch` here asserts a value and is rejected if it disagrees. After the bind is durable, koto writes a pointer into the child's session directory so the child can read its own leg back. A failed pointer write warns and does not fail the bind — re-run `bind` to repair it.
+
+### attach
+
+`attach` lets a **root session** (one started without `--parent`) bind itself to a leg it will answer, typically a stable `--no-cleanup` session run on a requester's behalf. It has no dispatch epoch, so koto checks instead, all before any write: the request and leg are open; the session isn't terminal or cancelled (`session_terminal`); the session's template file name is one the leg's `template` names (`template_mismatch`; a `--from-stdin` session has none); each key in the leg's `inputs` is a variable the template declares and, unless it's `rebind: true`, equals the session's recorded value (`input_mismatch`); the leg is unbound or already bound to this session (a no-op, `written: false`); and the session isn't answering another live leg — it moves only when its old leg was abandoned or its old request closed (`child_bound_to_different_leg`).
+
+On a self-attached leg, `progress`, `resolve`, and `abandon` are refused with `self_attached_leg` whatever `--dispatch-epoch` says. The result arrives when the session reaches a terminal state, including under `koto next --no-cleanup`. `abandon-request` and `close` still work. A dispatched child passed to `attach` is bound exactly as `bind` binds it; any other child is refused with `child_not_fenceable`.
 
 ### wait
 
@@ -517,6 +540,7 @@ Records an override for a blocked gate so that the next `koto next` call treats 
 
 **Error cases:**
 - Exit 2: gate not found in current state, no override value available, workflow not found
+- Exit 2, `error.code: "gate_not_overridable"`: the template declares the gate `overridable: false`. The refusal happens whatever `--with-data` holds and nothing is recorded; satisfy the gate itself or escalate to the user. Such a gate always shows `agent_actionable: false`.
 - Exit 3: template hash mismatch, corrupt state file
 
 ---

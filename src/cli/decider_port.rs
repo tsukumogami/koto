@@ -517,6 +517,8 @@ d
             retry_count: None,
             agent_config: None,
             respawn_generation: None,
+            origin: None,
+            template_source_file: None,
         }
     }
 
@@ -555,6 +557,7 @@ d
                             to: "review".to_string(),
                             condition_type: "auto".to_string(),
                             skip_if_matched: None,
+                            context_assignments: None,
                         },
                     ),
                 ],
@@ -726,6 +729,7 @@ d
                     to: "done".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -792,6 +796,7 @@ d
             to: "done".to_string(),
             condition_type: "auto".to_string(),
             skip_if_matched: None,
+            context_assignments: None,
         };
         let cases: Vec<(&str, Vec<EventPayload>, bool)> = vec![
             ("nothing moved", vec![], false),
@@ -880,6 +885,7 @@ d
                     to: "review".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             )
         };

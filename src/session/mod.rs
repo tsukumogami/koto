@@ -238,6 +238,20 @@ pub trait SessionBackend: Send + Sync {
         0
     }
 
+    /// # Stability: additive-only
+    ///
+    /// The identity of this session store -- backend kind and canonical
+    /// sessions directory -- recorded in a new session's origin record
+    /// (`StateFileHeader.origin`) and compared by `koto init
+    /// --attach-live`.
+    ///
+    /// The default returns `None` for backends with no stable identity;
+    /// sessions they create carry no origin record, and `--attach-live`
+    /// refuses them.
+    fn store_identity(&self) -> Option<crate::engine::types::SessionStoreIdentity> {
+        None
+    }
+
     /// # Stability: additive-only (Issue 19 / Decision 5)
     ///
     /// Not part of the Stage 1 frozen four; signature evolution is
@@ -509,6 +523,13 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.count_unreadable(),
             Backend::Cloud(b) => b.count_unreadable(),
+        }
+    }
+
+    fn store_identity(&self) -> Option<crate::engine::types::SessionStoreIdentity> {
+        match self {
+            Backend::Local(b) => b.store_identity(),
+            Backend::Cloud(b) => b.store_identity(),
         }
     }
 

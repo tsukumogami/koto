@@ -394,7 +394,7 @@ fn the_envelope_carries_the_five_contract_fields() {
     assert!(envelope["cli_contract"]["major"].is_u64());
     assert!(envelope["cli_contract"]["minor"].is_u64());
     assert_eq!(envelope["cli_contract"]["major"], 1);
-    assert_eq!(envelope["cli_contract"]["minor"], 0);
+    assert_eq!(envelope["cli_contract"]["minor"], 1);
 }
 
 #[test]

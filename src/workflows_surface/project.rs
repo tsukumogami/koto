@@ -430,6 +430,7 @@ mod tests {
                 to: to.to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
             idempotency_hash: None,
         }

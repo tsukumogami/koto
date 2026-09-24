@@ -683,6 +683,14 @@ impl SessionBackend for CloudBackend {
         self.local.session_dir(id)
     }
 
+    fn store_identity(&self) -> Option<crate::engine::types::SessionStoreIdentity> {
+        let base = self.local.base_dir();
+        Some(crate::engine::types::SessionStoreIdentity {
+            kind: "cloud".to_string(),
+            base: std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf()),
+        })
+    }
+
     fn exists(&self, id: &str) -> bool {
         if self.local.exists(id) {
             return true;
@@ -1045,6 +1053,8 @@ mod tests {
             created_at: created_at.to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1148,6 +1158,8 @@ mod tests {
             created_at: "2026-04-13T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1201,6 +1213,8 @@ mod tests {
             created_at: "2026-04-13T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1257,6 +1271,8 @@ mod tests {
             created_at: "2026-04-13T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1530,6 +1546,7 @@ mod tests {
                     to: "start".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
                 "2026-01-01T00:00:01Z",
             )

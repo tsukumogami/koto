@@ -53,6 +53,7 @@
 //! gap. Request records also do not replicate under the cloud backend.
 //! Both are documented limitations rather than silent gaps.
 
+pub mod attach;
 pub mod view;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -71,9 +72,12 @@ use crate::engine::persistence::{
 };
 use crate::engine::types::{
     CloseDisposition, Event, EventPayload, LegDeclaration, LegDisposition, LegResultSource,
-    RequestState, WorkflowResult,
+    LegTemplates, RequestState, WorkflowResult, MAX_LEG_TEMPLATES,
 };
 
+pub use attach::{
+    attach_leg, check_session_against_leg, precheck_attach, AttachLeg, AttachingSession,
+};
 pub use view::{LegCounts, LegView, ProgressEntry, RequestView};
 
 // ===== Layout =====
@@ -252,6 +256,79 @@ pub enum RequestStoreError {
     #[error("request {request_id} is closed")]
     RequestClosed { request_id: String },
 
+    /// A leg's `template` list is empty, too long, or carries an empty
+    /// entry. Rejected at creation so no leg ever names nothing.
+    #[error("leg {leg_name} declares an unusable template list: {reason}")]
+    InvalidLegTemplate { leg_name: String, reason: String },
+
+    /// An attaching session was built from a template the leg does not
+    /// name. See [`LegTemplates::admits`] for the matching rule.
+    #[error(
+        "session {session_id} was built from {}, which leg {leg_name} of request {request_id} \
+         does not name (it accepts {})",
+        describe_session_template(.session_template),
+        .leg_templates.join(", ")
+    )]
+    TemplateMismatch {
+        request_id: String,
+        leg_name: String,
+        session_id: String,
+        /// The session's source file name; `None` when it has none.
+        session_template: Option<String>,
+        leg_templates: Vec<String>,
+    },
+
+    /// A leg input disagrees with the attaching session's recorded,
+    /// non-rebind variable, or names a variable the session's template
+    /// does not declare (`recorded` is `None` then).
+    #[error(
+        "leg {leg_name} of request {request_id} expects {key}={expected:?}, but the session {}",
+        describe_recorded(.key, .recorded)
+    )]
+    InputMismatch {
+        request_id: String,
+        leg_name: String,
+        key: String,
+        recorded: Option<String>,
+        expected: String,
+    },
+
+    /// The attaching session is at a terminal state or was cancelled,
+    /// so it can never answer a leg.
+    #[error("session {session_id} is in terminal state {state:?} and cannot answer a leg")]
+    SessionTerminal { session_id: String, state: String },
+
+    /// The attaching session already answers a leg that is still live:
+    /// its pointer names a leg that is neither abandoned nor on a closed
+    /// request.
+    #[error(
+        "session {session_id} already answers leg {leg_name} of request {request_id}, which is \
+         still live; a session answers at most one live leg"
+    )]
+    SessionBoundToDifferentLeg {
+        session_id: String,
+        request_id: String,
+        leg_name: String,
+    },
+
+    /// A fenced verb on a leg a root session attached itself to. Such a
+    /// leg has no dispatch epoch, and its result arrives only by
+    /// promotion, so the verb is refused outright.
+    #[error(
+        "leg {leg_name} of request {request_id} was attached by its own session; {verb} is \
+         refused on a self-attached leg, whose result arrives only by promotion"
+    )]
+    SelfAttachedLeg {
+        request_id: String,
+        leg_name: String,
+        verb: &'static str,
+    },
+
+    /// A result with `source: refused` offered anywhere but
+    /// [`record_refusal`].
+    #[error("leg {leg_name}: a refused result can only be recorded by koto's refusal write")]
+    RefusedSourceReserved { leg_name: String },
+
     /// The atomic create found a record already at this identifier.
     #[error("request {request_id} already exists")]
     RequestIdCollision { request_id: String },
@@ -293,6 +370,22 @@ pub enum RequestStoreError {
     /// A read or append failed below the typed layer.
     #[error("request store failure: {0}")]
     Other(String),
+}
+
+/// How a template mismatch names the session's side.
+fn describe_session_template(source: &Option<String>) -> String {
+    match source {
+        Some(s) => format!("template '{s}'"),
+        None => "no template file".to_string(),
+    }
+}
+
+/// How an input mismatch names the session's side.
+fn describe_recorded(key: &str, recorded: &Option<String>) -> String {
+    match recorded {
+        Some(r) => format!("recorded {key}={r:?}"),
+        None => format!("declares no variable {key}"),
+    }
 }
 
 impl RequestStoreError {
@@ -670,6 +763,7 @@ fn create_request_with_id(
                 leg_name: leg.name.clone(),
             });
         }
+        validate_leg_templates(&leg.name, &leg.declaration.template)?;
         guard_json_payload("leg_inputs_bytes", &leg.declaration.inputs)?;
         legs.insert(leg.name.clone(), leg.declaration.clone());
     }
@@ -758,6 +852,41 @@ fn create_request_with_id(
                 }
             })
         }
+    }
+}
+
+/// Reject a template list that names nothing, or too much.
+///
+/// The single-string form is left exactly as it was accepted before
+/// lists existed. A list must carry between one and
+/// [`MAX_LEG_TEMPLATES`] entries, none of them empty: an empty list
+/// would be a leg nothing can attach to, and an unbounded one a leg
+/// that accepts anything.
+fn validate_leg_templates(
+    leg_name: &str,
+    templates: &LegTemplates,
+) -> Result<(), RequestStoreError> {
+    let LegTemplates::Many(list) = templates else {
+        return Ok(());
+    };
+    let reason = if list.is_empty() {
+        Some("the list is empty".to_string())
+    } else if list.len() > MAX_LEG_TEMPLATES {
+        Some(format!(
+            "the list names {} templates, over the limit of {MAX_LEG_TEMPLATES}",
+            list.len()
+        ))
+    } else if list.iter().any(|t| t.is_empty()) {
+        Some("the list carries an empty entry".to_string())
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => Err(RequestStoreError::InvalidLegTemplate {
+            leg_name: leg_name.to_string(),
+            reason,
+        }),
+        None => Ok(()),
     }
 }
 
@@ -1378,6 +1507,8 @@ pub fn bind_leg(
                         child_session_id: bind.child_session_id.clone(),
                         dispatch_epoch: bind.dispatch_epoch,
                         issued_by: bind.issued_by.clone(),
+                        attach: None,
+                        template: None,
                     },
                     timestamp: bind.timestamp.clone(),
                     hash: None,
@@ -1397,6 +1528,8 @@ pub fn bind_leg(
                 child_session_id: bind.child_session_id.clone(),
                 dispatch_epoch: bind.dispatch_epoch,
                 issued_by: bind.issued_by.clone(),
+                attach: None,
+                template: None,
             },
             timestamp: bind.timestamp.clone(),
             hash: None,
@@ -1442,6 +1575,7 @@ pub fn append_progress(
     append_under_lock(root, request_id, LOCK_WAIT_TIMEOUT, Some(probe), |view| {
         require_open(view)?;
         let leg = view.leg(&progress.leg_name)?;
+        reject_self_attached(view, leg, "progress")?;
         reject_closed_leg(view, leg)?;
 
         // Both bounds are checked here, inside the lock, so neither
@@ -1484,6 +1618,9 @@ pub struct LegResult {
     pub source: LegResultSource,
     pub issued_by: Option<String>,
     pub timestamp: String,
+    /// The terminal state a promoted result came from; `None` for an
+    /// explicit result.
+    pub final_state: Option<String>,
 }
 
 /// Record a leg's result.
@@ -1499,6 +1636,14 @@ pub fn record_result(
     result: &LegResult,
 ) -> Result<AppendResult, RequestStoreError> {
     validate_leg_name(&result.leg_name)?;
+    // A refused result is koto's own record that it turned the answering
+    // session away; letting any caller of this function write one would
+    // let an agent forge that record. Only [`record_refusal`] can.
+    if result.source == LegResultSource::Refused {
+        return Err(RequestStoreError::RefusedSourceReserved {
+            leg_name: result.leg_name.clone(),
+        });
+    }
     if let Some(payload) = &result.result.payload {
         guard_json_payload("result_payload_bytes", payload)?;
     }
@@ -1508,6 +1653,12 @@ pub fn record_result(
         result: result.result.clone(),
         source: result.source,
         issued_by: result.issued_by.clone(),
+        // Only a promotion comes from a terminal state; an explicit result
+        // names none, whatever the caller passed.
+        final_state: match result.source {
+            LegResultSource::Promoted => result.final_state.clone(),
+            _ => None,
+        },
     };
     let hash = idempotency_hash(&result.leg_name, &payload);
     let probe = IdempotencyProbe {
@@ -1518,6 +1669,11 @@ pub fn record_result(
     append_under_lock(root, request_id, LOCK_WAIT_TIMEOUT, Some(probe), |view| {
         require_open(view)?;
         let leg = view.leg(&result.leg_name)?;
+        // A self-attached leg's result arrives only by promotion from
+        // its own session's terminal tick.
+        if result.source == LegResultSource::Explicit {
+            reject_self_attached(view, leg, "resolve")?;
+        }
         match leg.disposition {
             LegDisposition::Resolved => {
                 return Err(RequestStoreError::LegAlreadyResolved {
@@ -1577,16 +1733,47 @@ pub struct AbandonLeg {
 /// is idempotent by nature, and the request-scoped abandon walks every
 /// open leg without wanting to care which ones a concurrent caller got
 /// to first.
+///
+/// This is the leg-scoped verb, so it is refused on a self-attached leg
+/// like the other fenced verbs. The request-scoped walk uses
+/// [`abandon_leg_for_request`] instead, which is not.
 pub fn abandon_leg(
     root: &Path,
     request_id: &ValidatedRequestId,
     abandon: &AbandonLeg,
+) -> Result<AppendResult, RequestStoreError> {
+    abandon_leg_inner(root, request_id, abandon, false)
+}
+
+/// Abandon one leg as part of abandoning its whole request.
+///
+/// Unlike [`abandon_leg`], a self-attached leg is abandoned too:
+/// request-scoped abandonment carries no single epoch to fence and is
+/// accepted as unfenced (DESIGN-request-lifecycle.md, root attach
+/// amendment), and it is how a newer run supersedes an older one whose
+/// sessions attached themselves.
+pub fn abandon_leg_for_request(
+    root: &Path,
+    request_id: &ValidatedRequestId,
+    abandon: &AbandonLeg,
+) -> Result<AppendResult, RequestStoreError> {
+    abandon_leg_inner(root, request_id, abandon, true)
+}
+
+fn abandon_leg_inner(
+    root: &Path,
+    request_id: &ValidatedRequestId,
+    abandon: &AbandonLeg,
+    request_scoped: bool,
 ) -> Result<AppendResult, RequestStoreError> {
     validate_leg_name(&abandon.leg_name)?;
     let rationale = sanitize_rationale(&abandon.rationale)?;
     append_under_lock(root, request_id, LOCK_WAIT_TIMEOUT, None, |view| {
         require_open(view)?;
         let leg = view.leg(&abandon.leg_name)?;
+        if !request_scoped {
+            reject_self_attached(view, leg, "abandon")?;
+        }
         match leg.disposition {
             LegDisposition::Abandoned => return Ok(None),
             LegDisposition::Resolved => {
@@ -1664,6 +1851,89 @@ fn derive_disposition(view: &RequestView) -> CloseDisposition {
     } else {
         CloseDisposition::AllResolved
     }
+}
+
+/// A refusal koto records on a leg itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LegRefusal {
+    pub leg_name: String,
+    /// The refusal as a result envelope, normally `status: failure` with
+    /// a payload naming the reason.
+    pub result: WorkflowResult,
+    pub issued_by: Option<String>,
+    pub timestamp: String,
+}
+
+/// Resolve a leg with `source: refused`.
+///
+/// The only way to write that source: [`record_result`] rejects it, and
+/// `koto request resolve` always writes `explicit`. Used when koto turns
+/// away the session that was to answer the leg, so the requester waiting
+/// on it learns why instead of waiting forever.
+///
+/// Admitted only while the leg is open and unbound, checked under the
+/// lock: a leg bound in the meantime has a session answering it, and a
+/// refusal recorded over it would block that session's promoted result.
+/// Every other state is a typed rejection with nothing written.
+pub fn record_refusal(
+    root: &Path,
+    request_id: &ValidatedRequestId,
+    refusal: &LegRefusal,
+) -> Result<AppendResult, RequestStoreError> {
+    validate_leg_name(&refusal.leg_name)?;
+    if let Some(payload) = &refusal.result.payload {
+        guard_json_payload("result_payload_bytes", payload)?;
+    }
+    let payload = EventPayload::RequestLegResult {
+        request_id: request_id.as_str().to_string(),
+        leg_name: refusal.leg_name.clone(),
+        result: refusal.result.clone(),
+        source: LegResultSource::Refused,
+        issued_by: refusal.issued_by.clone(),
+        final_state: None,
+    };
+    let hash = idempotency_hash(&refusal.leg_name, &payload);
+    let probe = IdempotencyProbe {
+        hash: hash.clone(),
+        payload: payload.clone(),
+    };
+    append_under_lock(root, request_id, LOCK_WAIT_TIMEOUT, Some(probe), |view| {
+        require_open(view)?;
+        let leg = view.leg(&refusal.leg_name)?;
+        reject_closed_leg(view, leg)?;
+        if let Some(bound) = &leg.bound_child {
+            return Err(RequestStoreError::LegBoundToChild {
+                request_id: view.header.request_id.clone(),
+                leg_name: refusal.leg_name.clone(),
+                child_session_id: bound.clone(),
+            });
+        }
+        Ok(Some(PendingAppend {
+            payload,
+            timestamp: refusal.timestamp.clone(),
+            hash: Some(hash),
+        }))
+    })
+}
+
+/// Refuse a fenced verb on a leg a root session attached itself to.
+///
+/// Such a leg carries no dispatch epoch, so the fence has nothing to
+/// compare against; and a root is never redelegated, so no legitimate
+/// second writer exists. Its result arrives only by promotion.
+fn reject_self_attached(
+    view: &RequestView,
+    leg: &LegView,
+    verb: &'static str,
+) -> Result<(), RequestStoreError> {
+    if leg.is_self_attached() {
+        return Err(RequestStoreError::SelfAttachedLeg {
+            request_id: view.header.request_id.clone(),
+            leg_name: leg.name.clone(),
+            verb,
+        });
+    }
+    Ok(())
 }
 
 /// Reject a mutation on a leg that has already reached a terminal

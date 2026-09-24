@@ -71,7 +71,12 @@ pub struct CompiledTemplate {
 }
 
 /// A variable declaration in a compiled template.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// `values`, `pattern`, and `rebind` are skipped when unset, so a template
+/// that declares none of them compiles to the same JSON (and so the same
+/// template hash) as it did before they existed. The constraint checks live
+/// in `src/template/variables.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct VariableDecl {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
@@ -79,6 +84,17 @@ pub struct VariableDecl {
     pub required: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub default: String,
+    /// Closed set of accepted values. Mutually exclusive with `pattern`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+    /// Regular expression (`regex` crate syntax) a value must match in full;
+    /// applied as `^(?:<pattern>)$`. Mutually exclusive with `values`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pattern: String,
+    /// Whether the variable is re-applied from each invocation when a live
+    /// session is attached. Non-rebind variables are fixed at `koto init`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rebind: bool,
 }
 
 /// A state declaration in a compiled template.
@@ -128,6 +144,14 @@ pub struct TemplateState {
     /// evidence. Uses the same dot-path syntax as `when` clauses on transitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_if: Option<BTreeMap<String, serde_json::Value>>,
+    /// The declared result of a terminal state: a flat map from key to a
+    /// string value holding literal text, `{{VAR}}`, or `${context.<key>}`.
+    /// When present, koto resolves it once on the terminal tick and it
+    /// becomes the `WorkflowResult`'s `payload` in place of the
+    /// evidence-derived one. Meaningful only when `terminal` is true; the
+    /// grammar lives in [`crate::template::result_map`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<BTreeMap<String, String>>,
 }
 
 /// Template-level declaration that a state fans out child workflows from an
@@ -176,6 +200,20 @@ pub struct Transition {
     pub target: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<BTreeMap<String, serde_json::Value>>,
+    /// Context writes that land with this transition (koto#204).
+    ///
+    /// Maps a context key to a value template: a literal, `{{VAR}}`,
+    /// `${evidence.<field>}` or `${gates.<gate>.<path>}`, with references
+    /// allowed inside a string literal. The engine resolves the values when
+    /// the transition fires, records them on the `Transitioned` event, and
+    /// writes them to the session's context store. `crate::template::assignments`
+    /// owns the reference grammar.
+    ///
+    /// Omitted from the compiled JSON when empty, so a template without
+    /// assignments compiles byte-identically to one built before the field
+    /// existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub context_assignments: BTreeMap<String, String>,
 }
 
 /// Schema for an evidence field declared in an `accepts` block.
@@ -235,6 +273,31 @@ pub struct Gate {
     /// only research children, not all children).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_filter: Option<String>,
+    /// Whether `koto overrides record` may force this gate. Defaults to `true`.
+    ///
+    /// A gate declared `overridable: false` refuses every override at record
+    /// time, with or without `--with-data`, and the advance loop ignores any
+    /// `GateOverrideRecorded` event for it (one written by an older koto or
+    /// appended by hand), evaluating the gate for real instead. Use it for
+    /// gates whose output decides progress that nothing downstream re-checks.
+    ///
+    /// Omitted from the compiled JSON when `true`, so a template that does
+    /// not use the field compiles byte-identical to before and existing
+    /// sessions' template hashes stay valid.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub overridable: bool,
+    /// Request id for `request-leg` gates. May carry `{{VAR}}` references,
+    /// which the tick substitutes before the gate reads the request store.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request: String,
+    /// Leg name for `request-leg` gates. Substituted like `request`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub leg: String,
+    /// Optional expectation set for `request-leg` gates: each key names a
+    /// payload key, and its list holds the scalar values that key may carry
+    /// for the gate to report `valid: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<BTreeMap<String, Vec<serde_json::Value>>>,
 }
 
 impl Gate {
@@ -278,11 +341,19 @@ impl Gate {
             override_default: _,
             completion: _,
             name_filter,
+            overridable: _,
+            request,
+            leg,
+            // `expect` holds literal scalar values compared against a leg's
+            // payload; it carries no references.
+            expect: _,
         } = self;
         let mut fields = vec![
             ("command", command.as_str()),
             ("key", key.as_str()),
             ("pattern", pattern.as_str()),
+            ("request", request.as_str()),
+            ("leg", leg.as_str()),
         ];
         if let Some(filter) = name_filter {
             fields.push(("name_filter", filter.as_str()));
@@ -413,6 +484,14 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn default_true() -> bool {
+    true
+}
+
 fn is_zero(n: &u32) -> bool {
     *n == 0
 }
@@ -425,6 +504,22 @@ pub const GATE_TYPE_CONTEXT_EXISTS: &str = "context-exists";
 pub const GATE_TYPE_CONTEXT_MATCHES: &str = "context-matches";
 /// Gate type: check whether all child workflows have reached their completion condition.
 pub const GATE_TYPE_CHILDREN_COMPLETE: &str = "children-complete";
+/// Gate type: read one request leg's disposition and recorded result.
+pub const GATE_TYPE_REQUEST_LEG: &str = "request-leg";
+
+/// Every gate type koto evaluates, in the order error messages list them.
+pub const SUPPORTED_GATE_TYPES: &[&str] = &[
+    GATE_TYPE_COMMAND,
+    GATE_TYPE_CONTEXT_EXISTS,
+    GATE_TYPE_CONTEXT_MATCHES,
+    GATE_TYPE_CHILDREN_COMPLETE,
+    GATE_TYPE_REQUEST_LEG,
+];
+
+/// The object-typed output field of a `request-leg` gate. A `when` clause
+/// routes on a key inside it (`gates.<gate>.payload.<key>`), never on the
+/// object itself.
+pub const REQUEST_LEG_PAYLOAD_FIELD: &str = "payload";
 
 /// Evidence namespace reserved for engine-injected gate output.
 /// Agent submissions starting with this prefix are rejected (Feature 2, R7).
@@ -543,6 +638,10 @@ pub enum GateSchemaFieldType {
     /// compares whole values, which is rarely what an author wants -- route on
     /// the aggregate booleans instead.
     Array,
+    /// JSON-object field. Only `request-leg` produces one (`payload`). A
+    /// `when` clause cannot compare it whole; it routes on a key inside it
+    /// through `gates.<gate>.payload.<key>`.
+    Object,
 }
 
 /// Return the static output field schema for a known gate type.
@@ -584,6 +683,24 @@ pub fn gate_type_schema(gate_type: &str) -> Option<&'static [(&'static str, Gate
             ("children", Array),
             ("error", Str),
         ]),
+        // Must stay in step with `request_leg_output()` in `src/gate.rs`; a
+        // test there asserts every key the evaluator emits is listed here and
+        // the other way round.
+        GATE_TYPE_REQUEST_LEG => Some(&[
+            ("found", Boolean),
+            ("disposition", Str),
+            ("bound", Boolean),
+            ("source", Str),
+            ("status", Str),
+            ("final_state", Str),
+            ("template", Str),
+            ("outcome", Str),
+            ("step", Str),
+            ("reason", Str),
+            ("valid", Boolean),
+            ("payload", Object),
+            ("error", Str),
+        ]),
         _ => None,
     }
 }
@@ -619,8 +736,109 @@ pub fn gate_type_builtin_default(gate_type: &str) -> Option<serde_json::Value> {
             "children": [],
             "error": ""
         })),
+        GATE_TYPE_REQUEST_LEG => Some(request_leg_builtin_default()),
         _ => None,
     }
+}
+
+/// The built-in default for a `request-leg` gate: a resolved, valid record
+/// that names no child outcome. Shared by both default functions so the two
+/// cannot disagree about this type.
+pub fn request_leg_builtin_default() -> serde_json::Value {
+    serde_json::json!({
+        "found": true,
+        "disposition": "resolved",
+        "bound": true,
+        "source": "promoted",
+        "status": "",
+        "final_state": "",
+        "template": "",
+        "outcome": "",
+        "step": "",
+        "reason": "",
+        "valid": true,
+        "payload": {},
+        "error": ""
+    })
+}
+
+/// Validate a `request-leg` gate's declaration.
+///
+/// `request` and `leg` are required. A value with no `{{VAR}}` reference is
+/// checked here against the request store's own id and leg-name rules, the
+/// ones `koto request` applies, so a typo fails compilation rather than
+/// every tick; a value with a reference is checked after substitution, at
+/// tick time, by the evaluator. `expect`, when present, must be a non-empty
+/// map whose every list is non-empty and holds only scalars.
+pub fn validate_request_leg_gate(
+    state_name: &str,
+    gate_name: &str,
+    gate: &Gate,
+) -> Result<(), String> {
+    use crate::engine::request_store::{validate_leg_name, ValidatedRequestId};
+
+    for (field, value) in [("request", &gate.request), ("leg", &gate.leg)] {
+        if value.trim().is_empty() {
+            return Err(format!(
+                "state {:?} gate {:?}: request-leg gate must have a non-empty {}",
+                state_name, gate_name, field
+            ));
+        }
+    }
+    if extract_refs(&gate.request).is_empty() {
+        if let Err(e) = ValidatedRequestId::new(&gate.request) {
+            return Err(format!(
+                "state {:?} gate {:?}: request {:?} is not a valid request id: {}",
+                state_name, gate_name, gate.request, e
+            ));
+        }
+    }
+    if extract_refs(&gate.leg).is_empty() {
+        if let Err(e) = validate_leg_name(&gate.leg) {
+            return Err(format!(
+                "state {:?} gate {:?}: leg {:?} is not a valid leg name: {}",
+                state_name, gate_name, gate.leg, e
+            ));
+        }
+    }
+    if let Some(expect) = &gate.expect {
+        if expect.is_empty() {
+            return Err(format!(
+                "state {:?} gate {:?}: expect must name at least one payload key; \
+                 omit it to accept any object payload",
+                state_name, gate_name
+            ));
+        }
+        for (key, values) in expect {
+            if key.is_empty() {
+                return Err(format!(
+                    "state {:?} gate {:?}: expect has an empty payload key",
+                    state_name, gate_name
+                ));
+            }
+            if values.is_empty() {
+                return Err(format!(
+                    "state {:?} gate {:?}: expect key {:?} must list at least one value",
+                    state_name, gate_name, key
+                ));
+            }
+            if let Some(bad) = values
+                .iter()
+                .find(|v| v.is_array() || v.is_object() || v.is_null())
+            {
+                return Err(format!(
+                    "state {:?} gate {:?}: expect key {:?} lists a non-scalar value {} \
+                     (found: {}); expected values must be strings, numbers, or booleans",
+                    state_name,
+                    gate_name,
+                    key,
+                    bad,
+                    json_type_name(bad)
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Return the lowercase type name of a JSON value (for error messages).
@@ -669,6 +887,7 @@ fn gate_schema_field_type_name(t: &GateSchemaFieldType) -> &'static str {
         GateSchemaFieldType::Str => "string",
         GateSchemaFieldType::Boolean => "boolean",
         GateSchemaFieldType::Array => "array",
+        GateSchemaFieldType::Object => "object",
     }
 }
 
@@ -679,6 +898,7 @@ fn json_value_matches_schema_type(value: &serde_json::Value, t: &GateSchemaField
         GateSchemaFieldType::Str => value.is_string(),
         GateSchemaFieldType::Boolean => value.is_boolean(),
         GateSchemaFieldType::Array => value.is_array(),
+        GateSchemaFieldType::Object => value.is_object(),
     }
 }
 
@@ -932,12 +1152,18 @@ impl CompiledTemplate {
                             }
                         }
                     }
+                    GATE_TYPE_REQUEST_LEG => {
+                        validate_request_leg_gate(state_name, gate_name, gate)?;
+                    }
                     other => {
                         return Err(format!(
-                            "state {:?} gate {:?}: unsupported gate type {:?}. \
+                            "state {:?} gate {:?}: unsupported gate type {:?}; supported types: {}. \
                              Field-based gates have been replaced by accepts/when. \
                              Use accepts blocks for evidence schema and when conditions for routing.",
-                            state_name, gate_name, other
+                            state_name,
+                            gate_name,
+                            other,
+                            SUPPORTED_GATE_TYPES.join(", ")
                         ));
                     }
                 }
@@ -1129,6 +1355,31 @@ impl CompiledTemplate {
 
             // Validate evidence routing rules on transitions (D3 included).
             self.validate_evidence_routing(state_name, state, &captures)?;
+
+            // Validate transition context_assignments (koto#204).
+            for transition in &state.transitions {
+                super::assignments::validate_transition_assignments(
+                    state_name,
+                    state,
+                    transition,
+                    &self.variables,
+                    &captures,
+                )?;
+            }
+
+            // Validate a declared terminal result map.
+            if let Some(result) = &state.result {
+                crate::template::result_map::validate_result_map(
+                    state_name,
+                    state.terminal,
+                    result,
+                    |name| {
+                        self.variables.contains_key(name)
+                            || captures.contains_key(name)
+                            || RUNTIME_VARIABLE_NAMES.contains(&name)
+                    },
+                )?;
+            }
 
             // Validate variable references in directives.
             for ref_name in extract_refs(&state.directive) {
@@ -1966,7 +2217,7 @@ impl CompiledTemplate {
     /// | W2 | `children-complete.name_filter` is set but does not end with `.` (ergo not scoped to one parent) |
     /// | W3 | Terminal state whose name matches /block|fail|error/ lacks `failure: true` |
     /// | W4 | State with `materialize_children` routes only on `all_complete: true` without a second transition handling failures |
-    /// | W5 | Terminal state with `failure: true` has no path writing `failure_reason` to context (v1 only checks the accepts-field path; templates relying on `default_action` or `context_assignments` may see false positives until those surfaces are checked) |
+    /// | W5 | Terminal state with `failure: true` has no path writing `failure_reason` to context: no accepts field and no `context_assignments` entry on every incoming transition (a `default_action` write is not detected, so templates relying on it may see false positives) |
     ///
     /// Warnings are returned as formatted strings; callers emit them via
     /// stderr (`validate`) or collect them for tests.
@@ -2111,17 +2362,17 @@ impl CompiledTemplate {
         // context key can land:
         //   (a) the state's `accepts` block declares a `failure_reason` field
         //   (b) the state's `default_action` writes `failure_reason`
-        //   (c) an upstream transition carries a `context_assignments`
+        //   (c) the transitions into the state carry a `context_assignments`
         //       entry writing `failure_reason`
         //
-        // Neither `default_action` nor `context_assignments` carry schema
-        // metadata today (the runtime context-assignment surface lands
-        // in a later phase), so for now we check (a) only. A future PR
-        // extends this check once (b)/(c) have stable representations;
-        // until then W5 over-warns on templates that rely on (b)/(c).
+        // (a) and (c) are checked. (c) credits the state only when every
+        // incoming edge assigns the key: a single edge that doesn't is a path
+        // reaching the terminal with no reason. A terminal no edge reaches is
+        // not credited by (c).
         //
-        // TODO(issue-8/W5): widen the check once default_action and
-        // context_assignments expose a writable-keys surface.
+        // TODO(issue-8/W5): (b) is still unchecked. A default_action is a
+        // shell command with no declared set of keys it writes, so W5 can
+        // over-warn on templates that rely on it.
         for (state_name, state) in &self.states {
             if !(state.terminal && state.failure) {
                 continue;
@@ -2130,11 +2381,21 @@ impl CompiledTemplate {
                 .accepts
                 .as_ref()
                 .is_some_and(|a| a.contains_key("failure_reason"));
-            if !has_failure_reason_accepts {
+            let incoming: Vec<&Transition> = self
+                .states
+                .values()
+                .flat_map(|s| s.transitions.iter())
+                .filter(|t| &t.target == state_name)
+                .collect();
+            let every_edge_assigns = !incoming.is_empty()
+                && incoming
+                    .iter()
+                    .all(|t| t.context_assignments.contains_key("failure_reason"));
+            if !has_failure_reason_accepts && !every_edge_assigns {
                 warnings.push(format!(
                     "W5: state {:?}: `failure: true` terminal state has no declared path writing the `failure_reason` context key; \
                      the batch view's per-child `reason` will fall back to the state name\n  \
-                     remedy: add `failure_reason` to the state's accepts block (or write it via default_action / context_assignments)",
+                     remedy: add `failure_reason` to the state's accepts block, or assign it in context_assignments on every transition into the state",
                     state_name
                 ));
             }
@@ -2214,6 +2475,22 @@ impl CompiledTemplate {
 
         let gates_prefix = format!("{}.", GATES_EVIDENCE_NAMESPACE);
 
+        // A transition whose `when` clause references a gate declared
+        // `overridable: false` is left out of the check. D4 asks whether an
+        // override could move the state; no override can ever apply to such a
+        // gate, so its arms fire only on the gate's real output and the
+        // override defaults say nothing about them.
+        let references_non_overridable = |t: &Transition| {
+            t.when.as_ref().is_some_and(|w| {
+                w.keys().any(|k| {
+                    k.strip_prefix(&gates_prefix)
+                        .and_then(|rest| rest.split('.').next())
+                        .and_then(|gate_name| state.gates.get(gate_name))
+                        .is_some_and(|g| !g.overridable)
+                })
+            })
+        };
+
         // Collect pure-gate transitions: `when` clause is non-empty and every key
         // starts with "gates.".
         let pure_gate_transitions: Vec<&Transition> = state
@@ -2224,9 +2501,12 @@ impl CompiledTemplate {
                     !w.is_empty() && w.keys().all(|k| k.starts_with(&gates_prefix))
                 })
             })
+            .filter(|t| !references_non_overridable(t))
             .collect();
 
         // No pure-gate transitions → exempt from the reachability check (AC5, AC6).
+        // That includes a state whose every pure-gate transition references a
+        // non-overridable gate.
         if pure_gate_transitions.is_empty() {
             return Ok(());
         }
@@ -2249,12 +2529,17 @@ impl CompiledTemplate {
         // AC10: warn for schema fields never referenced in any `when` clause.
         for (gate_name, gate) in &state.gates {
             if let Some(schema) = gate_type_schema(&gate.gate_type) {
-                for (field_name, _) in schema {
+                for (field_name, field_type) in schema {
                     let path = format!("{}.{}.{}", GATES_EVIDENCE_NAMESPACE, gate_name, field_name);
-                    let referenced = state
-                        .transitions
-                        .iter()
-                        .any(|t| t.when.as_ref().is_some_and(|w| w.contains_key(&path)));
+                    // An object field is referenced through a key inside it.
+                    let nested = format!("{}.", path);
+                    let referenced = state.transitions.iter().any(|t| {
+                        t.when.as_ref().is_some_and(|w| {
+                            w.contains_key(&path)
+                                || (*field_type == GateSchemaFieldType::Object
+                                    && w.keys().any(|k| k.starts_with(&nested)))
+                        })
+                    });
                     if !referenced {
                         eprintln!(
                             "warning: state {:?} gate {:?} field {:?} is never referenced in any when clause",
@@ -2430,10 +2715,22 @@ impl CompiledTemplate {
             }
 
             // D3: validate gates.* path structure and field references.
+            //
+            // Exactly `gates.<gate>.<field>`, with one exception: a
+            // `request-leg` gate's object-typed `payload` field is routed on
+            // by key, `gates.<gate>.payload.<key>[.<key>...]`. Every other
+            // deeper path keeps today's message.
             for (field, _) in &gate_fields {
-                let segments: Vec<&str> = field.splitn(4, '.').collect();
+                let segments: Vec<&str> = field.split('.').collect();
+                let is_payload_path = segments.len() > 3
+                    && segments[2] == REQUEST_LEG_PAYLOAD_FIELD
+                    && segments[3..].iter().all(|s| !s.is_empty())
+                    && state
+                        .gates
+                        .get(segments[1])
+                        .is_some_and(|g| g.gate_type == GATE_TYPE_REQUEST_LEG);
                 // segments[0] is "gates"; we need exactly 3 segments total.
-                if segments.len() != 3 {
+                if segments.len() != 3 && !is_payload_path {
                     return Err(format!(
                         "state {:?}: when clause key {:?} has invalid format; expected \"gates.<gate>.<field>\"",
                         state_name, field.as_str()
@@ -2464,6 +2761,25 @@ impl CompiledTemplate {
                             field_name_ref,
                             gate.gate_type,
                             valid_fields.join(", ")
+                        ));
+                    }
+                    // An object-typed field is never compared whole: a `when`
+                    // value is a scalar, so the comparison could never hold.
+                    // Route on a key inside it instead.
+                    let is_object_field = schema.iter().any(|(name, t)| {
+                        *name == field_name_ref && *t == GateSchemaFieldType::Object
+                    });
+                    if is_object_field && segments.len() == 3 {
+                        return Err(format!(
+                            "state {:?} transition to {:?}: when clause key {:?} names the object field {:?}, \
+                             which cannot be compared to a scalar value; route on a key inside it, \
+                             such as \"gates.{}.{}.<key>\"",
+                            state_name,
+                            transition.target,
+                            field.as_str(),
+                            field_name_ref,
+                            gate_name_ref,
+                            field_name_ref
                         ));
                     }
                 }
@@ -2566,6 +2882,7 @@ mod tests {
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 gates: BTreeMap::new(),
@@ -2576,6 +2893,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -2593,6 +2911,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         CompiledTemplate {
@@ -2667,6 +2986,7 @@ mod tests {
                     description: "a declared variable".to_string(),
                     required: true,
                     default: String::new(),
+                    ..Default::default()
                 },
             );
             t.states.get_mut("start").unwrap().default_action = Some(action);
@@ -2693,6 +3013,7 @@ mod tests {
                 description: "a declared variable".to_string(),
                 required: true,
                 default: String::new(),
+                ..Default::default()
             },
         );
         t.states.get_mut("start").unwrap().default_action = Some(ActionDecl {
@@ -2721,6 +3042,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -2743,6 +3068,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -2766,6 +3095,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -2773,6 +3106,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -2785,6 +3119,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(BTreeMap::new()),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(err.contains("when block must not be empty"), "got: {}", err);
@@ -2799,6 +3134,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2829,6 +3165,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(err.contains("not declared in accepts"), "got: {}", err);
@@ -2850,6 +3187,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -2857,6 +3198,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         assert!(
             t.validate(true).is_ok(),
@@ -2880,6 +3222,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -2890,10 +3236,12 @@ mod tests {
             Transition {
                 target: "done".to_string(),
                 when: Some(when_pass),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "fix".to_string(),
                 when: Some(when_fail),
+                context_assignments: Default::default(),
             },
         ];
         // Add the "fix" terminal state so the template is valid.
@@ -2912,6 +3260,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         assert!(
@@ -2931,6 +3280,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2953,6 +3303,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(err.contains("must be a scalar"), "got: {}", err);
@@ -2979,6 +3330,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(err.contains("must be a scalar"), "got: {}", err);
@@ -3005,6 +3357,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(err.contains("not in allowed values"), "got: {}", err);
@@ -3072,6 +3425,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -3107,10 +3461,12 @@ mod tests {
             Transition {
                 target: "done".to_string(),
                 when: Some(when_a),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "other".to_string(),
                 when: Some(when_b),
+                context_assignments: Default::default(),
             },
         ];
         let err = t.validate(true).unwrap_err();
@@ -3136,6 +3492,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -3161,10 +3518,12 @@ mod tests {
             Transition {
                 target: "done".to_string(),
                 when: Some(when_a),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "other".to_string(),
                 when: Some(when_b),
+                context_assignments: Default::default(),
             },
         ];
         let err = t.validate(true).unwrap_err();
@@ -3190,6 +3549,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -3215,10 +3575,12 @@ mod tests {
             Transition {
                 target: "done".to_string(),
                 when: Some(when_a),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "other".to_string(),
                 when: Some(when_b),
+                context_assignments: Default::default(),
             },
         ];
         t.validate(true).unwrap();
@@ -3242,6 +3604,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -3279,10 +3642,12 @@ mod tests {
             Transition {
                 target: "done".to_string(),
                 when: Some(when_a),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "other".to_string(),
                 when: Some(when_b),
+                context_assignments: Default::default(),
             },
         ];
         // Exclusive on priority even though decision overlaps.
@@ -3310,6 +3675,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -3359,6 +3725,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         t.validate(false).unwrap();
@@ -3388,6 +3758,7 @@ mod tests {
                 description: String::new(),
                 required: true,
                 default: String::new(),
+                ..Default::default()
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -3410,6 +3781,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3431,6 +3806,7 @@ mod tests {
                 description: String::new(),
                 required: false,
                 default: "main".to_string(),
+                ..Default::default()
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -3445,6 +3821,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         t.validate(false).unwrap();
@@ -3465,6 +3845,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3492,6 +3876,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         t.validate(false).unwrap();
@@ -3521,6 +3909,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3576,6 +3968,7 @@ mod tests {
                 description: "the branch".to_string(),
                 required: false,
                 default: String::new(),
+                ..Default::default()
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3661,6 +4054,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3686,6 +4083,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3731,6 +4132,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3760,6 +4165,10 @@ mod tests {
                     override_default: None,
                     completion: None,
                     name_filter: None,
+                    overridable: true,
+                    request: String::new(),
+                    leg: String::new(),
+                    expect: None,
                 },
             );
             let err = t.validate(true).unwrap_err();
@@ -3785,6 +4194,7 @@ mod tests {
                 description: "scopes the key".to_string(),
                 required: true,
                 default: String::new(),
+                ..Default::default()
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -3799,6 +4209,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         state.transitions = vec![Transition {
@@ -3807,6 +4221,7 @@ mod tests {
                 "gates.review.matches".to_string(),
                 serde_json::json!(true),
             )])),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -3955,6 +4370,7 @@ mod tests {
                 description: String::new(),
                 required: false,
                 default: "main".to_string(),
+                ..Default::default()
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -4203,6 +4619,10 @@ command: "./check.sh"
             override_default,
             completion: None,
             name_filter: None,
+            overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -4216,6 +4636,10 @@ command: "./check.sh"
             override_default,
             completion: None,
             name_filter: None,
+            overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -4229,6 +4653,10 @@ command: "./check.sh"
             override_default,
             completion: None,
             name_filter: None,
+            overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -4382,12 +4810,9 @@ command: "./check.sh"
     #[test]
     fn gate_type_builtin_default_matches_gate_rs_built_in_default() {
         use crate::gate::built_in_default;
-        for gate_type in &[
-            GATE_TYPE_COMMAND,
-            GATE_TYPE_CONTEXT_EXISTS,
-            GATE_TYPE_CONTEXT_MATCHES,
-            GATE_TYPE_CHILDREN_COMPLETE,
-        ] {
+        // Every supported type, so a type added to the list is covered here
+        // without anyone remembering to add it.
+        for gate_type in SUPPORTED_GATE_TYPES {
             let types_val = gate_type_builtin_default(gate_type)
                 .unwrap_or_else(|| panic!("gate_type_builtin_default missing for {}", gate_type));
             let gate_val = built_in_default(gate_type)
@@ -4419,6 +4844,10 @@ command: "./check.sh"
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         t
@@ -4434,6 +4863,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -4457,6 +4887,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -4480,6 +4911,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -4502,6 +4934,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -4526,6 +4959,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -4546,6 +4980,10 @@ command: "./check.sh"
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -4556,6 +4994,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -4576,6 +5015,10 @@ command: "./check.sh"
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -4586,6 +5029,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -4612,6 +5056,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -4640,6 +5085,10 @@ command: "./check.sh"
                 override_default,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -4656,10 +5105,12 @@ command: "./check.sh"
             Transition {
                 target: "done".to_string(),
                 when: Some(when_pass),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "fix".to_string(),
                 when: Some(when_fail),
+                context_assignments: Default::default(),
             },
         ];
         t.states.insert(
@@ -4677,6 +5128,7 @@ command: "./check.sh"
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         t
@@ -4704,6 +5156,58 @@ command: "./check.sh"
             resolve_gates_path(&evidence, "gates.ci.exit_code.sub"),
             None
         );
+    }
+
+    #[test]
+    fn resolve_gates_path_walks_a_request_leg_payload() {
+        // The same inputs `resolve_value` in src/engine/advance.rs is tested
+        // with (`resolve_value_walks_a_request_leg_payload`), so the two
+        // traversals are held to one answer.
+        let evidence = serde_json::json!({"gates": {"leg": {
+            "outcome": "scoped",
+            "payload": {"outcome": "scoped", "detail": {"kind": "split"}}
+        }}});
+        assert_eq!(
+            resolve_gates_path(&evidence, "gates.leg.payload.outcome"),
+            Some(&serde_json::json!("scoped"))
+        );
+        assert_eq!(
+            resolve_gates_path(&evidence, "gates.leg.payload.detail.kind"),
+            Some(&serde_json::json!("split"))
+        );
+        assert_eq!(
+            resolve_gates_path(&evidence, "gates.leg.payload.missing"),
+            None
+        );
+    }
+
+    #[test]
+    fn gate_type_schema_request_leg() {
+        use GateSchemaFieldType::*;
+        let schema = gate_type_schema(GATE_TYPE_REQUEST_LEG).expect("request-leg schema");
+        let expected: &[(&str, GateSchemaFieldType)] = &[
+            ("found", Boolean),
+            ("disposition", Str),
+            ("bound", Boolean),
+            ("source", Str),
+            ("status", Str),
+            ("final_state", Str),
+            ("template", Str),
+            ("outcome", Str),
+            ("step", Str),
+            ("reason", Str),
+            ("valid", Boolean),
+            ("payload", Object),
+            ("error", Str),
+        ];
+        assert_eq!(schema, expected);
+        // The built-in default satisfies its own schema (D2's rules).
+        let default = gate_type_builtin_default(GATE_TYPE_REQUEST_LEG).unwrap();
+        let obj = default.as_object().unwrap();
+        assert_eq!(obj.len(), schema.len());
+        for (name, t) in schema {
+            assert!(json_value_matches_schema_type(&obj[*name], t), "{name}");
+        }
     }
 
     // AC4: reachable state (override default satisfies a pure-gate transition) compiles.
@@ -4762,6 +5266,10 @@ command: "./check.sh"
                 override_default: None, // no override_default; builtin used
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when_a = BTreeMap::new();
@@ -4772,10 +5280,12 @@ command: "./check.sh"
             Transition {
                 target: "done".to_string(),
                 when: Some(when_a),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "fix".to_string(),
                 when: Some(when_b),
+                context_assignments: Default::default(),
             },
         ];
         t.states.insert(
@@ -4793,6 +5303,7 @@ command: "./check.sh"
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4817,6 +5328,10 @@ command: "./check.sh"
                 override_default: Some(serde_json::json!({"exit_code": 0, "error": ""})),
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut accepts = BTreeMap::new();
@@ -4838,6 +5353,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -4870,6 +5386,10 @@ command: "./check.sh"
                 override_default: Some(serde_json::json!({"exit_code": 0})),
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         // Dead-end transitions (would trigger D4 if D2 didn't block first).
@@ -4887,10 +5407,12 @@ command: "./check.sh"
             Transition {
                 target: "done".to_string(),
                 when: Some(when_a),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "fix".to_string(),
                 when: Some(when_b),
+                context_assignments: Default::default(),
             },
         ];
         t.states.insert(
@@ -4908,6 +5430,7 @@ command: "./check.sh"
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4959,6 +5482,10 @@ command: "./check.sh"
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         t
@@ -5195,6 +5722,7 @@ command: "./check.sh"
             failure: true,
             skipped_marker: true,
             skip_if: None,
+            result: None,
             ..TemplateState::default()
         };
         let json = serde_json::to_value(&state).unwrap();
@@ -5259,6 +5787,10 @@ command: "./check.sh"
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();
@@ -5269,6 +5801,7 @@ command: "./check.sh"
             transitions: vec![Transition {
                 target: "done".to_string(),
                 when: Some(when),
+                context_assignments: Default::default(),
             }],
             terminal: false,
             gates,
@@ -5283,6 +5816,7 @@ command: "./check.sh"
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         let done = TemplateState {
             directive: "Done.".to_string(),
@@ -5297,6 +5831,7 @@ command: "./check.sh"
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         let mut states = BTreeMap::new();
         states.insert("plan".to_string(), plan);
@@ -5436,6 +5971,10 @@ command: "./check.sh"
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();
@@ -5449,6 +5988,7 @@ command: "./check.sh"
             transitions: vec![Transition {
                 target: "done".to_string(),
                 when: Some(when),
+                context_assignments: Default::default(),
             }],
             terminal: false,
             gates: gates2,
@@ -5463,6 +6003,7 @@ command: "./check.sh"
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         t.states.insert("plan2".to_string(), plan2);
         let err = t.validate(true).unwrap_err();
@@ -5494,6 +6035,7 @@ command: "./check.sh"
         t.states.get_mut("plan").unwrap().transitions = vec![Transition {
             target: "done".to_string(),
             when: None,
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(err.starts_with("E10:"), "got: {}", err);
@@ -5512,6 +6054,7 @@ command: "./check.sh"
         t.states.get_mut("plan").unwrap().transitions = vec![Transition {
             target: "done".to_string(),
             when: None,
+            context_assignments: Default::default(),
         }];
         let warnings = t.collect_materialize_children_warnings();
         assert!(
@@ -5587,6 +6130,7 @@ command: "./check.sh"
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         t.states.insert("blocked".to_string(), blocked);
         let warnings = t.collect_materialize_children_warnings();
@@ -5615,6 +6159,7 @@ command: "./check.sh"
             failure: true,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();
@@ -5660,6 +6205,7 @@ command: "./check.sh"
             .push(Transition {
                 target: "done".to_string(),
                 when: Some(failure_when),
+                context_assignments: Default::default(),
             });
         let warnings = t.collect_materialize_children_warnings();
         assert!(
@@ -5686,6 +6232,7 @@ command: "./check.sh"
             failure: true,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();
@@ -5723,12 +6270,88 @@ command: "./check.sh"
             failure: true,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();
         assert!(
             !warnings.iter().any(|w| w.starts_with("W5:")),
             "W5 should be quiet when failure_reason is in accepts; got: {:?}",
+            warnings
+        );
+    }
+
+    /// A template with a `failure: true` terminal `failed` reached from two
+    /// states, `a` and `b`; `assigns` says which of the two edges assign
+    /// `failure_reason`.
+    fn w5_template_with_edges(assigns: [bool; 2]) -> CompiledTemplate {
+        let mut t = minimal_batch_parent();
+        let failed = TemplateState {
+            directive: "Failed.".to_string(),
+            details: String::new(),
+            transitions: vec![],
+            terminal: true,
+            gates: BTreeMap::new(),
+            accepts: None,
+            integration: None,
+            default_action: None,
+            materialize_children: None,
+            failure: true,
+            skipped_marker: false,
+            skip_if: None,
+            result: None,
+        };
+        t.states.insert("failed".to_string(), failed);
+        for (name, assign) in ["a", "b"].iter().zip(assigns) {
+            let mut context_assignments = BTreeMap::new();
+            if assign {
+                context_assignments.insert("failure_reason".to_string(), "broke".to_string());
+            }
+            t.states.insert(
+                name.to_string(),
+                TemplateState {
+                    directive: "Work.".to_string(),
+                    details: String::new(),
+                    transitions: vec![Transition {
+                        target: "failed".to_string(),
+                        when: None,
+                        context_assignments,
+                    }],
+                    terminal: false,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: None,
+                    result: None,
+                },
+            );
+        }
+        t
+    }
+
+    #[test]
+    fn w5_quiet_when_every_incoming_edge_assigns_failure_reason() {
+        let warnings = w5_template_with_edges([true, true]).collect_materialize_children_warnings();
+        assert!(
+            !warnings.iter().any(|w| w.starts_with("W5:")),
+            "W5 should be quiet when every edge assigns failure_reason; got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn w5_warns_when_one_incoming_edge_does_not_assign_failure_reason() {
+        let warnings =
+            w5_template_with_edges([true, false]).collect_materialize_children_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("W5:") && w.contains("\"failed\"")),
+            "expected W5 for the edge without failure_reason, got: {:?}",
             warnings
         );
     }
@@ -5764,6 +6387,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         assert!(
             t.validate(true).is_ok(),
@@ -5785,6 +6409,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -5804,6 +6429,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -5839,6 +6465,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
 
         // Validation succeeds (W6 is non-fatal).
@@ -5871,6 +6498,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
         let warnings = t.collect_when_clause_warnings();
@@ -5900,6 +6528,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
         let warnings = t.collect_when_clause_warnings();
@@ -5964,6 +6593,7 @@ command: "./check.sh"
                 description: String::new(),
                 required: false,
                 default: String::new(),
+                ..Default::default()
             },
         );
         t
@@ -5980,6 +6610,7 @@ command: "./check.sh"
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 ..Default::default()
@@ -6000,10 +6631,12 @@ command: "./check.sh"
             Transition {
                 target: "done".to_string(),
                 when: Some(when_set),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "alt".to_string(),
                 when: Some(when_unset),
+                context_assignments: Default::default(),
             },
         ];
         assert!(
@@ -6021,6 +6654,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -6042,6 +6676,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -6063,6 +6698,7 @@ command: "./check.sh"
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 ..Default::default()
@@ -6083,10 +6719,12 @@ command: "./check.sh"
             Transition {
                 target: "done".to_string(),
                 when: Some(when_set),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "alt".to_string(),
                 when: Some(when_unset),
+                context_assignments: Default::default(),
             },
         ];
         assert!(
@@ -6107,6 +6745,7 @@ command: "./check.sh"
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 ..Default::default()
@@ -6127,10 +6766,12 @@ command: "./check.sh"
             Transition {
                 target: "done".to_string(),
                 when: Some(when_a),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "alt".to_string(),
                 when: Some(when_b),
+                context_assignments: Default::default(),
             },
         ];
         let err = t.validate(true).unwrap_err();
@@ -6152,6 +6793,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         assert!(
             t.validate(true).is_ok(),

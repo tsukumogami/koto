@@ -93,10 +93,10 @@ Each item in `blocking_conditions` has six fields:
 | Field | Type | Notes |
 |-------|------|-------|
 | `name` | string | Gate name as declared in the template, or the reserved `__action__` for a failed `default_action` |
-| `type` | string | Gate type (`command`, `context-exists`, `context-matches`, `children-complete`), or `action` |
+| `type` | string | Gate type (`command`, `context-exists`, `context-matches`, `children-complete`, `request-leg`), or `action` |
 | `status` | string | `failed`, `timed_out`, or `error` |
-| `category` | string | `"corrective"` (fix something) or `"temporal"` (retry later). `children-complete` gates are temporal; all others are corrective. |
-| `agent_actionable` | boolean | `true` when `koto overrides record` can unblock this gate. Always `false` for `__action__` -- an action failure has nothing to override |
+| `category` | string | `"corrective"` (fix something) or `"temporal"` (retry later). `children-complete` and `request-leg` gates are temporal; all others are corrective. |
+| `agent_actionable` | boolean | `true` when `koto overrides record` can unblock this gate. Always `false` for `__action__` -- an action failure has nothing to override -- and for a gate declared `overridable: false` |
 | `output` | object | Gate-type-specific structured result (e.g., `{"exit_code": 1, "error": ""}` for `command` gates). For `__action__`: `state`, `command`, `failure_kind`, `stdout`, `stderr`, `truncated`, and `exit_code` only when `failure_kind` is `nonzero_exit` |
 
 `__action__` is reserved: the compiler rejects a state that declares a gate by that name, so the condition can never be confused with one of yours. Route on `failure_kind` (`nonzero_exit`, `spawn_failed`, `timed_out`, `wait_failed`, `capture_failed`) rather than on `status` or on message wording. When an action fails, the state's gates are not evaluated at all -- the tick returns first -- so a state whose action failed reports exactly one condition.

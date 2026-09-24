@@ -10,6 +10,149 @@ to `0.9.x`).
 
 ### Added
 
+- **A `request-leg` gate routes on what another session reported.** A gate of
+  type `request-leg` names a `request` and a `leg` (both may use `{{VAR}}`) and
+  reads that leg from the request store: its `disposition` (`open`,
+  `resolved`, `abandoned`, `missing`), whether a session is `bound`, the
+  result's `source`, `status`, and `payload`, the promoted result's
+  `final_state` and `template`, the payload's `outcome`, `step`, and `reason`,
+  and a `valid` flag checked against an optional `expect` map. An open leg is a
+  temporal block, so a coordinator waits on it without writing an arm for the
+  wait, and a resolved or abandoned leg passes. A `when` clause can route on a
+  key inside the payload (`gates.<gate>.payload.<key>`), the one place a
+  `gates.*` path may run past three segments, and `context_assignments` can
+  copy payload values into context. The gate never writes to the request log.
+  A promoted leg result now records the terminal state it came from, shown as
+  `result_final_state` in `koto request get`.
+
+- **The strict reachability check exempts non-overridable gates.** Strict
+  compilation requires that some gate-only transition fires when every gate
+  takes its override value, so that an override can always move a stuck
+  state. No override can apply to an `overridable: false` gate, so transitions
+  referencing one are now left out of that check, and a state whose gate-only
+  transitions all reference one is exempt. Before this, a non-overridable gate
+  routed on values its default can't produce (a `request-leg` gate's
+  `payload.outcome`, or a `context-matches` gate routed only on
+  `matches: false`) could not compile strictly at all, since the
+  `override_default` that would satisfy the check is an error on such a gate.
+  Transitions on overridable gates are checked as before.
+
+- **Transition `context_assignments` now run (koto#204).** A transition can
+  write context keys when it fires: literals, `{{VAR}}`,
+  `${evidence.<field>}`, and `${gates.<gate>.<path>}` (a dot path into any
+  gate's structured output), alone or inside a string literal. The resolved
+  values are recorded on the `transitioned` event, so they can't be separated
+  from the transition, and a store write that fails afterwards is restored on
+  the next `koto context get`, `koto context exists`, or context gate. An
+  absent evidence field or gate path resolves to the empty string; resolved
+  values are never expanded twice. Until now the compiler dropped these blocks
+  without a word. **Breaking for templates that relied on that:** any
+  transition key other than `target`, `when`, and `context_assignments` now
+  fails compilation, and assignment references are checked against the
+  state's `accepts` fields, gates, and declared variables. The W5 lint no
+  longer warns for a `failure: true` terminal whose every incoming transition
+  assigns `failure_reason`.
+
+- **A gate can refuse overrides with `overridable: false`.** Until now any
+  gate could be forced with `koto overrides record`, so one override on a gate
+  that decides a merge or a report could drive any arm it routes, including
+  arms nothing re-checks. A gate declared `overridable: false` (any gate type)
+  now refuses the override with exit 2 and the typed code
+  `gate_not_overridable`, with or without `--with-data`, and appends nothing;
+  it reports `agent_actionable: false`; and `koto next` ignores any override
+  for it already in the log and evaluates the gate for real. The field
+  defaults to `true` and is omitted from the compiled JSON when `true`, so
+  existing templates compile byte-identical and existing sessions' template
+  hashes stay valid. Declaring `override_default` on a non-overridable gate is
+  a compile error, as is an `overridable` value that isn't a boolean.
+  Compatibility note: a gate declaration now rejects unknown keys, naming the
+  state, gate, and key, so a misspelled `overrideable: false` can't compile
+  and leave the gate overridable. A template that carried a stray key on a
+  gate compiled before and fails now.
+
+- **A terminal state can declare the result it reports.** A workflow's result
+  used to carry whatever evidence was submitted on its terminal state, so the
+  outcome a caller routed on was text an agent composed. A terminal state may
+  now declare `result:`, a map of up to 32 keys whose values mix literal text,
+  `{{VAR}}` and `${context.<key>}`. koto resolves it once, on the tick that
+  lands in the terminal, and it becomes the result's `payload`; a key whose
+  context reference does not resolve comes through empty and is listed in
+  `payload.missing`. The result now also rides the terminal `koto next`
+  response and `koto status` on a terminal session, as a new `result` field,
+  alongside the places it already went: the child's log, a bound request leg,
+  and the parent's `ChildCompleted`. A terminal without a map reports exactly
+  what it did before.
+
+- **`koto request attach` lets a root session answer a request leg.** Only a
+  dispatched child could bind a leg, because the dispatch epoch was the only
+  thing fencing it, so a workflow that runs another workflow as a stable root
+  session had no way to have that session's result recorded against its
+  request. `koto request attach <request> <leg> --session <name>` admits a
+  root session in place of the epoch with checks that all run before any
+  write, the ones that read the request inside its lock: the session isn't
+  terminal or cancelled (`session_terminal`), it was built from a template
+  file the leg names (`template_mismatch`), its non-`rebind` variables equal
+  the leg's `inputs` (`input_mismatch`), the leg is open and unbound or
+  already bound to it (a no-op), and it isn't answering another live leg
+  (it moves only when its old leg was abandoned or its old request closed).
+  The bind event records `attach: self` and the session's template identity,
+  shown on the leg as `attach` and `bound_template`. On a self-attached leg
+  `progress`, `resolve` and leg-scoped `abandon` are refused with
+  `self_attached_leg` whatever `--dispatch-epoch` says; the result arrives by
+  promotion from the session's terminal tick, including under
+  `--no-cleanup`. A leg's `template` may now be a list of up to eight names,
+  the leg view gains the `refused` result source (written only by koto's own
+  refusal write, never by `resolve`), and `koto init` records the source
+  template's file name on the session header as `template_source_file`. The
+  request contract moves to 1.1; a dispatched child passed to `attach`
+  binds exactly as `bind` binds it, and `bind` is unchanged.
+
+- **`koto init` can attach, replace, and answer a request leg in one call.**
+  A skill that reopened the same named session on every invocation had to
+  read it first and pick between creating, resuming and cleaning up, and a
+  finished session left behind by an earlier run blocked the name outright.
+  Four new flags make that one step with one of four outcomes, reported as
+  `outcome` in the output: `created`, `attached`, `replaced`, or a typed
+  refusal. `--vars-file <path>` takes the variables as a JSON list of
+  `["KEY", "VALUE"]` pairs, so a repeated key is refused as `duplicate_var`,
+  and validates them before the name is looked up. `--replace-terminal`
+  replaces a finished session and returns its `replaced_result`, refusing a
+  running one (`session_live`). `--attach-live` joins a running session when
+  it was built from a template file of the same name (`template_mismatch`),
+  its new origin record matches the caller's worktree and session store
+  (`origin_mismatch`), and every explicitly passed non-`rebind` variable
+  equals the recorded one (`var_mismatch`); it then re-applies the
+  `rebind: true` variables. `--koto-leg <request>:<leg>` binds the session to
+  a request leg with every `koto request attach` check. All checks run
+  before any write, and writes follow in a fixed order (create or replace,
+  bind, rebind), so a refused or stale invocation changes nothing. Under
+  `--koto-leg` every refusal is also recorded on an open, unbound leg as
+  `result_source: refused` with a `{outcome, reason, var, recorded,
+  requested}` payload, without changing the command's output. Every new
+  session's header now carries `origin`; sessions created by earlier
+  releases have none and are refused by `--attach-live` until they finish or
+  are removed. Plain `koto init` without these flags behaves as before.
+
+- **Template variables can declare `values:`, `pattern:`, and `rebind: true`.**
+  A variable used to accept anything the character allowlist allowed, so a
+  skill that needed `--intent` to be `continue` or `stop` had to check it in
+  prose. Now `values:` names a closed set and `pattern:` a regular expression
+  matched against the whole value, and both are enforced at `koto init` and on
+  batch child spawns. A refused value exits 2 with no session and a typed
+  `code` in the error body: `invalid_var` (with `var`, `value`, and
+  `constraint`), `duplicate_var`, or `unknown_var`; the existing `error` text
+  is unchanged. The compiler checks the declaration itself: a default must
+  satisfy the constraint, an optional variable with no default needs a
+  constraint that accepts the empty value, `values:` and `pattern:` are
+  exclusive, and an unknown key in a variable declaration (a misspelled
+  `valuez:`) is now a compile error instead of being dropped. `rebind: true`
+  marks a per-invocation setting that a later attach re-applies on a live
+  session; the engine records that as a new additive `variables_rebound` event,
+  which the variable fold reads in order. The only command that rebinds a
+  variable is an accepted `koto init --attach-live`. Templates that declare
+  none of the new keys compile to byte-identical output, so existing sessions'
+  template hashes still match.
+
 - **`koto session rebind` moves a session whose checkout moved.** Execution
   anchoring shipped in 0.12.0 with the enforcement but not the repair: both
   refusals told the user to run `koto session rebind <session> --to <dir>`,

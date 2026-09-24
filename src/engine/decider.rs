@@ -320,8 +320,15 @@ pub(crate) enum StopOutcome {
     /// user would.
     NotApplied,
     /// Decider evidence was appended; take the transition to `target`, then
-    /// drop `guard`.
-    Apply { target: String, guard: VisitGuard },
+    /// drop `guard`. `edge` is the index of the matched transition and
+    /// `evidence` the agent's evidence with the decider's answer merged in,
+    /// so the edge's `context_assignments` resolve against what picked it.
+    Apply {
+        target: String,
+        edge: usize,
+        evidence: BTreeMap<String, Value>,
+        guard: VisitGuard,
+    },
 }
 
 /// The effective mode of each declared value, per field.
@@ -420,7 +427,7 @@ where
     };
 
     let mut model = UNKNOWN_MODEL.to_string();
-    let mut apply: Option<(Map<String, Value>, String)> = None;
+    let mut apply: Option<(Map<String, Value>, (usize, String))> = None;
     let (mut outcome, error_class, recorded_fields) = match result {
         ConsultResult::InputUnavailable => {
             (ConsultationOutcome::InputUnavailable, None, unevaluated())
@@ -494,24 +501,33 @@ where
     }
     port.recorded(&payload);
 
-    let Some((candidate, target)) = apply else {
+    let Some((candidate, (edge, target))) = apply else {
         drop(guard);
         return Ok(StopOutcome::NotApplied);
     };
-    let evidence = EventPayload::EvidenceSubmitted {
+    let mut evidence = ctx.agent_evidence.clone();
+    for (k, v) in &candidate {
+        evidence.insert(k.clone(), v.clone());
+    }
+    let submitted = EventPayload::EvidenceSubmitted {
         state: ctx.state.to_string(),
         fields: candidate.into_iter().collect(),
         submitter_cwd: None,
         source: Some(DECIDER_SOURCE.to_string()),
     };
-    if append_event(&evidence).is_err() {
+    if append_event(&submitted).is_err() {
         return Ok(StopOutcome::NotApplied);
     }
-    Ok(StopOutcome::Apply { target, guard })
+    Ok(StopOutcome::Apply {
+        target,
+        edge,
+        evidence,
+        guard,
+    })
 }
 
-/// The transition an all-qualified answer may take, or `None` when it may
-/// not be applied.
+/// The transition an all-qualified answer may take, as its index and
+/// target, or `None` when it may not be applied.
 ///
 /// The candidate must pass `validate_evidence` alongside the agent's own
 /// evidence (so an escape or undeclared value can never be written), must
@@ -525,7 +541,7 @@ fn applicable_target(
     ctx: &StopContext<'_>,
     accepts: &BTreeMap<String, crate::template::types::FieldSchema>,
     candidate: &Map<String, Value>,
-) -> Option<String> {
+) -> Option<(usize, String)> {
     let mut submission: Map<String, Value> = ctx
         .agent_evidence
         .iter()
@@ -556,7 +572,7 @@ fn applicable_target(
     {
         return None;
     }
-    Some(transition.target.clone())
+    Some((*index, transition.target.clone()))
 }
 
 #[cfg(test)]
@@ -631,6 +647,7 @@ mod tests {
             to: to.to_string(),
             condition_type: "auto".to_string(),
             skip_if_matched: None,
+            context_assignments: None,
         }
     }
 
@@ -1433,6 +1450,7 @@ mod tests {
             .push(crate::template::types::Transition {
                 target: "parked".to_string(),
                 when: Some(when),
+                context_assignments: Default::default(),
             });
         let mut port = FakePort::new(vec![GO]);
         let (r, events) = run(&tpl, "s1", BTreeMap::new(), Some(&mut port), false);
@@ -1443,5 +1461,35 @@ mod tests {
             consultation(&events).outcome,
             ConsultationOutcome::NotApplied
         );
+    }
+
+    #[test]
+    fn an_applied_answer_writes_the_taken_edges_context_assignments() {
+        // The `go` edge assigns from the evidence that picked it; the
+        // decider's answer is that evidence, so it resolves to `go`.
+        let mut tpl = chain(&[("s1", "last")]);
+        let s1 = tpl.states.get_mut("s1").unwrap();
+        let mut assignments = BTreeMap::new();
+        assignments.insert("picked".to_string(), "${evidence.verdict}".to_string());
+        assignments.insert("route".to_string(), "fast".to_string());
+        s1.transitions[0].context_assignments = assignments;
+        let mut parked = BTreeMap::new();
+        parked.insert("route".to_string(), "parked".to_string());
+        s1.transitions[1].context_assignments = parked;
+
+        let mut port = FakePort::new(vec![GO]);
+        let (r, events) = run(&tpl, "s1", BTreeMap::new(), Some(&mut port), false);
+        assert_eq!(r.final_state, "last");
+        match &events[2] {
+            EventPayload::Transitioned {
+                context_assignments,
+                ..
+            } => {
+                let written = context_assignments.as_ref().expect("assignments");
+                assert_eq!(written["picked"], "go");
+                assert_eq!(written["route"], "fast");
+            }
+            other => panic!("{:?}", other),
+        }
     }
 }

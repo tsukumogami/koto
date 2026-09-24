@@ -27,6 +27,12 @@ header:
       type: string
       required: false
       nullable: true
+    template_source_file:
+      type: string
+      required: false
+    origin:
+      type: object
+      required: false
     execution_dir:
       type: string
       required: false
@@ -65,6 +71,9 @@ events:
         type: object
         required: false
         nullable: true
+      context_assignments:
+        type: object
+        required: false
 
   directed_transition:
     tier: 1
@@ -279,6 +288,13 @@ events:
         type: string
         required: true
 
+  variables_rebound:
+    tier: 2
+    fields:
+      variables:
+        type: object
+        required: true
+
   execution_anchor_adopted:
     tier: 2
     fields:
@@ -383,6 +399,14 @@ version signal.
   "session_id": "550e8400-e29b-41d4-a716-446655440000",
   "parent_workflow": null,
   "template_source_dir": "/home/user/.claude/plugins/cache/shirabe/skills/work-on",
+  "template_source_file": "work-on.md",
+  "origin": {
+    "anchor": "/home/user/src/koto",
+    "store": {
+      "kind": "local",
+      "base": "/home/user/.koto/sessions"
+    }
+  },
   "execution_dir": "/home/user/src/koto"
 }
 ```
@@ -396,6 +420,8 @@ version signal.
 | `session_id` | string | No | UUID v4 generated at `koto init` time. Absent (empty string) in files written before this field existed. |
 | `parent_workflow` | string | No | Name of the parent workflow for batch-spawned children. Absent for top-level sessions. |
 | `template_source_dir` | string | No | Absolute path to the directory containing the source template at init time. Absent for stdin/inline templates and older files. |
+| `template_source_file` | string | No | File name (no directory) of the source template `koto init` compiled the session from, such as `work-on.md`. Together with `template_hash` it is the session's template identity, which `koto request attach` compares against the template a request leg names. Absent for `--from-stdin` sessions and older files; a leg attach refuses such a session rather than guessing. |
+| `origin` | object | No | Where the session was started: `anchor` (the canonical execution anchor at creation) and `store` (`kind`, `"local"` or `"cloud"`, and `base`, the canonical sessions directory). Written by `koto init` and every child spawn. `koto init --attach-live` compares it against the caller's own record and refuses a same-named session from another worktree or store. Absent on older files; nothing backfills it, and `--attach-live` refuses such a session. |
 | `execution_dir` | string | No | The session's execution anchor: the canonical absolute directory its ticks run gates and actions in. Recorded at `koto init` time from the process working directory, or from `--execution-dir`. A child copies its parent's value. Absent on files written before the field existed and on sessions created through `koto session start`; the first tick of such a session adopts the directory it is ticked from, writes it here, and records an `execution_anchor_adopted` event. Once recorded, `koto session rebind` is the only thing that changes it, and it records an `execution_anchor_rebound` event when it does. |
 
 `execution_dir` is where a session's commands *start*, not a boundary on what
@@ -525,6 +551,14 @@ Records every automatic or evidence-driven state change. The primary workflow pr
 | `to` | string | Yes | Destination state name. |
 | `condition_type` | string | Yes | Transition trigger: `"auto"`, `"gate"`, or `"skip_if"`. |
 | `skip_if_matched` | object | No | Present when `condition_type` is `"skip_if"`. Carries the key-value pairs from the `skip_if` map that triggered the transition. |
+| `context_assignments` | object | No | The taken edge's `context_assignments`, resolved when the transition fired: each context key mapped to the string value written. Absent when the edge declares none. |
+
+The event is the durable record of an assignment: the values ride the same
+append as the transition, and the context store is written from them right
+after. If that write doesn't land, the next read repairs the store from the
+log. A later `context_added` or `context_removed` for the same key supersedes
+an assignment, so a consumer reconstructing context folds all three in `seq`
+order, last write wins.
 
 ---
 
@@ -966,6 +1000,39 @@ delivered its value at all. The consequence for a reader is that a confirmed
 action leaves exactly one `variable_captured` and one `default_action_executed`
 in the log — both on the tick that stopped for confirmation, neither on the tick
 that confirmed.
+
+---
+
+#### `variables_rebound`
+
+Records that an accepted attach to a live session re-applied the template's
+`rebind: true` variables from the attaching invocation. Variables are otherwise
+fixed by `workflow_initialized`; this event is the only way a declared variable
+changes afterwards, and nothing but an accepted attach writes it.
+
+```json
+{
+  "type": "variables_rebound",
+  "payload": {
+    "variables": {
+      "MERGE": "true"
+    }
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `variables` | object | Yes | The variables this attach changed, each mapped to its new value. A `rebind: true` variable whose value didn't change is left out, and an attach that changes nothing appends no event. |
+
+Consumers fold these in event order together with `workflow_initialized` and
+`variable_captured`: the later of two rebinds wins, and the new value is what
+the next tick substitutes and what `vars.*` conditions see. Every value has
+already passed the variable's declared constraint and the allowlist.
+
+The event is additive and doesn't change the state file's schema version. An
+older koto build reads it as an unknown event and keeps reading the log, though
+it won't apply the new values.
 
 ---
 

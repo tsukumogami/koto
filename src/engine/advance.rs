@@ -912,7 +912,16 @@ where
                 BTreeMap::new();
 
             for (gate_name, gate_def) in &template_state.gates {
-                if let Some(override_applied) = epoch_overrides.get(gate_name) {
+                // A gate declared `overridable: false` ignores any override
+                // record in the log -- one written by an older koto, or
+                // appended by hand -- and is evaluated for real, so the
+                // override value never reaches `gates.<name>.*` routing.
+                let active_override = if gate_def.overridable {
+                    epoch_overrides.get(gate_name)
+                } else {
+                    None
+                };
+                if let Some(override_applied) = active_override {
                     // Gate has an active override: inject the override value and a
                     // synthetic Passed result without calling evaluate_gates.
                     gate_evidence_map.insert(gate_name.clone(), override_applied.clone());
@@ -1051,7 +1060,7 @@ where
         if !gate_evidence_map.is_empty() && has_gates_routing {
             merged.insert(
                 "gates".to_string(),
-                serde_json::Value::Object(gate_evidence_map),
+                serde_json::Value::Object(gate_evidence_map.clone()),
             );
         }
         let evidence_value = serde_json::Value::Object(merged);
@@ -1075,14 +1084,14 @@ where
                 // that gates.* when-clauses resolve correctly via dot-path traversal.
                 // conditions_satisfied() already verified the runtime state matches,
                 // so evidence_value contains the right values for routing.
-                match resolve_transition(
+                match resolve_transition_edge(
                     template_state,
                     &evidence_value,
                     false,
                     fresh_evidence,
                     &workflow_variables,
                 ) {
-                    TransitionResolution::Resolved(target) => {
+                    (TransitionResolution::Resolved(target), edge) => {
                         // Cycle detection BEFORE writing the event.
                         if visited.contains(&target) {
                             return Ok(AdvanceResult {
@@ -1091,12 +1100,22 @@ where
                                 stop_reason: StopReason::CycleDetected { state: target },
                             });
                         }
+                        // Resolve the taken edge's context_assignments; they
+                        // ride the same event append as the transition.
+                        let context_assignments = edge_assignments(
+                            template_state,
+                            edge,
+                            &workflow_variables,
+                            &current_evidence,
+                            &gate_evidence_map,
+                        );
                         // Append transitioned event.
                         let payload = EventPayload::Transitioned {
                             from: Some(state.clone()),
                             to: target.clone(),
                             condition_type: "skip_if".to_string(),
                             skip_if_matched: Some(skip_conditions.clone()),
+                            context_assignments,
                         };
                         append_event(&payload).map_err(AdvanceError::PersistenceError)?;
                         visited.insert(target.clone());
@@ -1116,18 +1135,29 @@ where
         }
 
         // 8. Resolve transition
-        match resolve_transition(
+        let (resolution, edge) = resolve_transition_edge(
             template_state,
             &evidence_value,
             gates_failed,
             fresh_evidence,
             &workflow_variables,
-        ) {
+        );
+        match resolution {
             TransitionResolution::Resolved(target) => {
+                // Resolve the taken edge's context_assignments; they ride
+                // the same event append as the transition (koto#204).
+                let context_assignments = edge_assignments(
+                    template_state,
+                    edge,
+                    &workflow_variables,
+                    &current_evidence,
+                    &gate_evidence_map,
+                );
                 if let Some(stop) = take_transition(
                     append_event,
                     &mut state,
                     target,
+                    context_assignments,
                     &mut visited,
                     &mut advanced,
                     &mut transition_count,
@@ -1152,13 +1182,27 @@ where
                             variables: &workflow_variables,
                             visited: &visited,
                         };
-                        if let StopOutcome::Apply { target, guard } =
-                            consult_at_stop(port, &ctx, &mut consultations, append_event)?
+                        if let StopOutcome::Apply {
+                            target,
+                            edge,
+                            evidence,
+                            guard,
+                        } = consult_at_stop(port, &ctx, &mut consultations, append_event)?
                         {
+                            // The decider's answer is the evidence that picked
+                            // this edge, so its assignments resolve against it.
+                            let context_assignments = edge_assignments(
+                                template_state,
+                                Some(edge),
+                                &workflow_variables,
+                                &evidence,
+                                &gate_evidence_map,
+                            );
                             let stop = take_transition(
                                 append_event,
                                 &mut state,
                                 target,
+                                context_assignments,
                                 &mut visited,
                                 &mut advanced,
                                 &mut transition_count,
@@ -1216,13 +1260,15 @@ where
 ///
 /// Refuses a target already visited in this call (returns the
 /// `CycleDetected` stop, before writing anything), appends the
-/// `transitioned` event with `condition_type: "auto"`, records the visit,
-/// counts the transition, and starts the next state with no evidence.
+/// `transitioned` event with `condition_type: "auto"` and the taken edge's
+/// resolved `context_assignments`, records the visit, counts the
+/// transition, and starts the next state with no evidence.
 #[allow(clippy::too_many_arguments)]
 fn take_transition<F>(
     append_event: &mut F,
     state: &mut String,
     target: String,
+    context_assignments: Option<BTreeMap<String, String>>,
     visited: &mut HashSet<String>,
     advanced: &mut bool,
     transition_count: &mut usize,
@@ -1246,6 +1292,7 @@ where
         to: target.clone(),
         condition_type: "auto".to_string(),
         skip_if_matched: None,
+        context_assignments,
     };
     append_event(&payload).map_err(AdvanceError::PersistenceError)?;
 
@@ -1358,22 +1405,55 @@ pub fn resolve_transition(
     fresh_evidence: bool,
     variables: &std::collections::HashMap<String, String>,
 ) -> TransitionResolution {
+    resolve_transition_edge(
+        template_state,
+        evidence,
+        gate_failed,
+        fresh_evidence,
+        variables,
+    )
+    .0
+}
+
+/// [`resolve_transition`], plus the index of the edge that resolved.
+///
+/// The target alone does not identify an edge: two guarded edges may share a
+/// target and carry different `context_assignments`, and only the taken one's
+/// may be written. The index is `Some` exactly when the resolution is
+/// `Resolved`.
+fn resolve_transition_edge(
+    template_state: &TemplateState,
+    evidence: &serde_json::Value,
+    gate_failed: bool,
+    fresh_evidence: bool,
+    variables: &std::collections::HashMap<String, String>,
+) -> (TransitionResolution, Option<usize>) {
     if template_state.transitions.is_empty() {
-        return TransitionResolution::NoTransitions;
+        return (TransitionResolution::NoTransitions, None);
     }
 
-    let conditional_matches = conditional_matches(template_state, evidence, variables);
+    let conditional_matches = conditional_match_indices(template_state, evidence, variables);
     let has_conditional = template_state.transitions.iter().any(|t| t.when.is_some());
-    let unconditional_target: Option<String> = template_state
+    let unconditional_target: Option<usize> = template_state
         .transitions
         .iter()
-        .filter(|t| t.when.is_none())
-        .map(|t| t.target.clone())
+        .enumerate()
+        .filter(|(_, t)| t.when.is_none())
+        .map(|(index, _)| index)
         .next_back();
 
+    let target_of = |index: usize| template_state.transitions[index].target.clone();
     match conditional_matches.len() {
-        1 => TransitionResolution::Resolved(conditional_matches.into_iter().next().unwrap()),
-        n if n > 1 => TransitionResolution::Ambiguous(conditional_matches),
+        1 => (
+            TransitionResolution::Resolved(target_of(conditional_matches[0])),
+            Some(conditional_matches[0]),
+        ),
+        n if n > 1 => (
+            TransitionResolution::Ambiguous(
+                conditional_matches.into_iter().map(target_of).collect(),
+            ),
+            None,
+        ),
         _ => {
             // No conditional match.
             if let Some(fallback) = unconditional_target {
@@ -1385,19 +1465,44 @@ pub fn resolve_transition(
                     //    evidence yet; firing now would silently bypass the directive.
                     //    Pure-routing states (unconditional only) are unaffected because
                     //    has_conditional is false.
-                    TransitionResolution::NeedsEvidence
+                    (TransitionResolution::NeedsEvidence, None)
                 } else {
-                    TransitionResolution::Resolved(fallback)
+                    (
+                        TransitionResolution::Resolved(target_of(fallback)),
+                        Some(fallback),
+                    )
                 }
             } else if has_conditional {
-                TransitionResolution::NeedsEvidence
+                (TransitionResolution::NeedsEvidence, None)
             } else {
                 // All transitions are unconditional (shouldn't happen with valid templates,
                 // but handle gracefully).
-                TransitionResolution::NoTransitions
+                (TransitionResolution::NoTransitions, None)
             }
         }
     }
+}
+
+/// Resolve the `context_assignments` of the edge at `edge`, if any.
+///
+/// `None` when no edge resolved or the edge declares no assignments, so the
+/// `Transitioned` event omits the field.
+fn edge_assignments(
+    template_state: &TemplateState,
+    edge: Option<usize>,
+    variables: &std::collections::HashMap<String, String>,
+    evidence: &BTreeMap<String, serde_json::Value>,
+    gates: &serde_json::Map<String, serde_json::Value>,
+) -> Option<BTreeMap<String, String>> {
+    let transition = template_state.transitions.get(edge?)?;
+    crate::template::assignments::resolve_assignments(
+        transition,
+        &crate::template::assignments::AssignmentInputs {
+            variables,
+            evidence,
+            gates,
+        },
+    )
 }
 
 /// Targets of every conditional transition (one with a `when`) whose
@@ -1503,6 +1608,7 @@ mod tests {
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         }
     }
 
@@ -1510,6 +1616,7 @@ mod tests {
         Transition {
             target: target.to_string(),
             when: None,
+            context_assignments: Default::default(),
         }
     }
 
@@ -1521,6 +1628,7 @@ mod tests {
         Transition {
             target: target.to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }
     }
 
@@ -2151,6 +2259,7 @@ mod tests {
                 to: "b".to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
             idempotency_hash: None,
         }];
@@ -2182,6 +2291,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2199,6 +2309,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2219,6 +2330,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2236,6 +2348,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -2286,6 +2399,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -2304,6 +2421,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -2363,6 +2481,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -2412,6 +2531,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -2461,6 +2581,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -2482,6 +2606,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -2555,6 +2680,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -2583,6 +2712,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2600,6 +2730,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2617,6 +2748,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -2678,6 +2810,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -2706,6 +2842,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2723,6 +2860,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2740,6 +2878,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -2802,6 +2941,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -2828,6 +2971,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2845,6 +2989,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -2912,6 +3057,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -2931,6 +3080,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -2948,6 +3098,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -3116,6 +3267,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -3133,6 +3285,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -3183,6 +3336,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -3240,6 +3394,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ));
         }
@@ -3259,6 +3414,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         ));
 
@@ -3301,6 +3457,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -3344,6 +3501,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -3361,6 +3519,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -3378,6 +3537,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -3425,6 +3585,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -3442,6 +3603,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -3459,6 +3621,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -3584,6 +3747,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )])
     }
@@ -3694,6 +3858,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
         let appended = std::cell::RefCell::new(Vec::new());
@@ -3750,6 +3915,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -3808,6 +3974,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -3853,6 +4020,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -3939,6 +4107,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -3956,6 +4125,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ])
@@ -4047,6 +4217,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -4082,6 +4256,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -4211,6 +4389,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -4229,6 +4411,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         )]);
 
@@ -4292,6 +4475,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -4309,6 +4493,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -4371,6 +4556,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -4388,6 +4574,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -4444,6 +4631,10 @@ mod tests {
             override_default: None,
             completion: None,
             name_filter: None,
+            overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -4458,6 +4649,7 @@ mod tests {
                     to: state.to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -4503,6 +4695,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -4520,6 +4713,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -4596,6 +4790,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -4613,6 +4808,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -4693,6 +4889,205 @@ mod tests {
         );
     }
 
+    // A gate declared `overridable: false` ignores an override record already
+    // in the log (written by an older koto, or appended by hand): the gate is
+    // evaluated for real, a GateEvaluated event is emitted, and the real
+    // output -- not the override value -- drives `gates.<name>.*` routing.
+    #[test]
+    fn non_overridable_gate_ignores_logged_override_and_routes_on_real_output() {
+        use crate::template::types::Gate;
+
+        // The override claims exit_code 0, which would route to "merged".
+        let override_val = serde_json::json!({"exit_code": 0, "error": ""});
+        let all_events = override_events("route", "verdict", override_val);
+
+        let mut gate = make_gate_def("command");
+        gate.command = "exit 1".to_string();
+        gate.overridable = false;
+        let mut gates = BTreeMap::new();
+        gates.insert("verdict".to_string(), gate);
+
+        let terminal = |directive: &str| TemplateState {
+            directive: directive.to_string(),
+            details: String::new(),
+            transitions: vec![],
+            terminal: true,
+            gates: BTreeMap::new(),
+            accepts: None,
+            integration: None,
+            default_action: None,
+            materialize_children: None,
+            failure: false,
+            skipped_marker: false,
+            skip_if: None,
+            result: None,
+        };
+        let template = make_template(vec![
+            (
+                "route",
+                TemplateState {
+                    directive: "Route.".to_string(),
+                    details: String::new(),
+                    transitions: vec![
+                        conditional(
+                            "merged",
+                            vec![("gates.verdict.exit_code", serde_json::json!(0))],
+                        ),
+                        conditional(
+                            "waiting",
+                            vec![("gates.verdict.exit_code", serde_json::json!(1))],
+                        ),
+                    ],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: None,
+                    result: None,
+                },
+            ),
+            ("merged", terminal("Merged.")),
+            ("waiting", terminal("Waiting.")),
+        ]);
+
+        let mut appended: Vec<EventPayload> = Vec::new();
+        let mut append = |payload: &EventPayload| -> Result<(), String> {
+            appended.push(payload.clone());
+            Ok(())
+        };
+        let shutdown = AtomicBool::new(false);
+
+        let evaluated_names = std::cell::RefCell::new(Vec::<String>::new());
+        let gate_eval = |gates: &BTreeMap<String, Gate>| {
+            let mut out = BTreeMap::new();
+            for name in gates.keys() {
+                evaluated_names.borrow_mut().push(name.clone());
+                out.insert(
+                    name.clone(),
+                    StructuredGateResult {
+                        outcome: GateOutcome::Failed,
+                        output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    },
+                );
+            }
+            Ok(out)
+        };
+
+        let result = advance_until_stop(
+            "route",
+            &template,
+            &BTreeMap::new(),
+            &all_events,
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &VariableOverlay::new(),
+            &shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(
+            evaluated_names.borrow().as_slice(),
+            ["verdict".to_string()],
+            "the non-overridable gate must go through evaluate_gates"
+        );
+        assert_eq!(
+            result.final_state, "waiting",
+            "the real gate output (exit_code 1) must drive routing, not the override"
+        );
+        let evaluated = appended.iter().any(|p| {
+            matches!(p, EventPayload::GateEvaluated { gate, output, .. }
+                if gate == "verdict" && output["exit_code"] == 1)
+        });
+        assert!(
+            evaluated,
+            "a GateEvaluated event must be emitted for the gate"
+        );
+    }
+
+    // The same log on an overridable gate still applies the override: the
+    // defense only engages for gates that opt out.
+    #[test]
+    fn overridable_gate_still_applies_logged_override() {
+        use crate::template::types::Gate;
+
+        let override_val = serde_json::json!({"exit_code": 0, "error": ""});
+        let all_events = override_events("route", "verdict", override_val);
+
+        let mut gates = BTreeMap::new();
+        gates.insert("verdict".to_string(), make_gate_def("command"));
+        let terminal = |directive: &str| TemplateState {
+            directive: directive.to_string(),
+            details: String::new(),
+            transitions: vec![],
+            terminal: true,
+            gates: BTreeMap::new(),
+            accepts: None,
+            integration: None,
+            default_action: None,
+            materialize_children: None,
+            failure: false,
+            skipped_marker: false,
+            skip_if: None,
+            result: None,
+        };
+        let template = make_template(vec![
+            (
+                "route",
+                TemplateState {
+                    directive: "Route.".to_string(),
+                    details: String::new(),
+                    transitions: vec![
+                        conditional(
+                            "merged",
+                            vec![("gates.verdict.exit_code", serde_json::json!(0))],
+                        ),
+                        conditional(
+                            "waiting",
+                            vec![("gates.verdict.exit_code", serde_json::json!(1))],
+                        ),
+                    ],
+                    terminal: false,
+                    gates,
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: None,
+                    result: None,
+                },
+            ),
+            ("merged", terminal("Merged.")),
+            ("waiting", terminal("Waiting.")),
+        ]);
+
+        let mut append = |_p: &EventPayload| -> Result<(), String> { Ok(()) };
+        let shutdown = AtomicBool::new(false);
+        let gate_eval = |_gates: &BTreeMap<String, Gate>| Ok(BTreeMap::new());
+
+        let result = advance_until_stop(
+            "route",
+            &template,
+            &BTreeMap::new(),
+            &all_events,
+            &mut append,
+            &gate_eval,
+            &unavailable_integration,
+            &noop_action,
+            &VariableOverlay::new(),
+            &shutdown,
+        )
+        .unwrap();
+        assert_eq!(result.final_state, "merged");
+    }
+
     // Test 3: one command gate, no active override, evaluation returns non-passing.
     // The blocking condition in GateBlocked must have agent_actionable checked
     // via blocking_conditions_from_gates (tested in next_types.rs). This test
@@ -4713,6 +5108,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -4732,6 +5131,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -4749,6 +5149,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -4761,6 +5162,7 @@ mod tests {
                 to: "build-state".to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
         )];
 
@@ -4835,6 +5237,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -4854,6 +5260,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -4871,6 +5278,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -4934,6 +5342,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -4953,6 +5365,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             (
@@ -4970,6 +5383,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -4981,6 +5395,7 @@ mod tests {
                 to: "check-state".to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
         )];
 
@@ -5058,6 +5473,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -5078,6 +5497,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             ("complete", {
@@ -5144,6 +5564,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -5167,6 +5591,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
             ("complete", {
@@ -5326,6 +5751,7 @@ mod tests {
                         m.insert("vars.SKIP".to_string(), serde_json::json!({"is_set": true}));
                         Some(m)
                     },
+                    result: None,
                 },
             ),
             (
@@ -5343,6 +5769,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -5438,6 +5865,7 @@ mod tests {
                         m.insert("vars.SKIP".to_string(), serde_json::json!({"is_set": true}));
                         Some(m)
                     },
+                    result: None,
                 },
             ),
             (
@@ -5455,6 +5883,7 @@ mod tests {
                     failure: false,
                     skipped_marker: false,
                     skip_if: None,
+                    result: None,
                 },
             ),
         ]);
@@ -5500,5 +5929,295 @@ mod tests {
             !fired_via_skip_if(&VariableOverlay::new()),
             "an empty overlay must leave vars.* evaluation exactly as it was"
         );
+    }
+
+    #[test]
+    fn resolve_value_walks_a_request_leg_payload() {
+        // Mirrors `resolve_gates_path_walks_a_request_leg_payload` in
+        // src/template/types.rs: same inputs, same answers.
+        let evidence = serde_json::json!({"gates": {"leg": {
+            "outcome": "scoped",
+            "payload": {"outcome": "scoped", "detail": {"kind": "split"}}
+        }}});
+        assert_eq!(
+            resolve_value(&evidence, "gates.leg.payload.outcome"),
+            Some(&serde_json::json!("scoped"))
+        );
+        assert_eq!(
+            resolve_value(&evidence, "gates.leg.payload.detail.kind"),
+            Some(&serde_json::json!("split"))
+        );
+        assert_eq!(resolve_value(&evidence, "gates.leg.payload.missing"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // request-leg gates driving the advance loop
+    // -----------------------------------------------------------------------
+
+    mod request_leg_routing {
+        use super::*;
+        use crate::engine::request_store::{
+            attach_leg, create_request, record_result, AttachLeg, AttachingSession, LegResult,
+            LegSpec, NewRequest, RequestBounds, ValidatedRequestId,
+        };
+        use crate::engine::types::{
+            LegDeclaration, LegResultSource, TemplateIdentity, TerminalOutcome, WorkflowResult,
+        };
+        use std::io::Write;
+        use std::path::Path;
+
+        const TS: &str = "2026-01-01T00:00:00.000Z";
+
+        fn seed(root: &Path) -> String {
+            let spec = NewRequest {
+                requested_by: "deliver".to_string(),
+                coordinator_of_record: "deliver".to_string(),
+                legs: vec![LegSpec {
+                    name: "scope".to_string(),
+                    declaration: LegDeclaration {
+                        role: "scope".to_string(),
+                        template: "scope.md".into(),
+                        inputs: serde_json::json!("brief"),
+                    },
+                }],
+                inputs: None,
+                created_at: TS.to_string(),
+            };
+            create_request(root, &spec, &RequestBounds::default())
+                .unwrap()
+                .as_str()
+                .to_string()
+        }
+
+        /// Attach a root session to the leg and promote `payload` onto it,
+        /// the path `/scope`'s terminal tick takes.
+        fn promote(root: &Path, req: &str, payload: serde_json::Value) {
+            let id = ValidatedRequestId::new(req).unwrap();
+            attach_leg(
+                root,
+                &id,
+                &AttachLeg {
+                    leg_name: "scope".to_string(),
+                    session: AttachingSession {
+                        session_id: "scope-run".to_string(),
+                        template: Some(TemplateIdentity {
+                            name: Some("scope".to_string()),
+                            hash: "h".to_string(),
+                            source: "scope.md".to_string(),
+                        }),
+                        variables: BTreeMap::new(),
+                        bindings: HashMap::new(),
+                        terminal_state: None,
+                        pointer: None,
+                    },
+                    issued_by: None,
+                    timestamp: TS.to_string(),
+                },
+            )
+            .unwrap();
+            record_result(
+                root,
+                &id,
+                &LegResult {
+                    leg_name: "scope".to_string(),
+                    result: WorkflowResult {
+                        status: TerminalOutcome::Success,
+                        summary: "scoped".to_string(),
+                        payload: Some(payload),
+                    },
+                    source: LegResultSource::Promoted,
+                    issued_by: None,
+                    timestamp: TS.to_string(),
+                    final_state: Some("done".to_string()),
+                },
+            )
+            .unwrap();
+        }
+
+        /// Compile `run_state` (indented under `run:`) as the initial state
+        /// of a template with terminals `scoped`, `declined`, and `absent`,
+        /// strictly, so the fixture is a template authors can actually ship.
+        fn compile_template(run_state: &str) -> CompiledTemplate {
+            let src = format!(
+                "---\nname: deliver\nversion: \"1.0\"\ninitial_state: run\nstates:\n  run:\n{run_state}  scoped:\n    terminal: true\n  declined:\n    terminal: true\n  absent:\n    terminal: true\n---\n\n## run\n\nRun.\n\n## scoped\n\nScoped.\n\n## declined\n\nDeclined.\n\n## absent\n\nAbsent.\n"
+            );
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            f.write_all(src.as_bytes()).unwrap();
+            crate::template::compile::compile(f.path(), true)
+                .unwrap_or_else(|e| panic!("fixture must compile strictly: {e}"))
+        }
+
+        /// The `/deliver` `scope_run` shape: a non-overridable leg gate
+        /// routed on the payload's outcome, copying `pr` into context.
+        fn scope_run(req: &str) -> CompiledTemplate {
+            compile_template(&format!(
+                "    gates:\n      leg:\n        type: request-leg\n        request: {req}\n        leg: scope\n        overridable: false\n    transitions:\n      - target: scoped\n        when:\n          gates.leg.payload.outcome: scoped\n        context_assignments:\n          pr: \"${{gates.leg.payload.pr}}\"\n          kind: \"${{gates.leg.payload.detail.kind}}\"\n          from: \"${{gates.leg.final_state}}\"\n      - target: declined\n        when:\n          gates.leg.payload.outcome: declined\n"
+            ))
+        }
+
+        fn run(
+            template: &CompiledTemplate,
+            root: &Path,
+            evidence: BTreeMap<String, serde_json::Value>,
+        ) -> (AdvanceResult, Vec<EventPayload>) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut appended: Vec<EventPayload> = Vec::new();
+            let mut append = |payload: &EventPayload| -> Result<(), String> {
+                appended.push(payload.clone());
+                Ok(())
+            };
+            let gates = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+                Ok(crate::gate::evaluate_gates_with_request_store(
+                    gates,
+                    dir.path(),
+                    None,
+                    None,
+                    None,
+                    Some(root),
+                ))
+            };
+            let result = advance_until_stop(
+                "run",
+                template,
+                &evidence,
+                &[],
+                &mut append,
+                &gates,
+                &unavailable_integration,
+                &noop_action,
+                &VariableOverlay::new(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            (result, appended)
+        }
+
+        fn transitioned_to(
+            events: &[EventPayload],
+        ) -> Option<(String, Option<BTreeMap<String, String>>)> {
+            events.iter().find_map(|e| match e {
+                EventPayload::Transitioned {
+                    to,
+                    context_assignments,
+                    ..
+                } => Some((to.clone(), context_assignments.clone())),
+                _ => None,
+            })
+        }
+
+        #[test]
+        fn an_open_leg_blocks_then_the_resolved_leg_routes_and_assigns() {
+            let store = tempfile::tempdir().unwrap();
+            let root = store.path();
+            let req = seed(root);
+            let template = scope_run(&req);
+
+            // Open: blocked on the gate, not an unresolvable transition.
+            let (result, events) = run(&template, root, BTreeMap::new());
+            assert_eq!(result.final_state, "run");
+            assert!(!result.advanced);
+            let StopReason::GateBlocked(conditions) = &result.stop_reason else {
+                panic!("expected GateBlocked, got {:?}", result.stop_reason);
+            };
+            assert_eq!(conditions["leg"].outcome, crate::gate::GateOutcome::Failed);
+            assert_eq!(conditions["leg"].output["disposition"], "open");
+            assert!(transitioned_to(&events).is_none());
+            // The blocking condition reads as temporal and not actionable.
+            let blocking = crate::cli::next_types::blocking_conditions_from_gates(
+                conditions,
+                &template.states["run"].gates,
+            );
+            assert_eq!(blocking.len(), 1);
+            assert_eq!(blocking[0].category, "temporal");
+            assert_eq!(blocking[0].condition_type, "request-leg");
+            assert!(!blocking[0].agent_actionable);
+
+            // Resolved: the same state advances down the matching arm, and
+            // the payload values land in the transition's assignments.
+            promote(
+                root,
+                &req,
+                serde_json::json!({
+                    "outcome": "scoped",
+                    "pr": "https://example.test/pr/7",
+                    "detail": {"kind": "split"}
+                }),
+            );
+            let (result, events) = run(&template, root, BTreeMap::new());
+            assert_eq!(result.final_state, "scoped");
+            assert!(matches!(result.stop_reason, StopReason::Terminal));
+            let (to, assignments) = transitioned_to(&events).unwrap();
+            assert_eq!(to, "scoped");
+            let assignments = assignments.expect("the arm assigns context");
+            assert_eq!(assignments["pr"], "https://example.test/pr/7");
+            assert_eq!(assignments["kind"], "split");
+            assert_eq!(assignments["from"], "done");
+        }
+
+        #[test]
+        fn routing_on_payload_outcome_fires_only_on_that_value() {
+            for (payload, expect_state) in [
+                (serde_json::json!({"outcome": "declined"}), "declined"),
+                (serde_json::json!({"outcome": "something-else"}), "run"),
+                (serde_json::json!({"step": "plan"}), "run"),
+            ] {
+                let store = tempfile::tempdir().unwrap();
+                let root = store.path();
+                let req = seed(root);
+                promote(root, &req, payload.clone());
+                let (result, _) = run(&scope_run(&req), root, BTreeMap::new());
+                assert_eq!(result.final_state, expect_state, "payload {payload}");
+                if expect_state == "run" {
+                    // The gate passed but no arm matched: a resolved leg
+                    // with an unknown outcome is not silently routed.
+                    assert!(
+                        matches!(result.stop_reason, StopReason::UnresolvableTransition),
+                        "payload {payload}: {:?}",
+                        result.stop_reason
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_missing_leg_can_route_on_disposition_missing() {
+            let store = tempfile::tempdir().unwrap();
+            let root = store.path();
+            let template = compile_template(
+                "    gates:\n      leg:\n        type: request-leg\n        request: req-never-created\n        leg: scope\n        overridable: false\n    transitions:\n      - target: absent\n        when:\n          gates.leg.disposition: missing\n      - target: scoped\n        when:\n          gates.leg.disposition: resolved\n",
+            );
+            let (result, _) = run(&template, root, BTreeMap::new());
+            assert_eq!(result.final_state, "absent");
+        }
+
+        #[test]
+        fn a_mixed_gate_and_evidence_arm_routes_an_unbound_leg() {
+            let store = tempfile::tempdir().unwrap();
+            let root = store.path();
+            let req = seed(root);
+            let template = compile_template(&format!(
+                "    accepts:\n      child_returned:\n        type: enum\n        values: [\"yes\", \"no\"]\n        required: true\n    gates:\n      scope_leg:\n        type: request-leg\n        request: {req}\n        leg: scope\n        overridable: false\n    transitions:\n      - target: absent\n        when:\n          gates.scope_leg.bound: false\n          child_returned: \"yes\"\n      - target: scoped\n        when:\n          gates.scope_leg.bound: true\n          gates.scope_leg.payload.outcome: scoped\n"
+            ));
+
+            // Unbound and no evidence yet: the agent is asked for it.
+            let (result, _) = run(&template, root, BTreeMap::new());
+            assert_eq!(result.final_state, "run");
+            assert!(matches!(
+                result.stop_reason,
+                StopReason::EvidenceRequired { .. }
+            ));
+
+            // The child returned without ever binding: the absent arm fires.
+            let mut evidence = BTreeMap::new();
+            evidence.insert("child_returned".to_string(), serde_json::json!("yes"));
+            let (result, _) = run(&template, root, evidence.clone());
+            assert_eq!(result.final_state, "absent");
+
+            // Once bound and resolved, the same evidence no longer matches the
+            // absent arm and the outcome arm routes instead.
+            promote(root, &req, serde_json::json!({"outcome": "scoped"}));
+            let (result, _) = run(&template, root, evidence);
+            assert_eq!(result.final_state, "scoped");
+        }
     }
 }

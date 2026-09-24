@@ -41,6 +41,7 @@ pub fn dispatch_next(
             state: state.to_string(),
             advanced,
             unassigned_children: vec![],
+            result: None,
         });
     }
 
@@ -152,6 +153,7 @@ mod tests {
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         }
     }
 
@@ -170,6 +172,7 @@ mod tests {
                 state: "done".to_string(),
                 advanced: false,
                 unassigned_children: vec![],
+                result: None,
             }
         );
     }
@@ -495,6 +498,7 @@ mod tests {
             vec![Transition {
                 target: "implement".to_string(),
                 when: Some(when),
+                context_assignments: Default::default(),
             }],
             BTreeMap::new(),
             Some(accepts),
@@ -563,6 +567,7 @@ mod tests {
             vec![Transition {
                 target: "next_step".to_string(),
                 when: None,
+                context_assignments: Default::default(),
             }],
             BTreeMap::new(),
             None,
@@ -646,6 +651,7 @@ mod tests {
                     w.insert("status".to_string(), serde_json::json!("completed"));
                     w
                 }),
+                context_assignments: Default::default(),
             }],
             BTreeMap::new(),
             Some(accepts),

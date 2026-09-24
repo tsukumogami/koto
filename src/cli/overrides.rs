@@ -73,12 +73,56 @@ pub fn resolve_override_applied(
     ))
 }
 
+/// The typed error code `koto overrides record` reports when the gate is
+/// declared `overridable: false`.
+pub const GATE_NOT_OVERRIDABLE: &str = "gate_not_overridable";
+
+/// Error body for an override refused because the gate opts out.
+///
+/// Uses the structured `error` object (a machine-readable `code` plus the
+/// gate and state) so a caller can tell the refusal apart from a malformed
+/// request without matching on the message.
+pub fn gate_not_overridable_error(gate: &str, state: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "code": GATE_NOT_OVERRIDABLE,
+            "message": format!(
+                "gate '{}' in state '{}' is declared overridable: false and cannot be overridden; \
+                 satisfy the gate itself, then run koto next",
+                gate, state
+            ),
+            "gate": gate,
+            "state": state,
+        },
+        "command": "overrides record"
+    })
+}
+
+/// Return the refusal body when `gate_def` does not accept overrides.
+///
+/// `None` means the override may proceed. The check reads only the gate
+/// declaration, never the `--with-data` payload, which is what lets
+/// `handle_overrides_record` run it before touching the payload.
+pub fn override_refusal(
+    gate_def: &crate::template::types::Gate,
+    gate: &str,
+    state: &str,
+) -> Option<serde_json::Value> {
+    if gate_def.overridable {
+        None
+    } else {
+        Some(gate_not_overridable_error(gate, state))
+    }
+}
+
 /// Handle the `koto overrides record` command.
 ///
 /// Flow:
-/// 1. Size-limit checks on --with-data and --rationale
+/// 1. Size-limit check on --rationale
 /// 2. Load state file and template
-/// 3. Validate --gate exists in current template state
+/// 3. Validate --gate exists in current template state, refuse the override
+///    if the gate is `overridable: false`, then resolve and size-check
+///    --with-data (the refusal comes first so no payload error can mask it)
 /// 4. Resolve override_applied: --with-data → gate.override_default → built_in_default
 /// 5. Read actual_output from derive_last_gate_evaluated (null if absent)
 /// 6. Append GateOverrideRecorded event
@@ -89,39 +133,9 @@ pub fn handle_overrides_record(
     rationale: String,
     with_data: Option<String>,
 ) -> Result<()> {
-    // 0. Resolve --with-data source (inline JSON or @file.json). Keeps this
-    //    handler aligned with `koto next`; see `resolve_with_data_source`.
-    let with_data = match with_data {
-        Some(raw) => match resolve_with_data_source(&raw) {
-            Ok(s) => Some(s),
-            Err(err) => {
-                exit_with_error_code(
-                    serde_json::json!({
-                        "error": err.message,
-                        "command": "overrides record"
-                    }),
-                    err.code.exit_code(),
-                );
-            }
-        },
-        None => None,
-    };
-
-    // 1. Size-limit checks
-    if let Some(ref d) = with_data {
-        if d.len() > MAX_WITH_DATA_BYTES {
-            exit_with_error_code(
-                serde_json::json!({
-                    "error": format!(
-                        "--with-data payload exceeds maximum size of {} bytes",
-                        MAX_WITH_DATA_BYTES
-                    ),
-                    "command": "overrides record"
-                }),
-                2,
-            );
-        }
-    }
+    // 1. Size-limit check on --rationale. The --with-data checks run after
+    //    the gate is found and known to accept overrides (step 3b), so a
+    //    non-overridable gate is refused before any payload error is reported.
     if rationale.len() > MAX_WITH_DATA_BYTES {
         exit_with_error_code(
             serde_json::json!({
@@ -253,6 +267,48 @@ pub fn handle_overrides_record(
             );
         }
     };
+
+    // 3b. Refuse the override when the gate opts out. This runs before
+    //     --with-data is resolved or parsed, so no payload -- valid, invalid,
+    //     or an unreadable @file -- can turn the refusal into another error.
+    //     Nothing is appended: the state file is left byte-identical.
+    if let Some(refusal) = override_refusal(gate_def, &gate, &current_state) {
+        exit_with_error_code(refusal, 2);
+    }
+
+    // 3c. Resolve --with-data source (inline JSON or @file.json). Keeps this
+    //     handler aligned with `koto next`; see `resolve_with_data_source`.
+    let with_data = match with_data {
+        Some(raw) => match resolve_with_data_source(&raw) {
+            Ok(s) => Some(s),
+            Err(err) => {
+                exit_with_error_code(
+                    serde_json::json!({
+                        "error": err.message,
+                        "command": "overrides record"
+                    }),
+                    err.code.exit_code(),
+                );
+            }
+        },
+        None => None,
+    };
+
+    // 3d. Size-limit check on the resolved --with-data payload.
+    if let Some(ref d) = with_data {
+        if d.len() > MAX_WITH_DATA_BYTES {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!(
+                        "--with-data payload exceeds maximum size of {} bytes",
+                        MAX_WITH_DATA_BYTES
+                    ),
+                    "command": "overrides record"
+                }),
+                2,
+            );
+        }
+    }
 
     // 4. Resolve override_applied: --with-data → gate.override_default → built_in_default
     let override_applied = match resolve_override_applied(with_data.as_deref(), gate_def) {
@@ -397,6 +453,10 @@ mod tests {
             override_default,
             completion: None,
             name_filter: None,
+            overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -452,6 +512,10 @@ mod tests {
             override_default: None,
             completion: None,
             name_filter: None,
+            overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         };
         let result = resolve_override_applied(None, &gate);
         assert!(result.is_err());
@@ -461,6 +525,80 @@ mod tests {
             "expected 'no override value available' in error, got: {}",
             msg
         );
+    }
+
+    #[test]
+    fn resolve_override_applied_on_a_request_leg_gate_keeps_the_usual_order() {
+        let mut gate = make_command_gate(None);
+        gate.gate_type = "request-leg".to_string();
+        gate.request = "req-a".to_string();
+        gate.leg = "scope".to_string();
+
+        // Built-in default last.
+        let builtin = resolve_override_applied(None, &gate).unwrap();
+        assert_eq!(builtin, built_in_default("request-leg").unwrap());
+        assert_eq!(builtin["disposition"], "resolved");
+
+        // override_default before it.
+        let mut declared = builtin.clone();
+        declared["payload"] = serde_json::json!({"outcome": "scoped"});
+        gate.override_default = Some(declared.clone());
+        assert_eq!(resolve_override_applied(None, &gate).unwrap(), declared);
+
+        // --with-data first.
+        let with_data = resolve_override_applied(
+            Some(r#"{"disposition": "abandoned", "payload": {}}"#),
+            &gate,
+        )
+        .unwrap();
+        assert_eq!(with_data["disposition"], "abandoned");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Unit tests: overridable: false refuses the override
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn override_refusal_refuses_non_overridable_gate_with_typed_code() {
+        let mut gate = make_command_gate(None);
+        gate.overridable = false;
+        let body = override_refusal(&gate, "merge_route", "merge_decide")
+            .expect("a non-overridable gate must be refused");
+        assert_eq!(body["error"]["code"], GATE_NOT_OVERRIDABLE);
+        assert_eq!(body["error"]["gate"], "merge_route");
+        assert_eq!(body["error"]["state"], "merge_decide");
+        assert_eq!(body["command"], "overrides record");
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("merge_route") && msg.contains("merge_decide"));
+    }
+
+    #[test]
+    fn override_refusal_allows_overridable_gate() {
+        let gate = make_command_gate(None);
+        assert!(gate.overridable);
+        assert!(override_refusal(&gate, "ci", "check").is_none());
+    }
+
+    #[test]
+    fn override_refusal_ignores_gate_defaults() {
+        // A non-overridable gate type with a built-in default is still
+        // refused: the refusal reads only the declaration.
+        for gate_type in [
+            "command",
+            "context-exists",
+            "context-matches",
+            "children-complete",
+            "request-leg",
+        ] {
+            let mut gate = make_command_gate(None);
+            gate.gate_type = gate_type.to_string();
+            gate.overridable = false;
+            assert!(
+                override_refusal(&gate, "g", "s").is_some(),
+                "{} gate should be refused",
+                gate_type
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -491,6 +629,7 @@ mod tests {
                     to: "start".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
                 idempotency_hash: None,
             },
@@ -527,6 +666,7 @@ mod tests {
                     to: "start".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
                 idempotency_hash: None,
             },

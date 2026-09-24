@@ -14,8 +14,8 @@ use serde::Serialize;
 
 use crate::engine::request_store::{RequestHeader, RequestStoreError};
 use crate::engine::types::{
-    CloseDisposition, Event, EventPayload, LegDeclaration, LegDisposition, LegResultSource,
-    RequestState, WorkflowResult,
+    CloseDisposition, Event, EventPayload, LegAttach, LegDeclaration, LegDisposition,
+    LegResultSource, RequestState, TemplateIdentity, WorkflowResult,
 };
 
 /// One mid-flight progress append on a leg.
@@ -57,10 +57,26 @@ pub struct LegView {
     /// but koto should not do the work for them.
     #[serde(skip_serializing)]
     pub bound_epoch: Option<u32>,
+    /// `"self"` when the bound session attached itself through `koto
+    /// request attach`, which is what refuses the fenced verbs on this
+    /// leg. Omitted for a coordinator's bind and for an unbound leg, so
+    /// those legs read exactly as they did before attach existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attach: Option<LegAttach>,
+    /// The self-attached session's template identity, as the bind event
+    /// recorded it. Omitted when absent, like `attach`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bound_template: Option<TemplateIdentity>,
     pub result: Option<WorkflowResult>,
-    /// Whether the result was promoted from a bound child's terminal
-    /// tick or recorded explicitly.
+    /// Which path recorded the result: promoted from the bound
+    /// session's terminal tick, recorded explicitly, or recorded by koto
+    /// when it refused the session that was to answer the leg.
     pub result_source: Option<LegResultSource>,
+    /// The terminal state a promoted result came from, as the promotion
+    /// recorded it. Omitted for explicit and refused results and for
+    /// results promoted before koto recorded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_final_state: Option<String>,
     /// The rationale recorded when the leg was abandoned. Read by the
     /// abandonment notice, which needs the verbatim text.
     pub abandoned_rationale: Option<String>,
@@ -68,6 +84,11 @@ pub struct LegView {
 }
 
 impl LegView {
+    /// Whether a root session bound this leg to itself.
+    pub fn is_self_attached(&self) -> bool {
+        self.attach == Some(LegAttach::SelfAttached)
+    }
+
     fn new(name: String, declaration: LegDeclaration) -> Self {
         Self {
             name,
@@ -75,8 +96,11 @@ impl LegView {
             disposition: LegDisposition::Open,
             bound_child: None,
             bound_epoch: None,
+            attach: None,
+            bound_template: None,
             result: None,
             result_source: None,
+            result_final_state: None,
             abandoned_rationale: None,
             progress: Vec::new(),
         }
@@ -204,11 +228,15 @@ pub fn project(header: RequestHeader, events: &[Event]) -> Result<RequestView, R
                 leg_name,
                 child_session_id,
                 dispatch_epoch,
+                attach,
+                template,
                 ..
             } => {
                 let leg = leg_mut(&mut view.legs, &request_id, leg_name, event.seq)?;
                 leg.bound_child = Some(child_session_id.clone());
                 leg.bound_epoch = *dispatch_epoch;
+                leg.attach = *attach;
+                leg.bound_template = template.clone();
             }
             EventPayload::RequestLegProgress {
                 leg_name,
@@ -228,11 +256,13 @@ pub fn project(header: RequestHeader, events: &[Event]) -> Result<RequestView, R
                 leg_name,
                 result,
                 source,
+                final_state,
                 ..
             } => {
                 let leg = leg_mut(&mut view.legs, &request_id, leg_name, event.seq)?;
                 leg.result = Some(result.clone());
                 leg.result_source = Some(*source);
+                leg.result_final_state = final_state.clone();
                 // Abandonment wins if it got there first: the write
                 // path rejects a result on an abandoned leg, so a log
                 // carrying both can only be one written by a build

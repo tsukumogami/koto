@@ -564,6 +564,8 @@ fn make_empty_header() -> StateFileHeader {
         created_at: String::new(),
         parent_workflow: None,
         template_source_dir: None,
+        template_source_file: None,
+        origin: None,
         execution_dir: None,
         session_id: String::new(),
         intent: None,
@@ -877,6 +879,7 @@ fn build_gate_condition(
                 "context-exists" => format!("key: {}", gate.key),
                 "context-matches" => format!("key: {}  pattern: {}", gate.key, gate.pattern),
                 "children-complete" => "children: ? complete".to_string(),
+                "request-leg" => format!("request: {}  leg: {}", gate.request, gate.leg),
                 other => format!("type: {}", other),
             };
             return Some(cond);
@@ -965,6 +968,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: parent.map(|s| s.to_string()),
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1014,6 +1019,7 @@ mod tests {
                 to: to_state.to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
             "2026-01-01T00:00:01Z",
         )
@@ -1698,6 +1704,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,

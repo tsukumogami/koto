@@ -193,6 +193,19 @@
         "Response does NOT tell the agent to rewind to `classify` or resubmit the classification as a fix",
         "Response tells the agent to continue with the `scope` state by dispatching on `action` as usual"
       ]
+    },
+    {
+      "id": 16,
+      "name": "self-attached-leg-resolves-by-promotion",
+      "prompt": "I started a root koto session 'scope-auth' (no --parent) from scope.md and ran `koto request attach req-7d2e1c90-1b2a-4c3d-9e8f-0a1b2c3d4e5f scope --session scope-auth`, which succeeded; `koto request get` shows the leg with `\"attach\":\"self\"`. My workflow is done in all but name and I want the requester to see the answer now. `koto request resolve req-7d2e1c90-1b2a-4c3d-9e8f-0a1b2c3d4e5f scope --with-data '{\"status\":\"success\",\"summary\":\"scoped\"}'` failed with code `self_attached_leg`. Should I retry it with `--dispatch-epoch 0`?",
+      "expected_output": "Agent says no: on a leg a root session attached itself to, `progress`, `resolve` and leg-scoped `abandon` are refused outright with `self_attached_leg` whatever `--dispatch-epoch` is presented, because the leg has no dispatch epoch and its result arrives only by promotion. The way to report is to drive `scope-auth` to its terminal state with `koto next`; its terminal tick records the result on the leg as `result_source: promoted`, even under `--no-cleanup`, which keeps the session on disk. It may mention that `abandon-request` and `close` still work on the request.",
+      "files": [],
+      "assertions": [
+        "Response says retrying with `--dispatch-epoch` will not help because the refusal applies whatever epoch is presented",
+        "Response explains that a self-attached leg's result arrives only by promotion from the session's terminal tick",
+        "Response tells the agent to advance `scope-auth` to its terminal state with `koto next` instead of resolving the leg",
+        "Response does NOT suggest `koto request bind` or editing the request log as a workaround"
+      ]
     }
   ]
 }

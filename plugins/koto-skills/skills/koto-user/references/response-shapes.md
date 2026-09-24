@@ -376,7 +376,8 @@ The state has a failed gate that is not actionable. The agent cannot override it
 
 **Decision points:**
 - `agent_actionable: false` — the gate has no `override_default` and no built-in default
-  for its type. The agent cannot call `koto overrides record` to resolve this.
+  for its type, or the template declares it `overridable: false`. The agent cannot call
+  `koto overrides record` to resolve this.
 - The right action is to report the blocking condition to the user. The directive text
   typically explains what external action is required.
 - Do not retry `koto next` in a loop — the condition is externally controlled and will
@@ -460,11 +461,21 @@ agents encounter today for any state that uses `integration:`.
   "state": "complete",
   "advanced": true,
   "expects": null,
-  "error": null
+  "error": null,
+  "result": {
+    "status": "success",
+    "summary": "completed at complete",
+    "payload": {"outcome": "scoped", "pr": "https://example.test/pr/7"}
+  }
 }
 ```
 
 **Decision points:**
+- `result` is the workflow's recorded outcome: `status` (`success`, `failure`,
+  `skipped`), `summary`, and an optional `payload`. When the terminal state declares
+  a `result:` map, `payload` is exactly that map resolved; route on its keys. A
+  `payload.missing` array lists keys whose `${context.<key>}` reference did not
+  resolve. The same value is returned by `koto status` while the session exists.
 - `directive` is **absent** — the key is not written at all, not written as `null`.
   Do not attempt to read `response.directive` when `action == "done"`.
 - `details` is **absent** — the terminal variant has no `details` field.

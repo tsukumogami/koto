@@ -57,6 +57,33 @@ pub fn handle_add(
     Ok(())
 }
 
+/// Restore `key` from the session log when a transition assigned it and the
+/// store write did not land (koto#204), so a read after a failed write still
+/// returns the assigned value.
+///
+/// Best-effort and silent: a session that does not exist, a log that cannot be
+/// read, or a key that is not a usable key leaves the store as it is, and the
+/// read that follows reports whatever it finds.
+pub fn restore_assigned(
+    store: &dyn ContextStore,
+    backend: &dyn SessionBackend,
+    session: &str,
+    key: &str,
+) {
+    if crate::session::validate::validate_context_key(key).is_err() || !backend.exists(session) {
+        return;
+    }
+    let Ok((_, events)) = backend.read_events(session) else {
+        return;
+    };
+    if let Err(e) = crate::engine::context_assign::reconcile(store, session, &events, Some(key)) {
+        eprintln!(
+            "warning: failed to restore assigned context value {:?}: {}",
+            key, e
+        );
+    }
+}
+
 /// Retrieve stored content and write it to stdout.
 ///
 /// When `to_file` is provided, writes to that path instead of stdout.

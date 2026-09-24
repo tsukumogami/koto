@@ -1,6 +1,6 @@
 //! `koto request` — the CLI noun group over the request store.
 //!
-//! Ten subcommands, one response envelope, four exit classes
+//! Eleven subcommands, one response envelope, four exit classes
 //! (DESIGN-request-lifecycle.md Decision 5). This module is a thin
 //! shell over [`crate::engine::request_store`]: it parses flags,
 //! validates identifiers, maps the store's typed errors onto the exit
@@ -45,8 +45,8 @@ use crate::engine::request_store::{
     ValidatedRequestId,
 };
 use crate::engine::types::{
-    now_iso8601, CloseDisposition, LegDeclaration, LegDisposition, LegResultSource, RequestState,
-    ValidatedCoordId, ValidatedSessionId, WorkflowResult,
+    now_iso8601, CloseDisposition, LegDeclaration, LegDisposition, LegResultSource, LegTemplates,
+    RequestState, ValidatedCoordId, ValidatedSessionId, WorkflowResult,
 };
 
 // ===== The contract =====
@@ -61,7 +61,12 @@ pub const CLI_CONTRACT_MAJOR: u32 = 1;
 /// fields it does not read. A caller pinning a *newer* minor is
 /// refused, because it was written against fields this build does not
 /// emit.
-pub const CLI_CONTRACT_MINOR: u32 = 0;
+///
+/// Minor 1 added `attach`, the `template_mismatch`, `input_mismatch`,
+/// `session_terminal` and `self_attached_leg` codes, the leg fields
+/// `attach` and `bound_template`, the `refused` result source, and a
+/// leg `template` that may be a list.
+pub const CLI_CONTRACT_MINOR: u32 = 1;
 
 /// The contract version, emitted on every response.
 ///
@@ -174,6 +179,20 @@ pub enum RequestErrorCode {
     /// through abandonment or close. Distinct from a timeout so a
     /// consumer can tell "not yet" from "never".
     PredicateBecameImpossible,
+    /// `attach` named a session built from a template the leg does not
+    /// name, or one with no template file at all.
+    TemplateMismatch,
+    /// `attach` named a session whose recorded, non-rebind variable
+    /// disagrees with one of the leg's inputs, or whose template does not
+    /// declare an input the leg names.
+    InputMismatch,
+    /// `attach` named a session that is terminal or cancelled.
+    SessionTerminal,
+    /// `progress`, `resolve`, or leg-scoped `abandon` on a leg a root
+    /// session attached itself to. Refused whatever `--dispatch-epoch`
+    /// says: the leg has no epoch, and its result arrives only by
+    /// promotion.
+    SelfAttachedLeg,
 
     // -- transient (1) --
     /// The predicate was still unsatisfied at the deadline.
@@ -218,7 +237,11 @@ impl RequestErrorCode {
             | RequestErrorCode::BoundExceeded
             | RequestErrorCode::EpochFenceViolation
             | RequestErrorCode::PredicateImpossible
-            | RequestErrorCode::PredicateBecameImpossible => 2,
+            | RequestErrorCode::PredicateBecameImpossible
+            | RequestErrorCode::TemplateMismatch
+            | RequestErrorCode::InputMismatch
+            | RequestErrorCode::SessionTerminal
+            | RequestErrorCode::SelfAttachedLeg => 2,
 
             RequestErrorCode::PersistenceError => 3,
         }
@@ -253,6 +276,14 @@ impl RequestError {
             reason: reason.into(),
         });
         self
+    }
+
+    /// The code's wire form (`template_mismatch`, `request_closed`, ...).
+    pub(crate) fn code_str(&self) -> String {
+        serde_json::to_value(self.code)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default()
     }
 
     /// Print the envelope on stdout and exit in this code's class.
@@ -312,6 +343,49 @@ fn map_store_error(e: RequestStoreError) -> RequestError {
         RequestStoreError::IdempotencyConflict { .. } => {
             RequestError::new(RequestErrorCode::IdempotencyConflict, message)
         }
+        RequestStoreError::InvalidLegTemplate { leg_name, reason } => {
+            RequestError::new(RequestErrorCode::InvalidSubmission, message)
+                .with_detail(format!("legs.{leg_name}.template"), reason)
+        }
+        RequestStoreError::RefusedSourceReserved { .. } => {
+            RequestError::new(RequestErrorCode::InvalidSubmission, message)
+        }
+        RequestStoreError::TemplateMismatch {
+            session_template,
+            leg_templates,
+            ..
+        } => RequestError::new(RequestErrorCode::TemplateMismatch, message).with_detail(
+            "--session",
+            format!(
+                "template {}, leg accepts {}",
+                session_template.as_deref().unwrap_or("(none)"),
+                leg_templates.join(", ")
+            ),
+        ),
+        RequestStoreError::InputMismatch {
+            key,
+            recorded,
+            expected,
+            ..
+        } => RequestError::new(RequestErrorCode::InputMismatch, message).with_detail(
+            key,
+            match recorded {
+                Some(recorded) => format!("recorded {recorded:?}, leg expects {expected:?}"),
+                None => format!("not declared by the template, leg expects {expected:?}"),
+            },
+        ),
+        RequestStoreError::SessionTerminal { state, .. } => {
+            RequestError::new(RequestErrorCode::SessionTerminal, message)
+                .with_detail("--session", format!("terminal state {state}"))
+        }
+        RequestStoreError::SessionBoundToDifferentLeg { .. } => {
+            RequestError::new(RequestErrorCode::ChildBoundToDifferentLeg, message)
+                .with_detail("--session", "already answers a live leg elsewhere")
+        }
+        RequestStoreError::SelfAttachedLeg { verb, .. } => {
+            RequestError::new(RequestErrorCode::SelfAttachedLeg, message)
+                .with_detail(verb, "refused on a self-attached leg")
+        }
         RequestStoreError::Corrupt { .. }
         | RequestStoreError::Io { .. }
         | RequestStoreError::Other(_) => {
@@ -323,7 +397,7 @@ fn map_store_error(e: RequestStoreError) -> RequestError {
 // ===== The command surface =====
 
 /// `--cli-contract MAJOR.MINOR`, declared once and marked global so it
-/// is accepted on every subcommand in the group without ten copies of
+/// is accepted on every subcommand in the group without eleven copies of
 /// the flag.
 #[derive(Args, Debug, Clone)]
 pub struct RequestGroupArgs {
@@ -350,7 +424,7 @@ impl From<StateFilter> for RequestState {
     }
 }
 
-/// The ten subcommands under `koto request`.
+/// The eleven subcommands under `koto request`.
 ///
 /// Leg-scoped `abandon` and request-scoped `abandon-request` are
 /// separate subcommands rather than one subcommand with an optional
@@ -358,7 +432,7 @@ impl From<StateFilter> for RequestState {
 /// instead of escalating a leg abandonment into abandoning the whole
 /// request (DESIGN-request-lifecycle.md Decision 5).
 ///
-/// `--issued-by` is on the six mutating verbs and on none of the
+/// `--issued-by` is on the seven mutating verbs and on none of the
 /// reads. `create` carries `--requested-by` instead, which is the same
 /// attribution recorded in the header.
 #[derive(Subcommand, Debug)]
@@ -407,6 +481,19 @@ pub enum RequestCommand {
         /// after the child's session directory is gone.
         #[arg(long, value_name = "N")]
         dispatch_epoch: Option<u32>,
+        #[arg(long, value_name = "ID")]
+        issued_by: Option<String>,
+    },
+
+    /// Attach a session to a leg it will answer: a root session binds
+    /// itself, gated by the leg's template and inputs; a dispatched child
+    /// binds exactly as `bind` does.
+    Attach {
+        request_id: String,
+        leg: String,
+        /// The session that will answer this leg.
+        #[arg(long, value_name = "SESSION_ID")]
+        session: String,
         #[arg(long, value_name = "ID")]
         issued_by: Option<String>,
     },
@@ -803,7 +890,22 @@ fn parse_object_flag(
 /// Strict equality, matching [`crate::engine::epoch::validate_epoch`]:
 /// a future epoch rejects alongside a stale one, which catches a
 /// spawner that bakes the wrong value.
-fn fence(leg: &LegView, presented: Option<u32>) -> Result<(), RequestError> {
+fn fence(leg: &LegView, verb: &'static str, presented: Option<u32>) -> Result<(), RequestError> {
+    // A self-attached leg has no epoch to fence at: its session is a
+    // root, never redelegated, and its result arrives only by promotion.
+    // So the fenced verbs are refused outright, whatever epoch was
+    // presented. The store re-checks this under its lock.
+    if leg.is_self_attached() {
+        return Err(RequestError::new(
+            RequestErrorCode::SelfAttachedLeg,
+            format!(
+                "leg '{}' was attached by its own session; {verb} is refused on a self-attached \
+                 leg, whose result arrives only by promotion",
+                leg.name
+            ),
+        )
+        .with_detail(verb, "refused on a self-attached leg"));
+    }
     // Key on the binding, not on the epoch's presence. A bound leg with
     // no recorded epoch would otherwise be silently unfenced — the
     // engine's `BindLeg::dispatch_epoch` is an `Option` and nothing in
@@ -858,7 +960,7 @@ fn read_leg(view: &RequestView, leg_name: &str) -> Result<LegView, RequestError>
 ///
 /// Never returns: every path either prints an envelope and exits zero
 /// or prints an error envelope and exits in its class. That keeps the
-/// exit mapping in one place instead of spread across ten call sites.
+/// exit mapping in one place instead of spread across eleven call sites.
 pub fn handle(args: RequestGroupArgs, command: RequestCommand) -> ! {
     // Before any IO, per Decision 5: a caller pinned to a contract
     // this build does not serve must not observe a side effect.
@@ -900,6 +1002,12 @@ fn run(command: RequestCommand) -> Result<String, RequestError> {
             dispatch_epoch,
             issued_by,
         } => bind(&id, &leg, &child, dispatch_epoch, issued_by.as_deref()),
+        RequestCommand::Attach {
+            request_id: id,
+            leg,
+            session,
+            issued_by,
+        } => attach(&id, &leg, &session, issued_by.as_deref()),
         RequestCommand::Get { request_id: id } => get(&id),
         RequestCommand::Wait {
             request_id: id,
@@ -965,7 +1073,9 @@ fn run(command: RequestCommand) -> Result<String, RequestError> {
 struct LegSpecInput {
     name: String,
     role: String,
-    template: String,
+    /// One template name, or a short list of them. The store bounds the
+    /// list and rejects an empty one.
+    template: LegTemplates,
     /// The leg's own ask. Absent means no ask, which is legitimate for
     /// a leg whose whole brief is in the request-level `inputs`.
     #[serde(default)]
@@ -1106,7 +1216,7 @@ fn parse_create_flat(
         name: role.to_string(),
         declaration: LegDeclaration {
             role: role.to_string(),
-            template: template.to_string(),
+            template: template.into(),
             inputs: parsed_inputs,
         },
     }])
@@ -1190,24 +1300,68 @@ fn bind(
     let id = request_id(id)?;
     let child = session_identifier("--child", child)?;
     let issued_by = optional_identifier("--issued-by", issued_by)?;
-    let root = koto_root()?;
 
     let session_dir = child_session_dir(&child)?;
-    let header = read_child_header(&child, &session_dir)?;
+    let header = read_child_header(&child, "--child", &session_dir)?;
 
     if !crate::engine::epoch::fence_applies_to(&header) {
-        return Err(RequestError::new(
-            RequestErrorCode::ChildNotFenceable,
-            format!(
-                "child '{child}' is not a dispatched request-store child, so a leg bound to it \
-                 could never be fenced"
-            ),
-        )
-        .with_detail(
-            "--child",
-            "the header needs a parent workflow and needs_agent: true",
-        ));
+        return Err(not_fenceable(&child, "--child", &header));
     }
+    bind_dispatched(
+        &id,
+        leg,
+        &child,
+        &session_dir,
+        &header,
+        dispatch_epoch,
+        issued_by,
+    )
+}
+
+/// The `child_not_fenceable` refusal, naming the root carve-out.
+///
+/// A root session is admitted to a leg only through `koto request
+/// attach`, which checks its template and inputs in place of an epoch;
+/// a child that is neither a dispatched delegate nor a root has neither
+/// protection and is refused by both verbs.
+fn not_fenceable(
+    session: &str,
+    flag: &str,
+    header: &crate::engine::types::StateFileHeader,
+) -> RequestError {
+    let root_hint = if header.parent_workflow.is_none() {
+        "; it is a root session, which `koto request attach` admits"
+    } else {
+        "; only a root session (no parent workflow) may attach itself through `koto request \
+         attach`, so a non-dispatched child can answer no leg"
+    };
+    RequestError::new(
+        RequestErrorCode::ChildNotFenceable,
+        format!(
+            "session '{session}' is not a dispatched request-store child, so a leg bound to it \
+             could never be fenced{root_hint}"
+        ),
+    )
+    .with_detail(
+        flag,
+        "a dispatched child needs a parent workflow and needs_agent: true; a root session needs \
+         no parent workflow",
+    )
+}
+
+/// The dispatched-child bind shared by `bind` and `attach`: epoch
+/// captured from the child's header, pointer checked, event appended,
+/// pointer written.
+fn bind_dispatched(
+    id: &ValidatedRequestId,
+    leg: &str,
+    child: &str,
+    session_dir: &std::path::Path,
+    header: &crate::engine::types::StateFileHeader,
+    dispatch_epoch: Option<u32>,
+    issued_by: Option<String>,
+) -> Result<String, RequestError> {
+    let root = koto_root()?;
 
     // Presented before the header is read, so the comparison is against
     // the value the fence will actually use.
@@ -1227,12 +1381,7 @@ fn bind(
         }
     }
 
-    let existing = crate::engine::leg_pointer::read_pointer(&session_dir).map_err(|e| {
-        RequestError::new(
-            RequestErrorCode::PersistenceError,
-            format!("could not read child '{child}'s leg pointer: {e}"),
-        )
-    })?;
+    let existing = read_session_pointer(child, session_dir)?;
     if let Some(existing) = &existing {
         if existing.names_a_different_leg(id.as_str(), leg) {
             return Err(RequestError::new(
@@ -1250,10 +1399,10 @@ fn bind(
     let timestamp = now_iso8601();
     let outcome = request_store::bind_leg(
         &root,
-        &id,
+        id,
         &BindLeg {
             leg_name: leg.to_string(),
-            child_session_id: child.clone(),
+            child_session_id: child.to_string(),
             dispatch_epoch: Some(header.dispatch_epoch),
             issued_by,
             timestamp: timestamp.clone(),
@@ -1266,22 +1415,332 @@ fn bind(
     // terminal tick's promotion. The event is authoritative; a lost
     // pointer leaves a correctly-bound leg whose delegate reads no leg,
     // which is degraded capability rather than corruption.
+    write_session_pointer(id, leg, child, session_dir, timestamp, "bind");
+
+    let view = request_store::read_view(&root, id).map_err(map_store_error)?;
+    render(&view, Some(outcome.written))
+}
+
+/// Read a session's leg pointer, treating a malformed one as an error so
+/// a bind or attach never silently overwrites a pointer it failed to
+/// parse.
+fn read_session_pointer(
+    session: &str,
+    session_dir: &std::path::Path,
+) -> Result<Option<crate::engine::leg_pointer::LegPointer>, RequestError> {
+    crate::engine::leg_pointer::read_pointer(session_dir).map_err(|e| {
+        RequestError::new(
+            RequestErrorCode::PersistenceError,
+            format!("could not read session '{session}'s leg pointer: {e}"),
+        )
+    })
+}
+
+/// Write the pointer after a bind or attach, warning rather than failing
+/// when it can't be written: the event is authoritative.
+fn write_session_pointer(
+    id: &ValidatedRequestId,
+    leg: &str,
+    session: &str,
+    session_dir: &std::path::Path,
+    bound_at: String,
+    verb: &str,
+) {
     if let Err(e) = crate::engine::leg_pointer::write_pointer(
-        &session_dir,
+        session_dir,
         &crate::engine::leg_pointer::LegPointer {
             request_id: id.as_str().to_string(),
             leg_name: leg.to_string(),
-            bound_at: timestamp,
+            bound_at,
         },
     ) {
         eprintln!(
-            "warning: the leg is bound but child '{child}' could not be told which leg it \
-             fulfils; re-run bind to repair: {e}"
+            "warning: the leg is bound but session '{session}' could not be told which leg it \
+             fulfils; re-run {verb} to repair: {e}"
         );
     }
+}
+
+/// Attach a session to a leg it will answer.
+///
+/// Three kinds of session reach this verb:
+///
+/// - A **dispatched child** (its header satisfies the dispatch-fence
+///   predicate) binds exactly as `bind` does: epoch captured from its
+///   header, leg fenced at that epoch.
+/// - A **root session** (no parent workflow) binds itself. It has no
+///   epoch, so admission is checked instead
+///   ([`request_store::attach_leg`]): not terminal, a template the leg
+///   names, inputs matching its non-rebind variables, the leg open and
+///   unbound or already bound to it, and a pointer that is absent,
+///   already names this leg, or names a leg that was abandoned or whose
+///   request closed. The bind event records `attach: self` and the
+///   session's template identity, and the fenced verbs are refused on
+///   the leg from then on.
+/// - Anything else (a non-dispatched `--parent` child) has neither
+///   protection and is refused with `child_not_fenceable`.
+///
+/// Every check runs before any write; the store re-runs the ones that
+/// read the request inside its lock. The pointer is written after the
+/// event, overwriting a released one.
+fn attach(
+    id: &str,
+    leg: &str,
+    session: &str,
+    issued_by: Option<&str>,
+) -> Result<String, RequestError> {
+    let id = request_id(id)?;
+    let session = session_identifier("--session", session)?;
+    let issued_by = optional_identifier("--issued-by", issued_by)?;
+
+    let session_dir = child_session_dir(&session)?;
+    let header = read_child_header(&session, "--session", &session_dir)?;
+
+    if crate::engine::epoch::fence_applies_to(&header) {
+        return bind_dispatched(&id, leg, &session, &session_dir, &header, None, issued_by);
+    }
+    if header.parent_workflow.is_some() {
+        return Err(not_fenceable(&session, "--session", &header));
+    }
+
+    let root = koto_root()?;
+    let facts = attaching_session(&session, &session_dir, &header)?;
+    let timestamp = now_iso8601();
+    let outcome = request_store::attach_leg(
+        &root,
+        &id,
+        &request_store::AttachLeg {
+            leg_name: leg.to_string(),
+            session: facts,
+            issued_by,
+            timestamp: timestamp.clone(),
+        },
+    )
+    .map_err(map_store_error)?;
+
+    write_session_pointer(&id, leg, &session, &session_dir, timestamp, "attach");
 
     let view = request_store::read_view(&root, &id).map_err(map_store_error)?;
     render(&view, Some(outcome.written))
+}
+
+/// Gather what the root-attach checks need from a session on disk: its
+/// log, its compiled template, and its current pointer.
+///
+/// `pub(crate)` so `koto init --koto-leg` can run the same admission on
+/// a session it attaches to.
+pub(crate) fn attaching_session(
+    session: &str,
+    session_dir: &std::path::Path,
+    header: &crate::engine::types::StateFileHeader,
+) -> Result<request_store::AttachingSession, RequestError> {
+    let unreadable = |what: String| {
+        RequestError::new(
+            RequestErrorCode::ChildNotFound,
+            format!("could not read session '{session}'s {what}"),
+        )
+        .with_detail("--session", "no readable session at this identifier")
+    };
+    let state_path = session_dir.join(crate::session::state_file_name(session));
+    let (_, events) = crate::engine::persistence::read_events(&state_path)
+        .map_err(|e| unreadable(format!("log: {e}")))?;
+    let machine = crate::engine::persistence::derive_machine_state(header, &events, session_dir)
+        .ok_or_else(|| unreadable("template: the log names none".to_string()))?;
+    let content = std::fs::read_to_string(&machine.template_path)
+        .map_err(|e| unreadable(format!("compiled template: {e}")))?;
+    let compiled: crate::template::types::CompiledTemplate = serde_json::from_str(&content)
+        .map_err(|e| unreadable(format!("compiled template: {e}")))?;
+    let pointer = read_session_pointer(session, session_dir)?;
+    Ok(request_store::AttachingSession::from_session(
+        session, header, &events, &compiled, pointer,
+    ))
+}
+
+// ===== `koto init --koto-leg` =====
+
+/// The leg a `koto init --koto-leg <req>:<leg>` invocation attaches to.
+#[derive(Debug, Clone)]
+pub(crate) struct InitLegTarget {
+    pub id: ValidatedRequestId,
+    pub leg: String,
+}
+
+impl InitLegTarget {
+    /// Parse `<request-id>:<leg>`, each part against the grammar `koto
+    /// request` enforces. Neither grammar admits `:`, so the split is
+    /// unambiguous.
+    pub fn parse(raw: &str) -> Result<Self, RequestError> {
+        let Some((id, leg)) = raw.split_once(':') else {
+            return Err(RequestError::new(
+                RequestErrorCode::InvalidIdentifier,
+                format!("--koto-leg {raw:?}: expected <request-id>:<leg>"),
+            )
+            .with_detail("--koto-leg", "missing ':' between request id and leg"));
+        };
+        let id = request_id(id)?;
+        request_store::validate_leg_name(leg).map_err(map_store_error)?;
+        Ok(Self {
+            id,
+            leg: leg.to_string(),
+        })
+    }
+}
+
+/// A leg-check refusal for `koto init --koto-leg`: the request error it
+/// renders as, plus the variable fields a refusal record carries (empty
+/// when the refusal names no variable).
+#[derive(Debug, Clone)]
+pub(crate) struct InitLegRefusal {
+    pub error: RequestError,
+    pub var: String,
+    pub recorded: String,
+    pub requested: String,
+}
+
+impl InitLegRefusal {
+    fn from_store(e: RequestStoreError) -> Box<Self> {
+        let (var, recorded, requested) = match &e {
+            RequestStoreError::InputMismatch {
+                key,
+                recorded,
+                expected,
+                ..
+            } => (
+                key.clone(),
+                recorded.clone().unwrap_or_default(),
+                expected.clone(),
+            ),
+            _ => Default::default(),
+        };
+        Box::new(Self {
+            error: map_store_error(e),
+            var,
+            recorded,
+            requested,
+        })
+    }
+
+    fn from_error(error: RequestError) -> Box<Self> {
+        Box::new(Self {
+            error,
+            var: String::new(),
+            recorded: String::new(),
+            requested: String::new(),
+        })
+    }
+
+    /// Wrap an error from the `koto request` helpers.
+    pub fn from_request_error(error: RequestError) -> Box<Self> {
+        Self::from_error(error)
+    }
+
+    /// A session or store that couldn't be read.
+    pub fn persistence(message: String) -> Box<Self> {
+        Self::from_error(RequestError::new(
+            RequestErrorCode::PersistenceError,
+            message,
+        ))
+    }
+
+    /// The snake_case code, as it appears on the wire.
+    pub fn code(&self) -> String {
+        self.error.code_str()
+    }
+}
+
+/// Run every leg check `attach` would run for `session`, writing
+/// nothing. `Ok(true)` means the leg is already bound to this session.
+pub(crate) fn init_precheck_leg(
+    target: &InitLegTarget,
+    session: &request_store::AttachingSession,
+) -> Result<bool, Box<InitLegRefusal>> {
+    let root = koto_root().map_err(InitLegRefusal::from_error)?;
+    request_store::precheck_attach(
+        &root,
+        &target.id,
+        &request_store::AttachLeg {
+            leg_name: target.leg.clone(),
+            session: session.clone(),
+            issued_by: None,
+            timestamp: now_iso8601(),
+        },
+    )
+    .map_err(InitLegRefusal::from_store)
+}
+
+/// Bind the leg to `session` (every check re-run under the request
+/// lock) and write the session's pointer. Returns whether an event was
+/// appended.
+pub(crate) fn init_attach_leg(
+    target: &InitLegTarget,
+    session: request_store::AttachingSession,
+    session_dir: &std::path::Path,
+) -> Result<bool, Box<InitLegRefusal>> {
+    let root = koto_root().map_err(InitLegRefusal::from_error)?;
+    let session_id = session.session_id.clone();
+    let timestamp = now_iso8601();
+    let outcome = request_store::attach_leg(
+        &root,
+        &target.id,
+        &request_store::AttachLeg {
+            leg_name: target.leg.clone(),
+            session,
+            issued_by: None,
+            timestamp: timestamp.clone(),
+        },
+    )
+    .map_err(InitLegRefusal::from_store)?;
+    write_session_pointer(
+        &target.id,
+        &target.leg,
+        &session_id,
+        session_dir,
+        timestamp,
+        "koto init --koto-leg",
+    );
+    Ok(outcome.written)
+}
+
+/// Record a refused `koto init --koto-leg` on the leg: `source:
+/// refused`, status `failure`, and the payload `{outcome: refused,
+/// reason, var, recorded, requested}`.
+///
+/// Best effort and silent. The store admits the write only while the leg
+/// is open and unbound; on any other leg, a closed or missing request, or
+/// an I/O failure it writes nothing, and the invocation refuses with its
+/// own error either way, so its output is the same with or without
+/// `--koto-leg`.
+pub(crate) fn init_record_refusal(
+    target: &InitLegTarget,
+    reason: &str,
+    var: &str,
+    recorded: &str,
+    requested: &str,
+) {
+    let Ok(root) = koto_root() else {
+        return;
+    };
+    let result = crate::engine::types::WorkflowResult::with_string_payload(
+        crate::engine::types::TerminalOutcome::Failure,
+        format!("koto init refused: {reason}"),
+        [
+            ("outcome", "refused"),
+            ("reason", reason),
+            ("var", var),
+            ("recorded", recorded),
+            ("requested", requested),
+        ],
+    );
+    let _ = request_store::record_refusal(
+        &root,
+        &target.id,
+        &request_store::LegRefusal {
+            leg_name: target.leg.clone(),
+            result,
+            issued_by: None,
+            timestamp: now_iso8601(),
+        },
+    );
 }
 
 /// Locate a child's session directory, honoring the same backend
@@ -1300,15 +1759,16 @@ fn child_session_dir(child: &str) -> Result<PathBuf, RequestError> {
 /// Read a child's state-file header, or report the child unreachable.
 fn read_child_header(
     child: &str,
+    flag: &str,
     session_dir: &std::path::Path,
 ) -> Result<crate::engine::types::StateFileHeader, RequestError> {
     let state_path = session_dir.join(crate::session::state_file_name(child));
     crate::engine::persistence::read_header(&state_path).map_err(|e| {
         RequestError::new(
             RequestErrorCode::ChildNotFound,
-            format!("could not read child '{child}'s session: {e}"),
+            format!("could not read session '{child}': {e}"),
         )
-        .with_detail("--child", "no readable session at this identifier")
+        .with_detail(flag, "no readable session at this identifier")
     })
 }
 
@@ -1325,7 +1785,7 @@ fn progress(
     let root = koto_root()?;
 
     let view = request_store::read_view(&root, &id).map_err(map_store_error)?;
-    fence(&read_leg(&view, leg)?, dispatch_epoch)?;
+    fence(&read_leg(&view, leg)?, "progress", dispatch_epoch)?;
 
     let outcome = request_store::append_progress(
         &root,
@@ -1368,7 +1828,7 @@ fn resolve(
 
     let view = request_store::read_view(&root, &id).map_err(map_store_error)?;
     let leg_view = read_leg(&view, leg)?;
-    fence(&leg_view, dispatch_epoch)?;
+    fence(&leg_view, "resolve", dispatch_epoch)?;
 
     // An explicit resolve on a bound leg is rejected by the store,
     // inside the same lock as the append: the discriminator is the
@@ -1385,6 +1845,7 @@ fn resolve(
             source: LegResultSource::Explicit,
             issued_by,
             timestamp: now_iso8601(),
+            final_state: None,
         },
     )
     .map_err(map_store_error)?;
@@ -1410,7 +1871,7 @@ fn abandon(
     // place text in a sibling delegate's authoritative field
     // (DESIGN-request-lifecycle.md Decision 3).
     let view = request_store::read_view(&root, &id).map_err(map_store_error)?;
-    fence(&read_leg(&view, leg)?, dispatch_epoch)?;
+    fence(&read_leg(&view, leg)?, "abandon", dispatch_epoch)?;
 
     let outcome = request_store::abandon_leg(
         &root,
@@ -1466,7 +1927,9 @@ fn abandon_request(
         .map(|leg| leg.name.clone())
         .collect();
     for leg_name in open_legs {
-        request_store::abandon_leg(
+        // The request-scoped form: a self-attached leg is abandoned too,
+        // which is how a newer run supersedes an older one.
+        request_store::abandon_leg_for_request(
             &root,
             &id,
             &AbandonLeg {
@@ -1786,7 +2249,7 @@ mod tests {
     fn the_contract_serializes_as_two_integers() {
         let json = serde_json::to_value(CliContract::current()).expect("serialize");
         assert_eq!(json["major"], 1);
-        assert_eq!(json["minor"], 0);
+        assert_eq!(json["minor"], 1);
         assert!(
             json["major"].is_number() && json["minor"].is_number(),
             "a string would let a consumer compare 1.10 against 1.9 lexicographically and be wrong"
@@ -1817,6 +2280,10 @@ mod tests {
             RequestErrorCode::EpochFenceViolation,
             RequestErrorCode::PredicateImpossible,
             RequestErrorCode::PredicateBecameImpossible,
+            RequestErrorCode::TemplateMismatch,
+            RequestErrorCode::InputMismatch,
+            RequestErrorCode::SessionTerminal,
+            RequestErrorCode::SelfAttachedLeg,
             RequestErrorCode::WaitTimeout,
             RequestErrorCode::WaitInterrupted,
             RequestErrorCode::LockContention,
@@ -1832,6 +2299,18 @@ mod tests {
                 ![64, 65, 66, 75].contains(&exit),
                 "{code:?} collides with a sysexits value used elsewhere in the crate"
             );
+        }
+    }
+
+    #[test]
+    fn the_attach_codes_are_caller_errors() {
+        for code in [
+            RequestErrorCode::TemplateMismatch,
+            RequestErrorCode::InputMismatch,
+            RequestErrorCode::SessionTerminal,
+            RequestErrorCode::SelfAttachedLeg,
+        ] {
+            assert_eq!(code.exit_code(), 2, "{code:?} must be caller-class");
         }
     }
 
@@ -2010,8 +2489,11 @@ mod tests {
             disposition: LegDisposition::Open,
             bound_child: None,
             bound_epoch,
+            attach: None,
+            bound_template: None,
             result: None,
             result_source: None,
+            result_final_state: None,
             abandoned_rationale: None,
             progress: Vec::new(),
         };
@@ -2021,19 +2503,40 @@ mod tests {
         view
     }
 
+    fn self_attached_leg() -> LegView {
+        let mut view = leg(None);
+        view.bound_child = Some("scope-topic".into());
+        view.attach = Some(crate::engine::types::LegAttach::SelfAttached);
+        view
+    }
+
+    #[test]
+    fn a_self_attached_leg_refuses_every_fenced_verb_whatever_the_epoch() {
+        for verb in ["progress", "resolve", "abandon"] {
+            for presented in [None, Some(0), Some(7)] {
+                let err = fence(&self_attached_leg(), verb, presented)
+                    .expect_err("a self-attached leg must refuse the fenced verbs");
+                assert_eq!(err.code, RequestErrorCode::SelfAttachedLeg);
+                assert_eq!(err.code.exit_code(), 2);
+                assert!(err.message.contains(verb), "{}", err.message);
+            }
+        }
+    }
+
     #[test]
     fn an_unbound_leg_is_unfenceable_by_construction() {
-        assert!(fence(&leg(None), None).is_ok());
+        assert!(fence(&leg(None), "progress", None).is_ok());
         assert!(
-            fence(&leg(None), Some(7)).is_ok(),
+            fence(&leg(None), "progress", Some(7)).is_ok(),
             "a wrapper that always passes the flag must keep working before the bind"
         );
     }
 
     #[test]
     fn a_matching_epoch_passes_and_a_stale_one_does_not() {
-        assert!(fence(&leg(Some(3)), Some(3)).is_ok());
-        let err = fence(&leg(Some(3)), Some(2)).expect_err("a stale epoch must be refused");
+        assert!(fence(&leg(Some(3)), "progress", Some(3)).is_ok());
+        let err =
+            fence(&leg(Some(3)), "progress", Some(2)).expect_err("a stale epoch must be refused");
         assert_eq!(err.code, RequestErrorCode::EpochFenceViolation);
         assert_eq!(err.code.exit_code(), 2);
     }
@@ -2042,12 +2545,13 @@ mod tests {
     fn a_future_epoch_is_refused_too() {
         // Strict equality, matching the child-log fence: a spawner
         // that bakes the wrong value is caught in both directions.
-        assert!(fence(&leg(Some(3)), Some(4)).is_err());
+        assert!(fence(&leg(Some(3)), "progress", Some(4)).is_err());
     }
 
     #[test]
     fn a_bound_leg_requires_the_flag() {
-        let err = fence(&leg(Some(0)), None).expect_err("a bound leg must require the flag");
+        let err =
+            fence(&leg(Some(0)), "progress", None).expect_err("a bound leg must require the flag");
         assert_eq!(err.code, RequestErrorCode::EpochFenceViolation);
     }
 

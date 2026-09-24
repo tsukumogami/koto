@@ -215,6 +215,32 @@ fn default_schema_version() -> u32 {
     1
 }
 
+/// A session's origin record: where it was started and which store holds
+/// it (`StateFileHeader.origin`).
+///
+/// Compared field-for-field by `koto init --attach-live`. Both paths are
+/// canonical (`fs::canonicalize` output) so two spellings of one
+/// directory compare equal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionOrigin {
+    /// The session's execution anchor at creation, the directory its
+    /// commands run in.
+    pub anchor: PathBuf,
+    /// The session store the session was created in.
+    pub store: SessionStoreIdentity,
+}
+
+/// Which session store holds a session: the backend kind and its
+/// canonical local sessions directory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionStoreIdentity {
+    /// `"local"` or `"cloud"`.
+    pub kind: String,
+    /// The directory sessions are stored under (`~/.koto/sessions`, or
+    /// `KOTO_SESSIONS_BASE`), canonicalized.
+    pub base: PathBuf,
+}
+
 /// Header line written as the first line of a state file.
 ///
 /// Contains metadata about the workflow log. Has no `seq` field -- it is
@@ -305,6 +331,39 @@ pub struct StateFileHeader {
     /// Additive field: omitted when None, defaults to None on old state files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_name: Option<String>,
+
+    /// File name of the source template `koto init` compiled this
+    /// session from (for example `scope.md`), without its directory.
+    ///
+    /// Part of the session's template identity, which `koto request
+    /// attach` compares against the template a request leg names.
+    /// `WorkflowInitialized.template_path` can't serve here: it records
+    /// the compiled artifact (`<sha256>.json`), not the source.
+    ///
+    /// `None` for `--from-stdin` sessions, which have no template file,
+    /// and for state files written before this field existed; both are
+    /// refused by a leg attach rather than guessed at.
+    ///
+    /// Additive field: omitted when None, defaults to None on old state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_source_file: Option<String>,
+
+    /// Where this session was started: its execution anchor and the
+    /// session store that holds it.
+    ///
+    /// Session names are machine-wide, so a name alone doesn't say whose
+    /// session it is. `koto init --attach-live` compares this record
+    /// against the caller's own and refuses a same-named session from
+    /// another worktree or store instead of adopting it.
+    ///
+    /// Written by every `koto init` and every child spawn from this
+    /// version on. `None` on state files written before the field
+    /// existed; such a session is refused at `--attach-live` rather than
+    /// guessed at, and nothing backfills the record.
+    ///
+    /// Additive field: omitted when None, defaults to None on old state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<SessionOrigin>,
 
     // ===== Request-store fields (Decision 1) =====
     //
@@ -505,6 +564,18 @@ pub enum EventPayload {
         /// pre-feature JSONL files round-trip without modification.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skip_if_matched: Option<BTreeMap<String, serde_json::Value>>,
+        /// The transition's `context_assignments`, resolved when it fired
+        /// (koto#204): context key to the value written.
+        ///
+        /// Recording them here is what makes the write atomic with the
+        /// transition: the event is the durable record, and the context store
+        /// is brought up to date from it -- right after the append, and again
+        /// on the next read if that write did not land
+        /// (`crate::engine::context_assign`).
+        ///
+        /// Additive field: omitted when `None` so pre-feature logs round-trip.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_assignments: Option<BTreeMap<String, String>>,
     },
     EvidenceSubmitted {
         state: String,
@@ -760,6 +831,17 @@ pub enum EventPayload {
         key: String,
         value: String,
     },
+    /// An accepted attach re-applied the session's `rebind: true` variables
+    /// from the attaching invocation (`crate::engine::variables`).
+    ///
+    /// `variables` carries only the names whose value changed, with their new
+    /// values; [`crate::engine::substitute::bindings_from_events`] folds it in
+    /// event order, so the later of two rebinds wins. Additive: it does not
+    /// move `CURRENT_SCHEMA_VERSION`, and an older build lands it in
+    /// [`Unknown`](EventPayload::Unknown) and keeps reading the log.
+    VariablesRebound {
+        variables: BTreeMap<String, String>,
+    },
     /// Carries the auto-promoted [`WorkflowResult`] envelope on a child's
     /// own session log (wire `type: "request_store.result"`, in the
     /// reserved `request_store.*` namespace;
@@ -823,6 +905,16 @@ pub enum EventPayload {
         dispatch_epoch: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         issued_by: Option<String>,
+        /// `Some(SelfAttached)` when a root session bound itself through
+        /// `koto request attach`. Absent on a coordinator's bind of a
+        /// dispatched child. Additive: pre-existing logs replay as
+        /// absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach: Option<LegAttach>,
+        /// The self-attached session's template identity, recorded so a
+        /// reader can tell which template answered the leg. Additive.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        template: Option<TemplateIdentity>,
     },
     /// A mid-flight progress append on a leg
     /// (wire `type: "request.leg_progress"`).
@@ -852,6 +944,11 @@ pub enum EventPayload {
         source: LegResultSource,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         issued_by: Option<String>,
+        /// The terminal state a promoted result came from. Set only by
+        /// promotion; absent on explicit and refused results and on events
+        /// written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_state: Option<String>,
     },
     /// A leg the requester stopped waiting on
     /// (wire `type: "request.leg_abandoned"`).
@@ -981,6 +1078,32 @@ pub struct WorkflowResult {
     pub payload: Option<serde_json::Value>,
 }
 
+impl WorkflowResult {
+    /// Build a result whose `payload` is a flat JSON object of string
+    /// values -- the shape a terminal state's declared `result:` map
+    /// resolves to, and the shape a reader routes on without knowing the
+    /// template that produced it.
+    pub fn with_string_payload<K, V>(
+        status: TerminalOutcome,
+        summary: impl Into<String>,
+        fields: impl IntoIterator<Item = (K, V)>,
+    ) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let map: serde_json::Map<String, serde_json::Value> = fields
+            .into_iter()
+            .map(|(k, v)| (k.into(), serde_json::Value::String(v.into())))
+            .collect();
+        WorkflowResult {
+            status,
+            summary: summary.into(),
+            payload: Some(serde_json::Value::Object(map)),
+        }
+    }
+}
+
 /// What one leg of a request asks for.
 ///
 /// Carries the fields the dispatch protocol requires of a child session
@@ -991,26 +1114,113 @@ pub struct WorkflowResult {
 pub struct LegDeclaration {
     /// Role identifier an assigning coordinator matches against.
     pub role: String,
-    /// Template the bound child is materialized from.
-    pub template: String,
+    /// Template the bound child is materialized from: one name, or a
+    /// short list of names any of which the leg accepts.
+    pub template: LegTemplates,
     /// The individual ask for this leg.
     pub inputs: serde_json::Value,
 }
 
+/// Most entries a leg's `template` list may carry.
+///
+/// A leg names the handful of templates that may answer it (`/execute`'s
+/// two modes, say); a long list would be a leg that accepts anything,
+/// which defeats the check.
+pub const MAX_LEG_TEMPLATES: usize = 8;
+
+/// The template, or templates, a leg names.
+///
+/// Untagged so the single-string form serializes exactly as it did
+/// before lists existed: a request log written by an older koto
+/// replays unchanged, and a single-template leg reads back byte-equal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum LegTemplates {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl LegTemplates {
+    /// Every entry, in declaration order.
+    pub fn entries(&self) -> Vec<&str> {
+        match self {
+            LegTemplates::One(s) => vec![s.as_str()],
+            LegTemplates::Many(list) => list.iter().map(String::as_str).collect(),
+        }
+    }
+
+    /// Whether a session with this template identity may attach to the
+    /// leg.
+    ///
+    /// **The matching rule.** An entry matches when it equals the
+    /// identity's `source` — the file name of the template `koto init`
+    /// compiled the session from, such as `scope.md` — exactly and
+    /// case-sensitively. The compiled `name` and the `hash` are recorded
+    /// on the bind event for audit and are never compared: a throwaway
+    /// template can copy any `name:` it likes, and a hash would pin one
+    /// revision of a template that legitimately changes between
+    /// releases. A session with no source file (`--from-stdin`, or one
+    /// created before koto recorded the file name) has no identity and
+    /// matches nothing (DESIGN-request-lifecycle.md, root attach
+    /// amendment).
+    pub fn admits(&self, identity: Option<&TemplateIdentity>) -> bool {
+        let Some(identity) = identity else {
+            return false;
+        };
+        self.entries().iter().any(|entry| *entry == identity.source)
+    }
+}
+
+impl From<&str> for LegTemplates {
+    fn from(value: &str) -> Self {
+        LegTemplates::One(value.to_string())
+    }
+}
+
+/// Who performed a leg's bind, recorded on the bind event.
+///
+/// Absent on a coordinator's `bind` of a dispatched child, which is the
+/// shape every pre-existing request log carries. `SelfAttached`
+/// (wire `"self"`) is a root session binding itself through `koto
+/// request attach`: such a leg has no dispatch epoch to fence against,
+/// so the fenced verbs are refused on it outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LegAttach {
+    #[serde(rename = "self")]
+    SelfAttached,
+}
+
+/// The template identity of a session that attached itself to a leg.
+///
+/// Which field [`LegTemplates::admits`] compares is stated there, once.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TemplateIdentity {
+    /// The compiled template's `name`, when it declares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// SHA-256 of the compiled template, from the session's header.
+    pub hash: String,
+    /// File name of the source template the session was compiled from.
+    pub source: String,
+}
+
 /// Which path recorded a leg's result.
 ///
-/// Serialized as snake_case (`"promoted"`, `"explicit"`). `Promoted`
-/// means a bound child's terminal tick carried its own
+/// Serialized as snake_case (`"promoted"`, `"explicit"`, `"refused"`).
+/// `Promoted` means a bound child's terminal tick carried its own
 /// [`WorkflowResult`] onto the leg with no extra action; `Explicit`
 /// means the leg had no bound child and its creator recorded the result
-/// directly. The distinction is recorded rather than derived so a later
-/// change to which paths may resolve a leg cannot make existing events
-/// retroactively ambiguous.
+/// directly; `Refused` means koto refused the session that was to answer
+/// the leg and recorded the refusal itself, which only
+/// `request_store::record_refusal` can write. The distinction is
+/// recorded rather than derived so a later change to which paths may
+/// resolve a leg cannot make existing events retroactively ambiguous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LegResultSource {
     Promoted,
     Explicit,
+    Refused,
 }
 
 /// How a request ended.
@@ -1142,6 +1352,7 @@ impl EventPayload {
             EventPayload::ExecutionAnchorAdopted { .. } => "execution_anchor_adopted",
             EventPayload::ExecutionAnchorRebound { .. } => "execution_anchor_rebound",
             EventPayload::VariableCaptured { .. } => "variable_captured",
+            EventPayload::VariablesRebound { .. } => "variables_rebound",
             EventPayload::RequestStoreResult { .. } => "request_store.result",
             EventPayload::RequestCreated { .. } => "request.created",
             EventPayload::RequestLegBound { .. } => "request.leg_bound",
@@ -1270,6 +1481,7 @@ impl<'de> Deserialize<'de> for Event {
                     to: p.to,
                     condition_type: p.condition_type,
                     skip_if_matched: p.skip_if_matched,
+                    context_assignments: p.context_assignments,
                 }
             }
             "evidence_submitted" => {
@@ -1436,6 +1648,13 @@ impl<'de> Deserialize<'de> for Event {
                     value: p.value,
                 }
             }
+            "variables_rebound" => {
+                let p: VariablesReboundPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::VariablesRebound {
+                    variables: p.variables,
+                }
+            }
             "request_store.result" => {
                 let p: RequestStoreResultPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
@@ -1461,6 +1680,8 @@ impl<'de> Deserialize<'de> for Event {
                     child_session_id: p.child_session_id,
                     dispatch_epoch: p.dispatch_epoch,
                     issued_by: p.issued_by,
+                    attach: p.attach,
+                    template: p.template,
                 }
             }
             "request.leg_progress" => {
@@ -1482,6 +1703,7 @@ impl<'de> Deserialize<'de> for Event {
                     result: p.result,
                     source: p.source,
                     issued_by: p.issued_by,
+                    final_state: p.final_state,
                 }
             }
             "request.leg_abandoned" => {
@@ -1562,6 +1784,8 @@ struct TransitionedPayload {
     condition_type: String,
     #[serde(default)]
     skip_if_matched: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default)]
+    context_assignments: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -1706,6 +1930,11 @@ struct VariableCapturedPayload {
 }
 
 #[derive(Deserialize)]
+struct VariablesReboundPayload {
+    variables: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
 struct RequestStoreResultPayload {
     result: WorkflowResult,
 }
@@ -1729,6 +1958,10 @@ struct RequestLegBoundPayload {
     dispatch_epoch: Option<u32>,
     #[serde(default)]
     issued_by: Option<String>,
+    #[serde(default)]
+    attach: Option<LegAttach>,
+    #[serde(default)]
+    template: Option<TemplateIdentity>,
 }
 
 #[derive(Deserialize)]
@@ -1748,6 +1981,8 @@ struct RequestLegResultPayload {
     source: LegResultSource,
     #[serde(default)]
     issued_by: Option<String>,
+    #[serde(default)]
+    final_state: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1900,6 +2135,8 @@ mod tests {
             created_at: "2026-03-15T14:30:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1931,6 +2168,8 @@ mod tests {
             created_at: "2026-03-15T14:30:00Z".to_string(),
             parent_workflow: Some("parent-wf".to_string()),
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1974,6 +2213,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: Some(PathBuf::from("/abs/templates")),
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -2010,6 +2251,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -2044,6 +2287,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -2264,6 +2509,7 @@ mod tests {
                 to: "gather".to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
             idempotency_hash: None,
         };
@@ -2273,12 +2519,54 @@ mod tests {
     }
 
     #[test]
+    fn event_transitioned_with_context_assignments_round_trips() {
+        let mut assignments = BTreeMap::new();
+        assignments.insert("outcome".to_string(), "landed".to_string());
+        assignments.insert("reason".to_string(), "{{TOPIC}}".to_string());
+        let e = Event {
+            seq: 3,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "transitioned".to_string(),
+            payload: EventPayload::Transitioned {
+                from: Some("work".to_string()),
+                to: "done".to_string(),
+                condition_type: "auto".to_string(),
+                skip_if_matched: None,
+                context_assignments: Some(assignments),
+            },
+            idempotency_hash: None,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"context_assignments\""), "got: {json}");
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn event_transitioned_without_context_assignments_matches_the_old_shape() {
+        // A line as the base commit wrote it: no context_assignments key.
+        let old = r#"{"seq":2,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":null,"to":"gather","condition_type":"auto"}}"#;
+        let parsed: Event = serde_json::from_str(old).unwrap();
+        match &parsed.payload {
+            EventPayload::Transitioned {
+                context_assignments,
+                ..
+            } => assert!(context_assignments.is_none()),
+            other => panic!("expected Transitioned, got {other:?}"),
+        }
+        // And an event without assignments serializes without the key.
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(!json.contains("context_assignments"), "got: {json}");
+    }
+
+    #[test]
     fn event_payload_type_name() {
         let p = EventPayload::Transitioned {
             from: Some("a".to_string()),
             to: "b".to_string(),
             condition_type: "auto".to_string(),
             skip_if_matched: None,
+            context_assignments: None,
         };
         assert_eq!(p.type_name(), "transitioned");
 
@@ -2788,6 +3076,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00.000Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             intent: None,
@@ -3136,6 +3426,22 @@ mod tests {
     }
 
     #[test]
+    fn variables_rebound_roundtrips_byte_for_byte() {
+        use super::{Event, EventPayload};
+        let json = r#"{"seq":7,"timestamp":"2026-01-01T00:00:00Z","type":"variables_rebound","payload":{"variables":{"MAX_ROUNDS":"5","MERGE":"true"}}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        match &event.payload {
+            EventPayload::VariablesRebound { variables } => {
+                assert_eq!(variables.get("MERGE").map(String::as_str), Some("true"));
+                assert_eq!(variables.len(), 2);
+            }
+            other => panic!("expected a variables_rebound payload, got {:?}", other),
+        }
+        assert_eq!(event.payload.type_name(), "variables_rebound");
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+    }
+
+    #[test]
     fn execution_anchor_rebound_without_a_previous_anchor_omits_from() {
         use super::{Event, EventPayload};
         // A session that recorded no anchor has nothing to move away
@@ -3451,7 +3757,7 @@ mod tests {
             "reviewer-b".to_string(),
             LegDeclaration {
                 role: "security".to_string(),
-                template: "review.md".to_string(),
+                template: "review.md".into(),
                 inputs: serde_json::json!({"focus": "authz"}),
             },
         );
@@ -3459,7 +3765,7 @@ mod tests {
             "reviewer-a".to_string(),
             LegDeclaration {
                 role: "correctness".to_string(),
-                template: "review.md".to_string(),
+                template: "review.md".into(),
                 inputs: serde_json::json!({"focus": "logic"}),
             },
         );
@@ -3486,6 +3792,8 @@ mod tests {
                     child_session_id: "child-1".to_string(),
                     dispatch_epoch: Some(0),
                     issued_by: None,
+                    attach: None,
+                    template: None,
                 },
                 "request.leg_bound",
             ),
@@ -3509,6 +3817,7 @@ mod tests {
                     },
                     source: LegResultSource::Promoted,
                     issued_by: None,
+                    final_state: None,
                 },
                 "request.leg_result",
             ),
@@ -3618,6 +3927,7 @@ mod tests {
                     },
                     source,
                     issued_by: Some("child-1".to_string()),
+                    final_state: None,
                 },
             );
             let json = serde_json::to_string(&e).unwrap();
@@ -3703,6 +4013,8 @@ mod tests {
                 child_session_id: "parent.reviewer-a".to_string(),
                 dispatch_epoch: Some(2),
                 issued_by: Some("coord".to_string()),
+                attach: None,
+                template: None,
             },
         );
         let back: Event = serde_json::from_str(&serde_json::to_string(&bound).unwrap()).unwrap();

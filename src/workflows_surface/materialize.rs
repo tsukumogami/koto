@@ -368,6 +368,7 @@ mod tests {
             to: to.to_string(),
             condition_type: "evidence".to_string(),
             skip_if_matched: None,
+            context_assignments: None,
         };
         backend
             .append_event(id, &payload, "2026-01-01T00:01:00Z")
