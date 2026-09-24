@@ -34,6 +34,14 @@ impl ApiKey {
     pub fn expose_for_transport(&self) -> &str {
         &self.0
     }
+
+    /// Whether `raw` can be sent as a bearer token in an HTTP header:
+    /// non-empty and made only of printable ASCII (space through `~`).
+    /// A control character (newline, CR, tab, DEL) or a non-ASCII
+    /// character makes it unusable. Config treats such a key as absent.
+    pub fn is_header_safe(raw: &str) -> bool {
+        !raw.is_empty() && raw.bytes().all(|b| (0x20..0x7f).contains(&b))
+    }
 }
 
 impl fmt::Debug for ApiKey {
@@ -515,6 +523,24 @@ mod tests {
         let dbg_opt = format!("{:?}", Some(key.clone()));
         assert!(!dbg_opt.contains("sk-very-secret-value"));
         assert_eq!(key.expose_for_transport(), "sk-very-secret-value");
+    }
+
+    #[test]
+    fn header_safe_keys_are_printable_ascii_only() {
+        assert!(ApiKey::is_header_safe("sk-abc_123.XYZ"));
+        assert!(ApiKey::is_header_safe("a b~!"));
+        for bad in [
+            "",
+            "sk-SECRET\nX",
+            "sk\rX",
+            "sk\tX",
+            "sk\u{0}X",
+            "sk\u{7f}X",
+            "sk\u{e9}X",
+            "sk\u{202e}X",
+        ] {
+            assert!(!ApiKey::is_header_safe(bad), "{:?}", bad);
+        }
     }
 
     #[test]

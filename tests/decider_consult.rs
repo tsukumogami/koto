@@ -1693,3 +1693,62 @@ fn produces_the_compatibility_log() {
         std::fs::copy(&log, dest).unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------
+// A key that can't be an HTTP header
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_key_with_a_control_character_does_not_opt_in_or_panic() {
+    const SECRET: &str = "sk-CTRL-SECRET-5d1e";
+    let bad = [
+        format!("{SECRET}\nX"),
+        format!("{SECRET}\rX"),
+        format!("{SECRET}\u{1}X"),
+    ];
+    for raw in &bad {
+        // From the environment.
+        let h = ready(&standard("auto", "auto"), vec![go()]);
+        let mut cmd = h.koto_mode("auto");
+        cmd.env("KOTO_DECIDER_API_KEY", raw);
+        let out = h.next(cmd);
+        let err = stderr(&out);
+        assert!(out.status.success(), "{:?}: {}", raw, describe(&out));
+        assert!(!err.contains("panicked"), "{:?}: {}", raw, err);
+        assert!(!err.contains(SECRET), "{:?}: {}", raw, err);
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(SECRET));
+        assert!(
+            err.contains("KOTO_DECIDER_API_KEY: the decider API key contains a control"),
+            "{:?}: {}",
+            raw,
+            err
+        );
+        assert_eq!(json_out(&out)["state"], "review", "{:?}", raw);
+        assert_eq!(h.stub.request_count(), 0, "{:?}", raw);
+        assert!(h.consultations().is_empty(), "{:?}", raw);
+        assert!(!h.raw_log().contains(SECRET));
+
+        // From user config, with the endpoint from the same layer.
+        let h = ready(&standard("auto", "auto"), vec![go()]);
+        let escaped = raw
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\u{1}', "\\u0001");
+        h.user_config(&format!(
+            "[decider]\nmode = \"auto\"\napi_key = \"{}\"\nendpoint = \"{}\"\n",
+            escaped,
+            h.stub.url()
+        ));
+        let out = h.next(h.koto());
+        let err = stderr(&out);
+        assert!(out.status.success(), "{:?}: {}", raw, describe(&out));
+        assert!(
+            !err.contains("panicked") && !err.contains(SECRET),
+            "{}",
+            err
+        );
+        assert!(err.contains("user config: the decider API key"), "{}", err);
+        assert_eq!(h.stub.request_count(), 0, "{:?}", raw);
+        assert!(h.consultations().is_empty(), "{:?}", raw);
+    }
+}

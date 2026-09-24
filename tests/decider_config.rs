@@ -372,3 +372,29 @@ fn user_set_and_unset_tighten_existing_0644() {
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(mode_of(&path), 0o600, "unset --user");
 }
+
+#[test]
+fn user_set_refuses_a_key_that_cannot_be_a_header() {
+    let d = dirs();
+    for bad in [
+        format!("{KEY}\nX"),
+        format!("{KEY}\rX"),
+        format!("{KEY}\tX"),
+        format!("{KEY}\u{e9}"),
+    ] {
+        let out = run(
+            koto(&d),
+            &["config", "set", "--user", "decider.api_key", &bad],
+        );
+        assert_ne!(out.code, 0, "{:?}", bad);
+        assert!(out.stderr.contains("control characters"), "{}", out.stderr);
+        assert!(!out.stderr.contains(KEY) && !out.stdout.contains(KEY));
+        assert!(!user_config(&d).exists(), "{:?}", bad);
+    }
+    // An ordinary key is still accepted.
+    let out = run(
+        koto(&d),
+        &["config", "set", "--user", "decider.api_key", KEY],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+}

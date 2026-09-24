@@ -89,19 +89,16 @@ fn send(
     } else {
         ProxySettings::from_env()
     };
-    let response = attohttpc::post(url.as_str())
-        .follow_redirects(false)
-        .connect_timeout(budget)
-        .read_timeout(budget)
-        .timeout(budget)
-        .proxy_settings(proxies)
-        .header("Authorization", bearer_value(bearer))
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .header("User-Agent", USER_AGENT)
-        .bytes(body)
-        .send()
-        .map_err(|e| classify(e.kind()))?;
+    let request = with_headers(
+        attohttpc::post(url.as_str())
+            .follow_redirects(false)
+            .connect_timeout(budget)
+            .read_timeout(budget)
+            .timeout(budget)
+            .proxy_settings(proxies),
+        bearer,
+    )?;
+    let response = request.bytes(body).send().map_err(|e| classify(e.kind()))?;
 
     let (status, _headers, reader) = response.split();
     let mut buf = Vec::new();
@@ -113,6 +110,26 @@ fn send(
         return Err(DeciderError::malformed("response body exceeds 1 MiB"));
     }
     Ok((status.as_u16(), buf))
+}
+
+/// Set the request headers with the fallible header API. attohttpc's
+/// `header()` panics on a value that isn't a valid header (a key holding a
+/// newline, say); here that's a `malformed` error with fixed text, which
+/// never includes the value.
+fn with_headers<B>(
+    builder: attohttpc::RequestBuilder<B>,
+    bearer: &ApiKey,
+) -> Result<attohttpc::RequestBuilder<B>, DeciderError> {
+    let bad_header = |_| DeciderError::malformed("request header value is not valid");
+    builder
+        .try_header("Authorization", bearer_value(bearer))
+        .map_err(bad_header)?
+        .try_header("Content-Type", "application/json")
+        .map_err(bad_header)?
+        .try_header("Accept", "application/json")
+        .map_err(bad_header)?
+        .try_header("User-Agent", USER_AGENT)
+        .map_err(bad_header)
 }
 
 fn bearer_value(key: &ApiKey) -> String {
@@ -202,6 +219,25 @@ mod tests {
         let e = classify_io(std::io::ErrorKind::ConnectionRefused);
         assert_eq!(e.class, ErrorClass::Connect);
         assert_eq!(e.detail, "request failed: connection refused");
+    }
+
+    #[test]
+    fn a_key_that_is_not_a_valid_header_is_an_error_not_a_panic() {
+        // The key never reaches the network: header building fails first.
+        // The URL is loopback on the discard port in case it didn't.
+        let url = Url::parse("http://127.0.0.1:9/d").unwrap();
+        for raw in ["sk-SECRET\nX", "sk-SECRET\rX", "sk-SECRET\u{0}X"] {
+            let key = ApiKey::new(raw);
+            let built = with_headers(attohttpc::post(url.as_str()), &key);
+            let err = built.expect_err("header refused");
+            assert_eq!(err.class, ErrorClass::Malformed);
+            assert!(!err.detail.contains("SECRET"), "{}", err.detail);
+
+            let got = post_json_with_deadline(&url, &key, b"{}".to_vec(), Duration::from_secs(2));
+            let err = got.unwrap_err();
+            assert_eq!(err.class, ErrorClass::Malformed, "{}", err.detail);
+            assert!(!err.detail.contains("SECRET"), "{}", err.detail);
+        }
     }
 
     #[test]

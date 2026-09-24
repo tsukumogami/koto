@@ -232,6 +232,12 @@ pub fn validate_decider_endpoint_value(value: &str) -> Result<(), String> {
 pub fn validate_decider_api_key_value(value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         Err("decider.api_key must not be empty".to_string())
+    } else if !crate::decider::ApiKey::is_header_safe(value) {
+        Err(
+            "decider.api_key must be printable ASCII with no control characters \
+             (newline, carriage return, tab) or non-ASCII characters"
+                .to_string(),
+        )
     } else {
         Ok(())
     }
@@ -434,5 +440,15 @@ mod tests {
     fn api_key_value_error_does_not_echo() {
         assert!(validate_decider_api_key_value("abc").is_ok());
         assert!(validate_decider_api_key_value("  ").is_err());
+        for bad in [
+            "sk-SECRET\nX",
+            "sk-SECRET\rX",
+            "sk-SECRET\tX",
+            "sk-SECRET\u{e9}",
+        ] {
+            let err = validate_decider_api_key_value(bad).unwrap_err();
+            assert!(!err.contains("SECRET"), "{}", err);
+            assert!(err.contains("control characters"), "{}", err);
+        }
     }
 }

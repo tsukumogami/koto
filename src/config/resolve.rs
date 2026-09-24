@@ -703,12 +703,21 @@ pub fn resolve_decider(cfg: &DeciderConfig) -> (DeciderSettings, Vec<String>) {
         Some(n) => n as u64,
     };
 
-    // Key.
-    let api_key = cfg
-        .api_key
-        .as_deref()
-        .filter(|k| !k.trim().is_empty())
-        .map(ApiKey::new);
+    // Key. One that can't travel in an HTTP header (a control or
+    // non-ASCII character) counts as absent, so it never opts the user in
+    // and never reaches the transport. The warning names only the source.
+    let api_key = match cfg.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
+        Some(k) if ApiKey::is_header_safe(k) => Some(ApiKey::new(k)),
+        Some(_) => {
+            warnings.push(format!(
+                "{}: the decider API key contains a control or non-ASCII character \
+                 and can't be sent; ignoring it, so the decider is off",
+                key_source_label(file_origin_if_unset(cfg.api_key_origin))
+            ));
+            None
+        }
+        None => None,
+    };
     let api_key_origin = if api_key.is_some() {
         file_origin_if_unset(cfg.api_key_origin)
     } else {
@@ -1411,6 +1420,44 @@ mod tests {
                 &[("KOTO_DECIDER", "auto")],
             );
             assert_eq!(s.mode(), GlobalMode::Shadow);
+        }
+
+        #[test]
+        fn a_key_that_cannot_be_a_header_is_absent_with_a_warning() {
+            let bad = [
+                format!("{KEY}\nX"),
+                format!("{KEY}\rX"),
+                format!("{KEY}\tX"),
+                format!("{KEY}\u{7f}"),
+                format!("{KEY}\u{e9}"),
+            ];
+            for raw in &bad {
+                // From the environment.
+                let (s, w) = resolve(
+                    "",
+                    "",
+                    &[("KOTO_DECIDER", "auto"), (ENV_DECIDER_API_KEY, raw)],
+                );
+                assert!(s.api_key().is_none(), "{raw:?}");
+                assert!(!s.opted_in(), "{raw:?}");
+                assert_eq!(s.api_key_origin(), SettingOrigin::Default);
+                assert_no_secret(&w);
+                assert_eq!(w.len(), 1, "{w:?}");
+                assert!(w[0].starts_with(ENV_DECIDER_API_KEY), "{w:?}");
+                assert!(w[0].contains("control or non-ASCII"), "{w:?}");
+
+                // From user config (TOML escapes carry the character).
+                let mut cfg = build("[decider]\nmode = \"auto\"\n", "", &[]);
+                cfg.api_key = Some(raw.clone());
+                cfg.api_key_origin = SettingOrigin::User;
+                let (s, w) = resolve_decider(&cfg);
+                assert!(s.api_key().is_none() && !s.opted_in(), "{raw:?}");
+                assert_no_secret(&w);
+                assert!(w.iter().any(|m| m.starts_with("user config")), "{w:?}");
+            }
+            // An ordinary key is untouched and still opts in.
+            let (s, w) = resolve(&user_key("auto"), "", &[]);
+            assert!(s.opted_in(), "{w:?}");
         }
 
         #[test]
