@@ -64,6 +64,34 @@ A few things to note about this template:
 
 The supported gate types are `command`, `context-exists`, `context-matches`, and `children-complete`. For full template-authoring guidance, use the `koto-author` skill (in the koto-skills plugin), which compiles and validates templates interactively.
 
+### Constraining variables
+
+Every variable value already has to pass koto's character allowlist. When a variable should only ever hold a few specific values, or values of a known shape, say so in the declaration and let koto refuse anything else at `koto init`, before a gate command or directive ever sees it. That keeps argument checking out of your SKILL.md prose.
+
+```yaml
+variables:
+  INTENT_FLAG:
+    description: The caller's intent token, or empty
+    pattern: ^(continue|stop)?$
+  MERGE:
+    values: ["true", "false"]
+    default: "false"
+    rebind: true
+  MAX_ROUNDS:
+    pattern: "([1-9]|[1-4][0-9]|50)?"
+    rebind: true
+```
+
+- **`values:`** is a closed list. A value must equal one of the entries exactly. The list can't be empty, and every entry must itself pass the allowlist.
+- **`pattern:`** is a regular expression in the Rust `regex` crate's syntax. koto matches it against the whole value, applying it as `^(?:<pattern>)$`, so `pattern: "[a-z]+"` refuses `abc-1` even though you didn't write anchors. Anchors you do write are harmless. The crate has no lookaround or backreferences, and an expression it can't compile is a compile error.
+- A variable declares at most one of `values:` and `pattern:`.
+- A non-empty `default` must satisfy the constraint. An optional variable with no default resolves to the empty string when it isn't passed, so its constraint has to accept `""` (as `INTENT_FLAG` and `MAX_ROUNDS` above do); otherwise give it a default or mark it `required: true`.
+- Unknown keys in a variable declaration are compile errors, so a misspelled `valuez:` can't silently leave a variable unconstrained.
+
+At `koto init`, a value that fails its constraint (or the allowlist) exits with code 2, creates no session, and reports `"code": "invalid_var"` with the variable, the value, and the constraint. A repeated `--var` key reports `duplicate_var` and an undeclared one `unknown_var`. See [the error code reference](../reference/error-codes.md#init).
+
+**`rebind: true`** marks a per-invocation setting, such as whether this run may merge, as opposed to an identity variable like a topic or a document path. Variables are fixed when the session is created. A `rebind: true` variable is the exception: when a later invocation attaches to the same live session, koto re-applies it from that invocation, using the invocation's value or else the declared default, so the setting is never inherited from an earlier run. Rebinding happens only through an accepted `koto init --attach-live`; there's no standalone command that changes a variable, and a refused attach leaves every variable as it was. The session log records each rebind as a `variables_rebound` event. `rebind` must be a YAML boolean.
+
 ## Step 2: Validate the template
 
 Before writing the SKILL.md, compile the template to catch errors:

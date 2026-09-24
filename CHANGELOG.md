@@ -10,6 +10,26 @@ to `0.9.x`).
 
 ### Added
 
+- **Template variables can declare `values:`, `pattern:`, and `rebind: true`.**
+  A variable used to accept anything the character allowlist allowed, so a
+  skill that needed `--intent` to be `continue` or `stop` had to check it in
+  prose. Now `values:` names a closed set and `pattern:` a regular expression
+  matched against the whole value, and both are enforced at `koto init` and on
+  batch child spawns. A refused value exits 2 with no session and a typed
+  `code` in the error body: `invalid_var` (with `var`, `value`, and
+  `constraint`), `duplicate_var`, or `unknown_var`; the existing `error` text
+  is unchanged. The compiler checks the declaration itself: a default must
+  satisfy the constraint, an optional variable with no default needs a
+  constraint that accepts the empty value, `values:` and `pattern:` are
+  exclusive, and an unknown key in a variable declaration (a misspelled
+  `valuez:`) is now a compile error instead of being dropped. `rebind: true`
+  marks a per-invocation setting that a later attach re-applies on a live
+  session; the engine records that as a new additive `variables_rebound` event,
+  which the variable fold reads in order. No command rebinds a variable yet:
+  the primitive is library-only until attach lands. Templates that declare
+  none of the new keys compile to byte-identical output, so existing sessions'
+  template hashes still match.
+
 - **`koto session rebind` moves a session whose checkout moved.** Execution
   anchoring shipped in 0.12.0 with the enforcement but not the repair: both
   refusals told the user to run `koto session rebind <session> --to <dir>`,
