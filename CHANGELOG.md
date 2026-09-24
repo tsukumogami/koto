@@ -80,6 +80,32 @@ to `0.9.x`).
   request contract moves to 1.1; a dispatched child passed to `attach`
   binds exactly as `bind` binds it, and `bind` is unchanged.
 
+- **`koto init` can attach, replace, and answer a request leg in one call.**
+  A skill that reopened the same named session on every invocation had to
+  read it first and pick between creating, resuming and cleaning up, and a
+  finished session left behind by an earlier run blocked the name outright.
+  Four new flags make that one step with one of four outcomes, reported as
+  `outcome` in the output: `created`, `attached`, `replaced`, or a typed
+  refusal. `--vars-file <path>` takes the variables as a JSON list of
+  `["KEY", "VALUE"]` pairs, so a repeated key is refused as `duplicate_var`,
+  and validates them before the name is looked up. `--replace-terminal`
+  replaces a finished session and returns its `replaced_result`, refusing a
+  running one (`session_live`). `--attach-live` joins a running session when
+  it was built from a template file of the same name (`template_mismatch`),
+  its new origin record matches the caller's worktree and session store
+  (`origin_mismatch`), and every explicitly passed non-`rebind` variable
+  equals the recorded one (`var_mismatch`); it then re-applies the
+  `rebind: true` variables. `--koto-leg <request>:<leg>` binds the session to
+  a request leg with every `koto request attach` check. All checks run
+  before any write, and writes follow in a fixed order (create or replace,
+  bind, rebind), so a refused or stale invocation changes nothing. Under
+  `--koto-leg` every refusal is also recorded on an open, unbound leg as
+  `result_source: refused` with a `{outcome, reason, var, recorded,
+  requested}` payload, without changing the command's output. Every new
+  session's header now carries `origin`; sessions created by earlier
+  releases have none and are refused by `--attach-live` until they finish or
+  are removed. Plain `koto init` without these flags behaves as before.
+
 - **Template variables can declare `values:`, `pattern:`, and `rebind: true`.**
   A variable used to accept anything the character allowlist allowed, so a
   skill that needed `--intent` to be `continue` or `stop` had to check it in
@@ -95,8 +121,8 @@ to `0.9.x`).
   `valuez:`) is now a compile error instead of being dropped. `rebind: true`
   marks a per-invocation setting that a later attach re-applies on a live
   session; the engine records that as a new additive `variables_rebound` event,
-  which the variable fold reads in order. No command rebinds a variable yet:
-  the primitive is library-only until attach lands. Templates that declare
+  which the variable fold reads in order. The only command that rebinds a
+  variable is an accepted `koto init --attach-live`. Templates that declare
   none of the new keys compile to byte-identical output, so existing sessions'
   template hashes still match.
 

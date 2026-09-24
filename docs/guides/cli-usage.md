@@ -52,6 +52,37 @@ This creates a session directory at `~/.koto/sessions/<name>/` and writes a stat
 
 Exits non-zero if a workflow with that name already exists or if the template is invalid.
 
+Every new session's header carries an **origin record**, `origin`: the session's execution anchor (the canonical directory its commands run in) and the identity of the session store that holds it (`kind`, `local` or `cloud`, and the canonical sessions directory `base`). Session names are machine-wide, so the record is what tells two same-named sessions from different worktrees or stores apart. `koto session rebind` moves the record's anchor along with the session. Sessions created before this field existed have none, and nothing backfills it.
+
+#### Entry flags
+
+A skill that enters the same session on every invocation passes these flags instead of reading the session first and deciding what to do. With any of them, or with `--vars-file`, one `koto init` call ends in one of four outcomes:
+
+- a new session (`"outcome": "created"`);
+- an attached live session (`"outcome": "attached"`), with its `rebind: true` variables re-applied;
+- a fresh session replacing a finished one (`"outcome": "replaced"`);
+- a refusal with a typed `code`, almost always exit 2, that changes nothing.
+
+```bash
+koto init <name> --template <path> --vars-file <file> [--attach-live] [--replace-terminal] [--koto-leg <request-id>:<leg>]
+```
+
+- `--vars-file <path>` reads the variables from a JSON list of `["KEY", "VALUE"]` string pairs, such as `[["TOPIC","t1"],["MERGE","true"]]`. A list rather than an object, so a repeated key survives to be refused as `duplicate_var`. Values pass the same checks as `--var`. The file must be a regular file of at most 64 KiB and not a symlink; anything else, including malformed JSON or a pair that isn't two strings, is refused with `invalid_vars_file`. It can't be combined with `--var`. With `--vars-file` or any entry flag, variables are validated before the name is looked up, so a bad value against an existing session is reported as the variable error, not "already exists".
+- `--replace-terminal` replaces a session that is finished (in a terminal state, or cancelled): koto removes it and creates a fresh one under the same name. The output carries the old session's `replaced_state` and `replaced_result`, its workflow result (`null` for a cancelled session that recorded none). Removing the session removes its override log too. A running session is refused with `session_live`.
+- `--attach-live` attaches to a running session instead of refusing the name. koto checks, in order, that the session was built from a template file with the same name as `--template` (`template_mismatch`, with `recorded` and `requested`); that its origin record equals this invocation's, meaning the same execution anchor (`--execution-dir` or the working directory) and the same session store (`origin_mismatch`); and that every non-`rebind` variable passed explicitly equals the recorded value (`var_mismatch`, naming `var`, `recorded` and `requested`). Variables the caller doesn't pass aren't compared. A session with no origin record is refused with `origin_mismatch` and a message that says so: finish it with the koto version that started it, or remove it with `koto session cleanup <name>`. On acceptance every `rebind: true` variable is re-applied from this invocation (its value, else the declared default), recorded as one `variables_rebound` event, and the output lists the changes under `rebound`. A finished session is refused with `session_terminal`. `--intent` is not applied to an attached session.
+- With both `--attach-live` and `--replace-terminal`, a running session is attached, a finished one is replaced, and a missing one is created.
+- `--koto-leg <request-id>:<leg>` attaches the created, attached or replacement session to a request leg in the same call, with every check `koto request attach` makes (see [request attach](#request-attach)). A value that doesn't match the request-id and leg-name grammars is a usage error. The output gains `leg`: `{"request_id", "leg", "written"}`.
+
+Without `--attach-live` or `--replace-terminal`, an existing session still gets the "already exists" message and exit 1. The three entry flags are rejected with `--from-stdin` and with `--parent` (`invalid_usage`, exit 2).
+
+**Order of checks and writes.** Every check runs before anything is written: variables, then the existing session's template, origin and fixed variables, then the leg checks. Writes follow in a fixed order: create or replace the session, bind the leg, then re-apply the rebind variables. So a refused invocation leaves the session and its variables as they were; a stale invocation that names an abandoned leg, or a leg another session holds, can't flip a rebind variable such as `MERGE`. If the leg bind loses a race after the checks passed, the invocation exits with the bind's error, removes a session it just created, and leaves an attached session's variables unchanged.
+
+**Refusals recorded on the leg.** Under `--koto-leg`, every refusal is also written onto the named leg when that leg is open and unbound: it resolves with `result_source: refused`, status `failure`, and a payload `{"outcome": "refused", "reason", "var", "recorded", "requested"}`. `reason` is `invalid-var:<V>`, `duplicate-var:<V>`, `unknown-var:<V>`, `var-mismatch:<V>`, `template-mismatch`, `origin-mismatch`, or, for any other refusal, its error code in the same kebab form (`session-terminal`, `session-live`, `leg-abandoned`, `input-mismatch`, and so on). The other three keys are empty strings when they don't apply. A leg that is bound, resolved or abandoned, or a request that is closed or doesn't exist, gets nothing, and a refusal never binds the leg or writes a leg pointer. The exit code and the printed error are the same with and without `--koto-leg`.
+
+```json
+{"name":"scope-t1","state":"work","outcome":"attached","rebound":{"MERGE":"false"},"leg":{"request_id":"req-...","leg":"scope","written":true}}
+```
+
 ### next
 
 Returns the directive for the current state. This is the main agent-facing command -- it tells the agent what to do next, what evidence to submit, and whether any gates are blocking.
