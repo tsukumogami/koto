@@ -1843,3 +1843,100 @@ fn the_report_pairs_records_written_by_koto_next() {
     assert_eq!(q["disagreements"][0]["agent"], "exit");
     assert_eq!(q["disagreements"][0]["decider"], "proceed");
 }
+
+// ---------------------------------------------------------------------------
+// A config file that fails to parse never echoes its content
+// ---------------------------------------------------------------------------
+
+/// A key only a broken config file holds. The toml parser quotes the
+/// offending line in its message, so this must never reach any output.
+const LEAKED: &str = "sk-LEAKME-123";
+
+/// Config bodies that fail to parse on a line holding [`LEAKED`]: an
+/// unterminated string (a syntax error) and a string where a table belongs
+/// (a shape error, whose serde message quotes the value).
+fn broken_configs() -> [(&'static str, String); 2] {
+    [
+        ("syntax", format!("[decider]\napi_key = \"{}\n", LEAKED)),
+        ("shape", format!("[session]\ncloud = \"{}\"\n", LEAKED)),
+    ]
+}
+
+/// Every command that loads a user or project config, each opted in
+/// against the stub so none of them would reach a real provider.
+fn config_commands(h: &Harness, user: bool) -> Vec<(String, Command)> {
+    let mut out = Vec::new();
+    let mut push = |name: &str, args: &[&str]| {
+        let mut cmd = h.koto_mode("shadow");
+        cmd.args(args);
+        out.push((name.to_string(), cmd));
+    };
+    push("next", &["next", WF]);
+    push("config list", &["config", "list"]);
+    push("config list --json", &["config", "list", "--json"]);
+    push("config get", &["config", "get", "decider.mode"]);
+    let scope: &[&str] = if user { &["--user"] } else { &[] };
+    let set: Vec<&str> = [&["config", "set"][..], scope, &["decider.mode", "off"][..]].concat();
+    push("config set", &set);
+    let unset: Vec<&str> = [&["config", "unset"][..], scope, &["decider.mode"][..]].concat();
+    push("config unset", &unset);
+    let report: Vec<&str> = [&["decider", "report"][..], &FIXTURE_ARGS[..]].concat();
+    push("decider report --fixtures", &report);
+    out
+}
+
+#[test]
+fn a_config_parse_error_never_prints_the_file_content() {
+    for user in [true, false] {
+        for (kind, body) in broken_configs() {
+            let h = Harness::new(&standard("shadow", "shadow"));
+            h.ready();
+            write_fixtures(&h, &fixture_body(&["proceed"]));
+            h.stub.set_default(say("proceed"));
+            let (layer, path) = if user {
+                h.user_config(&body);
+                ("user config", h.home().join(".koto").join("config.toml"))
+            } else {
+                h.project_config(&body);
+                ("project config", h.dir.join(".koto").join("config.toml"))
+            };
+            // A shape-broken file is still valid TOML, so a command may
+            // rewrite it (the machine id) and move the bad line; only the
+            // syntax case has a fixed position.
+            let line = if kind == "syntax" {
+                "at line 2, column 25"
+            } else {
+                " at line "
+            };
+
+            for (name, mut cmd) in config_commands(&h, user) {
+                let case = format!("{} {} {}", layer, kind, name);
+                let out = cmd.output().unwrap();
+                let so = String::from_utf8_lossy(&out.stdout);
+                let se = stderr(&out);
+                assert!(!so.contains(LEAKED), "{}: stdout leaks: {}", case, so);
+                assert!(!se.contains(LEAKED), "{}: stderr leaks: {}", case, se);
+                assert!(!se.contains("sk-"), "{}: {}", case, se);
+                // `config set/unset` edit the raw TOML, so a well-formed
+                // file with a wrong-shaped value doesn't stop them.
+                if kind == "shape" && name.starts_with("config set")
+                    || kind == "shape" && name.starts_with("config unset")
+                {
+                    assert_eq!(out.status.code(), Some(0), "{}: {}", case, describe(&out));
+                    continue;
+                }
+                assert_ne!(out.status.code(), Some(0), "{}: {}", case, describe(&out));
+                assert!(se.contains(line), "{}: no position: {}", case, se);
+                // The path is named; `config set/unset` read the file
+                // directly, so it's shown as given.
+                let shown = if user {
+                    path.display().to_string()
+                } else {
+                    ".koto/config.toml".to_string()
+                };
+                assert!(se.contains(&shown), "{}: no path: {}", case, se);
+            }
+            assert_eq!(h.stub.request_count(), 0, "{} {}", layer, kind);
+        }
+    }
+}

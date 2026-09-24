@@ -60,8 +60,7 @@ pub fn load_config() -> Result<KotoConfig> {
     // Layer 1: user config
     if let Some(user_path) = user_config_path() {
         if user_path.exists() {
-            let user_config = load_config_file(&user_path)
-                .with_context(|| format!("loading user config from {}", user_path.display()))?;
+            let user_config = load_config_file(&user_path, "user config")?;
             merge_config(&mut config, &user_config);
             merge_decider(
                 &mut config.decider,
@@ -74,8 +73,7 @@ pub fn load_config() -> Result<KotoConfig> {
     // Layer 2: project config
     let project_path = project_config_path();
     if project_path.exists() {
-        let project_config = load_config_file(&project_path)
-            .with_context(|| format!("loading project config from {}", project_path.display()))?;
+        let project_config = load_config_file(&project_path, "project config")?;
         merge_config(&mut config, &project_config);
         merge_decider(
             &mut config.decider,
@@ -191,10 +189,18 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
 /// is parsed separately from `KotoConfig` so we can distinguish "field
 /// present in the source file" from "field defaulted by serde" -- the
 /// merge step only overlays explicitly-set fields onto the target.
-fn load_config_file(path: &Path) -> Result<LoadedConfig> {
-    let content = fs::read_to_string(path)?;
-    let config: KotoConfig = toml::from_str(&content)?;
-    let raw: toml::Value = content.parse()?;
+///
+/// A parse failure is reported as a [`ConfigParseError`], which carries
+/// only the path and position: the toml error's message and source
+/// snippet can quote a line holding a key, so neither is kept.
+fn load_config_file(path: &Path, label: &'static str) -> Result<LoadedConfig> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("loading {} from {}", label, path.display()))?;
+    let raw: toml::Value = content
+        .parse()
+        .map_err(|e| ConfigParseError::new(label, path, &content, &e, ParseProblem::Syntax))?;
+    let config: KotoConfig = toml::from_str(&content)
+        .map_err(|e| ConfigParseError::new(label, path, &content, &e, ParseProblem::Shape))?;
     let request_store_keys = raw
         .as_table()
         .and_then(|t| t.get("request_store"))
@@ -224,6 +230,85 @@ fn load_config_file(path: &Path) -> Result<LoadedConfig> {
         request_store_has_recursion,
         workflows_native_present,
     })
+}
+
+/// What kind of parse failure a [`ConfigParseError`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseProblem {
+    /// The file isn't valid TOML.
+    Syntax,
+    /// The file is valid TOML but a value has the wrong type or shape.
+    Shape,
+}
+
+/// A config file that failed to parse.
+///
+/// Holds only fixed text, the file's label and path, and the 1-based line
+/// and column of the problem. The underlying toml error is dropped on
+/// purpose: its message and source snippet quote the offending line, and a
+/// user config line can hold `decider.api_key`. Nothing built from this
+/// error (`Display`, `Debug`, or an anyhow chain) can carry file content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigParseError {
+    label: &'static str,
+    path: PathBuf,
+    position: Option<(usize, usize)>,
+    problem: ParseProblem,
+}
+
+impl ConfigParseError {
+    /// Build the error from a toml error, keeping only its position.
+    pub fn new(
+        label: &'static str,
+        path: &Path,
+        content: &str,
+        err: &toml::de::Error,
+        problem: ParseProblem,
+    ) -> Self {
+        ConfigParseError {
+            label,
+            path: path.to_path_buf(),
+            position: err.span().map(|span| line_column(content, span.start)),
+            problem,
+        }
+    }
+
+    /// 1-based line and column of the problem, when the parser gave one.
+    pub fn position(&self) -> Option<(usize, usize)> {
+        self.position
+    }
+}
+
+impl std::fmt::Display for ConfigParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self.problem {
+            ParseProblem::Syntax => "is not valid TOML",
+            ParseProblem::Shape => "has a value of the wrong type or shape",
+        };
+        write!(f, "{} {} {}", self.label, self.path.display(), what)?;
+        if let Some((line, column)) = self.position {
+            write!(f, " at line {}, column {}", line, column)?;
+        }
+        write!(
+            f,
+            " (the file's content isn't shown because it can hold credentials)"
+        )
+    }
+}
+
+impl std::error::Error for ConfigParseError {}
+
+/// 1-based line and column (in characters) of byte offset `offset`.
+fn line_column(content: &str, offset: usize) -> (usize, usize) {
+    let mut offset = offset.min(content.len());
+    while !content.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let before = &content[..offset];
+    let line = before.matches('\n').count() + 1;
+    let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let column = before[line_start..].chars().count() + 1;
+    (line, column)
 }
 
 /// A loaded config plus metadata about which request_store fields the
@@ -716,8 +801,11 @@ pub fn load_toml_value(path: &Path) -> Result<toml::Value> {
     if !path.exists() {
         return Ok(toml::Value::Table(toml::map::Map::new()));
     }
-    let content = fs::read_to_string(path)?;
-    let value: toml::Value = content.parse()?;
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("loading config file {}", path.display()))?;
+    let value: toml::Value = content.parse().map_err(|e| {
+        ConfigParseError::new("config file", path, &content, &e, ParseProblem::Syntax)
+    })?;
     Ok(value)
 }
 
@@ -873,7 +961,7 @@ mod tests {
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[workflows]\nnative = true\n").unwrap();
 
-        let loaded = load_config_file(&path).unwrap();
+        let loaded = load_config_file(&path, "user config").unwrap();
         assert!(loaded.config.workflows.native);
         assert!(loaded.workflows_native_present);
     }
@@ -884,7 +972,7 @@ mod tests {
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[session]\nbackend = \"local\"\n").unwrap();
 
-        let loaded = load_config_file(&path).unwrap();
+        let loaded = load_config_file(&path, "user config").unwrap();
         // Absent from the file: not tracked for merge, and left at the default (on).
         assert!(!loaded.workflows_native_present);
         assert!(loaded.config.workflows.native);
@@ -896,7 +984,7 @@ mod tests {
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[workflows]\nnative = false\n").unwrap();
 
-        let loaded = load_config_file(&path).unwrap();
+        let loaded = load_config_file(&path, "user config").unwrap();
         assert!(loaded.workflows_native_present);
         assert!(!loaded.config.workflows.native);
     }
@@ -1002,6 +1090,55 @@ mod tests {
         let loaded = load_toml_value(&path).unwrap();
         let config: KotoConfig = loaded.try_into().unwrap();
         assert_eq!(config.session.backend, "cloud");
+    }
+
+    #[test]
+    fn parse_errors_carry_only_path_and_position() {
+        const SECRET: &str = "sk-PARSE-SECRET-91";
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let cases = [
+            (format!("[decider]\napi_key = \"{SECRET}\n"), (2, 30)),
+            (format!("# é\n[session]\ncloud = \"{SECRET}\"\n"), (3, 9)),
+        ];
+        for (body, pos) in cases {
+            std::fs::write(&path, &body).unwrap();
+            let errs = [
+                load_config_file(&path, "user config").err().unwrap(),
+                // load_toml_value only parses TOML; the shape case is valid.
+                match load_toml_value(&path) {
+                    Err(e) => e,
+                    Ok(_) => continue,
+                },
+            ];
+            for e in errs {
+                for text in [
+                    format!("{}", e),
+                    format!("{:#}", e),
+                    format!("{:?}", e),
+                    format!("{:#?}", e),
+                ] {
+                    assert!(!text.contains(SECRET), "{}", text);
+                    assert!(!text.contains("api_key"), "{}", text);
+                    assert!(!text.contains("cloud"), "{}", text);
+                }
+                let shown = format!("{}", e);
+                assert!(shown.contains(&path.display().to_string()), "{}", shown);
+                let parse = e.downcast_ref::<ConfigParseError>().unwrap();
+                assert_eq!(parse.position(), Some(pos), "{}", shown);
+                assert!(e.source().is_none(), "no toml error kept: {}", shown);
+            }
+        }
+    }
+
+    #[test]
+    fn line_column_counts_chars_and_clamps() {
+        assert_eq!(line_column("", 0), (1, 1));
+        assert_eq!(line_column("ab\ncd", 4), (2, 2));
+        assert_eq!(line_column("é=x", 2), (1, 2));
+        // Inside a multi-byte char and past the end both clamp.
+        assert_eq!(line_column("é", 1), (1, 1));
+        assert_eq!(line_column("a\n", 99), (2, 1));
     }
 
     // -----------------------------------------------------------------------
@@ -1149,7 +1286,7 @@ mod tests {
                 "[session]\nbackend = \"cloud\"\n[decider]\nmode = 3\ntimeout_ms = \"fast\"\n",
             )
             .unwrap();
-            let loaded = load_config_file(&path).expect("loads");
+            let loaded = load_config_file(&path, "user config").expect("loads");
             assert_eq!(loaded.config.session.backend, "cloud");
 
             let mut out = DeciderConfig::default();
