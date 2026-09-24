@@ -594,6 +594,19 @@ pub enum EventPayload {
         /// older state files round-trip cleanly.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         submitter_cwd: Option<PathBuf>,
+        /// Who produced this evidence when it wasn't the agent. `"decider"`
+        /// marks an answer koto applied from an opted-in decider; `None`
+        /// (the key absent) is agent-submitted evidence.
+        ///
+        /// Only the engine sets it: `--with-data` builds the event with
+        /// `None`, and a `source` key inside submitted data lands in
+        /// `fields`. A string rather than an enum, so a value a later
+        /// version adds can't break an older reader.
+        ///
+        /// Additive field: omitted when `None`, so agent evidence
+        /// serializes byte-identically to logs written before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     IntegrationInvoked {
         state: String,
@@ -986,6 +999,18 @@ pub enum EventPayload {
     /// dispatch on `Event`'s `type` string rather than through the derived
     /// impl, but keeping this variant behind the more specific ones costs
     /// nothing and removes the trap for anyone who does reach for it.
+    /// One decider consultation for a state visit
+    /// (DESIGN-jev-decision-offload.md, Decision 2 and Decision 4).
+    ///
+    /// A visit is consulted at most once: an event for `(state, visit_seq)`
+    /// is what makes the consultation sticky across `koto next` calls. The
+    /// payload holds names, hashes, numbers, modes, and the error class,
+    /// never input content, a key, or response text. Additive: an older
+    /// build lands it in `Unknown`, and a payload this build can't parse
+    /// (a future outcome, say) does the same rather than failing the read.
+    ///
+    /// Declared before `InstructionsDelivered` for the reason given there.
+    DeciderConsulted(crate::decider::record::DeciderConsultation),
     InstructionsDelivered {
         /// The phase whose instructions the response carried.
         state: String,
@@ -1335,6 +1360,7 @@ impl EventPayload {
             EventPayload::RequestLegResult { .. } => "request.leg_result",
             EventPayload::RequestLegAbandoned { .. } => "request.leg_abandoned",
             EventPayload::RequestClosed { .. } => "request.closed",
+            EventPayload::DeciderConsulted(_) => "decider_consulted",
             EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
             EventPayload::Unknown { .. } => "unknown",
         }
@@ -1465,6 +1491,13 @@ impl<'de> Deserialize<'de> for Event {
                     state: p.state,
                     fields: p.fields,
                     submitter_cwd: p.submitter_cwd,
+                    // Lenient: a non-string `source` reads as absent rather
+                    // than failing the whole log.
+                    source: p
+                        .source
+                        .as_ref()
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
                 }
             }
             "directed_transition" => {
@@ -1692,6 +1725,19 @@ impl<'de> Deserialize<'de> for Event {
                     issued_by: p.issued_by,
                 }
             }
+            "decider_consulted" => {
+                // A payload this build can't read degrades to `Unknown`
+                // instead of making the log unreadable.
+                match serde_json::from_value::<crate::decider::record::DeciderConsultation>(
+                    payload_val.clone(),
+                ) {
+                    Ok(c) => EventPayload::DeciderConsulted(c),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
             "instructions_delivered" => {
                 let p: InstructionsDeliveredPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
@@ -1748,6 +1794,8 @@ struct EvidenceSubmittedPayload {
     fields: HashMap<String, serde_json::Value>,
     #[serde(default)]
     submitter_cwd: Option<PathBuf>,
+    #[serde(default)]
+    source: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -2746,6 +2794,7 @@ mod tests {
                     m
                 },
                 submitter_cwd: Some(PathBuf::from("/work/repo")),
+                source: None,
             },
             idempotency_hash: None,
         };
@@ -2869,6 +2918,134 @@ mod tests {
             "round-tripped pre-feature event must not introduce submitter_cwd, got {}",
             reserialized
         );
+    }
+
+    // ===== Decider: evidence source and decider_consulted =====
+
+    fn evidence_with_source(source: Option<&str>) -> Event {
+        let mut fields = HashMap::new();
+        fields.insert("verdict".to_string(), serde_json::json!("proceed"));
+        Event {
+            seq: 5,
+            timestamp: "2026-04-13T10:00:00Z".to_string(),
+            event_type: "evidence_submitted".to_string(),
+            payload: EventPayload::EvidenceSubmitted {
+                state: "review".to_string(),
+                fields,
+                submitter_cwd: None,
+                source: source.map(str::to_string),
+            },
+            idempotency_hash: None,
+        }
+    }
+
+    #[test]
+    fn evidence_without_source_serializes_as_before() {
+        let json = serde_json::to_string(&evidence_with_source(None)).unwrap();
+        assert_eq!(
+            json,
+            r#"{"seq":5,"timestamp":"2026-04-13T10:00:00Z","type":"evidence_submitted","payload":{"state":"review","fields":{"verdict":"proceed"}}}"#
+        );
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, evidence_with_source(None));
+    }
+
+    #[test]
+    fn evidence_with_decider_source_round_trips() {
+        let e = evidence_with_source(Some("decider"));
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""source":"decider""#), "{}", json);
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+    }
+
+    #[test]
+    fn evidence_with_an_unrecognized_source_still_parses() {
+        let json = r#"{"seq":5,"timestamp":"2026-04-13T10:00:00Z","type":"evidence_submitted","payload":{"state":"review","fields":{},"source":"oracle-v9"}}"#;
+        let e: Event = serde_json::from_str(json).unwrap();
+        match e.payload {
+            EventPayload::EvidenceSubmitted { source, .. } => {
+                assert_eq!(source.as_deref(), Some("oracle-v9"))
+            }
+            other => panic!("{:?}", other),
+        }
+        // A non-string source reads as absent rather than failing the log.
+        let json = r#"{"seq":5,"timestamp":"2026-04-13T10:00:00Z","type":"evidence_submitted","payload":{"state":"review","fields":{},"source":{"x":1}}}"#;
+        let e: Event = serde_json::from_str(json).unwrap();
+        match e.payload {
+            EventPayload::EvidenceSubmitted { source, .. } => assert!(source.is_none()),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    fn sample_consultation() -> crate::decider::record::DeciderConsultation {
+        use crate::decider::record::{ConsultationOutcome, DeciderConsultation, FieldConsultation};
+        use crate::template::decider::DeciderMode;
+        let mut modes = BTreeMap::new();
+        modes.insert("proceed".to_string(), DeciderMode::Auto);
+        let mut fc = FieldConsultation::unevaluated("h".repeat(64), modes);
+        fc.probabilities.insert("proceed".to_string(), 0.95);
+        fc.winning = Some("proceed".to_string());
+        fc.confidence = Some(0.95);
+        fc.threshold = Some(0.9);
+        fc.at_threshold = true;
+        fc.outcome = Some(crate::decider::FieldOutcome::Qualified);
+        let mut fields = BTreeMap::new();
+        fields.insert("verdict".to_string(), fc);
+        DeciderConsultation {
+            state: "review".to_string(),
+            visit_seq: 3,
+            provider: "jev".to_string(),
+            model: "jev-1.13.0".to_string(),
+            input_sha256: Some("a".repeat(64)),
+            outcome: ConsultationOutcome::Applied,
+            error_class: None,
+            latency_ms: 120,
+            directive_bytes: 88,
+            endpoint_origin: crate::decider::SettingOrigin::Default,
+            fields,
+        }
+    }
+
+    #[test]
+    fn decider_consulted_round_trips_under_its_type_name() {
+        let p = EventPayload::DeciderConsulted(sample_consultation());
+        assert_eq!(p.type_name(), "decider_consulted");
+        let e = Event {
+            seq: 4,
+            timestamp: "2026-04-13T10:00:00Z".to_string(),
+            event_type: p.type_name().to_string(),
+            payload: p,
+            idempotency_hash: None,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "decider_consulted");
+        assert_eq!(v["payload"]["outcome"], "applied");
+        assert_eq!(v["payload"]["endpoint_origin"], "default");
+        assert!(v["payload"].get("error_class").is_none());
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+    }
+
+    #[test]
+    fn unreadable_decider_consulted_and_future_types_fall_through_to_unknown() {
+        // A decider_consulted payload this build can't read (a future
+        // outcome) degrades to Unknown rather than failing the log.
+        let mut v = serde_json::to_value(sample_consultation()).unwrap();
+        v["outcome"] = serde_json::json!("deferred");
+        let line = serde_json::json!({
+            "seq": 4, "timestamp": "2026-04-13T10:00:00Z",
+            "type": "decider_consulted", "payload": v,
+        });
+        let e: Event = serde_json::from_value(line).unwrap();
+        match e.payload {
+            EventPayload::Unknown { type_name, .. } => assert_eq!(type_name, "decider_consulted"),
+            other => panic!("{:?}", other),
+        }
+        let line = r#"{"seq":9,"timestamp":"2026-04-13T10:00:00Z","type":"decider_consulted_v2","payload":{"state":"x"}}"#;
+        let e: Event = serde_json::from_str(line).unwrap();
+        assert!(matches!(e.payload, EventPayload::Unknown { .. }));
     }
 
     // ===== Issue 1: millisecond timestamps =====

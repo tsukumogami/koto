@@ -1732,6 +1732,7 @@ mod tests {
                 state: "gather".to_string(),
                 fields: HashMap::new(),
                 submitter_cwd: None,
+                source: None,
             },
             "2026-01-01T00:01:00Z",
         )

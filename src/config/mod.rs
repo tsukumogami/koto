@@ -3,6 +3,8 @@ pub mod validate;
 
 use serde::{Deserialize, Serialize};
 
+use crate::decider::SettingOrigin;
+
 /// Top-level koto configuration.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct KotoConfig {
@@ -12,6 +14,154 @@ pub struct KotoConfig {
     pub request_store: RequestStoreConfig,
     #[serde(default)]
     pub workflows: WorkflowsConfig,
+    /// Opt-in decider settings. Omitted from `koto config list` output
+    /// when nothing is set, so configs without a `[decider]` table print
+    /// exactly as before.
+    #[serde(default, skip_serializing_if = "DeciderConfig::is_empty")]
+    pub decider: DeciderConfig,
+}
+
+/// The `[decider]` table.
+///
+/// `mode`, `api_key`, `endpoint`, and `timeout_ms` hold the user-level
+/// (global) values: user config, replaced by non-empty `KOTO_DECIDER`,
+/// `KOTO_DECIDER_API_KEY`, and `KOTO_DECIDER_ENDPOINT`. A project config
+/// contributes only its mode, which lands in `project_mode` and is never
+/// serialized; its key, endpoint, and timeout are dropped at load (see
+/// [`resolve::merge_decider`]).
+///
+/// Parsing is lenient: a wrong-typed value or unknown key never fails the
+/// whole file. The bad value is treated as unset and a warning is kept in
+/// `warnings`, which [`resolve::resolve_decider`] returns to the caller.
+/// Nothing here is interpreted until `resolve_decider` runs.
+#[derive(Clone, Default, Serialize)]
+pub struct DeciderConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<i64>,
+    /// Mode from project config. Can only lower the effective mode.
+    #[serde(skip)]
+    pub project_mode: Option<String>,
+    /// Layer `mode` came from (`User` or `Env`; `Default` when unset).
+    #[serde(skip)]
+    pub mode_origin: SettingOrigin,
+    /// Layer `api_key` came from (`User` or `Env`; `Default` when unset).
+    #[serde(skip)]
+    pub api_key_origin: SettingOrigin,
+    /// Layer `endpoint` came from (`User` or `Env`; `Default` when unset).
+    #[serde(skip)]
+    pub endpoint_origin: SettingOrigin,
+    /// Problems found while loading, already labelled with their layer.
+    /// Never contains a key value.
+    #[serde(skip)]
+    pub warnings: Vec<String>,
+}
+
+impl DeciderConfig {
+    /// True when no user-visible field is set (used to keep `[decider]`
+    /// out of `koto config list` output).
+    pub fn is_empty(&self) -> bool {
+        self.mode.is_none()
+            && self.api_key.is_none()
+            && self.endpoint.is_none()
+            && self.timeout_ms.is_none()
+    }
+}
+
+impl std::fmt::Debug for DeciderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeciderConfig")
+            .field("mode", &self.mode)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field(
+                "endpoint",
+                &self
+                    .endpoint
+                    .as_deref()
+                    .map(validate::display_decider_endpoint),
+            )
+            .field("timeout_ms", &self.timeout_ms)
+            .field("project_mode", &self.project_mode)
+            .field("mode_origin", &self.mode_origin)
+            .field("api_key_origin", &self.api_key_origin)
+            .field("endpoint_origin", &self.endpoint_origin)
+            .field("warnings", &self.warnings)
+            .finish()
+    }
+}
+
+impl<'de> Deserialize<'de> for DeciderConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = toml::Value::deserialize(deserializer)?;
+        Ok(DeciderConfig::from_toml_lenient(&raw))
+    }
+}
+
+impl DeciderConfig {
+    /// Build a `DeciderConfig` from a raw `[decider]` value, keeping every
+    /// well-typed field and turning every problem into a warning. Warnings
+    /// name the key and the expected type, never the value.
+    pub fn from_toml_lenient(raw: &toml::Value) -> DeciderConfig {
+        let mut out = DeciderConfig::default();
+        let table = match raw.as_table() {
+            Some(t) => t,
+            None => {
+                out.warnings
+                    .push("[decider] must be a table; ignoring it".to_string());
+                return out;
+            }
+        };
+        for (k, v) in table {
+            match k.as_str() {
+                "mode" | "api_key" | "endpoint" => match v.as_str() {
+                    Some(s) => {
+                        let s = Some(s.to_string());
+                        match k.as_str() {
+                            "mode" => out.mode = s,
+                            "api_key" => out.api_key = s,
+                            _ => out.endpoint = s,
+                        }
+                    }
+                    None => out
+                        .warnings
+                        .push(format!("decider.{} must be a string; ignoring it", k)),
+                },
+                "timeout_ms" => match v.as_integer() {
+                    Some(n) => out.timeout_ms = Some(n),
+                    None => out
+                        .warnings
+                        .push("decider.timeout_ms must be an integer; ignoring it".to_string()),
+                },
+                other => out.warnings.push(format!(
+                    "unknown key decider.{}; ignoring it",
+                    sanitize_key_name(other)
+                )),
+            }
+        }
+        out
+    }
+}
+
+/// Keep an unknown key name printable and short in a warning.
+fn sanitize_key_name(k: &str) -> String {
+    let cleaned: String = k
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "<unprintable>".to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Native Claude Code `/workflows` rendering configuration.
@@ -214,6 +364,24 @@ pub fn get_value(config: &KotoConfig, key: &str) -> Option<String> {
         }
         "request_store.request_leg_cap" => Some(config.request_store.request_leg_cap.to_string()),
         "workflows.native" => Some(config.workflows.native.to_string()),
+        // The effective mode (global minimum project), shown only when a
+        // mode is configured somewhere.
+        "decider.mode" => {
+            if config.decider.mode.is_none() && config.decider.project_mode.is_none() {
+                None
+            } else {
+                let (settings, _) = resolve::resolve_decider(&config.decider);
+                Some(settings.mode().as_str().to_string())
+            }
+        }
+        // Never the key itself.
+        "decider.api_key" => config.decider.api_key.as_ref().map(|_| "<set>".to_string()),
+        "decider.endpoint" => config
+            .decider
+            .endpoint
+            .as_deref()
+            .map(validate::display_decider_endpoint),
+        "decider.timeout_ms" => config.decider.timeout_ms.map(|n| n.to_string()),
         _ => None,
     }
 }
@@ -314,6 +482,26 @@ pub fn set_value_in_toml(doc: &mut toml::Value, key: &str, value: &str) -> Resul
             let workflows_table = workflows.as_table_mut().ok_or("workflows is not a table")?;
             workflows_table.insert("native".to_string(), toml::Value::Boolean(parsed));
         }
+        "decider.mode" | "decider.api_key" | "decider.endpoint" | "decider.timeout_ms" => {
+            let field = key.strip_prefix("decider.").unwrap();
+            let toml_value = match field {
+                "mode" => toml::Value::String(validate::validate_decider_mode_value(value)?.into()),
+                "api_key" => {
+                    validate::validate_decider_api_key_value(value)?;
+                    toml::Value::String(value.to_string())
+                }
+                "endpoint" => {
+                    validate::validate_decider_endpoint_value(value)?;
+                    toml::Value::String(value.trim().to_string())
+                }
+                _ => toml::Value::Integer(validate::validate_decider_timeout_value(value)?),
+            };
+            let decider = table
+                .entry("decider")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            let decider_table = decider.as_table_mut().ok_or("decider is not a table")?;
+            decider_table.insert(field.to_string(), toml_value);
+        }
         _ => return Err(format!("unknown config key: {}", key)),
     }
     Ok(())
@@ -392,6 +580,15 @@ pub fn unset_value_in_toml(doc: &mut toml::Value, key: &str) -> Result<bool, Str
             }
             Ok(false)
         }
+        "decider.mode" | "decider.api_key" | "decider.endpoint" | "decider.timeout_ms" => {
+            let field = key.strip_prefix("decider.").unwrap();
+            if let Some(decider) = table.get_mut("decider") {
+                if let Some(t) = decider.as_table_mut() {
+                    return Ok(t.remove(field).is_some());
+                }
+            }
+            Ok(false)
+        }
         _ => Err(format!("unknown config key: {}", key)),
     }
 }
@@ -415,6 +612,10 @@ pub const ALL_KEYS: &[&str] = &[
     "request_store.request_leg_append_cap",
     "request_store.request_leg_cap",
     "workflows.native",
+    "decider.mode",
+    "decider.api_key",
+    "decider.endpoint",
+    "decider.timeout_ms",
 ];
 
 /// Produce a redacted copy of the config for display.
@@ -426,6 +627,12 @@ pub fn redact(config: &KotoConfig) -> KotoConfig {
     }
     if redacted.session.cloud.secret_key.is_some() {
         redacted.session.cloud.secret_key = Some("<set>".to_string());
+    }
+    if redacted.decider.api_key.is_some() {
+        redacted.decider.api_key = Some("<set>".to_string());
+    }
+    if let Some(endpoint) = redacted.decider.endpoint.as_deref() {
+        redacted.decider.endpoint = Some(validate::display_decider_endpoint(endpoint));
     }
     redacted
 }
@@ -791,5 +998,110 @@ mod tests {
     #[test]
     fn test_workflows_native_in_all_keys() {
         assert!(ALL_KEYS.contains(&"workflows.native"));
+    }
+    // -----------------------------------------------------------------------
+    // decider.* coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decider_keys_in_all_keys() {
+        for k in [
+            "decider.mode",
+            "decider.api_key",
+            "decider.endpoint",
+            "decider.timeout_ms",
+        ] {
+            assert!(ALL_KEYS.contains(&k), "{k}");
+        }
+    }
+
+    #[test]
+    fn test_no_decider_table_serializes_as_before() {
+        let cfg: KotoConfig = toml::from_str("[session]\nbackend = \"local\"\n").unwrap();
+        let t = toml::to_string_pretty(&redact(&cfg)).unwrap();
+        assert!(!t.contains("decider"), "{t}");
+        let j = serde_json::to_string_pretty(&redact(&cfg)).unwrap();
+        assert!(!j.contains("decider"), "{j}");
+
+        // A project-only mode lives in project_mode, which never serializes.
+        let mut cfg = cfg;
+        cfg.decider.project_mode = Some("off".into());
+        let t = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!t.contains("decider"), "{t}");
+    }
+
+    #[test]
+    fn test_decider_set_get_unset_round_trip() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        set_value_in_toml(&mut doc, "decider.mode", " Shadow ").unwrap();
+        set_value_in_toml(&mut doc, "decider.api_key", "sk-round-trip-secret").unwrap();
+        set_value_in_toml(&mut doc, "decider.endpoint", "https://api.example.com/v1/d").unwrap();
+        set_value_in_toml(&mut doc, "decider.timeout_ms", "1500").unwrap();
+        let cfg: KotoConfig = doc.clone().try_into().unwrap();
+        assert_eq!(cfg.decider.mode.as_deref(), Some("shadow"));
+        assert_eq!(get_value(&cfg, "decider.mode"), Some("shadow".into()));
+        assert_eq!(get_value(&cfg, "decider.api_key"), Some("<set>".into()));
+        assert_eq!(
+            get_value(&cfg, "decider.endpoint"),
+            Some("https://api.example.com/v1/d".into())
+        );
+        assert_eq!(get_value(&cfg, "decider.timeout_ms"), Some("1500".into()));
+
+        for k in [
+            "decider.mode",
+            "decider.api_key",
+            "decider.endpoint",
+            "decider.timeout_ms",
+        ] {
+            assert!(unset_value_in_toml(&mut doc, k).unwrap(), "{k}");
+            assert!(!unset_value_in_toml(&mut doc, k).unwrap(), "{k}");
+        }
+        let cfg: KotoConfig = doc.try_into().unwrap();
+        assert!(cfg.decider.is_empty());
+        assert_eq!(get_value(&cfg, "decider.api_key"), None);
+        assert_eq!(get_value(&cfg, "decider.mode"), None);
+    }
+
+    #[test]
+    fn test_decider_set_rejects_bad_values_without_echo() {
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        let err = set_value_in_toml(&mut doc, "decider.mode", "never").unwrap_err();
+        assert!(err.contains("template-only"), "{err}");
+        assert!(set_value_in_toml(&mut doc, "decider.mode", "bogus").is_err());
+        for bad in ["0", "10001", "fast", "-1"] {
+            assert!(
+                set_value_in_toml(&mut doc, "decider.timeout_ms", bad).is_err(),
+                "{bad}"
+            );
+        }
+        for bad in [
+            "http://example.com/d",
+            "http://localhost.example.com/d",
+            "not a url",
+            "https://user:pass@example.com/d",
+        ] {
+            let err = set_value_in_toml(&mut doc, "decider.endpoint", bad).unwrap_err();
+            assert!(!err.contains("pass"), "{err}");
+        }
+        assert!(set_value_in_toml(&mut doc, "decider.endpoint", "http://127.0.0.1:9/d").is_ok());
+        assert!(set_value_in_toml(&mut doc, "decider.api_key", "").is_err());
+    }
+
+    #[test]
+    fn test_redact_decider_key_and_endpoint() {
+        let mut config = KotoConfig::default();
+        config.decider.api_key = Some("sk-redact-me-123".into());
+        config.decider.endpoint = Some("https://u:p@api.example.com/d?x=1".into());
+        let redacted = redact(&config);
+        assert_eq!(redacted.decider.api_key.as_deref(), Some("<set>"));
+        assert_eq!(
+            redacted.decider.endpoint.as_deref(),
+            Some("https://api.example.com/d")
+        );
+        let t = toml::to_string_pretty(&redacted).unwrap();
+        assert!(!t.contains("sk-redact-me-123"));
+        let j = serde_json::to_string(&redacted).unwrap();
+        assert!(!j.contains("sk-redact-me-123"));
+        assert!(!format!("{:?}", config).contains("sk-redact-me-123"));
     }
 }

@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use regex::Regex;
 
+use super::decider::{
+    DeciderInputSource, DeciderMode, FieldDecider, FloorViolation, FloorViolationKind,
+    MAX_THRESHOLD, MIN_THRESHOLD,
+};
+
 /// Regex for variable references in template strings: `{{KEY}}` where KEY is
 /// uppercase letters, digits, and underscores.
 pub const VAR_REF_PATTERN: &str = r"\{\{([A-Z][A-Z0-9_]*)\}\}";
@@ -221,6 +226,12 @@ pub struct FieldSchema {
     pub values: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    /// Compiled `decider` block, with every default resolved. Skipped when
+    /// unset, so a template that declares none compiles byte for byte as it
+    /// did before the block existed and keeps its `template_hash`. See
+    /// `src/template/decider.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decider: Option<FieldDecider>,
 }
 
 /// A gate declaration in a compiled template state.
@@ -923,6 +934,18 @@ fn is_capture_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// True when a `when` value names `answer`: a string equal to it, or a
+/// boolean or number whose text equals it. Used by the decider floor and the
+/// escape-routing check, which both err toward matching.
+fn when_value_matches_answer(value: &serde_json::Value, answer: &str) -> bool {
+    match value {
+        serde_json::Value::String(s) => s == answer,
+        serde_json::Value::Bool(b) => b.to_string() == answer,
+        serde_json::Value::Number(n) => n.to_string() == answer,
+        _ => false,
+    }
+}
+
 impl CompiledTemplate {
     /// Every `capture_stdout_as` name in the template, mapped to the state
     /// that delivers it.
@@ -1326,6 +1349,10 @@ impl CompiledTemplate {
                 }
             }
 
+            // Decider declarations (E-DECIDER-*), ahead of evidence routing
+            // so the escape-routed case gets its own code.
+            self.validate_deciders(state_name, state, &captures)?;
+
             // Validate evidence routing rules on transitions (D3 included).
             self.validate_evidence_routing(state_name, state, &captures)?;
 
@@ -1571,6 +1598,470 @@ impl CompiledTemplate {
         // flat agent-evidence key). Same convention as W1-W5.
         for warning in self.collect_when_clause_warnings() {
             eprintln!("warning: {}", warning);
+        }
+
+        Ok(())
+    }
+
+    /// Every transition out of `state` that an `auto` answer `answer` for
+    /// `field` is forbidden to take, with the reason.
+    ///
+    /// This is the floor from docs/designs/DESIGN-jev-decision-offload.md: an
+    /// answer in `auto` may never route to a terminal state, to a state whose
+    /// `default_action` requires confirmation, or along a `when` clause that
+    /// also tests a `gates.*` key. It considers every transition whose `when`
+    /// tests `field` directly, and matches the answer generously: a `when`
+    /// value that is a string, a boolean, or a number counts when its text
+    /// equals `answer`, so `"true"` and `true` both match a boolean answer
+    /// `"true"`. Over-matching is the safe direction -- a template can't dodge
+    /// the floor by spelling a value differently.
+    ///
+    /// Pure: no I/O, and nothing about the declaration's modes is consulted, so
+    /// a caller can ask about any answer. An unknown state yields no
+    /// violations. Routes that reach the field only through `evidence.*` or
+    /// `vars.*` keys aren't visible here; the runtime checks the transition it
+    /// actually matched with [`CompiledTemplate::transition_floor_violations`].
+    pub fn floor_violations(&self, state: &str, field: &str, answer: &str) -> Vec<FloorViolation> {
+        let Some(st) = self.states.get(state) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (index, transition) in st.transitions.iter().enumerate() {
+            let tests_answer = transition
+                .when
+                .as_ref()
+                .and_then(|w| w.get(field))
+                .is_some_and(|v| when_value_matches_answer(v, answer));
+            if !tests_answer {
+                continue;
+            }
+            for kind in self.transition_floor_violations(transition) {
+                out.push(FloorViolation {
+                    transition_index: index,
+                    target: transition.target.clone(),
+                    kind,
+                });
+            }
+        }
+        out
+    }
+
+    /// The floor rules `transition` breaks, whatever its `when` tests.
+    ///
+    /// This is the per-transition half of [`CompiledTemplate::floor_violations`],
+    /// public so the engine can recheck the one transition an answer actually
+    /// matched, including routes the compiler couldn't attribute to a field.
+    /// Pure: no I/O. A target that isn't a declared state breaks no rule here
+    /// (validation has already refused it).
+    pub fn transition_floor_violations(&self, transition: &Transition) -> Vec<FloorViolationKind> {
+        let mut out = Vec::new();
+        if let Some(target) = self.states.get(&transition.target) {
+            if target.terminal {
+                out.push(FloorViolationKind::TerminalTarget);
+            }
+            if target
+                .default_action
+                .as_ref()
+                .is_some_and(|a| a.requires_confirmation)
+            {
+                out.push(FloorViolationKind::ConfirmationRequired);
+            }
+        }
+        if let Some(when) = &transition.when {
+            let gates_prefix = format!("{}.", GATES_EVIDENCE_NAMESPACE);
+            for key in when.keys() {
+                if key.starts_with(&gates_prefix) {
+                    out.push(FloorViolationKind::GateConditioned {
+                        gate_key: key.clone(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Validate every `decider` block on one state (`E-DECIDER-*`).
+    ///
+    /// Runs ahead of evidence routing, so a `when` clause that routes on the
+    /// escape value is reported as `E-DECIDER-ESCAPE-ROUTED` rather than as an
+    /// unknown enum value. Runs whatever `strict` is: `--allow-legacy-gates`
+    /// relaxes gate routing only, never these rules or the floor.
+    fn validate_deciders(
+        &self,
+        state_name: &str,
+        state: &TemplateState,
+        captures: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let Some(accepts) = &state.accepts else {
+            return Ok(());
+        };
+        let declared: Vec<(&String, &FieldSchema, &FieldDecider)> = accepts
+            .iter()
+            .filter_map(|(name, schema)| schema.decider.as_ref().map(|d| (name, schema, d)))
+            .collect();
+        if declared.is_empty() {
+            return Ok(());
+        }
+
+        // Context keys a gate anywhere in the template names. A declaration's
+        // context input must be one of them: the compiler can't see what a
+        // default_action writes, so a key some gate checks for is the half of
+        // "a key the template writes or gates on" it can verify.
+        let gated_context_keys: std::collections::BTreeSet<&str> = self
+            .states
+            .values()
+            .flat_map(|s| s.gates.values())
+            .filter(|g| {
+                g.gate_type == GATE_TYPE_CONTEXT_EXISTS || g.gate_type == GATE_TYPE_CONTEXT_MATCHES
+            })
+            .map(|g| g.key.as_str())
+            .collect();
+
+        for (field_name, schema, decider) in &declared {
+            let at =
+                |code: &str| format!("{}: state {:?} field {:?}", code, state_name, field_name);
+
+            // E-DECIDER-FIELD-TYPE
+            let is_boolean = match schema.field_type.as_str() {
+                "enum" => false,
+                "boolean" => true,
+                other => {
+                    return Err(format!(
+                        "{}: a decider block is only allowed on enum and boolean fields, \
+                         not on a {} field\n  \
+                         remedy: remove the decider block, or make the field an enum or boolean",
+                        at("E-DECIDER-FIELD-TYPE"),
+                        other
+                    ));
+                }
+            };
+
+            // E-DECIDER-QUESTION
+            if schema.description.trim().is_empty() {
+                return Err(format!(
+                    "{}: a declared field needs a description; it is the question the \
+                     decider answers\n  \
+                     remedy: add a description to the field",
+                    at("E-DECIDER-QUESTION")
+                ));
+            }
+
+            let expected: Vec<String> = if is_boolean {
+                vec!["true".to_string(), "false".to_string()]
+            } else {
+                schema.values.clone()
+            };
+
+            // E-DECIDER-ESCAPE
+            match (&decider.escape, is_boolean) {
+                (Some(_), true) => {
+                    return Err(format!(
+                        "{}: a boolean field takes no escape; an answer that meets neither \
+                         threshold is already treated as the escape\n  \
+                         remedy: remove the escape key",
+                        at("E-DECIDER-ESCAPE")
+                    ));
+                }
+                (None, false) => {
+                    return Err(format!(
+                        "{}: an enum field needs an escape, the value the decider gives when \
+                         the question can't be judged from its inputs\n  \
+                         remedy: add `escape: {{value: <name>, description: <text>}}`, with a \
+                         value that isn't in values",
+                        at("E-DECIDER-ESCAPE")
+                    ));
+                }
+                (Some(escape), false) => {
+                    if escape.value.trim().is_empty() {
+                        return Err(format!(
+                            "{}: the escape value must not be empty\n  \
+                             remedy: name the escape value",
+                            at("E-DECIDER-ESCAPE")
+                        ));
+                    }
+                    if escape.description.trim().is_empty() {
+                        return Err(format!(
+                            "{} value {:?}: the escape needs a description\n  \
+                             remedy: say when the decider should answer with the escape",
+                            at("E-DECIDER-ESCAPE"),
+                            escape.value
+                        ));
+                    }
+                    if expected.contains(&escape.value) {
+                        return Err(format!(
+                            "{} value {:?}: the escape value is also in values; it must not be \
+                             a value evidence can carry\n  \
+                             remedy: rename the escape, or remove it from values",
+                            at("E-DECIDER-ESCAPE"),
+                            escape.value
+                        ));
+                    }
+                }
+                (None, true) => {}
+            }
+
+            // E-DECIDER-ANSWERS
+            let missing: Vec<&String> = expected
+                .iter()
+                .filter(|v| !decider.answers.contains_key(*v))
+                .collect();
+            let extra: Vec<&String> = decider
+                .answers
+                .keys()
+                .filter(|k| !expected.contains(k))
+                .collect();
+            if !missing.is_empty() || !extra.is_empty() {
+                let mut parts = Vec::new();
+                if !missing.is_empty() {
+                    parts.push(format!("missing answers for {:?}", missing));
+                }
+                if !extra.is_empty() {
+                    parts.push(format!("answers for {:?}, which are not values", extra));
+                }
+                let set = if is_boolean {
+                    "true and false".to_string()
+                } else {
+                    format!("{:?}", expected)
+                };
+                return Err(format!(
+                    "{}: {}; answers must have exactly one entry per value ({})\n  \
+                     remedy: make the answers keys match the field's values",
+                    at("E-DECIDER-ANSWERS"),
+                    parts.join(" and "),
+                    set
+                ));
+            }
+
+            for value in &expected {
+                let answer = &decider.answers[value];
+                // E-DECIDER-VALUE-DESCRIPTION
+                if answer.description.trim().is_empty() {
+                    return Err(format!(
+                        "{} value {:?}: the answer needs a description\n  \
+                         remedy: say what this value means, for the agent and the decider",
+                        at("E-DECIDER-VALUE-DESCRIPTION"),
+                        value
+                    ));
+                }
+                // E-DECIDER-THRESHOLD
+                let t = answer.threshold;
+                if !t.is_finite() || !(MIN_THRESHOLD..=MAX_THRESHOLD).contains(&t) {
+                    return Err(format!(
+                        "{} value {:?}: threshold {} is outside [{:?}, {:?}]\n  \
+                         remedy: use a threshold from {:?} to {:?}, or omit it for {:?}",
+                        at("E-DECIDER-THRESHOLD"),
+                        value,
+                        t,
+                        MIN_THRESHOLD,
+                        MAX_THRESHOLD,
+                        MIN_THRESHOLD,
+                        MAX_THRESHOLD,
+                        super::decider::DEFAULT_THRESHOLD
+                    ));
+                }
+            }
+
+            // E-DECIDER-INPUT
+            if decider.inputs.is_empty() {
+                return Err(format!(
+                    "{}: a declaration needs at least one input\n  \
+                     remedy: add an input naming a context key or a variable",
+                    at("E-DECIDER-INPUT")
+                ));
+            }
+            let mut labels: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            for input in &decider.inputs {
+                if input.label.trim().is_empty() {
+                    return Err(format!(
+                        "{}: every input needs a label\n  remedy: add a label",
+                        at("E-DECIDER-INPUT")
+                    ));
+                }
+                if !labels.insert(input.label.as_str()) {
+                    return Err(format!(
+                        "{}: label {:?} is used by more than one input\n  \
+                         remedy: give each input its own label",
+                        at("E-DECIDER-INPUT"),
+                        input.label
+                    ));
+                }
+                if input.max_bytes == 0 {
+                    return Err(format!(
+                        "{}: input {:?} has max_bytes 0\n  \
+                         remedy: set max_bytes above 0, or omit it for {}",
+                        at("E-DECIDER-INPUT"),
+                        input.label,
+                        super::decider::DEFAULT_MAX_BYTES
+                    ));
+                }
+                match &input.source {
+                    DeciderInputSource::Var(name) => {
+                        if !self.variables.contains_key(name) && !captures.contains_key(name) {
+                            let (why, remedy) = if RUNTIME_VARIABLE_NAMES.contains(&name.as_str()) {
+                                (
+                                    "is a runtime name; an input can't read one",
+                                    "name a declared variable or a capture_stdout_as name instead",
+                                )
+                            } else {
+                                (
+                                    "is neither a declared variable nor a capture_stdout_as name",
+                                    "declare it in the variables block, or name a capture",
+                                )
+                            };
+                            return Err(format!(
+                                "{}: input {:?} names var {:?}, which {}\n  remedy: {}",
+                                at("E-DECIDER-INPUT"),
+                                input.label,
+                                name,
+                                why,
+                                remedy
+                            ));
+                        }
+                    }
+                    DeciderInputSource::Context(key) => {
+                        // Unlike a gate key, a decider input's key may not
+                        // reference a runtime name: the block reads only
+                        // declared variables, captures, and the context store,
+                        // so nothing about the session's location or identity
+                        // can shape what is sent.
+                        for ref_name in extract_refs(key) {
+                            if !self.variables.contains_key(&ref_name)
+                                && !captures.contains_key(&ref_name)
+                            {
+                                let why = if RUNTIME_VARIABLE_NAMES.contains(&ref_name.as_str()) {
+                                    "a runtime name, which an input can't use"
+                                } else {
+                                    "not declared in the template's variables block"
+                                };
+                                return Err(format!(
+                                    "{}: input {:?} context key {:?} references '{{{{{}}}}}', \
+                                     which is {}\n  \
+                                     remedy: reference a declared variable or a capture, or fix \
+                                     the reference",
+                                    at("E-DECIDER-INPUT"),
+                                    input.label,
+                                    key,
+                                    ref_name,
+                                    why
+                                ));
+                            }
+                        }
+                        // A reference is stood in for by one literal character,
+                        // as for a context-matches pattern: the key's own shape
+                        // is checked now, the substituted value at run time.
+                        let stand_in = pattern_with_refs_as_literals(key);
+                        if let Some(reason) =
+                            crate::session::validate::unusable_context_key_reason(&stand_in)
+                        {
+                            return Err(format!(
+                                "{}: input {:?}: {}",
+                                at("E-DECIDER-INPUT"),
+                                input.label,
+                                reason
+                            ));
+                        }
+                        if !gated_context_keys.contains(key.as_str()) {
+                            return Err(format!(
+                                "{}: input {:?} names context key {:?}, which no context-exists \
+                                 or context-matches gate in the template checks\n  \
+                                 remedy: gate on the key in the state that produces it, so a \
+                                 run can't reach this state without it",
+                                at("E-DECIDER-INPUT"),
+                                input.label,
+                                key
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // E-DECIDER-INPUT across fields: one consultation carries every
+        // declared field on the state, so a label must mean one thing.
+        let mut by_label: BTreeMap<&str, (&String, &super::decider::DeciderInput)> =
+            BTreeMap::new();
+        for (field_name, _, decider) in &declared {
+            for input in &decider.inputs {
+                if let Some((other_field, other)) = by_label.get(input.label.as_str()) {
+                    if other.source != input.source || other.max_bytes != input.max_bytes {
+                        return Err(format!(
+                            "E-DECIDER-INPUT: state {:?} field {:?}: label {:?} is also used by \
+                             field {:?} with a different source or max_bytes\n  \
+                             remedy: use the same source and max_bytes for a shared label, or \
+                             rename one",
+                            state_name, field_name, input.label, other_field
+                        ));
+                    }
+                } else {
+                    by_label.insert(input.label.as_str(), (field_name, input));
+                }
+            }
+        }
+
+        // E-DECIDER-SIBLING-REQUIRED
+        for (sibling, schema) in accepts {
+            if schema.required && schema.decider.is_none() {
+                return Err(format!(
+                    "E-DECIDER-SIBLING-REQUIRED: state {:?} field {:?}: the state declares a \
+                     decider on {:?}, but {:?} is also required and has no decider, so a \
+                     decider answer could never be complete\n  \
+                     remedy: declare a decider on {:?}, or make it optional",
+                    state_name, sibling, declared[0].0, sibling, sibling
+                ));
+            }
+        }
+
+        for (field_name, _, decider) in &declared {
+            // E-DECIDER-ESCAPE-ROUTED
+            if let Some(escape) = &decider.escape {
+                for transition in &state.transitions {
+                    let routed = transition
+                        .when
+                        .as_ref()
+                        .and_then(|w| w.get(*field_name))
+                        .is_some_and(|v| when_value_matches_answer(v, &escape.value));
+                    if routed {
+                        return Err(format!(
+                            "E-DECIDER-ESCAPE-ROUTED: state {:?} field {:?} value {:?}: the \
+                             transition to {:?} routes on the escape value, which evidence can \
+                             never carry\n  \
+                             remedy: remove the transition, or route on a value in values",
+                            state_name, field_name, escape.value, transition.target
+                        ));
+                    }
+                }
+            }
+
+            // E-DECIDER-FLOOR
+            for (value, answer) in &decider.answers {
+                if answer.mode != DeciderMode::Auto {
+                    continue;
+                }
+                let violations = self.floor_violations(state_name, field_name, value);
+                if let Some(first) = violations.first() {
+                    let all: Vec<String> = violations
+                        .iter()
+                        .map(|v| format!("transition to {:?}: {}", v.target, v.kind.describe()))
+                        .collect();
+                    return Err(format!(
+                        "E-DECIDER-FLOOR: state {:?} field {:?} value {:?}: mode auto is not \
+                         allowed on the transition to {:?}: {}{}\n  \
+                         remedy: set this value's mode to shadow or never; an auto answer can't \
+                         route to a terminal state, to a state whose default_action requires \
+                         confirmation, or along a when clause that tests a gate",
+                        state_name,
+                        field_name,
+                        value,
+                        first.target,
+                        first.kind.describe(),
+                        if all.len() > 1 {
+                            format!(" (all violations: {})", all.join("; "))
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -2665,6 +3156,7 @@ mod tests {
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -2829,6 +3321,7 @@ mod tests {
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -2855,6 +3348,7 @@ mod tests {
                 required: true,
                 values: vec!["proceed".to_string(), "escalate".to_string()],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -2881,6 +3375,7 @@ mod tests {
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -2900,6 +3395,7 @@ mod tests {
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -2941,6 +3437,7 @@ mod tests {
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         accepts.insert(
@@ -2950,6 +3447,7 @@ mod tests {
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -3006,6 +3504,7 @@ mod tests {
                 required: true,
                 values: vec!["proceed".to_string()],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -3062,6 +3561,7 @@ mod tests {
                 required: true,
                 values: vec!["proceed".to_string(), "escalate".to_string()],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -3116,6 +3616,7 @@ mod tests {
                 required: true,
                 values: vec!["proceed".to_string()],
                 description: String::new(),
+                decider: None,
             },
         );
         accepts.insert(
@@ -3125,6 +3626,7 @@ mod tests {
                 required: true,
                 values: vec!["high".to_string(), "low".to_string()],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -3164,6 +3666,7 @@ mod tests {
                 required: true,
                 values: vec!["proceed".to_string(), "escalate".to_string()],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -3197,6 +3700,7 @@ mod tests {
                 required: false,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -4543,6 +5047,7 @@ command: "./check.sh"
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -4837,6 +5342,7 @@ command: "./check.sh"
                 required: false,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -5144,6 +5650,7 @@ command: "./check.sh"
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -5164,6 +5671,7 @@ command: "./check.sh"
                 required: false,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -5264,6 +5772,7 @@ command: "./check.sh"
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         let mut gates: BTreeMap<String, Gate> = BTreeMap::new();
@@ -5447,6 +5956,7 @@ command: "./check.sh"
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         let mut gates2: BTreeMap<String, Gate> = BTreeMap::new();
@@ -5744,6 +6254,7 @@ command: "./check.sh"
                 required: false,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         let failed = TemplateState {
@@ -5942,6 +6453,7 @@ command: "./check.sh"
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);
@@ -6007,6 +6519,7 @@ command: "./check.sh"
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         state.accepts = Some(accepts);

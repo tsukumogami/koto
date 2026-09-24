@@ -116,6 +116,7 @@ fn append_child_dispatched_event(
         state: "request_store.dispatch".into(),
         fields,
         submitter_cwd: None,
+        source: None,
     };
     append_event(coord_state_file, &payload, timestamp).unwrap();
 }
@@ -409,6 +410,7 @@ fn recovery_fires_when_requester_idle_past_timeout() {
         state: "request_store.wake".into(),
         fields,
         submitter_cwd: None,
+        source: None,
     };
     append_event(&coord_path, &payload, &woken_at_str).unwrap();
 
@@ -462,6 +464,7 @@ fn recovery_does_not_fire_when_requester_made_progress() {
         state: "request_store.wake".into(),
         fields,
         submitter_cwd: None,
+        source: None,
     };
     append_event(&coord_path, &payload, &woken_at_str).unwrap();
 
@@ -509,6 +512,7 @@ fn recovery_does_not_fire_within_timeout() {
         state: "request_store.wake".into(),
         fields,
         submitter_cwd: None,
+        source: None,
     };
     append_event(&coord_path, &payload, &woken_at_str).unwrap();
     // Requester's log mtime pinned older than woken_at to isolate the
@@ -692,6 +696,7 @@ fn requester_resumed_then_idle_does_not_trigger_wake_recovery() {
         state: "request_store.wake".into(),
         fields,
         submitter_cwd: None,
+        source: None,
     };
     append_event(&coord_path, &payload, &woken_at_str).unwrap();
 

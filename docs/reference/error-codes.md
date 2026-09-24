@@ -367,6 +367,109 @@ warning: W-SKIP-GATE-ABSENT: state "check": skip_if key "gates.ci.exit_code" ref
 
 Fix: add the referenced gate name to the state's `gates` block, or correct the `skip_if` key.
 
+#### decider diagnostic codes
+
+A `decider` block on an `accepts` field has these compile-time errors. Each fails compilation, and each message names the state, the field, and the value where one applies. None of them is relaxed by `--allow-legacy-gates`. A misspelled key inside the block isn't one of these codes: it fails as invalid YAML, and the message names the key (for example ``unknown field `thresold` ``).
+
+**E-DECIDER-FIELD-TYPE (error)**: the block sits on a `string`, `number`, or `tasks` field. Only `enum` and `boolean` fields can be declared.
+
+```
+E-DECIDER-FIELD-TYPE: state "review" field "verdict": a decider block is only allowed on enum and boolean fields, not on a string field
+  remedy: remove the decider block, or make the field an enum or boolean
+```
+
+Fix: remove the block, or change the field's type.
+
+**E-DECIDER-QUESTION (error)**: a declared field has an empty `description`. The description is the question the decider answers.
+
+```
+E-DECIDER-QUESTION: state "review" field "verdict": a declared field needs a description; it is the question the decider answers
+  remedy: add a description to the field
+```
+
+Fix: give the field a `description`.
+
+**E-DECIDER-ANSWERS (error)**: the `answers` keys differ from the field's `values`, or from `true` and `false` on a boolean field, or a value has two entries. The message names the missing or extra key.
+
+```
+E-DECIDER-ANSWERS: state "review" field "verdict": missing answers for ["exit"]; answers must have exactly one entry per value (["proceed", "exit"])
+  remedy: make the answers keys match the field's values
+```
+
+Fix: write exactly one `answers` entry per value.
+
+**E-DECIDER-VALUE-DESCRIPTION (error)**: an answer has an empty or missing `description`.
+
+```
+E-DECIDER-VALUE-DESCRIPTION: state "review" field "verdict" value "exit": the answer needs a description
+  remedy: say what this value means, for the agent and the decider
+```
+
+Fix: describe the value.
+
+**E-DECIDER-ESCAPE (error)**: on an enum field, the escape is missing, its `value` is empty, its `description` is missing, or its value is also in `values`. On a boolean field, any `escape` key is refused.
+
+```
+E-DECIDER-ESCAPE: state "review" field "verdict" value "exit": the escape value is also in values; it must not be a value evidence can carry
+  remedy: rename the escape, or remove it from values
+```
+
+Fix: give an enum field an escape `{value, description}` whose value isn't in `values`, and remove `escape` from a boolean field.
+
+**E-DECIDER-ESCAPE-ROUTED (error)**: a transition's `when` clause tests the field at the escape value. Evidence can never carry the escape, so the route could never fire. This code is reported instead of the general "not in allowed values" routing error.
+
+```
+E-DECIDER-ESCAPE-ROUTED: state "review" field "verdict" value "unclear": the transition to "stopped" routes on the escape value, which evidence can never carry
+  remedy: remove the transition, or route on a value in values
+```
+
+Fix: remove the transition, or route on one of `values`.
+
+**E-DECIDER-MODE (error)**: an answer's `mode` isn't one of `off`, `shadow`, `auto`, or `never`.
+
+```
+E-DECIDER-MODE: state "review" field "verdict" value "exit": unknown mode "sometimes"; a mode is one of off, shadow, auto, never
+  remedy: use one of those modes, or omit mode for shadow
+```
+
+Fix: use one of the four modes, or leave `mode` out.
+
+**E-DECIDER-THRESHOLD (error)**: an answer's `threshold` isn't a finite number from 0.5 to 1.0 inclusive.
+
+```
+E-DECIDER-THRESHOLD: state "review" field "verdict" value "proceed": threshold 1.1 is outside [0.5, 1.0]
+  remedy: use a threshold from 0.5 to 1.0, or omit it for 0.9
+```
+
+Fix: pick a threshold in range, or leave it out.
+
+**E-DECIDER-INPUT (error)**: an input is wrong. The declaration has no inputs, or an input names both or neither of `context` and `var`, or has an empty label, reuses a label within the field, or sets `max_bytes: 0`. A `var` that's neither a declared variable nor a `capture_stdout_as` name is also refused, including runtime names like `SESSION_DIR`. So is a `context` key that isn't a usable key, references an undeclared variable or a runtime name, or isn't checked by any `context-exists` or `context-matches` gate in the template. The last case is two declared fields on one state sharing a label with a different source or budget.
+
+```
+E-DECIDER-INPUT: state "review" field "verdict": input "outline_item" names context key "notes.md", which no context-exists or context-matches gate in the template checks
+  remedy: gate on the key in the state that produces it, so a run can't reach this state without it
+```
+
+Fix: follow the remedy line. For a context key, gate on it with `context-exists` in the state whose `default_action` writes it.
+
+**E-DECIDER-SIBLING-REQUIRED (error)**: the state has a declared field and another `required: true` field with no `decider` block.
+
+```
+E-DECIDER-SIBLING-REQUIRED: state "review" field "rationale": the state declares a decider on "verdict", but "rationale" is also required and has no decider, so a decider answer could never be complete
+  remedy: declare a decider on "rationale", or make it optional
+```
+
+Fix: make the sibling optional, or declare it too.
+
+**E-DECIDER-FLOOR (error)**: an answer in `auto` can take a transition that targets a terminal state, targets a state whose `default_action` has `requires_confirmation: true`, or has a `when` clause that also tests a `gates.*` key. Every transition whose `when` tests the field at that value is checked, and on a boolean field `"true"` and `true` count alike. The message names the target state and the rule, and the gate key in the gate case. Only `auto` answers are checked.
+
+```
+E-DECIDER-FLOOR: state "review" field "verdict" value "proceed": mode auto is not allowed on the transition to "done": the target is a terminal state
+  remedy: set this value's mode to shadow or never; an auto answer can't route to a terminal state, to a state whose default_action requires confirmation, or along a when clause that tests a gate
+```
+
+Fix: set the answer's mode to `shadow` or `never`. Nothing else in the template suppresses this error.
+
 ---
 
 ### template validate

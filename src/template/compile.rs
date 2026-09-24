@@ -4,6 +4,10 @@ use std::path::Path;
 use anyhow::{anyhow, Context};
 use serde::Deserialize;
 
+use super::decider::{
+    DeciderAnswer, DeciderEscape, DeciderInput, DeciderInputSource, DeciderMode, FieldDecider,
+    DEFAULT_MAX_BYTES, DEFAULT_THRESHOLD,
+};
 use super::types::{
     default_failure_policy, ActionDecl, CompiledTemplate, FailurePolicy, FieldSchema, Gate,
     MaterializeChildrenSpec, PollingConfig, TemplateState, Transition, VariableDecl,
@@ -212,6 +216,228 @@ struct SourceFieldSchema {
     values: Vec<String>,
     #[serde(default)]
     description: String,
+    /// Optional decider declaration. `SourceFieldSchema` itself stays lenient
+    /// (no `deny_unknown_fields`), which is what lets koto v0.12.2 drop this
+    /// whole block silently; the structs inside the block are strict, so a
+    /// typo in it fails on a current koto.
+    #[serde(default)]
+    decider: Option<SourceDecider>,
+}
+
+/// A field-level `decider` block in source YAML.
+///
+/// See docs/designs/DESIGN-jev-decision-offload.md, Decision 1. Modes are
+/// read as strings and input sources as two optional keys, so that an unknown
+/// mode or an input naming both or neither source reaches lowering and fails
+/// with its own `E-DECIDER-*` code rather than a generic parse error.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceDecider {
+    #[serde(default)]
+    answers: SourceDeciderAnswers,
+    /// `Some` whenever the key is written at all, even as `escape: ~`, so a
+    /// boolean field can't carry an escape key that lowering fails to see.
+    #[serde(default, deserialize_with = "present_as_some")]
+    escape: Option<SourceDeciderEscape>,
+    #[serde(default)]
+    inputs: Vec<SourceDeciderInput>,
+}
+
+/// One entry of a `decider.answers` map.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SourceDeciderAnswer {
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    threshold: Option<f64>,
+}
+
+/// `decider.escape` in source YAML.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SourceDeciderEscape {
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// One entry of `decider.inputs` in source YAML.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceDeciderInput {
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    var: Option<String>,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    max_bytes: Option<u32>,
+}
+
+/// The `answers` map, kept as written (in order, duplicates included) so that
+/// lowering can report a duplicate rather than serde silently keeping one.
+///
+/// Keys may be written as YAML booleans: a boolean field's answers are
+/// naturally spelled `true:` and `false:`, which YAML parses as booleans, not
+/// strings.
+#[derive(Debug, Default)]
+struct SourceDeciderAnswers(Vec<(String, SourceDeciderAnswer)>);
+
+impl<'de> Deserialize<'de> for SourceDeciderAnswers {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct AnswersVisitor;
+        impl<'de> serde::de::Visitor<'de> for AnswersVisitor {
+            type Value = SourceDeciderAnswers;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a map from each value to its answer")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(AnswerKey(key)) = map.next_key()? {
+                    let answer: SourceDeciderAnswer = map.next_value()?;
+                    entries.push((key, answer));
+                }
+                Ok(SourceDeciderAnswers(entries))
+            }
+        }
+        d.deserialize_map(AnswersVisitor)
+    }
+}
+
+/// An `answers` key: a string, or a YAML boolean or integer rendered as the
+/// string evidence would carry.
+struct AnswerKey(String);
+
+impl<'de> Deserialize<'de> for AnswerKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct KeyVisitor;
+        impl serde::de::Visitor<'_> for KeyVisitor {
+            type Value = AnswerKey;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a value name")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<AnswerKey, E> {
+                Ok(AnswerKey(v.to_string()))
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<AnswerKey, E> {
+                Ok(AnswerKey(v.to_string()))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<AnswerKey, E> {
+                Ok(AnswerKey(v.to_string()))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<AnswerKey, E> {
+                Ok(AnswerKey(v.to_string()))
+            }
+        }
+        d.deserialize_any(KeyVisitor)
+    }
+}
+
+/// Deserialize a present key as `Some`, treating an explicit null as the
+/// type's default rather than as absence. Paired with `#[serde(default)]`,
+/// only a missing key yields `None`.
+fn present_as_some<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Some(Option::<T>::deserialize(d)?.unwrap_or_default()))
+}
+
+/// Lower a source `decider` block, resolving every default.
+///
+/// Only the two rules the compiled types can't represent fail here: an unknown
+/// mode string (`E-DECIDER-MODE`) and an input naming both or neither of
+/// `context` and `var` (`E-DECIDER-INPUT`), plus a duplicated answer key
+/// (`E-DECIDER-ANSWERS`), which a map can't hold. Everything else is checked
+/// on the compiled form by `CompiledTemplate::validate`, so a compiled
+/// template loaded from the cache gets the same checks.
+fn lower_decider(
+    state_name: &str,
+    field_name: &str,
+    source: &SourceDecider,
+) -> anyhow::Result<FieldDecider> {
+    let mut answers: BTreeMap<String, DeciderAnswer> = BTreeMap::new();
+    for (value, sa) in &source.answers.0 {
+        let mode = match &sa.mode {
+            None => DeciderMode::DEFAULT,
+            Some(m) => DeciderMode::parse(m).ok_or_else(|| {
+                anyhow!(
+                    "validation error: E-DECIDER-MODE: state {:?} field {:?} value {:?}: \
+                     unknown mode {:?}; a mode is one of {}\n  \
+                     remedy: use one of those modes, or omit mode for {}",
+                    state_name,
+                    field_name,
+                    value,
+                    m,
+                    DeciderMode::NAMES.join(", "),
+                    DeciderMode::DEFAULT
+                )
+            })?,
+        };
+        let lowered = DeciderAnswer {
+            description: sa.description.clone(),
+            mode,
+            threshold: sa.threshold.unwrap_or(DEFAULT_THRESHOLD),
+        };
+        if answers.insert(value.clone(), lowered).is_some() {
+            return Err(anyhow!(
+                "validation error: E-DECIDER-ANSWERS: state {:?} field {:?} value {:?}: \
+                 the value has more than one entry under answers\n  \
+                 remedy: keep one entry per value",
+                state_name,
+                field_name,
+                value
+            ));
+        }
+    }
+
+    let mut inputs = Vec::with_capacity(source.inputs.len());
+    for (i, si) in source.inputs.iter().enumerate() {
+        let src = match (&si.context, &si.var) {
+            (Some(key), None) => DeciderInputSource::Context(key.clone()),
+            (None, Some(name)) => DeciderInputSource::Var(name.clone()),
+            (Some(_), Some(_)) | (None, None) => {
+                let which = if si.context.is_some() {
+                    "names both context and var"
+                } else {
+                    "names neither context nor var"
+                };
+                return Err(anyhow!(
+                    "validation error: E-DECIDER-INPUT: state {:?} field {:?}: input {} \
+                     (label {:?}) {}; each input names exactly one source\n  \
+                     remedy: write either `context: <key>` or `var: <NAME>`",
+                    state_name,
+                    field_name,
+                    i + 1,
+                    si.label,
+                    which
+                ));
+            }
+        };
+        inputs.push(DeciderInput {
+            source: src,
+            label: si.label.clone(),
+            max_bytes: si.max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
+        });
+    }
+
+    Ok(FieldDecider {
+        answers,
+        escape: source.escape.as_ref().map(|e| DeciderEscape {
+            value: e.value.clone(),
+            description: e.description.clone(),
+        }),
+        inputs,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -285,8 +511,10 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
         anyhow!("invalid YAML: template must begin with YAML front-matter delimited by '---'")
     })?;
 
-    // The parser's own message is kept: it is what names an unknown or
-    // mistyped key (for example `variables.X: unknown field ...`).
+    // The parse error is part of the message, not only the error chain: the
+    // CLI prints the top-level message, and a key misspelled inside a strict
+    // block (say `thresold:` in a decider answer, or `valuez:` in a variable
+    // declaration) is only named down there.
     let fm: SourceFrontmatter = serde_yaml_ng::from_str(frontmatter_str)
         .map_err(|e| anyhow!("invalid YAML: failed to parse front-matter: {}", e))?;
 
@@ -336,23 +564,25 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
             if source_state.accepts.is_empty() {
                 None
             } else {
-                Some(
-                    source_state
-                        .accepts
-                        .iter()
-                        .map(|(k, v)| {
-                            (
-                                k.clone(),
-                                FieldSchema {
-                                    field_type: v.field_type.clone(),
-                                    required: v.required,
-                                    values: v.values.clone(),
-                                    description: v.description.clone(),
-                                },
-                            )
-                        })
-                        .collect(),
-                )
+                let mut fields = BTreeMap::new();
+                for (k, v) in &source_state.accepts {
+                    let decider = v
+                        .decider
+                        .as_ref()
+                        .map(|d| lower_decider(state_name, k, d))
+                        .transpose()?;
+                    fields.insert(
+                        k.clone(),
+                        FieldSchema {
+                            field_type: v.field_type.clone(),
+                            required: v.required,
+                            values: v.values.clone(),
+                            description: v.description.clone(),
+                            decider,
+                        },
+                    );
+                }
+                Some(fields)
             };
 
         // Transform source default_action to compiled ActionDecl.
@@ -3203,5 +3433,30 @@ Done.
             );
             compile_src(&src, true).expect("the overridable arm fires on its default");
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Decider declarations: a template that declares none is untouched.
+    // ---------------------------------------------------------------------
+
+    /// `template_hash` of `tests/fixtures/template-hash/no-decider.md`,
+    /// captured by compiling it with the koto on main before decider blocks
+    /// existed. The fixture has described enum, boolean, and string fields,
+    /// gates, a capture, and variables, so any change to how an undeclared
+    /// field compiles moves this hash.
+    const NO_DECIDER_TEMPLATE_HASH: &str =
+        "4c831681fe2c9ee56ed6bce3568f08b2e1c756ad080deb5f7b5e63378b1224d6";
+
+    #[test]
+    fn template_without_decider_keeps_its_template_hash() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/template-hash/no-decider.md");
+        let compiled = compile(&path, true).expect("fixture compiles");
+        let json = serde_json::to_string_pretty(&compiled).unwrap();
+        assert!(!json.contains("\"decider\""));
+        assert_eq!(
+            crate::cache::sha256_hex(json.as_bytes()),
+            NO_DECIDER_TEMPLATE_HASH
+        );
     }
 }

@@ -1064,6 +1064,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "assert_fs",
+ "attohttpc",
  "clap",
  "criterion",
  "crossterm",
@@ -1084,6 +1085,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "toml",
+ "url",
  "wait-timeout",
 ]
 

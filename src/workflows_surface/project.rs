@@ -516,6 +516,7 @@ mod tests {
                     state: "gather".to_string(),
                     fields,
                     submitter_cwd: None,
+                    source: None,
                 },
                 idempotency_hash: None,
             },

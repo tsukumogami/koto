@@ -420,6 +420,7 @@ mod tests {
             state: state.to_string(),
             fields,
             submitter_cwd: None,
+            source: None,
         };
         backend
             .append_event(id, &payload, "2026-01-01T00:01:00Z")

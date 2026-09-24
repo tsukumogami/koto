@@ -8,10 +8,12 @@ pub mod caps;
 #[cfg(unix)]
 pub mod claim;
 pub mod context_assign;
+pub mod decider;
 pub mod discovery;
 pub mod epoch;
 pub mod errors;
 pub mod evidence;
+pub mod jsonl_append;
 pub mod leg_pointer;
 pub mod name_grammar;
 pub mod path_resolution;

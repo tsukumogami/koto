@@ -321,6 +321,22 @@ pub trait SessionBackend: Send + Sync {
     /// Read all events from the state file.
     fn read_events(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)>;
 
+    /// # Stability: additive-only
+    ///
+    /// Read all events from the local copy of the state file, without any
+    /// remote sync first.
+    ///
+    /// For a backend with no remote half this is [`read_events`]. A
+    /// backend that pulls before reading (`CloudBackend`) overrides it to
+    /// read only the local file, so a caller holding a lock (the decider's
+    /// per-session `decider.lock`) never puts a network round trip inside
+    /// it.
+    ///
+    /// [`read_events`]: SessionBackend::read_events
+    fn read_events_local(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
+        self.read_events(id)
+    }
+
     /// # Stability: additive-only (Issue 19 / Decision 5)
     ///
     /// Not part of the Stage 1 frozen four; signature evolution is
@@ -540,6 +556,13 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.read_events(id),
             Backend::Cloud(b) => b.read_events(id),
+        }
+    }
+
+    fn read_events_local(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
+        match self {
+            Backend::Local(b) => b.read_events_local(id),
+            Backend::Cloud(b) => b.read_events_local(id),
         }
     }
 

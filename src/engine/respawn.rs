@@ -544,6 +544,7 @@ fn emit_respawn_event(
         state: "request_store.respawn".to_string(),
         fields,
         submitter_cwd: None,
+        source: None,
     };
     append_event(requester_state_file, &payload, &respawned_at).with_context(|| {
         format!(

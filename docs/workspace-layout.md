@@ -7,9 +7,9 @@ below when troubleshooting without risk of data loss, because every
 one of those entries is rebuildable from the authoritative session
 state (headers + event logs).
 
-Two trees are authoritative and rebuild from nothing:
-`~/.koto/sessions/` and `~/.koto/requests/`. Deleting either destroys
-history.
+Two trees and one file are authoritative and rebuild from nothing:
+`~/.koto/sessions/`, `~/.koto/requests/`, and
+`~/.koto/_decider_ledger.jsonl`. Deleting any of them destroys history.
 
 Cross-references: `docs/STABILITY.md` for the public crate stability
 contract; `docs/designs/current/DESIGN-request-store-converge.md` for the full
@@ -33,6 +33,7 @@ of authority for this document).
 ├── coordinators/                              # derived (request-store cursor state)
 │   └── <coord_id>/
 │       └── scan_cursor.toml
+├── _decider_ledger.jsonl                      # AUTHORITATIVE state (decider consultations and answers)
 ├── _terminal_index.jsonl                      # derived (request-store skip-list)
 └── _terminal_index.compact.lock               # derived (request-store compaction lease)
 ```
@@ -48,8 +49,9 @@ session recover` to see what is in there and `koto session recover
 --apply` to move it back into the session list.
 
 Request records under `~/.koto/requests/` are authoritative too and
-have no cleanup verb at all. The four derived files below are safe to
-delete.
+have no cleanup verb at all, and so is the decider ledger. The four
+derived files described further down are safe to delete; nothing else
+here is.
 
 ## Authoritative state: `~/.koto/requests/`
 
@@ -131,6 +133,55 @@ whose sequence gap the reader refuses — the record becomes unreadable
 rather than merely stale. Point `~/.koto/` at local storage.
 
 Both are documented limitations rather than silent gaps.
+
+## Authoritative state: `~/.koto/_decider_ledger.jsonl`
+
+When a user opts in to a decider, koto records each consultation, and
+each agent answer to a consultation it didn't apply, as one line in
+this file. It's the evidence a template author reads, through `koto
+decider report`, to decide whether an answer is reliable enough to let
+koto apply it on its own.
+
+Each line is a JSON object tagged by `kind`:
+
+- `consulted`: written the moment a consultation is recorded in the
+  session log. It carries everything the `decider_consulted` event
+  does (state, `visit_seq`, provider, model, `input_sha256`, outcome,
+  `error_class`, latency, `directive_bytes`, `endpoint_origin`, and
+  per-field declaration hash, modes, probabilities, winner,
+  confidence, threshold, `at_threshold`, and outcome).
+- `answered`: written when the agent submits evidence on a visit whose
+  consultation wasn't applied. It carries the submitted values of the
+  declared fields only.
+
+Both kinds also carry `v` (always 1), `at` (RFC 3339 UTC), `session`
+(the session name), and `session_id` (the session header's UUID, or
+`null` for a header without one). A consultation and its answer pair
+on `session_id` plus `visit_seq`; session names are reused across
+runs, so the name is never the join key. No line carries input
+content, the API key, a response body, or error text.
+
+Lines are capped at 4096 bytes and written with the same single
+`O_APPEND` write and fsync as the terminal index, so concurrent
+sessions never interleave. A `consulted` line over the cap is written
+without its probability maps and with `"trimmed": true`; one still
+over it is skipped with a warning.
+
+- **Derivability:** none. The session logs the records came from are
+  deleted when a session is cleaned up, and child sessions are always
+  cleaned up on their terminal tick. The ledger can't be rebuilt.
+- **Deletion:** nothing in koto deletes it. `koto session cleanup` and
+  `koto workspace prune` remove session directories only, so the
+  ledger outlives every session it describes. Deleting it by hand
+  throws away every consultation and answer recorded so far.
+- **Growth:** it isn't compacted or rotated in this version. It grows
+  by a few hundred bytes per consultation and only for users who opted
+  in.
+- **Permissions:** koto creates it mode 0600. An existing file's mode
+  is left alone.
+- **Failure:** a ledger that can't be written (read-only, or a
+  `~/.koto` that can't be created) costs one warning on stderr per
+  record. The `koto next` response and exit code don't change.
 
 ## Derived files introduced by the request-store
 
@@ -336,12 +387,13 @@ The supported flow is `koto workspace prune`. Manual deletion is a
 diagnostic shortcut for an operator investigating an unusual state —
 e.g., a coordinator stuck behind a stale lock that the prune verb
 should but hasn't cleared. The four derivability rules above keep
-manual deletion safe: every file rebuilds on the next tick.
+manual deletion of those four files safe: every one rebuilds on the
+next tick.
 
-The exceptions are `~/.koto/sessions/<session-id>/` and
-`~/.koto/requests/<request_id>/`: those directories are NOT derived
-and contain the authoritative state. Deleting either permanently
-destroys the history it holds.
+The exceptions are `~/.koto/sessions/<session-id>/`,
+`~/.koto/requests/<request_id>/`, and `~/.koto/_decider_ledger.jsonl`:
+they're NOT derived and hold the authoritative state. Deleting any of
+them permanently destroys the history it holds.
 
 ## Cross-references
 

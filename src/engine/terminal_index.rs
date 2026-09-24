@@ -11,9 +11,12 @@
 //!
 //! ## Atomicity
 //!
-//! Appends use `OpenOptions::append(true)` (sets POSIX `O_APPEND`) and
-//! `fsync` after each write. Under POSIX, writes ≤ `PIPE_BUF` (4 KiB on
-//! Linux) to a single file descriptor opened with `O_APPEND` are
+//! Appends go through
+//! [`append_bounded_line`](crate::engine::jsonl_append::append_bounded_line),
+//! which the decider ledger shares: `OpenOptions::append(true)` (sets
+//! POSIX `O_APPEND`) and `fsync` after each write. Under POSIX, writes
+//! ≤ `PIPE_BUF` (4 KiB on Linux) to a single file descriptor opened
+//! with `O_APPEND` are
 //! atomic w.r.t. each other: the kernel resolves the offset and
 //! performs the write as one syscall. Index lines are bounded to
 //! [`MAX_INDEX_LINE_BYTES`] (4096) — comfortably within `PIPE_BUF` —
@@ -145,9 +148,11 @@ pub fn header_mtime_unix_nanos(header_path: &Path) -> Result<u64> {
 /// 2. Constructs the JSONL line and verifies it fits within
 ///    [`MAX_INDEX_LINE_BYTES`]; an oversize line returns an error
 ///    BEFORE any write, preserving the POSIX atomic-append discipline.
-/// 3. Opens the file with `OpenOptions::append(true)` (POSIX
+/// 3. Hands the line to
+///    [`append_bounded_line`](crate::engine::jsonl_append::append_bounded_line),
+///    which opens the file with `OpenOptions::append(true)` (POSIX
 ///    `O_APPEND`), writes the line + newline as a single `write_all`,
-///    flushes, and `fsync`s.
+///    and `fsync`s. A file it creates is mode 0600.
 ///
 /// The opened `File` is dropped at function exit — the next append
 /// re-opens. This is the documented append discipline (Decision 3,
@@ -184,47 +189,18 @@ pub fn append_terminal_index(
 /// Tests use this to drive race-condition fixtures with deterministic
 /// `terminal_at` / `header_mtime_ns` values.
 pub fn append_terminal_index_entry(koto_root: &Path, entry: &TerminalIndexEntry) -> Result<()> {
-    // Ensure koto_root exists so first-ever append on a fresh workspace
-    // doesn't fail. Parent dir of the index IS koto_root itself.
-    if !koto_root.exists() {
-        std::fs::create_dir_all(koto_root)
-            .with_context(|| format!("failed to create {}", koto_root.display()))?;
-    }
-    let path = terminal_index_path(koto_root);
-
-    // Serialize and bound-check before opening. An overlength line is
-    // a hard error: writes > PIPE_BUF lose POSIX atomic-w.r.t.-each-
-    // other appends, so refusing to write protects the race-condition
-    // AC for N concurrent writers.
-    let mut serialized = serde_json::to_string(entry)
+    // Serialize here; the bound check, directory creation, O_APPEND open,
+    // single write, and fsync all live in `append_bounded_line`. An
+    // overlength line is refused before the file is opened: writes over
+    // PIPE_BUF lose POSIX atomic-w.r.t.-each-other appends.
+    let serialized = serde_json::to_string(entry)
         .with_context(|| format!("failed to serialize entry for {}", entry.session_id))?;
-    serialized.push('\n');
-    if serialized.len() > MAX_INDEX_LINE_BYTES {
-        anyhow::bail!(
-            "terminal-index line exceeds PIPE_BUF bound ({} bytes > {})",
-            serialized.len(),
-            MAX_INDEX_LINE_BYTES
-        );
-    }
-
-    // O_APPEND is the security spine: the kernel resolves the offset
-    // atomically per write, so concurrent appenders never overwrite
-    // each other under PIPE_BUF. Do NOT introduce a seek() or
-    // write_at(offset) call on this handle. (Security Considerations
-    // release-time enforcement #3.)
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("failed to open {} for append", path.display()))?;
-
-    file.write_all(serialized.as_bytes())
-        .with_context(|| format!("failed to append to {}", path.display()))?;
-    file.flush()
-        .with_context(|| format!("failed to flush {}", path.display()))?;
-    file.sync_data()
-        .with_context(|| format!("failed to fsync {}", path.display()))?;
-    Ok(())
+    crate::engine::jsonl_append::append_bounded_line(
+        koto_root,
+        &terminal_index_path(koto_root),
+        &serialized,
+        MAX_INDEX_LINE_BYTES,
+    )
 }
 
 /// Read the terminal index into an in-memory dedup table.

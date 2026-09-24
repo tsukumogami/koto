@@ -2,6 +2,7 @@
 // Implemented in Issue 2.
 pub mod assignments;
 pub mod compile;
+pub mod decider;
 pub mod result_map;
 pub mod types;
 pub mod variables;
