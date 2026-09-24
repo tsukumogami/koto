@@ -7,6 +7,7 @@ pub mod dashboard_data;
 pub mod dashboard_render;
 pub mod dashboard_state;
 pub mod init_child;
+pub mod init_entry;
 pub mod next;
 pub mod next_types;
 pub mod overrides;
@@ -125,6 +126,36 @@ pub enum Command {
         /// spaces.
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
+
+        /// Read template variables from a file holding a JSON list of
+        /// ["KEY", "VALUE"] string pairs (at most 64 KiB, a regular file,
+        /// not a symlink). A repeated key is refused as duplicate_var.
+        /// Variables are validated before the name is looked up. Can't be
+        /// combined with --var.
+        #[arg(long, value_name = "PATH")]
+        vars_file: Option<String>,
+
+        /// If a finished (terminal or cancelled) session already has this
+        /// name, remove it and start a fresh one, reporting the old
+        /// session's result as `replaced_result`. A running session is
+        /// refused with session_live unless --attach-live is also given.
+        #[arg(long)]
+        replace_terminal: bool,
+
+        /// If a running session already has this name, attach to it
+        /// instead of failing: its template file, origin record (worktree
+        /// and session store) and any explicitly passed non-rebind
+        /// variable must match, and its `rebind: true` variables are
+        /// re-applied from this invocation. A finished session is refused
+        /// with session_terminal unless --replace-terminal is also given.
+        #[arg(long)]
+        attach_live: bool,
+
+        /// Attach the created, attached or replacement session to leg LEG
+        /// of request REQ in the same step, with the checks `koto request
+        /// attach` makes. A refusal is recorded on the leg.
+        #[arg(long, value_name = "REQ:LEG")]
+        koto_leg: Option<String>,
 
         /// Name of an existing parent workflow (creates a child workflow)
         #[arg(long)]
@@ -1170,10 +1201,47 @@ pub fn run(app: App) -> Result<()> {
             from_stdin,
             allow_legacy_gates,
             vars,
+            vars_file,
+            replace_terminal,
+            attach_live,
+            koto_leg,
             parent,
             intent,
             execution_dir,
         } => {
+            // Entry-flag usage errors come first, before any IO: they are
+            // caller mistakes, and there is no leg yet to record them on.
+            let entry_flags_used = attach_live || replace_terminal || koto_leg.is_some();
+            if vars_file.is_some() && !vars.is_empty() {
+                init_entry::usage_error("--vars-file and --var are mutually exclusive: pass one");
+            }
+            if entry_flags_used && from_stdin {
+                init_entry::usage_error(
+                    "--attach-live, --replace-terminal and --koto-leg can't be used with \
+                     --from-stdin",
+                );
+            }
+            if entry_flags_used && parent.is_some() {
+                init_entry::usage_error(
+                    "--attach-live, --replace-terminal and --koto-leg can't be used with --parent",
+                );
+            }
+            let koto_leg = koto_leg.map(|raw| {
+                request::InitLegTarget::parse(&raw).unwrap_or_else(|e| {
+                    init_entry::usage_error(format!("--koto-leg: {}", e.message))
+                })
+            });
+            let entry = init_entry::EntryFlags {
+                attach_live,
+                replace_terminal,
+                koto_leg,
+            };
+            let vars = match &vars_file {
+                Some(path) => init_entry::read_vars_file(path)
+                    .unwrap_or_else(|reason| init_entry::refuse_vars_file(&entry, reason)),
+                None => vars,
+            };
+
             let backend = build_backend()?;
             // Resolve `--execution-dir` once, before either init path:
             // a directory that does not resolve is a caller error, and
@@ -1247,6 +1315,19 @@ pub fn run(app: App) -> Result<()> {
                         2,
                     )
                 });
+                if parent.is_none() && (entry_flags_used || vars_file.is_some()) {
+                    return init_entry::run(
+                        &backend,
+                        &init_entry::InitArgs {
+                            name: &name,
+                            template: &template,
+                            vars: &vars,
+                            intent: intent.as_deref(),
+                            execution_dir: execution_dir.as_deref(),
+                        },
+                        &entry,
+                    );
+                }
                 handle_init(
                     &backend,
                     &name,
@@ -6945,6 +7026,7 @@ mod tests {
             parent_workflow: None,
             template_source_dir: dir,
             template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -7623,6 +7705,7 @@ Done.
                     parent_workflow: Some("parent".to_string()),
                     template_source_dir: None,
                     template_source_file: None,
+                    origin: None,
                     execution_dir: None,
                     session_id: String::new(),
                     intent: None,

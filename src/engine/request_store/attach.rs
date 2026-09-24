@@ -251,49 +251,78 @@ pub fn attach_leg(
     attach: &AttachLeg,
 ) -> Result<AppendResult, RequestStoreError> {
     validate_leg_name(&attach.leg_name)?;
-    let session = &attach.session;
     append_under_lock(root, request_id, LOCK_WAIT_TIMEOUT, None, |view| {
-        require_open(view)?;
-        let leg = view.leg(&attach.leg_name)?;
-        reject_closed_leg(view, leg)?;
-        check_session_against_leg(&view.header.request_id, leg, session)?;
+        admit(root, view, attach)
+    })
+}
 
-        if let Some(bound) = &leg.bound_child {
-            if bound == &session.session_id {
-                return Ok(None);
-            }
-            return Err(RequestStoreError::LegBoundToDifferentChild {
-                request_id: view.header.request_id.clone(),
-                leg_name: attach.leg_name.clone(),
-                bound_child: bound.clone(),
-                requested_child: session.session_id.clone(),
+/// Run every admission check [`attach_leg`] runs, against an unlocked
+/// read of the request, writing nothing.
+///
+/// Returns `true` when the leg is already bound to this session (the
+/// attach would be a no-op). Used by `koto init --koto-leg`, which must
+/// know an attach would be admitted before it creates, replaces or
+/// rebinds anything; [`attach_leg`] re-runs the same checks under the
+/// lock, so a write that raced this read is still refused there.
+pub fn precheck_attach(
+    root: &Path,
+    request_id: &ValidatedRequestId,
+    attach: &AttachLeg,
+) -> Result<bool, RequestStoreError> {
+    validate_leg_name(&attach.leg_name)?;
+    let view = read_view(root, request_id)?;
+    Ok(admit(root, &view, attach)?.is_none())
+}
+
+/// The admission decision shared by [`attach_leg`] (under the lock) and
+/// [`precheck_attach`] (without it): the bind event to append, `None`
+/// for a no-op re-attach, or the refusal.
+fn admit(
+    root: &Path,
+    view: &RequestView,
+    attach: &AttachLeg,
+) -> Result<Option<PendingAppend>, RequestStoreError> {
+    let session = &attach.session;
+    require_open(view)?;
+    let leg = view.leg(&attach.leg_name)?;
+    reject_closed_leg(view, leg)?;
+    check_session_against_leg(&view.header.request_id, leg, session)?;
+
+    if let Some(bound) = &leg.bound_child {
+        if bound == &session.session_id {
+            return Ok(None);
+        }
+        return Err(RequestStoreError::LegBoundToDifferentChild {
+            request_id: view.header.request_id.clone(),
+            leg_name: attach.leg_name.clone(),
+            bound_child: bound.clone(),
+            requested_child: session.session_id.clone(),
+        });
+    }
+
+    if let Some(pointer) = &session.pointer {
+        if pointer.names_a_different_leg(&view.header.request_id, &attach.leg_name)
+            && !pointer_released(root, view, pointer)?
+        {
+            return Err(RequestStoreError::SessionBoundToDifferentLeg {
+                session_id: session.session_id.clone(),
+                request_id: pointer.request_id.clone(),
+                leg_name: pointer.leg_name.clone(),
             });
         }
+    }
 
-        if let Some(pointer) = &session.pointer {
-            if pointer.names_a_different_leg(&view.header.request_id, &attach.leg_name)
-                && !pointer_released(root, view, pointer)?
-            {
-                return Err(RequestStoreError::SessionBoundToDifferentLeg {
-                    session_id: session.session_id.clone(),
-                    request_id: pointer.request_id.clone(),
-                    leg_name: pointer.leg_name.clone(),
-                });
-            }
-        }
-
-        Ok(Some(PendingAppend {
-            payload: EventPayload::RequestLegBound {
-                request_id: view.header.request_id.clone(),
-                leg_name: attach.leg_name.clone(),
-                child_session_id: session.session_id.clone(),
-                dispatch_epoch: None,
-                issued_by: attach.issued_by.clone(),
-                attach: Some(LegAttach::SelfAttached),
-                template: session.template.clone(),
-            },
-            timestamp: attach.timestamp.clone(),
-            hash: None,
-        }))
-    })
+    Ok(Some(PendingAppend {
+        payload: EventPayload::RequestLegBound {
+            request_id: view.header.request_id.clone(),
+            leg_name: attach.leg_name.clone(),
+            child_session_id: session.session_id.clone(),
+            dispatch_epoch: None,
+            issued_by: attach.issued_by.clone(),
+            attach: Some(LegAttach::SelfAttached),
+            template: session.template.clone(),
+        },
+        timestamp: attach.timestamp.clone(),
+        hash: None,
+    }))
 }

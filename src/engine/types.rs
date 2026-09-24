@@ -215,6 +215,32 @@ fn default_schema_version() -> u32 {
     1
 }
 
+/// A session's origin record: where it was started and which store holds
+/// it (`StateFileHeader.origin`).
+///
+/// Compared field-for-field by `koto init --attach-live`. Both paths are
+/// canonical (`fs::canonicalize` output) so two spellings of one
+/// directory compare equal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionOrigin {
+    /// The session's execution anchor at creation, the directory its
+    /// commands run in.
+    pub anchor: PathBuf,
+    /// The session store the session was created in.
+    pub store: SessionStoreIdentity,
+}
+
+/// Which session store holds a session: the backend kind and its
+/// canonical local sessions directory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionStoreIdentity {
+    /// `"local"` or `"cloud"`.
+    pub kind: String,
+    /// The directory sessions are stored under (`~/.koto/sessions`, or
+    /// `KOTO_SESSIONS_BASE`), canonicalized.
+    pub base: PathBuf,
+}
+
 /// Header line written as the first line of a state file.
 ///
 /// Contains metadata about the workflow log. Has no `seq` field -- it is
@@ -321,6 +347,23 @@ pub struct StateFileHeader {
     /// Additive field: omitted when None, defaults to None on old state files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_source_file: Option<String>,
+
+    /// Where this session was started: its execution anchor and the
+    /// session store that holds it.
+    ///
+    /// Session names are machine-wide, so a name alone doesn't say whose
+    /// session it is. `koto init --attach-live` compares this record
+    /// against the caller's own and refuses a same-named session from
+    /// another worktree or store instead of adopting it.
+    ///
+    /// Written by every `koto init` and every child spawn from this
+    /// version on. `None` on state files written before the field
+    /// existed; such a session is refused at `--attach-live` rather than
+    /// guessed at, and nothing backfills the record.
+    ///
+    /// Additive field: omitted when None, defaults to None on old state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<SessionOrigin>,
 
     // ===== Request-store fields (Decision 1) =====
     //
@@ -2037,6 +2080,7 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -2069,6 +2113,7 @@ mod tests {
             parent_workflow: Some("parent-wf".to_string()),
             template_source_dir: None,
             template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -2113,6 +2158,7 @@ mod tests {
             parent_workflow: None,
             template_source_dir: Some(PathBuf::from("/abs/templates")),
             template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -2150,6 +2196,7 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -2185,6 +2232,7 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -2844,6 +2892,7 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             intent: None,

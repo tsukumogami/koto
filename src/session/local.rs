@@ -149,6 +149,13 @@ impl SessionBackend for LocalBackend {
         Ok(results)
     }
 
+    fn store_identity(&self) -> Option<crate::engine::types::SessionStoreIdentity> {
+        Some(crate::engine::types::SessionStoreIdentity {
+            kind: "local".to_string(),
+            base: fs::canonicalize(&self.base_dir).unwrap_or_else(|_| self.base_dir.clone()),
+        })
+    }
+
     fn count_unreadable(&self) -> usize {
         let entries = match fs::read_dir(&self.base_dir) {
             Ok(entries) => entries,
@@ -922,6 +929,7 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -960,6 +968,7 @@ mod tests {
             parent_workflow: None,
             template_source_dir,
             template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1521,6 +1530,7 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1623,6 +1633,7 @@ mod tests {
                     parent_workflow: None,
                     template_source_dir: None,
                     template_source_file: None,
+                    origin: None,
                     execution_dir: None,
                     session_id: String::new(),
                     intent: None,
@@ -2071,6 +2082,7 @@ mod tests {
             parent_workflow: parent.map(|s| s.to_string()),
             template_source_dir: None,
             template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -2213,6 +2225,7 @@ mod tests {
             parent_workflow: None,
             template_source_dir: None,
             template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: original_session_id.to_string(),
             intent: None,

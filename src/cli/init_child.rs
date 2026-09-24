@@ -257,6 +257,20 @@ fn compile_with_cache(
     Ok(entry)
 }
 
+/// Compile `template_path` through `cache` ahead of an init, returning
+/// the compiled template and its hash.
+///
+/// `koto init`'s entry flags validate variables and compare template
+/// identities before deciding whether to create anything; compiling here
+/// fills the same cache the later [`init_child_from_parent_at`] call
+/// reads, so the template is still compiled once.
+pub(crate) fn compile_for_init(
+    template_path: &Path,
+    cache: &mut TemplateCompileCache,
+) -> Result<(CompiledTemplate, String), CompileErrorInfo> {
+    compile_with_cache(template_path, cache).map(|c| (c.compiled, c.hash))
+}
+
 /// Map a [`SessionError`] raised by `init_state_file` onto the
 /// appropriate [`SpawnErrorKind`].
 ///
@@ -437,7 +451,7 @@ pub fn init_child_as_skip_marker_from_parent(
 /// dropped: `koto next` then refuses with the unresolvable-anchor code
 /// and names the recorded directory, which is more useful than a
 /// session that silently re-adopts.
-fn canonical_or_verbatim(path: &Path) -> PathBuf {
+pub(crate) fn canonical_or_verbatim(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -471,6 +485,25 @@ fn resolve_execution_dir(
     std::env::current_dir()
         .ok()
         .map(|cwd| canonical_or_verbatim(&cwd))
+}
+
+/// The origin record for a session about to be created: its execution
+/// anchor and the store's identity.
+///
+/// `None` when either is unknown -- no anchor could be resolved, or the
+/// backend has no store identity. Such a session is refused by `koto init
+/// --attach-live` like one created before origin records existed.
+///
+/// Call after the session directory exists, so the store's base
+/// directory canonicalizes the same way a later caller's will.
+pub(crate) fn origin_record(
+    backend: &dyn SessionBackend,
+    anchor: Option<&Path>,
+) -> Option<crate::engine::types::SessionOrigin> {
+    Some(crate::engine::types::SessionOrigin {
+        anchor: anchor?.to_path_buf(),
+        store: backend.store_identity()?,
+    })
 }
 
 /// Shared implementation. When `override_initial_state` is `Some`, the
@@ -553,7 +586,7 @@ fn init_child_core(
     // over both.
     let execution_dir = resolve_execution_dir(backend, parent_name, execution_dir_override);
 
-    let header = StateFileHeader {
+    let mut header = StateFileHeader {
         schema_version: 1,
         workflow: child_name.to_string(),
         template_hash: cached.hash.clone(),
@@ -566,6 +599,9 @@ fn init_child_core(
         template_source_file: template_path
             .file_name()
             .map(|f| f.to_string_lossy().into_owned()),
+        // Filled in once the session directory exists, so the store's
+        // base canonicalizes to the same form a later caller computes.
+        origin: None,
         execution_dir,
         session_id: generate_session_id(),
         intent: None,
@@ -631,6 +667,7 @@ fn init_child_core(
         )
         .with_path(cached.source_path.clone())
     })?;
+    header.origin = origin_record(backend, header.execution_dir.as_deref());
 
     backend
         .init_state_file(child_name, header, initial_events)
@@ -733,6 +770,8 @@ pub fn init_inline_into_session(
 
     let ts = now_iso8601();
     let initial_state = compiled.initial_state.clone();
+    let execution_dir = resolve_execution_dir(backend, None, execution_dir_override);
+    let origin = origin_record(backend, execution_dir.as_deref());
 
     let header = StateFileHeader {
         schema_version: 1,
@@ -744,9 +783,10 @@ pub fn init_inline_into_session(
         // tree, so there is no parent source dir for the batch resolver.
         template_source_dir: None,
         template_source_file: None,
+        origin,
         // An inline session is always top-level (`--from-stdin`
         // rejects `--parent`), so there is no parent anchor to copy.
-        execution_dir: resolve_execution_dir(backend, None, execution_dir_override),
+        execution_dir,
         session_id: generate_session_id(),
         intent: None,
         template_name: if compiled.name.is_empty() {
@@ -982,6 +1022,7 @@ Done.
             parent_workflow: None,
             template_source_dir: None,
             template_source_file: None,
+            origin: None,
             execution_dir,
             session_id: String::new(),
             intent: None,

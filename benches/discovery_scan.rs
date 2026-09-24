@@ -262,6 +262,7 @@ fn base_header(id: &str) -> StateFileHeader {
         parent_workflow: None,
         template_source_dir: None,
         template_source_file: None,
+        origin: None,
         execution_dir: None,
         session_id: id.to_string(),
         intent: None,

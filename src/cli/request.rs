@@ -278,6 +278,14 @@ impl RequestError {
         self
     }
 
+    /// The code's wire form (`template_mismatch`, `request_closed`, ...).
+    pub(crate) fn code_str(&self) -> String {
+        serde_json::to_value(self.code)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
     /// Print the envelope on stdout and exit in this code's class.
     fn emit(&self) -> ! {
         let json = serde_json::json!({ "error": self });
@@ -1546,6 +1554,193 @@ pub(crate) fn attaching_session(
     Ok(request_store::AttachingSession::from_session(
         session, header, &events, &compiled, pointer,
     ))
+}
+
+// ===== `koto init --koto-leg` =====
+
+/// The leg a `koto init --koto-leg <req>:<leg>` invocation attaches to.
+#[derive(Debug, Clone)]
+pub(crate) struct InitLegTarget {
+    pub id: ValidatedRequestId,
+    pub leg: String,
+}
+
+impl InitLegTarget {
+    /// Parse `<request-id>:<leg>`, each part against the grammar `koto
+    /// request` enforces. Neither grammar admits `:`, so the split is
+    /// unambiguous.
+    pub fn parse(raw: &str) -> Result<Self, RequestError> {
+        let Some((id, leg)) = raw.split_once(':') else {
+            return Err(RequestError::new(
+                RequestErrorCode::InvalidIdentifier,
+                format!("--koto-leg {raw:?}: expected <request-id>:<leg>"),
+            )
+            .with_detail("--koto-leg", "missing ':' between request id and leg"));
+        };
+        let id = request_id(id)?;
+        request_store::validate_leg_name(leg).map_err(map_store_error)?;
+        Ok(Self {
+            id,
+            leg: leg.to_string(),
+        })
+    }
+}
+
+/// A leg-check refusal for `koto init --koto-leg`: the request error it
+/// renders as, plus the variable fields a refusal record carries (empty
+/// when the refusal names no variable).
+#[derive(Debug, Clone)]
+pub(crate) struct InitLegRefusal {
+    pub error: RequestError,
+    pub var: String,
+    pub recorded: String,
+    pub requested: String,
+}
+
+impl InitLegRefusal {
+    fn from_store(e: RequestStoreError) -> Box<Self> {
+        let (var, recorded, requested) = match &e {
+            RequestStoreError::InputMismatch {
+                key,
+                recorded,
+                expected,
+                ..
+            } => (
+                key.clone(),
+                recorded.clone().unwrap_or_default(),
+                expected.clone(),
+            ),
+            _ => Default::default(),
+        };
+        Box::new(Self {
+            error: map_store_error(e),
+            var,
+            recorded,
+            requested,
+        })
+    }
+
+    fn from_error(error: RequestError) -> Box<Self> {
+        Box::new(Self {
+            error,
+            var: String::new(),
+            recorded: String::new(),
+            requested: String::new(),
+        })
+    }
+
+    /// Wrap an error from the `koto request` helpers.
+    pub fn from_request_error(error: RequestError) -> Box<Self> {
+        Self::from_error(error)
+    }
+
+    /// A session or store that couldn't be read.
+    pub fn persistence(message: String) -> Box<Self> {
+        Self::from_error(RequestError::new(
+            RequestErrorCode::PersistenceError,
+            message,
+        ))
+    }
+
+    /// The snake_case code, as it appears on the wire.
+    pub fn code(&self) -> String {
+        self.error.code_str()
+    }
+}
+
+/// Run every leg check `attach` would run for `session`, writing
+/// nothing. `Ok(true)` means the leg is already bound to this session.
+pub(crate) fn init_precheck_leg(
+    target: &InitLegTarget,
+    session: &request_store::AttachingSession,
+) -> Result<bool, Box<InitLegRefusal>> {
+    let root = koto_root().map_err(InitLegRefusal::from_error)?;
+    request_store::precheck_attach(
+        &root,
+        &target.id,
+        &request_store::AttachLeg {
+            leg_name: target.leg.clone(),
+            session: session.clone(),
+            issued_by: None,
+            timestamp: now_iso8601(),
+        },
+    )
+    .map_err(InitLegRefusal::from_store)
+}
+
+/// Bind the leg to `session` (every check re-run under the request
+/// lock) and write the session's pointer. Returns whether an event was
+/// appended.
+pub(crate) fn init_attach_leg(
+    target: &InitLegTarget,
+    session: request_store::AttachingSession,
+    session_dir: &std::path::Path,
+) -> Result<bool, Box<InitLegRefusal>> {
+    let root = koto_root().map_err(InitLegRefusal::from_error)?;
+    let session_id = session.session_id.clone();
+    let timestamp = now_iso8601();
+    let outcome = request_store::attach_leg(
+        &root,
+        &target.id,
+        &request_store::AttachLeg {
+            leg_name: target.leg.clone(),
+            session,
+            issued_by: None,
+            timestamp: timestamp.clone(),
+        },
+    )
+    .map_err(InitLegRefusal::from_store)?;
+    write_session_pointer(
+        &target.id,
+        &target.leg,
+        &session_id,
+        session_dir,
+        timestamp,
+        "koto init --koto-leg",
+    );
+    Ok(outcome.written)
+}
+
+/// Record a refused `koto init --koto-leg` on the leg: `source:
+/// refused`, status `failure`, and the payload `{outcome: refused,
+/// reason, var, recorded, requested}`.
+///
+/// Best effort and silent. The store admits the write only while the leg
+/// is open and unbound; on any other leg, a closed or missing request, or
+/// an I/O failure it writes nothing, and the invocation refuses with its
+/// own error either way, so its output is the same with or without
+/// `--koto-leg`.
+pub(crate) fn init_record_refusal(
+    target: &InitLegTarget,
+    reason: &str,
+    var: &str,
+    recorded: &str,
+    requested: &str,
+) {
+    let Ok(root) = koto_root() else {
+        return;
+    };
+    let result = crate::engine::types::WorkflowResult::with_string_payload(
+        crate::engine::types::TerminalOutcome::Failure,
+        format!("koto init refused: {reason}"),
+        [
+            ("outcome", "refused"),
+            ("reason", reason),
+            ("var", var),
+            ("recorded", recorded),
+            ("requested", requested),
+        ],
+    );
+    let _ = request_store::record_refusal(
+        &root,
+        &target.id,
+        &request_store::LegRefusal {
+            leg_name: target.leg.clone(),
+            result,
+            issued_by: None,
+            timestamp: now_iso8601(),
+        },
+    );
 }
 
 /// Locate a child's session directory, honoring the same backend
