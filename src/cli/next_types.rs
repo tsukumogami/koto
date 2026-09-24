@@ -100,6 +100,12 @@ pub enum NextResponse {
         state: String,
         advanced: bool,
         unassigned_children: Vec<UnassignedChild>,
+        /// The session's result: the declared `result:` map resolved into
+        /// `payload`, or the evidence-derived envelope when the terminal
+        /// declares none. `koto next` always fills it before printing;
+        /// `None` exists for response construction that has no session to
+        /// read (dispatch, unit tests), and is omitted from the wire.
+        result: Option<crate::engine::types::WorkflowResult>,
     },
     ActionRequiresConfirmation {
         state: String,
@@ -184,6 +190,26 @@ pub fn execution_anchor_adopted_notice(name: &str, anchor: &std::path::Path) -> 
 }
 
 impl NextResponse {
+    /// Return this response with `result` set, when it is a `Terminal`.
+    /// Every other variant is returned unchanged: only a terminal response
+    /// carries a result.
+    pub fn with_terminal_result(self, value: crate::engine::types::WorkflowResult) -> Self {
+        match self {
+            NextResponse::Terminal {
+                state,
+                advanced,
+                unassigned_children,
+                ..
+            } => NextResponse::Terminal {
+                state,
+                advanced,
+                unassigned_children,
+                result: Some(value),
+            },
+            other => other,
+        }
+    }
+
     /// Return a new `NextResponse` with the directive and details fields substituted
     /// using the given function. Terminal variants have no directive and are returned
     /// unchanged.
@@ -621,14 +647,19 @@ impl Serialize for NextResponse {
                 state,
                 advanced,
                 unassigned_children,
+                result,
             } => {
-                let mut map = serializer.serialize_map(Some(6))?;
+                let count = 6 + result.as_ref().map_or(0, |_| 1);
+                let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("action", "done")?;
                 map.serialize_entry("state", state)?;
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("expects", &None::<()>)?;
                 map.serialize_entry("unassigned_children", unassigned_children)?;
                 map.serialize_entry("error", &None::<()>)?;
+                if let Some(r) = result {
+                    map.serialize_entry("result", r)?;
+                }
                 map.end()
             }
             NextResponse::ActionRequiresConfirmation {
@@ -1074,6 +1105,7 @@ mod tests {
             state: "done".to_string(),
             advanced: true,
             unassigned_children: vec![],
+            result: None,
         };
         assert_eq!(
             terminal.clone().with_directive_prefix(RECOVERY_POINTER),
@@ -1388,6 +1420,7 @@ mod tests {
             state: "done".to_string(),
             advanced: true,
             unassigned_children: vec![],
+            result: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -1414,6 +1447,7 @@ mod tests {
             state: "complete".to_string(),
             advanced: false,
             unassigned_children: vec![],
+            result: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -1490,6 +1524,7 @@ mod tests {
             state: "done".to_string(),
             advanced: true,
             unassigned_children: vec![],
+            result: None,
         };
         assert_eq!(
             terminal
@@ -1534,6 +1569,7 @@ mod tests {
             state: "done".to_string(),
             advanced: true,
             unassigned_children: vec![],
+            result: None,
         };
         assert!(!terminal.carries_details());
 
@@ -1771,6 +1807,7 @@ mod tests {
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         }
     }
 
@@ -2717,6 +2754,7 @@ mod tests {
             state: "done".into(),
             advanced: true,
             unassigned_children: vec![],
+            result: None,
         };
         let v: serde_json::Value = serde_json::to_value(&terminal).unwrap();
         assert_eq!(v["unassigned_children"], serde_json::json!([]));

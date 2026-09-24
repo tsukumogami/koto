@@ -334,6 +334,10 @@ so an agent that has lost everything else still learns it exists.
 Key presence:
 - `directive`, `details`, and `expects` are all **absent** together when
   `is_terminal` is `true` -- there is nothing to substitute for a terminal phase.
+- `result` is **present** exactly when `is_terminal` is `true`: the result the
+  terminal tick recorded (`status`, `summary`, optional `payload`), the same value
+  the terminal `koto next` response carried. A context write after the terminal
+  does not change it.
 - `details` is additionally absent (on its own) when the current phase declares
   no details content, even for a non-terminal phase.
 - Retrieving these keys takes no lock on the session -- including for a

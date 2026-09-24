@@ -41,6 +41,7 @@ pub fn dispatch_next(
             state: state.to_string(),
             advanced,
             unassigned_children: vec![],
+            result: None,
         });
     }
 
@@ -152,6 +153,7 @@ mod tests {
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         }
     }
 
@@ -170,6 +172,7 @@ mod tests {
                 state: "done".to_string(),
                 advanced: false,
                 unassigned_children: vec![],
+                result: None,
             }
         );
     }

@@ -968,6 +968,32 @@ pub struct WorkflowResult {
     pub payload: Option<serde_json::Value>,
 }
 
+impl WorkflowResult {
+    /// Build a result whose `payload` is a flat JSON object of string
+    /// values -- the shape a terminal state's declared `result:` map
+    /// resolves to, and the shape a reader routes on without knowing the
+    /// template that produced it.
+    pub fn with_string_payload<K, V>(
+        status: TerminalOutcome,
+        summary: impl Into<String>,
+        fields: impl IntoIterator<Item = (K, V)>,
+    ) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let map: serde_json::Map<String, serde_json::Value> = fields
+            .into_iter()
+            .map(|(k, v)| (k.into(), serde_json::Value::String(v.into())))
+            .collect();
+        WorkflowResult {
+            status,
+            summary: summary.into(),
+            payload: Some(serde_json::Value::Object(map)),
+        }
+    }
+}
+
 /// What one leg of a request asks for.
 ///
 /// Carries the fields the dispatch protocol requires of a child session

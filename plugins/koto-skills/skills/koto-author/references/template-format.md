@@ -72,6 +72,7 @@ Each state is a key under `states:`. A state can have:
 | `gates` | map | Conditions checked before transitioning |
 | `accepts` | map | Evidence schema for agent-submitted data |
 | `terminal` | bool | Marks this as an end state |
+| `result` | map | Terminal only: the structured result the workflow reports (see "Terminal `result:` maps" below) |
 
 Every non-terminal state needs at least one transition. Terminal states need `terminal: true` and no transitions.
 
@@ -853,6 +854,28 @@ A self-loop is a lap, not an arrival, so the state's `details` are not repeated 
 it — see the `<!-- details -->` section above. Write the directive so it stands on
 its own across iterations, and point an agent that has lost the procedure at
 `koto status <session-name>` rather than expecting the next lap to hand it back.
+
+### Terminal `result:` maps
+
+A terminal state can declare the result the workflow reports when it lands there. koto resolves the map once, on that tick, into the result's `payload`, and the same value appears on the terminal `koto next` response, `koto status`, a bound request leg, and a parent's `ChildCompleted` event.
+
+```yaml
+done_error:
+  terminal: true
+  failure: true
+  result:
+    outcome: error
+    step: "${context.step}"
+    topic: "{{TOPIC}}"
+    state: "merge-state:${context.state}"
+```
+
+- Values are strings mixing literal text, `{{VAR}}`, and `${context.<key>}` (the content stored with `koto context add`). Resolution is single-pass: resolved content holding `{{X}}` is not expanded again.
+- At most 32 keys; keys follow the context-key grammar; `missing` is reserved.
+- Only on terminal states. A nested map or list value, an undeclared `{{VAR}}`, an invalid context key, or any other `${...}` form (`${evidence.x}`, `${gates.g.x}`) fails compilation.
+- A context key that is absent or not UTF-8 resolves to `""` and its result key is listed in `payload.missing`; the tick still succeeds.
+- The map replaces the evidence-derived payload entirely. `status` still comes from `failure`/`skipped_marker`.
+- Resolved once: a later `koto context add` does not change the recorded result.
 
 ### Split topology
 
