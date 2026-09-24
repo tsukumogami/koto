@@ -449,6 +449,7 @@ Every subcommand except `list` prints the same object:
 | `legs` | Keyed by leg name, in name order — that ordering is what makes two `get` calls byte-equal. |
 | `legs[*].disposition` | `open`, `resolved`, or `abandoned`. |
 | `legs[*].result_source` | `promoted` (from the bound session's terminal tick), `explicit` (recorded through `resolve`), or `refused` (koto refused the session that was to answer the leg and recorded why; no command writes this). |
+| `legs[*].result_final_state` | For a promoted result, the terminal state it came from. Omitted for explicit and refused results, and for results promoted by a koto that didn't record it. |
 | `legs[*].attach` | `"self"` when a root session attached itself through `attach`. Omitted otherwise. |
 | `legs[*].bound_template` | For a self-attached leg, the session's template identity: `name`, `hash`, and `source` (the template's file name). Omitted otherwise. |
 | `legs[*].declaration.template` | One template name, or a list of up to eight any of which may answer the leg. |

@@ -319,6 +319,7 @@ Gates are preconditions evaluated before any transition fires. A state can have 
 | `context-matches` | Content for a key matches a regex | `key`, `pattern` |
 | `command` | A shell command exits 0 | `command` |
 | `children-complete` | All child workflows have reached their completion condition | (none required) |
+| `request-leg` | A request leg is resolved or abandoned (an open leg blocks; a missing one fails) | `request`, `leg` |
 
 ```yaml
 gates:
@@ -430,6 +431,49 @@ straight into `converge`. That's the second conjunct's whole job. On a state tha
 also declares `materialize_children`, the compiler catches the omission as
 warning W4 -- see [batch-authoring.md](batch-authoring.md) for the full rule.
 
+#### `request-leg` gate type
+
+The `request-leg` gate reads one leg of a koto request and reports what the
+session answering it recorded, so a coordinator can wait for another workflow's
+result and route on it without the agent relaying anything.
+
+```yaml
+gates:
+  scope_leg:
+    type: request-leg
+    request: "{{REQ}}"          # request id; {{VAR}} allowed
+    leg: scope                  # leg name; {{VAR}} allowed
+    expect:                     # optional: payload key -> allowed values
+      outcome: [scoped, declined]
+    overridable: false          # recommended
+transitions:
+  - target: scoped
+    when:
+      gates.scope_leg.disposition: resolved
+      gates.scope_leg.payload.outcome: scoped
+    context_assignments:
+      pr: "${gates.scope_leg.payload.pr}"
+  - target: request_abandoned
+    when:
+      gates.scope_leg.disposition: abandoned
+```
+
+- A literal `request` or `leg` is checked at compile time against `koto request`'s
+  id and leg-name rules; a substituted one is checked at evaluation, and a bad
+  value makes the gate report outcome `error`. `expect` must be a non-empty map of
+  non-empty scalar lists.
+- `resolved` and `abandoned` legs pass (so does an unresolved leg on an abandoned
+  or closed request, reported as `abandoned`). A `missing` request or leg fails,
+  and an arm on `disposition: missing` can still fire. An `open` leg fails with
+  `category: "temporal"`: that stop is the wait, so write no arm for it.
+- Route on keys inside the payload with `gates.<gate>.payload.<key>` (deeper keys
+  work too). A `when` clause on the whole `payload` object is a compile error.
+- The gate only reads: it never writes to the request log.
+- Declare it `overridable: false`. Its built-in default names no outcome, and an
+  override would let an agent claim the child finished. Non-overridable also
+  exempts the state from the strict reachability check (see
+  [Reachability check](#reachability-check-and-non-overridable-gates)).
+
 ### Gate output fields
 
 Each gate type produces structured output that the engine injects into the evidence map under the `gates.<gate_name>` namespace. Use these fields in `when` conditions to route on gate results.
@@ -458,6 +502,17 @@ Each gate type produces structured output that the engine injects into the evide
 | `children-complete` | `needs_attention` | boolean | `any_failed OR any_skipped OR any_spawn_failed`. Route to retry / analysis states on this boolean. |
 | `children-complete` | `children` | array | Per-child detail: `[{"name", "state", "complete", "outcome", ...}]`. Each entry carries `outcome` (`success \| failure \| skipped \| pending \| blocked \| spawn_failed`); failed entries add `failure_mode` + `reason_source: "state_name"`; skipped entries add `skipped_because` (direct blocker), `skipped_because_chain` (all unique failed ancestors, closest-first), and `reason_source: "skipped"`; blocked entries add `blocked_by` (non-terminal `waits_on` entries). |
 | `children-complete` | `error` | string | Empty on normal evaluation. Error message on backend failures. |
+| `request-leg` | `found` | boolean | `true` when the request and leg exist and were read. |
+| `request-leg` | `disposition` | string | `open`, `resolved`, `abandoned`, or `missing`; empty when the gate errored. |
+| `request-leg` | `bound` | boolean | Whether a session is bound to the leg. |
+| `request-leg` | `source` | string | For a resolved leg: `promoted`, `explicit`, or `refused`. Empty otherwise. |
+| `request-leg` | `status` | string | The result's `status` (`success`, `failure`, `skipped`); empty until resolved. |
+| `request-leg` | `final_state` | string | Terminal state a promoted result came from; empty for explicit and refused results. |
+| `request-leg` | `template` | string | The bound session's template source file name; empty for explicit and refused results. |
+| `request-leg` | `outcome` / `step` / `reason` | string | The payload's string keys of the same names; empty when absent or not a string. |
+| `request-leg` | `valid` | boolean | Resolved, payload is an object, and every `expect` key carries a listed value (extra keys are fine). |
+| `request-leg` | `payload` | object | The result's payload, or `{}`. Route on keys inside it: `gates.<gate>.payload.<key>`. |
+| `request-leg` | `error` | string | Why the leg couldn't be read; empty on a normal read. |
 
 `passed` is not a field name in any gate type. Don't use it in `when` conditions.
 
@@ -534,7 +589,9 @@ satisfied by the replacement and the state advances against whatever you wrote.
 
 **Path format rules:**
 
-- Exactly three dot-separated segments: `gates.<gate_name>.<field>`.
+- Exactly three dot-separated segments: `gates.<gate_name>.<field>`. The one
+  exception is a `request-leg` gate's `payload`, routed by key:
+  `gates.<gate_name>.payload.<key>[.<key>...]`.
 - `<gate_name>` must be declared in the same state's `gates` block.
 - `<field>` must be a valid output field for that gate type.
 - The compiler enforces all three rules (D3 check) and rejects malformed paths.
@@ -560,7 +617,7 @@ When `koto overrides record` runs, the value to inject is resolved in this order
 2. `override_default` declared on the gate
 3. Built-in default for the gate type (lowest priority)
 
-Built-in defaults for all three gate types:
+Built-in defaults by gate type:
 
 | Gate type | Built-in default |
 |-----------|-----------------|
@@ -568,8 +625,9 @@ Built-in defaults for all three gate types:
 | `context-exists` | `{"exists": true, "error": ""}` |
 | `context-matches` | `{"matches": true, "error": ""}` |
 | `children-complete` | `{"total": 0, "completed": 0, "pending": 0, "success": 0, "failed": 0, "skipped": 0, "blocked": 0, "spawn_failed": 0, "all_complete": true, "all_success": true, "any_failed": false, "any_skipped": false, "any_spawn_failed": false, "needs_attention": false, "children": [], "error": ""}` |
+| `request-leg` | `{"found": true, "disposition": "resolved", "bound": true, "source": "promoted", "status": "", "final_state": "", "template": "", "outcome": "", "step": "", "reason": "", "valid": true, "payload": {}, "error": ""}` |
 
-All four built-in types always have a built-in default, so `koto overrides record` always succeeds for them without `--with-data` or `override_default`. Setting `override_default` is useful when you want a specific non-passing value injected (for example, a known exit code that triggers a particular routing branch).
+Every built-in type has a built-in default, so `koto overrides record` always succeeds for them without `--with-data` or `override_default`. Setting `override_default` is useful when you want a specific non-passing value injected (for example, a known exit code that triggers a particular routing branch).
 
 The compiler validates `override_default` at compile time (D2 check): all required fields must be present, no extra fields, and each value must match the expected type.
 
@@ -613,6 +671,23 @@ The field defaults to `true` and is omitted from the compiled JSON when `true`. 
 - `overridable` that isn't a YAML boolean (`overridable: "no"`, `overridable: no`).
 - `override_default` on a gate with `overridable: false` -- no override could ever apply it.
 - Any unknown key on a gate (for example the misspelling `overrideable`), named with its state and gate.
+
+### Reachability check and non-overridable gates
+
+Strict compilation checks every state whose transitions route only on `gates.*`
+keys: with each gate set to its override value (`override_default`, else the
+built-in default), at least one of those pure-gate transitions must fire, or the
+compile fails with `no transition fires when all gates use override defaults`.
+The point is that an override must be able to move a stuck state; the usual fix
+is an `override_default` that selects an arm.
+
+Transitions whose `when` clause references an `overridable: false` gate are left
+out of the check, and a state whose pure-gate transitions all reference one is
+exempt, because no override can ever apply to such a gate. Transitions on
+overridable gates are still checked, even on a state that also has a
+non-overridable gate. This is what lets a non-overridable `request-leg` gate
+routed on `payload.outcome` values, or a non-overridable `context-matches` gate
+routed only on `matches: false`, compile strictly.
 
 ### Combining gates and evidence routing
 

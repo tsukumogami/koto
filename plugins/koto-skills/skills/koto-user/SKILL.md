@@ -136,7 +136,7 @@ One or more gates failed, but the state still accepts evidence. You can either f
 
 Check each item in `blocking_conditions`:
 
-- Check `category`: `"temporal"` means the condition will resolve on its own (e.g., child workflows finishing) — retry later. `"corrective"` (the default) means you or the user must fix something.
+- Check `category`: `"temporal"` means the condition will resolve on its own (e.g., child workflows finishing, or an open request leg the `request-leg` gate is waiting on) — retry later. `"corrective"` (the default) means you or the user must fix something.
 - If `agent_actionable` is `true`: record an override (see [Override flow](#override-flow)), then re-query
 - If `agent_actionable` is `false`: you can't override this gate; submit evidence to bypass if the template allows it, or escalate to the user
 

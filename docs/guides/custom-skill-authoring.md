@@ -62,7 +62,7 @@ A few things to note about this template:
 - **Gates** are conditions that must be satisfied before a transition. The `context-exists` type checks whether a key exists in the content store. The `command` type runs a shell command and checks the exit code.
 - **Variables** are interpolated at runtime using `{{VARIABLE_NAME}}` syntax. The agent supplies them via `--var KEY=VALUE` on `koto init`.
 
-The supported gate types are `command`, `context-exists`, `context-matches`, and `children-complete`. For full template-authoring guidance, use the `koto-author` skill (in the koto-skills plugin), which compiles and validates templates interactively.
+The supported gate types are `command`, `context-exists`, `context-matches`, `children-complete`, and `request-leg` (see [Routing on another session's result](#routing-on-another-sessions-result-request-leg-gates)). For full template-authoring guidance, use the `koto-author` skill (in the koto-skills plugin), which compiles and validates templates interactively.
 
 ### Constraining variables
 
@@ -475,6 +475,7 @@ Every gate type produces structured output, available under `gates.<gate_name>` 
 | `command` | `{"exit_code": number, "error": string}` |
 | `context-exists` | `{"exists": boolean, "error": string}` |
 | `context-matches` | `{"matches": boolean, "error": string}` |
+| `request-leg` | `{"found": boolean, "disposition": string, "bound": boolean, "source": string, "status": string, "final_state": string, "template": string, "outcome": string, "step": string, "reason": string, "valid": boolean, "payload": object, "error": string}` |
 
 For `command` gates, `error` is `""` on normal exit (pass or fail). On timeout it's `"timed_out"` with `exit_code: -1`. On spawn errors it's the error message with `exit_code: -1`.
 
@@ -589,6 +590,72 @@ With the flag set:
 A good rule: a gate that routes on a context key your own `default_action` script wrote should be `overridable: false`, because otherwise an override lets the agent supply the value the script exists to produce. Leave gates that only guard against a transient failure overridable, so a stuck run has a logged way forward.
 
 The compiler holds you to the declaration. `overridable` accepts only `true` or `false` (`"no"` is an error), `override_default` on a gate with `overridable: false` is an error because nothing could ever apply it, and an unknown key on a gate, such as the misspelling `overrideable`, fails `koto template compile` with an error naming the state, the gate, and the key.
+
+### The reachability check, and why non-overridable gates are exempt
+
+Strict compilation (`koto template compile` without `--allow-legacy-gates`) runs a reachability check on every state whose `when` clauses route only on gate output. It builds each gate's override value, its `override_default` or else its type's built-in default, and requires that at least one of those pure-gate transitions fires on it. The check exists because an override is the escape hatch for a stuck state: if forcing every gate still matches no arm, the override can't move the state, and the template has a dead end. The failure reads `no transition fires when all gates use override defaults`, and the fix is an `override_default` that selects an arm.
+
+That premise doesn't hold for a gate declared `overridable: false`, since no override can ever apply to it. So the check leaves out every pure-gate transition whose `when` clause references a non-overridable gate, and a state whose pure-gate transitions all reference one is exempt. The arms still have to be right; they're just reached by the gate's real output rather than by an override. Transitions that reference only overridable gates are checked exactly as before, including on a state that also has a non-overridable gate. Without the exemption, a state that routes a non-overridable gate on values its default can't produce (the `payload.outcome` of a `request-leg` gate, say, or a `context-matches` gate routed only on `matches: false`) could never compile strictly, because the `override_default` that would satisfy the check is itself a compile error on such a gate.
+
+### Routing on another session's result: `request-leg` gates
+
+A `request-leg` gate reads one leg of a koto request (`koto request create`) and reports what the session answering that leg recorded. It's how a coordinating workflow waits for, and then routes on, the result of a workflow it handed work to, without the agent relaying anything.
+
+```yaml
+variables:
+  REQ:
+    required: true
+states:
+  scope_run:
+    gates:
+      scope_leg:
+        type: request-leg
+        request: "{{REQ}}"
+        leg: scope
+        expect:
+          outcome: [scoped, declined]
+        overridable: false
+    transitions:
+      - target: scoped
+        when:
+          gates.scope_leg.disposition: resolved
+          gates.scope_leg.payload.outcome: scoped
+        context_assignments:
+          plan_path: "${gates.scope_leg.payload.plan_path}"
+      - target: declined
+        when:
+          gates.scope_leg.disposition: resolved
+          gates.scope_leg.payload.outcome: declined
+      - target: request_abandoned
+        when:
+          gates.scope_leg.disposition: abandoned
+```
+
+**Fields.** `request` (the request id) and `leg` (the leg name) are required. Both may use `{{VAR}}` references, which the tick substitutes. A literal value is checked at compile time against the same rules `koto request` applies to ids and leg names; a substituted value is checked when the gate is evaluated, and a bad one makes the gate report outcome `error` with the reason in `error`, without reading the store. `expect` is optional: a map from a payload key to the list of scalar values that key may carry. An empty map, an empty list, or a list element that is an object, an array, or null is a compile error.
+
+**Output.**
+
+| Field | Meaning |
+|-------|---------|
+| `found` | `true` when the request and leg exist and were read. |
+| `disposition` | `open`, `resolved`, `abandoned`, or `missing`; empty when the gate errored. |
+| `bound` | Whether a session is bound to the leg. |
+| `source` | For a resolved leg, how the result got there: `promoted` (from the bound session's terminal tick), `explicit` (`koto request resolve`), or `refused` (koto turned away the session that was to answer it). Empty otherwise. |
+| `status` | The result's `status`: `success`, `failure`, or `skipped`. Empty until resolved. |
+| `final_state` | The terminal state a promoted result came from. Empty for explicit and refused results. |
+| `template` | The bound session's template source file name, as the attach recorded it. Empty for explicit and refused results. |
+| `outcome`, `step`, `reason` | Copied from the payload's string keys of the same names; empty when absent or not a string. |
+| `valid` | `true` only for a resolved leg whose payload is an object carrying every `expect` key with a listed value. Keys `expect` doesn't name are ignored. With no `expect`, any resolved object payload is valid. |
+| `payload` | The result's payload object, or `{}` when it has none (or has one that isn't an object). |
+| `error` | Why the gate couldn't read the leg; empty on a normal read. |
+
+**Dispositions.** A `resolved` leg passes the gate. An `abandoned` leg passes too, as does an unresolved leg on a request that was abandoned or closed, because nothing can answer it any more; route it to a state that handles the abandonment. A `missing` request or leg fails the gate, and an arm keyed on `disposition: missing` can still fire, since gate output reaches `when` clauses whether or not the gate passed. An `open` leg fails the gate and is a temporal block: `koto next` stops with `gate_blocked` (or `evidence_required` on a state with `accepts`) and `category: "temporal"`, the same wait a `children-complete` gate gives. Don't write an arm for the open case; the stop is the wait. When no request store is reachable (no home directory, or a host where request records aren't available), the gate reports outcome `error` with `found: false` rather than passing.
+
+**Payload paths.** A `when` clause routes on a key inside the payload with `gates.<gate>.payload.<key>`, and deeper keys work too (`gates.<gate>.payload.detail.kind`). This is the one place a `gates.*` path may run past three segments; every other field and gate type still takes exactly `gates.<gate>.<field>`. A `when` clause on the whole `payload` object is a compile error, since a scalar can never equal an object. The same paths work in `context_assignments` (`${gates.scope_leg.payload.pr}`), which is how a coordinator copies what the child reported into its own context.
+
+**The gate only reads.** Evaluating it never appends to the request log, binds, resolves, or abandons the leg.
+
+**Make it non-overridable.** The built-in default an override would inject is a resolved, valid record with an empty payload, so it names no outcome, and an override on a leg gate would let an agent claim a child finished when it didn't. Declare `overridable: false` on any leg gate whose outcome decides what happens next; that also exempts the state from the reachability check, which its payload arms couldn't otherwise pass.
 
 ### Updating your SKILL.md
 

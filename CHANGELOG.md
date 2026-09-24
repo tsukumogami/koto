@@ -10,6 +10,33 @@ to `0.9.x`).
 
 ### Added
 
+- **A `request-leg` gate routes on what another session reported.** A gate of
+  type `request-leg` names a `request` and a `leg` (both may use `{{VAR}}`) and
+  reads that leg from the request store: its `disposition` (`open`,
+  `resolved`, `abandoned`, `missing`), whether a session is `bound`, the
+  result's `source`, `status`, and `payload`, the promoted result's
+  `final_state` and `template`, the payload's `outcome`, `step`, and `reason`,
+  and a `valid` flag checked against an optional `expect` map. An open leg is a
+  temporal block, so a coordinator waits on it without writing an arm for the
+  wait, and a resolved or abandoned leg passes. A `when` clause can route on a
+  key inside the payload (`gates.<gate>.payload.<key>`), the one place a
+  `gates.*` path may run past three segments, and `context_assignments` can
+  copy payload values into context. The gate never writes to the request log.
+  A promoted leg result now records the terminal state it came from, shown as
+  `result_final_state` in `koto request get`.
+
+- **The strict reachability check exempts non-overridable gates.** Strict
+  compilation requires that some gate-only transition fires when every gate
+  takes its override value, so that an override can always move a stuck
+  state. No override can apply to an `overridable: false` gate, so transitions
+  referencing one are now left out of that check, and a state whose gate-only
+  transitions all reference one is exempt. Before this, a non-overridable gate
+  routed on values its default can't produce (a `request-leg` gate's
+  `payload.outcome`, or a `context-matches` gate routed only on
+  `matches: false`) could not compile strictly at all, since the
+  `override_default` that would satisfy the check is an error on such a gate.
+  Transitions on overridable gates are checked as before.
+
 - **Transition `context_assignments` now run (koto#204).** A transition can
   write context keys when it fires: literals, `{{VAR}}`,
   `${evidence.<field>}`, and `${gates.<gate>.<path>}` (a dot path into any
