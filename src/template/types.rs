@@ -275,6 +275,18 @@ pub struct Gate {
     /// sessions' template hashes stay valid.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub overridable: bool,
+    /// Request id for `request-leg` gates. May carry `{{VAR}}` references,
+    /// which the tick substitutes before the gate reads the request store.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request: String,
+    /// Leg name for `request-leg` gates. Substituted like `request`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub leg: String,
+    /// Optional expectation set for `request-leg` gates: each key names a
+    /// payload key, and its list holds the scalar values that key may carry
+    /// for the gate to report `valid: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<BTreeMap<String, Vec<serde_json::Value>>>,
 }
 
 impl Gate {
@@ -319,11 +331,18 @@ impl Gate {
             completion: _,
             name_filter,
             overridable: _,
+            request,
+            leg,
+            // `expect` holds literal scalar values compared against a leg's
+            // payload; it carries no references.
+            expect: _,
         } = self;
         let mut fields = vec![
             ("command", command.as_str()),
             ("key", key.as_str()),
             ("pattern", pattern.as_str()),
+            ("request", request.as_str()),
+            ("leg", leg.as_str()),
         ];
         if let Some(filter) = name_filter {
             fields.push(("name_filter", filter.as_str()));
@@ -474,6 +493,22 @@ pub const GATE_TYPE_CONTEXT_EXISTS: &str = "context-exists";
 pub const GATE_TYPE_CONTEXT_MATCHES: &str = "context-matches";
 /// Gate type: check whether all child workflows have reached their completion condition.
 pub const GATE_TYPE_CHILDREN_COMPLETE: &str = "children-complete";
+/// Gate type: read one request leg's disposition and recorded result.
+pub const GATE_TYPE_REQUEST_LEG: &str = "request-leg";
+
+/// Every gate type koto evaluates, in the order error messages list them.
+pub const SUPPORTED_GATE_TYPES: &[&str] = &[
+    GATE_TYPE_COMMAND,
+    GATE_TYPE_CONTEXT_EXISTS,
+    GATE_TYPE_CONTEXT_MATCHES,
+    GATE_TYPE_CHILDREN_COMPLETE,
+    GATE_TYPE_REQUEST_LEG,
+];
+
+/// The object-typed output field of a `request-leg` gate. A `when` clause
+/// routes on a key inside it (`gates.<gate>.payload.<key>`), never on the
+/// object itself.
+pub const REQUEST_LEG_PAYLOAD_FIELD: &str = "payload";
 
 /// Evidence namespace reserved for engine-injected gate output.
 /// Agent submissions starting with this prefix are rejected (Feature 2, R7).
@@ -592,6 +627,10 @@ pub enum GateSchemaFieldType {
     /// compares whole values, which is rarely what an author wants -- route on
     /// the aggregate booleans instead.
     Array,
+    /// JSON-object field. Only `request-leg` produces one (`payload`). A
+    /// `when` clause cannot compare it whole; it routes on a key inside it
+    /// through `gates.<gate>.payload.<key>`.
+    Object,
 }
 
 /// Return the static output field schema for a known gate type.
@@ -633,6 +672,24 @@ pub fn gate_type_schema(gate_type: &str) -> Option<&'static [(&'static str, Gate
             ("children", Array),
             ("error", Str),
         ]),
+        // Must stay in step with `request_leg_output()` in `src/gate.rs`; a
+        // test there asserts every key the evaluator emits is listed here and
+        // the other way round.
+        GATE_TYPE_REQUEST_LEG => Some(&[
+            ("found", Boolean),
+            ("disposition", Str),
+            ("bound", Boolean),
+            ("source", Str),
+            ("status", Str),
+            ("final_state", Str),
+            ("template", Str),
+            ("outcome", Str),
+            ("step", Str),
+            ("reason", Str),
+            ("valid", Boolean),
+            ("payload", Object),
+            ("error", Str),
+        ]),
         _ => None,
     }
 }
@@ -668,8 +725,109 @@ pub fn gate_type_builtin_default(gate_type: &str) -> Option<serde_json::Value> {
             "children": [],
             "error": ""
         })),
+        GATE_TYPE_REQUEST_LEG => Some(request_leg_builtin_default()),
         _ => None,
     }
+}
+
+/// The built-in default for a `request-leg` gate: a resolved, valid record
+/// that names no child outcome. Shared by both default functions so the two
+/// cannot disagree about this type.
+pub fn request_leg_builtin_default() -> serde_json::Value {
+    serde_json::json!({
+        "found": true,
+        "disposition": "resolved",
+        "bound": true,
+        "source": "promoted",
+        "status": "",
+        "final_state": "",
+        "template": "",
+        "outcome": "",
+        "step": "",
+        "reason": "",
+        "valid": true,
+        "payload": {},
+        "error": ""
+    })
+}
+
+/// Validate a `request-leg` gate's declaration.
+///
+/// `request` and `leg` are required. A value with no `{{VAR}}` reference is
+/// checked here against the request store's own id and leg-name rules, the
+/// ones `koto request` applies, so a typo fails compilation rather than
+/// every tick; a value with a reference is checked after substitution, at
+/// tick time, by the evaluator. `expect`, when present, must be a non-empty
+/// map whose every list is non-empty and holds only scalars.
+pub fn validate_request_leg_gate(
+    state_name: &str,
+    gate_name: &str,
+    gate: &Gate,
+) -> Result<(), String> {
+    use crate::engine::request_store::{validate_leg_name, ValidatedRequestId};
+
+    for (field, value) in [("request", &gate.request), ("leg", &gate.leg)] {
+        if value.trim().is_empty() {
+            return Err(format!(
+                "state {:?} gate {:?}: request-leg gate must have a non-empty {}",
+                state_name, gate_name, field
+            ));
+        }
+    }
+    if extract_refs(&gate.request).is_empty() {
+        if let Err(e) = ValidatedRequestId::new(&gate.request) {
+            return Err(format!(
+                "state {:?} gate {:?}: request {:?} is not a valid request id: {}",
+                state_name, gate_name, gate.request, e
+            ));
+        }
+    }
+    if extract_refs(&gate.leg).is_empty() {
+        if let Err(e) = validate_leg_name(&gate.leg) {
+            return Err(format!(
+                "state {:?} gate {:?}: leg {:?} is not a valid leg name: {}",
+                state_name, gate_name, gate.leg, e
+            ));
+        }
+    }
+    if let Some(expect) = &gate.expect {
+        if expect.is_empty() {
+            return Err(format!(
+                "state {:?} gate {:?}: expect must name at least one payload key; \
+                 omit it to accept any object payload",
+                state_name, gate_name
+            ));
+        }
+        for (key, values) in expect {
+            if key.is_empty() {
+                return Err(format!(
+                    "state {:?} gate {:?}: expect has an empty payload key",
+                    state_name, gate_name
+                ));
+            }
+            if values.is_empty() {
+                return Err(format!(
+                    "state {:?} gate {:?}: expect key {:?} must list at least one value",
+                    state_name, gate_name, key
+                ));
+            }
+            if let Some(bad) = values
+                .iter()
+                .find(|v| v.is_array() || v.is_object() || v.is_null())
+            {
+                return Err(format!(
+                    "state {:?} gate {:?}: expect key {:?} lists a non-scalar value {} \
+                     (found: {}); expected values must be strings, numbers, or booleans",
+                    state_name,
+                    gate_name,
+                    key,
+                    bad,
+                    json_type_name(bad)
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Return the lowercase type name of a JSON value (for error messages).
@@ -718,6 +876,7 @@ fn gate_schema_field_type_name(t: &GateSchemaFieldType) -> &'static str {
         GateSchemaFieldType::Str => "string",
         GateSchemaFieldType::Boolean => "boolean",
         GateSchemaFieldType::Array => "array",
+        GateSchemaFieldType::Object => "object",
     }
 }
 
@@ -728,6 +887,7 @@ fn json_value_matches_schema_type(value: &serde_json::Value, t: &GateSchemaField
         GateSchemaFieldType::Str => value.is_string(),
         GateSchemaFieldType::Boolean => value.is_boolean(),
         GateSchemaFieldType::Array => value.is_array(),
+        GateSchemaFieldType::Object => value.is_object(),
     }
 }
 
@@ -969,12 +1129,18 @@ impl CompiledTemplate {
                             }
                         }
                     }
+                    GATE_TYPE_REQUEST_LEG => {
+                        validate_request_leg_gate(state_name, gate_name, gate)?;
+                    }
                     other => {
                         return Err(format!(
-                            "state {:?} gate {:?}: unsupported gate type {:?}. \
+                            "state {:?} gate {:?}: unsupported gate type {:?}; supported types: {}. \
                              Field-based gates have been replaced by accepts/when. \
                              Use accepts blocks for evidence schema and when conditions for routing.",
-                            state_name, gate_name, other
+                            state_name,
+                            gate_name,
+                            other,
+                            SUPPORTED_GATE_TYPES.join(", ")
                         ));
                     }
                 }
@@ -1818,6 +1984,22 @@ impl CompiledTemplate {
 
         let gates_prefix = format!("{}.", GATES_EVIDENCE_NAMESPACE);
 
+        // A transition whose `when` clause references a gate declared
+        // `overridable: false` is left out of the check. D4 asks whether an
+        // override could move the state; no override can ever apply to such a
+        // gate, so its arms fire only on the gate's real output and the
+        // override defaults say nothing about them.
+        let references_non_overridable = |t: &Transition| {
+            t.when.as_ref().is_some_and(|w| {
+                w.keys().any(|k| {
+                    k.strip_prefix(&gates_prefix)
+                        .and_then(|rest| rest.split('.').next())
+                        .and_then(|gate_name| state.gates.get(gate_name))
+                        .is_some_and(|g| !g.overridable)
+                })
+            })
+        };
+
         // Collect pure-gate transitions: `when` clause is non-empty and every key
         // starts with "gates.".
         let pure_gate_transitions: Vec<&Transition> = state
@@ -1828,9 +2010,12 @@ impl CompiledTemplate {
                     !w.is_empty() && w.keys().all(|k| k.starts_with(&gates_prefix))
                 })
             })
+            .filter(|t| !references_non_overridable(t))
             .collect();
 
         // No pure-gate transitions → exempt from the reachability check (AC5, AC6).
+        // That includes a state whose every pure-gate transition references a
+        // non-overridable gate.
         if pure_gate_transitions.is_empty() {
             return Ok(());
         }
@@ -1853,12 +2038,17 @@ impl CompiledTemplate {
         // AC10: warn for schema fields never referenced in any `when` clause.
         for (gate_name, gate) in &state.gates {
             if let Some(schema) = gate_type_schema(&gate.gate_type) {
-                for (field_name, _) in schema {
+                for (field_name, field_type) in schema {
                     let path = format!("{}.{}.{}", GATES_EVIDENCE_NAMESPACE, gate_name, field_name);
-                    let referenced = state
-                        .transitions
-                        .iter()
-                        .any(|t| t.when.as_ref().is_some_and(|w| w.contains_key(&path)));
+                    // An object field is referenced through a key inside it.
+                    let nested = format!("{}.", path);
+                    let referenced = state.transitions.iter().any(|t| {
+                        t.when.as_ref().is_some_and(|w| {
+                            w.contains_key(&path)
+                                || (*field_type == GateSchemaFieldType::Object
+                                    && w.keys().any(|k| k.starts_with(&nested)))
+                        })
+                    });
                     if !referenced {
                         eprintln!(
                             "warning: state {:?} gate {:?} field {:?} is never referenced in any when clause",
@@ -2034,10 +2224,22 @@ impl CompiledTemplate {
             }
 
             // D3: validate gates.* path structure and field references.
+            //
+            // Exactly `gates.<gate>.<field>`, with one exception: a
+            // `request-leg` gate's object-typed `payload` field is routed on
+            // by key, `gates.<gate>.payload.<key>[.<key>...]`. Every other
+            // deeper path keeps today's message.
             for (field, _) in &gate_fields {
-                let segments: Vec<&str> = field.splitn(4, '.').collect();
+                let segments: Vec<&str> = field.split('.').collect();
+                let is_payload_path = segments.len() > 3
+                    && segments[2] == REQUEST_LEG_PAYLOAD_FIELD
+                    && segments[3..].iter().all(|s| !s.is_empty())
+                    && state
+                        .gates
+                        .get(segments[1])
+                        .is_some_and(|g| g.gate_type == GATE_TYPE_REQUEST_LEG);
                 // segments[0] is "gates"; we need exactly 3 segments total.
-                if segments.len() != 3 {
+                if segments.len() != 3 && !is_payload_path {
                     return Err(format!(
                         "state {:?}: when clause key {:?} has invalid format; expected \"gates.<gate>.<field>\"",
                         state_name, field.as_str()
@@ -2068,6 +2270,25 @@ impl CompiledTemplate {
                             field_name_ref,
                             gate.gate_type,
                             valid_fields.join(", ")
+                        ));
+                    }
+                    // An object-typed field is never compared whole: a `when`
+                    // value is a scalar, so the comparison could never hold.
+                    // Route on a key inside it instead.
+                    let is_object_field = schema.iter().any(|(name, t)| {
+                        *name == field_name_ref && *t == GateSchemaFieldType::Object
+                    });
+                    if is_object_field && segments.len() == 3 {
+                        return Err(format!(
+                            "state {:?} transition to {:?}: when clause key {:?} names the object field {:?}, \
+                             which cannot be compared to a scalar value; route on a key inside it, \
+                             such as \"gates.{}.{}.<key>\"",
+                            state_name,
+                            transition.target,
+                            field.as_str(),
+                            field_name_ref,
+                            gate_name_ref,
+                            field_name_ref
                         ));
                     }
                 }
@@ -2331,6 +2552,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -2354,6 +2578,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -2378,6 +2605,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -2466,6 +2696,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -2498,6 +2731,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -2986,6 +3222,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         t.validate(false).unwrap();
@@ -3039,6 +3278,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3076,6 +3318,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         t.validate(false).unwrap();
@@ -3097,6 +3342,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3125,6 +3373,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         t.validate(false).unwrap();
@@ -3155,6 +3406,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3297,6 +3551,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3323,6 +3580,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3369,6 +3629,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3399,6 +3662,9 @@ mod tests {
                     completion: None,
                     name_filter: None,
                     overridable: true,
+                    request: String::new(),
+                    leg: String::new(),
+                    expect: None,
                 },
             );
             let err = t.validate(true).unwrap_err();
@@ -3440,6 +3706,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         state.transitions = vec![Transition {
@@ -3847,6 +4116,9 @@ command: "./check.sh"
             completion: None,
             name_filter: None,
             overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -3861,6 +4133,9 @@ command: "./check.sh"
             completion: None,
             name_filter: None,
             overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -3875,6 +4150,9 @@ command: "./check.sh"
             completion: None,
             name_filter: None,
             overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -4028,12 +4306,9 @@ command: "./check.sh"
     #[test]
     fn gate_type_builtin_default_matches_gate_rs_built_in_default() {
         use crate::gate::built_in_default;
-        for gate_type in &[
-            GATE_TYPE_COMMAND,
-            GATE_TYPE_CONTEXT_EXISTS,
-            GATE_TYPE_CONTEXT_MATCHES,
-            GATE_TYPE_CHILDREN_COMPLETE,
-        ] {
+        // Every supported type, so a type added to the list is covered here
+        // without anyone remembering to add it.
+        for gate_type in SUPPORTED_GATE_TYPES {
             let types_val = gate_type_builtin_default(gate_type)
                 .unwrap_or_else(|| panic!("gate_type_builtin_default missing for {}", gate_type));
             let gate_val = built_in_default(gate_type)
@@ -4066,6 +4341,9 @@ command: "./check.sh"
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         t
@@ -4199,6 +4477,9 @@ command: "./check.sh"
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -4231,6 +4512,9 @@ command: "./check.sh"
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -4297,6 +4581,9 @@ command: "./check.sh"
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -4366,6 +4653,58 @@ command: "./check.sh"
         );
     }
 
+    #[test]
+    fn resolve_gates_path_walks_a_request_leg_payload() {
+        // The same inputs `resolve_value` in src/engine/advance.rs is tested
+        // with (`resolve_value_walks_a_request_leg_payload`), so the two
+        // traversals are held to one answer.
+        let evidence = serde_json::json!({"gates": {"leg": {
+            "outcome": "scoped",
+            "payload": {"outcome": "scoped", "detail": {"kind": "split"}}
+        }}});
+        assert_eq!(
+            resolve_gates_path(&evidence, "gates.leg.payload.outcome"),
+            Some(&serde_json::json!("scoped"))
+        );
+        assert_eq!(
+            resolve_gates_path(&evidence, "gates.leg.payload.detail.kind"),
+            Some(&serde_json::json!("split"))
+        );
+        assert_eq!(
+            resolve_gates_path(&evidence, "gates.leg.payload.missing"),
+            None
+        );
+    }
+
+    #[test]
+    fn gate_type_schema_request_leg() {
+        use GateSchemaFieldType::*;
+        let schema = gate_type_schema(GATE_TYPE_REQUEST_LEG).expect("request-leg schema");
+        let expected: &[(&str, GateSchemaFieldType)] = &[
+            ("found", Boolean),
+            ("disposition", Str),
+            ("bound", Boolean),
+            ("source", Str),
+            ("status", Str),
+            ("final_state", Str),
+            ("template", Str),
+            ("outcome", Str),
+            ("step", Str),
+            ("reason", Str),
+            ("valid", Boolean),
+            ("payload", Object),
+            ("error", Str),
+        ];
+        assert_eq!(schema, expected);
+        // The built-in default satisfies its own schema (D2's rules).
+        let default = gate_type_builtin_default(GATE_TYPE_REQUEST_LEG).unwrap();
+        let obj = default.as_object().unwrap();
+        assert_eq!(obj.len(), schema.len());
+        for (name, t) in schema {
+            assert!(json_value_matches_schema_type(&obj[*name], t), "{name}");
+        }
+    }
+
     // AC4: reachable state (override default satisfies a pure-gate transition) compiles.
     #[test]
     fn reachability_reachable_state_with_override_default() {
@@ -4423,6 +4762,9 @@ command: "./check.sh"
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when_a = BTreeMap::new();
@@ -4482,6 +4824,9 @@ command: "./check.sh"
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut accepts = BTreeMap::new();
@@ -4536,6 +4881,9 @@ command: "./check.sh"
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         // Dead-end transitions (would trigger D4 if D2 didn't block first).
@@ -4629,6 +4977,9 @@ command: "./check.sh"
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         t
@@ -4928,6 +5279,9 @@ command: "./check.sh"
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();
@@ -5108,6 +5462,9 @@ command: "./check.sh"
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();

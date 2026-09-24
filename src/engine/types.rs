@@ -888,6 +888,11 @@ pub enum EventPayload {
         source: LegResultSource,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         issued_by: Option<String>,
+        /// The terminal state a promoted result came from. Set only by
+        /// promotion; absent on explicit and refused results and on events
+        /// written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_state: Option<String>,
     },
     /// A leg the requester stopped waiting on
     /// (wire `type: "request.leg_abandoned"`).
@@ -1622,6 +1627,7 @@ impl<'de> Deserialize<'de> for Event {
                     result: p.result,
                     source: p.source,
                     issued_by: p.issued_by,
+                    final_state: p.final_state,
                 }
             }
             "request.leg_abandoned" => {
@@ -1884,6 +1890,8 @@ struct RequestLegResultPayload {
     source: LegResultSource,
     #[serde(default)]
     issued_by: Option<String>,
+    #[serde(default)]
+    final_state: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3583,6 +3591,7 @@ mod tests {
                     },
                     source: LegResultSource::Promoted,
                     issued_by: None,
+                    final_state: None,
                 },
                 "request.leg_result",
             ),
@@ -3692,6 +3701,7 @@ mod tests {
                     },
                     source,
                     issued_by: Some("child-1".to_string()),
+                    final_state: None,
                 },
             );
             let json = serde_json::to_string(&e).unwrap();

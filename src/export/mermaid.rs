@@ -326,6 +326,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let output = to_mermaid(&t);
@@ -365,6 +368,9 @@ mod tests {
                             completion: None,
                             name_filter: None,
                             overridable: true,
+                            request: String::new(),
+                            leg: String::new(),
+                            expect: None,
                         },
                     );
                     g

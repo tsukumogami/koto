@@ -1945,6 +1945,9 @@ mod tests {
             completion: None,
             name_filter: None,
             overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -1959,6 +1962,9 @@ mod tests {
             completion: None,
             name_filter: None,
             overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -2249,6 +2255,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -2284,6 +2293,9 @@ mod tests {
             completion: None,
             name_filter: None,
             overridable,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         };
         let mut gate_defs = BTreeMap::new();
         gate_defs.insert("locked".to_string(), gate(false));
@@ -2326,6 +2338,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 

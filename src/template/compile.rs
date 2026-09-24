@@ -8,7 +8,7 @@ use super::types::{
     default_failure_policy, ActionDecl, CompiledTemplate, FailurePolicy, FieldSchema, Gate,
     MaterializeChildrenSpec, PollingConfig, TemplateState, Transition, VariableDecl,
     GATE_TYPE_CHILDREN_COMPLETE, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS,
-    GATE_TYPE_CONTEXT_MATCHES,
+    GATE_TYPE_CONTEXT_MATCHES, GATE_TYPE_REQUEST_LEG, SUPPORTED_GATE_TYPES,
 };
 
 /// YAML front-matter structure of a template source file.
@@ -236,6 +236,16 @@ struct SourceGate {
     /// boolean with an error that names the state and gate.
     #[serde(default)]
     overridable: Option<serde_yaml_ng::Value>,
+    /// Request id for `request-leg` gates.
+    #[serde(default)]
+    request: String,
+    /// Leg name for `request-leg` gates.
+    #[serde(default)]
+    leg: String,
+    /// Kept as a raw YAML value so `compile_gate` can reject a malformed
+    /// `expect` with an error that names the state and gate.
+    #[serde(default)]
+    expect: Option<serde_yaml_ng::Value>,
     /// Every key the fields above don't name. `SourceState` uses
     /// `deny_unknown_fields`, but serde's error for it surfaces only as the
     /// outer "failed to parse front-matter" context, which names neither the
@@ -257,6 +267,9 @@ const SOURCE_GATE_KEYS: &[&str] = &[
     "completion",
     "name_filter",
     "overridable",
+    "request",
+    "leg",
+    "expect",
 ];
 
 /// Compile a YAML/Markdown template source file to a FormatVersion=1 CompiledTemplate.
@@ -685,6 +698,9 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 completion: None,
                 name_filter: None,
                 overridable,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             })
         }
         GATE_TYPE_CONTEXT_EXISTS => {
@@ -705,6 +721,9 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 completion: None,
                 name_filter: None,
                 overridable,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             })
         }
         GATE_TYPE_CONTEXT_MATCHES => {
@@ -732,6 +751,9 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 completion: None,
                 name_filter: None,
                 overridable,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             })
         }
         GATE_TYPE_CHILDREN_COMPLETE => {
@@ -768,17 +790,97 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 completion: source.completion.clone(),
                 name_filter: source.name_filter.clone(),
                 overridable,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             })
         }
+        GATE_TYPE_REQUEST_LEG => {
+            let expect = match &source.expect {
+                None => None,
+                Some(raw) => Some(compile_expect(state_name, gate_name, raw)?),
+            };
+            let gate = Gate {
+                gate_type: source.gate_type.clone(),
+                command: String::new(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: source.override_default.clone(),
+                completion: None,
+                name_filter: None,
+                overridable,
+                request: source.request.clone(),
+                leg: source.leg.clone(),
+                expect,
+            };
+            super::types::validate_request_leg_gate(state_name, gate_name, &gate)
+                .map_err(|e| anyhow!(e))?;
+            Ok(gate)
+        }
         other => Err(anyhow!(
-            "state {:?} gate {:?}: unsupported gate type {:?}. \
+            "state {:?} gate {:?}: unsupported gate type {:?}; supported types: {}. \
              Field-based gates (field_not_empty, field_equals) have been replaced by accepts/when. \
              Use accepts blocks for evidence schema and when conditions for routing.",
             state_name,
             gate_name,
-            other
+            other,
+            SUPPORTED_GATE_TYPES.join(", ")
         )),
     }
+}
+
+/// Convert a `request-leg` gate's raw `expect` value into its compiled form.
+///
+/// The shape is a map from payload key to a list of scalar values. Anything
+/// else is refused here, naming the state and gate; emptiness and scalar
+/// checks on the converted map run in `validate_request_leg_gate`, which the
+/// compiled-template validator shares.
+fn compile_expect(
+    state_name: &str,
+    gate_name: &str,
+    raw: &serde_yaml_ng::Value,
+) -> anyhow::Result<BTreeMap<String, Vec<serde_json::Value>>> {
+    let serde_yaml_ng::Value::Mapping(map) = raw else {
+        return Err(anyhow!(
+            "state {:?} gate {:?}: expect must be a map from payload key to a list of values",
+            state_name,
+            gate_name
+        ));
+    };
+    let mut out = BTreeMap::new();
+    for (key, values) in map {
+        let Some(key) = key.as_str() else {
+            return Err(anyhow!(
+                "state {:?} gate {:?}: expect keys must be strings naming payload keys",
+                state_name,
+                gate_name
+            ));
+        };
+        let serde_yaml_ng::Value::Sequence(list) = values else {
+            return Err(anyhow!(
+                "state {:?} gate {:?}: expect key {:?} must map to a list of values, such as [a, b]",
+                state_name,
+                gate_name,
+                key
+            ));
+        };
+        let mut converted = Vec::with_capacity(list.len());
+        for value in list {
+            let json = serde_json::to_value(value).map_err(|e| {
+                anyhow!(
+                    "state {:?} gate {:?}: expect key {:?} has a value that is not valid JSON: {}",
+                    state_name,
+                    gate_name,
+                    key,
+                    e
+                )
+            })?;
+            converted.push(json);
+        }
+        out.insert(key.to_string(), converted);
+    }
+    Ok(out)
 }
 
 /// Split a markdown file into front-matter and body.
@@ -2716,6 +2818,7 @@ Done.
             "        type: context-exists\n        key: some.key\n",
             "        type: context-matches\n        key: some.key\n        pattern: \"^ok$\"\n",
             "        type: children-complete\n",
+            "        type: request-leg\n        request: req-a\n        leg: scope\n",
         ];
         for body in bodies {
             let src = gate_template(&format!("{}        overridable: false\n", body));
@@ -2808,5 +2911,297 @@ Done.
         );
         let f = write_temp(&src);
         compile(f.path(), false).expect("override_default on an overridable gate is fine");
+    }
+
+    // -----------------------------------------------------------------
+    // request-leg gates, payload paths, and D4 for non-overridable gates
+    // -----------------------------------------------------------------
+
+    mod request_leg_gate {
+        use super::*;
+
+        /// A template whose `run` state is `state_yaml` (indented to sit
+        /// under `run:`), with terminals `scoped`, `declined`, `absent`,
+        /// and `other`, and a declared `REQ` variable.
+        fn template(state_yaml: &str) -> String {
+            format!(
+                "---\nname: leg\nversion: \"1.0\"\ninitial_state: run\nvariables:\n  REQ:\n    default: req-a\nstates:\n  run:\n{state_yaml}  scoped:\n    terminal: true\n  declined:\n    terminal: true\n  absent:\n    terminal: true\n  other:\n    terminal: true\n---\n\n## run\n\nRun.\n\n## scoped\n\nScoped.\n\n## declined\n\nDeclined.\n\n## absent\n\nAbsent.\n\n## other\n\nOther.\n"
+            )
+        }
+
+        /// A `run` state with one gate `g` (body indented under `g:`) and
+        /// the given transitions block.
+        fn state(gate_body: &str, transitions: &str) -> String {
+            format!("    gates:\n      g:\n{gate_body}    transitions:\n{transitions}")
+        }
+
+        const LEG_GATE: &str =
+            "        type: request-leg\n        request: \"{{REQ}}\"\n        leg: scope\n";
+        const OUTCOME_ARMS: &str = "      - target: scoped\n        when:\n          gates.g.payload.outcome: scoped\n      - target: declined\n        when:\n          gates.g.payload.outcome: declined\n";
+
+        fn compile_src(src: &str, strict: bool) -> anyhow::Result<CompiledTemplate> {
+            let f = write_temp(src);
+            compile(f.path(), strict)
+        }
+
+        fn err(src: &str, strict: bool) -> String {
+            compile_src(src, strict)
+                .expect_err("template should fail to compile")
+                .to_string()
+        }
+
+        fn non_overridable(body: &str) -> String {
+            format!("{body}        overridable: false\n")
+        }
+
+        #[test]
+        fn a_request_leg_gate_with_request_and_leg_compiles() {
+            let src = template(&state(&non_overridable(LEG_GATE), OUTCOME_ARMS));
+            let compiled = compile_src(&src, true).expect("the /deliver scope_run shape");
+            let gate = &compiled.states["run"].gates["g"];
+            assert_eq!(gate.gate_type, "request-leg");
+            assert_eq!(gate.request, "{{REQ}}");
+            assert_eq!(gate.leg, "scope");
+            let json = serde_json::to_value(gate).unwrap();
+            assert_eq!(json["request"], "{{REQ}}");
+            assert_eq!(json["leg"], "scope");
+            assert!(json.get("expect").is_none());
+        }
+
+        #[test]
+        fn request_and_leg_are_required() {
+            for body in [
+                "        type: request-leg\n        leg: scope\n",
+                "        type: request-leg\n        request: req-a\n",
+                "        type: request-leg\n        request: \"\"\n        leg: scope\n",
+                "        type: request-leg\n        request: req-a\n        leg: \"\"\n",
+            ] {
+                let e = err(&template(&state(body, OUTCOME_ARMS)), false);
+                assert!(
+                    e.contains("\"run\"") && e.contains("\"g\"") && e.contains("non-empty"),
+                    "{e}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_literal_request_or_leg_is_checked_against_the_store_rules() {
+            let e = err(
+                &template(&state(
+                    "        type: request-leg\n        request: Req-A\n        leg: scope\n",
+                    OUTCOME_ARMS,
+                )),
+                false,
+            );
+            assert!(e.contains("not a valid request id"), "{e}");
+            let e = err(
+                &template(&state(
+                    "        type: request-leg\n        request: \"req/../a\"\n        leg: scope\n",
+                    OUTCOME_ARMS,
+                )),
+                false,
+            );
+            assert!(e.contains("not a valid request id"), "{e}");
+            let e = err(
+                &template(&state(
+                    "        type: request-leg\n        request: req-a\n        leg: \"-scope\"\n",
+                    OUTCOME_ARMS,
+                )),
+                false,
+            );
+            assert!(e.contains("not a valid leg name"), "{e}");
+        }
+
+        #[test]
+        fn a_reference_is_checked_for_declaration_not_for_shape() {
+            // Declared: accepted even though `{{REQ}}` is not itself a valid id.
+            compile_src(&template(&state(LEG_GATE, OUTCOME_ARMS)), false).unwrap();
+            // Undeclared: refused, naming the field.
+            let e = err(
+                &template(&state(
+                    "        type: request-leg\n        request: req-a\n        leg: \"{{NOPE}}\"\n",
+                    OUTCOME_ARMS,
+                )),
+                false,
+            );
+            assert!(e.contains("NOPE") && e.contains("'leg'"), "{e}");
+        }
+
+        #[test]
+        fn expect_must_map_keys_to_non_empty_scalar_lists() {
+            let ok = format!("{LEG_GATE}        expect:\n          outcome: [scoped, declined]\n          n: [1, true]\n");
+            let compiled = compile_src(&template(&state(&ok, OUTCOME_ARMS)), false).unwrap();
+            let expect = compiled.states["run"].gates["g"].expect.clone().unwrap();
+            assert_eq!(
+                expect["outcome"],
+                vec![serde_json::json!("scoped"), serde_json::json!("declined")]
+            );
+
+            let bad = [
+                ("        expect: [a]\n", "must be a map"),
+                ("        expect: {}\n", "at least one payload key"),
+                (
+                    "        expect:\n          outcome: scoped\n",
+                    "must map to a list",
+                ),
+                (
+                    "        expect:\n          outcome: []\n",
+                    "at least one value",
+                ),
+                (
+                    "        expect:\n          outcome: [{a: 1}]\n",
+                    "non-scalar value",
+                ),
+                (
+                    "        expect:\n          outcome: [[a]]\n",
+                    "non-scalar value",
+                ),
+            ];
+            for (expect, needle) in bad {
+                let e = err(
+                    &template(&state(&format!("{LEG_GATE}{expect}"), OUTCOME_ARMS)),
+                    false,
+                );
+                assert!(e.contains(needle), "{expect:?}: {e}");
+                assert!(e.contains("\"run\"") && e.contains("\"g\""), "{e}");
+            }
+        }
+
+        #[test]
+        fn a_request_leg_gate_without_routing_gets_d5() {
+            let src = template(&state(LEG_GATE, "      - target: scoped\n"));
+            let e = err(&src, true);
+            assert!(e.contains("has no gates.* routing"), "{e}");
+            compile_src(&src, false).expect("permissive mode only warns");
+        }
+
+        #[test]
+        fn d3_accepts_payload_key_paths_on_a_request_leg_gate() {
+            let arms = "      - target: scoped\n        when:\n          gates.g.payload.outcome: scoped\n      - target: declined\n        when:\n          gates.g.payload.detail.kind: declined\n          gates.g.payload.outcome: declined\n";
+            compile_src(&template(&state(&non_overridable(LEG_GATE), arms)), true)
+                .expect("one or more segments after payload");
+        }
+
+        #[test]
+        fn d3_rejects_the_whole_payload_object() {
+            let arms = "      - target: scoped\n        when:\n          gates.g.payload: scoped\n";
+            let e = err(&template(&state(LEG_GATE, arms)), false);
+            assert!(e.contains("object field \"payload\""), "{e}");
+            // An object value is refused as a non-scalar, as today.
+            let arms = "      - target: scoped\n        when:\n          gates.g.payload:\n            outcome: scoped\n";
+            let e = err(&template(&state(LEG_GATE, arms)), false);
+            assert!(e.contains("must be a scalar"), "{e}");
+        }
+
+        #[test]
+        fn d3_still_rejects_deeper_paths_everywhere_else() {
+            let invalid = "has invalid format; expected \"gates.<gate>.<field>\"";
+            // Under another request-leg field.
+            let arms =
+                "      - target: scoped\n        when:\n          gates.g.status.x: success\n";
+            assert!(err(&template(&state(LEG_GATE, arms)), false).contains(invalid));
+            // An empty segment after payload.
+            let arms = "      - target: scoped\n        when:\n          gates.g.payload..x: a\n";
+            assert!(err(&template(&state(LEG_GATE, arms)), false).contains(invalid));
+            // `payload` on other gate types.
+            for body in [
+                "        type: context-matches\n        key: k\n        pattern: x\n",
+                "        type: command\n        command: \"true\"\n",
+                "        type: children-complete\n",
+            ] {
+                let arms =
+                    "      - target: scoped\n        when:\n          gates.g.payload.outcome: a\n";
+                let e = err(&template(&state(body, arms)), false);
+                assert!(e.contains(invalid), "{body:?}: {e}");
+            }
+        }
+
+        #[test]
+        fn a_mixed_when_clause_with_agent_evidence_compiles() {
+            let src = template(
+                "    accepts:\n      child_returned:\n        type: enum\n        values: [yes, no]\n        required: true\n    gates:\n      scope_leg:\n        type: request-leg\n        request: \"{{REQ}}\"\n        leg: scope\n        overridable: false\n    transitions:\n      - target: absent\n        when:\n          gates.scope_leg.bound: false\n          child_returned: \"yes\"\n      - target: scoped\n        when:\n          gates.scope_leg.bound: true\n          gates.scope_leg.payload.outcome: scoped\n",
+            );
+            compile_src(&src, true).expect("mixed gate and evidence arms compile");
+        }
+
+        // ----- D4 -----
+
+        const D4_ERROR: &str = "no transition fires when all gates use override defaults";
+
+        #[test]
+        fn d4_exempts_arms_on_a_non_overridable_request_leg_gate() {
+            let src = template(&state(&non_overridable(LEG_GATE), OUTCOME_ARMS));
+            compile_src(&src, true).expect("the /deliver scope_run shape passes strict D4");
+        }
+
+        #[test]
+        fn d4_still_fails_the_same_state_when_the_gate_is_overridable() {
+            // The built-in default names no outcome, so nothing fires.
+            let src = template(&state(LEG_GATE, OUTCOME_ARMS));
+            let e = err(&src, true);
+            assert!(e.contains(D4_ERROR), "{e}");
+        }
+
+        #[test]
+        fn an_override_default_on_an_overridable_leg_gate_satisfies_d4() {
+            let body = format!(
+                "{LEG_GATE}        override_default:\n          found: true\n          disposition: resolved\n          bound: true\n          source: promoted\n          status: success\n          final_state: \"\"\n          template: \"\"\n          outcome: scoped\n          step: \"\"\n          reason: \"\"\n          valid: true\n          payload:\n            outcome: scoped\n          error: \"\"\n"
+            );
+            compile_src(&template(&state(&body, OUTCOME_ARMS)), true)
+                .expect("the override default fires the scoped arm");
+        }
+
+        #[test]
+        fn an_override_default_is_schema_checked_including_the_object_payload() {
+            let body = format!(
+                "{LEG_GATE}        override_default:\n          found: true\n          disposition: resolved\n          bound: true\n          source: promoted\n          status: success\n          final_state: \"\"\n          template: \"\"\n          outcome: scoped\n          step: \"\"\n          reason: \"\"\n          valid: true\n          payload: scoped\n          error: \"\"\n"
+            );
+            let e = err(&template(&state(&body, OUTCOME_ARMS)), false);
+            assert!(
+                e.contains("\"payload\"") && e.contains("expected: object"),
+                "{e}"
+            );
+            let body = format!(
+                "{LEG_GATE}        override_default:\n          found: true\n          error: \"\"\n"
+            );
+            let e = err(&template(&state(&body, OUTCOME_ARMS)), false);
+            assert!(e.contains("missing required field"), "{e}");
+        }
+
+        const MATCHES_GATE: &str =
+            "        type: context-matches\n        key: verdict\n        pattern: \"^merged$\"\n";
+        const MATCHES_ARMS: &str =
+            "      - target: other\n        when:\n          gates.g.matches: false\n";
+
+        #[test]
+        fn d4_exempts_arms_on_a_non_overridable_context_matches_gate() {
+            let src = template(&state(&non_overridable(MATCHES_GATE), MATCHES_ARMS));
+            compile_src(&src, true).expect("non-overridable context-matches is exempt");
+        }
+
+        #[test]
+        fn d4_still_fails_the_overridable_context_matches_state() {
+            let src = template(&state(MATCHES_GATE, MATCHES_ARMS));
+            let e = err(&src, true);
+            assert!(e.contains(D4_ERROR), "{e}");
+        }
+
+        #[test]
+        fn d4_still_checks_arms_on_the_overridable_gate_of_a_mixed_state() {
+            // `ci` is overridable and its only arm needs exit_code 1, which
+            // its default (0) never gives; the non-overridable leg gate's
+            // arm is left out of the check and cannot rescue the state.
+            let src = template(
+                "    gates:\n      ci:\n        type: command\n        command: \"true\"\n      leg:\n        type: request-leg\n        request: req-a\n        leg: scope\n        overridable: false\n    transitions:\n      - target: other\n        when:\n          gates.ci.exit_code: 1\n      - target: scoped\n        when:\n          gates.leg.payload.outcome: scoped\n          gates.ci.exit_code: 0\n",
+            );
+            let e = err(&src, true);
+            assert!(e.contains(D4_ERROR), "{e}");
+
+            // With the ci arm firing on its default, the state passes.
+            let src = template(
+                "    gates:\n      ci:\n        type: command\n        command: \"true\"\n      leg:\n        type: request-leg\n        request: req-a\n        leg: scope\n        overridable: false\n    transitions:\n      - target: other\n        when:\n          gates.ci.exit_code: 0\n      - target: scoped\n        when:\n          gates.leg.payload.outcome: scoped\n          gates.ci.exit_code: 1\n",
+            );
+            compile_src(&src, true).expect("the overridable arm fires on its default");
+        }
     }
 }

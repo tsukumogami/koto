@@ -65,6 +65,7 @@ fn resolve(root: &Path, id: &ValidatedRequestId, leg: &str, summary: &str) -> Ap
             source: LegResultSource::Explicit,
             issued_by: Some("coord-a".to_string()),
             timestamp: ts(3),
+            final_state: None,
         },
     )
     .expect("resolve must succeed")
@@ -551,6 +552,7 @@ fn a_second_result_on_a_resolved_leg_is_rejected() {
             source: LegResultSource::Explicit,
             issued_by: None,
             timestamp: ts(7),
+            final_state: None,
         },
     )
     .expect_err("a second result must be rejected");
@@ -597,6 +599,7 @@ fn a_result_on_an_abandoned_leg_is_rejected_distinctly() {
             source: LegResultSource::Promoted,
             issued_by: None,
             timestamp: ts(7),
+            final_state: None,
         },
     )
     .expect_err("a result on an abandoned leg must be rejected");
@@ -1059,6 +1062,7 @@ fn two_simultaneous_resolves_of_one_leg_leave_exactly_one_winner() {
                             source: LegResultSource::Explicit,
                             issued_by: None,
                             timestamp: ts(3),
+                            final_state: None,
                         },
                     )
                 })
@@ -1125,6 +1129,7 @@ fn an_identical_resolve_retry_is_not_a_spurious_second_result_rejection() {
         source: LegResultSource::Explicit,
         issued_by: None,
         timestamp: ts(3),
+        final_state: None,
     };
 
     record_result(root, &id, &payload).expect("first");
@@ -1988,6 +1993,7 @@ fn the_fenced_writes_are_refused_on_a_self_attached_leg_inside_the_store() {
             source: LegResultSource::Explicit,
             issued_by: None,
             timestamp: ts(3),
+            final_state: None,
         },
     )
     .unwrap_err();
@@ -2035,6 +2041,7 @@ fn the_fenced_writes_are_refused_on_a_self_attached_leg_inside_the_store() {
             source: LegResultSource::Promoted,
             issued_by: None,
             timestamp: ts(4),
+            final_state: None,
         },
     )
     .expect("promotion onto a self-attached leg");
@@ -2127,6 +2134,7 @@ fn a_refusal_is_rejected_on_a_bound_resolved_abandoned_or_closed_leg() {
             source: LegResultSource::Explicit,
             issued_by: None,
             timestamp: ts(3),
+            final_state: None,
         },
     )
     .expect("resolve");
@@ -2187,6 +2195,7 @@ fn record_result_cannot_write_the_refused_source() {
             source: LegResultSource::Refused,
             issued_by: None,
             timestamp: ts(3),
+            final_state: None,
         },
     )
     .unwrap_err();

@@ -878,6 +878,7 @@ fn build_gate_condition(
                 "context-exists" => format!("key: {}", gate.key),
                 "context-matches" => format!("key: {}  pattern: {}", gate.key, gate.pattern),
                 "children-complete" => "children: ? complete".to_string(),
+                "request-leg" => format!("request: {}  leg: {}", gate.request, gate.leg),
                 other => format!("type: {}", other),
             };
             return Some(cond);

@@ -72,6 +72,11 @@ pub struct LegView {
     /// session's terminal tick, recorded explicitly, or recorded by koto
     /// when it refused the session that was to answer the leg.
     pub result_source: Option<LegResultSource>,
+    /// The terminal state a promoted result came from, as the promotion
+    /// recorded it. Omitted for explicit and refused results and for
+    /// results promoted before koto recorded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_final_state: Option<String>,
     /// The rationale recorded when the leg was abandoned. Read by the
     /// abandonment notice, which needs the verbatim text.
     pub abandoned_rationale: Option<String>,
@@ -95,6 +100,7 @@ impl LegView {
             bound_template: None,
             result: None,
             result_source: None,
+            result_final_state: None,
             abandoned_rationale: None,
             progress: Vec::new(),
         }
@@ -250,11 +256,13 @@ pub fn project(header: RequestHeader, events: &[Event]) -> Result<RequestView, R
                 leg_name,
                 result,
                 source,
+                final_state,
                 ..
             } => {
                 let leg = leg_mut(&mut view.legs, &request_id, leg_name, event.seq)?;
                 leg.result = Some(result.clone());
                 leg.result_source = Some(*source);
+                leg.result_final_state = final_state.clone();
                 // Abandonment wins if it got there first: the write
                 // path rejects a result on an abandoned leg, so a log
                 // carrying both can only be one written by a build

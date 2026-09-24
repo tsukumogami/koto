@@ -2841,7 +2841,7 @@ fn finish_terminal_tick(
     // crash between them cannot leave a permanently skipped session with
     // a forever-open leg.
     let defer_for_promotion = match &pointer {
-        Some(pointer) => promote_leg_result(pointer, result),
+        Some(pointer) => promote_leg_result(pointer, result, final_state),
         None => false,
     };
 
@@ -2882,10 +2882,14 @@ fn finish_terminal_tick(
 /// **No surviving session directory is required.** The envelope rides by
 /// value and the leg identity came off a pointer already read, so
 /// promotion is unaffected by the cleanup that follows it.
+///
+/// `final_state` is recorded on the promotion so a `request-leg` gate can
+/// report which terminal state answered the leg.
 #[cfg(unix)]
 fn promote_leg_result(
     pointer: &crate::engine::leg_pointer::LegPointer,
     result: &crate::engine::types::WorkflowResult,
+    final_state: &str,
 ) -> bool {
     use crate::engine::request_store::{self, RequestStoreError};
 
@@ -2930,6 +2934,7 @@ fn promote_leg_result(
             source: crate::engine::types::LegResultSource::Promoted,
             issued_by: None,
             timestamp: now_iso8601(),
+            final_state: Some(final_state.to_string()),
         },
     );
     match promotion {
@@ -3292,6 +3297,10 @@ fn substitute_gate_fields(
             g.command = substitute_shell_command(&g.command, runtime_vars, variables, overlay);
             g.key = substitute_plain(&g.key, runtime_vars, variables, overlay);
             g.pattern = substitute_regex_literal(&g.pattern, runtime_vars, variables, overlay);
+            // A request id and leg name are identifiers, not shell words or
+            // patterns; the evaluator validates what substitution produced.
+            g.request = substitute_plain(&g.request, runtime_vars, variables, overlay);
+            g.leg = substitute_plain(&g.leg, runtime_vars, variables, overlay);
             g.name_filter = gate
                 .name_filter
                 .as_deref()
@@ -3432,7 +3441,7 @@ fn handle_next(
     use crate::engine::reentrancy;
     use crate::engine::substitute::Variables;
     use crate::engine::template_source_status::{check_execution_anchor, ExecutionAnchorCheck};
-    use crate::gate::evaluate_gates;
+    use crate::gate::evaluate_gates_with_request_store;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -4651,6 +4660,10 @@ fn handle_next(
     let capture_names = compiled.capture_names().unwrap_or_default();
 
     let session_name = &name;
+    // The request store `request-leg` gates read: the same `~/.koto` root the
+    // leg promotion above writes to. `None` without a home directory, which
+    // the gate reports as an error rather than a pass.
+    let request_root = dirs::home_dir().map(|home| home.join(".koto"));
     let gate_closure =
         |gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
             // Substitute runtime, overlay, and template variables in every
@@ -4659,12 +4672,13 @@ fn handle_next(
             // see what an earlier state in the same tick produced.
             let substituted =
                 substitute_gate_fields(gates, &runtime_vars, &variables, &overlay, &capture_names)?;
-            Ok(evaluate_gates(
+            Ok(evaluate_gates_with_request_store(
                 &substituted,
                 &execution_dir,
                 Some(context_store),
                 Some(session_name),
                 Some(&children_eval),
+                request_root.as_deref(),
             ))
         };
 
@@ -4810,12 +4824,13 @@ fn handle_next(
                 polling,
                 &state_gates,
                 &|gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
-                    crate::gate::evaluate_gates(
+                    evaluate_gates_with_request_store(
                         gates,
                         &execution_dir,
                         Some(context_store),
                         Some(&name),
                         None, // children-complete not needed in polling loop
+                        request_root.as_deref(),
                     )
                 },
                 &shutdown,
@@ -7987,6 +8002,9 @@ Done.
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let substituted =
@@ -8050,6 +8068,9 @@ Done.
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -8119,6 +8140,10 @@ Done.
             // accessor names.
             name_filter: Some("{{TOKEN}}.research.".to_string()),
             overridable: true,
+            // The request-leg identifiers substitute like the rest.
+            request: "req-{{TOKEN}}".to_string(),
+            leg: "{{TOKEN}}-leg".to_string(),
+            expect: None,
         };
         for (field, raw) in authored.substitutable_fields() {
             assert!(
@@ -8279,6 +8304,9 @@ Done.
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -8355,6 +8383,9 @@ Done.
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let expected_command = {

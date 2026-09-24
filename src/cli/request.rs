@@ -1650,6 +1650,7 @@ fn resolve(
             source: LegResultSource::Explicit,
             issued_by,
             timestamp: now_iso8601(),
+            final_state: None,
         },
     )
     .map_err(map_store_error)?;
@@ -2297,6 +2298,7 @@ mod tests {
             bound_template: None,
             result: None,
             result_source: None,
+            result_final_state: None,
             abandoned_rationale: None,
             progress: Vec::new(),
         };

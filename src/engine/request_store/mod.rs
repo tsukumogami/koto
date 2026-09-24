@@ -1616,6 +1616,9 @@ pub struct LegResult {
     pub source: LegResultSource,
     pub issued_by: Option<String>,
     pub timestamp: String,
+    /// The terminal state a promoted result came from; `None` for an
+    /// explicit result.
+    pub final_state: Option<String>,
 }
 
 /// Record a leg's result.
@@ -1648,6 +1651,12 @@ pub fn record_result(
         result: result.result.clone(),
         source: result.source,
         issued_by: result.issued_by.clone(),
+        // Only a promotion comes from a terminal state; an explicit result
+        // names none, whatever the caller passed.
+        final_state: match result.source {
+            LegResultSource::Promoted => result.final_state.clone(),
+            _ => None,
+        },
     };
     let hash = idempotency_hash(&result.leg_name, &payload);
     let probe = IdempotencyProbe {
@@ -1879,6 +1888,7 @@ pub fn record_refusal(
         result: refusal.result.clone(),
         source: LegResultSource::Refused,
         issued_by: refusal.issued_by.clone(),
+        final_state: None,
     };
     let hash = idempotency_hash(&refusal.leg_name, &payload);
     let probe = IdempotencyProbe {

@@ -454,6 +454,9 @@ mod tests {
             completion: None,
             name_filter: None,
             overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -510,6 +513,9 @@ mod tests {
             completion: None,
             name_filter: None,
             overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         };
         let result = resolve_override_applied(None, &gate);
         assert!(result.is_err());
@@ -519,6 +525,33 @@ mod tests {
             "expected 'no override value available' in error, got: {}",
             msg
         );
+    }
+
+    #[test]
+    fn resolve_override_applied_on_a_request_leg_gate_keeps_the_usual_order() {
+        let mut gate = make_command_gate(None);
+        gate.gate_type = "request-leg".to_string();
+        gate.request = "req-a".to_string();
+        gate.leg = "scope".to_string();
+
+        // Built-in default last.
+        let builtin = resolve_override_applied(None, &gate).unwrap();
+        assert_eq!(builtin, built_in_default("request-leg").unwrap());
+        assert_eq!(builtin["disposition"], "resolved");
+
+        // override_default before it.
+        let mut declared = builtin.clone();
+        declared["payload"] = serde_json::json!({"outcome": "scoped"});
+        gate.override_default = Some(declared.clone());
+        assert_eq!(resolve_override_applied(None, &gate).unwrap(), declared);
+
+        // --with-data first.
+        let with_data = resolve_override_applied(
+            Some(r#"{"disposition": "abandoned", "payload": {}}"#),
+            &gate,
+        )
+        .unwrap();
+        assert_eq!(with_data["disposition"], "abandoned");
     }
 
     // ---------------------------------------------------------------------------
@@ -555,6 +588,7 @@ mod tests {
             "context-exists",
             "context-matches",
             "children-complete",
+            "request-leg",
         ] {
             let mut gate = make_command_gate(None);
             gate.gate_type = gate_type.to_string();

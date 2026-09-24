@@ -89,6 +89,9 @@ mod tests {
                             completion: None,
                             name_filter: None,
                             overridable: true,
+                            request: String::new(),
+                            leg: String::new(),
+                            expect: None,
                         },
                     );
                     g

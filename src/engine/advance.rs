@@ -2207,6 +2207,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -2386,6 +2389,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -2482,6 +2488,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -2609,6 +2618,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -2737,6 +2749,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -2850,6 +2865,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -4007,6 +4025,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -4043,6 +4064,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -4173,6 +4197,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -4412,6 +4439,9 @@ mod tests {
             completion: None,
             name_filter: None,
             overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -4886,6 +4916,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -5012,6 +5045,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -5114,6 +5150,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -5242,6 +5281,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -5330,6 +5372,9 @@ mod tests {
                 completion: None,
                 name_filter: None,
                 overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -5691,5 +5736,295 @@ mod tests {
             !fired_via_skip_if(&VariableOverlay::new()),
             "an empty overlay must leave vars.* evaluation exactly as it was"
         );
+    }
+
+    #[test]
+    fn resolve_value_walks_a_request_leg_payload() {
+        // Mirrors `resolve_gates_path_walks_a_request_leg_payload` in
+        // src/template/types.rs: same inputs, same answers.
+        let evidence = serde_json::json!({"gates": {"leg": {
+            "outcome": "scoped",
+            "payload": {"outcome": "scoped", "detail": {"kind": "split"}}
+        }}});
+        assert_eq!(
+            resolve_value(&evidence, "gates.leg.payload.outcome"),
+            Some(&serde_json::json!("scoped"))
+        );
+        assert_eq!(
+            resolve_value(&evidence, "gates.leg.payload.detail.kind"),
+            Some(&serde_json::json!("split"))
+        );
+        assert_eq!(resolve_value(&evidence, "gates.leg.payload.missing"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // request-leg gates driving the advance loop
+    // -----------------------------------------------------------------------
+
+    mod request_leg_routing {
+        use super::*;
+        use crate::engine::request_store::{
+            attach_leg, create_request, record_result, AttachLeg, AttachingSession, LegResult,
+            LegSpec, NewRequest, RequestBounds, ValidatedRequestId,
+        };
+        use crate::engine::types::{
+            LegDeclaration, LegResultSource, TemplateIdentity, TerminalOutcome, WorkflowResult,
+        };
+        use std::io::Write;
+        use std::path::Path;
+
+        const TS: &str = "2026-01-01T00:00:00.000Z";
+
+        fn seed(root: &Path) -> String {
+            let spec = NewRequest {
+                requested_by: "deliver".to_string(),
+                coordinator_of_record: "deliver".to_string(),
+                legs: vec![LegSpec {
+                    name: "scope".to_string(),
+                    declaration: LegDeclaration {
+                        role: "scope".to_string(),
+                        template: "scope.md".into(),
+                        inputs: serde_json::json!("brief"),
+                    },
+                }],
+                inputs: None,
+                created_at: TS.to_string(),
+            };
+            create_request(root, &spec, &RequestBounds::default())
+                .unwrap()
+                .as_str()
+                .to_string()
+        }
+
+        /// Attach a root session to the leg and promote `payload` onto it,
+        /// the path `/scope`'s terminal tick takes.
+        fn promote(root: &Path, req: &str, payload: serde_json::Value) {
+            let id = ValidatedRequestId::new(req).unwrap();
+            attach_leg(
+                root,
+                &id,
+                &AttachLeg {
+                    leg_name: "scope".to_string(),
+                    session: AttachingSession {
+                        session_id: "scope-run".to_string(),
+                        template: Some(TemplateIdentity {
+                            name: Some("scope".to_string()),
+                            hash: "h".to_string(),
+                            source: "scope.md".to_string(),
+                        }),
+                        variables: BTreeMap::new(),
+                        bindings: HashMap::new(),
+                        terminal_state: None,
+                        pointer: None,
+                    },
+                    issued_by: None,
+                    timestamp: TS.to_string(),
+                },
+            )
+            .unwrap();
+            record_result(
+                root,
+                &id,
+                &LegResult {
+                    leg_name: "scope".to_string(),
+                    result: WorkflowResult {
+                        status: TerminalOutcome::Success,
+                        summary: "scoped".to_string(),
+                        payload: Some(payload),
+                    },
+                    source: LegResultSource::Promoted,
+                    issued_by: None,
+                    timestamp: TS.to_string(),
+                    final_state: Some("done".to_string()),
+                },
+            )
+            .unwrap();
+        }
+
+        /// Compile `run_state` (indented under `run:`) as the initial state
+        /// of a template with terminals `scoped`, `declined`, and `absent`,
+        /// strictly, so the fixture is a template authors can actually ship.
+        fn compile_template(run_state: &str) -> CompiledTemplate {
+            let src = format!(
+                "---\nname: deliver\nversion: \"1.0\"\ninitial_state: run\nstates:\n  run:\n{run_state}  scoped:\n    terminal: true\n  declined:\n    terminal: true\n  absent:\n    terminal: true\n---\n\n## run\n\nRun.\n\n## scoped\n\nScoped.\n\n## declined\n\nDeclined.\n\n## absent\n\nAbsent.\n"
+            );
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            f.write_all(src.as_bytes()).unwrap();
+            crate::template::compile::compile(f.path(), true)
+                .unwrap_or_else(|e| panic!("fixture must compile strictly: {e}"))
+        }
+
+        /// The `/deliver` `scope_run` shape: a non-overridable leg gate
+        /// routed on the payload's outcome, copying `pr` into context.
+        fn scope_run(req: &str) -> CompiledTemplate {
+            compile_template(&format!(
+                "    gates:\n      leg:\n        type: request-leg\n        request: {req}\n        leg: scope\n        overridable: false\n    transitions:\n      - target: scoped\n        when:\n          gates.leg.payload.outcome: scoped\n        context_assignments:\n          pr: \"${{gates.leg.payload.pr}}\"\n          kind: \"${{gates.leg.payload.detail.kind}}\"\n          from: \"${{gates.leg.final_state}}\"\n      - target: declined\n        when:\n          gates.leg.payload.outcome: declined\n"
+            ))
+        }
+
+        fn run(
+            template: &CompiledTemplate,
+            root: &Path,
+            evidence: BTreeMap<String, serde_json::Value>,
+        ) -> (AdvanceResult, Vec<EventPayload>) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut appended: Vec<EventPayload> = Vec::new();
+            let mut append = |payload: &EventPayload| -> Result<(), String> {
+                appended.push(payload.clone());
+                Ok(())
+            };
+            let gates = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+                Ok(crate::gate::evaluate_gates_with_request_store(
+                    gates,
+                    dir.path(),
+                    None,
+                    None,
+                    None,
+                    Some(root),
+                ))
+            };
+            let result = advance_until_stop(
+                "run",
+                template,
+                &evidence,
+                &[],
+                &mut append,
+                &gates,
+                &unavailable_integration,
+                &noop_action,
+                &VariableOverlay::new(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            (result, appended)
+        }
+
+        fn transitioned_to(
+            events: &[EventPayload],
+        ) -> Option<(String, Option<BTreeMap<String, String>>)> {
+            events.iter().find_map(|e| match e {
+                EventPayload::Transitioned {
+                    to,
+                    context_assignments,
+                    ..
+                } => Some((to.clone(), context_assignments.clone())),
+                _ => None,
+            })
+        }
+
+        #[test]
+        fn an_open_leg_blocks_then_the_resolved_leg_routes_and_assigns() {
+            let store = tempfile::tempdir().unwrap();
+            let root = store.path();
+            let req = seed(root);
+            let template = scope_run(&req);
+
+            // Open: blocked on the gate, not an unresolvable transition.
+            let (result, events) = run(&template, root, BTreeMap::new());
+            assert_eq!(result.final_state, "run");
+            assert!(!result.advanced);
+            let StopReason::GateBlocked(conditions) = &result.stop_reason else {
+                panic!("expected GateBlocked, got {:?}", result.stop_reason);
+            };
+            assert_eq!(conditions["leg"].outcome, crate::gate::GateOutcome::Failed);
+            assert_eq!(conditions["leg"].output["disposition"], "open");
+            assert!(transitioned_to(&events).is_none());
+            // The blocking condition reads as temporal and not actionable.
+            let blocking = crate::cli::next_types::blocking_conditions_from_gates(
+                conditions,
+                &template.states["run"].gates,
+            );
+            assert_eq!(blocking.len(), 1);
+            assert_eq!(blocking[0].category, "temporal");
+            assert_eq!(blocking[0].condition_type, "request-leg");
+            assert!(!blocking[0].agent_actionable);
+
+            // Resolved: the same state advances down the matching arm, and
+            // the payload values land in the transition's assignments.
+            promote(
+                root,
+                &req,
+                serde_json::json!({
+                    "outcome": "scoped",
+                    "pr": "https://example.test/pr/7",
+                    "detail": {"kind": "split"}
+                }),
+            );
+            let (result, events) = run(&template, root, BTreeMap::new());
+            assert_eq!(result.final_state, "scoped");
+            assert!(matches!(result.stop_reason, StopReason::Terminal));
+            let (to, assignments) = transitioned_to(&events).unwrap();
+            assert_eq!(to, "scoped");
+            let assignments = assignments.expect("the arm assigns context");
+            assert_eq!(assignments["pr"], "https://example.test/pr/7");
+            assert_eq!(assignments["kind"], "split");
+            assert_eq!(assignments["from"], "done");
+        }
+
+        #[test]
+        fn routing_on_payload_outcome_fires_only_on_that_value() {
+            for (payload, expect_state) in [
+                (serde_json::json!({"outcome": "declined"}), "declined"),
+                (serde_json::json!({"outcome": "something-else"}), "run"),
+                (serde_json::json!({"step": "plan"}), "run"),
+            ] {
+                let store = tempfile::tempdir().unwrap();
+                let root = store.path();
+                let req = seed(root);
+                promote(root, &req, payload.clone());
+                let (result, _) = run(&scope_run(&req), root, BTreeMap::new());
+                assert_eq!(result.final_state, expect_state, "payload {payload}");
+                if expect_state == "run" {
+                    // The gate passed but no arm matched: a resolved leg
+                    // with an unknown outcome is not silently routed.
+                    assert!(
+                        matches!(result.stop_reason, StopReason::UnresolvableTransition),
+                        "payload {payload}: {:?}",
+                        result.stop_reason
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_missing_leg_can_route_on_disposition_missing() {
+            let store = tempfile::tempdir().unwrap();
+            let root = store.path();
+            let template = compile_template(
+                "    gates:\n      leg:\n        type: request-leg\n        request: req-never-created\n        leg: scope\n        overridable: false\n    transitions:\n      - target: absent\n        when:\n          gates.leg.disposition: missing\n      - target: scoped\n        when:\n          gates.leg.disposition: resolved\n",
+            );
+            let (result, _) = run(&template, root, BTreeMap::new());
+            assert_eq!(result.final_state, "absent");
+        }
+
+        #[test]
+        fn a_mixed_gate_and_evidence_arm_routes_an_unbound_leg() {
+            let store = tempfile::tempdir().unwrap();
+            let root = store.path();
+            let req = seed(root);
+            let template = compile_template(&format!(
+                "    accepts:\n      child_returned:\n        type: enum\n        values: [\"yes\", \"no\"]\n        required: true\n    gates:\n      scope_leg:\n        type: request-leg\n        request: {req}\n        leg: scope\n        overridable: false\n    transitions:\n      - target: absent\n        when:\n          gates.scope_leg.bound: false\n          child_returned: \"yes\"\n      - target: scoped\n        when:\n          gates.scope_leg.bound: true\n          gates.scope_leg.payload.outcome: scoped\n"
+            ));
+
+            // Unbound and no evidence yet: the agent is asked for it.
+            let (result, _) = run(&template, root, BTreeMap::new());
+            assert_eq!(result.final_state, "run");
+            assert!(matches!(
+                result.stop_reason,
+                StopReason::EvidenceRequired { .. }
+            ));
+
+            // The child returned without ever binding: the absent arm fires.
+            let mut evidence = BTreeMap::new();
+            evidence.insert("child_returned".to_string(), serde_json::json!("yes"));
+            let (result, _) = run(&template, root, evidence.clone());
+            assert_eq!(result.final_state, "absent");
+
+            // Once bound and resolved, the same evidence no longer matches the
+            // absent arm and the outcome arm routes instead.
+            promote(root, &req, serde_json::json!({"outcome": "scoped"}));
+            let (result, _) = run(&template, root, evidence);
+            assert_eq!(result.final_state, "scoped");
+        }
     }
 }
