@@ -117,6 +117,31 @@ Submit evidence with:
 koto next my-workflow --with-data '{"outcome": "approve"}'
 ```
 
+### Fields with a question and value descriptions
+
+A field whose template declares a `decider` block carries two more keys in its
+`expects.fields` entry, in both `koto next` and `koto status`:
+
+```json
+"verdict": {
+  "type": "enum",
+  "required": true,
+  "values": ["proceed", "exit"],
+  "description": "Is the plan outline item clear and scoped enough to implement?",
+  "value_descriptions": {
+    "proceed": "Names a concrete change with checkable criteria.",
+    "exit": "Vague, contradictory, or needs design first."
+  }
+}
+```
+
+- `description` is the question the field answers.
+- `value_descriptions` has one key per entry in `values`, saying what that value
+  means. On a `boolean` field its keys are `"true"` and `"false"`.
+- Submit one of `values` as usual. Neither key adds a value you can submit.
+- Both keys are absent on every other field, even one whose template gives it a
+  description.
+
 ---
 
 ## Scenario (b): evidence_required — gates failed, accepts block also present
@@ -639,6 +664,8 @@ Several fields are conditionally absent rather than `null`. When writing code to
   only for `"capture_failed"`.
 - `options` inside an `expects` object is omitted (not written) when empty, not written
   as `[]`.
+- `description` and `value_descriptions` on an `expects.fields` entry are present only
+  for a field whose template declares a `decider` block. Check for them before reading.
 - `leg` and `leg_abandoned` are absent unless the session is bound to a request leg (and,
   for the second, unless that leg was abandoned). Check for `leg` before reading it — its
   absence means this session has no leg, not that the request is unreachable.

@@ -286,6 +286,79 @@ transitions:
 
 See [evidence-routing-workflow.md](examples/evidence-routing-workflow.md) for a full compilable template using this pattern.
 
+### Decider declarations on accepts fields
+
+An `enum` or `boolean` field can carry a `decider` block that declares the field as a decision a typed decider could answer from the inputs you name. This section covers the block's syntax, its defaults, and the compile rules. Everything lives inside the field, so an older koto that doesn't know the block drops it and treats the field as an ordinary one.
+
+```yaml
+accepts:
+  verdict:
+    type: enum
+    values: [proceed, exit]
+    required: true
+    description: Is the plan outline item clear and scoped enough to implement?
+    decider:
+      answers:
+        proceed: {description: "Names a concrete change with checkable criteria.", threshold: 0.92}
+        exit:    {description: "Vague, contradictory, or needs design first.", mode: never}
+      escape:  {value: unclear, description: "Missing, truncated, or unjudgeable."}
+      inputs:
+        - {context: outline.md, label: outline_item, max_bytes: 12000}
+        - {var: PLAN_DOC, label: plan_path}
+  rationale:
+    type: string
+    required: false
+```
+
+The field's `description` is the question. The block has three keys:
+
+| Key | Meaning |
+|-----|---------|
+| `answers` | One entry per value, keyed by value. On a boolean field the keys are `true` and `false` (bare YAML `true:`/`false:` work). Each entry has a `description` (required), a `mode`, and a `threshold`. |
+| `escape` | Enum fields only, and required there: `{value, description}`. The value the decider gives when the question can't be judged. It must not be in `values`, and no `when` clause may route on it. A boolean field takes no escape. |
+| `inputs` | At least one entry. Each names exactly one of `context: <key>` (a context-store key) or `var: <NAME>` (a declared variable or a `capture_stdout_as` name), plus a `label` that's unique within the field and an optional `max_bytes`. |
+
+Defaults are resolved at compile time. An answer with no `mode` is `shadow`, one with no `threshold` is `0.9`, and an input with no `max_bytes` gets `8192`. Writing a default explicitly compiles to the same thing as leaving it out.
+
+`mode` is one of `off`, `shadow`, `auto`, or `never`. `never` means the value can be asked about but never applied. `threshold` must be a number from 0.5 to 1.0 inclusive.
+
+A `context` input may use `{{VAR}}` references to declared variables or captures, and it has to be a key that some `context-exists` or `context-matches` gate in the template checks. The compiler can't see what a `default_action` writes, so the usual pattern is for the state that produces the key to gate on it:
+
+```yaml
+gather:
+  default_action:
+    command: "koto context add {{SESSION_NAME}} outline.md --from-file outline.md"
+  gates:
+    outline:
+      type: context-exists
+      key: outline.md
+  transitions:
+    - target: review
+      when:
+        gates.outline.exists: true
+```
+
+Neither kind of input can use a runtime name like `SESSION_NAME` or `SESSION_DIR`, and no input can read an environment variable or a file.
+
+The compiler refuses a declaration that breaks any of these rules, with an `E-DECIDER-*` code naming the state, the field, and the value where there is one:
+
+- the block sits on a `string`, `number`, or `tasks` field (`E-DECIDER-FIELD-TYPE`);
+- the field has no `description` (`E-DECIDER-QUESTION`);
+- the `answers` keys differ from `values`, or from `true`/`false` (`E-DECIDER-ANSWERS`);
+- an answer has no `description` (`E-DECIDER-VALUE-DESCRIPTION`);
+- the escape is missing, empty, undescribed, or in `values` on an enum, or present on a boolean (`E-DECIDER-ESCAPE`), or a transition routes on it (`E-DECIDER-ESCAPE-ROUTED`);
+- a `mode` isn't one of the four (`E-DECIDER-MODE`), or a `threshold` is outside 0.5 to 1.0 (`E-DECIDER-THRESHOLD`);
+- an input is missing, unlabelled, duplicated, zero-budget, names both or neither source, or names an undeclared variable, an unusable or ungated context key, or reuses another declared field's label with a different source or budget on the same state (`E-DECIDER-INPUT`);
+- the state has another `required: true` field without a `decider` block (`E-DECIDER-SIBLING-REQUIRED`). Optional siblings, like `rationale` above, are fine.
+
+**The floor.** An answer in `auto` can't take a transition that targets a terminal state, targets a state whose `default_action` has `requires_confirmation: true`, or has a `when` clause that also tests a `gates.*` key. The compiler checks every transition whose `when` tests the field at that value, and it counts `"true"` and `true` alike on a boolean. A violation fails with `E-DECIDER-FLOOR` naming the target state and the rule. Nothing in the template relaxes it, and `--allow-legacy-gates` doesn't either. The only way past it is to take the answer out of `auto`. `shadow`, `never`, and `off` answers aren't floor-checked.
+
+Keys inside the block are strict, so a typo like `thresold:` fails compilation and names the key. The field's own keys stay lenient.
+
+A declared field adds `description` and `value_descriptions` to its `expects` entry in `koto next` and `koto status`. The escape never appears there, and submitting it as evidence is rejected like any other value outside `values`. A template with no `decider` block compiles exactly as before and keeps its `template_hash`.
+
+See `docs/reference/error-codes.md` for each `E-DECIDER-*` message.
+
 ## Layer 3: Advanced features
 
 ### Gates
