@@ -1014,6 +1014,7 @@ mod tests {
                 to: to_state.to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
             "2026-01-01T00:00:01Z",
         )

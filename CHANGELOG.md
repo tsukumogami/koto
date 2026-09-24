@@ -10,6 +10,22 @@ to `0.9.x`).
 
 ### Added
 
+- **Transition `context_assignments` now run (koto#204).** A transition can
+  write context keys when it fires: literals, `{{VAR}}`,
+  `${evidence.<field>}`, and `${gates.<gate>.<path>}` (a dot path into any
+  gate's structured output), alone or inside a string literal. The resolved
+  values are recorded on the `transitioned` event, so they can't be separated
+  from the transition, and a store write that fails afterwards is restored on
+  the next `koto context get`, `koto context exists`, or context gate. An
+  absent evidence field or gate path resolves to the empty string; resolved
+  values are never expanded twice. Until now the compiler dropped these blocks
+  without a word. **Breaking for templates that relied on that:** any
+  transition key other than `target`, `when`, and `context_assignments` now
+  fails compilation, and assignment references are checked against the
+  state's `accepts` fields, gates, and declared variables. The W5 lint no
+  longer warns for a `failure: true` terminal whose every incoming transition
+  assigns `failure_reason`.
+
 - **`koto session rebind` moves a session whose checkout moved.** Execution
   anchoring shipped in 0.12.0 with the enforcement but not the repair: both
   refusals told the user to run `koto session rebind <session> --to <dir>`,

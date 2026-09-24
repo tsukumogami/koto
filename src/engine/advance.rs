@@ -1001,7 +1001,7 @@ where
         if !gate_evidence_map.is_empty() && has_gates_routing {
             merged.insert(
                 "gates".to_string(),
-                serde_json::Value::Object(gate_evidence_map),
+                serde_json::Value::Object(gate_evidence_map.clone()),
             );
         }
         let evidence_value = serde_json::Value::Object(merged);
@@ -1025,14 +1025,14 @@ where
                 // that gates.* when-clauses resolve correctly via dot-path traversal.
                 // conditions_satisfied() already verified the runtime state matches,
                 // so evidence_value contains the right values for routing.
-                match resolve_transition(
+                match resolve_transition_edge(
                     template_state,
                     &evidence_value,
                     false,
                     fresh_evidence,
                     &workflow_variables,
                 ) {
-                    TransitionResolution::Resolved(target) => {
+                    (TransitionResolution::Resolved(target), edge) => {
                         // Cycle detection BEFORE writing the event.
                         if visited.contains(&target) {
                             return Ok(AdvanceResult {
@@ -1041,12 +1041,22 @@ where
                                 stop_reason: StopReason::CycleDetected { state: target },
                             });
                         }
+                        // Resolve the taken edge's context_assignments; they
+                        // ride the same event append as the transition.
+                        let context_assignments = edge_assignments(
+                            template_state,
+                            edge,
+                            &workflow_variables,
+                            &current_evidence,
+                            &gate_evidence_map,
+                        );
                         // Append transitioned event.
                         let payload = EventPayload::Transitioned {
                             from: Some(state.clone()),
                             to: target.clone(),
                             condition_type: "skip_if".to_string(),
                             skip_if_matched: Some(skip_conditions.clone()),
+                            context_assignments,
                         };
                         append_event(&payload).map_err(AdvanceError::PersistenceError)?;
                         visited.insert(target.clone());
@@ -1066,13 +1076,14 @@ where
         }
 
         // 8. Resolve transition
-        match resolve_transition(
+        let (resolution, edge) = resolve_transition_edge(
             template_state,
             &evidence_value,
             gates_failed,
             fresh_evidence,
             &workflow_variables,
-        ) {
+        );
+        match resolution {
             TransitionResolution::Resolved(target) => {
                 // Check for cycle before transitioning
                 if visited.contains(&target) {
@@ -1083,12 +1094,23 @@ where
                     });
                 }
 
+                // Resolve the taken edge's context_assignments; they ride
+                // the same event append as the transition (koto#204).
+                let context_assignments = edge_assignments(
+                    template_state,
+                    edge,
+                    &workflow_variables,
+                    &current_evidence,
+                    &gate_evidence_map,
+                );
+
                 // Append transitioned event
                 let payload = EventPayload::Transitioned {
                     from: Some(state.clone()),
                     to: target.clone(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments,
                 };
                 append_event(&payload).map_err(AdvanceError::PersistenceError)?;
 
@@ -1239,17 +1261,40 @@ pub fn resolve_transition(
     fresh_evidence: bool,
     variables: &std::collections::HashMap<String, String>,
 ) -> TransitionResolution {
+    resolve_transition_edge(
+        template_state,
+        evidence,
+        gate_failed,
+        fresh_evidence,
+        variables,
+    )
+    .0
+}
+
+/// [`resolve_transition`], plus the index of the edge that resolved.
+///
+/// The target alone does not identify an edge: two guarded edges may share a
+/// target and carry different `context_assignments`, and only the taken one's
+/// may be written. The index is `Some` exactly when the resolution is
+/// `Resolved`.
+fn resolve_transition_edge(
+    template_state: &TemplateState,
+    evidence: &serde_json::Value,
+    gate_failed: bool,
+    fresh_evidence: bool,
+    variables: &std::collections::HashMap<String, String>,
+) -> (TransitionResolution, Option<usize>) {
     if template_state.transitions.is_empty() {
-        return TransitionResolution::NoTransitions;
+        return (TransitionResolution::NoTransitions, None);
     }
 
-    let mut conditional_matches: Vec<String> = Vec::new();
-    let mut unconditional_target: Option<String> = None;
+    let mut conditional_matches: Vec<usize> = Vec::new();
+    let mut unconditional_target: Option<usize> = None;
     let mut has_conditional = false;
 
     let evidence_prefix = format!("{}.", EVIDENCE_NAMESPACE);
     let vars_prefix = format!("{}.", VARS_NAMESPACE);
-    for transition in &template_state.transitions {
+    for (index, transition) in template_state.transitions.iter().enumerate() {
         match &transition.when {
             Some(conditions) => {
                 has_conditional = true;
@@ -1282,18 +1327,27 @@ pub fn resolve_transition(
                     resolve_value(evidence, field) == Some(expected)
                 });
                 if all_match {
-                    conditional_matches.push(transition.target.clone());
+                    conditional_matches.push(index);
                 }
             }
             None => {
-                unconditional_target = Some(transition.target.clone());
+                unconditional_target = Some(index);
             }
         }
     }
 
+    let target_of = |index: usize| template_state.transitions[index].target.clone();
     match conditional_matches.len() {
-        1 => TransitionResolution::Resolved(conditional_matches.into_iter().next().unwrap()),
-        n if n > 1 => TransitionResolution::Ambiguous(conditional_matches),
+        1 => (
+            TransitionResolution::Resolved(target_of(conditional_matches[0])),
+            Some(conditional_matches[0]),
+        ),
+        n if n > 1 => (
+            TransitionResolution::Ambiguous(
+                conditional_matches.into_iter().map(target_of).collect(),
+            ),
+            None,
+        ),
         _ => {
             // No conditional match.
             if let Some(fallback) = unconditional_target {
@@ -1305,19 +1359,44 @@ pub fn resolve_transition(
                     //    evidence yet; firing now would silently bypass the directive.
                     //    Pure-routing states (unconditional only) are unaffected because
                     //    has_conditional is false.
-                    TransitionResolution::NeedsEvidence
+                    (TransitionResolution::NeedsEvidence, None)
                 } else {
-                    TransitionResolution::Resolved(fallback)
+                    (
+                        TransitionResolution::Resolved(target_of(fallback)),
+                        Some(fallback),
+                    )
                 }
             } else if has_conditional {
-                TransitionResolution::NeedsEvidence
+                (TransitionResolution::NeedsEvidence, None)
             } else {
                 // All transitions are unconditional (shouldn't happen with valid templates,
                 // but handle gracefully).
-                TransitionResolution::NoTransitions
+                (TransitionResolution::NoTransitions, None)
             }
         }
     }
+}
+
+/// Resolve the `context_assignments` of the edge at `edge`, if any.
+///
+/// `None` when no edge resolved or the edge declares no assignments, so the
+/// `Transitioned` event omits the field.
+fn edge_assignments(
+    template_state: &TemplateState,
+    edge: Option<usize>,
+    variables: &std::collections::HashMap<String, String>,
+    evidence: &BTreeMap<String, serde_json::Value>,
+    gates: &serde_json::Map<String, serde_json::Value>,
+) -> Option<BTreeMap<String, String>> {
+    let transition = template_state.transitions.get(edge?)?;
+    crate::template::assignments::resolve_assignments(
+        transition,
+        &crate::template::assignments::AssignmentInputs {
+            variables,
+            evidence,
+            gates,
+        },
+    )
 }
 
 /// Merge evidence from the current epoch's `evidence_submitted` events.
@@ -1364,6 +1443,7 @@ mod tests {
         Transition {
             target: target.to_string(),
             when: None,
+            context_assignments: Default::default(),
         }
     }
 
@@ -1375,6 +1455,7 @@ mod tests {
         Transition {
             target: target.to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }
     }
 
@@ -1975,6 +2056,7 @@ mod tests {
                 to: "b".to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
             idempotency_hash: None,
         }];
@@ -4282,6 +4364,7 @@ mod tests {
                     to: state.to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -4585,6 +4668,7 @@ mod tests {
                 to: "build-state".to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
         )];
 
@@ -4805,6 +4889,7 @@ mod tests {
                 to: "check-state".to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
         )];
 

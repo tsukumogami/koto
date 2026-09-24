@@ -62,6 +62,7 @@ mod tests {
                             m.insert("route".to_string(), serde_json::json!("build"));
                             m
                         }),
+                        context_assignments: Default::default(),
                     },
                     Transition {
                         target: "investigate".to_string(),
@@ -70,6 +71,7 @@ mod tests {
                             m.insert("route".to_string(), serde_json::json!("investigate"));
                             m
                         }),
+                        context_assignments: Default::default(),
                     },
                 ],
                 terminal: false,
@@ -107,6 +109,7 @@ mod tests {
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 gates: BTreeMap::new(),
@@ -127,6 +130,7 @@ mod tests {
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 gates: BTreeMap::new(),

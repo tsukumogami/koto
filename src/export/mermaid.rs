@@ -100,6 +100,7 @@ mod tests {
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 gates: BTreeMap::new(),
@@ -227,10 +228,12 @@ mod tests {
                     Transition {
                         target: "implement".to_string(),
                         when: Some(when_build),
+                        context_assignments: Default::default(),
                     },
                     Transition {
                         target: "research".to_string(),
                         when: Some(when_investigate),
+                        context_assignments: Default::default(),
                     },
                 ],
                 terminal: false,
@@ -338,6 +341,7 @@ mod tests {
                 transitions: vec![Transition {
                     target: "evaluate".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 gates: {
@@ -381,10 +385,12 @@ mod tests {
                     Transition {
                         target: "implement".to_string(),
                         when: Some(when_build),
+                        context_assignments: Default::default(),
                     },
                     Transition {
                         target: "research".to_string(),
                         when: Some(when_investigate),
+                        context_assignments: Default::default(),
                     },
                 ],
                 terminal: false,
@@ -406,6 +412,7 @@ mod tests {
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 gates: BTreeMap::new(),
@@ -426,6 +433,7 @@ mod tests {
                 transitions: vec![Transition {
                     target: "evaluate".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 gates: BTreeMap::new(),

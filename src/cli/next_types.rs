@@ -1804,10 +1804,12 @@ mod tests {
             Transition {
                 target: "implement".to_string(),
                 when: Some(when_proceed),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "review".to_string(),
                 when: Some(when_escalate),
+                context_assignments: Default::default(),
             },
         ];
 
@@ -1868,6 +1870,7 @@ mod tests {
         let transitions = vec![Transition {
             target: "next_state".to_string(),
             when: None,
+            context_assignments: Default::default(),
         }];
 
         let state = make_template_state(Some(accepts), transitions);
@@ -2133,10 +2136,12 @@ mod tests {
             Transition {
                 target: "path_a".to_string(),
                 when: Some(when),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "fallback".to_string(),
                 when: None,
+                context_assignments: Default::default(),
             },
         ];
 

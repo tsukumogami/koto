@@ -5725,6 +5725,7 @@ mod tests {
                 to: "b".to_string(),
                 condition_type: "gate".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
             idempotency_hash: None,
         }];
@@ -5743,6 +5744,7 @@ mod tests {
                     to: "b".to_string(),
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
                 idempotency_hash: None,
             },
@@ -5766,6 +5768,7 @@ mod tests {
                     to: "b".to_string(),
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
                 idempotency_hash: None,
             },

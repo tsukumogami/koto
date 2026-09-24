@@ -107,16 +107,79 @@ struct SourcePollingConfig {
     timeout_secs: u32,
 }
 
-/// A transition in source YAML: either a bare string or a structured object.
+/// A transition in source YAML:
+/// `{target: "done", when: {field: value}, context_assignments: {key: value}}`.
+///
+/// Unknown keys are collected rather than refused by serde, so the error can
+/// name the state and the target the typo sits on (`compile_transition`). They
+/// used to be dropped silently, which is how every `context_assignments` block
+/// written before koto#204 compiled and never ran.
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum SourceTransition {
-    /// Structured: `{target: "done", when: {field: value}}`
-    Structured {
-        target: String,
-        #[serde(default)]
-        when: Option<HashMap<String, serde_json::Value>>,
-    },
+struct SourceTransition {
+    target: String,
+    #[serde(default)]
+    when: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    context_assignments: Option<HashMap<String, serde_json::Value>>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde_json::Value>,
+}
+
+/// Fields a source transition may declare, for the unknown-field message.
+const SOURCE_TRANSITION_FIELDS: &[&str] = &["target", "when", "context_assignments"];
+
+/// Convert one source transition, refusing unknown keys and non-scalar
+/// assignment values. Reference checks that need the rest of the template
+/// (declared evidence fields, gates, variables) run in
+/// `CompiledTemplate::validate`.
+fn compile_transition(state_name: &str, st: &SourceTransition) -> anyhow::Result<Transition> {
+    if let Some(field) = st.unknown.keys().next() {
+        return Err(anyhow!(
+            "state {:?} transition to {:?}: unknown field {:?}; expected one of: {}",
+            state_name,
+            st.target,
+            field,
+            SOURCE_TRANSITION_FIELDS.join(", ")
+        ));
+    }
+    let mut context_assignments: BTreeMap<String, String> = BTreeMap::new();
+    for (key, value) in st.context_assignments.iter().flatten() {
+        let rendered = match value {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => value.to_string(),
+            serde_json::Value::Null => {
+                return Err(anyhow!(
+                    "state {:?} transition to {:?}: context_assignments {:?} has no value; \
+                     write a string (use \"\" for an empty value)",
+                    state_name,
+                    st.target,
+                    key
+                ));
+            }
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                return Err(anyhow!(
+                    "state {:?} transition to {:?}: context_assignments {:?} must be a string, not {}",
+                    state_name,
+                    st.target,
+                    key,
+                    if value.is_array() {
+                        "a sequence"
+                    } else {
+                        "a mapping"
+                    }
+                ));
+            }
+        };
+        context_assignments.insert(key.clone(), rendered);
+    }
+    Ok(Transition {
+        target: st.target.clone(),
+        when: st
+            .when
+            .as_ref()
+            .map(|w| w.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        context_assignments,
+    })
 }
 
 /// Field schema in source YAML for an `accepts` block.
@@ -206,15 +269,8 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
         let compiled_transitions: Vec<Transition> = source_state
             .transitions
             .iter()
-            .map(|st| match st {
-                SourceTransition::Structured { target, when } => Transition {
-                    target: target.clone(),
-                    when: when
-                        .as_ref()
-                        .map(|w| w.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
-                },
-            })
-            .collect();
+            .map(|st| compile_transition(state_name, st))
+            .collect::<anyhow::Result<_>>()?;
 
         // Transform source accepts to compiled accepts.
         let compiled_accepts: Option<BTreeMap<String, FieldSchema>> =
@@ -2182,5 +2238,169 @@ Done.
         let f = write_temp(src);
         // W-SKIP-GATE-ABSENT is a warning, not an error — compile succeeds.
         compile(f.path(), true).expect("W-SKIP-GATE-ABSENT should warn but not fail compilation");
+    }
+
+    // -------------------------------------------------------------------
+    // koto#204: transition context_assignments
+    // -------------------------------------------------------------------
+
+    /// A two-state template whose `start` state carries `state_extra` (YAML
+    /// at state indentation, e.g. an accepts block) and the `transitions`
+    /// list given, indented under `transitions:`.
+    fn assignment_template(state_extra: &str, transitions: &str) -> String {
+        format!(
+            r#"---
+name: assign
+version: "1.0"
+initial_state: start
+variables:
+  TOPIC:
+    default: t
+states:
+  start:
+{state_extra}    transitions:
+{transitions}
+  done:
+    terminal: true
+---
+
+## start
+
+Work.
+
+## done
+
+Done.
+"#
+        )
+    }
+
+    fn compile_src(src: &str) -> anyhow::Result<CompiledTemplate> {
+        let f = write_temp(src);
+        compile(f.path(), true)
+    }
+
+    const DETAIL_ACCEPTS: &str = "    accepts:\n      detail:\n        type: string\n";
+    const CI_GATE: &str =
+        "    gates:\n      ci:\n        type: command\n        command: \"true\"\n";
+
+    #[test]
+    fn transition_unknown_field_is_refused_naming_state_target_and_field() {
+        let src = assignment_template(
+            "",
+            "      - target: done\n        context_assignment:\n          a: b",
+        );
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(err.contains("\"start\""), "state missing: {err}");
+        assert!(err.contains("\"done\""), "target missing: {err}");
+        assert!(err.contains("context_assignment"), "field missing: {err}");
+    }
+
+    #[test]
+    fn transition_context_assignments_compile_into_the_transition() {
+        let src = assignment_template(
+            &format!("{DETAIL_ACCEPTS}{CI_GATE}"),
+            "      - target: done\n        when:\n          gates.ci.exit_code: 0\n        context_assignments:\n          outcome: landed\n          reason: \"blocked: ${evidence.detail}\"\n          code: ${gates.ci.exit_code}\n          topic: \"{{TOPIC}}\"\n          count: 3",
+        );
+        let t = compile_src(&src).unwrap();
+        let a = &t.states["start"].transitions[0].context_assignments;
+        assert_eq!(a["outcome"], "landed");
+        assert_eq!(a["reason"], "blocked: ${evidence.detail}");
+        assert_eq!(a["code"], "${gates.ci.exit_code}");
+        assert_eq!(a["topic"], "{{TOPIC}}");
+        assert_eq!(a["count"], "3");
+    }
+
+    #[test]
+    fn template_without_assignments_omits_the_field_from_compiled_json() {
+        let src = assignment_template("", "      - target: done");
+        let json = serde_json::to_string(&compile_src(&src).unwrap()).unwrap();
+        assert!(!json.contains("context_assignments"), "got: {json}");
+    }
+
+    #[test]
+    fn assignment_key_must_be_a_usable_context_key() {
+        let src = assignment_template(
+            "",
+            "      - target: done\n        context_assignments:\n          \"bad key\": x",
+        );
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(
+            err.contains("bad key") && err.contains("is not usable"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn assignment_value_must_not_be_a_mapping_or_sequence() {
+        for value in ["{a: b}", "[a, b]"] {
+            let src = assignment_template(
+                "",
+                &format!(
+                    "      - target: done\n        context_assignments:\n          k: {value}"
+                ),
+            );
+            let err = compile_src(&src).unwrap_err().to_string();
+            assert!(err.contains("must be a string"), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn assignment_evidence_field_must_be_declared_in_accepts() {
+        // With an accepts block that lacks the field, and with none at all.
+        for extra in [DETAIL_ACCEPTS, ""] {
+            let src = assignment_template(
+                extra,
+                "      - target: done\n        context_assignments:\n          r: ${evidence.missing}",
+            );
+            let err = compile_src(&src).unwrap_err().to_string();
+            assert!(
+                err.contains("\"start\"")
+                    && err.contains("\"done\"")
+                    && err.contains("\"missing\"")
+                    && err.contains("not declared in accepts"),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_gate_must_be_declared_on_the_state() {
+        let src = assignment_template(
+            "",
+            "      - target: done\n        context_assignments:\n          r: ${gates.ci.exit_code}",
+        );
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(
+            err.contains("references gate \"ci\" which is not declared in this state"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn assignment_variable_must_be_declared() {
+        let src = assignment_template(
+            "",
+            "      - target: done\n        context_assignments:\n          r: \"{{NOPE}}\"",
+        );
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(
+            err.contains("is not declared in the template's variables block"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn assignment_other_namespaces_are_refused() {
+        for reference in ["${context.x}", "${foo.bar}", "${gates.ci}"] {
+            let src = assignment_template(
+                CI_GATE,
+                &format!(
+                    "      - target: done\n        when:\n          gates.ci.exit_code: 0\n        context_assignments:\n          r: \"{reference}\""
+                ),
+            );
+            let err = compile_src(&src).unwrap_err().to_string();
+            assert!(err.contains("unsupported reference"), "{reference}: {err}");
+        }
     }
 }

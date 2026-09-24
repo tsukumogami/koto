@@ -1454,6 +1454,7 @@ pub fn run(app: App) -> Result<()> {
                     key,
                     to_file,
                 } => {
+                    context::restore_assigned(store, &backend, &session, &key);
                     if let Err(e) = context::handle_get(store, &session, &key, to_file.as_deref()) {
                         exit_with_error_code(
                             serde_json::json!({
@@ -1470,6 +1471,7 @@ pub fn run(app: App) -> Result<()> {
                     // caller that branches on success-versus-failure is
                     // unaffected; exit 2 is "not a key at all", which koto
                     // already uses for input the caller must fix.
+                    context::restore_assigned(store, &backend, &session, &key);
                     match context::handle_exists(store, &session, &key) {
                         context::KeyPresence::Present => std::process::exit(0),
                         context::KeyPresence::Absent => std::process::exit(1),
@@ -4451,11 +4453,42 @@ fn handle_next(
     let epoch_events = derive_evidence(&current_events);
     let evidence = merge_epoch_evidence(&epoch_events.into_iter().cloned().collect::<Vec<_>>());
 
+    // Repair any transition `context_assignments` an earlier tick recorded
+    // but did not get into the store, before a context gate reads it
+    // (koto#204). Non-fatal: the log still holds the value and the next read
+    // tries again.
+    if let Err(e) =
+        crate::engine::context_assign::reconcile(context_store, &name, &current_events, None)
+    {
+        eprintln!("warning: failed to restore assigned context values: {}", e);
+    }
+
     // 9. Set up I/O closures and run advancement loop.
+    //
+    // A `Transitioned` event carrying `context_assignments` is appended first
+    // and then projected into the context store. The append is the commit
+    // point; a store write that fails here is repaired from the log on the
+    // next read, so it is reported rather than failing the tick.
     let mut append_closure = |payload: &EventPayload| -> Result<(), String> {
         backend
             .append_event(&name, payload, &now_iso8601())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if let EventPayload::Transitioned {
+            context_assignments: Some(assignments),
+            ..
+        } = payload
+        {
+            if let Err(e) =
+                crate::engine::context_assign::write_assignments(context_store, &name, assignments)
+            {
+                eprintln!(
+                    "warning: transition recorded, but writing its context_assignments failed: {}; \
+                     the next read restores them from the log",
+                    e
+                );
+            }
+        }
+        Ok(())
     };
 
     // Build the children-complete gate evaluator closure. It captures the

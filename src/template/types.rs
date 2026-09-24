@@ -171,6 +171,20 @@ pub struct Transition {
     pub target: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<BTreeMap<String, serde_json::Value>>,
+    /// Context writes that land with this transition (koto#204).
+    ///
+    /// Maps a context key to a value template: a literal, `{{VAR}}`,
+    /// `${evidence.<field>}` or `${gates.<gate>.<path>}`, with references
+    /// allowed inside a string literal. The engine resolves the values when
+    /// the transition fires, records them on the `Transitioned` event, and
+    /// writes them to the session's context store. `crate::template::assignments`
+    /// owns the reference grammar.
+    ///
+    /// Omitted from the compiled JSON when empty, so a template without
+    /// assignments compiles byte-identically to one built before the field
+    /// existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub context_assignments: BTreeMap<String, String>,
 }
 
 /// Schema for an evidence field declared in an `accepts` block.
@@ -1103,6 +1117,17 @@ impl CompiledTemplate {
             // Validate evidence routing rules on transitions (D3 included).
             self.validate_evidence_routing(state_name, state, &captures)?;
 
+            // Validate transition context_assignments (koto#204).
+            for transition in &state.transitions {
+                super::assignments::validate_transition_assignments(
+                    state_name,
+                    state,
+                    transition,
+                    &self.variables,
+                    &captures,
+                )?;
+            }
+
             // Validate variable references in directives.
             for ref_name in extract_refs(&state.directive) {
                 if !self.variables.contains_key(&ref_name)
@@ -1475,7 +1500,7 @@ impl CompiledTemplate {
     /// | W2 | `children-complete.name_filter` is set but does not end with `.` (ergo not scoped to one parent) |
     /// | W3 | Terminal state whose name matches /block|fail|error/ lacks `failure: true` |
     /// | W4 | State with `materialize_children` routes only on `all_complete: true` without a second transition handling failures |
-    /// | W5 | Terminal state with `failure: true` has no path writing `failure_reason` to context (v1 only checks the accepts-field path; templates relying on `default_action` or `context_assignments` may see false positives until those surfaces are checked) |
+    /// | W5 | Terminal state with `failure: true` has no path writing `failure_reason` to context: no accepts field and no `context_assignments` entry on every incoming transition (a `default_action` write is not detected, so templates relying on it may see false positives) |
     ///
     /// Warnings are returned as formatted strings; callers emit them via
     /// stderr (`validate`) or collect them for tests.
@@ -1620,17 +1645,17 @@ impl CompiledTemplate {
         // context key can land:
         //   (a) the state's `accepts` block declares a `failure_reason` field
         //   (b) the state's `default_action` writes `failure_reason`
-        //   (c) an upstream transition carries a `context_assignments`
+        //   (c) the transitions into the state carry a `context_assignments`
         //       entry writing `failure_reason`
         //
-        // Neither `default_action` nor `context_assignments` carry schema
-        // metadata today (the runtime context-assignment surface lands
-        // in a later phase), so for now we check (a) only. A future PR
-        // extends this check once (b)/(c) have stable representations;
-        // until then W5 over-warns on templates that rely on (b)/(c).
+        // (a) and (c) are checked. (c) credits the state only when every
+        // incoming edge assigns the key: a single edge that doesn't is a path
+        // reaching the terminal with no reason. A terminal no edge reaches is
+        // not credited by (c).
         //
-        // TODO(issue-8/W5): widen the check once default_action and
-        // context_assignments expose a writable-keys surface.
+        // TODO(issue-8/W5): (b) is still unchecked. A default_action is a
+        // shell command with no declared set of keys it writes, so W5 can
+        // over-warn on templates that rely on it.
         for (state_name, state) in &self.states {
             if !(state.terminal && state.failure) {
                 continue;
@@ -1639,11 +1664,21 @@ impl CompiledTemplate {
                 .accepts
                 .as_ref()
                 .is_some_and(|a| a.contains_key("failure_reason"));
-            if !has_failure_reason_accepts {
+            let incoming: Vec<&Transition> = self
+                .states
+                .values()
+                .flat_map(|s| s.transitions.iter())
+                .filter(|t| &t.target == state_name)
+                .collect();
+            let every_edge_assigns = !incoming.is_empty()
+                && incoming
+                    .iter()
+                    .all(|t| t.context_assignments.contains_key("failure_reason"));
+            if !has_failure_reason_accepts && !every_edge_assigns {
                 warnings.push(format!(
                     "W5: state {:?}: `failure: true` terminal state has no declared path writing the `failure_reason` context key; \
                      the batch view's per-child `reason` will fall back to the state name\n  \
-                     remedy: add `failure_reason` to the state's accepts block (or write it via default_action / context_assignments)",
+                     remedy: add `failure_reason` to the state's accepts block, or assign it in context_assignments on every transition into the state",
                     state_name
                 ));
             }
@@ -2075,6 +2110,7 @@ mod tests {
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 gates: BTreeMap::new(),
@@ -2282,6 +2318,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -2294,6 +2331,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(BTreeMap::new()),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(err.contains("when block must not be empty"), "got: {}", err);
@@ -2308,6 +2346,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2337,6 +2376,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(err.contains("not declared in accepts"), "got: {}", err);
@@ -2365,6 +2405,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         assert!(
             t.validate(true).is_ok(),
@@ -2398,10 +2439,12 @@ mod tests {
             Transition {
                 target: "done".to_string(),
                 when: Some(when_pass),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "fix".to_string(),
                 when: Some(when_fail),
+                context_assignments: Default::default(),
             },
         ];
         // Add the "fix" terminal state so the template is valid.
@@ -2439,6 +2482,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -2461,6 +2505,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(err.contains("must be a scalar"), "got: {}", err);
@@ -2486,6 +2531,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(err.contains("must be a scalar"), "got: {}", err);
@@ -2511,6 +2557,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(err.contains("not in allowed values"), "got: {}", err);
@@ -2609,10 +2656,12 @@ mod tests {
             Transition {
                 target: "done".to_string(),
                 when: Some(when_a),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "other".to_string(),
                 when: Some(when_b),
+                context_assignments: Default::default(),
             },
         ];
         let err = t.validate(true).unwrap_err();
@@ -2662,10 +2711,12 @@ mod tests {
             Transition {
                 target: "done".to_string(),
                 when: Some(when_a),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "other".to_string(),
                 when: Some(when_b),
+                context_assignments: Default::default(),
             },
         ];
         let err = t.validate(true).unwrap_err();
@@ -2715,10 +2766,12 @@ mod tests {
             Transition {
                 target: "done".to_string(),
                 when: Some(when_a),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "other".to_string(),
                 when: Some(when_b),
+                context_assignments: Default::default(),
             },
         ];
         t.validate(true).unwrap();
@@ -2777,10 +2830,12 @@ mod tests {
             Transition {
                 target: "done".to_string(),
                 when: Some(when_a),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "other".to_string(),
                 when: Some(when_b),
+                context_assignments: Default::default(),
             },
         ];
         // Exclusive on priority even though decision overlaps.
@@ -2807,6 +2862,7 @@ mod tests {
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -3303,6 +3359,7 @@ mod tests {
                 "gates.review.matches".to_string(),
                 serde_json::json!(true),
             )])),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -3930,6 +3987,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -3953,6 +4011,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -3976,6 +4035,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -3998,6 +4058,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -4022,6 +4083,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -4052,6 +4114,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -4082,6 +4145,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -4107,6 +4171,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -4151,10 +4216,12 @@ command: "./check.sh"
             Transition {
                 target: "done".to_string(),
                 when: Some(when_pass),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "fix".to_string(),
                 when: Some(when_fail),
+                context_assignments: Default::default(),
             },
         ];
         t.states.insert(
@@ -4267,10 +4334,12 @@ command: "./check.sh"
             Transition {
                 target: "done".to_string(),
                 when: Some(when_a),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "fix".to_string(),
                 when: Some(when_b),
+                context_assignments: Default::default(),
             },
         ];
         t.states.insert(
@@ -4332,6 +4401,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
     }
@@ -4381,10 +4451,12 @@ command: "./check.sh"
             Transition {
                 target: "done".to_string(),
                 when: Some(when_a),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "fix".to_string(),
                 when: Some(when_b),
+                context_assignments: Default::default(),
             },
         ];
         t.states.insert(
@@ -4760,6 +4832,7 @@ command: "./check.sh"
             transitions: vec![Transition {
                 target: "done".to_string(),
                 when: Some(when),
+                context_assignments: Default::default(),
             }],
             terminal: false,
             gates,
@@ -4939,6 +5012,7 @@ command: "./check.sh"
             transitions: vec![Transition {
                 target: "done".to_string(),
                 when: Some(when),
+                context_assignments: Default::default(),
             }],
             terminal: false,
             gates: gates2,
@@ -4984,6 +5058,7 @@ command: "./check.sh"
         t.states.get_mut("plan").unwrap().transitions = vec![Transition {
             target: "done".to_string(),
             when: None,
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(err.starts_with("E10:"), "got: {}", err);
@@ -5002,6 +5077,7 @@ command: "./check.sh"
         t.states.get_mut("plan").unwrap().transitions = vec![Transition {
             target: "done".to_string(),
             when: None,
+            context_assignments: Default::default(),
         }];
         let warnings = t.collect_materialize_children_warnings();
         assert!(
@@ -5150,6 +5226,7 @@ command: "./check.sh"
             .push(Transition {
                 target: "done".to_string(),
                 when: Some(failure_when),
+                context_assignments: Default::default(),
             });
         let warnings = t.collect_materialize_children_warnings();
         assert!(
@@ -5222,6 +5299,79 @@ command: "./check.sh"
         );
     }
 
+    /// A template with a `failure: true` terminal `failed` reached from two
+    /// states, `a` and `b`; `assigns` says which of the two edges assign
+    /// `failure_reason`.
+    fn w5_template_with_edges(assigns: [bool; 2]) -> CompiledTemplate {
+        let mut t = minimal_batch_parent();
+        let failed = TemplateState {
+            directive: "Failed.".to_string(),
+            details: String::new(),
+            transitions: vec![],
+            terminal: true,
+            gates: BTreeMap::new(),
+            accepts: None,
+            integration: None,
+            default_action: None,
+            materialize_children: None,
+            failure: true,
+            skipped_marker: false,
+            skip_if: None,
+        };
+        t.states.insert("failed".to_string(), failed);
+        for (name, assign) in ["a", "b"].iter().zip(assigns) {
+            let mut context_assignments = BTreeMap::new();
+            if assign {
+                context_assignments.insert("failure_reason".to_string(), "broke".to_string());
+            }
+            t.states.insert(
+                name.to_string(),
+                TemplateState {
+                    directive: "Work.".to_string(),
+                    details: String::new(),
+                    transitions: vec![Transition {
+                        target: "failed".to_string(),
+                        when: None,
+                        context_assignments,
+                    }],
+                    terminal: false,
+                    gates: BTreeMap::new(),
+                    accepts: None,
+                    integration: None,
+                    default_action: None,
+                    materialize_children: None,
+                    failure: false,
+                    skipped_marker: false,
+                    skip_if: None,
+                },
+            );
+        }
+        t
+    }
+
+    #[test]
+    fn w5_quiet_when_every_incoming_edge_assigns_failure_reason() {
+        let warnings = w5_template_with_edges([true, true]).collect_materialize_children_warnings();
+        assert!(
+            !warnings.iter().any(|w| w.starts_with("W5:")),
+            "W5 should be quiet when every edge assigns failure_reason; got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn w5_warns_when_one_incoming_edge_does_not_assign_failure_reason() {
+        let warnings =
+            w5_template_with_edges([true, false]).collect_materialize_children_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("W5:") && w.contains("\"failed\"")),
+            "expected W5 for the edge without failure_reason, got: {:?}",
+            warnings
+        );
+    }
+
     // ---------------------------------------------------------------------
     // Issue #11: when-clause evidence.<field>: present matcher (compile)
     // ---------------------------------------------------------------------
@@ -5253,6 +5403,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         assert!(
             t.validate(true).is_ok(),
@@ -5274,6 +5425,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -5293,6 +5445,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -5327,6 +5480,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
 
         // Validation succeeds (W6 is non-fatal).
@@ -5359,6 +5513,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
         let warnings = t.collect_when_clause_warnings();
@@ -5387,6 +5542,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         t.validate(true).unwrap();
         let warnings = t.collect_when_clause_warnings();
@@ -5467,6 +5623,7 @@ command: "./check.sh"
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 ..Default::default()
@@ -5487,10 +5644,12 @@ command: "./check.sh"
             Transition {
                 target: "done".to_string(),
                 when: Some(when_set),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "alt".to_string(),
                 when: Some(when_unset),
+                context_assignments: Default::default(),
             },
         ];
         assert!(
@@ -5508,6 +5667,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -5529,6 +5689,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -5550,6 +5711,7 @@ command: "./check.sh"
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 ..Default::default()
@@ -5570,10 +5732,12 @@ command: "./check.sh"
             Transition {
                 target: "done".to_string(),
                 when: Some(when_set),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "alt".to_string(),
                 when: Some(when_unset),
+                context_assignments: Default::default(),
             },
         ];
         assert!(
@@ -5594,6 +5758,7 @@ command: "./check.sh"
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 ..Default::default()
@@ -5614,10 +5779,12 @@ command: "./check.sh"
             Transition {
                 target: "done".to_string(),
                 when: Some(when_a),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "alt".to_string(),
                 when: Some(when_b),
+                context_assignments: Default::default(),
             },
         ];
         let err = t.validate(true).unwrap_err();
@@ -5639,6 +5806,7 @@ command: "./check.sh"
         state.transitions = vec![Transition {
             target: "done".to_string(),
             when: Some(when),
+            context_assignments: Default::default(),
         }];
         assert!(
             t.validate(true).is_ok(),

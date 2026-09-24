@@ -505,6 +505,18 @@ pub enum EventPayload {
         /// pre-feature JSONL files round-trip without modification.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skip_if_matched: Option<BTreeMap<String, serde_json::Value>>,
+        /// The transition's `context_assignments`, resolved when it fired
+        /// (koto#204): context key to the value written.
+        ///
+        /// Recording them here is what makes the write atomic with the
+        /// transition: the event is the durable record, and the context store
+        /// is brought up to date from it -- right after the append, and again
+        /// on the next read if that write did not land
+        /// (`crate::engine::context_assign`).
+        ///
+        /// Additive field: omitted when `None` so pre-feature logs round-trip.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_assignments: Option<BTreeMap<String, String>>,
     },
     EvidenceSubmitted {
         state: String,
@@ -1244,6 +1256,7 @@ impl<'de> Deserialize<'de> for Event {
                     to: p.to,
                     condition_type: p.condition_type,
                     skip_if_matched: p.skip_if_matched,
+                    context_assignments: p.context_assignments,
                 }
             }
             "evidence_submitted" => {
@@ -1516,6 +1529,8 @@ struct TransitionedPayload {
     condition_type: String,
     #[serde(default)]
     skip_if_matched: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default)]
+    context_assignments: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -2216,6 +2231,7 @@ mod tests {
                 to: "gather".to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
             idempotency_hash: None,
         };
@@ -2225,12 +2241,54 @@ mod tests {
     }
 
     #[test]
+    fn event_transitioned_with_context_assignments_round_trips() {
+        let mut assignments = BTreeMap::new();
+        assignments.insert("outcome".to_string(), "landed".to_string());
+        assignments.insert("reason".to_string(), "{{TOPIC}}".to_string());
+        let e = Event {
+            seq: 3,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "transitioned".to_string(),
+            payload: EventPayload::Transitioned {
+                from: Some("work".to_string()),
+                to: "done".to_string(),
+                condition_type: "auto".to_string(),
+                skip_if_matched: None,
+                context_assignments: Some(assignments),
+            },
+            idempotency_hash: None,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"context_assignments\""), "got: {json}");
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, parsed);
+    }
+
+    #[test]
+    fn event_transitioned_without_context_assignments_matches_the_old_shape() {
+        // A line as the base commit wrote it: no context_assignments key.
+        let old = r#"{"seq":2,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":null,"to":"gather","condition_type":"auto"}}"#;
+        let parsed: Event = serde_json::from_str(old).unwrap();
+        match &parsed.payload {
+            EventPayload::Transitioned {
+                context_assignments,
+                ..
+            } => assert!(context_assignments.is_none()),
+            other => panic!("expected Transitioned, got {other:?}"),
+        }
+        // And an event without assignments serializes without the key.
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(!json.contains("context_assignments"), "got: {json}");
+    }
+
+    #[test]
     fn event_payload_type_name() {
         let p = EventPayload::Transitioned {
             from: Some("a".to_string()),
             to: "b".to_string(),
             condition_type: "auto".to_string(),
             skip_if_matched: None,
+            context_assignments: None,
         };
         assert_eq!(p.type_name(), "transitioned");
 

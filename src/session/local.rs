@@ -1556,6 +1556,7 @@ mod tests {
                     to: "start".to_string(),
                     condition_type: "initial".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
                 idempotency_hash: None,
             },
