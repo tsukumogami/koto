@@ -146,6 +146,12 @@ the same shape as any other response. Nothing new appears in the response, so
 keep dispatching on `action`. If koto consulted the decider but didn't apply its
 answer, you get the ordinary `evidence_required` for the declared state and
 submit evidence as usual; your evidence always wins over the decider's.
+
+koto records each consultation, and the declared fields of the evidence you
+then submit, in the user's decider ledger (`~/.koto/_decider_ledger.jsonl`), so
+the template's author can compare the decider's answers with yours. A
+`warning: decider ledger write failed (...)` line on stderr means that record
+was lost; the response and exit code are unaffected, so carry on.
 - Submit one of `values` as usual. Neither key adds a value you can submit.
 - Both keys are absent on every other field, even one whose template gives it a
   description.

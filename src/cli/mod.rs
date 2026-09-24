@@ -4390,6 +4390,26 @@ fn handle_next(
                 let json = serde_json::json!({"error": ne});
                 exit_with_error_code(json, ne.code.exit_code());
             }
+
+            // The decider ledger's `answered` record: the agent's answer on
+            // a visit whose consultation wasn't applied, paired with it by
+            // `visit_seq`. Written whatever the decider mode is now, so a
+            // user who turned the decider off still completes the pair. A
+            // failed write is one warning and nothing more.
+            if let Some(record) = crate::cli::decider_port::answered_record(
+                &name,
+                Some(header.session_id.as_str()),
+                &events,
+                current_state,
+                accepts,
+                data.as_object()
+                    .expect("validate_evidence guarantees object input"),
+            ) {
+                crate::decider::ledger::append_or_warn(
+                    dirs::home_dir().map(|h| h.join(".koto")).as_deref(),
+                    &record,
+                );
+            }
         }
     }
 
@@ -4752,6 +4772,7 @@ fn handle_next(
                     Box::new(render_for_decider),
                     full,
                 )
+                .with_ledger_root(dirs::home_dir().map(|h| h.join(".koto")))
             })
         } else {
             None

@@ -322,6 +322,8 @@ Defaults are resolved at compile time. An answer with no `mode` is `shadow`, one
 
 `mode` is one of `off`, `shadow`, `auto`, or `never`. `never` means the value can be asked about but never applied. `threshold` must be a number from 0.5 to 1.0 inclusive.
 
+For users who opt in, every consultation and every agent answer to a consultation koto didn't apply is appended to `~/.koto/_decider_ledger.jsonl`, keyed by the field's declaration hash. That ledger survives session cleanup and is the evidence for moving a value from `shadow` to `auto`. Changing a question, a value or escape description, or an input's `max_bytes` changes the hash, so evidence gathered under the old wording doesn't count toward the new one.
+
 A `context` input may use `{{VAR}}` references to declared variables or captures, and it has to be a key that some `context-exists` or `context-matches` gate in the template checks. The compiler can't see what a `default_action` writes, so the usual pattern is for the state that produces the key to gate on it:
 
 ```yaml

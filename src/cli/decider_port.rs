@@ -13,6 +13,10 @@
 //!    variable bindings, within its byte budget;
 //! 5. calls the provider and times it.
 //!
+//! When the engine reports the `decider_consulted` append through
+//! [`DeciderPort::recorded`], the port writes the ledger's `consulted`
+//! record, still under the lock.
+//!
 //! Any failure before the provider call (lock, read, left the state,
 //! already consulted) is a [`ConsultReply::Skipped`], which the engine
 //! turns into the opted-out response. An input problem is recorded as
@@ -25,6 +29,8 @@ use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
+use crate::decider::ledger::{append_or_warn, LedgerRecord};
+use crate::decider::record::ConsultationOutcome;
 use crate::decider::request::{build_request, DeclaredField};
 use crate::decider::types::{Decider, LabelledInput, SettingOrigin};
 use crate::engine::decider::{
@@ -71,6 +77,7 @@ pub struct CliDeciderPort<'a> {
     full: bool,
     session_id: Option<String>,
     recorded: usize,
+    ledger_root: Option<PathBuf>,
 }
 
 impl<'a> CliDeciderPort<'a> {
@@ -96,7 +103,16 @@ impl<'a> CliDeciderPort<'a> {
             full,
             session_id: None,
             recorded: 0,
+            ledger_root: None,
         }
+    }
+
+    /// Write `consulted` records to the ledger under `koto_root`
+    /// (`~/.koto`). `None` means there is no home directory: each record
+    /// then produces a warning instead of a line.
+    pub fn with_ledger_root(mut self, koto_root: Option<PathBuf>) -> Self {
+        self.ledger_root = koto_root;
+        self
     }
 
     /// The session header's `session_id` from the last locked re-read;
@@ -246,6 +262,47 @@ pub fn input_sha256(inputs: &[LabelledInput]) -> String {
     hex::encode(h.finalize())
 }
 
+/// The ledger's `answered` record for evidence the agent just submitted on
+/// `state`, or `None` when there's nothing to pair it with.
+///
+/// `events` is the log before the submission. A record is due when the
+/// current visit to `state` holds a `decider_consulted` event whose outcome
+/// isn't `applied`, and the submission carries at least one field with a
+/// `decider` block. Only those fields go in `values`. Nothing here reads
+/// the decider settings: an answer is recorded even when the user has
+/// since turned the decider off.
+pub fn answered_record(
+    session: &str,
+    session_id: Option<&str>,
+    events: &[Event],
+    state: &str,
+    accepts: &BTreeMap<String, crate::template::types::FieldSchema>,
+    submitted: &serde_json::Map<String, serde_json::Value>,
+) -> Option<LedgerRecord> {
+    let consultation = prior_consultation(events, state)?;
+    if consultation.outcome == ConsultationOutcome::Applied {
+        return None;
+    }
+    let values: BTreeMap<String, serde_json::Value> = crate::decider::declared_fields(accepts)
+        .iter()
+        .filter_map(|f| {
+            submitted
+                .get(f.name)
+                .map(|v| (f.name.to_string(), v.clone()))
+        })
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    Some(LedgerRecord::answered(
+        session,
+        session_id,
+        state,
+        consultation.visit_seq,
+        values,
+    ))
+}
+
 impl DeciderPort for CliDeciderPort<'_> {
     fn policy(&self) -> &DeciderPolicy {
         &self.policy
@@ -303,10 +360,17 @@ impl DeciderPort for CliDeciderPort<'_> {
         )
     }
 
+    /// Append the ledger's `consulted` record. The engine calls this right
+    /// after the `decider_consulted` append, while the visit's guard (and
+    /// so `decider.lock`) is still held. A ledger that can't be written
+    /// produces one warning and changes nothing else.
     fn recorded(&mut self, event: &EventPayload) {
-        if matches!(event, EventPayload::DeciderConsulted(_)) {
-            self.recorded += 1;
-        }
+        let EventPayload::DeciderConsulted(c) = event else {
+            return;
+        };
+        self.recorded += 1;
+        let record = LedgerRecord::consulted(&self.session, self.session_id.as_deref(), c.clone());
+        append_or_warn(self.ledger_root.as_deref(), &record);
     }
 }
 
@@ -643,5 +707,125 @@ d
         let mut p = port(&backend, &decider);
         assert!(matches!(consult(&mut p, &tpl), ConsultReply::Skipped));
         assert_eq!(decider.calls(), 0);
+    }
+
+    fn consultation_at(
+        visit_seq: u64,
+        outcome: crate::decider::ConsultationOutcome,
+    ) -> EventPayload {
+        EventPayload::DeciderConsulted(crate::decider::DeciderConsultation {
+            state: "review".to_string(),
+            visit_seq,
+            provider: "fake".to_string(),
+            model: "m".to_string(),
+            input_sha256: None,
+            outcome,
+            error_class: None,
+            latency_ms: 0,
+            directive_bytes: 0,
+            endpoint_origin: SettingOrigin::Default,
+            fields: BTreeMap::new(),
+        })
+    }
+
+    #[test]
+    fn recorded_appends_one_consulted_line_with_the_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = session(tmp.path(), "sess-uuid-9");
+        let tpl = compiled();
+        let decider = Arc::new(ScriptedDecider::new());
+        decider.push_answer(answer());
+        let root = tmp.path().join("home").join(".koto");
+        let mut p = port(&backend, &decider).with_ledger_root(Some(root.clone()));
+        let _held = consult(&mut p, &tpl);
+        let ev = consultation_at(2, crate::decider::ConsultationOutcome::NotApplied);
+        p.recorded(&ev);
+        // Anything else the engine reports is not a consultation.
+        p.recorded(&EventPayload::ContextRemoved {
+            key: "k".to_string(),
+        });
+        let body = std::fs::read_to_string(crate::decider::ledger::ledger_path(&root)).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["kind"], "consulted");
+        assert_eq!(v["session"], "wf");
+        assert_eq!(v["session_id"], "sess-uuid-9");
+        assert_eq!(v["visit_seq"], 2);
+        assert_eq!(p.recorded_count(), 1);
+    }
+
+    #[test]
+    fn answered_record_needs_an_unapplied_consultation_and_a_declared_field() {
+        let tpl = compiled();
+        let accepts = tpl.states["review"].accepts.clone().unwrap();
+        let entry = |seq| {
+            event(
+                seq,
+                EventPayload::Transitioned {
+                    from: None,
+                    to: "review".to_string(),
+                    condition_type: "auto".to_string(),
+                    skip_if_matched: None,
+                },
+            )
+        };
+        let submitted: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"verdict": "exit"}"#).unwrap();
+        let undeclared: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"notes": "x"}"#).unwrap();
+
+        // No consultation on the visit.
+        let events = vec![entry(1)];
+        assert!(
+            answered_record("wf", Some("u"), &events, "review", &accepts, &submitted).is_none()
+        );
+
+        // Applied.
+        let events = vec![
+            entry(1),
+            event(
+                2,
+                consultation_at(1, crate::decider::ConsultationOutcome::Applied),
+            ),
+        ];
+        assert!(
+            answered_record("wf", Some("u"), &events, "review", &accepts, &submitted).is_none()
+        );
+
+        // A consultation from an earlier visit doesn't count.
+        let events = vec![
+            entry(1),
+            event(
+                2,
+                consultation_at(1, crate::decider::ConsultationOutcome::NotApplied),
+            ),
+            entry(3),
+        ];
+        assert!(
+            answered_record("wf", Some("u"), &events, "review", &accepts, &submitted).is_none()
+        );
+
+        // Not applied, but nothing declared was submitted.
+        let events = vec![
+            entry(1),
+            event(
+                2,
+                consultation_at(1, crate::decider::ConsultationOutcome::Error),
+            ),
+        ];
+        assert!(
+            answered_record("wf", Some("u"), &events, "review", &accepts, &undeclared).is_none()
+        );
+
+        // Not applied and declared: one record with only declared values.
+        let mut both = submitted.clone();
+        both.insert("notes".to_string(), serde_json::json!("free text"));
+        let rec = answered_record("wf", Some(""), &events, "review", &accepts, &both).unwrap();
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(v["kind"], "answered");
+        assert_eq!(v["visit_seq"], 1);
+        assert_eq!(v["values"], serde_json::json!({"verdict": "exit"}));
+        assert!(v["session_id"].is_null());
     }
 }

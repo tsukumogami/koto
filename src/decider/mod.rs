@@ -11,6 +11,7 @@
 //! - `types`, `request`, `evaluate`, `record`: pure and provider-neutral. The engine
 //!   depends only on these.
 //! - `jev`, `http`: the Jev client and its bounded transport.
+//! - `ledger`: the append-only `_decider_ledger.jsonl` writers.
 //! - [`build_decider`]: the only production constructor of a provider.
 
 pub mod evaluate;
@@ -18,6 +19,7 @@ pub mod evaluate;
 pub mod fake;
 pub mod http;
 pub mod jev;
+pub mod ledger;
 pub mod record;
 pub mod request;
 pub mod types;
