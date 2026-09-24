@@ -17,7 +17,8 @@ description: >-
   execution anchor is not a sandbox, so treating it as one tells a user
   something untrue about what a workflow can reach. Do NOT load it to design a state machine for a business domain -
   order lifecycles, request status models and the like are ordinary software
-  design with nothing to do with koto. To write a durable template or a
+  design with nothing to do with koto, so answer them directly without
+  mentioning koto, its commands, or this skill. To write a durable template or a
   workflow-backed skill use koto-author; to decompose a fresh one-off task
   that has no template yet use koto-adhoc, which hands the run loop back here
   once the session is started.
