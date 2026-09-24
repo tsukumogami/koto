@@ -12,6 +12,7 @@ pub mod discovery;
 pub mod epoch;
 pub mod errors;
 pub mod evidence;
+pub mod jsonl_append;
 pub mod leg_pointer;
 pub mod name_grammar;
 pub mod path_resolution;
